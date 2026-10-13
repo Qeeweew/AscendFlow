@@ -15,7 +15,7 @@ QUALIFIER = {
 CTYPE = {"f32": "float", "f16": "half"}
 
 
-def pointer(ref: Ref, g="g"):
+def pointer(ref: Ref, g="g", *, core="0", extra=""):
     terms = []
     for offset, stride, modulus in ref.terms:
         if offset:
@@ -23,17 +23,21 @@ def pointer(ref: Ref, g="g"):
         if stride:
             index = f"({g} % {modulus})" if modulus else g
             terms.append(f"{stride} * {index}")
+    if ref.core_stride and core != "0":
+        terms.append(f"{ref.core_stride} * {core}")
+    if extra:
+        terms.append(extra)
     address = " + ".join(terms) or "0"
     q = QUALIFIER[ref.storage.bank]
     return f"({q} {CTYPE[ref.dtype]}*)({ref.storage.name} + ({address}))"
 
 
-def native_line(task, count):
+def native_line(task, count, core="0"):
     refs = task.refs
-    p = [pointer(r) for r in refs]
+    p = [pointer(r, core=core) for r in refs]
 
     def length(ref, unit=1):
-        base = ref.nbytes // unit
+        base = ref.total_nbytes // unit
         if ref.tail_nbytes:
             return f"(g == {count - 1} ? {ref.tail_nbytes // unit} : {base})"
         return str(base)
@@ -57,8 +61,26 @@ def native_line(task, count):
             f"{function}({p[-1]}, {p[0]}, float({task.scalar!r}), "
             f"uint32_t({length(refs[0], ITEMSIZE[refs[0].dtype])}));"
         )
-    if task.native == "add":
-        return f"asc_add({p[2]}, {p[0]}, {p[1]}, uint32_t({length(refs[0], 4)}));"
+    if task.native in {"add", "mul", "sub", "div"}:
+        return f"asc_{task.native}({p[2]}, {p[0]}, {p[1]}, uint32_t({length(refs[0], 4)}));"
+    if task.native in {"exp", "rsqrt"}:
+        return f"asc_{task.native}({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
+    if task.native == "scalar_load":
+        source = pointer(refs[0], core=core).replace("__ubuf__ float*", "__ubuf__ volatile float*")
+        return f"npu_value_{task.uid} = *({source});"
+    if task.native == "scale_value":
+        return (
+            f"asc_mul_scalar({p[1]}, {p[0]}, npu_value_{task.scalar_source}, "
+            f"uint32_t({length(refs[0], 4)}));"
+        )
+    if task.native in {"mul_rows", "sub_rows", "add_rows", "div_rows"}:
+        rows, cols = task.params
+        pp = [pointer(r, core=core, extra=f"npu_row * {r.row_stride}") for r in refs]
+        function = task.native.removesuffix("_rows")
+        return (
+            f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
+            f"asc_{function}({pp[2]}, {pp[0]}, {pp[1]}, uint32_t({cols})); }}"
+        )
     if task.native == "mad16":
         clear = "true" if task.params[0] else "false"
         return f"asc_mmad({p[2]}, {p[0]}, {p[1]}, 16, 16, 16, 0, false, false, {clear});"
@@ -72,7 +94,9 @@ def emit_asc(module, *, host_launcher=True):
     ex = execution(module)
     p = ex.program
     _, stream = parts(module)
-    tasks = {t.uid: t for t in p.tasks}
+    tasks = {
+        t.uid: t for _, t in sorted(enumerate(p.tasks), key=lambda x: (x[1].issue_order, x[0]))
+    }
     # Read actual sync placements, then retain the compact physical step loop.
     before, after, pending, previous = {}, {}, [], None
     from .ir import SyncOp
@@ -100,6 +124,8 @@ def emit_asc(module, *, host_launcher=True):
         "  asc_set_ctrl(asc_get_ctrl() | (uint64_t(1) << 48));",
     ]
     offsets, _ = storage_layout(p.storages)
+    if p.blocks > 1:
+        lines.append("  const int64_t core_id = asc_get_block_idx();")
     for s in p.storages:
         if s.external:
             continue
@@ -136,14 +162,17 @@ def emit_asc(module, *, host_launcher=True):
     if p.count:
         end = p.count + max(t.stage for t in p.tasks)
         lines.append(f"  for (int64_t step = 0; step < {end}; ++step) {{")
+        for task in p.tasks:
+            if task.native == "scalar_load":
+                lines.append(f"    float npu_value_{task.uid} = 0.0f;")
         for task in tasks.values():
             lines += [
                 f"    // {task.uid}: {task.pipe}, logical generation = step - {task.stage}",
-                f"    if (step >= {task.stage} && step < {p.count + task.stage}) {{",
+                f"    if (step >= {task.lower + task.stage} && step < {task.upper + task.stage}) {{",
                 f"      const int64_t g = step - {task.stage};",
             ]
             lines.extend("      " + sync_line(op) for op in before[task.uid])
-            lines.append("      " + native_line(task, p.count))
+            lines.append("      " + native_line(task, p.count, "core_id" if p.blocks > 1 else "0"))
             lines.extend("      " + sync_line(op) for op in after.get(task.uid, []))
             lines.append("    }")
         lines.append("  }")
@@ -158,7 +187,7 @@ def emit_asc(module, *, host_launcher=True):
         lines += [
             "",
             f'extern "C" void launch_{p.name}({sig}) {{',
-            f"  {p.name}<<<1, nullptr, stream>>>({call});",
+            f"  {p.name}<<<{p.blocks}, nullptr, stream>>>({call});",
             "}",
         ]
     return "\n".join(lines) + "\n"

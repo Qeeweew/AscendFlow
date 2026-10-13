@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from .codegen import emit_asc
-from .examples import cube_pipeline, vector_pipeline
+from .examples import cube_pipeline, scalar_pipeline, vector_pipeline
 from .ir import dump, parse
 from .sync import autosync, explain_plan, verify_plan
 from .toolchain import offline_compile
@@ -11,10 +11,13 @@ from .toolchain import offline_compile
 
 def main():
     parser = argparse.ArgumentParser(description="Physical xDSL NPU compiler for dav-2201")
-    parser.add_argument("example", choices=["vector", "last-read", "cube", "ir"])
+    parser.add_argument("example", choices=["vector", "last-read", "cube", "scalar", "ir"])
     parser.add_argument("--input", type=Path, help="physical unsynchronized xDSL for example=ir")
     parser.add_argument("--count", type=int, default=6)
     parser.add_argument("--slots", type=int, default=2)
+    parser.add_argument(
+        "--blocks", type=int, default=1, help="independent cores for the Scalar example"
+    )
     parser.add_argument(
         "--tail", type=int, default=0, help="final Vector tile element count, multiple of 8"
     )
@@ -28,6 +31,8 @@ def main():
         module = parse(args.input.read_text())
     elif args.example == "cube":
         module = cube_pipeline(args.count, args.slots)
+    elif args.example == "scalar":
+        module = scalar_pipeline(args.count, args.blocks)
     else:
         module = vector_pipeline(
             args.count, slots=args.slots, late_reader=args.example == "last-read", tail=args.tail
@@ -40,11 +45,9 @@ def main():
     (args.output / "after.xdsl").write_text(dump(plan))
     (args.output / "witnesses.json").write_text(json.dumps(explain_plan(plan), indent=2) + "\n")
     (args.output / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
-    name = "cube_pipeline" if args.example == "cube" else "vector_pipeline"
-    if args.example == "ir":
-        from .model import extract
+    from .model import extract
 
-        name = extract(plan).name
+    name = extract(plan).name
     (args.output / f"{name}.asc").write_text(source)
     if args.compile or args.shared:
         report["cann"] = offline_compile(source, args.output.resolve(), name, shared=args.shared)

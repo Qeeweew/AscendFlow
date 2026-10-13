@@ -3,7 +3,8 @@
 基于 xDSL 0.73.0 的独立 Python 编译器，目标 Ascend 910B / dav-2201，直接输出
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
-当前实现是物理编程入口和局部自动同步闭环，尚不是完整的复杂算子编译器。
+当前实现是物理编程入口和局部自动同步闭环，含独立核 grid、Scalar 捕获和
+strided 访问；尚不是完整的复杂算子编译器。
 `Kernel` builder 明确表达原生计算、搬运、物理布局、子视图、slot 和固定 stage。
 专家指定的 issue 顺序、stage 和 buffer 不会被同步器重排或扩大。
 源码、测试和文档属于本产品 Git；环境和运行产物放在外层工作区。
@@ -67,17 +68,18 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 
 | 能力 | 实际支持 |
 |---|---|
-| 执行域 | 单个 AIV 或 AIC；host launcher 固定一个物理核 |
-| 控制 | 静态有限单 stream；固定 stage 的 prologue/steady state/epilogue；零次执行 |
+| 执行域 | AIV 或 AIC 的独立核 grid；检查 GM 写入/读取的跨 owner 不重叠 |
+| 控制 | 静态有限单 stream、连续 task 激活区间、once cache；固定 stage 的填排；零次执行 |
 | 存储 | UB/L1/L0A/L0B/L0C 容量和对齐；GM 输入契约；嵌套子视图和跨 dtype 字节别名 |
 | 代次 | 显式线性或 modulo 地址；多缓冲；完整 RAW/WAR/WAW 和多 reader |
-| Vector | 连续 f32 Add、Muls、Adds；精确的静态末块，DMA 长度为 32 字节倍数 |
+| Vector | f32 Add/Sub/Mul/Div/Exp/Rsqrt、标量和逐行计算；静态末块，DMA 长度为 32 字节倍数 |
+| Scalar | f32 UB word 读取，显式 SSA 值、同步读取和发射时捕获；支持 Scalar Wait 的全核 dispatch 门控 |
 | Cube | 完整 f16 16×16×16 MAD；f32 clear/累加；NT 预打包输入；f32 NZ→ND Fixpipe |
 | 搬运 | GM→UB、UB→GM、GM→L1、单 fractal L1→L0A/B |
 | 同步 | 本地二值事件、同流水必要 barrier；每有向 bank 八 ID；配对和复用验证 |
 | 保护 | executing ops 的 xDSL effects 防止普通 DCE/CSE 删除异步工作 |
 
-不支持的动态 task count、分支/带洞激活、间接 gather/scatter、任意 native extern、
+不支持的动态 task count、数据相关分支/带洞激活、间接 gather/scatter、任意 native extern、
 跨 AIC/AIV 交接、跨核 ownership、全局 phase 和通信会被拒绝。
 没有直接 L0C→UB 路径、事件溢出的 mutex fallback，或静默缩小 tile/扩大 buffer。
 这些边界也意味着当前不支持完整的 GEMM/FFN、RoPE、normalization 或 attention 算子库。
@@ -87,4 +89,5 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 语义来源，也不能证明任意规模或任意动态程序。数值和性能仍需设备验证。
 
 参见 [同步规则与反例](docs/synchronization.md)、[源码依据](docs/source-notes.md)
-和 [阶段验证记录](docs/validation-stage1.md)。
+和 [阶段验证记录](docs/validation-stage1.md)。阶段1对应 Git `6a54f43`，该记录
+保留当时的验证范围。后续基础能力见 [物理执行扩展](docs/physical-extensions.md)。

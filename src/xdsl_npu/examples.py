@@ -3,6 +3,25 @@
 from .builder import Kernel
 
 
+def scalar_pipeline(count=3, blocks=1):
+    """A real Scalar UB read; the scalar operand is captured before Vector issue."""
+    k = Kernel("scalar_pipeline", blocks=blocks, disjoint_external=True)
+    x = k.buffer("x", "GM", count * blocks * 32, external=True, initialized=True)
+    y = k.buffer("y", "GM", count * blocks * 32, external=True)
+    a = k.buffer("a", "UB", 64)
+    b = k.buffer("b", "UB", 64)
+    k.loop(count)
+    xr = k.view(x, 32, stride=32, core_stride=count * 32)
+    yr = k.view(y, 32, stride=32, core_stride=count * 32)
+    ar, br = k.view(a, 32, stride=32, slots=2), k.view(b, 32, stride=32, slots=2)
+    k.copy("load", xr, ar)
+    word = k.view(ar, 4)
+    value = k.scalar_load("factor", word, stage=1)
+    k.scale_value("multiply", ar, br, value, stage=1)
+    k.copy("store", br, yr, stage=2)
+    return k.finish()
+
+
 def vector_pipeline(count=6, tile=128, slots=2, *, stages=(0, 1, 2), late_reader=False, tail=0):
     nbytes = tile * 4
     total_bytes = (count - 1) * nbytes + tail * 4 if count and tail else count * nbytes

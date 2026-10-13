@@ -25,6 +25,8 @@ from xdsl.irdl import (
     irdl_attr_definition,
     irdl_op_definition,
     operand_def,
+    opt_attr_def,
+    opt_result_def,
     region_def,
     result_def,
     traits_def,
@@ -69,6 +71,7 @@ class KernelOp(IRDLOperation):
     target = attr_def(StringAttr)
     core = attr_def(StringAttr)
     disjoint_external = attr_def(IntAttr)
+    blocks = opt_attr_def(IntAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
 
@@ -94,6 +97,9 @@ class ViewOp(IRDLOperation):
     modulus = attr_def(IntAttr)
     nbytes = attr_def(IntAttr)
     tail_nbytes = attr_def(IntAttr)
+    rows = opt_attr_def(IntAttr)
+    row_stride = opt_attr_def(IntAttr)
+    core_stride = opt_attr_def(IntAttr)
     ref = result_def(RefType)
 
 
@@ -108,13 +114,17 @@ class StreamOp(IRDLOperation):
 @irdl_op_definition
 class TaskOp(IRDLOperation):
     name = "npu.task"
-    refs = var_operand_def(RefType)
+    refs = var_operand_def()
     uid = attr_def(StringAttr)
     native = attr_def(StringAttr)
     stage = attr_def(IntAttr)
+    lower = opt_attr_def(IntAttr)
+    upper = opt_attr_def(IntAttr)
+    issue_order = opt_attr_def(IntAttr)
     params = attr_def(ArrayAttr[IntAttr])
     scalar = attr_def(FloatAttr)
     task = result_def(TaskType)
+    value = opt_result_def(f32)
     traits = traits_def(AsyncEffects())
 
 

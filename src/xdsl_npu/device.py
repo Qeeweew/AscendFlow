@@ -145,10 +145,13 @@ class ACL:
 
 def input_and_oracle(program, *, late_reader=False):
     n = program.count
-    if program.name == "vector_pipeline":
+    if program.name in {"vector_pipeline", "scalar_pipeline"}:
         elements = next(s.nbytes for s in program.storages if s.name == "x") // 4
         values = [(i % 127 - 63) / 16 for i in range(elements)]
-        expected = [v * (3 if late_reader else 2) + 1 for v in values]
+        if program.name == "scalar_pipeline":
+            expected = [v * values[i // 8 * 8] for i, v in enumerate(values)]
+        else:
+            expected = [v * (3 if late_reader else 2) + 1 for v in values]
         return [struct.pack(f"<{elements}f", *values), b"\xcd" * (elements * 4)], expected
     require(
         program.name == "cube_pipeline", "device oracle supports only the shipped example recipes"

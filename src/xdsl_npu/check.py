@@ -35,8 +35,9 @@ def bounded_check(module, *, max_states=200_000) -> CheckResult:
         task = p.tasks[inst.task]
         access.append(
             [
-                (r.storage.name, *r.interval(inst.generation), mode)
+                (r.storage.name, a, b, mode)
                 for r, mode in zip(task.refs, task.modes)
+                for a, b in r.segments(inst.generation)
             ]
         )
     previous_conflicts = []
@@ -69,9 +70,25 @@ def bounded_check(module, *, max_states=200_000) -> CheckResult:
                 notification_indices[(cmd.channel, cmd.epoch)] = i
                 notification_pipe[cmd.pipe] |= 1 << i
     initial = ((0,) * len(queues), 0, 0, (0,) * len(event_keys), 0)
+    positions = {id(cmd): pos for pos, cmd in enumerate(ex.commands)}
+    scalar_gates = [
+        (positions[id(cmd)], q, head, cmd)
+        for q, queue in enumerate(queues)
+        for head, cmd in enumerate(queue)
+        if cmd.pipe == "S" and cmd.kind in {"task", "wait"}
+    ]
     todo, seen, terminals = [initial], {initial}, 0
     while todo:
         heads, active, retired, flags, pending = todo.pop()
+        blocked_at = len(ex.commands)
+        for pos, q, head, cmd in scalar_gates:
+            completed = (
+                bool(retired & (1 << index[cmd.instance]))
+                if cmd.kind == "task"
+                else heads[q] > head
+            )
+            if not completed:
+                blocked_at = min(blocked_at, pos)
         next_states = []
         for bit in range(len(instances)):
             if active & (1 << bit):
@@ -89,6 +106,8 @@ def bounded_check(module, *, max_states=200_000) -> CheckResult:
             if heads[q] == len(queue):
                 continue
             cmd = queue[heads[q]]
+            if positions[id(cmd)] > blocked_at:
+                continue
             pipe_busy = active & active_pipe[cmd.pipe]
             new_active, new_flags, new_pending = active, flags, pending
             if cmd.kind == "task":

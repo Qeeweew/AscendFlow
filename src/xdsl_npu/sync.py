@@ -100,9 +100,6 @@ def execution(module: ModuleOp) -> Execution:
         require(
             a != b, f"{name}: same-pipe synchronization must use its native completion contract"
         )
-        require(
-            a != "S" and b != "S", "Scalar dispatch waits require a separate admission contract"
-        )
         channels[name] = Channel(name, source, destination, d, lo, hi, w, base, op.reason.data)
         usage[(a, b)].update(range(base, base + w))
     before = defaultdict(list)
@@ -244,6 +241,7 @@ def completion_graph(ex: Execution):
     notifications, waits = {}, {}
     physical_sets = defaultdict(list)
     previous_issue, previous_fence = {}, {}
+    dispatch_gate = None
     tasks_in_pipe = defaultdict(list)
     for cmd in ex.commands:
         inst, pipe = cmd.instance, cmd.pipe
@@ -252,6 +250,8 @@ def completion_graph(ex: Execution):
         start = graph.node(label + ".begin")
         finish = graph.node(label + ".end") if cmd.kind in {"task", "set"} else start
         graph.edge(start, finish)
+        if dispatch_gate is not None:
+            graph.edge(dispatch_gate, start)
         if pipe in previous_issue:
             graph.edge(previous_issue[pipe], start)  # issue order is deliberately weak.
         if pipe in previous_fence:
@@ -262,6 +262,10 @@ def completion_graph(ex: Execution):
             if pipe in IMPLICIT_COMPLETION and tasks_in_pipe[pipe]:
                 graph.edge(tasks_in_pipe[pipe][-1], start)
             tasks_in_pipe[pipe].append(finish)
+            if pipe == "S":
+                # Scalar UB load is synchronous and its by-value result is
+                # captured before the controller can dispatch later work.
+                dispatch_gate = finish
         else:
             if cmd.kind in {"set", "barrier"}:
                 for done in tasks_in_pipe[pipe]:
@@ -275,6 +279,10 @@ def completion_graph(ex: Execution):
                 physical_sets[cmd.event].append((finish, cmd.channel, cmd.epoch))
             elif cmd.kind == "wait":
                 waits[(cmd.channel, cmd.epoch)] = finish
+                if pipe == "S":
+                    # A Scalar hard-event wait stops later core dispatch;
+                    # instructions already dispatched remain independent.
+                    dispatch_gate = finish
     for key, producer in notifications.items():
         graph.edge(producer, waits[key])
     graph.close()
@@ -294,6 +302,15 @@ def verify_plan(module: ModuleOp) -> dict:
             f"{ex.program.tasks[o.destination.task].uid}[{o.destination.generation}] "
             f"on {o.storage}[{o.start}:{o.stop}]",
         )
+    indices = {task.uid: i for i, task in enumerate(ex.program.tasks)}
+    for inst in ex.program.instances():
+        task = ex.program.tasks[inst.task]
+        if task.scalar_source is not None:
+            provider = Instance(inst.generation, indices[task.scalar_source])
+            require(
+                graph.precedes(end[provider], begin[inst]),
+                f"Scalar value {task.scalar_source} is not captured before {task.uid}",
+            )
     for event, sets in physical_sets.items():
         # Same physical direction means one source pipe, hence totally ordered sets.
         for (_, name, epoch), (next_set, next_name, next_epoch) in itertools.pairwise(sets):
@@ -310,6 +327,7 @@ def verify_plan(module: ModuleOp) -> dict:
     _, peaks = storage_layout(ex.program.storages)
     return {
         "tasks": len(begin),
+        "independent_cores": ex.program.blocks,
         "obligations": len(obligations),
         "channels": len(ex.channels),
         "event_ids": {k: sorted(v) for k, v in bank.items()},
