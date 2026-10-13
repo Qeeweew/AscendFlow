@@ -20,7 +20,7 @@ ops-transformer 与报告的固定 `98f82c34...` 不同；历史固定链接不�
 
 | 来源（相对于工作区 reference） | 对实现的约束 |
 |---|---|
-| `tilelang/src/ascend/transform/insert_sync.cc`, `HasImplicitSamePipeOrder` | S/M 的隐式完成规则；V/MTE/FIX 不能直接当完成边 |
+| `tilelang/src/ascend/transform/insert_sync.cc`, `HasImplicitSamePipeOrder` | 最初 S/M 顺序设计输入；短 MAD 的无条件 M 假设已被后续设备反例修正；V/MTE/FIX 不能直接当完成边 |
 | `tilelang/docs/compiler_internals/ascend_local_events.md` | 二值 flag、八 ID bank、旧 Wait→下一 Set、跨核 Wait 的 dispatch 语义 |
 | `ops-transformer/moe/moe_finalize_routing/op_kernel/moe_finalize_routing_fp_db.h`, 325–357 | Add 读取输入后 release，后续 Scale/输出计算仍继续；V RAW barrier 必须保留 |
 | `catlass/include/catlass/gemm/block/block_mmad_preload_async_with_callback.hpp`, 278–375 | L1/MTE1、L0/MAD、L0C/FIX 的独立最后读取和 release |
@@ -41,6 +41,12 @@ Fixpipe wrapper 不设置 ND_PARA，产品在明确的一次初始化契约中�
 原生操作的 source read retirement 与 destination write done 默认同在其可信
 完成点；这里没有推断指令内部的更早读取完成。Set 发射/生效/后续 source work
 必须分开，设备反例已经说明单靠静态图中一个错误的“fence”前提会误判。
+
+后续实际 HEAD 仍为上述记录，参考工作树未改变。CATLASS
+`include/catlass/gemm/tile/tile_mmad.hpp:71–74` 对
+`(m/16)*(n/16)<10` 显式加 M barrier。连续小 tile 设备反例暴露了此前统一
+采用 M completion 的问题；最终生成器从真实 C RAW/WAW 推导局部 M 完成，
+保留其他 C 槽的交错。具体数值反例和修正产物见 `hierarchical-gemm.md`。
 
 已有设计建议按能力逐步验证。跨核 GM handoff、动态 segmented task、GDN state
 ownership、MoE global phase、communication completion 都尚未实现；其审计结论

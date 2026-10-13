@@ -73,12 +73,15 @@ class Kernel:
         offset=0,
         stride=0,
         slots=0,
+        divisor=1,
         dtype=None,
         layout=None,
         tail_nbytes=0,
         rows=1,
         row_stride=0,
         core_stride=0,
+        core_divisor=1,
+        core_modulus=0,
     ) -> SSAValue:
         assert self.task_block is not None
         typ = source.type
@@ -91,18 +94,31 @@ class Kernel:
                 "offset": IntAttr(offset),
                 "stride": IntAttr(stride),
                 "modulus": IntAttr(slots),
+                "divisor": IntAttr(divisor),
                 "nbytes": IntAttr(nbytes),
                 "tail_nbytes": IntAttr(tail_nbytes),
                 "rows": IntAttr(rows),
                 "row_stride": IntAttr(row_stride),
                 "core_stride": IntAttr(core_stride),
+                "core_divisor": IntAttr(core_divisor),
+                "core_modulus": IntAttr(core_modulus),
             },
         )
         self.task_block.add_op(op)
         return op.ref
 
     def task(
-        self, uid, native, *refs, stage=0, params=(), scalar=0.0, active=(0, -1), issue_order=None
+        self,
+        uid,
+        native,
+        *refs,
+        stage=0,
+        params=(),
+        scalar=0.0,
+        active=(0, -1),
+        issue_order=None,
+        period=1,
+        phase=0,
     ) -> TaskOp:
         assert self.task_block is not None
         attrs = task_attrs(uid, native, stage, params, scalar)
@@ -110,6 +126,8 @@ class Kernel:
             lower=IntAttr(active[0]),
             upper=IntAttr(active[1]),
             issue_order=IntAttr(self.num_tasks if issue_order is None else issue_order),
+            period=IntAttr(period),
+            phase=IntAttr(phase),
         )
         op = TaskOp.create(
             operands=list(refs),

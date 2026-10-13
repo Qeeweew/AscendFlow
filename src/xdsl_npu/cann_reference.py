@@ -39,14 +39,17 @@ class OperatorReference:
         self.launch.argtypes = [ct.c_void_p, ct.c_uint64, ct.c_void_p, ct.c_void_p]
         self.launch.restype = ct.c_int32
 
-    def tensor(self, ptr, shape):
+    def tensor(self, ptr, shape, *, dtype=0, strides=None, storage_shape=None):
         dims = (ct.c_int64 * len(shape))(*shape)
-        strides = []
-        stride = 1
-        for size in reversed(shape):
-            strides.insert(0, stride)
-            stride *= size
+        if strides is None:
+            strides = []
+            stride = 1
+            for size in reversed(shape):
+                strides.insert(0, stride)
+                stride *= size
         layout = (ct.c_int64 * len(shape))(*strides)
+        storage_shape = shape if storage_shape is None else storage_shape
+        storage_dims = (ct.c_int64 * len(storage_shape))(*storage_shape)
         create = self.meta.aclCreateTensor
         create.argtypes = [
             ct.POINTER(ct.c_int64),
@@ -60,7 +63,9 @@ class OperatorReference:
             ct.c_void_p,
         ]
         create.restype = ct.c_void_p
-        tensor = create(dims, len(shape), 0, layout, 0, 2, dims, len(shape), ptr)
+        tensor = create(
+            dims, len(shape), dtype, layout, 0, 2, storage_dims, len(storage_shape), ptr
+        )
         require(tensor is not None, "aclCreateTensor failed")
         self.tensors.append(tensor)
         return tensor
@@ -111,9 +116,35 @@ class SoftmaxReference(OperatorReference):
         )
 
 
+class GemmReference(OperatorReference):
+    interface = "aclnnMatmul; f16 A and Bt.T view, f32 C; cubeMathType=0"
+
+    def __init__(self, runtime, a, bt, c, m, n, reduction):
+        super().__init__(runtime)
+        self.prepare(
+            "aclnnMatmul",
+            [
+                self.tensor(a, (m, reduction), dtype=1),
+                self.tensor(
+                    bt,
+                    (reduction, n),
+                    dtype=1,
+                    strides=(1, reduction),
+                    storage_shape=(n, reduction),
+                ),
+                self.tensor(c, (m, n)),
+                0,
+            ],
+            [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_int8],
+        )
+
+
 def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_case="standard"):
     p = extract(plan)
-    require(p.name in {"rms_norm", "softmax"}, "reference adapter implements RMSNorm and Softmax")
+    require(
+        p.name in {"rms_norm", "softmax", "gemm_nt"},
+        "reference adapter implements RMSNorm, Softmax and GEMM",
+    )
     require(repeats > 0 and warmup > 0, "correctness and timing require positive launch counts")
     health = health_snapshot(physical, output)
     contents, expected, tolerance, shape = operator_inputs(p, data_case=data_case)
@@ -126,9 +157,12 @@ def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_
             rstd = runtime.allocate_uninitialized(shape[0] * 4)
             epsilon = next(t.scalar for t in p.tasks if t.uid == "epsilon")
             baseline = RmsNormReference(runtime, *pointers, rstd, *shape, epsilon)
-        else:
+        elif p.name == "softmax":
             epsilon = None
             baseline = SoftmaxReference(runtime, *pointers, *shape)
+        else:
+            epsilon = None
+            baseline = GemmReference(runtime, *pointers, *shape)
         for _ in range(warmup):
             baseline()
         runtime.synchronize()
@@ -161,7 +195,7 @@ def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_
             "shape": shape,
             "data_case": data_case,
             "argument_sha256": [hashlib.sha256(data).hexdigest() for data in contents],
-            "dtype": "f32",
+            "dtype": "f16 operands/f32 output" if p.name == "gemm_nt" else "f32",
             "epsilon": epsilon,
             "warmup": warmup,
             "repeats": repeats,

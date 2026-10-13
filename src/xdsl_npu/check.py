@@ -9,7 +9,7 @@ Exhaustion of the state budget is reported as incomplete, never as a proof.
 
 from dataclasses import dataclass
 
-from .model import IMPLICIT_COMPLETION, CompileError, require
+from .model import CompileError, require
 from .sync import execution
 
 
@@ -30,13 +30,21 @@ def bounded_check(module, *, max_states=200_000) -> CheckResult:
         pipe: sum(1 << i for i, inst in enumerate(instances) if p.tasks[inst.task].pipe == pipe)
         for pipe in ex.queues()
     }
+    implicit_pipe = {
+        pipe: sum(
+            1 << i
+            for i, inst in enumerate(instances)
+            if p.tasks[inst.task].pipe == pipe and p.tasks[inst.task].implicit_completion
+        )
+        for pipe in ex.queues()
+    }
     access = []
     for inst in instances:
         task = p.tasks[inst.task]
         access.append(
             [
                 (r.storage.name, a, b, mode)
-                for r, mode in zip(task.refs, task.modes)
+                for r, mode in zip(task.refs, task.modes_for(inst.generation))
                 for a, b in r.segments(inst.generation)
             ]
         )
@@ -111,7 +119,7 @@ def bounded_check(module, *, max_states=200_000) -> CheckResult:
             pipe_busy = active & active_pipe[cmd.pipe]
             new_active, new_flags, new_pending = active, flags, pending
             if cmd.kind == "task":
-                if cmd.pipe in IMPLICIT_COMPLETION and pipe_busy:
+                if active & implicit_pipe[cmd.pipe]:
                     continue
                 i = index[cmd.instance]
                 missing = previous_conflicts[i] & ~retired

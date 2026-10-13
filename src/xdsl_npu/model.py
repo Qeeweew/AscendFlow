@@ -34,7 +34,7 @@ CAPACITY = {
     "L0C": 128 * 1024,
 }
 ITEMSIZE = {"f32": 4, "f16": 2}
-IMPLICIT_COMPLETION = {"S", "M"}  # NOT V, MTE1/2/3 or FIX on 2201.
+IMPLICIT_COMPLETION = {"S"}  # Unconditional; short Cube instructions need separate treatment.
 MAX_INSTANCES = 4096
 
 
@@ -63,16 +63,34 @@ def optional_int(attr, default):
 
 
 def ranges_cover(parent, child):
-    for start, stop in child:
+    parent = sorted(parent)
+    index = 0
+    for start, stop in sorted(child):
+        while index < len(parent) and parent[index][1] <= start:
+            index += 1
         cursor = start
-        for lo, hi in sorted(parent):
-            if lo <= cursor < hi:
-                cursor = max(cursor, hi)
-            if cursor >= stop:
-                break
-        if cursor < stop:
-            return False
+        while cursor < stop:
+            if index == len(parent) or parent[index][0] > cursor:
+                return False
+            cursor = max(cursor, parent[index][1])
+            if cursor < stop:
+                index += 1
     return True
+
+
+def ranges_overlap(left, right):
+    """Linear comparison of two sorted interval unions, including their holes."""
+    i = j = 0
+    while i < len(left) and j < len(right):
+        a, b = left[i]
+        c, d = right[j]
+        if a < d and c < b:
+            return True
+        if b <= c:
+            i += 1
+        else:
+            j += 1
+    return False
 
 
 @dataclass(frozen=True)
@@ -89,7 +107,7 @@ class Storage:
 @dataclass(frozen=True)
 class Ref:
     storage: Storage
-    terms: tuple[tuple[int, int, int], ...]  # offset, stride, modulus, in bytes
+    terms: tuple[tuple[int, int, int, int], ...]  # offset, byte stride, modulus, divisor
     nbytes: int
     dtype: str
     layout: str
@@ -97,10 +115,12 @@ class Ref:
     tail_generation: int = -1
     rows: int = 1
     row_stride: int = 0
-    core_stride: int = 0
+    core_terms: tuple[tuple[int, int, int], ...] = ()  # byte stride, divisor, modulus
 
     def address(self, g: int, core=0) -> int:
-        return sum(o + s * (g % m if m else g) for o, s, m in self.terms) + core * self.core_stride
+        return sum(o + s * ((g // d) % m if m else g // d) for o, s, m, d in self.terms) + sum(
+            s * ((core // d) % m if m else core // d) for s, d, m in self.core_terms
+        )
 
     def interval(self, g: int, core=0) -> tuple[int, int]:
         parts = self.segments(g, core)
@@ -139,6 +159,27 @@ class Task:
     upper: int = -1
     issue_order: int = 0
     scalar_source: str | None = None
+    period: int = 1
+    phase: int = 0
+
+    def active(self, g):
+        return self.lower <= g < self.upper and g % self.period == self.phase
+
+    def modes_for(self, g):
+        if self.native == "mad_cycle":
+            return ("R", "R", "W" if g % self.params[3] == 0 else "RW")
+        return self.modes
+
+    @property
+    def implicit_completion(self):
+        if self.pipe == "S":
+            return True
+        if self.pipe != "M":
+            return False
+        m, n = (16, 16) if self.native == "mad16" else self.params[:2]
+        # AtlasA2 CATLASS TileMmad fences short instructions: <10 output
+        # fractals cannot supply the prior blanket M completion guarantee.
+        return (m // 16) * (n // 16) >= 10
 
 
 @dataclass(frozen=True, order=True)
@@ -173,7 +214,7 @@ class Program:
             Instance(g, t)
             for g in range(self.count)
             for t, task in enumerate(self.tasks)
-            if task.lower <= g < (self.count if task.upper == -1 else task.upper)
+            if task.active(g)
         ]
 
     def issued(self):
@@ -350,8 +391,10 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
         require(len(params) == 2, "matrix DMA requires (rows, columns)")
         rows, cols = params
         require(
-            16 <= rows <= 256 and 16 <= cols <= 256 and rows % 16 == cols % 16 == 0,
-            "matrix DMA supports complete f16 fractals with dimensions in [16,256]",
+            16 <= rows <= 256
+            and 16 <= cols <= (65520 if native == "nd2nz" else 256)
+            and rows % 16 == cols % 16 == 0,
+            "matrix DMA requires complete f16 fractals and bounded native dimensions",
         )
         require(
             len(refs) == 2 and dtypes == ("f16", "f16") and lengths == (rows * cols * 2,) * 2,
@@ -379,12 +422,12 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "Load2D requires complete compact fractals and a legal repeat count",
         )
         return "MTE1", ("R", "W")
-    if native == "mad":
-        require(len(params) == 4, "MAD requires (M,N,K,clear)")
+    if native in {"mad", "mad_cycle"}:
+        require(len(params) == 4, "MAD requires (M,N,K,clear or periodic-clear extent)")
         m, n, k, clear = params
         require(
             all(16 <= dim <= 256 and dim % 16 == 0 for dim in (m, n, k))
-            and clear in {0, 1}
+            and (clear in {0, 1} if native == "mad" else 1 <= clear <= MAX_INSTANCES)
             and banks == ("L0A", "L0B", "L0C")
             and dtypes == ("f16", "f16", "f32")
             and layouts == ("ZZ", "ZN", "NZ")
@@ -392,7 +435,7 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             and all(r.contiguous for r in refs),
             "MAD requires exact f16 operand tiles and an f32 accumulator, without padding",
         )
-        return "M", ("R", "R", "W" if clear else "RW")
+        return "M", ("R", "R", "W" if native == "mad" and clear else "RW")
     if native == "fix":
         require(len(params) == 2, "Fixpipe requires (M,N)")
         m, n = params
@@ -544,16 +587,20 @@ def extract(module: ModuleOp) -> Program:
                 isinstance(typ, RefType) and typ.dtype.data in ITEMSIZE, "unsupported view dtype"
             )
             o, s, m, length = op.offset.data, op.stride.data, op.modulus.data, op.nbytes.data
-            require(o >= 0 and s >= 0 and m >= 0 and length > 0, "invalid view address/footprint")
+            divisor = optional_int(op.divisor, 1)
+            require(
+                o >= 0 and s >= 0 and m >= 0 and length > 0 and 1 <= divisor <= MAX_INSTANCES,
+                "invalid view address/footprint/divisor",
+            )
             if op.source in roots:
                 root, terms = roots[op.source], ()
                 bounds = lambda g, core, size=root.nbytes: ((0, size),)
-                inherited_core_stride = 0
+                core_terms = ()
             else:
                 parent = views[op.source]
                 root, terms = parent.storage, parent.terms
                 bounds = parent.segments
-                inherited_core_stride = parent.core_stride
+                core_terms = parent.core_terms
             require(typ.bank.data == root.bank, "a view cannot change physical bank/owner")
             tail = op.tail_nbytes.data
             require(
@@ -561,18 +608,27 @@ def extract(module: ModuleOp) -> Program:
                 "tail footprint must fit the view and its dtype",
             )
             rows, row_stride = optional_int(op.rows, 1), optional_int(op.row_stride, 0)
-            core_stride = inherited_core_stride + optional_int(op.core_stride, 0)
+            core_stride = optional_int(op.core_stride, 0)
+            core_divisor = optional_int(op.core_divisor, 1)
+            core_modulus = optional_int(op.core_modulus, 0)
             require(
-                1 <= rows <= 255 and row_stride >= 0 and (rows == 1 or row_stride >= length),
+                1 <= rows <= MAX_INSTANCES
+                and row_stride >= 0
+                and (rows == 1 or row_stride >= length),
                 "strided view rows must not overlap",
             )
             require(
-                core_stride >= 0 and (root.external or core_stride == 0),
+                core_stride >= 0
+                and (root.external or core_stride == 0)
+                and 1 <= core_divisor <= 1024
+                and 0 <= core_modulus <= 1024,
                 "local physical banks are core-private, not indexed by another core",
             )
+            if core_stride:
+                core_terms += ((core_stride, core_divisor, core_modulus),)
             ref = Ref(
                 root,
-                terms + ((o, s, m),),
+                terms + ((o, s, m, divisor),),
                 length,
                 typ.dtype.data,
                 typ.layout.data,
@@ -580,7 +636,7 @@ def extract(module: ModuleOp) -> Program:
                 count - 1,
                 rows,
                 row_stride,
-                core_stride,
+                core_terms,
             )
             for core in range(blocks if root.external else 1):
                 for g in range(max(count, 1)):
@@ -627,7 +683,11 @@ def extract(module: ModuleOp) -> Program:
             for ref in refs:
                 alignment = 4 if pipe == "S" else 32
                 require(
-                    (not ref.storage.external or blocks == 1 or ref.core_stride % alignment == 0)
+                    (
+                        not ref.storage.external
+                        or blocks == 1
+                        or all(ref.address(0, core) % alignment == 0 for core in range(blocks))
+                    )
                     and all(
                         a % alignment == 0 for g in range(max(count, 1)) for a, _ in ref.segments(g)
                     ),
@@ -668,6 +728,11 @@ def extract(module: ModuleOp) -> Program:
                 0 <= lower <= upper <= count,
                 "task activation must be a bounded contiguous interval",
             )
+            period, phase = optional_int(op.period, 1), optional_int(op.phase, 0)
+            require(
+                1 <= period <= MAX_INSTANCES and 0 <= phase < period,
+                "static periodic task activation requires 1<=period<=4096 and 0<=phase<period",
+            )
             issue_order = optional_int(op.issue_order, len(tasks))
             require(
                 0 <= issue_order <= 65535, "fixed issue order must be a bounded nonnegative rank"
@@ -685,6 +750,8 @@ def extract(module: ModuleOp) -> Program:
                 upper,
                 issue_order,
                 scalar_source,
+                period,
+                phase,
             )
             if scalar_source is not None:
                 provider = next(t for t in tasks if t.uid == scalar_source)
@@ -692,6 +759,7 @@ def extract(module: ModuleOp) -> Program:
                     provider.stage == stage
                     and provider.lower <= lower
                     and provider.upper >= upper
+                    and all(provider.active(g) for g in range(lower, upper) if task.active(g))
                     and (provider.issue_order, tasks.index(provider)) < (issue_order, len(tasks)),
                     "Scalar arguments must be captured earlier in the same physical step; "
                     "delayed descriptors need explicit storage",
@@ -715,7 +783,7 @@ def extract(module: ModuleOp) -> Program:
             )
     require(tasks, "stream must contain native tasks")
     require(
-        sum(t.upper - t.lower for t in tasks) <= MAX_INSTANCES,
+        sum(sum(t.active(g) for g in range(count)) for t in tasks) <= MAX_INSTANCES,
         f"finite verifier budget exceeded ({MAX_INSTANCES} task instances); no unchecked fallback",
     )
     program = Program(
@@ -735,10 +803,30 @@ def verify_independent_owners(program):
     if program.blocks == 1:
         return
     accesses = {}
+    instances = program.instances()
+    active_tasks = {i.task for i in instances}
+    written_roots = {
+        ref.storage.name
+        for i in active_tasks
+        for ref, mode in zip(program.tasks[i].refs, program.tasks[i].modes)
+        if ref.storage.external and "W" in mode
+    }
     for core in range(program.blocks):
-        for inst in program.instances():
+        translations = {}
+        for i in active_tasks:
+            for ref in program.tasks[i].refs:
+                if ref.storage.name in written_roots:
+                    translations.setdefault(ref.storage.name, set()).add(
+                        ref.address(0, core) - ref.address(0)
+                    )
+        require(
+            all(len(values) == 1 for values in translations.values()),
+            f"core {core}: views of a written GM root must share one core translation; "
+            "core-dependent internal aliases need per-actor synchronization",
+        )
+        for inst in instances:
             task = program.tasks[inst.task]
-            for ref, mode in zip(task.refs, task.modes):
+            for ref, mode in zip(task.refs, task.modes_for(inst.generation)):
                 if ref.storage.external:
                     for a, b in ref.segments(inst.generation, core):
                         accesses.setdefault((core, ref.storage.name), []).append((a, b, mode))
@@ -760,11 +848,7 @@ def verify_independent_owners(program):
                 continue
             for mode in ("R", "W"):
                 require(
-                    not any(
-                        a < d and c < b
-                        for a, b in writes
-                        for c, d in unions.get((other, root, mode), ())
-                    ),
+                    not ranges_overlap(writes, unions.get((other, root, mode), ())),
                     f"cross-core {root} ownership overlap {core}->{other}; "
                     "handoff/global synchronization is not implemented",
                 )
@@ -812,7 +896,7 @@ def dependencies(program: Program) -> tuple[Obligation, ...]:
     for instance in program.instances():
         task = program.tasks[instance.task]
         accesses = []
-        for ref, mode in zip(task.refs, task.modes):
+        for ref, mode in zip(task.refs, task.modes_for(instance.generation)):
             for start, stop in ref.segments(instance.generation):
                 accesses.extend(
                     ((ref.storage.name, a, b), mode)

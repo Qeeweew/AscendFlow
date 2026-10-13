@@ -343,3 +343,150 @@ def batched_matmul_nt(batch, m, n, reduction, *, k_block=64, slots=2):
     k.task("mad_acc", "mad", aa, ba, cc, stage=2, params=(m, n, k_block, 0), active=(1, count))
     k.task("export", "fix", cc, cr, stage=3, params=(m, n), active=(count - 1, count))
     return k.finish()
+
+
+def gemm_nt(
+    m,
+    n,
+    reduction,
+    *,
+    tile_m=128,
+    tile_n=128,
+    l1_k=128,
+    l0_k=64,
+    l1_slots=2,
+    l0_slots=2,
+    grid_m=None,
+    c_slots=1,
+    cache_b=False,
+):
+    """Dense C[M,N] = A[M,K] @ Bt[N,K].T, f16 -> f32, independent tile grid.
+
+    L1 loads have their own K clock and ring. Every L1 tile serves l1_k/l0_k
+    complete Load2D/MAD slices before its last MTE1 reader releases it.
+    Output rows/columns map to exact core coordinates; all GM inputs remain ND.
+    """
+    require(
+        all(
+            isinstance(d, int) and 16 <= d <= 256 and d % 16 == 0
+            for d in (tile_m, tile_n, l1_k, l0_k)
+        )
+        and l1_k % l0_k == 0,
+        "GEMM tiles must be complete 16-aligned fractals in [16,256]; L1 K divides into L0 K",
+    )
+    require(
+        all(isinstance(d, int) and d > 0 for d in (m, n, reduction))
+        and m % tile_m == n % tile_n == reduction % l1_k == 0
+        and reduction <= 65520,
+        "GEMM static M,N,K must divide the selected tiles; K must fit ND2NZ leading dimension",
+    )
+    require(
+        all(isinstance(s, int) and 1 <= s <= 8 for s in (l1_slots, l0_slots, c_slots)),
+        "independent L1/L0 slot counts must be in [1,8]",
+    )
+    rows, grid_n = m // tile_m, n // tile_n
+    grid_m = rows if grid_m is None else grid_m
+    require(
+        isinstance(grid_m, int) and 1 <= grid_m <= rows and rows % grid_m == 0,
+        "fixed GEMM row grid must divide the M tile count",
+    )
+    require(isinstance(cache_b, bool), "GEMM cache_b must be an explicit boolean policy")
+    require(grid_m * grid_n <= 1024, "GEMM output grid exceeds 1024 independent actors")
+    ratio, k_slices = l1_k // l0_k, reduction // l0_k
+    k_groups, outputs = reduction // l1_k, rows // grid_m
+    count = k_slices * outputs
+    ab, bb, cb = tile_m * l1_k * 2, tile_n * l1_k * 2, tile_m * tile_n * 4
+    a0b, b0b = tile_m * l0_k * 2, tile_n * l0_k * 2
+    k = Kernel("gemm_nt", core="aic", blocks=grid_m * grid_n, disjoint_external=True)
+    a = k.buffer("a", "GM", m * reduction * 2, "f16", external=True, initialized=True)
+    bt = k.buffer("bt", "GM", n * reduction * 2, "f16", external=True, initialized=True)
+    c = k.buffer("c", "GM", m * n * 4, external=True)
+    l1a = k.buffer("l1a", "L1", l1_slots * ab, "f16", layout="NZ")
+    l1b = k.buffer(
+        "l1b", "L1", tile_n * reduction * 2 if cache_b else l1_slots * bb, "f16", layout="NZ"
+    )
+    l0a = k.buffer("l0a", "L0A", l0_slots * a0b, "f16", layout="ZZ")
+    l0b = k.buffer("l0b", "L0B", l0_slots * b0b, "f16", layout="ZN")
+    l0c = k.buffer("accumulator", "L0C", c_slots * cb, layout="NZ")
+    k.init_fixpipe()
+    k.loop(count)
+    a_rows = k.view(
+        a,
+        reduction * 2,
+        rows=tile_m,
+        row_stride=reduction * 2,
+        stride=grid_m * tile_m * reduction * 2 if outputs > 1 else 0,
+        divisor=k_slices,
+        core_stride=tile_m * reduction * 2,
+        core_divisor=grid_n,
+    )
+    ar = k.view(
+        a_rows,
+        l1_k * 2,
+        rows=tile_m,
+        row_stride=reduction * 2,
+        stride=l1_k * 2,
+        divisor=ratio,
+        slots=k_groups,
+    )
+    br = k.view(
+        bt,
+        reduction * 2 if cache_b else l1_k * 2,
+        rows=tile_n,
+        row_stride=reduction * 2,
+        stride=0 if cache_b else l1_k * 2,
+        divisor=ratio,
+        slots=k_groups,
+        core_stride=tile_n * reduction * 2,
+        core_modulus=grid_n,
+    )
+    cr_rows = k.view(
+        c,
+        n * 4,
+        rows=tile_m,
+        row_stride=n * 4,
+        stride=grid_m * tile_m * n * 4 if outputs > 1 else 0,
+        divisor=k_slices,
+        core_stride=tile_m * n * 4,
+        core_divisor=grid_n,
+    )
+    cr = k.view(
+        cr_rows,
+        tile_n * 4,
+        rows=tile_m,
+        row_stride=n * 4,
+        core_stride=tile_n * 4,
+        core_modulus=grid_n,
+    )
+    la = k.view(l1a, ab, stride=ab, slots=l1_slots, divisor=ratio)
+    lb = (
+        k.view(l1b, tile_n * reduction * 2)
+        if cache_b
+        else k.view(l1b, bb, stride=bb, slots=l1_slots, divisor=ratio)
+    )
+    la_part = k.view(la, a0b, stride=a0b, slots=ratio)
+    lb_part = k.view(lb, b0b, stride=b0b, slots=k_slices if cache_b else ratio)
+    aa = k.view(l0a, a0b, stride=a0b, slots=l0_slots)
+    ba = k.view(l0b, b0b, stride=b0b, slots=l0_slots)
+    cc = k.view(l0c, cb, stride=cb, slots=c_slots, divisor=k_slices)
+    if cache_b:
+        # Resident B precedes the first A load, so a real A ready prefix can
+        # also cover B readiness without any extra notifications.
+        k.task("load_bt", "nd2nz", br, lb, params=(tile_n, reduction), active=(0, 1))
+    k.task("load_a", "nd2nz", ar, la, params=(tile_m, l1_k), period=ratio)
+    if not cache_b:
+        k.task("load_bt", "nd2nz", br, lb, params=(tile_n, l1_k), period=ratio)
+    k.task("operand_a", "load2d_a", la_part, aa, stage=1, params=(tile_m, l0_k))
+    k.task("operand_b", "load2d_b_nt", lb_part, ba, stage=1, params=(tile_n, l0_k))
+    k.task("mad_step", "mad_cycle", aa, ba, cc, stage=2, params=(tile_m, tile_n, l0_k, k_slices))
+    k.task(
+        "export",
+        "fix",
+        cc,
+        cr,
+        stage=3,
+        params=(tile_m, tile_n),
+        period=k_slices,
+        phase=k_slices - 1,
+    )
+    return k.finish()

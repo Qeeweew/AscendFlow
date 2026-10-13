@@ -149,3 +149,7 @@ XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 
 进一步扩展的主要缺口：动态 task/间接 alias与 ownership，跨 AIC/AIV交接，
 普通 GEMM 的 M/N层级复用及融合 FFN/attention。当前验证不包含这些能力。
+
+本记录固定在算子阶段 `e6c06b0`。后续普通/连续 GEMM、独立 L1/L0与C槽的
+真实生命周期及短 MAD 硬件反例见 [分层 GEMM 验证](hierarchical-gemm.md)；
+这里的历史数值/性能结果不扩大到新能力。

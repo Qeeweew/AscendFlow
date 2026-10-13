@@ -40,3 +40,8 @@ ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 ```
 
 产物、健康快照、编译选项和数值结果保存在外层 runs/stage2，未提交产品 Git。
+
+上述85项记录属于当时的阶段。后续实际扩展加入了静态周期 task、常量整数
+divisor/modulo 和二维核坐标，已用于分层/连续 GEMM；不等同于支持数据相关
+动态 stream。短 Cube 的旧 M completion 假设也已由设备反例修正，详情见
+[分层 GEMM](hierarchical-gemm.md)。

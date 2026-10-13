@@ -2,7 +2,7 @@
 
 from .builder import Kernel
 from .codegen import emit_asc
-from .kernels import batched_matmul_nt, rms_norm, rope, softmax, swiglu
+from .kernels import batched_matmul_nt, gemm_nt, rms_norm, rope, softmax, swiglu
 from .sync import autosync, verify_plan
 
 __all__ = [
@@ -10,6 +10,7 @@ __all__ = [
     "autosync",
     "batched_matmul_nt",
     "emit_asc",
+    "gemm_nt",
     "rms_norm",
     "rope",
     "softmax",

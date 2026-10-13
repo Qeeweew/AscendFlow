@@ -1,7 +1,7 @@
 """ASC emission consumes verified final IR; no instruction selection or hidden DMA."""
 
 from .ir import TaskOp
-from .model import ITEMSIZE, Ref, storage_layout
+from .model import ITEMSIZE, Ref, optional_int, storage_layout
 from .sync import execution, parts, verify_plan
 
 QUALIFIER = {
@@ -17,14 +17,18 @@ CTYPE = {"f32": "float", "f16": "half"}
 
 def pointer(ref: Ref, g="g", *, core="0", extra=""):
     terms = []
-    for offset, stride, modulus in ref.terms:
+    for offset, stride, modulus, divisor in ref.terms:
         if offset:
             terms.append(str(offset))
         if stride:
-            index = f"({g} % {modulus})" if modulus else g
+            index = f"({g} / {divisor})" if divisor != 1 else g
+            index = f"({index} % {modulus})" if modulus else index
             terms.append(f"{stride} * {index}")
-    if ref.core_stride and core != "0":
-        terms.append(f"{ref.core_stride} * {core}")
+    if core != "0":
+        for stride, divisor, modulus in ref.core_terms:
+            index = f"({core} / {divisor})" if divisor != 1 else core
+            index = f"({index} % {modulus})" if modulus else index
+            terms.append(f"{stride} * {index}")
     if extra:
         terms.append(extra)
     address = " + ".join(terms) or "0"
@@ -154,9 +158,11 @@ def native_line(task, count, core="0"):
     if task.native == "load2d_b_nt":
         rows, cols = task.params
         return f"asc_copy_l12l0b({p[1]}, {p[0]}, 0, {rows * cols // 256}, 1, 0);"
-    if task.native == "mad":
+    if task.native in {"mad", "mad_cycle"}:
         m, n, k, clear = task.params
-        flag = "true" if clear else "false"
+        flag = (
+            f"(g % {clear} == 0)" if task.native == "mad_cycle" else ("true" if clear else "false")
+        )
         return f"asc_mmad({p[2]}, {p[0]}, {p[1]}, {m}, {k}, {n}, 0, false, false, {flag});"
     if task.native == "fix":
         m, n = task.params
@@ -231,14 +237,19 @@ def emit_asc(module, *, host_launcher=True):
             ch = ex.channels[op.channel.data]
             a, b = p.tasks[ch.source].pipe, p.tasks[ch.destination].pipe
             epoch = f"g - {op.distance.data} - {ch.lower}"
+            if ch.stride != 1:
+                epoch = f"({epoch}) / {ch.stride}"
             event_id = f"{ch.base} + (({epoch}) % {ch.width})"
             function = "asc_sync_notify" if op.action.data == "set" else "asc_sync_wait"
             code = f"{function}(PIPE_{a}, PIPE_{b}, {event_id});"
             comment = f" // {ch.name}"
         lo, hi = op.lower.data, op.upper.data
-        if (lo, hi) != (0, p.count):
+        stride = optional_int(op.stride, 1)
+        if (lo, hi) != (0, p.count) or stride != 1:
             # The surrounding task guard already establishes 0 <= g < count.
             clauses = ([f"g >= {lo}"] if lo else []) + ([f"g < {hi}"] if hi != p.count else [])
+            if stride != 1:
+                clauses.append(f"(g - {lo}) % {stride} == 0")
             code = f"if ({' && '.join(clauses)}) {{ {code} }}"
         return code + comment
 
@@ -249,9 +260,12 @@ def emit_asc(module, *, host_launcher=True):
             if task.native == "scalar_load":
                 lines.append(f"    float npu_value_{task.uid} = 0.0f;")
         for task in tasks.values():
+            guard = f"step >= {task.lower + task.stage} && step < {task.upper + task.stage}"
+            if task.period != 1:
+                guard += f" && (step - {task.stage}) % {task.period} == {task.phase}"
             lines += [
                 f"    // {task.uid}: {task.pipe}, logical generation = step - {task.stage}",
-                f"    if (step >= {task.lower + task.stage} && step < {task.upper + task.stage}) {{",
+                f"    if ({guard}) {{",
                 f"      const int64_t g = step - {task.stage};",
             ]
             lines.extend("      " + sync_line(op) for op in before[task.uid])

@@ -18,6 +18,7 @@ from .model import (
     Program,
     dependencies,
     extract,
+    optional_int,
     require,
     storage_layout,
 )
@@ -34,6 +35,7 @@ class Channel:
     width: int
     base: int
     reason: str
+    stride: int = 1
 
 
 @dataclass(frozen=True)
@@ -81,15 +83,16 @@ def execution(module: ModuleOp) -> Execution:
             f"invalid or duplicate channel {name}",
         )
         source, destination = task_indices[src], task_indices[dst]
-        d, lo, hi, w, base = (
+        d, lo, hi, w, base, stride = (
             op.distance.data,
             op.lower.data,
             op.upper.data,
             op.width.data,
             op.base.data,
+            optional_int(op.stride, 1),
         )
         require(
-            0 <= d and 0 <= lo < hi <= p.count and hi + d <= p.count,
+            0 <= d and 0 <= lo < hi <= p.count and hi + d <= p.count and 1 <= stride <= 4096,
             f"{name}: unsupported activation/generation span",
         )
         require(
@@ -100,7 +103,9 @@ def execution(module: ModuleOp) -> Execution:
         require(
             a != b, f"{name}: same-pipe synchronization must use its native completion contract"
         )
-        channels[name] = Channel(name, source, destination, d, lo, hi, w, base, op.reason.data)
+        channels[name] = Channel(
+            name, source, destination, d, lo, hi, w, base, op.reason.data, stride
+        )
         usage[(a, b)].update(range(base, base + w))
     before = defaultdict(list)
     after = defaultdict(list)
@@ -119,7 +124,9 @@ def execution(module: ModuleOp) -> Execution:
             action = op.action.data
             require(action in {"set", "wait", "barrier"}, f"unknown sync action {action}")
             require(
-                0 <= op.lower.data < op.upper.data <= p.count and op.distance.data >= 0,
+                0 <= op.lower.data < op.upper.data <= p.count
+                and op.distance.data >= 0
+                and 1 <= optional_int(op.stride, 1) <= 4096,
                 "sync has invalid active generation span",
             )
             if action == "set":
@@ -133,7 +140,11 @@ def execution(module: ModuleOp) -> Execution:
 
     def convert(op, inst):
         action, name = op.action.data, op.channel.data
-        if not op.lower.data <= inst.generation < op.upper.data:
+        stride = optional_int(op.stride, 1)
+        if not (
+            op.lower.data <= inst.generation < op.upper.data
+            and (inst.generation - op.lower.data) % stride == 0
+        ):
             return None
         pipe = p.tasks[inst.task].pipe
         if action == "barrier":
@@ -145,6 +156,7 @@ def execution(module: ModuleOp) -> Execution:
         require(name in channels, f"sync references missing channel {name}")
         ch = channels[name]
         require(op.pipe.data == pipe, f"{name}: sync is on the wrong execution pipe")
+        require(stride == ch.stride, f"{name}: sync uses the wrong periodic epoch stride")
         if action == "set":
             require(
                 inst.task == ch.source
@@ -169,7 +181,7 @@ def execution(module: ModuleOp) -> Execution:
         event = (
             p.tasks[ch.source].pipe,
             p.tasks[ch.destination].pipe,
-            ch.base + (epoch - ch.lower) % ch.width,
+            ch.base + ((epoch - ch.lower) // ch.stride) % ch.width,
         )
         return Command(action, pipe, inst, name, epoch, event)
 
@@ -183,7 +195,9 @@ def execution(module: ModuleOp) -> Execution:
             command = convert(op, inst)
             if command:
                 commands.append(command)
-    expected = {(ch.name, g) for ch in channels.values() for g in range(ch.lower, ch.upper)}
+    expected = {
+        (ch.name, g) for ch in channels.values() for g in range(ch.lower, ch.upper, ch.stride)
+    }
     require(
         seen_sets == seen_waits == expected,
         "event pairs missing: incomplete ready/release lifecycle",
@@ -243,6 +257,7 @@ def completion_graph(ex: Execution):
     previous_issue, previous_fence = {}, {}
     dispatch_gate = None
     tasks_in_pipe = defaultdict(list)
+    previous_native = {}
     for cmd in ex.commands:
         inst, pipe = cmd.instance, cmd.pipe
         suffix = f"({cmd.channel})" if cmd.channel else ""
@@ -259,9 +274,10 @@ def completion_graph(ex: Execution):
         previous_issue[pipe] = start
         if cmd.kind == "task":
             begin[inst], end[inst] = start, finish
-            if pipe in IMPLICIT_COMPLETION and tasks_in_pipe[pipe]:
+            if pipe in previous_native and previous_native[pipe].implicit_completion:
                 graph.edge(tasks_in_pipe[pipe][-1], start)
             tasks_in_pipe[pipe].append(finish)
+            previous_native[pipe] = ex.program.tasks[inst.task]
             if pipe == "S":
                 # Scalar UB load is synchronous and its by-value result is
                 # captured before the controller can dispatch later work.
@@ -337,7 +353,7 @@ def verify_plan(module: ModuleOp) -> dict:
     }
 
 
-def sync_op(g, action, channel, pipe, lower, upper, distance=0):
+def sync_op(g, action, channel, pipe, lower, upper, distance=0, stride=1):
     return SyncOp.create(
         operands=[g],
         attributes={
@@ -347,8 +363,20 @@ def sync_op(g, action, channel, pipe, lower, upper, distance=0):
             "lower": IntAttr(lower),
             "upper": IntAttr(upper),
             "distance": IntAttr(distance),
+            "stride": IntAttr(stride),
         },
     )
+
+
+def arithmetic_span(epochs):
+    """A finite arithmetic progression; no invented notifications in its holes."""
+    lo, hi = epochs[0], epochs[-1] + 1
+    stride = epochs[1] - lo if len(epochs) > 1 else 1
+    require(
+        epochs == list(range(lo, hi, stride)),
+        "irregular activation needs a richer stream contract; cannot invent event pairs",
+    )
+    return lo, hi, stride
 
 
 def explain_plan(module: ModuleOp) -> dict:
@@ -423,7 +451,7 @@ def autosync(module: ModuleOp) -> ModuleOp:
     groups = defaultdict(list)
     for o in obs:
         a, b = p.tasks[o.source.task], p.tasks[o.destination.task]
-        if a.pipe == b.pipe and a.pipe in IMPLICIT_COMPLETION:
+        if a.pipe == b.pipe and a.implicit_completion:
             continue
         d = o.destination.generation - o.source.generation
         groups[(o.source.task, o.destination.task, d)].append(o)
@@ -432,15 +460,19 @@ def autosync(module: ModuleOp) -> ModuleOp:
     proposals = []
     for (src, dst, d), records in groups.items():
         active = sorted({o.source.generation for o in records})
-        require(
-            active == list(range(active[0], active[-1] + 1)),
-            f"{p.tasks[src].uid}->{p.tasks[dst].uid}: gapped activation needs a stream contract",
-        )
-        lo, hi = active[0], active[-1] + 1
         reason = "; ".join(
             sorted({f"{o.hazard}:{o.storage}[{o.start}:{o.stop}]:{o.milestone}" for o in records})
         )
-        proposals.append((src, dst, d, lo, hi, reason))
+        try:
+            spans = [arithmetic_span(active)]
+        except CompileError:
+            # A finite union of contiguous runs, e.g. accumulator dependencies
+            # inside each output's K loop with independent first-write holes.
+            spans = [
+                arithmetic_span([value for _, value in group])
+                for _, group in itertools.groupby(enumerate(active), lambda pair: pair[1] - pair[0])
+            ]
+        proposals.extend((src, dst, d, lo, hi, stride, reason) for lo, hi, stride in spans)
 
     def materialize(proposals, widths=None, *, virtual=False):
         for op in list(kernel.body.block.ops):
@@ -450,15 +482,16 @@ def autosync(module: ModuleOp) -> ModuleOp:
             if isinstance(op, SyncOp):
                 stream.body.block.erase_op(op)
         banks = defaultdict(int)
-        for i, (src, dst, d, lo, hi, reason) in enumerate(proposals):
+        for i, (src, dst, d, lo, hi, stride, reason) in enumerate(proposals):
             a, b = p.tasks[src], p.tasks[dst]
             if a.pipe == b.pipe:
                 stream.body.block.insert_op_before(
-                    sync_op(g, "barrier", "", b.pipe, lo + d, hi + d, d), task_ops[dst]
+                    sync_op(g, "barrier", "", b.pipe, lo + d, hi + d, d, stride), task_ops[dst]
                 )
                 continue
             name = f"c{i}_{a.uid}_{b.uid}_d{d}"
-            w = widths[i] if widths is not None else min(8, hi - lo)
+            epochs = len(range(lo, hi, stride))
+            w = widths[i] if widths is not None else min(8, epochs)
             # Before allocation, logical pairs are independent in the completion graph.
             # ID reuse is deliberately not inferred until the final allocation is checked.
             base = 0 if virtual else banks[(a.pipe, b.pipe)]
@@ -471,6 +504,7 @@ def autosync(module: ModuleOp) -> ModuleOp:
                     "distance": IntAttr(d),
                     "lower": IntAttr(lo),
                     "upper": IntAttr(hi),
+                    "stride": IntAttr(stride),
                     "width": IntAttr(w),
                     "base": IntAttr(base),
                     "reason": StringAttr(reason),
@@ -478,10 +512,10 @@ def autosync(module: ModuleOp) -> ModuleOp:
             )
             kernel.body.block.insert_op_before(channel, stream)
             stream.body.block.insert_op_before(
-                sync_op(g, "wait", name, b.pipe, lo + d, hi + d, d), task_ops[dst]
+                sync_op(g, "wait", name, b.pipe, lo + d, hi + d, d, stride), task_ops[dst]
             )
             stream.body.block.insert_op_after(
-                sync_op(g, "set", name, a.pipe, lo, hi), task_ops[src]
+                sync_op(g, "set", name, a.pipe, lo, hi, stride=stride), task_ops[src]
             )
         return banks
 
@@ -511,7 +545,7 @@ def autosync(module: ModuleOp) -> ModuleOp:
     # Restrict a barrier only when a real destination completion path covers
     # the removed epochs. Source notifications alone cannot provide that path.
     for proposal in list(proposals):
-        src, dst, d, lo, hi, reason = proposal
+        src, dst, d, lo, hi, stride, reason = proposal
         if p.tasks[src].pipe != p.tasks[dst].pipe:
             continue
         candidate = proposals.copy()
@@ -532,16 +566,20 @@ def autosync(module: ModuleOp) -> ModuleOp:
                 and not graph.precedes(end[o.source], begin[o.destination])
             }
         )
-        if missing and missing == list(range(missing[0], missing[-1] + 1)):
-            narrowed = (src, dst, d, missing[0], missing[-1] + 1, reason)
+        if missing:
+            try:
+                span = arithmetic_span(missing)
+            except CompileError:
+                continue
+            narrowed = (src, dst, d, *span, reason)
             if covered(candidate + [narrowed]):
                 proposals = candidate + [narrowed]
     # Find width by actual old-Wait->next-Set paths, never by storage count.
     widths = [1] * len(proposals)
-    for i, (src, dst, d, lo, hi, reason) in enumerate(proposals):
+    for i, (src, dst, d, lo, hi, stride, reason) in enumerate(proposals):
         if p.tasks[src].pipe == p.tasks[dst].pipe:
             continue
-        for width in range(1, min(8, hi - lo) + 1):
+        for width in range(1, min(8, len(range(lo, hi, stride))) + 1):
             widths[i] = width
             materialize(proposals, widths, virtual=True)
             try:

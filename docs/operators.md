@@ -3,7 +3,7 @@
 这些 Python 工厂生成真实的 `npu.buffer/view/task/stream`，并通过产品的共享
 AutoSync、最终 verifier 和 ASC 后端。工厂中没有 event ID；ASC 后端也不增加
 未进入效果分析的搬运或 scratch。`from xdsl_npu import rms_norm, rope, softmax,
-swiglu, batched_matmul_nt` 是可安装包的公开入口。
+swiglu, batched_matmul_nt, gemm_nt` 是可安装包的公开入口。
 
 | 入口 | 参数/输出 | 首轮 shape 契约 |
 |---|---|---|
@@ -12,6 +12,7 @@ swiglu, batched_matmul_nt` 是可安装包的公开入口。
 | `softmax(R,D)` | f32 X → f32 Y | 最后一维；D 为64的倍数，64…4096 |
 | `swiglu(R,D)` | f32 Gate、Up → f32 Y | 两个独立输入；D 为8的倍数，8…4096 |
 | `batched_matmul_nt(B,M,N,K)` | f16 A[B,M,K]、Bt[B,N,K] → f32 C[B,M,N] | 每个矩阵一个 AIC；M/N/K-block 为16的倍数，16…256；K 为 K-block 的正整数倍 |
+| `gemm_nt(M,N,K)` | f16 A[M,K]、Bt[N,K] → f32 C[M,N] | 二维输出 grid；静态 M/N/K 整除选定 tile；独立 L1/L0 K 与槽；可连续输出/驻留 B |
 
 Vector 行数静态非负，须整除 `blocks`，每核行数须整除固定 `row_block`。
 未指定行粒度时，在8/4/2/1中选能容纳完整分配的最大合法值；这是明确的默认
@@ -109,6 +110,7 @@ witness 可复现为：
 这些工厂不支持动态 task count、带洞/数据相关 guard、间接 gather/scatter、
 动态 group descriptors、可变跨核 ownership、mixed AIC/AIV、全局归约 phase、
 稀疏/paged attention、GDN 间接状态和通信。当前未提供假空接口声称支持它们。
-普通大 GEMM 的 M/N 层级 tile 复用和融合 FFN/attention 也尚未完成。
+普通/连续 GEMM 的已实现政策见 [分层 GEMM](hierarchical-gemm.md)。融合
+FFN/attention、NN 输入格式、BF16 与一般尾块尚未完成。
 扩展时需新增经审查的物理访问、owner/activation 与完成契约，并进入同一个
 最终 verifier；不能在 ASC 文本层隐藏工作，或凭事件数字绕过检查。

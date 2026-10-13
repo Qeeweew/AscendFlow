@@ -162,7 +162,11 @@ def test_batched_matmul_has_one_clear_and_one_final_export(m, n, chunks):
     plan = autosync(source)
     assert verify_plan(plan)["independent_cores"] == 4
     code = emit_asc(plan)
-    assert "asc_copy_gm2l1_nd2nz" in code and "asc_sync_pipe(PIPE_M)" not in code
+    assert "asc_copy_gm2l1_nd2nz" in code
+    if chunks > 1 and (m // 16) * (n // 16) < 10:
+        assert "asc_sync_pipe(PIPE_M)" in code
+    else:
+        assert "asc_sync_pipe(PIPE_M)" not in code
     assert "asc_copy_l0c2gm" in code and code.count("asc_sync_pipe(PIPE_ALL)") == 1
 
 

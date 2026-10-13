@@ -15,6 +15,27 @@ def operator_inputs(program, *, data_case="standard"):
         raise ValueError(f"unknown numerical input case {data_case}")
     if data_case != "standard" and program.name != "rms_norm":
         raise ValueError("numerical-edges currently applies to RMSNorm")
+    if program.name == "gemm_nt":
+        reduction = next(t for t in program.tasks if t.uid == "load_a").refs[0].row_stride // 2
+        m = next(s.nbytes for s in program.storages if s.name == "a") // (reduction * 2)
+        n = next(s.nbytes for s in program.storages if s.name == "bt") // (reduction * 2)
+        a = [((3 * i + 5 * l) % 17 - 8) / 8 for i in range(m) for l in range(reduction)]
+        bt = [((2 * j + 3 * l) % 13 - 6) / 8 for j in range(n) for l in range(reduction)]
+        rhs = [bt[j * reduction : (j + 1) * reduction] for j in range(n)]
+        expected = array("f")
+        for i in range(m):
+            lhs = a[i * reduction : (i + 1) * reduction]
+            expected.extend(sum(x * y for x, y in zip(lhs, row)) for row in rhs)
+        return (
+            [
+                struct.pack(f"<{len(a)}e", *a),
+                struct.pack(f"<{len(bt)}e", *bt),
+                b"\xcd" * (m * n * 4),
+            ],
+            expected,
+            (0, 0),
+            [m, n, reduction],
+        )
     if program.name == "batched_matmul_nt":
         m, n, grain, _ = next(t.params for t in program.tasks if t.uid == "mad_init")
         reduction, batch = grain * program.count, program.blocks

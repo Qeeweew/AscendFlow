@@ -1,6 +1,7 @@
 # 局部流水线的同步契约
 
-`Ref` 保存 storage root、以字节为单位的 offset/stride/modulus、dtype/layout 和末块
+`Ref` 保存 storage root、以字节为单位的 offset/stride、常量整数 divisor/modulus、
+独立核坐标、dtype/layout 和末块
 范围。Subview/recast 不产生新 allocation；布局转换只允许在具有明确效果的 recipe
 中发生。分析采用指令的完整 native footprint，不把逻辑有效 shape 当作访存许可。
 
@@ -13,13 +14,16 @@ Vector in-place shifted overlap 在单指令内部不合法时直接拒绝，同
 ## 从任务到完成图
 
 每个原生 task 有 start/end；实际效果默认在 recipe 的可信 end 退休。SSA use-def
-不建立 end→start。对 dav-2201，当前采用的隐式完成顺序只有 S 和 M；V、MTE 和
-FIX 的发射顺序保持为弱边。相同流水存在真实冲突时用该 pipe 的 barrier。
+不建立 end→start。S 同步读取有隐式完成保证；M 不能无条件采用该保证。
+经 CATLASS AtlasA2 源码审查与设备反例，少于10个输出 fractal 的短 MAD 在
+相同 C 的连续累加前需要真实 M 完成路径。当前从物理依赖插入 `PIPE_M`，
+不同 C 槽的首次 clear 不因此被串行化；大 MAD 保留既有隐式顺序契约。
+V、MTE 和 FIX 的发射顺序保持为弱边。
 
 Set 的发射与生效也是两个点：Set 在生效前需完成该 source pipe 的前序 native
 工作，但它不阻止后续 source 指令在它生效前开始。Wait 消费匹配通知并门控
 destination pipe 的后续工作。只有真实 completion 路径能满足物理依赖。
-Scalar Wait 会影响全核 dispatch；目前不接受需要此机制的 stream 计划。
+Scalar Wait 会影响全核 dispatch；完成图与交错检查均检查其门控范围。
 Fixpipe 的唯一 invariant S 初始化使用一个真实 S→FIX handshake。
 
 这是设备验证中修正的关键前提：曾把 source Set 当作 source fence，导致删除
@@ -78,6 +82,9 @@ buffer ring 和 event ring 是不同资源。分配前采用逻辑 channel，删
 分配失败诊断是当前方案的失败，不宣称硬件上不存在别的合法方案。
 
 release 只对有下一消费者的代次产生 Set，Wait 只在旧代确实存在时激活。
+周期 producer 的 bank ID 按实际通知序号 `(g-lower)/stride` 轮换，而不是直接
+用稀疏 stream generation modulo 环宽。静态非规则义务分解成精确的区间并集，
+不会在空洞中创造 Set/Wait。
 因此 startup 无 seed，所有通知都有且仅有一次消费，epilogue 无剩余 credit。
 N=0 无 stream 通知；N=1/小于环宽时只产生实际 ready。
 最终 verifier 从实际 SyncOp 位置重建配对、完成闭包和每个真实 ID 的消费路径。

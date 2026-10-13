@@ -5,7 +5,7 @@ from pathlib import Path
 from .codegen import emit_asc
 from .examples import cube_pipeline, scalar_pipeline, vector_pipeline
 from .ir import dump, parse
-from .kernels import batched_matmul_nt, rms_norm, rope, softmax, swiglu
+from .kernels import batched_matmul_nt, gemm_nt, rms_norm, rope, softmax, swiglu
 from .sync import autosync, explain_plan, verify_plan
 from .toolchain import offline_compile
 
@@ -24,6 +24,7 @@ def main():
             "softmax",
             "swiglu",
             "batched-matmul",
+            "gemm",
             "ir",
         ],
     )
@@ -38,6 +39,15 @@ def main():
     parser.add_argument("--n", type=int, default=64)
     parser.add_argument("--k", type=int, default=256)
     parser.add_argument("--k-block", type=int, default=64)
+    parser.add_argument("--tile-m", type=int, default=64)
+    parser.add_argument("--tile-n", type=int, default=64)
+    parser.add_argument("--l1-k", type=int, default=128)
+    parser.add_argument("--l0-k", type=int, default=64)
+    parser.add_argument("--l1-slots", type=int, default=2)
+    parser.add_argument("--l0-slots", type=int, default=2)
+    parser.add_argument("--grid-m", type=int)
+    parser.add_argument("--c-slots", type=int, default=1)
+    parser.add_argument("--cache-b", action="store_true")
     parser.add_argument("--blocks", type=int, default=1, help="independent physical cores")
     parser.add_argument(
         "--tail", type=int, default=0, help="final Vector tile element count, multiple of 8"
@@ -57,6 +67,21 @@ def main():
     elif args.example == "batched-matmul":
         module = batched_matmul_nt(
             args.batch, args.m, args.n, args.k, k_block=args.k_block, slots=args.slots
+        )
+    elif args.example == "gemm":
+        module = gemm_nt(
+            args.m,
+            args.n,
+            args.k,
+            tile_m=args.tile_m,
+            tile_n=args.tile_n,
+            l1_k=args.l1_k,
+            l0_k=args.l0_k,
+            l1_slots=args.l1_slots,
+            l0_slots=args.l0_slots,
+            grid_m=args.grid_m,
+            c_slots=args.c_slots,
+            cache_b=args.cache_b,
         )
     elif args.example in {"rms-norm", "rope", "softmax", "swiglu"}:
         factory = {"rms-norm": rms_norm, "rope": rope, "softmax": softmax, "swiglu": swiglu}[

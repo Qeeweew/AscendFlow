@@ -95,11 +95,14 @@ class ViewOp(IRDLOperation):
     offset = attr_def(IntAttr)
     stride = attr_def(IntAttr)
     modulus = attr_def(IntAttr)
+    divisor = opt_attr_def(IntAttr)
     nbytes = attr_def(IntAttr)
     tail_nbytes = attr_def(IntAttr)
     rows = opt_attr_def(IntAttr)
     row_stride = opt_attr_def(IntAttr)
     core_stride = opt_attr_def(IntAttr)
+    core_divisor = opt_attr_def(IntAttr)
+    core_modulus = opt_attr_def(IntAttr)
     ref = result_def(RefType)
 
 
@@ -121,6 +124,8 @@ class TaskOp(IRDLOperation):
     lower = opt_attr_def(IntAttr)
     upper = opt_attr_def(IntAttr)
     issue_order = opt_attr_def(IntAttr)
+    period = opt_attr_def(IntAttr)
+    phase = opt_attr_def(IntAttr)
     params = attr_def(ArrayAttr[IntAttr])
     scalar = attr_def(FloatAttr)
     task = result_def(TaskType)
@@ -149,6 +154,7 @@ class ChannelOp(IRDLOperation):
     distance = attr_def(IntAttr)
     lower = attr_def(IntAttr)
     upper = attr_def(IntAttr)
+    stride = opt_attr_def(IntAttr)
     width = attr_def(IntAttr)
     base = attr_def(IntAttr)
     reason = attr_def(StringAttr)
@@ -171,6 +177,7 @@ class SyncOp(IRDLOperation):
     lower = attr_def(IntAttr)
     upper = attr_def(IntAttr)
     distance = attr_def(IntAttr)
+    stride = opt_attr_def(IntAttr)
     traits = traits_def(AsyncEffects())
 
 

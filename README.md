@@ -4,7 +4,9 @@
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
 当前可编译运行固定 shape 的 RMSNorm、rotate-half RoPE、稳定 Softmax、SwiGLU
-和带 K 块累加的矩形 batched NT matmul。所有算子展开为同一个物理 IR，并经过
+和带 K 块累加的矩形 batched NT matmul、普通/连续 NT GEMM。GEMM 支持二维
+输出 grid、独立 L1/L0 K 分块、L0C 多槽及显式 B 驻留政策。所有算子展开为
+同一个物理 IR，并经过
 局部 AutoSync、最终 verifier 和 ASC 后端。独立核 grid、Scalar 捕获、strided
 访问和多级 buffer 复用均由共享模型检查。
 `Kernel` builder 明确表达原生计算、搬运、物理布局、子视图、slot 和固定 stage。
@@ -71,13 +73,13 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 | 能力 | 实际支持 |
 |---|---|
 | 执行域 | AIV 或 AIC 的独立核 grid；检查 GM 写入/读取的跨 owner 不重叠 |
-| 控制 | 静态有限单 stream、连续 task 激活区间、once cache；固定 stage 的填排；零次执行 |
+| 控制 | 静态有限单 stream、连续/周期 task 激活、once cache；固定 stage 的填排；零次执行 |
 | 存储 | UB/L1/L0A/L0B/L0C 容量和对齐；GM 输入契约；嵌套子视图和跨 dtype 字节别名 |
-| 代次 | 显式线性或 modulo 地址；多缓冲；完整 RAW/WAR/WAW 和多 reader |
+| 代次 | 常量整数 divisor/modulo 地址与二维核坐标；多缓冲；完整 RAW/WAR/WAW 和多 reader |
 | Vector | f32 Add/Sub/Mul/Div/Exp/Rsqrt、标量和逐行计算；静态末块，DMA 长度为 32 字节倍数 |
 | 归约 | 64 元素 Sum/Max partial、每行合并、Sqrt/Div 和精确统计量 footprint |
 | Scalar | f32 UB word 读取，显式 SSA 值、同步读取和发射时捕获；支持 Scalar Wait 的全核 dispatch 门控 |
-| Cube | 完整 f16 矩形 MAD，f32 clear/跨 K 块累加，最终 NZ→ND Fixpipe；受实际 bank 容量约束 |
+| Cube | f16 矩形 MAD、逐输出 f32 clear/跨 K 累加、NZ→ND Fixpipe；短 MAD 的实际 M 完成约束 |
 | 搬运 | GM→UB、UB→GM、GM→L1、原生 GM ND→L1 NZ、完整 tile 的 L1→L0A/B |
 | 同步 | 本地二值事件、同流水必要 barrier；每有向 bank 八 ID；配对和复用验证 |
 | 保护 | executing ops 的 xDSL effects 防止普通 DCE/CSE 删除异步工作 |
@@ -85,9 +87,10 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 不支持的动态 task count、数据相关分支/带洞激活、间接 gather/scatter、任意 native extern、
 跨 AIC/AIV 交接、跨核 ownership、全局 phase 和通信会被拒绝。
 没有直接 L0C→UB 路径、事件溢出的 mutex fallback，或静默缩小 tile/扩大 buffer。
-普通大矩阵的多级 M/N 分块、融合 FFN、完整 attention、间接 routing 和动态 grouped
-matmul 尚未实现。batched NT matmul 的每个矩阵由一个 AIC 执行，不能把它当作
-任意规模的高性能 GEMM。算子 shape、数值和存储契约见 [算子入口](docs/operators.md)。
+融合 FFN、完整 attention、间接 routing 和动态 grouped matmul 尚未实现。GEMM
+当前要求选定 tile 整除静态 M/N/K，输入 f16、输出 f32；未支持一般尾块或 BF16。
+算子契约见 [算子入口](docs/operators.md)，分层/连续 GEMM 与设备反例见
+[GEMM 实现和验证](docs/hierarchical-gemm.md)。
 
 同步生成使用有限图提案和最终重检；有界交错检查独立探索 task 开始、退休、Set
 发射、生效和 Wait 消费。两者共享受审查的 native effect 表，不能当作独立硬件
@@ -107,12 +110,13 @@ matmul 尚未实现。batched NT matmul 的每个矩阵由一个 AIC 执行，�
 .venv/bin/xdsl-npu softmax --rows 256 --columns 1024 --blocks 8 --output runs/operators/softmax --compile --shared
 .venv/bin/xdsl-npu swiglu --rows 256 --columns 1024 --blocks 8 --output runs/operators/swiglu --compile --shared
 .venv/bin/xdsl-npu batched-matmul --batch 8 --m 64 --n 64 --k 256 --k-block 64 --output runs/operators/matmul --compile --shared
+.venv/bin/xdsl-npu gemm --m 512 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/gemm/persistent-512-1024-768 --compile --shared
 
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/operators/matmul --physical 1
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reference.py runs/operators/rms --physical 1
 ```
 
 `run_device.py` 对上述任一目录执行独立数值 oracle，并保存数据、源码和产物 hash。
-`run_reference.py` 直接执行安装的 ACLNN RMSNorm/Softmax，作为独立比较基线。
+`run_reference.py` 直接执行安装的 ACLNN RMSNorm/Softmax/Matmul，作为独立比较基线。
 [算子验证记录](docs/validation-operators.md) 区分设备正确性、ACL stream 间隔和
 msprof 内核时间，记录当前性能证据及其限制。

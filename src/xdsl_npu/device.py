@@ -212,7 +212,7 @@ def run_example(
     health = health_snapshot(physical, output)
     tolerance = (0, 0)
     shape = [p.count, p.tasks[0].refs[0].nbytes // 4] if p.core == "aiv" else [p.count, 16, 16, 16]
-    if p.name in {"rms_norm", "rope", "softmax", "swiglu", "batched_matmul_nt"}:
+    if p.name in {"rms_norm", "rope", "softmax", "swiglu", "batched_matmul_nt", "gemm_nt"}:
         from .oracles import operator_inputs
 
         contents, expected, tolerance, shape = operator_inputs(p, data_case=data_case)
