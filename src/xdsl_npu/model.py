@@ -313,6 +313,76 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "Scalar load requires one f32 UB word",
         )
         return "S", ("R",)
+    if native == "vector_copy":
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous for r in refs)
+            and lengths[0] == lengths[1] > 0
+            and lengths[0] % 4 == 0
+            and not params,
+            "bitwise Vector copy needs equal contiguous f32 UB footprints",
+        )
+        return "V", ("R", "W")
+    if native in {"mul_columns64", "fma_columns64"}:
+        require(len(params) == 1, "column operation needs its physical row count")
+        rows = params[0]
+        require(
+            1 <= rows <= 255
+            and len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and lengths == (rows * 256, 256, rows * 256),
+            "column operation requires complete contiguous f32 rows of 64 elements",
+        )
+        return "V", ("R", "R", "RW" if native == "fma_columns64" else "W")
+    if native == "reduce_rows64":
+        require(len(params) == 1, "packed row reduction needs its physical row count")
+        rows = params[0]
+        require(
+            1 <= rows <= 255
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and lengths == (rows * 256, rows * 4),
+            "packed reduction requires f32 rows of 64 and one contiguous result per row",
+        )
+        return "V", ("R", "W")
+    if native == "brcb8":
+        require(len(params) == 1, "BRCB needs the source word count")
+        rows = params[0]
+        require(
+            8 <= rows <= 255 * 8
+            and rows % 8 == 0
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and lengths == (rows * 4, rows * 32),
+            "BRCB replicates each of a multiple of eight f32 words to one 32-byte block",
+        )
+        return "V", ("R", "W")
+    if native == "broadcast_rows64":
+        require(len(params) == 1, "row broadcast needs its physical row count")
+        rows = params[0]
+        require(
+            1 <= rows <= 255
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and lengths == (rows * 32, rows * 256),
+            "row broadcast copies each 32-byte block to a complete f32 row of 64",
+        )
+        return "V", ("R", "W")
     if native in {"mul_rows", "sub_rows", "add_rows", "div_rows"}:
         require(len(params) == 2, "row binary recipe needs (rows, columns)")
         rows, cols = params

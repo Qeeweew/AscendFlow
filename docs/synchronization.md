@@ -126,3 +126,9 @@ epoch、两份 AIV GM read retirement、mode-2 counter 和尾部 credit drain �
 动态激活仍需要显式 task 时钟；不能把本地二值事件或反向通知 ack 直接推广到
 动态 ownership、不同 participants 或跨组通信。
 后续原生 recipe 必须先物化搬运、布局和 scratch，再进入同一效果/同步/验证机制。
+
+静态 GDN 将 FP32 carry 与 snapshot 环分开：carry 的最后 reader 是 Vector
+bitwise snapshot-copy，snapshot 槽的最后 reader 是 MTE3 output DMA。
+下一轮 carry 写不等待整个 snapshot 输出；只有 snapshot 槽复用才需 MTE3→V
+release。最小反例、同步前后 IR、独立交错检查与设备结果见
+[recurrent-gdn.md](recurrent-gdn.md)。

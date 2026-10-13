@@ -48,7 +48,7 @@ Fixpipe wrapper 不设置 ND_PARA，产品在明确的一次初始化契约中�
 采用 M completion 的问题；最终生成器从真实 C RAW/WAW 推导局部 M 完成，
 保留其他 C 槽的交错。具体数值反例和修正产物见 `hierarchical-gemm.md`。
 
-已有设计建议按能力逐步验证。动态 segmented task、GDN state ownership、MoE
+已有设计建议按能力逐步验证。动态 segmented task、动态 GDN state ownership、MoE
 global phase、communication completion 都尚未实现；其审计结论
 只用于检验接口和拒绝边界，没有登记为空接口或宣称已支持。
 
@@ -73,3 +73,18 @@ global phase、communication completion 都尚未实现；其审计结论
 mode2 ready 的 FIX 完成/GM 可见性和双 AIV 返回的参与者契约，在上述上游算法
 和安装接口基础上经设备样本验证。模型与交错检查仍共享这些可信机器前提，
 不能反过来把图验证或有限枚举当成硬件契约的独立证明。
+
+## 静态 GDN 的指令边界
+
+本阶段 ops-transformer 实际 HEAD 为 `4bbfb3b2bccceb2a1b80828d04eee915169a2b2e`，
+工作树干净，未 pull。`recurrent_gated_delta_rule_arch22.h` 的 carry、snapshot 与
+MulAddDst 是本阶段的算法输入；动态接受 token/state ID 没有被替换成静态能力。
+安装的 `asc/impl/adv_api/detail/reduce/reduce_sum/reduce_sum_v220_impl.h`
+对 R64 使用 WholeReduceSum(vcadd)，避免套用大 R 的 folding 算法。
+`kernel_operator_vec_binary_impl.h` 的 MulAddDst 与
+`npu_arch_2201/vector_compute_impl/asc_fma_impl.h` 均生成 vmla。
+`broadcast_v220_impl.h` 的 BRCB→Copy 保持为两个 task；ASC `asc_brcb` 与
+`asc_copy` 直接对应 vbrcb 与 vcopy，其 RAW/barrier 和物理 scratch 已显式建模。
+f32 bitwise snapshot 使用 vcopy，保留源位模式，没有以加0代替复制。
+当前只实现静态 f32、R64 的递推子集，具体接口、拒绝范围与设备证据见
+[recurrent-gdn.md](recurrent-gdn.md)。

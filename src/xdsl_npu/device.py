@@ -230,6 +230,11 @@ def run_example(
             not reference and data_case == "standard", "mixed oracle requires its generated kernel"
         )
         contents, expected, tolerance, shape = mixed_inputs(plan)
+    elif p.name == "recurrent_gdn":
+        from .recurrent_oracle import recurrent_inputs
+
+        require(not reference and data_case == "standard", "GDN runner requires standard inputs")
+        contents, expected, tolerance, shape = recurrent_inputs(p)
     elif p.name in {"rms_norm", "rope", "softmax", "swiglu", "batched_matmul_nt", "gemm_nt"}:
         from .oracles import operator_inputs
 
@@ -246,17 +251,34 @@ def run_example(
         for _ in range(warmup):
             launch(runtime.stream, *pointers)
         runtime.synchronize()
-        raw = runtime.read(pointers[-1], len(expected) * 4)
-        actual = struct.unpack(f"<{len(expected)}f", raw)
-        (output / "device-output.bin").write_bytes(raw)
-        max_error = max((abs(a - b) for a, b in zip(actual, expected)), default=0.0)
-        require(
-            all(
-                abs(a - b) <= tolerance[1] + tolerance[0] * abs(b) for a, b in zip(actual, expected)
-            ),
-            f"device numerical mismatch; max_abs_error={max_error}, "
-            f"first actual={actual[:8]}, expected={expected[:8]}",
-        )
+        if isinstance(expected, dict):
+            parameters = [s for s in p.storages if s.external]
+            expected_outputs = {
+                name: (
+                    pointers[next(i for i, s in enumerate(parameters) if s.name == name)],
+                    values,
+                )
+                for name, values in expected.items()
+            }
+        else:
+            expected_outputs = {"output": (pointers[-1], expected)}
+        checked_outputs = {}
+        for name, (ptr, values) in expected_outputs.items():
+            raw = runtime.read(ptr, len(values) * 4)
+            actual = struct.unpack(f"<{len(values)}f", raw)
+            filename = "device-output.bin" if name == "output" else f"device-{name}.bin"
+            (output / filename).write_bytes(raw)
+            error = max((abs(a - b) for a, b in zip(actual, values)), default=0.0)
+            require(
+                all(
+                    abs(a - b) <= tolerance[1] + tolerance[0] * abs(b)
+                    for a, b in zip(actual, values)
+                ),
+                f"device numerical mismatch in {name}; max_abs_error={error}, "
+                f"first actual={actual[:8]}, expected={values[:8]}",
+            )
+            checked_outputs[name] = {"elements": len(values), "max_abs_error": error}
+        max_error = max(result["max_abs_error"] for result in checked_outputs.values())
         start, stop = runtime.event(), runtime.event()
         runtime.record(start)
         for _ in range(repeats):
@@ -279,8 +301,9 @@ def run_example(
             "correctness": "compared with the independent FP32 CPU oracle",
             "rtol": tolerance[0],
             "atol": tolerance[1],
-            "elements": len(expected),
+            "elements": sum(result["elements"] for result in checked_outputs.values()),
             "max_abs_error": max_error,
+            "outputs": checked_outputs,
             "warmup": warmup,
             "repeats": repeats,
             "stream_interval_us_per_launch": ms.value * 1000 / repeats,

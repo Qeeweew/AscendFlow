@@ -79,6 +79,24 @@ def native_line(task, count, core="0"):
     if task.native == "scalar_load":
         source = pointer(refs[0], core=core).replace("__ubuf__ float*", "__ubuf__ volatile float*")
         return f"npu_value_{task.uid} = *({source});"
+    if task.native in {"vector_copy", "brcb8", "broadcast_rows64"}:
+        bits = [value.replace("float*", "uint32_t*") for value in p]
+        if task.native == "vector_copy":
+            return f"asc_copy({bits[1]}, {bits[0]}, uint32_t({length(refs[0], 4)}));"
+        if task.native == "brcb8":
+            return f"asc_brcb({bits[1]}, {bits[0]}, 1, 8, uint8_t({task.params[0] // 8}));"
+        return (
+            "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
+            f"asc_copy({bits[1]}, {bits[0]}, uint8_t({task.params[0]}), 1, 0, 8, 1);"
+        )
+    if task.native in {"mul_columns64", "fma_columns64"}:
+        function = "asc_fma" if task.native == "fma_columns64" else "asc_mul"
+        return (
+            "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
+            f"{function}({p[2]}, {p[0]}, {p[1]}, uint8_t({task.params[0]}), 1, 1, 1, 8, 8, 0);"
+        )
+    if task.native == "reduce_rows64":
+        return f"asc_repeat_reduce_sum({p[1]}, {p[0]}, uint32_t({task.params[0] * 64}));"
     if task.native in {"scale_value", "sub_value"}:
         function = "asc_mul_scalar" if task.native == "scale_value" else "asc_add_scalar"
         value = f"npu_value_{task.scalar_source}"

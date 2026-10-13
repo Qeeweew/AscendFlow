@@ -6,6 +6,7 @@ from .codegen import emit_asc
 from .examples import cube_pipeline, mixed_pipeline, scalar_pipeline, vector_pipeline
 from .ir import dump, parse
 from .kernels import batched_matmul_nt, gemm_bias_silu, gemm_nt, rms_norm, rope, softmax, swiglu
+from .recurrent import recurrent_gdn
 from .sync import autosync, explain_plan, verify_plan
 from .toolchain import offline_compile
 
@@ -27,11 +28,17 @@ def main():
             "gemm",
             "gemm-bias-silu",
             "mixed",
+            "gdn",
             "ir",
         ],
     )
     parser.add_argument("--input", type=Path, help="physical unsynchronized xDSL for example=ir")
     parser.add_argument("--count", type=int, default=6)
+    parser.add_argument("--sequences", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=16)
+    parser.add_argument("--key-dim", type=int, default=64)
+    parser.add_argument("--value-dim", type=int, default=64)
+    parser.add_argument("--snapshot-slots", type=int, default=2)
     parser.add_argument("--slots", type=int, default=2)
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--columns", type=int, default=128)
@@ -78,6 +85,15 @@ def main():
         module = mixed_pipeline(args.count, args.slots, aiv1_delay=args.aiv1_delay)
     elif args.example == "scalar":
         module = scalar_pipeline(args.count, args.blocks)
+    elif args.example == "gdn":
+        module = recurrent_gdn(
+            args.sequences,
+            args.steps,
+            key_dim=args.key_dim,
+            value_dim=args.value_dim,
+            slots=args.slots,
+            snapshot_slots=args.snapshot_slots,
+        )
     elif args.example == "batched-matmul":
         module = batched_matmul_nt(
             args.batch, args.m, args.n, args.k, k_block=args.k_block, slots=args.slots

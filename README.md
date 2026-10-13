@@ -4,7 +4,8 @@
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
 当前可编译运行固定 shape 的 RMSNorm、rotate-half RoPE、稳定 Softmax、SwiGLU
-和带 K 块累加的矩形 batched NT matmul、普通/连续 NT GEMM、混合核 GEMM+bias+SiLU。GEMM 支持二维
+和带 K 块累加的矩形 batched NT matmul、普通/连续 NT GEMM、混合核 GEMM+bias+SiLU、
+静态 f32 GDN 递推。GEMM 支持二维
 输出 grid、独立 L1/L0 K 分块、L0C 多槽及显式 B 驻留政策。所有算子展开为
 同一个物理 IR，并经过
 局部/混合核 AutoSync、最终 verifier 和 ASC 后端。独立核 grid、Scalar 捕获、strided
@@ -78,6 +79,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 | 代次 | 常量整数 divisor/modulo 地址与二维核坐标；多缓冲；完整 RAW/WAR/WAW 和多 reader |
 | Vector | f32 Add/Sub/Mul/Div/Exp/Rsqrt、列 bias 广播、标量和逐行计算；静态末块，DMA 长度为 32 字节倍数 |
 | 归约 | 64 元素 Sum/Max partial、每行合并、Sqrt/Div 和精确统计量 footprint |
+| 状态 | 64-key 静态 GDN；独立 FP32 carry、snapshot 环及每 token 两份输出；原生 vmla、vcadd 与 bitwise vcopy |
 | Scalar | f32 UB word 读取，显式 SSA 值、同步读取和发射时捕获；支持 Scalar Wait 的全核 dispatch 门控 |
 | Cube | f16 矩形 MAD、逐输出 f32 clear/跨 K 累加、NZ→ND Fixpipe；短 MAD 的实际 M 完成约束 |
 | 搬运 | GM↔UB（含原生二维 DMA）、GM→L1、原生 GM ND→L1 NZ、完整 tile 的 L1→L0A/B |
@@ -93,6 +95,8 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 [GEMM 实现和验证](docs/hierarchical-gemm.md)。
 实际混合核协议、自动同步前后、设备证据和复现命令见
 [混合核 GM ownership](docs/mixed-ownership.md)。
+递推 carry、snapshot 的独立最后读取及当前 event packing 限制见
+[静态 GDN](docs/recurrent-gdn.md)。
 
 同步生成使用有限图提案和最终重检；有界交错检查独立探索 task 开始、退休、Set
 发射、生效和 Wait 消费。两者共享受审查的 native effect 表，不能当作独立硬件
@@ -115,6 +119,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 .venv/bin/xdsl-npu gemm --m 512 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/gemm/persistent-512-1024-768 --compile --shared
 .venv/bin/xdsl-npu mixed --count 17 --slots 2 --check-interleavings shared --output runs/mixed/17-epochs --shared
 .venv/bin/xdsl-npu gemm-bias-silu --m 768 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/mixed/768-1024-768 --shared
+.venv/bin/xdsl-npu gdn --sequences 32 --steps 16 --value-dim 64 --slots 2 --snapshot-slots 2 --output runs/gdn/32-16-64 --compile --shared
 
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/operators/matmul --physical 1
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reference.py runs/operators/rms --physical 1
