@@ -1,0 +1,52 @@
+// Independent expert reference: 0/1/2 fixed stages, two independent UB rings.
+// COUNT must be >=3, TILE must be a positive multiple of 8 f32 elements.
+#include "c_api/asc_simd.h"
+#include <cstdint>
+
+extern "C" __global__ __vector__ void vector_pipeline(__gm__ uint8_t* x, __gm__ uint8_t* y) {
+  asc_init();
+  asc_set_ctrl(asc_get_ctrl() | (uint64_t(1) << 48));
+  __ubuf__ uint8_t* input_slots = (__ubuf__ uint8_t*)0;
+  __ubuf__ uint8_t* output_slots = (__ubuf__ uint8_t*)@RING_BYTES@;
+  for (int64_t step = 0; step < @END@; ++step) {
+    if (step >= 0 && step < @COUNT@) {
+      const int64_t g = step;
+      if (g >= 2) { asc_sync_wait(PIPE_V, PIPE_MTE2, (g - 2) % 2); }
+      asc_copy_gm2ub((__ubuf__ float*)(input_slots + (@TILE_BYTES@ * (g % 2))),
+                    (__gm__ float*)(x + (@TILE_BYTES@ * g)), uint32_t(@TILE_BYTES@));
+      asc_sync_notify(PIPE_MTE2, PIPE_V, g % 2);
+    }
+    if (step >= 1 && step < @V_END@) {
+      const int64_t g = step - 1;
+      asc_sync_wait(PIPE_MTE2, PIPE_V, g % 2);
+      if (g >= 2) { asc_sync_wait(PIPE_MTE3, PIPE_V, (g - 2) % 2); }
+      asc_mul_scalar((__ubuf__ float*)(output_slots + (@TILE_BYTES@ * (g % 2))),
+                     (__ubuf__ float*)(input_slots + (@TILE_BYTES@ * (g % 2))),
+                     float(2.0), uint32_t(@TILE@));
+      // Input read retirement precedes output postprocessing.
+      if (g < @RELEASE_END@) { asc_sync_notify(PIPE_V, PIPE_MTE2, g % 2); }
+    }
+    if (step >= 1 && step < @V_END@) {
+      const int64_t g = step - 1;
+      // Notify does not gate later source-pipe tasks; this RAW needs a V barrier.
+      asc_sync_pipe(PIPE_V);
+      asc_add_scalar((__ubuf__ float*)(output_slots + (@TILE_BYTES@ * (g % 2))),
+                     (__ubuf__ float*)(output_slots + (@TILE_BYTES@ * (g % 2))),
+                     float(1.0), uint32_t(@TILE@));
+      asc_sync_notify(PIPE_V, PIPE_MTE3, g % 2);
+    }
+    if (step >= 2 && step < @END@) {
+      const int64_t g = step - 2;
+      asc_sync_wait(PIPE_V, PIPE_MTE3, g % 2);
+      asc_copy_ub2gm((__gm__ float*)(y + (@TILE_BYTES@ * g)),
+                    (__ubuf__ float*)(output_slots + (@TILE_BYTES@ * (g % 2))),
+                    uint32_t(@TILE_BYTES@));
+      if (g < @RELEASE_END@) { asc_sync_notify(PIPE_MTE3, PIPE_V, g % 2); }
+    }
+  }
+  asc_sync_pipe(PIPE_ALL);
+}
+
+extern "C" void launch_vector_pipeline(void* stream, void* arg_x, void* arg_y) {
+  vector_pipeline<<<1, nullptr, stream>>>((uint8_t*)arg_x, (uint8_t*)arg_y);
+}

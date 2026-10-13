@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xdsl-npu"
+version = "0.1.0"
+description = "Physical asynchronous NPU IR and automatic local synchronization for dav-2201"
+requires-python = ">=3.11"
+dependencies = ["xdsl==0.73.0"]
+
+[project.scripts]
+xdsl-npu = "xdsl_npu.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
