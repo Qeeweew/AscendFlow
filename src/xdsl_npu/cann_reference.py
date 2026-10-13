@@ -18,6 +18,7 @@ class OperatorReference:
         self.meta = ct.CDLL(str(CANN / "lib64/libnnopbase.so"), mode=ct.RTLD_GLOBAL)
         self.ops = ct.CDLL(str(CANN / "lib64/libopapi.so"), mode=ct.RTLD_GLOBAL)
         self.tensors = []
+        self.scalars = []
 
     def prepare(self, operator, arguments, types):
         self.operator = operator
@@ -76,6 +77,15 @@ class OperatorReference:
         )
         require(status == 0, f"{self.operator} failed: {status}; no retry")
 
+    def scalar(self, value):
+        create = self.meta.aclCreateScalar
+        create.argtypes, create.restype = [ct.c_void_p, ct.c_int], ct.c_void_p
+        data = ct.c_float(value)
+        scalar = create(ct.byref(data), 0)
+        require(scalar is not None, "aclCreateScalar failed")
+        self.scalars.append(scalar)
+        return scalar
+
     def close(self):
         destroy = self.meta.aclDestroyAclOpExecutor
         destroy.argtypes, destroy.restype = [ct.c_void_p], ct.c_int32
@@ -84,6 +94,10 @@ class OperatorReference:
         destroy_tensor.argtypes, destroy_tensor.restype = [ct.c_void_p], ct.c_int32
         for tensor in self.tensors:
             require(destroy_tensor(tensor) == 0, "ACL tensor destroy failed")
+        destroy_scalar = self.meta.aclDestroyScalar
+        destroy_scalar.argtypes, destroy_scalar.restype = [ct.c_void_p], ct.c_int32
+        for scalar in self.scalars:
+            require(destroy_scalar(scalar) == 0, "ACL scalar destroy failed")
 
 
 class RmsNormReference(OperatorReference):
@@ -139,15 +153,64 @@ class GemmReference(OperatorReference):
         )
 
 
+class GemmBiasSiluReference:
+    interface = "aclnnMatmul f16->f32; aclnnAdd broadcast f32 bias; aclnnSilu f32, three calls"
+
+    def __init__(self, runtime, a, bt, bias, y, m, n, reduction):
+        c = runtime.allocate_uninitialized(m * n * 4)
+        biased = runtime.allocate_uninitialized(m * n * 4)
+        self.calls = [GemmReference(runtime, a, bt, c, m, n, reduction)]
+        add = OperatorReference(runtime)
+        add.prepare(
+            "aclnnAdd",
+            [
+                add.tensor(c, (m, n)),
+                add.tensor(bias, (n,)),
+                add.scalar(1),
+                add.tensor(biased, (m, n)),
+            ],
+            [ct.c_void_p] * 4,
+        )
+        self.calls.append(add)
+        silu = OperatorReference(runtime)
+        silu.prepare(
+            "aclnnSilu", [silu.tensor(biased, (m, n)), silu.tensor(y, (m, n))], [ct.c_void_p] * 2
+        )
+        self.calls.append(silu)
+        self.workspace_size = ct.c_uint64(sum(op.workspace_size.value for op in self.calls))
+
+    def __call__(self):
+        for op in self.calls:
+            op()
+
+    def close(self):
+        for op in reversed(self.calls):
+            op.close()
+
+
 def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_case="standard"):
-    p = extract(plan)
+    from .ir import MixedOp
+
+    mixed = isinstance(plan.body.block.first_op, MixedOp)
+    if mixed:
+        from types import SimpleNamespace
+
+        p = SimpleNamespace(name=plan.body.block.first_op.sym_name.data)
+    else:
+        p = extract(plan)
     require(
-        p.name in {"rms_norm", "softmax", "gemm_nt"},
-        "reference adapter implements RMSNorm, Softmax and GEMM",
+        p.name in {"rms_norm", "softmax", "gemm_nt", "gemm_bias_silu"},
+        "reference adapter implements RMSNorm, Softmax, GEMM and GEMM+bias+SiLU",
     )
     require(repeats > 0 and warmup > 0, "correctness and timing require positive launch counts")
     health = health_snapshot(physical, output)
-    contents, expected, tolerance, shape = operator_inputs(p, data_case=data_case)
+    if mixed:
+        from .oracles import mixed_inputs
+
+        require(data_case == "standard", "mixed baseline requires standard inputs")
+        contents, expected, tolerance, shape = mixed_inputs(plan)
+    else:
+        contents, expected, tolerance, shape = operator_inputs(p, data_case=data_case)
     runtime = ACL()
     baseline = None
     try:
@@ -160,6 +223,13 @@ def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_
         elif p.name == "softmax":
             epsilon = None
             baseline = SoftmaxReference(runtime, *pointers, *shape)
+        elif p.name == "gemm_bias_silu":
+            epsilon = None
+            # The generated workspace is not part of the ACLNN algorithm.
+            # Keep its bytes/hash in the common argument manifest for comparison.
+            baseline = GemmBiasSiluReference(
+                runtime, pointers[0], pointers[1], pointers[3], pointers[4], *shape
+            )
         else:
             epsilon = None
             baseline = GemmReference(runtime, *pointers, *shape)
@@ -195,7 +265,9 @@ def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_
             "shape": shape,
             "data_case": data_case,
             "argument_sha256": [hashlib.sha256(data).hexdigest() for data in contents],
-            "dtype": "f16 operands/f32 output" if p.name == "gemm_nt" else "f32",
+            "dtype": "f16 operands/f32 output"
+            if p.name in {"gemm_nt", "gemm_bias_silu"}
+            else "f32",
             "epsilon": epsilon,
             "warmup": warmup,
             "repeats": repeats,

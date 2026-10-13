@@ -72,8 +72,60 @@ class KernelOp(IRDLOperation):
     core = attr_def(StringAttr)
     disjoint_external = attr_def(IntAttr)
     blocks = opt_attr_def(IntAttr)
+    epoch_divisor = opt_attr_def(IntAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
+
+
+@irdl_op_definition
+class MixedOp(IRDLOperation):
+    """One dav-2201 group: one AIC and two participating, private-UB AIVs."""
+
+    name = "npu.mixed"
+    sym_name = attr_def(StringAttr)
+    target = attr_def(StringAttr)
+    blocks = attr_def(IntAttr)
+    disjoint_external = attr_def(IntAttr)
+    body = region_def("single_block")
+    traits = traits_def(RecursiveMemoryEffect())
+
+
+@irdl_op_definition
+class CrossChannelOp(IRDLOperation):
+    """Mode-2 counting notification, with explicit collective participants."""
+
+    name = "npu.cross_channel"
+    sym_name = attr_def(StringAttr)
+    sources = attr_def(ArrayAttr[StringAttr])
+    destinations = attr_def(ArrayAttr[StringAttr])
+    flag_id = attr_def(IntAttr)
+    count = attr_def(IntAttr)
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
+class CrossSyncOp(IRDLOperation):
+    name = "npu.cross_sync"
+    generation = operand_def(IndexType)
+    action = attr_def(StringAttr)
+    channel = attr_def(StringAttr)
+    lower = attr_def(IntAttr)
+    upper = attr_def(IntAttr)
+    stride = attr_def(IntAttr)
+    epoch_divisor = attr_def(IntAttr)
+    epoch_offset = attr_def(IntAttr)
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
+class CrossDrainOp(IRDLOperation):
+    """Consume the remaining returns after dispatching this actor's stream."""
+
+    name = "npu.cross_drain"
+    channel = attr_def(StringAttr)
+    lower = attr_def(IntAttr)
+    upper = attr_def(IntAttr)
+    traits = traits_def(AsyncEffects())
 
 
 @irdl_op_definition
@@ -189,7 +241,21 @@ class EndOp(IRDLOperation):
 
 NPU = Dialect(
     "npu",
-    [KernelOp, BufferOp, ViewOp, StreamOp, TaskOp, FixConfigOp, ChannelOp, SyncOp, EndOp],
+    [
+        KernelOp,
+        MixedOp,
+        BufferOp,
+        ViewOp,
+        StreamOp,
+        TaskOp,
+        FixConfigOp,
+        ChannelOp,
+        SyncOp,
+        CrossChannelOp,
+        CrossSyncOp,
+        CrossDrainOp,
+        EndOp,
+    ],
     [RefType, TaskType],
 )
 

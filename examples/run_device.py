@@ -19,12 +19,10 @@ parser.add_argument(
 )
 args = parser.parse_args()
 plan = parse((args.directory / "after.xdsl").read_text())
-from xdsl_npu.model import extract
-
-program = extract(plan)
+program_name = plan.body.block.first_op.sym_name.data
 result = run_example(
     plan,
-    args.directory / f"{program.name}.so",
+    args.directory / f"{program_name}.so",
     args.record_output or args.directory,
     physical=args.physical,
     repeats=args.repeats,

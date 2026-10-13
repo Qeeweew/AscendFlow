@@ -490,3 +490,139 @@ def gemm_nt(
         phase=k_slices - 1,
     )
     return k.finish()
+
+
+def gemm_bias_silu(
+    m,
+    n,
+    reduction,
+    *,
+    tile_m=128,
+    tile_n=128,
+    l1_k=128,
+    l0_k=64,
+    l1_slots=2,
+    l0_slots=2,
+    grid_m=None,
+    gm_slots=2,
+    ub_slots=2,
+    c_slots=2,
+    cache_b=False,
+):
+    """Mixed Y = SiLU(A @ Bt.T + bias), f16 inputs, explicit f32 boundaries.
+
+    One AIC publishes a compact tile to its bounded GM ring. Its two AIVs
+    own separate row halves, import into private UB, and release GM immediately
+    after MTE2 retirement. The GM workspace is an explicit algorithm operand.
+    """
+    from xdsl.dialects.builtin import IntAttr, StringAttr
+
+    from .ir import BufferOp, ViewOp
+    from .mixed import compose
+    from .sync import parts
+
+    require(
+        isinstance(gm_slots, int)
+        and 1 <= gm_slots <= 8
+        and isinstance(ub_slots, int)
+        and 1 <= ub_slots <= 8,
+        "mixed GM and UB rings must have static slot counts in [1,8]",
+    )
+    cube = gemm_nt(
+        m,
+        n,
+        reduction,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        l1_k=l1_k,
+        l0_k=l0_k,
+        l1_slots=l1_slots,
+        l0_slots=l0_slots,
+        grid_m=grid_m,
+        c_slots=c_slots,
+        cache_b=cache_b,
+    )
+    rows, grid_n = m // tile_m, n // tile_n
+    grid_m = rows if grid_m is None else grid_m
+    blocks, epochs = grid_m * grid_n, rows // grid_m
+    cb, half = tile_m * tile_n * 4, tile_m // 2
+    half_bytes = half * tile_n * 4
+    kernel, stream = parts(cube)
+    scratch = next(
+        o for o in kernel.body.block.ops if isinstance(o, BufferOp) and o.sym_name.data == "c"
+    )
+    scratch.attributes["sym_name"] = StringAttr("scratch")
+    scratch.attributes["nbytes"] = IntAttr(blocks * gm_slots * cb)
+    scratch.ref.name_hint = "scratch"
+    parent = next(
+        o for o in stream.body.block.ops if isinstance(o, ViewOp) and o.source is scratch.ref
+    )
+    parent.attributes.update(
+        {
+            "nbytes": IntAttr(tile_n * 4),
+            "row_stride": IntAttr(tile_n * 4),
+            "stride": IntAttr(cb),
+            "modulus": IntAttr(gm_slots),
+            "core_stride": IntAttr(gm_slots * cb),
+            "core_divisor": IntAttr(1),
+        }
+    )
+    child = next(
+        o for o in stream.body.block.ops if isinstance(o, ViewOp) and o.source is parent.ref
+    )
+    child.attributes.update({"row_stride": IntAttr(tile_n * 4), "core_stride": IntAttr(0)})
+    vectors = []
+    for subblock in range(2):
+        v = Kernel("epilogue", core="aiv", blocks=blocks, disjoint_external=True)
+        gm = v.buffer("scratch", "GM", blocks * gm_slots * cb, external=True)
+        bias = v.buffer("bias", "GM", n * 4, external=True, initialized=True)
+        y = v.buffer("y", "GM", m * n * 4, external=True)
+        data = v.buffer("data", "UB", ub_slots * half_bytes)
+        denom = v.buffer("denom", "UB", ub_slots * half_bytes)
+        b = v.buffer("bias_ub", "UB", tile_n * 4)
+        v.loop(epochs)
+        import_ref = v.view(
+            gm,
+            half_bytes,
+            offset=subblock * half_bytes,
+            stride=cb,
+            slots=gm_slots,
+            core_stride=gm_slots * cb,
+        )
+        bias_ref = v.view(bias, tile_n * 4, core_stride=tile_n * 4, core_modulus=grid_n)
+        db = v.view(data, half_bytes, stride=half_bytes, slots=ub_slots)
+        denominator = v.view(denom, half_bytes, stride=half_bytes, slots=ub_slots)
+        bu = v.view(b, tile_n * 4)
+        out_rows = v.view(
+            y,
+            n * 4,
+            rows=half,
+            row_stride=n * 4,
+            offset=subblock * half * n * 4,
+            stride=grid_m * tile_m * n * 4 if epochs > 1 else 0,
+            core_stride=tile_m * n * 4,
+            core_divisor=grid_n,
+        )
+        out = v.view(
+            out_rows,
+            tile_n * 4,
+            rows=half,
+            row_stride=n * 4,
+            core_stride=tile_n * 4,
+            core_modulus=grid_n,
+        )
+        db_rows = v.view(db, tile_n * 4, rows=half, row_stride=tile_n * 4)
+        # Previous compute/store work is dispatched before the next globally
+        # blocking ready Wait. Semantic task order still begins with imports.
+        v.task("load_bias", "copy", bias_ref, bu, active=(0, 1), issue_order=40)
+        v.task("import_tile", "copy", import_ref, db, issue_order=50)
+        v.task("bias_add", "add_bias", db, bu, db, params=(half, tile_n), stage=1, issue_order=10)
+        v.task("negate", "muls", db, denominator, scalar=-1, stage=1, issue_order=11)
+        v.task("exponential", "exp", denominator, denominator, stage=1, issue_order=12)
+        v.task("plus_one", "adds", denominator, denominator, scalar=1, stage=1, issue_order=13)
+        v.task("silu", "div", db, denominator, db, stage=1, issue_order=14)
+        v.task("store", "copy_rows", db_rows, out, stage=2, issue_order=0)
+        vectors.append(v.finish())
+    return compose(
+        "gemm_bias_silu", cube, *vectors, cube_epoch=reduction // l0_k, disjoint_external=True
+    )

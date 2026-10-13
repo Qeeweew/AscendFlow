@@ -72,3 +72,51 @@ def cube_pipeline(count=5, slots=2, *, stages=(0, 1, 2, 3)):
     k.mad("mad", aa, bb, cc, stage=stages[2])
     k.fixpipe("export", cc, cr, stage=stages[3])
     return k.finish()
+
+
+def mixed_pipeline(count=3, slots=2, *, aiv1_delay=0):
+    """Minimal real FIX -> GM ring -> two AIVs, including zero/reuse boundaries."""
+    from xdsl.dialects.builtin import IntAttr, StringAttr
+
+    from .ir import BufferOp, ViewOp
+    from .mixed import compose
+    from .model import require
+    from .sync import parts
+
+    require(isinstance(aiv1_delay, int) and 0 <= aiv1_delay <= 64, "AIV delay must be in [0,64]")
+
+    cube = cube_pipeline(count, slots)
+    kernel, stream = parts(cube)
+    root = next(
+        o for o in kernel.body.block.ops if isinstance(o, BufferOp) and o.sym_name.data == "c"
+    )
+    root.attributes.update({"sym_name": StringAttr("scratch"), "nbytes": IntAttr(slots * 1024)})
+    view = next(o for o in stream.body.block.ops if isinstance(o, ViewOp) and o.source is root.ref)
+    view.attributes["modulus"] = IntAttr(slots)
+    vectors = []
+    for subblock in range(2):
+        v = Kernel("consumer", disjoint_external=True)
+        gm = v.buffer("scratch", "GM", slots * 1024, external=True)
+        y = v.buffer("y", "GM", count * 1024, external=True)
+        ub = v.buffer("tile", "UB", slots * 512)
+        delay = v.buffer("delay_word", "UB", 32) if subblock == 1 and aiv1_delay else None
+        v.loop(count)
+        src = v.view(gm, 512, offset=subblock * 512, stride=1024, slots=slots)
+        local = v.view(ub, 512, stride=512, slots=slots)
+        dst = v.view(y, 512, offset=subblock * 512, stride=1024)
+        if delay is not None:
+            word = v.view(delay, 4)
+            v.task("delay_init", "stat_fill", word, params=(1,), issue_order=30)
+            for i in range(aiv1_delay):
+                v.task(
+                    f"delay_{i}", "stat_adds", word, word, params=(1,), scalar=1, issue_order=31 + i
+                )
+            # A real synchronous, volatile UB load gates subsequent dispatch.
+            # Its result is intentionally unused; the extra private work only
+            # stresses uneven collective arrival, without altering Y.
+            v.scalar_load("capture_delay", word, issue_order=31 + aiv1_delay)
+        v.task("import_tile", "copy", src, local, issue_order=200)
+        v.task("scale", "muls", local, local, scalar=2, stage=1, issue_order=10)
+        v.task("store", "copy", local, dst, stage=2, issue_order=0)
+        vectors.append(v.finish())
+    return compose("mixed_pipeline", cube, *vectors, disjoint_external=True)

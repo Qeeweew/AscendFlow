@@ -194,7 +194,18 @@ def run_example(
     from .sync import verify_plan
 
     verify_plan(plan)
-    p = extract(plan)
+    from .ir import MixedOp
+
+    mixed = isinstance(plan.body.block.first_op, MixedOp)
+    if mixed:
+        from .mixed import extract_mixed
+
+        group = extract_mixed(plan)
+        from types import SimpleNamespace
+
+        p = SimpleNamespace(name=group.op.sym_name.data, core="mixed", count=group.epochs)
+    else:
+        p = extract(plan)
     manifest = json.loads(shared_library.with_suffix(".compile.json").read_text())
     require(
         hashlib.sha256(shared_library.read_bytes()).hexdigest() == manifest["shared_sha256"],
@@ -212,7 +223,14 @@ def run_example(
     health = health_snapshot(physical, output)
     tolerance = (0, 0)
     shape = [p.count, p.tasks[0].refs[0].nbytes // 4] if p.core == "aiv" else [p.count, 16, 16, 16]
-    if p.name in {"rms_norm", "rope", "softmax", "swiglu", "batched_matmul_nt", "gemm_nt"}:
+    if mixed:
+        from .oracles import mixed_inputs
+
+        require(
+            not reference and data_case == "standard", "mixed oracle requires its generated kernel"
+        )
+        contents, expected, tolerance, shape = mixed_inputs(plan)
+    elif p.name in {"rms_norm", "rope", "softmax", "swiglu", "batched_matmul_nt", "gemm_nt"}:
         from .oracles import operator_inputs
 
         contents, expected, tolerance, shape = operator_inputs(p, data_case=data_case)

@@ -59,6 +59,13 @@ def native_line(task, count, core="0"):
             # CATLASS AtlasA2 zN->zZ uses classic Load2D with ifTranspose=false.
             return f"asc_copy_l12l0a({p[1]}, {p[0]}, 0, 1, 1, 0);"
         return f"asc_copy_l12l0b({p[1]}, {p[0]}, 0, 1, 1, 0);"
+    if task.native == "copy_rows":
+        function = "asc_copy_gm2ub" if refs[0].storage.bank == "GM" else "asc_copy_ub2gm"
+        gaps = [(r.row_stride - r.nbytes) // 32 if r.rows > 1 else 0 for r in refs]
+        return (
+            f"{function}({p[1]}, {p[0]}, uint16_t({refs[0].rows}), "
+            f"uint16_t({refs[0].nbytes // 32}), uint16_t({gaps[0]}), uint16_t({gaps[1]}));"
+        )
     if task.native in {"muls", "adds"}:
         function = "asc_mul_scalar" if task.native == "muls" else "asc_add_scalar"
         return (
@@ -125,13 +132,14 @@ def native_line(task, count, core="0"):
             function = "asc_mul_scalar" if task.native == "stat_muls" else "asc_add_scalar"
             call = f"{function}({dst}, {src}, float({task.scalar!r}), uint32_t(1));"
         return f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ {call} }}"
-    if task.native == "mul_gamma":
+    if task.native in {"mul_gamma", "add_bias"}:
         rows, cols = task.params
         src = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4}")
         dst = pointer(refs[2], core=core, extra=f"npu_row * {cols * 4}")
         return (
             f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
-            f"asc_mul({dst}, {src}, {p[1]}, uint32_t({cols})); }}"
+            f"asc_{'mul' if task.native == 'mul_gamma' else 'add'}"
+            f"({dst}, {src}, {p[1]}, uint32_t({cols})); }}"
         )
     if task.native in {"stat_fill", "stat_div"}:
         rows = task.params[0]
@@ -178,37 +186,26 @@ def native_line(task, count, core="0"):
     raise AssertionError("unvalidated native recipe")
 
 
-def emit_asc(module, *, host_launcher=True):
-    verify_plan(module)
-    ex = execution(module)
-    p = ex.program
-    _, stream = parts(module)
+def _body_lines(p, ex, stream, *, cross=None, drains=()):
+    """Backend helper; callers must verify the entire enclosing program first."""
     tasks = {
         t.uid: t for _, t in sorted(enumerate(p.tasks), key=lambda x: (x[1].issue_order, x[0]))
     }
     # Read actual sync placements, then retain the compact physical step loop.
     before, after, pending, previous = {}, {}, [], None
-    from .ir import SyncOp
+    from .ir import CrossSyncOp, SyncOp
 
     for op in stream.body.block.ops:
         if isinstance(op, TaskOp):
             before[op.uid.data] = pending
             pending = []
             previous = op.uid.data
-        elif isinstance(op, SyncOp):
+        elif isinstance(op, (SyncOp, CrossSyncOp)):
             if op.action.data == "set":
                 after.setdefault(previous, []).append(op)
             else:
                 pending.append(op)
-    args = [s for s in p.storages if s.external]
-    signature = ", ".join(f"__gm__ uint8_t* {s.name}" for s in args)
-    kind = "__vector__" if p.core == "aiv" else "__cube__"
     lines = [
-        "// xdsl-npu v0.1: dav-2201, single physical core, fixed issue plan",
-        '#include "c_api/asc_simd.h"',
-        "#include <cstdint>",
-        "",
-        f'extern "C" __global__ {kind} void {p.name}({signature}) {{',
         "  asc_init();",
         "  asc_set_ctrl(asc_get_ctrl() | (uint64_t(1) << 48));",
     ]
@@ -231,7 +228,13 @@ def emit_asc(module, *, host_launcher=True):
 
     def sync_line(op):
         comment = ""
-        if op.action.data == "barrier":
+        if isinstance(op, CrossSyncOp):
+            ch = cross[op.channel.data]
+            pipe = current_task.pipe
+            function = "asc_sync_block_arrive" if op.action.data == "set" else "asc_sync_block_wait"
+            code = f"{function}(PIPE_{pipe}, {ch.flag_id});"
+            comment = f" // {ch.name}: epoch g/{op.epoch_divisor.data}{op.epoch_offset.data:+d}"
+        elif op.action.data == "barrier":
             code = f"asc_sync_pipe(PIPE_{op.pipe.data});"
         else:
             ch = ex.channels[op.channel.data]
@@ -260,6 +263,7 @@ def emit_asc(module, *, host_launcher=True):
             if task.native == "scalar_load":
                 lines.append(f"    float npu_value_{task.uid} = 0.0f;")
         for task in tasks.values():
+            current_task = task
             guard = f"step >= {task.lower + task.stage} && step < {task.upper + task.stage}"
             if task.period != 1:
                 guard += f" && (step - {task.stage}) % {task.period} == {task.phase}"
@@ -273,9 +277,40 @@ def emit_asc(module, *, host_launcher=True):
             lines.extend("      " + sync_line(op) for op in after.get(task.uid, []))
             lines.append("    }")
         lines.append("  }")
+    for drain in drains:
+        ch = cross[drain.channel.data]
+        lines += [
+            "  // Retire outstanding GM credits, including the final partial ring.",
+            f"  for (int64_t epoch = {drain.lower.data}; epoch < {drain.upper.data}; ++epoch) {{",
+            f"    asc_sync_block_wait(PIPE_S, {ch.flag_id}); // {ch.name}",
+            "  }",
+        ]
     lines += [
         "  // Required kernel lifetime boundary; no PIPE_ALL inside the task stream.",
         "  asc_sync_pipe(PIPE_ALL);",
+    ]
+    return lines
+
+
+def emit_asc(module, *, host_launcher=True):
+    from .ir import MixedOp
+
+    if isinstance(module.body.block.first_op, MixedOp):
+        return _emit_mixed(module, host_launcher=host_launcher)
+    verify_plan(module)
+    ex = execution(module)
+    p = ex.program
+    _, stream = parts(module)
+    args = [s for s in p.storages if s.external]
+    signature = ", ".join(f"__gm__ uint8_t* {s.name}" for s in args)
+    kind = "__vector__" if p.core == "aiv" else "__cube__"
+    lines = [
+        "// xdsl-npu v0.1: dav-2201, single physical core, fixed issue plan",
+        '#include "c_api/asc_simd.h"',
+        "#include <cstdint>",
+        "",
+        f'extern "C" __global__ {kind} void {p.name}({signature}) {{',
+        *_body_lines(p, ex, stream),
         "}",
     ]
     if host_launcher:
@@ -285,6 +320,50 @@ def emit_asc(module, *, host_launcher=True):
             "",
             f'extern "C" void launch_{p.name}({sig}) {{',
             f"  {p.name}<<<{p.blocks}, nullptr, stream>>>({call});",
+            "}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _emit_mixed(module, *, host_launcher):
+    from .ir import CrossDrainOp, StreamOp
+    from .mixed import mixed_execution, verify_mixed
+
+    verify_mixed(module)
+    m, channels, _ = mixed_execution(module)
+    signature = ", ".join(f"__gm__ uint8_t* {name}" for name in m.roots)
+    name = m.op.sym_name.data
+    lines = [
+        "// xdsl-npu: verified dav-2201 1 AIC : 2 AIV GM ownership protocol",
+        '#include "c_api/asc_simd.h"',
+        "#include <cstdint>",
+        "",
+        f'extern "C" __global__ __mix__(1, 2) void {name}({signature}) {{',
+    ]
+    for actor, kernel in m.actors.items():
+        guard = "ASC_IS_AIC" if actor == "aic" else "ASC_IS_AIV"
+        # ASC_IS_* expands to constexpr(...), part of the if syntax itself.
+        lines.append(f"  if {guard} {{ // {actor}: private local banks")
+        if actor != "aic":
+            lines.append(f"  if (asc_get_sub_block_id() == {int(actor[-1])}) {{")
+        ex = execution(m.projections[actor])
+        stream = next(o for o in kernel.body.block.ops if isinstance(o, StreamOp))
+        drains = [o for o in kernel.body.block.ops if isinstance(o, CrossDrainOp)]
+        lines.extend(
+            "  " + line
+            for line in _body_lines(ex.program, ex, stream, cross=channels, drains=drains)
+        )
+        if actor != "aic":
+            lines.append("  }")
+        lines.append("  }")
+    lines.append("}")
+    if host_launcher:
+        sig = ", ".join(["void* stream"] + [f"void* arg_{root}" for root in m.roots])
+        call = ", ".join(f"(uint8_t*)arg_{root}" for root in m.roots)
+        lines += [
+            "",
+            f'extern "C" void launch_{name}({sig}) {{',
+            f"  {name}<<<{m.op.blocks.data}, nullptr, stream>>>({call});",
             "}",
         ]
     return "\n".join(lines) + "\n"

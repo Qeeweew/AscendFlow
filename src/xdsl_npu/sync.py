@@ -305,9 +305,16 @@ def completion_graph(ex: Execution):
     return graph, begin, end, waits, physical_sets
 
 
-def verify_plan(module: ModuleOp) -> dict:
+def verify_plan(module: ModuleOp, *, _imports=()) -> dict:
+    from .ir import MixedOp
+
+    if isinstance(module.body.block.first_op, MixedOp):
+        from .mixed import verify_mixed
+
+        require(not _imports, "whole mixed proofs cannot assume imports")
+        return verify_mixed(module)
     ex = execution(module)
-    obligations = dependencies(ex.program)  # recomputed from final effects, never reasons.
+    obligations = dependencies(ex.program, _imports=_imports)  # recomputed from final effects.
     graph, begin, end, waits, physical_sets = completion_graph(ex)
     # Diagnose a missing physical release before its secondary lost ready paths.
     for o in sorted(obligations, key=lambda o: o.hazard != "WAR"):
@@ -348,7 +355,12 @@ def verify_plan(module: ModuleOp) -> dict:
         "channels": len(ex.channels),
         "event_ids": {k: sorted(v) for k, v in bank.items()},
         "storage_bytes": {**peaks, "GM": sum(s.nbytes for s in ex.program.storages if s.external)},
-        "verification": "all instances of this static finite stream; trusted native contracts",
+        "verification": (
+            "conditional actor-local proof; shared imports still need a whole-group proof"
+            if _imports
+            else "all instances of this static finite stream; trusted native contracts"
+        ),
+        "conditional_imports": list(_imports),
         "terminal_drain": "kernel return drains all issued pipelines",
     }
 
@@ -380,6 +392,12 @@ def arithmetic_span(epochs):
 
 
 def explain_plan(module: ModuleOp) -> dict:
+    from .ir import MixedOp
+
+    if isinstance(module.body.block.first_op, MixedOp):
+        from .mixed import explain_mixed
+
+        return explain_mixed(module)
     """Concrete finite witnesses, regenerated from final command locations."""
     verify_plan(module)
     ex = execution(module)
@@ -433,13 +451,20 @@ def explain_plan(module: ModuleOp) -> dict:
     }
 
 
-def autosync(module: ModuleOp) -> ModuleOp:
+def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
     """Preserve issue/stage/storage. Reduce redundant *whole channels* with witnesses.
 
     The finite proof permits testing ring widths and removing channels, with no
     assumption that the buffer ring equals the event ring. Capacity failure is
     a diagnostic, not permission to serialize or enlarge buffers.
     """
+    from .ir import MixedOp
+
+    if isinstance(module.body.block.first_op, MixedOp):
+        from .mixed import autosync_mixed
+
+        require(not _imports, "whole mixed planning cannot assume imports")
+        return autosync_mixed(module)
     result = module.clone()
     p = extract(result)
     kernel, stream = parts(result)
@@ -447,7 +472,7 @@ def autosync(module: ModuleOp) -> ModuleOp:
         not any(isinstance(o, (ChannelOp, SyncOp)) for o in result.walk()),
         "AutoSync expects unsynchronized physical IR",
     )
-    obs = dependencies(p)
+    obs = dependencies(p, _imports=_imports)
     groups = defaultdict(list)
     for o in obs:
         a, b = p.tasks[o.source.task], p.tasks[o.destination.task]
@@ -601,5 +626,5 @@ def autosync(module: ModuleOp) -> ModuleOp:
                 f"for {p.tasks[src].uid}->{p.tasks[dst].uid}, distance {d}"
             )
     materialize(proposals, widths)
-    verify_plan(result)
+    verify_plan(result, _imports=_imports)
     return result

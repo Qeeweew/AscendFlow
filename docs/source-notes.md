@@ -48,6 +48,28 @@ Fixpipe wrapper 不设置 ND_PARA，产品在明确的一次初始化契约中�
 采用 M completion 的问题；最终生成器从真实 C RAW/WAW 推导局部 M 完成，
 保留其他 C 槽的交错。具体数值反例和修正产物见 `hierarchical-gemm.md`。
 
-已有设计建议按能力逐步验证。跨核 GM handoff、动态 segmented task、GDN state
-ownership、MoE global phase、communication completion 都尚未实现；其审计结论
+已有设计建议按能力逐步验证。动态 segmented task、GDN state ownership、MoE
+global phase、communication completion 都尚未实现；其审计结论
 只用于检验接口和拒绝边界，没有登记为空接口或宣称已支持。
+
+## 静态混合核的实际契约
+
+本阶段再次确认上述 ops-transformer/CATLASS HEAD 与干净工作树，没有 pull。
+安装的 9.1.0 2201 头文件是 emitter 的实际契约来源：
+
+| 来源 | 已采用并检验的行为 |
+|---|---|
+| `asc/impl/basic_api/dav_c220/kernel_operator_sys_var_impl.h`, `GetBlockIdxImpl` | raw `get_block_idx()` 是 group index；AscendC 的复合 AIV index 才是 `group*2+subblock`，不能把 raw ASC index 再除2 |
+| `asc/include/c_api/sync/sync.h` 和 2201 `asc_sync_block_arrive_impl.h` | arrive 固定 mode2，flag 编码4位；wait 是 `wait_flag_dev(id)`，忽略 pipe 参数 |
+| `tilelang/docs/compiler_internals/ascend_local_events.md` | cross Wait 阻止后续所有 pipe dispatch，已发射的工作可以继续；并非 MTE2 queue Wait |
+| `catlass/include/catlass/arch/cross_core_sync.hpp` | 连续未消费通知最多15；反向计数 ack 与真实 GM read retirement 不相同；本实现独占0/1，只允许0…7 |
+| `ops-transformer/gmm/grouped_matmul/op_kernel/grouped_matmul_quant_mixcore.h`, 170–178、210–215、244–248 | AIC FIX 发布、两 AIV MTE2 返回、下一 scratch overwrite 前 wait，以及最终剩余 credit drain |
+| 2201 `vector_datamove_impl/asc_copy_{gm2ub,ub2gm}_impl.h` | 二维原生 DMA 的 `n_burst,len_burst,src_gap,dst_gap`；len/gap 单位32字节，方向不能照抄3510头文件 |
+
+`__mix__(1,2)` 通过 Bisheng 的共享宿主启动路径调用，产物引用
+`aclrtGetHardwareSyncAddr`。未手工覆盖 FFTS base；本 ABI 已由实际多组、槽复用
+及多次 kernel 调用验证。仅离线生成混合 ELF 不表示已有其他 ELF 启动 ABI 支持。
+通知从同一源 pipe FIFO 发布，捕获此前 source completion；它不阻止后续源任务。
+mode2 ready 的 FIX 完成/GM 可见性和双 AIV 返回的参与者契约，在上述上游算法
+和安装接口基础上经设备样本验证。模型与交错检查仍共享这些可信机器前提，
+不能反过来把图验证或有限枚举当成硬件契约的独立证明。

@@ -259,6 +259,24 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
                 "raw DMA footprint must be positive, 32-byte aligned and fit burst length",
             )
         return routes[banks], ("R", "W")
+    if native == "copy_rows":
+        require(
+            len(refs) == 2
+            and banks in {("GM", "UB"), ("UB", "GM")}
+            and dtypes[0] == dtypes[1]
+            and layouts == ("linear", "linear")
+            and refs[0].rows == refs[1].rows
+            and refs[0].nbytes == refs[1].nbytes
+            and 1 <= refs[0].rows <= 4095
+            and refs[0].nbytes % 32 == 0
+            and 0 < refs[0].nbytes <= 65535 * 32
+            and all(r.row_stride % 32 == 0 for r in refs)
+            and not any(r.tail_nbytes for r in refs)
+            and all(r.rows == 1 or 0 <= (r.row_stride - r.nbytes) // 32 <= 65535 for r in refs)
+            and not params,
+            "row DMA requires equal, aligned physical rows in GM and UB",
+        )
+        return ("MTE2" if banks[0] == "GM" else "MTE3"), ("R", "W")
     if native in {
         "muls",
         "adds",
@@ -357,7 +375,7 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "statistics operation needs one aligned f32 result per row",
         )
         return "V", ("R", "W")
-    if native == "mul_gamma":
+    if native in {"mul_gamma", "add_bias"}:
         require(len(refs) == 3, "Gamma multiplication needs matrix, Gamma and output")
         require(len(params) == 2, "Gamma multiplication needs (rows, columns)")
         rows, cols = params
@@ -371,7 +389,7 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             and layouts == ("linear",) * 3
             and all(r.contiguous for r in refs)
             and lengths == (rows * cols * 4, cols * 4, rows * cols * 4),
-            "Gamma multiplication requires a resident column vector and contiguous rows",
+            "column broadcast requires a resident column vector and contiguous rows",
         )
         return "V", ("R", "R", "W")
     if native in {"stat_fill", "stat_div"}:
@@ -866,7 +884,7 @@ def storage_layout(storages):
     return offsets, peaks
 
 
-def dependencies(program: Program) -> tuple[Obligation, ...]:
+def dependencies(program: Program, *, _imports=()) -> tuple[Obligation, ...]:
     """Interval frontier in semantic generation/source order, independent of issue stages.
 
     Each byte segment has a last writer and ALL unretired readers. Reading one
@@ -882,7 +900,10 @@ def dependencies(program: Program) -> tuple[Obligation, ...]:
     }
     writers = {}
     readers = {}
-    initialized = {s.name: s.initialized for s in program.storages}
+    # These are conditional actor-local premises, never a GM initialization
+    # claim. The mixed verifier must discharge them from actual shared writers.
+    require(set(_imports) <= {s.name for s in program.storages if s.external}, "invalid imports")
+    initialized = {s.name: s.initialized or s.name in _imports for s in program.storages}
     obligations = set()
 
     def edge(src, dst, kind, root, a, b):

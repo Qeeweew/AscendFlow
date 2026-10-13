@@ -117,6 +117,12 @@ L1 release 放在 MTE1 最后读取后，不等待 MAD 或 FIX。L0A/B 归还在
 | 部分写后全范围读 | padding 区没有真实 writer | `test_uninitialized_partial_write_is_rejected` |
 | 给 view 另起名字 | 不能消除共同 root 的字节冲突 | `test_partial_view_and_recast_preserve_storage_provenance` |
 
-动态激活需要显式 task 时钟，跨 AIC/AIV 需要真实 participants、GM visibility 和
-各 owner 的 read retirement；不能把本地二值事件或反向通知 ack 直接推广过去。
+静态 1 AIC/2 AIV 的 GM handoff 已实现：真实 shared SSA allocation、共同语义
+epoch、两份 AIV GM read retirement、mode-2 counter 和尾部 credit drain 进入
+最终全组图。910B 跨核 Wait 是 controller 全核 dispatch gate，即使公开接口
+传入 PIPE_MTE2，也不能把它放进 MTE2 queue 或依赖此前 MTE2 local Wait 完成。
+具体协议与反例见 [mixed-ownership.md](mixed-ownership.md)。
+
+动态激活仍需要显式 task 时钟；不能把本地二值事件或反向通知 ack 直接推广到
+动态 ownership、不同 participants 或跨组通信。
 后续原生 recipe 必须先物化搬运、布局和 scratch，再进入同一效果/同步/验证机制。

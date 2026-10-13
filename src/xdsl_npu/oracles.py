@@ -165,3 +165,42 @@ def operator_inputs(program, *, data_case="standard"):
             [rows, columns],
         )
     raise ValueError(f"no operator oracle for {program.name}")
+
+
+def mixed_inputs(module):
+    """Independent f32 boundary oracle; shared scratch starts with poison bytes."""
+    from dataclasses import replace
+
+    from .mixed import extract_mixed
+
+    m = extract_mixed(module)
+    if m.op.sym_name.data == "mixed_pipeline":
+        from .device import input_and_oracle
+
+        data, product = input_and_oracle(replace(m.programs["aic"], name="cube_pipeline"))
+        buffers = {"a": data[0], "b": data[1]}
+        return (
+            [buffers.get(name, b"\xcd" * root.nbytes.data) for name, root in m.roots.items()],
+            array("f", (f32(v * 2) for v in product)),
+            (0, 0),
+            [m.epochs, 16, 16, 16],
+        )
+    if m.op.sym_name.data != "gemm_bias_silu":
+        raise ValueError("no numerical oracle for this mixed algorithm")
+    cube = replace(m.programs["aic"], name="gemm_nt")
+    data, product, _, shape = operator_inputs(cube)
+    rows, cols, _ = shape
+    bias = array("f", ((j % 17 - 8) / 16 for j in range(cols)))
+    expected = array("f")
+    for i in range(rows):
+        for j in range(cols):
+            value = f32(product[i * cols + j] + bias[j])
+            denominator = f32(f32(exp(f32(-value))) + 1)
+            expected.append(f32(value / denominator))
+    buffers = {"a": data[0], "bt": data[1], "bias": bias.tobytes()}
+    return (
+        [buffers.get(name, b"\xcd" * root.nbytes.data) for name, root in m.roots.items()],
+        expected,
+        (5e-5, 5e-6),
+        shape,
+    )

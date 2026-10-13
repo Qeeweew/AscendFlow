@@ -18,9 +18,16 @@ class CheckResult:
     states: int
     terminal_states: int
     exhaustive: bool
+    scope: str = "all"
 
 
 def bounded_check(module, *, max_states=200_000) -> CheckResult:
+    from .ir import MixedOp
+
+    if isinstance(module.body.block.first_op, MixedOp):
+        from .mixed_check import bounded_mixed_check
+
+        return bounded_mixed_check(module, max_states=max_states)
     ex = execution(module)
     p = ex.program
     queues = tuple(ex.queues().values())

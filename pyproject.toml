@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xdsl-npu"
 version = "0.1.0"
-description = "Physical asynchronous NPU IR and automatic local synchronization for dav-2201"
+description = "Physical asynchronous NPU IR and automatic synchronization for dav-2201"
 requires-python = ">=3.11"
 dependencies = ["xdsl==0.73.0"]
 
