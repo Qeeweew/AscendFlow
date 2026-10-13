@@ -133,6 +133,11 @@ class Kernel:
             uid, "scale_value", source, destination, value, stage=stage, issue_order=issue_order
         )
 
+    def subtract_value(self, uid, source, destination, value, *, stage=0, issue_order=None):
+        return self.task(
+            uid, "sub_value", source, destination, value, stage=stage, issue_order=issue_order
+        )
+
     def copy(self, uid, source, destination, *, stage=0):
         return self.task(uid, "copy", source, destination, stage=stage)
 

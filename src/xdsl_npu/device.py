@@ -83,17 +83,8 @@ class ACL:
 
     def allocate(self, contents: bytes):
         # Align only the newly allocated argument base, retaining the allocation handle.
+        ptr = self.allocate_uninitialized(len(contents))
         size = max(len(contents), 1)
-        handle = ct.c_void_p()
-        self.call(
-            "aclrtMalloc",
-            [ct.POINTER(ct.c_void_p), ct.c_size_t, ct.c_int],
-            ct.byref(handle),
-            size + 511,
-            0,
-        )
-        self.allocations.append(handle)
-        ptr = ct.c_void_p((handle.value + 511) // 512 * 512)
         if contents:
             host = ct.create_string_buffer(contents)
             self.call(
@@ -104,7 +95,21 @@ class ACL:
                 host,
                 len(contents),
                 1,
-            )  # HOST_TO_DEVICE
+            )
+        return ptr
+
+    def allocate_uninitialized(self, nbytes):
+        size = max(nbytes, 1)
+        handle = ct.c_void_p()
+        self.call(
+            "aclrtMalloc",
+            [ct.POINTER(ct.c_void_p), ct.c_size_t, ct.c_int],
+            ct.byref(handle),
+            size + 511,
+            0,
+        )
+        self.allocations.append(handle)
+        ptr = ct.c_void_p((handle.value + 511) // 512 * 512)
         return ptr
 
     def read(self, ptr, nbytes):
@@ -183,6 +188,7 @@ def run_example(
     warmup=5,
     late_reader=False,
     reference=False,
+    data_case="standard",
 ) -> dict:
     from .codegen import emit_asc
     from .sync import verify_plan
@@ -204,7 +210,15 @@ def run_example(
         "correctness requires a launch; timing requires positive repeats",
     )
     health = health_snapshot(physical, output)
-    contents, expected = input_and_oracle(p, late_reader=late_reader)
+    tolerance = (0, 0)
+    shape = [p.count, p.tasks[0].refs[0].nbytes // 4] if p.core == "aiv" else [p.count, 16, 16, 16]
+    if p.name in {"rms_norm", "rope", "softmax", "swiglu", "batched_matmul_nt"}:
+        from .oracles import operator_inputs
+
+        contents, expected, tolerance, shape = operator_inputs(p, data_case=data_case)
+    else:
+        require(data_case == "standard", "numerical input cases require an operator recipe")
+        contents, expected = input_and_oracle(p, late_reader=late_reader)
     runtime = ACL()
     try:
         pointers = [runtime.allocate(data) for data in contents]
@@ -219,7 +233,9 @@ def run_example(
         (output / "device-output.bin").write_bytes(raw)
         max_error = max((abs(a - b) for a, b in zip(actual, expected)), default=0.0)
         require(
-            all(a == b for a, b in zip(actual, expected)),
+            all(
+                abs(a - b) <= tolerance[1] + tolerance[0] * abs(b) for a, b in zip(actual, expected)
+            ),
             f"device numerical mismatch; max_abs_error={max_error}, "
             f"first actual={actual[:8]}, expected={expected[:8]}",
         )
@@ -242,7 +258,9 @@ def run_example(
             "kernel": p.name,
             "count": p.count,
             "dtype": "f32" if p.core == "aiv" else "f16 operands/f32 accumulation and output",
-            "correctness": "exact equality on binary-representable finite test inputs",
+            "correctness": "compared with the independent FP32 CPU oracle",
+            "rtol": tolerance[0],
+            "atol": tolerance[1],
             "elements": len(expected),
             "max_abs_error": max_error,
             "warmup": warmup,
@@ -251,9 +269,11 @@ def run_example(
             "timing_scope": "ACL event stream interval; includes submission gaps; not kernel-only",
             "library": str(shared_library.resolve()),
             "reference": reference,
-            "shape": [p.count, p.tasks[0].refs[0].nbytes // 4]
-            if p.core == "aiv"
-            else [p.count, 16, 16, 16],
+            "shape": shape,
+            "data_case": data_case,
+            "argument_sha256": [hashlib.sha256(data).hexdigest() for data in contents],
+            "compiled_source_sha256": manifest["source_sha256"],
+            "shared_sha256": manifest["shared_sha256"],
             "tail_elements": p.tasks[0].refs[0].tail_nbytes // 4 if p.core == "aiv" else 0,
         }
         (output / "device.json").write_text(json.dumps(record, indent=2) + "\n")

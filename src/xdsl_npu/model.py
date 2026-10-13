@@ -6,6 +6,7 @@ The first version deliberately bounds finite expansion, and emits compact loops.
 """
 
 import re
+import struct
 from dataclasses import dataclass, replace
 from math import isfinite
 
@@ -44,6 +45,17 @@ class CompileError(ValueError):
 def require(condition, message):
     if not condition:
         raise CompileError(message)
+
+
+def round_f32(value):
+    """The IR literal and emitted C++ float must have the same value."""
+    require(isfinite(value), "Vector scalar must be finite")
+    try:
+        result = struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError as error:
+        raise CompileError("Vector scalar is outside finite f32 range") from error
+    require(isfinite(result), "Vector scalar is outside finite f32 range")
+    return result
 
 
 def optional_int(attr, default):
@@ -206,7 +218,18 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
                 "raw DMA footprint must be positive, 32-byte aligned and fit burst length",
             )
         return routes[banks], ("R", "W")
-    if native in {"muls", "adds", "add", "mul", "sub", "div", "exp", "rsqrt", "scale_value"}:
+    if native in {
+        "muls",
+        "adds",
+        "add",
+        "mul",
+        "sub",
+        "div",
+        "exp",
+        "rsqrt",
+        "scale_value",
+        "sub_value",
+    }:
         arity = 3 if native in {"add", "mul", "sub", "div"} else 2
         require(
             len(refs) == arity
@@ -246,6 +269,148 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "row binary requires bounded equal f32 rows with aligned origins",
         )
         return "V", ("R", "R", "W")
+    if native in {"reduce_sum64", "reduce_max64"}:
+        require(len(params) == 2, "native reduction needs (rows, columns)")
+        rows, cols = params
+        require(
+            1 <= rows <= 255 and 64 <= cols <= 4096 and cols % 64 == 0,
+            "native row reduction requires positive rows and 64-aligned columns <=4096",
+        )
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and refs[0].contiguous
+            and lengths[0] == rows * cols * 4
+            and refs[1].rows == rows
+            and refs[1].nbytes == cols // 64 * 4,
+            "reduction partials must expose their exact row footprint",
+        )
+        return "V", ("R", "W")
+    if native in {"merge_sum", "merge_max"}:
+        require(len(params) == 2, "partial reduction needs (rows, partials)")
+        rows, partials = params
+        require(
+            1 <= rows <= 255
+            and 1 <= partials <= 64
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and refs[0].rows == refs[1].rows == rows
+            and refs[0].nbytes == partials * 4
+            and refs[1].nbytes == 4,
+            "partial reduction must preserve rows and exact compact results",
+        )
+        return "V", ("R", "W")
+    if native in {"stat_muls", "stat_adds", "stat_rsqrt", "stat_sqrt"}:
+        require(
+            len(params) == 1
+            and 1 <= params[0] <= 255
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.rows == params[0] and r.nbytes == 4 for r in refs),
+            "statistics operation needs one aligned f32 result per row",
+        )
+        return "V", ("R", "W")
+    if native == "mul_gamma":
+        require(len(refs) == 3, "Gamma multiplication needs matrix, Gamma and output")
+        require(len(params) == 2, "Gamma multiplication needs (rows, columns)")
+        rows, cols = params
+        require(
+            1 <= rows <= 255
+            and cols > 0
+            and cols % 8 == 0
+            and len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and all(r.contiguous for r in refs)
+            and lengths == (rows * cols * 4, cols * 4, rows * cols * 4),
+            "Gamma multiplication requires a resident column vector and contiguous rows",
+        )
+        return "V", ("R", "R", "W")
+    if native in {"stat_fill", "stat_div"}:
+        arity = 1 if native == "stat_fill" else 3
+        require(
+            len(params) == 1
+            and 1 <= params[0] <= 255
+            and len(refs) == arity
+            and banks == ("UB",) * arity
+            and dtypes == ("f32",) * arity
+            and layouts == ("linear",) * arity
+            and all(r.rows == params[0] and r.nbytes == 4 for r in refs),
+            "statistics recipe needs aligned f32 words per row",
+        )
+        return "V", ("W",) if arity == 1 else ("R", "R", "W")
+    if native in {"nd2nz", "load2d_a", "load2d_b_nt"}:
+        require(len(params) == 2, "matrix DMA requires (rows, columns)")
+        rows, cols = params
+        require(
+            16 <= rows <= 256 and 16 <= cols <= 256 and rows % 16 == cols % 16 == 0,
+            "matrix DMA supports complete f16 fractals with dimensions in [16,256]",
+        )
+        require(
+            len(refs) == 2 and dtypes == ("f16", "f16") and lengths == (rows * cols * 2,) * 2,
+            "matrix DMA must expose the full source and destination tile",
+        )
+        if native == "nd2nz":
+            require(
+                banks == ("GM", "L1")
+                and layouts == ("linear", "NZ")
+                and refs[0].rows == rows
+                and refs[0].nbytes == cols * 2
+                and refs[0].row_stride % 2 == 0
+                and cols <= refs[0].row_stride // 2 <= 65535
+                and refs[1].contiguous,
+                "ND2NZ needs precise GM rows, legal leading dimension and compact NZ output",
+            )
+            return "MTE2", ("R", "W")
+        destination = "L0A" if native == "load2d_a" else "L0B"
+        layout = "ZZ" if native == "load2d_a" else "ZN"
+        require(
+            banks == ("L1", destination)
+            and layouts == ("NZ", layout)
+            and all(r.contiguous for r in refs)
+            and (native == "load2d_a" or rows * cols // 256 <= 255),
+            "Load2D requires complete compact fractals and a legal repeat count",
+        )
+        return "MTE1", ("R", "W")
+    if native == "mad":
+        require(len(params) == 4, "MAD requires (M,N,K,clear)")
+        m, n, k, clear = params
+        require(
+            all(16 <= dim <= 256 and dim % 16 == 0 for dim in (m, n, k))
+            and clear in {0, 1}
+            and banks == ("L0A", "L0B", "L0C")
+            and dtypes == ("f16", "f16", "f32")
+            and layouts == ("ZZ", "ZN", "NZ")
+            and lengths == (m * k * 2, n * k * 2, m * n * 4)
+            and all(r.contiguous for r in refs),
+            "MAD requires exact f16 operand tiles and an f32 accumulator, without padding",
+        )
+        return "M", ("R", "R", "W" if clear else "RW")
+    if native == "fix":
+        require(len(params) == 2, "Fixpipe requires (M,N)")
+        m, n = params
+        require(
+            16 <= m <= 256
+            and 16 <= n <= 256
+            and m % 16 == n % 16 == 0
+            and banks == ("L0C", "GM")
+            and dtypes == ("f32", "f32")
+            and layouts == ("NZ", "linear")
+            and lengths == (m * n * 4,) * 2
+            and refs[0].contiguous
+            and refs[1].rows == m
+            and refs[1].nbytes == n * 4
+            and refs[1].row_stride % 4 == 0,
+            "Fixpipe requires the exact f32 NZ tile and ND destination rows",
+        )
+        return "FIX", ("R", "W")
     if native == "mad16":
         require(
             banks == ("L0A", "L0B", "L0C")
@@ -439,10 +604,10 @@ def extract(module: ModuleOp) -> Program:
             require(0 <= stage <= 32, "stage must be a static offset in [0,32]")
             operands = tuple(op.refs)
             scalar_source = None
-            if native == "scale_value":
+            if native in {"scale_value", "sub_value"}:
                 require(
                     len(operands) == 3 and operands[-1] in scalar_values,
-                    "scale_value needs a preceding synchronous Scalar f32 result",
+                    f"{native} needs a preceding synchronous Scalar f32 result",
                 )
                 scalar_source = scalar_values[operands[-1]]
                 operands = operands[:-1]
@@ -462,7 +627,8 @@ def extract(module: ModuleOp) -> Program:
             for ref in refs:
                 alignment = 4 if pipe == "S" else 32
                 require(
-                    all(
+                    (not ref.storage.external or blocks == 1 or ref.core_stride % alignment == 0)
+                    and all(
                         a % alignment == 0 for g in range(max(count, 1)) for a, _ in ref.segments(g)
                     ),
                     f"{uid}: {pipe} operand origin requires {alignment}-byte alignment",
@@ -491,12 +657,11 @@ def extract(module: ModuleOp) -> Program:
                 "native task owner mismatch",
             )
             require(
-                native != "fix16" or config,
+                native not in {"fix16", "fix"} or config,
                 "Fixpipe needs explicit invariant ND_PARA initialization",
             )
             require(op.scalar.type == f32, "native Vector scalar literals must be f32")
-            scalar = op.scalar.value.data
-            require(isfinite(scalar), "Vector scalar must be finite")
+            scalar = round_f32(op.scalar.value.data)
             lower, upper = optional_int(op.lower, 0), optional_int(op.upper, -1)
             upper = count if upper == -1 else min(upper, count)
             require(

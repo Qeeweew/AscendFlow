@@ -5,19 +5,40 @@ from pathlib import Path
 from .codegen import emit_asc
 from .examples import cube_pipeline, scalar_pipeline, vector_pipeline
 from .ir import dump, parse
+from .kernels import batched_matmul_nt, rms_norm, rope, softmax, swiglu
 from .sync import autosync, explain_plan, verify_plan
 from .toolchain import offline_compile
 
 
 def main():
     parser = argparse.ArgumentParser(description="Physical xDSL NPU compiler for dav-2201")
-    parser.add_argument("example", choices=["vector", "last-read", "cube", "scalar", "ir"])
+    parser.add_argument(
+        "example",
+        choices=[
+            "vector",
+            "last-read",
+            "cube",
+            "scalar",
+            "rms-norm",
+            "rope",
+            "softmax",
+            "swiglu",
+            "batched-matmul",
+            "ir",
+        ],
+    )
     parser.add_argument("--input", type=Path, help="physical unsynchronized xDSL for example=ir")
     parser.add_argument("--count", type=int, default=6)
     parser.add_argument("--slots", type=int, default=2)
-    parser.add_argument(
-        "--blocks", type=int, default=1, help="independent cores for the Scalar example"
-    )
+    parser.add_argument("--rows", type=int, default=32)
+    parser.add_argument("--columns", type=int, default=128)
+    parser.add_argument("--row-block", type=int)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--m", type=int, default=64)
+    parser.add_argument("--n", type=int, default=64)
+    parser.add_argument("--k", type=int, default=256)
+    parser.add_argument("--k-block", type=int, default=64)
+    parser.add_argument("--blocks", type=int, default=1, help="independent physical cores")
     parser.add_argument(
         "--tail", type=int, default=0, help="final Vector tile element count, multiple of 8"
     )
@@ -33,6 +54,17 @@ def main():
         module = cube_pipeline(args.count, args.slots)
     elif args.example == "scalar":
         module = scalar_pipeline(args.count, args.blocks)
+    elif args.example == "batched-matmul":
+        module = batched_matmul_nt(
+            args.batch, args.m, args.n, args.k, k_block=args.k_block, slots=args.slots
+        )
+    elif args.example in {"rms-norm", "rope", "softmax", "swiglu"}:
+        factory = {"rms-norm": rms_norm, "rope": rope, "softmax": softmax, "swiglu": swiglu}[
+            args.example
+        ]
+        module = factory(
+            args.rows, args.columns, blocks=args.blocks, row_block=args.row_block, slots=args.slots
+        )
     else:
         module = vector_pipeline(
             args.count, slots=args.slots, late_reader=args.example == "last-read", tail=args.tail

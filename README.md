@@ -3,8 +3,10 @@
 基于 xDSL 0.73.0 的独立 Python 编译器，目标 Ascend 910B / dav-2201，直接输出
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
-当前实现是物理编程入口和局部自动同步闭环，含独立核 grid、Scalar 捕获和
-strided 访问；尚不是完整的复杂算子编译器。
+当前可编译运行固定 shape 的 RMSNorm、rotate-half RoPE、稳定 Softmax、SwiGLU
+和带 K 块累加的矩形 batched NT matmul。所有算子展开为同一个物理 IR，并经过
+局部 AutoSync、最终 verifier 和 ASC 后端。独立核 grid、Scalar 捕获、strided
+访问和多级 buffer 复用均由共享模型检查。
 `Kernel` builder 明确表达原生计算、搬运、物理布局、子视图、slot 和固定 stage。
 专家指定的 issue 顺序、stage 和 buffer 不会被同步器重排或扩大。
 源码、测试和文档属于本产品 Git；环境和运行产物放在外层工作区。
@@ -73,16 +75,19 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 | 存储 | UB/L1/L0A/L0B/L0C 容量和对齐；GM 输入契约；嵌套子视图和跨 dtype 字节别名 |
 | 代次 | 显式线性或 modulo 地址；多缓冲；完整 RAW/WAR/WAW 和多 reader |
 | Vector | f32 Add/Sub/Mul/Div/Exp/Rsqrt、标量和逐行计算；静态末块，DMA 长度为 32 字节倍数 |
+| 归约 | 64 元素 Sum/Max partial、每行合并、Sqrt/Div 和精确统计量 footprint |
 | Scalar | f32 UB word 读取，显式 SSA 值、同步读取和发射时捕获；支持 Scalar Wait 的全核 dispatch 门控 |
-| Cube | 完整 f16 16×16×16 MAD；f32 clear/累加；NT 预打包输入；f32 NZ→ND Fixpipe |
-| 搬运 | GM→UB、UB→GM、GM→L1、单 fractal L1→L0A/B |
+| Cube | 完整 f16 矩形 MAD，f32 clear/跨 K 块累加，最终 NZ→ND Fixpipe；受实际 bank 容量约束 |
+| 搬运 | GM→UB、UB→GM、GM→L1、原生 GM ND→L1 NZ、完整 tile 的 L1→L0A/B |
 | 同步 | 本地二值事件、同流水必要 barrier；每有向 bank 八 ID；配对和复用验证 |
 | 保护 | executing ops 的 xDSL effects 防止普通 DCE/CSE 删除异步工作 |
 
 不支持的动态 task count、数据相关分支/带洞激活、间接 gather/scatter、任意 native extern、
 跨 AIC/AIV 交接、跨核 ownership、全局 phase 和通信会被拒绝。
 没有直接 L0C→UB 路径、事件溢出的 mutex fallback，或静默缩小 tile/扩大 buffer。
-这些边界也意味着当前不支持完整的 GEMM/FFN、RoPE、normalization 或 attention 算子库。
+普通大矩阵的多级 M/N 分块、融合 FFN、完整 attention、间接 routing 和动态 grouped
+matmul 尚未实现。batched NT matmul 的每个矩阵由一个 AIC 执行，不能把它当作
+任意规模的高性能 GEMM。算子 shape、数值和存储契约见 [算子入口](docs/operators.md)。
 
 同步生成使用有限图提案和最终重检；有界交错检查独立探索 task 开始、退休、Set
 发射、生效和 Wait 消费。两者共享受审查的 native effect 表，不能当作独立硬件
@@ -91,3 +96,23 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 参见 [同步规则与反例](docs/synchronization.md)、[源码依据](docs/source-notes.md)
 和 [阶段验证记录](docs/validation-stage1.md)。阶段1对应 Git `6a54f43`，该记录
 保留当时的验证范围。后续基础能力见 [物理执行扩展](docs/physical-extensions.md)。
+
+## 编译和运行算子
+
+在工作区执行；运行前依据全部卡的健康和占用选择物理卡，下面使用物理卡1、逻辑0：
+
+```bash
+.venv/bin/xdsl-npu rms-norm --rows 256 --columns 1024 --blocks 8 --output runs/operators/rms --compile --shared
+.venv/bin/xdsl-npu rope --rows 4096 --columns 128 --blocks 32 --output runs/operators/rope --compile --shared
+.venv/bin/xdsl-npu softmax --rows 256 --columns 1024 --blocks 8 --output runs/operators/softmax --compile --shared
+.venv/bin/xdsl-npu swiglu --rows 256 --columns 1024 --blocks 8 --output runs/operators/swiglu --compile --shared
+.venv/bin/xdsl-npu batched-matmul --batch 8 --m 64 --n 64 --k 256 --k-block 64 --output runs/operators/matmul --compile --shared
+
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/operators/matmul --physical 1
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reference.py runs/operators/rms --physical 1
+```
+
+`run_device.py` 对上述任一目录执行独立数值 oracle，并保存数据、源码和产物 hash。
+`run_reference.py` 直接执行安装的 ACLNN RMSNorm/Softmax，作为独立比较基线。
+[算子验证记录](docs/validation-operators.md) 区分设备正确性、ACL stream 间隔和
+msprof 内核时间，记录当前性能证据及其限制。

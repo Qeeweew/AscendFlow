@@ -68,11 +68,12 @@ def native_line(task, count, core="0"):
     if task.native == "scalar_load":
         source = pointer(refs[0], core=core).replace("__ubuf__ float*", "__ubuf__ volatile float*")
         return f"npu_value_{task.uid} = *({source});"
-    if task.native == "scale_value":
-        return (
-            f"asc_mul_scalar({p[1]}, {p[0]}, npu_value_{task.scalar_source}, "
-            f"uint32_t({length(refs[0], 4)}));"
-        )
+    if task.native in {"scale_value", "sub_value"}:
+        function = "asc_mul_scalar" if task.native == "scale_value" else "asc_add_scalar"
+        value = f"npu_value_{task.scalar_source}"
+        if task.native == "sub_value":
+            value = f"-{value}"
+        return f"{function}({p[1]}, {p[0]}, {value}, uint32_t({length(refs[0], 4)}));"
     if task.native in {"mul_rows", "sub_rows", "add_rows", "div_rows"}:
         rows, cols = task.params
         pp = [pointer(r, core=core, extra=f"npu_row * {r.row_stride}") for r in refs]
@@ -80,6 +81,88 @@ def native_line(task, count, core="0"):
         return (
             f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
             f"asc_{function}({pp[2]}, {pp[0]}, {pp[1]}, uint32_t({cols})); }}"
+        )
+    if task.native in {"reduce_sum64", "reduce_max64"}:
+        rows, cols = task.params
+        function = (
+            "asc_repeat_reduce_sum"
+            if task.native == "reduce_sum64"
+            else "asc_repeat_reduce_max_only_value"
+        )
+        if refs[1].contiguous:
+            return f"{function}({p[1]}, {p[0]}, uint32_t({rows * cols}));"
+        src = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4}")
+        dst = pointer(refs[1], core=core, extra=f"npu_row * {refs[1].row_stride}")
+        return (
+            f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
+            f"{function}({dst}, {src}, uint32_t({cols})); }}"
+        )
+    if task.native in {
+        "merge_sum",
+        "merge_max",
+        "stat_muls",
+        "stat_adds",
+        "stat_rsqrt",
+        "stat_sqrt",
+    }:
+        rows = task.params[0]
+        src = pointer(refs[0], core=core, extra=f"npu_row * {refs[0].row_stride}")
+        dst = pointer(refs[1], core=core, extra=f"npu_row * {refs[1].row_stride}")
+        if task.native.startswith("merge"):
+            function = (
+                "asc_repeat_reduce_sum"
+                if task.native == "merge_sum"
+                else "asc_repeat_reduce_max_only_value"
+            )
+            call = f"{function}({dst}, {src}, uint32_t({task.params[1]}));"
+        elif task.native in {"stat_rsqrt", "stat_sqrt"}:
+            call = f"asc_{task.native.removeprefix('stat_')}({dst}, {src}, uint32_t(1));"
+        else:
+            function = "asc_mul_scalar" if task.native == "stat_muls" else "asc_add_scalar"
+            call = f"{function}({dst}, {src}, float({task.scalar!r}), uint32_t(1));"
+        return f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ {call} }}"
+    if task.native == "mul_gamma":
+        rows, cols = task.params
+        src = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4}")
+        dst = pointer(refs[2], core=core, extra=f"npu_row * {cols * 4}")
+        return (
+            f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
+            f"asc_mul({dst}, {src}, {p[1]}, uint32_t({cols})); }}"
+        )
+    if task.native in {"stat_fill", "stat_div"}:
+        rows = task.params[0]
+        pp = [pointer(r, core=core, extra=f"npu_row * {r.row_stride}") for r in refs]
+        if task.native == "stat_fill":
+            call = f"asc_duplicate({pp[0]}, float({task.scalar!r}), uint32_t(1));"
+        else:
+            call = f"asc_div({pp[2]}, {pp[0]}, {pp[1]}, uint32_t(1));"
+        return f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ {call} }}"
+    if task.native == "nd2nz":
+        rows, cols = task.params
+        return (
+            f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, {rows}, {cols}, 0, "
+            f"{refs[0].row_stride // 2}, {rows}, 1, 0);"
+        )
+    if task.native == "load2d_a":
+        rows, cols = task.params
+        src = pointer(refs[0], core=core, extra="npu_chunk * 512")
+        dst = pointer(refs[1], core=core, extra=f"npu_chunk * {cols * 32}")
+        return (
+            f"for (int npu_chunk = 0; npu_chunk < {rows // 16}; ++npu_chunk) {{ "
+            f"asc_copy_l12l0a({dst}, {src}, 0, {cols // 16}, {rows // 16}, 0); }}"
+        )
+    if task.native == "load2d_b_nt":
+        rows, cols = task.params
+        return f"asc_copy_l12l0b({p[1]}, {p[0]}, 0, {rows * cols // 256}, 1, 0);"
+    if task.native == "mad":
+        m, n, k, clear = task.params
+        flag = "true" if clear else "false"
+        return f"asc_mmad({p[2]}, {p[0]}, {p[1]}, {m}, {k}, {n}, 0, false, false, {flag});"
+    if task.native == "fix":
+        m, n = task.params
+        return (
+            f"asc_copy_l0c2gm({p[1]}, {p[0]}, {n}, {m}, {refs[1].row_stride // 4}, "
+            f"{m}, 0, 0, 0, false, true);"
         )
     if task.native == "mad16":
         clear = "true" if task.params[0] else "false"

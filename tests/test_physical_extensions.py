@@ -81,6 +81,16 @@ def test_independent_owner_grid_rejects_shared_writes():
         autosync(module)
 
 
+def test_independent_core_stride_preserves_dma_alignment():
+    k = Kernel("misaligned_core", blocks=2)
+    x = k.buffer("x", "GM", 64, external=True, initialized=True)
+    a = k.buffer("a", "UB", 32)
+    k.loop(1)
+    k.copy("load", k.view(x, 32, core_stride=4), k.view(a, 32))
+    with pytest.raises(CompileError, match="32-byte alignment"):
+        autosync(k.finish())
+
+
 def test_strided_accesses_preserve_the_holes():
     k = Kernel("strided", disjoint_external=True)
     x = k.buffer("x", "GM", 128, external=True, initialized=True)
