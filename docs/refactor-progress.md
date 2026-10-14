@@ -1,5 +1,53 @@
 # 重构的验证记录
 
+## R1 首个切片：AST → 自动同步 → ASC → 设备
+
+R0 的原型已保存为 `d3a00d0`。新 `N.prim_func` 返回捕获源码的 `PrimFunction`，
+编译时解析 AST，设备函数体不在 Python 执行；`N.from_source` 是源码不可取得时
+的明确入口。旧示例/回归改用显式 `N.trace_func`，没有 parser 失败后的 fallback。
+
+已实现两遍参数解析、`N.int64`、显式 constexpr 特化、固定范围的常量捕获、
+源码位置诊断、显式槽位和 AST statement/展开预算。`Pipelined` 保留 body 一份，
+即使边界是常量或零；只有 `N.unroll` 进行受预算限制的展开。设备条件和 serial
+循环形成真实 `arith/scf`，内含 typed memory operations，序列化后可重新解析。
+目前它们的同步 lowering **明确拒绝**；标量合流/iter_args 也尚未接通。
+
+`examples/ast_vector.py` 的单外层、完整64元素 tile、显式双槽程序已经经过现有
+物理访问/代次/event 检查并生成 ASC。与同配置 legacy 程序对照，统一函数名后
+ASC 完全一致；没有新增搬运、loop barrier 或缓冲。其源码、自动同步前后 IR、
+ASC、离线 ELF/shared 库和 CANN 选项在外层 `runs/refactor/ast-vector/`。
+
+全部8张卡健康、无进程、利用率0后，选择物理卡1映射逻辑0；runner 再次检查。
+同一 binary 运行0/1/2/4/4096/65536/262144 tiles，最大16,777,216个 f32 元素，
+每例预热1次、重复5次，误差0，输入只读及输出 guard 通过。记录在外层
+`runs/refactor/ast-vector-device/device.json`。这些是 correctness 证据，所记时间
+是含提交间隙的 ACL stream interval；单 AIV/小 tile 不是吞吐率目标验收。
+
+编译 benchmark 新增 `--entry scale`，从 Python 定义模块读取/捕获、AST 和源 IR
+构造计至 ASC，import/CANN 分开；每 case 有60秒进程预算，至少5个冷进程。
+已有产物属性读取明确标记为非编译缓存。首批完整输入到 ASC 中位数0.2317秒、
+最大0.2463秒、RSS约31.1 MiB；原始数据包含 package/source/ASC hash，位于
+`runs/refactor/ast-vector-cold/`。最终源码复测为中位数0.2253秒、最大0.2274秒、
+RSS约31.4 MiB，另存 `ast-vector-cold-final/`；最终生成 ASC 的 hash 与设备已
+验证产物一致：`26e6a53204100b776c9f47c3b2fa2efe12e0cc7a7cca961cd5a9a56883c3025d`。
+
+相关回归104项通过（38.85秒）；随后增加 serial 内实际访存及 decorator 契约
+检查，最终前端/source 回归45项通过（11.13秒），ruff 全目录通过。
+日志在外层 `runs/refactor/r0-checkpoint/ast-*.log`。未重跑的旧设备记录未冒充
+当前新路径证据；最终再次编译的 ASC 与设备实际运行库的源码 hash 对照后记录。
+
+R1 仍未完成：raw 元素长度与 `ceildiv` 的物理 lowering、精确尾部、两个独立
+运行时参数的设备闭环、标量 SSA 合流/携带、归约例、可验证输入契约和完整
+性能基线。R2 的层次摘要、R3/R4 的真实 FA 迁移和性能验收仍待执行。
+
+复现（工作区根目录，设备命令先检查全部卡）：
+
+```bash
+.venv/bin/python compiler/examples/ast_vector.py --output runs/refactor/ast-vector --shared
+.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_vector.py --entry scale --trials 5 --output runs/refactor/ast-vector-cold
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/runtime_vector.py --frontend ast --output runs/refactor/ast-vector-device --library runs/refactor/ast-vector/scale.so --physical 1 --counts 0 1 2 4 4096 65536 262144 --repeats 5
+```
+
 ## R0：实现现场保存与重新验证
 
 设计提交 `a80aadd` 后重新检查符号循环工作树。执行
@@ -11,6 +59,8 @@
 本次 checkpoint 保存此前全部符号循环源码、回归和 runner，不宣称 R0 的全部
 基线或新设计已验收。后续首先接入不执行用户函数体的 AST 前端，保留自动同步
 和最终实际 IR 检查。固定 AscendC 对照及完整前端编译口径仍待补齐。
+
+## 以下为设计修订时的历史记录
 
 2026-10-14 的[总体设计](design.md)、[DSL 规格](dsl-multistage.md)和
 [重构计划](refactor-plan.md)已重写；它们规定后续目标，不能作为实现证明。

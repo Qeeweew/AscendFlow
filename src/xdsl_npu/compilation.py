@@ -32,6 +32,11 @@ class Compilation:
     def __init__(self, module, *, synchronize=True, host_launcher=True):
         started = perf_counter()
         require(type(synchronize) is bool, "synchronize must be an explicit boolean policy")
+        from .frontend import PrimFunction
+
+        if isinstance(module, PrimFunction):
+            module = module.to_ir()
+        frontend = perf_counter()
         module = module.clone()
         owned = perf_counter()
         source = isinstance(module.body.block.first_op, ProgramOp)
@@ -89,7 +94,8 @@ class Compilation:
         frozen = perf_counter()
         snapshots["_timings_json"] = json.dumps(
             {
-                "own_input_s": owned - started,
+                "frontend_s": frontend - started,
+                "own_input_s": owned - frontend,
                 "lowering_s": lowered - owned,
                 "planning_and_final_check_s": planned - lowered,
                 "planning_s": planned - lowered - final_check_s,

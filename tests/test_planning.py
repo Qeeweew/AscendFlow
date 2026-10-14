@@ -1,5 +1,6 @@
 import random
 from collections import defaultdict
+from itertools import pairwise
 
 import pytest
 from pipeline_fixtures import cube_pipeline, vector_pipeline
@@ -107,7 +108,7 @@ def test_shared_suffixes_and_control_only_invalidation_match_full_closure(seed):
         for query, path in search.paths.items():
             arcs_in_path = tuple(path)
             assert arcs_in_path[0][0] == query[0] and arcs_in_path[-1][1] == query[1]
-            assert all(b == c for (_, b), (c, _) in zip(arcs_in_path, arcs_in_path[1:]))
+            assert all(b == c for (_, b), (c, _) in pairwise(arcs_in_path))
             assert not set(arcs_in_path) & omitted
             assert all(b in graph.edges[a] for a, b in arcs_in_path)
     untracked = next(arc for arc in arcs if arc not in removable)

@@ -1,7 +1,7 @@
 # DSL 前端、结构化循环与 CV 多阶段语义
 
 2026-10-14 修订。本文是待实现规格，代码块展示目标语法，不能作为当前可运行
-API 使用。现有 tracing/单循环原型的能力和设备记录见[重构记录](refactor-progress.md)。
+API 使用。现有 AST 单循环切片及 legacy 原型的能力和设备记录见[重构记录](refactor-progress.md)。
 架构约束见[总体设计](design.md)，实施顺序见[重构计划](refactor-plan.md)。
 
 ## 1. 采用 TileLang 风格作用域，明确 Python 与设备的边界

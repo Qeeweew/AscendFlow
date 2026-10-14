@@ -12,7 +12,7 @@ def _extent(count):
 
 
 def vector_source(count=4):
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def scale(
         X: N.Tensor((2, _extent(count), 64), N.f32),
         Y: N.Tensor((2, _extent(count), 64), N.f32, access="write"),
@@ -34,7 +34,7 @@ def vector_source(count=4):
 def cv_source(count=4):
     shape = (1, _extent(count), 16, 16)
 
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def cv(
         Q: N.Tensor(shape, N.f16),
         K: N.Tensor(shape, N.f16),
@@ -89,7 +89,7 @@ def segmented_cv_source(count=4, segments=3, groups=2):
     q_shape = (groups, _extent(count), 16, 16)
     kv_shape = (groups, _extent(count), segments, 16, 16)
 
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def segmented_cv(
         Q: N.Tensor(q_shape, N.f16),
         K: N.Tensor(kv_shape, N.f16),

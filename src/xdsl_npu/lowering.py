@@ -652,12 +652,37 @@ def _check_loop_values(physical, actors, outer):
 
 
 def lower_source(module, *, symbolic=True):
+    from .frontend import PrimFunction
+
+    if isinstance(module, PrimFunction):
+        module = module.to_ir()
     module.verify()
     program = module.body.block.first_op
     require(
         isinstance(program, ProgramOp) and len(list(module.body.block.ops)) == 1,
         "expected one typed source program",
     )
+    if program.attributes.get("frontend") == StringAttr("ast"):
+        from xdsl.dialects import arith, scf
+
+        for operation in program.walk():
+            require(
+                not isinstance(operation, (scf.ForOp, scf.IfOp)),
+                f"{operation.location}: structured {operation.name} synchronization is not "
+                "implemented; AST control flow is never silently expanded or discarded",
+            )
+            if isinstance(operation, PipelineOp):
+                require(
+                    operation.parent_op() is program,
+                    "nested AST pipelines require hierarchical synchronization; "
+                    "constant bounds do not authorize implicit unrolling",
+                )
+        require(
+            not any(
+                operation.name.startswith(arith.Arith.name + ".") for operation in program.walk()
+            ),
+            "arithmetic runtime bounds require structured scalar lowering",
+        )
     pipelines = [op for op in program.body.block.ops if isinstance(op, PipelineOp)]
     require(len(pipelines) == 1, "source requires one continuous outer task stream")
     require(

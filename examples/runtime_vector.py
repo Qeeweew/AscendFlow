@@ -1,4 +1,4 @@
-"""Build once, run a dynamic-length three-stage Vector pipeline.
+"""Build once, run an AST dynamic-length three-stage Vector pipeline.
 
 Set ASCEND_RT_VISIBLE_DEVICES=<physical> and ASCEND_DEVICE_ID=0 before Python.
 The length counts complete 64-element tiles per group; native tile sizes are
@@ -39,6 +39,7 @@ def run(result, library, output, physical, counts, repeats):
     health = health_snapshot(physical, output)
     runtime = ACL()
     records = []
+    groups = result.report["groups"]
     try:
         module = ct.CDLL(str(library.resolve()))
         launch = getattr(module, f"launch_{result.name}")
@@ -46,7 +47,7 @@ def run(result, library, output, physical, counts, repeats):
         launch.restype = ct.c_int
         guard = b"\x5a" * 128
         for count in counts:
-            values = ((np.arange(2 * count * 64, dtype=np.int32) % 127 - 63) / 16).astype(
+            values = ((np.arange(groups * count * 64, dtype=np.int32) % 127 - 63) / 16).astype(
                 np.float32
             )
             raw_input = values.tobytes() + guard
@@ -90,7 +91,7 @@ def run(result, library, output, physical, counts, repeats):
             )
             record = {
                 "tiles_per_group": count,
-                "shape": [2, count, 64],
+                "shape": [groups, count, 64],
                 "dtype": "f32",
                 "elements": values.size,
                 "max_abs_error": 0.0,
@@ -133,8 +134,14 @@ def main():
     )
     parser.add_argument("--counts", type=int, nargs="+", default=[0, 1, 2, 4, 4096, 65536])
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--frontend", choices=["ast", "legacy"], default="ast")
     args = parser.parse_args()
-    result = compile(vector_source(N.dynamic("tasks")))
+    if args.frontend == "ast":
+        from ast_vector import scale
+
+        result = compile(scale)
+    else:
+        result = compile(vector_source(N.dynamic("tasks")))
     result.write(args.output)
     library = args.library
     if (args.offline or args.physical is not None) and library is None:

@@ -4,38 +4,40 @@
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
 2026-10-14 重新制定了[总体设计](docs/design.md)、[DSL 前端与 CV 多阶段规格](docs/dsl-multistage.md)
-和[重构计划](docs/refactor-plan.md)。规格中的受限 AST、嵌套符号循环和真实 FA
-迁移属于待实现目标。下方代码是现有原型 API，不能与新规格混用；当前工作树的
-单循环实验和历史证据见[重构记录](docs/refactor-progress.md)。
+和[重构计划](docs/refactor-plan.md)。受限 AST 已接通完整 tile 的单循环 Vector；
+嵌套符号同步和真实 FA 迁移尚未完成。新 `prim_func` 不执行设备函数体，遗留
+构造明确使用 `trace_func`。实现边界和历史证据见[重构记录](docs/refactor-progress.md)。
 
 当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
 源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
 实际同步。软件 stage、buffer versions 和硬件 event 资源各自独立。
 
 ```python
+from __future__ import annotations
 from xdsl_npu import language as N
 from xdsl_npu import compile
 
 @N.prim_func(disjoint_external=True)
-def scale(X: N.Tensor((4, 64), N.f32),
-          Y: N.Tensor((4, 64), N.f32, access="write")):
+def scale(X: N.Tensor((tiles, B), N.f32),
+          Y: N.Tensor((tiles, B), N.f32, access="write"),
+          tiles: N.int64, B: N.constexpr = 64):
     with N.Kernel(kind="vector"):
-        x = N.alloc_ub((64,), versions=2)
-        y = N.alloc_ub((64,), versions=2)
-        for t in N.Pipelined(4, stages=3):
+        x = N.alloc_ub((2, B), N.f32)
+        y = N.alloc_ub((2, B), N.f32)
+        for t in N.Pipelined(tiles, stages=3):
             with N.Stage(0, name="load"):
-                value = N.copy(X[t, :], x)
+                N.copy(X[t, :], x[t % 2, :])
             with N.Stage(1, name="compute"), N.Vector():
-                result = N.mul(value, 2.0, out=y)
+                N.mul(x[t % 2, :], 2.0, out=y[t % 2, :])
             with N.Stage(2, name="store"):
-                N.copy(result, Y[t, :])
+                N.copy(y[t % 2, :], Y[t, :])
 
 compiled = compile(scale)
 print(compiled.asc)
 print(compiled.report)
 ```
 
-CV 示例直接写 Stage0/Cube、Stage1/Vector、Stage1/Cube、Stage2/Vector。
+遗留 CV 示例直接写 Stage0/Cube、Stage1/Vector、Stage1/Cube、Stage2/Vector。
 两处 Stage1 是独立 region；Cube region 内仍有 MTE2、MTE1、Cube、Fixpipe 的
 各自最后读取和复用约束。静态内层预取拥有独立 clock，不把整个 CV task 改成
 一个扁平微步索引。具体语义、分段例子和设备结果见
@@ -57,7 +59,20 @@ Python 编译性能和目录重构的进度见 [重构记录](docs/refactor-prog
 
 ## 重现首个闭环
 
-在 `/workspace/xdsl-910b` 执行。新 DSL 的局部和双向 CV 闭环：
+在 `/workspace/xdsl-910b` 执行。AST 前端的向量闭环和包含前端的五次冷编译计时：
+
+```bash
+.venv/bin/python compiler/examples/ast_vector.py --output runs/refactor/ast-vector --shared
+.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_vector.py --entry scale --trials 5 --output runs/refactor/ast-vector-cold
+```
+
+设备运行前先检查全部卡；下例显式选择物理卡1，runner 再次检查：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/runtime_vector.py --frontend ast --output runs/refactor/ast-vector-device --library runs/refactor/ast-vector/scale.so --physical 1 --counts 0 1 2 4 4096 65536 262144
+```
+
+以下是显式 legacy 构造的局部和双向 CV 闭环：
 
 ```bash
 .venv/bin/python compiler/examples/multistage.py vector --count 4 --output runs/refactor/vector --shared

@@ -56,7 +56,7 @@ def test_cv_regions_share_stage_one_without_merging_their_semantics():
 def test_dynamic_python_if_is_rejected_instead_of_selecting_one_branch():
     with pytest.raises(TypeError, match="Python if"):
 
-        @N.prim_func
+        @N.trace_func
         def invalid(X: N.Tensor((2, 64), N.f32)):
             with N.Kernel():
                 for task in N.Pipelined(2, stages=1):
@@ -77,7 +77,7 @@ def test_stage_depth_does_not_silently_change_buffer_versions():
 def test_typed_copy_requires_an_explicit_rounding_conversion():
     with pytest.raises(CompileError, match="explicit cast"):
 
-        @N.prim_func
+        @N.trace_func
         def invalid(X: N.Tensor((1, 64), N.f32)):
             with N.Kernel():
                 output = N.alloc_ub((64,), N.f16)
@@ -131,7 +131,7 @@ def test_source_cv_preserves_shared_stage_and_actual_handoff(count):
 
 
 def test_a_logical_value_is_not_a_snapshot_of_overwritten_storage():
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def stale(X: N.Tensor((1, 64), N.f32), Y: N.Tensor((1, 64), N.f32, access="write")):
         with N.Kernel():
             x, y = N.alloc_ub((64,)), N.alloc_ub((64,))
@@ -147,7 +147,7 @@ def test_a_logical_value_is_not_a_snapshot_of_overwritten_storage():
 
 
 def test_nested_pipeline_result_preserves_the_producer_descriptor_and_slot():
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def nested(X: N.Tensor((2, 3, 64), N.f32), Y: N.Tensor((2, 64), N.f32, access="write")):
         with N.Kernel():
             x = N.alloc_ub((64,), versions=2, name="x")
@@ -176,7 +176,7 @@ def test_nested_pipeline_result_preserves_the_producer_descriptor_and_slot():
 
 
 def test_two_logical_values_may_share_one_root_with_disjoint_input_views():
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def slices(X: N.Tensor((1, 128), N.f32), Y: N.Tensor((1, 64), N.f32, access="write")):
         with N.Kernel():
             x, y = N.alloc_ub((128,)), N.alloc_ub((64,))
@@ -192,7 +192,7 @@ def test_two_logical_values_may_share_one_root_with_disjoint_input_views():
 def test_source_axis_bounds_are_checked_before_flattening_addresses():
     with pytest.raises(CompileError, match="logical axis"):
 
-        @N.prim_func
+        @N.trace_func
         def invalid(X: N.Tensor((2, 64), N.f32)):
             with N.Kernel():
                 x = N.alloc_ub((64,))
@@ -244,7 +244,7 @@ def test_segmented_cv_uses_inner_prefetch_and_complete_outer_handoffs(count, seg
 
 
 def test_unimplemented_runtime_initialization_is_rejected_explicitly():
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def invalid(A: N.Tensor((2, 16, 16), N.f16), B: N.Tensor((2, 16, 16), N.f16)):
         with N.Kernel(kind="cube"):
             a, b, c = N.alloc_l1((16, 16)), N.alloc_l1((16, 16)), N.alloc_l0c((16, 16))
@@ -298,7 +298,7 @@ def test_all_segment_contributions_precede_ready_and_an_early_ready_is_rejected(
 def test_incompatible_domain_is_rejected_without_silently_dropping_work():
     with pytest.raises(VerifyException, match="kernel kind"):
 
-        @N.prim_func
+        @N.trace_func
         def invalid(X: N.Tensor((1, 64), N.f32)):
             with N.Kernel(kind="vector"):
                 x = N.alloc_ub((64,))

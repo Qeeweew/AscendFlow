@@ -12,16 +12,26 @@ from statistics import median
 from time import perf_counter
 
 
-def worker(path, output):
+def worker(path, output, entry=None):
     started = perf_counter()
     from xdsl_npu import compile
     from xdsl_npu.ir import parse
 
     imported = perf_counter()
     source = path.read_text()
-    module = parse(source)
+    if entry is None:
+        module = parse(source)
+    else:
+        import runpy
+
+        from xdsl_npu.frontend import PrimFunction
+
+        module = runpy.run_path(str(path))[entry]
+        if not isinstance(module, PrimFunction):
+            raise TypeError("--entry must name a captured AST prim_func")
     parsed = perf_counter()
     result = compile(module)
+    finished = perf_counter()
     timings = result.timings
     reuse = []
     for _ in range(100):
@@ -42,14 +52,18 @@ def worker(path, output):
         "asc_sha256": hashlib.sha256(result.asc.encode()).hexdigest(),
         "import_s": imported - started,
         "parse_s": parsed - imported,
+        "frontend_to_asc_s": finished - imported,
+        "input_kind": "serialized_ir" if entry is None else "python_ast_definition",
+        "entry": entry,
         "compilation": timings,
         "reuse_median_s": median(reuse),
         "reuse_max_s": max(reuse),
+        "reuse_scope": "immutable artifact property access, not a compilation cache hit",
         "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "verification": result.report,
         "python": sys.version,
         "machine": platform.machine(),
-        "scope": "fresh Python process; complete final physical verification; no cProfile, CANN, or NPU timing",
+        "scope": "fresh process; input reading/construction through final physical verification and ASC; import/CANN separate",
     }
 
 
@@ -57,14 +71,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument(
+        "--entry", help="AST prim_func in a Python input module; no device body execution"
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker:
-        print(json.dumps(worker(args.input[0], args.output)))
+        print(json.dumps(worker(args.input[0], args.output, args.entry)))
         return
-    if args.trials < 3:
-        parser.error("at least three independent trials required")
+    if args.trials < 5:
+        parser.error("at least five independent trials required")
     args.output.mkdir(parents=True, exist_ok=True)
     cases = []
     for number, source in enumerate(args.input):
@@ -80,8 +97,10 @@ def main():
                     str(source.resolve()),
                     "--output",
                     str((args.output / f"case-{number}-trial-{trial}").resolve()),
-                ],
+                ]
+                + ([] if args.entry is None else ["--entry", args.entry]),
                 text=True,
+                timeout=60,
             )
             result = json.loads(raw)
             result["process_wall_s"] = perf_counter() - start
@@ -93,14 +112,16 @@ def main():
             "trials": trials,
             "total_median_s": median(trial["compilation"]["total_s"] for trial in trials),
             "total_max_s": max(trial["compilation"]["total_s"] for trial in trials),
+            "frontend_to_asc_median_s": median(trial["frontend_to_asc_s"] for trial in trials),
+            "frontend_to_asc_max_s": max(trial["frontend_to_asc_s"] for trial in trials),
             "reuse_max_s": max(trial["reuse_max_s"] for trial in trials),
             "peak_rss_kib": max(trial["peak_rss_kib"] for trial in trials),
         }
         cases.append(record)
         (args.output / "benchmark.json").write_text(json.dumps(cases, indent=2) + "\n")
         print(
-            f"{source.parent.name}: median {record['total_median_s']:.4f}s, "
-            f"max {record['total_max_s']:.4f}s, RSS {record['peak_rss_kib']} KiB",
+            f"{source.name}: input-to-ASC median {record['frontend_to_asc_median_s']:.4f}s, "
+            f"max {record['frontend_to_asc_max_s']:.4f}s, RSS {record['peak_rss_kib']} KiB",
             flush=True,
         )
 

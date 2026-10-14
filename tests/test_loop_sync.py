@@ -209,7 +209,7 @@ def test_candidate_pruning_builds_three_graphs_not_one_per_candidate(monkeypatch
 def test_guarded_prefix_graph_has_linear_edges_in_template_count(width):
     count = N.dynamic("tasks")
 
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def chain(X: N.Tensor((count, 64), N.f32), Y: N.Tensor((count, 64), N.f32, access="write")):
         with N.Kernel():
             inputs, outputs = N.alloc_ub((64,), versions=2), N.alloc_ub((64,), versions=2)
@@ -271,7 +271,7 @@ def test_war_records_last_reader_not_logical_result_completion():
 def test_nested_runtime_loop_is_diagnosed_instead_of_expanded():
     tasks = N.dynamic("tasks")
 
-    @N.prim_func(disjoint_external=True)
+    @N.trace_func(disjoint_external=True)
     def nested(X: N.Tensor((tasks, 64), N.f32)):
         with N.Kernel():
             ub = N.alloc_ub((64,))

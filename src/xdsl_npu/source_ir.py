@@ -187,8 +187,8 @@ class PipelineOp(IRDLOperation):
             raise VerifyException(
                 "fixed pipeline needs bounded count/stage horizon and source order"
             )
-        if self.limit is not None and not isinstance(self.limit.owner, SizeOp):
-            raise VerifyException("runtime pipeline length must be a uniform SSA size parameter")
+        # Arithmetic bounds stay in source SSA. Target lowering must separately
+        # prove uniformity/range and reject unsupported expressions.
         if len(self.body.block.args) != 1 or not isinstance(
             self.body.block.args[0].type, IndexType
         ):

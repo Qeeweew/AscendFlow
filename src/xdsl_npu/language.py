@@ -1,7 +1,7 @@
-"""Tile-style typed source construction with explicit software stage regions.
+"""Tile-style DSL declarations and shared typed operation builders.
 
-Python iterates a symbolic pipeline body once. Static Python policy remains
-ordinary Python; execution coordinates become xDSL region arguments.
+prim_func captures restricted Python AST. trace_func is the explicit legacy
+constructor, retained for migration/reference tests, never a parser fallback.
 """
 
 import inspect
@@ -40,6 +40,14 @@ class DType(StrEnum):
 
 
 f32, f16, bf16 = DType.F32, DType.F16, DType.BF16
+
+
+class _ParameterType(StrEnum):
+    INT64 = "int64"
+    CONSTEXPR = "constexpr"
+
+
+int64, constexpr = _ParameterType.INT64, _ParameterType.CONSTEXPR
 
 
 def _ints(values):
@@ -199,6 +207,7 @@ class _Trace:
         self.kernel_entered = False
         self.counter = 0
         self.sizes = {}
+        self.location = None
 
     def size(self, dimension):
         if dimension.name not in self.sizes:
@@ -209,6 +218,8 @@ class _Trace:
                     "multiple": IntAttr(dimension.multiple),
                 },
             )
+            if self.location is not None:
+                op.location = self.location
             block = self.op.body.block
             if block.first_op is None:
                 block.add_op(op)
@@ -220,6 +231,8 @@ class _Trace:
         return op.value
 
     def add(self, op):
+        if self.location is not None:
+            op.location = self.location
         self.blocks[-1].add_op(op)
         return op
 
@@ -272,7 +285,7 @@ class _Trace:
 
 def _trace():
     trace = _current.get()
-    require(trace is not None, "source operations require @prim_func tracing")
+    require(trace is not None, "source operations require DSL construction")
     return trace
 
 
@@ -362,7 +375,6 @@ class _View:
 
     def emit(self):
         trace, buffer = _trace(), self.buffer
-        require(trace.pipelines, "executable views require a Pipelined task region")
         bound = self.bound()
         offset = bound.offset
         if buffer.versions > 1:
@@ -431,6 +443,8 @@ def _view(value):
 
 
 def _index_bounds(index):
+    from xdsl.dialects import arith, scf
+
     index, trace = _trace().resolve_index(index), _trace()
     lo = hi = index.constant
     for value, coefficient, divisor, modulus in index.terms:
@@ -443,6 +457,18 @@ def _index_bounds(index):
                 count = divisor * modulus
             else:
                 count = max(1, region.count.data)
+        elif isinstance(region, scf.ForOp):
+            lower = region.lb.owner
+            require(
+                isinstance(lower, arith.ConstantOp) and lower.value.value.data == 0,
+                "serial view bounds currently require a zero lower bound",
+            )
+            upper = region.ub.owner
+            if isinstance(upper, arith.ConstantOp):
+                count = max(1, upper.value.value.data)
+            else:
+                require(modulus > 0, "runtime serial index on a static axis needs modulo")
+                count = divisor * modulus
         else:
             require(isinstance(region, DomainOp), "unknown source index scope")
             count = 2 if region.kind.data == "vector" and trace.op.kind.data == "mixed" else 1
@@ -665,6 +691,26 @@ class Pipelined:
 
 
 def prim_func(function=None, *, disjoint_external=False):
+    """Capture a device function without executing its body."""
+    from .frontend import capture
+
+    def decorate(func):
+        return capture(func, disjoint_external=disjoint_external)
+
+    return decorate if function is None else decorate(function)
+
+
+def from_source(source, *, constants=None, filename="<dsl>", disjoint_external=False):
+    from .frontend import from_source as parse_source
+
+    return parse_source(
+        source, constants=constants, filename=filename, disjoint_external=disjoint_external
+    )
+
+
+def trace_func(function=None, *, disjoint_external=False):
+    """Explicit legacy tracing API; new programs should use prim_func."""
+
     def decorate(func):
         trace = _Trace(func.__name__, disjoint_external)
         token = _current.set(trace)

@@ -348,12 +348,17 @@ def dump(module: ModuleOp) -> str:
 
 
 def parse(text: str) -> ModuleOp:
+    from xdsl.dialects.arith import Arith
+    from xdsl.dialects.scf import Scf
+
     from .source_ir import SOURCE
 
     ctx = Context()
     ctx.load_dialect(Builtin)
     ctx.load_dialect(NPU)
     ctx.load_dialect(SOURCE)
+    ctx.load_dialect(Arith)
+    ctx.load_dialect(Scf)
     module = Parser(ctx, text).parse_module()
     module.verify()
     return module
