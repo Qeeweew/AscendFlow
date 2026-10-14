@@ -13,6 +13,11 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 一般多层CV同步和真实FA迁移尚未完成。新 `prim_func` 不执行设备函数体，遗留
 构造明确使用 `trace_func`。实现边界和历史证据见[重构记录](docs/refactor-progress.md)。
 
+新的[FA目标源码](docs/attention-target.md)已将嵌套/连续两种组织、真实online
+数学及声明存储固定在examples，仍是明确拒绝编译的设计fixture。
+[顺序区域访问组合](docs/region-sequence.md)已实现精确frontier与开放义务；
+一般前后工作、完成/事件协议和代码生成仍待接通，不能仅凭访问分析宣布支持。
+
 两个独立长度参数、`ceildiv` 循环和有效前缀的可运行例子见
 [ast_prefix.py](examples/ast_prefix.py)；实际同步、拒绝条件和设备命令见
 [运行时尾部](docs/runtime-prefix.md)。

@@ -1,5 +1,25 @@
 # 重构的验证记录
 
+## P0目标源码与P1顺序访问组合
+
+在 `fafeea3` 上增加[真实FA目标源码](attention-target.md)：BNSD、BK1024、
+Cube128子块、Vector8行、FP32 online状态、P舍入与reciprocal+mul输出。
+嵌套与连续task组织共用数学主体；实例仍明确拒绝编译，不走legacy。12项
+fixture检查覆盖源码、每actor声明容量、空域和跨query激活表；不是FA数值/
+设备测试。独立同policy AscendC仍待完成，P0未全部验收。
+
+新增[顺序区域访问分析](region-sequence.md)，保留真实allocation/bound的SSA
+身份、各区域独立generation、开放初始化义务和全部reader families。零child
+是恒等转换；精确孔洞及独立29/31周期不被合并；固定百万次child不展开。
+组合输出RAW/WAR/WAW，尚未生成跨区域完成协议，不能当作一般region已可运行。
+
+最终结构/组合/既有父子相关92项回归通过（12.75秒），包含独立有限逐字节
+oracle、随机区域组合、末代writer、预算/取消和scope反例。原父子与K归约
+最终ASC的hash继续匹配既有设备/profiling产物；没有新增设备或性能测量。
+新目标源码/有限表在外层 `runs/refactor/attention-target/`，原ASC核对记录在
+`runs/refactor/region-sequence/source-checks.json`。下一步将真实前后工作接入
+物理region和完成/事件边界；只读共享GM与一般组合的代码生成仍未接通。
+
 ## 设计重审：基线 b98d541，后续按 P0–P5 推进
 
 本次按用户要求重写[总体设计](design.md)、[DSL规格](dsl-multistage.md)和

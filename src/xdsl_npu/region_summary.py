@@ -14,6 +14,9 @@ from bisect import bisect_left
 from dataclasses import dataclass
 from math import gcd
 
+from xdsl.ir import SSAValue
+
+from .ir import BufferOp
 from .loop_model import access_cells, slope
 from .model import require
 from .scalar import Expr
@@ -191,6 +194,10 @@ class RegionSummary:
     visits: int
     bound: Expr | None
     constant_count: int | None
+    # Actual allocation identities, not textual buffer names. Region composition
+    # must not merge two private buffers just because their printed names match.
+    origins: tuple[tuple[str, SSAValue], ...] = ()
+    bound_value: SSAValue | None = None
 
     def for_count(self, count):
         require(count >= 0, "negative invocation length")
@@ -353,4 +360,20 @@ def summarize_reused_storage(loop, roots):
                         final_pending if final_last is not None else spans + final_pending,
                     ),
                 )
-    return RegionSummary(roots, tuple(summaries), visits, loop.bound, loop.constant_count)
+    origins = {}
+    for actor, data in loop.actors.items():
+        for op in data.kernel.body.block.ops:
+            if isinstance(op, BufferOp):
+                root = op.sym_name.data if op.external.data else actor + "/" + op.sym_name.data
+                if root in roots:
+                    origins[root] = op.ref
+    require(set(origins) == set(roots), "region summary needs actual stationary allocation roots")
+    return RegionSummary(
+        roots,
+        tuple(summaries),
+        visits,
+        loop.bound,
+        loop.constant_count,
+        tuple(origins.items()),
+        next(iter(loop.actors.values())).stream.limit if loop.constant_count is None else None,
+    )
