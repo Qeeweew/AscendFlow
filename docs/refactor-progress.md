@@ -1,5 +1,19 @@
 # 重构的验证记录
 
+## R2a进行中：多维源地址、内存与event调用边界
+
+在 `5c49ab3` 上增加真实父output×子K的AST源码，保留两个runtime轴及共享的
+uniform地址乘积。实现精确cell的入口/出口frontier、跨调用RAW/WAR/WAW义务及
+每bank/ID的末次Wait→首次Set义务；均以静态周期构造，不枚举runtime长度。
+增加row×residue materialization之前的fragment预算，防止少量view隐藏巨大访问集合。
+最终相关256项回归通过（67.39秒）；既有K子程序5次冷编译p50=0.2376秒，
+最终ASC与此前设备profiling源码一致。这些不是父流水的编译/设备验收。
+
+实现、复杂度、有限独立oracle和当前拒绝范围见[调用边界](hierarchy-boundaries.md)。
+父物理IR、GM frame ownership、父层完成/资源规划及设备验收仍未接通；当前
+`compile(hierarchical_gemm)`明确拒绝，不能把摘要当作已验证完整父子流水。
+下一步继续这些项目，不恢复算子调参，也不另加单层算子代替R2a。
+
 ## 设计再次审视：以872bf6e为已保存基线
 
 重写[总体设计](design.md)与[实施计划](refactor-plan.md)，补充[DSL规格](dsl-multistage.md)

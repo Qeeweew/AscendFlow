@@ -82,6 +82,8 @@ class _Dimension:
     scale: int = 1
 
     def __mul__(self, factor):
+        if isinstance(factor, (_Dimension, _ExtentProduct)):
+            return _extent_product(self, factor)
         require(
             type(factor) is int and factor >= 0,
             "one runtime extent times a static integer required",
@@ -92,6 +94,36 @@ class _Dimension:
 
     def __bool__(self):
         raise TypeError("runtime lengths cannot control Python branches")
+
+
+@dataclass(frozen=True)
+class _ExtentProduct:
+    """Uniform row-major stride, with the static byte coefficient kept separate.
+
+    This is a source address expression, not a flattened loop coordinate. Its
+    factors become a shared arith.muli DAG in the program's parameter scope.
+    """
+
+    factors: tuple[_Dimension, ...]
+    scale: int = 1
+
+    def __mul__(self, factor):
+        if type(factor) is int:
+            return 0 if factor == 0 else replace(self, scale=self.scale * factor)
+        require(isinstance(factor, (_Dimension, _ExtentProduct)), "unsupported extent product")
+        return _extent_product(self, factor)
+
+    __rmul__ = __mul__
+
+
+def _extent_product(left, right):
+    factors = tuple(
+        replace(dimension, scale=1)
+        for part in (left, right)
+        for dimension in (part.factors if isinstance(part, _ExtentProduct) else (part,))
+    )
+    require(len(factors) <= 8, "tensor address exceeds eight dynamic stride factors")
+    return _ExtentProduct(tuple(sorted(factors, key=lambda d: d.name)), left.scale * right.scale)
 
 
 def dynamic(name, *, multiple_of=1):
@@ -133,8 +165,11 @@ class _Index:
     __radd__ = __add__
 
     def __mul__(self, factor):
-        require(type(factor) is int or isinstance(factor, _Dimension), "unsupported index product")
-        if isinstance(factor, _Dimension):
+        require(
+            type(factor) is int or isinstance(factor, (_Dimension, _ExtentProduct)),
+            "unsupported index product",
+        )
+        if isinstance(factor, (_Dimension, _ExtentProduct)):
             constant = _index(self.constant * factor) if self.constant else _Index()
             return constant + _Index(tuple((v, factor * c, d, m) for v, c, d, m in self.terms))
         return _Index(
@@ -187,7 +222,7 @@ class _Index:
 def _index(value):
     if isinstance(value, _Index):
         return value
-    if isinstance(value, _Dimension):
+    if isinstance(value, (_Dimension, _ExtentProduct)):
         return _Index(((_trace().size(value), value.scale, 1, 0),))
     require(type(value) is int, "tensor indices must be static integers or pipeline coordinates")
     return _Index(constant=value)
@@ -219,9 +254,31 @@ class _Trace:
         self.kernel_entered = False
         self.counter = 0
         self.sizes = {}
+        self.products = {}
         self.location = None
 
     def size(self, dimension):
+        if isinstance(dimension, _ExtentProduct):
+            from xdsl.dialects import arith
+
+            factors = dimension.factors
+            if factors not in self.products:
+                lhs = self.size(factors[0])
+                for end in range(2, len(factors) + 1):
+                    key = factors[:end]
+                    if key not in self.products:
+                        op = arith.MuliOp(lhs, self.size(factors[end - 1]))
+                        if self.location is not None:
+                            op.location = self.location
+                        previous = (
+                            list(self.products.values())[-1].owner
+                            if self.products
+                            else list(self.sizes.values())[-1]
+                        )
+                        self.op.body.block.insert_op_after(op, previous)
+                        self.products[key] = op.result
+                    lhs = self.products[key]
+            return self.products[factors]
         if dimension.name not in self.sizes:
             op = SizeOp.create(
                 result_types=[IndexType()],
@@ -267,7 +324,7 @@ class _Trace:
         """An exported tile keeps its producer's descriptor and storage version."""
         result = _Index(constant=index.constant)
         for value, coefficient, divisor, modulus in index.terms:
-            if isinstance(value.owner, SizeOp):
+            if isinstance(value.owner, SizeOp) or value in self.products.values():
                 result += _Index(((value, coefficient, divisor, modulus),))
                 continue
             if value.owner in self.blocks:
@@ -404,7 +461,7 @@ class _View:
         variables = list(dict.fromkeys(v for v, _, _, _ in offset.terms))
         dynamic_terms, static_terms = [], []
         for variable, coefficient, divisor, modulus in offset.terms:
-            if isinstance(coefficient, _Dimension):
+            if isinstance(coefficient, (_Dimension, _ExtentProduct)):
                 count = trace.size(coefficient)
                 if count not in variables:
                     variables.append(count)
@@ -424,6 +481,10 @@ class _View:
                     _ints((variables.index(variable), coefficient, divisor, modulus))
                 )
         terms = ArrayAttr(static_terms)
+        require(
+            all(type(stride) is int for stride in self.strides),
+            "a native tile needs static inner strides; select runtime axes before the tile",
+        )
         valid_attrs = {}
         if valid is not None:
             require(
@@ -517,11 +578,24 @@ def _runtime_axis(index, dimension, width):
         )
         variable, coefficient, divisor, modulus = index.terms[0]
         pipeline = variable.owner.parent_op()
-        require(
-            isinstance(pipeline, PipelineOp) and pipeline.limit is not None,
-            "runtime tile view requires its pipeline bound",
-        )
-        bound = from_ssa(pipeline.limit)
+        from xdsl.dialects import arith, scf
+
+        if isinstance(pipeline, scf.ForOp):
+            require(
+                isinstance(pipeline.lb.owner, arith.ConstantOp)
+                and pipeline.lb.owner.value.value.data == 0
+                and isinstance(pipeline.step.owner, arith.ConstantOp)
+                and pipeline.step.owner.value.value.data == 1,
+                "runtime tensor axis requires a zero-based unit-step serial coordinate",
+            )
+            limit = pipeline.ub
+        else:
+            require(
+                isinstance(pipeline, PipelineOp) and pipeline.limit is not None,
+                "runtime tile view requires its pipeline bound",
+            )
+            limit = pipeline.limit
+        bound = from_ssa(limit)
         extent = from_ssa(trace.size(dimension))
         if (coefficient, divisor, modulus) == (width, 1, 0) and (
             bound == extent
@@ -608,8 +682,8 @@ def _allocate(
     axes = [i for i, n in enumerate(shape) if isinstance(n, _Dimension)]
     require(not axes or memory == "GM", "local native tile shapes must be static")
     require(
-        len(axes) <= 1 and all(shape[i].scale == 1 for i in axes),
-        "one unscaled runtime tensor axis currently required",
+        len(axes) <= 8 and all(shape[i].scale == 1 for i in axes),
+        "at most eight unscaled runtime tensor axes required",
     )
     dtype = DType(dtype)
     name = name or trace.name(memory.lower())

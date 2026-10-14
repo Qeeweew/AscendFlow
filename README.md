@@ -32,6 +32,10 @@ ASC 对照、有限逐字节反例、冷编译和大长度设备验证；嵌套�
 接通首代清零和末代一次 Fixpipe，960 MiB固定例已对照 AscendC/profiling；
 它仍是单层流，父子流水和跨调用生命周期尚待实现。
 
+R2a已加入[父输出×子K的源程序](examples/ast_hierarchical_gemm.py)与
+[调用边界分析](docs/hierarchy-boundaries.md)：多runtime轴地址、最后读取和event
+跨调用义务可以参数化表达；父层同步物化仍未接通，该例目前只生成源IR。
+
 当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
 源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
 实际同步。软件 stage、buffer versions 和硬件 event 资源各自独立。

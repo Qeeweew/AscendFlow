@@ -280,6 +280,18 @@ class ViewOp(IRDLOperation):
     ref = result_def(TensorType)
 
     def verify_(self):
+        from xdsl.dialects import arith
+
+        def extent_factors(value, depth=0):
+            owner = value.owner
+            if isinstance(owner, SizeOp):
+                return (owner.parent_op(),)
+            if isinstance(owner, arith.MuliOp) and depth < 8:
+                left, right = (extent_factors(v, depth + 1) for v in owner.operands)
+                if left and right and all(root is owner.parent_op() for root in left + right):
+                    return left + right if len(left) + len(right) <= 8 else ()
+            return ()
+
         if self.valid_index is not None and not 0 <= self.valid_index.data < len(self.indices):
             raise VerifyException("valid prefix must bind an actual index SSA operand")
         if (
@@ -307,7 +319,7 @@ class ViewOp(IRDLOperation):
             if (
                 not 0 <= index < len(self.indices)
                 or not 0 <= size < len(self.indices)
-                or not isinstance(self.indices[size].owner, SizeOp)
+                or not extent_factors(self.indices[size])
                 or divisor <= 0
                 or modulus < 0
             ):
