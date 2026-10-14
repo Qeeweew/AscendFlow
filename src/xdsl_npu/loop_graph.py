@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from .ir import EndOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
 from .model import require
+from .periodic import MAX_PERIOD_TEMPLATES, MAX_PROOF_STATES
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,9 @@ class Graph:
         self.domains = {}
         self.potentials = None
         self._arcs = set()
+        self.domain_states = 0
+        self.domain_edges = 0
+        self.path_queries = 0
 
     def node(self, command, residue, point, *, guard=None):
         key = command.index, residue, point
@@ -164,12 +168,24 @@ class Graph:
         if self.potentials is None:
             self.potential()
         stride, ranks = self.potentials
-        states = []
+        bounds = []
+        count = 0
         for node, meta in enumerate(self.nodes):
             difference = meta.residue - residue
             lower = -((first + difference - meta.lower) // self.period)
             upper = (gap - meta.upper - difference) // self.period
-            states.extend((node, cycle) for cycle in range(lower, upper + 1))
+            count += max(0, upper - lower + 1)
+            bounds.append((node, lower, upper))
+        require(
+            self.domain_states + count <= MAX_PROOF_STATES,
+            f"completion proof state budget exceeded: cached={self.domain_states}, "
+            f"requested={count}, limit={MAX_PROOF_STATES}, period={self.period}, "
+            f"nodes={len(self.nodes)}, first={first}, upper_gap={gap}; "
+            "no expansion or serialization fallback",
+        )
+        states = [
+            (node, cycle) for node, lower, upper in bounds for cycle in range(lower, upper + 1)
+        ]
         states.sort(key=lambda state: state[1] * stride + ranks[state[0]])
         index = {state: i for i, state in enumerate(states)}
         successors = [[] for _ in states]
@@ -185,6 +201,8 @@ class Graph:
                     predecessors[target].append(i)
             successors[i].sort()
         value = Domain(index, successors, predecessors, {})
+        self.domain_states += len(states)
+        self.domain_edges += sum(len(arcs) for arcs in successors)
         self.domains[key] = value
         return value
 
@@ -194,12 +212,16 @@ class Graph:
         source_g,
         destination_command,
         destination_g,
+        minimum=0,
         *,
         omitted=(),
         _shorten=True,
     ):
+        self.path_queries += 1
         p = self.period
-        first = max(destination_command.lower, source_command.lower - (source_g - destination_g))
+        first = max(
+            minimum, destination_command.lower, source_command.lower - (source_g - destination_g)
+        )
         residue = destination_g % p
         first += (residue - first) % p
         gap = max(destination_command.upper, source_command.upper + source_g - destination_g)
@@ -303,6 +325,7 @@ class Graph:
 
 
 def channels(loop, *, virtual=False):
+    protocol_period = loop.protocol_period
     result = {}
     tasks = {
         (actor, task.uid): task
@@ -346,7 +369,7 @@ def channels(loop, *, virtual=False):
         ids = tuple(v.data for v in op.event_ids)
         require(
             period > 0
-            and loop.period % period == 0
+            and protocol_period % period == 0
             and residues == tuple(sorted(set(residues)))
             and residues
             and all(0 <= r < period for r in residues)
@@ -370,6 +393,7 @@ def channels(loop, *, virtual=False):
 
 
 def commands(loop, channel_map):
+    protocol_period = loop.protocol_period
     result, endpoints, native = {}, {}, {}
     number = 0
     for actor, data in loop.actors.items():
@@ -407,7 +431,7 @@ def commands(loop, channel_map):
                 period, residues = operation.period.data, tuple(v.data for v in operation.residues)
                 require(
                     period > 0
-                    and loop.period % period == 0
+                    and protocol_period % period == 0
                     and residues == tuple(sorted(set(residues)))
                     and residues
                     and all(0 <= r < period for r in residues),
@@ -502,8 +526,14 @@ def completion_graph(loop, channel_map):
     a pure prefix cannot retain that Wait's controller gate.
     """
     sequences, endpoints, native = commands(loop, channel_map)
-    graph = Graph(loop.period, loop.constant_count)
-    period = loop.period
+    period = loop.protocol_period
+    count = sum(len(sequence) for sequence in sequences.values())
+    require(
+        period * count <= MAX_PERIOD_TEMPLATES,
+        f"protocol residue/command budget exceeded (period={period}, commands={count}); "
+        "no serialization fallback",
+    )
+    graph = Graph(period, loop.constant_count)
     for actor, sequence in sequences.items():
         maximum = max(command.task.stage for command in sequence)
         timeline = []

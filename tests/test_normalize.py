@@ -42,7 +42,7 @@ def test_reduction_keeps_numeric_order_and_exact_scratch_footprint(artifact):
     capture = next(task for task in tasks if task.native == "scalar_load")
     assert merge.refs[-1].nbytes == capture.refs[0].nbytes == 4
     assert merge.refs[0].nbytes == 256
-    assert artifact.report["scalar_capture_queries"] == 2
+    assert artifact.report["scalar_capture_queries"] == artifact.report["protocol_period"]
     assert "rsqrt(" not in artifact.asc
 
 

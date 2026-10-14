@@ -768,14 +768,14 @@ def _check_loop_values(physical, actors, outer):
                 native_index = 0 if isinstance(record.op, MatmulOp) and index < 2 else index
                 ref = task.refs[native_index]
                 root_name = loop.root(owner, ref)
-                for r in range(loop.period):
+                for r in range(loop.storage_periods[root_name]):
                     produced = [
                         (o.start, o.stop)
                         for o in raw
                         if o.source == candidates[0]
                         and o.destination == (owner, read_uid)
                         and o.distance == 0
-                        and r in o.residues
+                        and r % o.period in o.residues
                         and o.storage == root_name
                     ]
                     frame = loop.frames.get(root_name, 0)

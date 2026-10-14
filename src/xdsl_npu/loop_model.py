@@ -39,6 +39,7 @@ from .model import (
     round_f32,
     storage_layout,
 )
+from .periodic import MAX_PERIOD_TEMPLATES, bounded_period
 from .scalar import ARITHMETIC, Expr, bounded_by, expression, from_ssa, literal, uniform
 
 
@@ -70,10 +71,18 @@ class Loop:
     roots: dict[str, BufferOp]
     size: RuntimeSizeOp | None
     constant_count: int | None
-    period: int
+    storage_periods: dict[str, int]
     frames: dict[str, int]
     parameters: tuple[RuntimeSizeOp, ...]
     bound: Expr | None
+
+    @property
+    def protocol_period(self):
+        period = 1
+        for op in self.op.walk():
+            if isinstance(op, (LoopChannelOp, LoopSyncOp)):
+                period = bounded_period(lcm(period, op.period.data), "synchronization predicates")
+        return period
 
     @property
     def groups(self):
@@ -476,7 +485,7 @@ def extract_loop(module):
         kernels = [("aic" if op.core.data == "aic" else "aiv0", op)]
     actors, all_views = {}, {}
     constants = set()
-    period = 1
+    storage_periods, view_counts = {}, {}
     for name, kernel in kernels:
         actor, views = _actor(name, kernel, shared, limit, groups, uniform_values)
         actors[name] = actor
@@ -484,9 +493,13 @@ def extract_loop(module):
             constants.add(actor.stream.count.data)
         all_views[name] = views
         for ref in views.values():
+            root = ref.storage.name if ref.storage.external else name + "/" + ref.storage.name
+            period = storage_periods.setdefault(root, 1)
+            view_counts[root] = view_counts.get(root, 0) + 1
             for _, stride, modulus, divisor in ref.terms:
                 if stride and modulus:
-                    period = lcm(period, modulus * divisor)
+                    period = bounded_period(lcm(period, modulus * divisor), f"storage {root}")
+            storage_periods[root] = period
     require(
         len(constants) <= 1 and (limit is not None or len(constants) == 1),
         "all actors need the same loop bound",
@@ -494,8 +507,9 @@ def extract_loop(module):
     constant = next(iter(constants)) if constants else None
     require(constant is None or constant >= 0, "negative static loop bound")
     require(
-        period <= 840 and period * sum(len(a.program.tasks) for a in actors.values()) <= 65536,
-        "periodic template budget exceeded; no finite-length fallback",
+        sum(p * view_counts[root] for root, p in storage_periods.items()) <= MAX_PERIOD_TEMPLATES,
+        f"storage residue/access budget exceeded ({storage_periods}, views={view_counts}); "
+        "no finite-length fallback",
     )
     loop = Loop(
         op,
@@ -503,7 +517,7 @@ def extract_loop(module):
         roots,
         size,
         constant,
-        period,
+        storage_periods,
         {},
         tuple(sizes),
         None if limit is None else uniform_values[limit],
@@ -526,6 +540,7 @@ def _check_prefixes(loop, all_views):
         for ref in views.values():
             by_root.setdefault(loop.root(actor, ref), []).append(ref)
     for root, refs in by_root.items():
+        period = loop.storage_periods[root]
         clipped = [ref for ref in refs if ref.prefix_extent is not None]
         if not clipped:
             continue
@@ -553,7 +568,7 @@ def _check_prefixes(loop, all_views):
                 f"{root}: prefix aliases require equal cell extent, dtype and clipping",
             )
             require(
-                all(ref.address(r) % ref.nbytes == 0 for r in range(loop.period)),
+                all(ref.address(r) % ref.nbytes == 0 for r in range(period)),
                 f"{root}: clipped aliases must select whole aligned cells",
             )
             if ref.storage.external:
@@ -566,7 +581,7 @@ def _check_prefixes(loop, all_views):
                     and ref.storage.extent is not None
                     and bounded_by(ref.prefix_extent, ref.storage.extent)
                     and slope(ref) == ref.nbytes
-                    and all(ref.address(r) == r * ref.nbytes for r in range(loop.period)),
+                    and all(ref.address(r) == r * ref.nbytes for r in range(period)),
                     f"{root}: clipped GM view needs a bounded contiguous stream and one owner",
                 )
     for data in loop.actors.values():
@@ -614,6 +629,7 @@ def _check_accesses(loop, all_views):
         for ref in views.values():
             refs_by_root.setdefault(loop.root(actor, ref), []).append(ref)
     for root, refs in refs_by_root.items():
+        period = loop.storage_periods[root]
         storage = refs[0].storage
         drift = {slope(ref) for ref in refs}
         if root in writes and storage.external and any(drift):
@@ -667,9 +683,7 @@ def _check_accesses(loop, all_views):
                 for ref in refs
             }
             require(len(shifts) == 1, f"{root}: ring translations disagree")
-            used = [
-                (lo, hi) for ref in refs for r in range(loop.period) for lo, hi in ref.segments(r)
-            ]
+            used = [(lo, hi) for ref in refs for r in range(period) for lo, hi in ref.segments(r)]
             from .model import verify_translated_owners
 
             verify_translated_owners(
@@ -688,7 +702,7 @@ def _check_accesses(loop, all_views):
             require(ref.nbytes % itemsize == 0, "view extent does not match its dtype")
             for core in range(loop.groups if storage.external else 1):
                 coefficient = ref.count_offset + ref.count_core_stride * core
-                for r in range(loop.period):
+                for r in range(period):
                     parts = ref.segments(r, core)
                     if ref.prefix_extent is not None and storage.external:
                         pass  # The upper address is min((g+1)*tile, raw_extent), not padded.
@@ -711,7 +725,7 @@ def _check_accesses(loop, all_views):
                             f"{root}: periodic access exceeds its allocation",
                         )
                     elif r < loop.constant_count:
-                        last = r + (loop.constant_count - 1 - r) // loop.period * loop.period
+                        last = r + (loop.constant_count - 1 - r) // period * period
                         require(
                             all(hi <= storage.nbytes for _, hi in ref.segments(last, core)),
                             f"{root}: affine static bound exceeds allocation",
@@ -735,6 +749,7 @@ def _check_accesses(loop, all_views):
     for actor, data in loop.actors.items():
         views = all_views[actor]
         for value, ref in views.items():
+            period = loop.storage_periods[loop.root(actor, ref)]
             parent = views.get(value.owner.source)
             if parent:
                 require(
@@ -744,19 +759,20 @@ def _check_accesses(loop, all_views):
                 require(
                     all(
                         ranges_cover(parent.segments(r, core), ref.segments(r, core))
-                        for r in range(loop.period)
+                        for r in range(period)
                         for core in range(loop.groups if ref.storage.external else 1)
                     ),
                     "nested view exceeds actual parent rows/holes",
                 )
         for task in data.program.tasks:
             for ref in task.refs:
+                period = loop.storage_periods[loop.root(actor, ref)]
                 alignment = 4 if task.pipe == "S" else 32
                 require(
                     (ref.count_offset % alignment == ref.count_core_stride % alignment == 0)
                     and all(
                         lo % alignment == 0
-                        for r in range(loop.period)
+                        for r in range(period)
                         for core in range(loop.groups if ref.storage.external else 1)
                         for lo, _ in ref.segments(r, core)
                     ),
@@ -764,7 +780,7 @@ def _check_accesses(loop, all_views):
                 )
                 if task.pipe in {"M", "MTE1", "FIX"} and not ref.storage.external:
                     require(
-                        all(ref.address(r) % 512 == 0 for r in range(loop.period)),
+                        all(ref.address(r) % 512 == 0 for r in range(period)),
                         f"{task.uid}: Cube local origin needs 512-byte alignment",
                     )
             if task.pipe == "V":
@@ -772,11 +788,12 @@ def _check_accesses(loop, all_views):
                 for ref in task.refs[:-1]:
                     if ref.storage != destination.storage:
                         continue
+                    period = loop.storage_periods[loop.root(actor, ref)]
                     require(
                         all(
                             ref.segments(r) == destination.segments(r)
                             or not ranges_overlap(ref.segments(r), destination.segments(r))
-                            for r in range(loop.period)
+                            for r in range(period)
                         ),
                         f"{task.uid}: shifted in-place Vector alias",
                     )
@@ -797,20 +814,32 @@ def loop_dependencies(loop):
         for owner, (actor, data) in enumerate(loop.actors.items())
         for index, task in enumerate(data.program.tasks)
     )
-    for r in range(loop.period):
-        for _, _, index, actor, task in work:
-            accesses = {}
-            for ref, mode in zip(task.refs, task.modes):
-                root = loop.root(actor, ref)
-                if ref.storage.initialized and root not in written:
-                    continue
-                frame = loop.frames.get(root, 0)
-                for lo, hi in ref.segments(r):
-                    accesses.setdefault(root, []).append(
-                        (lo - r * frame, hi - r * frame, mode, ref.storage.initialized)
+    by_root = {}
+    for _, _, index, actor, task in work:
+        accesses = {}
+        for ref, mode in zip(task.refs, task.modes):
+            root = loop.root(actor, ref)
+            if ref.storage.initialized and root not in written:
+                continue
+            accesses.setdefault(root, []).append((ref, mode))
+        for root, parts in accesses.items():
+            by_root.setdefault(root, []).append((actor, task.uid, parts))
+    for root, tasks in by_root.items():
+        frame = loop.frames.get(root, 0)
+        for r in range(loop.storage_periods[root]):
+            for actor, uid, parts in tasks:
+                cells.setdefault(root, []).append(
+                    (
+                        r,
+                        actor,
+                        uid,
+                        [
+                            (lo - r * frame, hi - r * frame, mode, ref.storage.initialized)
+                            for ref, mode in parts
+                            for lo, hi in ref.segments(r)
+                        ],
                     )
-            for root, parts in accesses.items():
-                cells.setdefault(root, []).append((r, actor, task.uid, parts))
+                )
     edges = {}
 
     def edge(source, destination, hazard, root, lo, hi):
@@ -824,6 +853,7 @@ def loop_dependencies(loop):
         edges.setdefault(key, set()).add(dg)
 
     for root, work in cells.items():
+        period = loop.storage_periods[root]
         points = sorted({p for _, _, _, parts in work for lo, hi, _, _ in parts for p in (lo, hi)})
         cuts = {point: i for i, point in enumerate(points)}
         per_cell = [[] for _ in points[:-1]]
@@ -848,14 +878,12 @@ def loop_dependencies(loop):
             last = writes[-1] if writes else None
             if root in loop.frames:
                 last = None
-            writer = (
-                None if last is None else (events[last][0][0] - loop.period, *events[last][0][1:])
-            )
+            writer = None if last is None else (events[last][0][0] - period, *events[last][0][1:])
             pending = (
                 []
                 if last is None
                 else [
-                    (event[0][0] - loop.period, *event[0][1:])
+                    (event[0][0] - period, *event[0][1:])
                     for event in events[last + 1 :]
                     if event[1]
                 ]
@@ -881,7 +909,15 @@ def loop_dependencies(loop):
                     writer, pending = destination, []
     return tuple(
         Dependence(
-            (sa, su), (da, du), distance, loop.period, tuple(sorted(residues)), hazard, root, lo, hi
+            (sa, su),
+            (da, du),
+            distance,
+            loop.storage_periods[root],
+            tuple(sorted(residues)),
+            hazard,
+            root,
+            lo,
+            hi,
         )
         for (sa, su, da, du, distance, hazard, root, lo, hi), residues in sorted(edges.items())
     )

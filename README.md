@@ -18,6 +18,10 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 8192×4096设备 profiling 和硬件工作量分析见[验证记录](docs/ast-normalization.md)。
 前端已有整数/布尔 SSA 合流与循环携带值，一般结构化控制的物理同步仍待实现。
 
+R2 已将存储地址周期与同步执行条件周期分开，避免无关 buffer 周期相乘后
+复制整个完成图。[互素槽位示例与证明边界](docs/factored-periods.md)包含最终
+ASC 对照、有限逐字节反例、冷编译和大长度设备验证；嵌套流水仍待接通。
+
 当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
 源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
 实际同步。软件 stage、buffer versions 和硬件 event 资源各自独立。
@@ -133,7 +137,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 
 ## 当前支持边界
 
-下表主要记录已提交的有限物理路径，不能直接套用到未提交的符号循环原型。
+下表主要记录遗留有限物理路径，不能直接套用到当前 AST/符号循环路径。
 AST 路径支持多个非负 uniform 参数及 min/max/ceildiv 上界；对齐尾部目前限于
 单独 AIV 和共同有效前缀。嵌套循环与分支保留为 IR，尚未接通同步 lowering；
 legacy 静态内层仍有展开。两条路径的准确边界见[重构记录](docs/refactor-progress.md)。

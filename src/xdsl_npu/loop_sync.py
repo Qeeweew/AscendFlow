@@ -8,37 +8,45 @@ from .ir import KernelOp, LoopChannelOp, LoopSyncOp, StreamOp
 from .loop_graph import channels, completion_graph
 from .loop_model import extract_loop, loop_dependencies
 from .model import CompileError, require
+from .periodic import project, union
 
 
 def _ints(values):
     return ArrayAttr(IntAttr(value) for value in values)
 
 
-def _period(period, residues):
-    residues = set(residues)
-    for divisor in range(1, period + 1):
-        if period % divisor == 0:
-            chosen = tuple(sorted({r % divisor for r in residues}))
-            if {r for r in range(period) if r % divisor in chosen} == residues:
-                return divisor, chosen
-    raise AssertionError("period cannot normalize")
+def _obligation_queries(obligation, graph, native):
+    o = obligation
+    for residue, first in project(o.period, o.residues, graph.period, o.distance):
+        yield (native[o.source], residue - o.distance, native[o.destination], residue, first)
+
+
+def _coverage_queries(obligations, graph, native):
+    # Byte cells with the same endpoint relation share one proof. The earliest
+    # real occurrence is the strongest guard domain; later cells need no new
+    # graph/domain. Keep a real obligation for a concrete failure diagnostic.
+    queries = {}
+    for o in sorted(obligations, key=lambda o: o.hazard != "WAR"):
+        for query in _obligation_queries(o, graph, native):
+            source, _, destination, residue, first = query
+            key = source.index, destination.index, o.distance, residue
+            if key not in queries or first < queries[key][1][-1]:
+                queries[key] = o, query
+    return queries.values()
 
 
 def _coverage(loop, obligations, graph, native):
-    checked = set()
-    for o in sorted(obligations, key=lambda o: o.hazard != "WAR"):
-        source, destination = native[o.source], native[o.destination]
-        for residue in o.residues:
-            query = source.index, destination.index, o.distance, residue
-            if query in checked:
-                continue
-            path = graph.path(source, residue - o.distance, destination, residue)
-            if path is None:
-                raise CompileError(
-                    f"missing loop {o.hazard} {'read_retired' if o.hazard == 'WAR' else 'write_done'}: {o.source} -> {o.destination}, distance {o.distance}, residue {residue}/{o.period}, on {o.storage}[{o.start}:{o.stop}]"
-                )
-            checked.add(query)
-    return len(checked)
+    queries = _coverage_queries(obligations, graph, native)
+    for o, query in queries:
+        _, _, _, residue, first = query
+        if graph.path(*query) is None:
+            raise CompileError(
+                f"missing loop {o.hazard} {'read_retired' if o.hazard == 'WAR' else 'write_done'}: "
+                f"{o.source} -> {o.destination}, distance {o.distance}, protocol residue "
+                f"{residue}/{graph.period}, first {first}, storage residues "
+                f"{o.residues}/{o.period}, on {o.storage}[{o.start}:{o.stop}]"
+            )
+    return len(queries)
 
 
 def _successor(channel, residue, count, period):
@@ -48,14 +56,14 @@ def _successor(channel, residue, count, period):
     return active[following] + cycles * period
 
 
-def _counter_queries(loop, channel_map, endpoints):
+def _counter_queries(period, channel_map, endpoints):
     for name, channel in channel_map.items():
         if channel.kind != "cross":
             continue
-        for residue in range(loop.period):
+        for residue in range(period):
             if residue % channel.period not in channel.residues:
                 continue
-            following = _successor(channel, residue, 15, loop.period)
+            following = _successor(channel, residue, 15, period)
             for source_actor, _ in channel.sources:
                 for destination_actor, _ in channel.destinations:
                     yield (
@@ -90,16 +98,15 @@ class _ProofSearch:
             if node.command.kind != "task" and node.point in {"begin", "end"}
         )
         self.searches = 0
-        for o in sorted(obligations, key=lambda o: o.hazard != "WAR"):
-            for residue in o.residues:
-                self._add((native[o.source], residue - o.distance, native[o.destination], residue))
-        for name, query in _counter_queries(loop, channel_map, endpoints):
+        for _, query in _coverage_queries(obligations, graph, native):
+            self._add(query)
+        for name, query in _counter_queries(graph.period, channel_map, endpoints):
             key = self._add(query)
             self.channel_queries[name].add(key)
 
     def _add(self, query):
-        source, sg, destination, dg = query
-        key = source.index, sg, destination.index, dg
+        source, sg, destination, dg, *minimum = query
+        key = source.index, sg, destination.index, dg, tuple(minimum)
         if key not in self.queries:
             self.queries[key] = query
             path = self.graph.path(*query)
@@ -166,10 +173,10 @@ def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True)
                 require(len(banks[key] | reserved) <= 8, "local event bank exhausted")
             width = len(channel.ids)
             require(width > 0, "local event width must be assigned")
-            for residue in range(loop.period):
+            for residue in range(graph.period):
                 if residue % channel.period not in channel.residues:
                     continue
-                following = _successor(channel, residue, width, loop.period)
+                following = _successor(channel, residue, width, graph.period)
                 require(
                     graph.path(destination, residue + channel.distance, source, following)
                     is not None,
@@ -186,7 +193,7 @@ def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True)
                 )
                 cross_ids.add(channel.ids[0])
     if counters:
-        for name, query in _counter_queries(loop, channel_map, endpoints):
+        for name, query in _counter_queries(graph.period, channel_map, endpoints):
             require(
                 graph.path(*query) is not None,
                 f"{name}: mode-2 notification backlog may exceed 15",
@@ -207,7 +214,7 @@ def verify_loop(module, *, _details=False):
             if task.scalar_source is None:
                 continue
             source, destination = native[actor, task.scalar_source], native[actor, task.uid]
-            for residue in range(loop.period):
+            for residue in range(graph.period):
                 require(
                     graph.path(source, residue, destination, residue) is not None,
                     "Scalar value lacks an actual capture-to-dispatch completion path",
@@ -225,10 +232,24 @@ def verify_loop(module, *, _details=False):
         "runtime_parameters": [size.sym_name.data for size in loop.parameters],
         "static_length": loop.constant_count,
         "native_templates": sum(len(actor.program.tasks) for actor in loop.actors.values()),
-        "storage_period": loop.period,
+        "storage_periods": loop.storage_periods,
+        "native_accesses": sum(
+            len(task.refs) for actor in loop.actors.values() for task in actor.program.tasks
+        ),
+        "storage_residue_accesses": sum(
+            loop.storage_periods[loop.root(actor, ref)]
+            for actor, data in loop.actors.items()
+            for task in data.program.tasks
+            for ref in task.refs
+        ),
+        "protocol_period": graph.period,
         "physical_dependence_templates": len(obligations),
         "completion_node_families": len(graph.nodes),
         "completion_arc_families": len(graph.edges),
+        "proof_domains": len(graph.domains),
+        "proof_domain_states": graph.domain_states,
+        "proof_domain_edges": graph.domain_edges,
+        "proof_path_queries": graph.path_queries,
         "coverage_queries": queries,
         "scalar_capture_queries": scalar_queries,
         "binary_lifetime_queries": lifetime_queries,
@@ -261,10 +282,9 @@ def explain_loop(module):
     }
     witnesses = []
     for o in loop_dependencies(loop):
-        for residue in o.residues:
-            path = graph.path(
-                native[o.source], residue - o.distance, native[o.destination], residue
-            )
+        for query in _obligation_queries(o, graph, native):
+            _, _, _, residue, first = query
+            path = graph.path(*query)
             witnesses.append(
                 {
                     "source": "/".join(o.source),
@@ -274,7 +294,10 @@ def explain_loop(module):
                     "bytes": [o.start, o.stop],
                     "distance": o.distance,
                     "period": o.period,
+                    "storage_residues": list(o.residues),
+                    "protocol_period": graph.period,
                     "destination_residue": residue,
+                    "first_generation": first,
                     "required_milestone": "read_retired" if o.hazard == "WAR" else "write_done",
                     "completion_arc_families": list(path),
                 }
@@ -302,14 +325,14 @@ def _sync(stream, action, channel, lower, upper, period, residues):
 
 def _install(loop, specs, barriers):
     operations = []
-    for actor, uid, lower, residues in barriers:
+    for actor, uid, lower, family in barriers:
         data = loop.actors[actor]
-        period, chosen = _period(loop.period, residues)
+        period, chosen = family
         op = _sync(data.stream, "barrier", "", lower, 0, period, chosen)
         data.stream.body.block.insert_op_before(op, data.operations[uid])
         operations.append((None, [op]))
-    for number, (kind, sources, destinations, distance, residues) in enumerate(specs):
-        period, chosen = _period(loop.period, residues)
+    for number, (kind, sources, destinations, distance, family) in enumerate(specs):
+        period, chosen = family
         name = f"loop_c{number}"
         op = LoopChannelOp.create(
             attributes={
@@ -358,24 +381,32 @@ def _proposals(loop, obligations):
             # Acquire at this actual consumer, joining only its overlapping
             # contributors. A different native subview gets its own gate.
             key = o.storage, o.distance, o.hazard, o.destination[1]
-            item = cross.setdefault(key, ({}, {}, set()))
+            item = cross.setdefault(key, ({}, {}, {}))
             source_actor, destination_actor = o.source[0], o.destination[0]
             old_source, old_destination = item[0].get(source_actor), item[1].get(destination_actor)
             if old_source is None or tasks[old_source].issue_order < a.issue_order:
                 item[0][source_actor] = o.source
             if old_destination is None or tasks[old_destination].issue_order > b.issue_order:
                 item[1][destination_actor] = o.destination
-            item[2].update((r - o.distance) % loop.period for r in o.residues)
-        elif a.pipe == b.pipe:
-            item = barrier_map.setdefault(o.destination, [o.distance, set()])
-            item[0] = min(item[0], o.distance)
-            item[1].update(o.residues)
-        else:
-            local.setdefault((o.source, o.destination, o.distance), set()).update(
-                (r - o.distance) % loop.period for r in o.residues
+            item[2].setdefault(o.period, set()).update(
+                (r - o.distance) % o.period for r in o.residues
             )
+        elif a.pipe == b.pipe:
+            item = barrier_map.setdefault(o.destination, [o.distance, {}])
+            item[0] = min(item[0], o.distance)
+            item[1].setdefault(o.period, set()).update(o.residues)
+        else:
+            local.setdefault((o.source, o.destination, o.distance), {}).setdefault(
+                o.period, set()
+            ).update((r - o.distance) % o.period for r in o.residues)
     specs = [
-        ("local", (source,), (destination,), distance, residues)
+        (
+            "local",
+            (source,),
+            (destination,),
+            distance,
+            union(residues, f"channel {source}->{destination}"),
+        )
         for (source, destination, distance), residues in sorted(local.items())
     ]
     specs += [
@@ -384,12 +415,12 @@ def _proposals(loop, obligations):
             tuple(sorted(sources.values())),
             tuple(sorted(destinations.values())),
             distance,
-            residues,
+            union(residues, "cross-core channel"),
         )
         for (_, distance, _, _), (sources, destinations, residues) in sorted(cross.items())
     ]
     barriers = [
-        (actor, uid, lower, residues)
+        (actor, uid, lower, union(residues, f"barrier {actor}/{uid}"))
         for (actor, uid), (lower, residues) in sorted(barrier_map.items())
     ]
     return specs, barriers
@@ -445,10 +476,10 @@ def autosync_loop(module, *, _capture=None):
                     destination,
                     r + channel.distance,
                     source,
-                    _successor(channel, r, candidate, loop.period),
+                    _successor(channel, r, candidate, graph.period),
                 )
                 is not None
-                for r in range(loop.period)
+                for r in range(graph.period)
                 if r % channel.period in channel.residues
             ):
                 width = candidate

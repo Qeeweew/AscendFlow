@@ -129,9 +129,9 @@ def test_periodic_completion_arcs_are_actual_hardware_paths_at_boundaries(artifa
     maximum = max(command.task.stage for sequence in sequences.values() for command in sequence)
     for a, b, delta in graph.edges:
         source, destination = graph.nodes[a], graph.nodes[b]
-        for cycle in range(-maximum // loop.period - 1, count // loop.period + 1):
-            sg = source.residue + cycle * loop.period
-            dg = destination.residue + (cycle + delta) * loop.period
+        for cycle in range(-maximum // graph.period - 1, count // graph.period + 1):
+            sg = source.residue + cycle * graph.period
+            dg = destination.residue + (cycle + delta) * graph.period
             i = ids.get((source.command.index, sg, source.point))
             j = ids.get((destination.command.index, dg, destination.point))
             if i is not None and j is not None and i != j:
@@ -147,7 +147,7 @@ def test_periodic_completion_arcs_are_actual_hardware_paths_at_boundaries(artifa
     for obligation in loop_dependencies(loop):
         a, b = native[obligation.source], native[obligation.destination]
         for dg in range(obligation.distance, count):
-            if dg % loop.period in obligation.residues:
+            if dg % obligation.period in obligation.residues:
                 i = ids[a.index, dg - obligation.distance, "end"]
                 j = ids[b.index, dg, "begin"]
                 assert reach[i] & (1 << j), (count, obligation, dg)
