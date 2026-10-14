@@ -3,8 +3,11 @@
 基于 xDSL 0.73.0 的独立 Python 编译器，目标 Ascend 910B / dav-2201，直接输出
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
-2026-10-14 重新制定了[总体设计](docs/design.md)、[DSL 前端与 CV 多阶段规格](docs/dsl-multistage.md)
-和[重构计划](docs/refactor-plan.md)。受限 AST 已接通单循环 Vector、运行时原始
+2026-10-14对照实现 `872bf6e` 重写了[总体设计](docs/design.md)、
+[DSL 前端与 CV 多阶段规格](docs/dsl-multistage.md)和[重构计划](docs/refactor-plan.md)。
+新计划将父子派发/异步出口、跨调用event生命周期、编译预算和固定性能验收
+放在一起；下一步是父output×子K循环，不以更多单层例子替代层次流水。
+受限 AST 已接通单循环 Vector、运行时原始
 长度与精确对齐尾部；
 嵌套符号同步和真实 FA 迁移尚未完成。新 `prim_func` 不执行设备函数体，遗留
 构造明确使用 `trace_func`。实现边界和历史证据见[重构记录](docs/refactor-progress.md)。
@@ -146,7 +149,8 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 
 下表主要记录遗留有限物理路径，不能直接套用到当前 AST/符号循环路径。
 AST 路径支持多个非负 uniform 参数及 min/max/ceildiv 上界；对齐尾部目前限于
-单独 AIV 和共同有效前缀。嵌套循环与分支保留为 IR，尚未接通同步 lowering；
+单独 AIV 和共同有效前缀。单actor末代effect后缀已接通；一般分支与嵌套循环
+保留为IR，尚未接通同步lowering；
 legacy 静态内层仍有展开。两条路径的准确边界见[重构记录](docs/refactor-progress.md)。
 
 | 能力 | 实际支持 |
