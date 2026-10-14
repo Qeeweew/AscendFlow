@@ -2,7 +2,8 @@
 
 from .codegen import QUALIFIER, native_line
 from .ir import MixedOp
-from .model import storage_layout
+from .model import ITEMSIZE, storage_layout
+from .scalar import bindings, from_ssa
 
 
 def _guard(command):
@@ -39,10 +40,20 @@ def emit_loop(analysis, *, host_launcher=True):
     loop, channel_map, sequences, _, _ = analysis
     name = loop.op.sym_name.data
     roots = list(loop.roots)
-    size_arg = None if loop.size is None else "npu_size_" + loop.size.sym_name.data
+    size_args = ["npu_size_" + size.sym_name.data for size in loop.parameters]
     signature = [f"__gm__ uint8_t* {root}" for root in roots]
-    if size_arg:
-        signature.append(f"int64_t {size_arg}")
+    signature.extend(f"int64_t {arg}" for arg in size_args)
+    expressions = [loop.bound] + [
+        from_ssa(root.extent_count) for root in loop.roots.values() if root.extent_count is not None
+    ]
+    expressions += [
+        ref.prefix_extent
+        for data in loop.actors.values()
+        for task in data.program.tasks
+        for ref in task.refs
+        if ref.prefix_extent is not None
+    ]
+    uniform_names, uniform_lines = bindings(expressions)
     kind = (
         "__mix__(1, 2)"
         if isinstance(loop.op, MixedOp)
@@ -54,7 +65,8 @@ def emit_loop(analysis, *, host_launcher=True):
         "#include <cstdint>",
         "",
         f'extern "C" __global__ {kind} void {name}({", ".join(signature)}) {{',
-        f"  const int64_t n = {size_arg or loop.constant_count};",
+        *uniform_lines,
+        f"  const int64_t n = {loop.bound.c(uniform_names) if loop.bound is not None else loop.constant_count};",
     ]
     tasks = {
         (actor, task.uid): task
@@ -95,7 +107,7 @@ def emit_loop(analysis, *, host_launcher=True):
                 "      if (g >= 0 && g < n) {",
             ]
             if command.kind == "task":
-                code = native_line(task, "n", "core_id")
+                code = native_line(task, "n", "core_id", uniform_names=uniform_names)
             elif command.kind == "barrier":
                 code = f"asc_sync_pipe(PIPE_{task.pipe});"
             else:
@@ -131,23 +143,75 @@ def emit_loop(analysis, *, host_launcher=True):
     if host_launcher:
         signature = ["void* stream"] + [f"void* arg_{root}" for root in roots]
         arguments = [f"(uint8_t*)arg_{root}" for root in roots]
-        if size_arg:
-            signature.append(f"int64_t {size_arg}")
-            arguments.append(size_arg)
+        signature.extend(f"int64_t {arg}" for arg in size_args)
+        arguments.extend(size_args)
         lines += ["", f'extern "C" int launch_{name}({", ".join(signature)}) {{']
-        if size_arg:
-            coefficient = max(
-                [1]
-                + [
-                    storage.count_scale
-                    for actor in loop.actors.values()
-                    for storage in actor.program.storages
-                ]
-            )
-            limit = ((1 << 63) - 1 - 64) // coefficient
+        coefficient = max(
+            [1] + [s.count_scale for actor in loop.actors.values() for s in actor.program.storages]
+        )
+        margin = max(
+            [64]
+            + [
+                r.prefix_elements
+                for actor in loop.actors.values()
+                for task in actor.program.tasks
+                for r in task.refs
+            ]
+        )
+        limit = ((1 << 63) - 1 - margin) // coefficient
+        for size_arg, size in zip(size_args, loop.parameters):
             lines.append(
-                f"  if ({size_arg} < 0 || {size_arg} > {limit} || {size_arg} % {loop.size.multiple.data} != 0) return -1;"
+                f"  if ({size_arg} < 0 || {size_arg} > {limit} || {size_arg} % {size.multiple.data} != 0) return -1;"
             )
+        lines += uniform_lines
+        if loop.bound is not None:
+            stage_margin = max(
+                task.stage for actor in loop.actors.values() for task in actor.program.tasks
+            )
+            lines.append(
+                f"  if ({loop.bound.c(uniform_names)} > {(1 << 63) - 1 - stage_margin}) return -1; // loop step overflow"
+            )
+        alignments = sorted(
+            {
+                (ref.prefix_extent.c(uniform_names), 32 // ITEMSIZE[ref.dtype])
+                for actor in loop.actors.values()
+                for task in actor.program.tasks
+                if task.pipe in {"MTE2", "MTE3"}
+                for ref in task.refs
+                if ref.prefix_extent is not None
+            }
+        )
+        for extent, multiple in alignments:
+            lines.append(
+                f"  if ({extent} % {multiple} != 0) return -1; // exact DMA prefix alignment"
+            )
+        # Check the declared extents, not padded loop envelopes. This is a host
+        # input contract check, never a device barrier or a hidden allocation.
+        for root, allocation in loop.roots.items():
+            if allocation.extent_count is not None:
+                extent = from_ssa(allocation.extent_count).c(uniform_names)
+                lines.append(
+                    f"  if ({extent} > {((1 << 63) - 1) // allocation.count_scale.data}) return -1; // extent multiplication overflow"
+                )
+                nbytes = f"({from_ssa(allocation.extent_count).c(uniform_names)} * {allocation.count_scale.data})"
+            else:
+                nbytes = str(allocation.nbytes.data)
+            lines += [
+                f"  const uint64_t npu_bytes_{root} = {nbytes};",
+                f"  const uintptr_t npu_ptr_{root} = (uintptr_t)arg_{root};",
+                (
+                    f"  if (npu_bytes_{root} && (!npu_ptr_{root} || npu_ptr_{root} % 32 || "
+                    f"npu_ptr_{root} > UINTPTR_MAX - npu_bytes_{root})) return -1;"
+                ),
+            ]
+        if loop.op.disjoint_external.data:
+            for i, left in enumerate(roots):
+                for right in roots[i + 1 :]:
+                    lines.append(
+                        f"  if (npu_bytes_{left} && npu_bytes_{right} && "
+                        f"npu_ptr_{left} < npu_ptr_{right} + npu_bytes_{right} && "
+                        f"npu_ptr_{right} < npu_ptr_{left} + npu_bytes_{left}) return -1;"
+                    )
         lines += [
             f"  {name}<<<{loop.groups}, nullptr, stream>>>({', '.join(arguments)});",
             "  return 0;",

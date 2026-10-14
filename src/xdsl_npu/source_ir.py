@@ -248,9 +248,12 @@ class ViewOp(IRDLOperation):
     terms = attr_def(ArrayAttr[ArrayAttr[IntAttr]])
     dynamic_terms = opt_attr_def(ArrayAttr[ArrayAttr[IntAttr]])
     strides = attr_def(ArrayAttr[IntAttr])
+    valid_index = opt_attr_def(IntAttr)
     ref = result_def(TensorType)
 
     def verify_(self):
+        if self.valid_index is not None and not 0 <= self.valid_index.data < len(self.indices):
+            raise VerifyException("valid prefix must bind an actual index SSA operand")
         if (
             self.ref.type.memory != self.source.type.memory
             or self.ref.type.dtype != self.source.type.dtype

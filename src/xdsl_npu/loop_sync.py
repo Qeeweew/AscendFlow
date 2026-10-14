@@ -205,7 +205,12 @@ def verify_loop(module, *, _details=False):
     report = {
         "kernel": loop.op.sym_name.data,
         "groups": loop.groups,
-        "runtime_length": None if loop.size is None else loop.size.sym_name.data,
+        "runtime_length": None
+        if loop.bound is None
+        else loop.size.sym_name.data
+        if loop.size
+        else loop.bound.text(),
+        "runtime_parameters": [size.sym_name.data for size in loop.parameters],
         "static_length": loop.constant_count,
         "native_templates": sum(len(actor.program.tasks) for actor in loop.actors.values()),
         "storage_period": loop.period,
@@ -218,8 +223,17 @@ def verify_loop(module, *, _details=False):
         "event_ids": {":".join(key): sorted(values) for key, values in banks.items()},
         "cross_counter_ids": sorted(cross_ids),
         "verification": "parametric periodic physical frontier, guarded translation paths, and integer completion potential; no runtime-length expansion",
-        "input_contract": "uniform nonnegative by-value length; declared GM extents, disjoint aligned bases; complete native tiles",
+        "input_contract": "uniform nonnegative by-value scalars; declared GM extents and disjoint aligned bases; full tiles or verified aligned final prefixes",
         "terminal_drain": "notifications only for real future consumers; each actor drains issued pipes at return",
+        "valid_prefixes": sorted(
+            {
+                (ref.prefix_extent.text(), ref.prefix_elements)
+                for actor in loop.actors.values()
+                for task in actor.program.tasks
+                for ref in task.refs
+                if ref.prefix_extent is not None
+            }
+        ),
     }
     analysis = loop, channel_map, sequence, graph, (stride, potential)
     return (report, analysis) if _details else report

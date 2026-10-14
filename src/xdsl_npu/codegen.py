@@ -40,12 +40,17 @@ def pointer(ref: Ref, g="g", *, core="0", extra=""):
     return f"({q} {CTYPE[ref.dtype]}*)({ref.storage.name} + ({address}))"
 
 
-def native_line(task, count, core="0"):
+def native_line(task, count, core="0", *, uniform_names=None):
     refs = task.refs
     p = [pointer(r, core=core) for r in refs]
 
     def length(ref, unit=1):
         base = ref.total_nbytes // unit
+        if ref.prefix_extent is not None:
+            extent = ref.prefix_extent.c(uniform_names)
+            remaining = f"({extent} - g * {ref.prefix_elements})"
+            valid = f"({remaining} < {ref.prefix_elements} ? {remaining} : {ref.prefix_elements})"
+            return f"({valid} * {ITEMSIZE[ref.dtype] // unit})"
         if ref.tail_nbytes:
             return f"(g == {count - 1} ? {ref.tail_nbytes // unit} : {base})"
         return str(base)

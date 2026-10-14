@@ -1,5 +1,49 @@
 # 重构的验证记录
 
+## R1 第二个切片：原始元素长度、双参数与真实尾块
+
+在 `b79025e` 基础上，增加非负 uniform 标量表达式的物理 lowering，保留
+`min(n,m)` / `ceildiv(length,B)` SSA；GM extent 使用各自的原始长度。新例子
+`examples/ast_prefix.py` 对 min(n,m) 个 f32 元素进行缩放，不修改输出后缀。
+`valid=min(B,length-t*B)` 被传入搬运与计算，生成真实长度的 CANN native 调用。
+完整语义、同步前后和最小反例见[运行时尾部](runtime-prefix.md)。
+
+当前 prefix 证明要求同一 allocation 的访问使用相同的有效前缀、dtype 和
+等宽对齐 cell；仅最后一个 generation 可部分有效。混入 full reader、不同
+mask、错位 alias、跨 owner 或未知 recipe 时拒绝。此前周期依赖/事件证明在
+该明确条件下复用；最终 IR 重检不信任 source 的 valid 声明。
+
+物理模板已使用独立 `Templates` 数据类型，移除 `Program(count=0)` 容器。
+uniform DAG 每节点只生成一次，避免嵌套三目表达式造成代码膨胀；证明输入有
+4096项/128层预算。host launcher 增加长度/step/extent 溢出、DMA有效长度、
+指针范围/对齐和外部区间不重叠检查；实际分配大小仍属于调用者提供的契约。
+
+验证：
+
+- 相关前端、source、loop、编译、prefix 回归104项通过（42.52秒）；随后对
+  等价上界复用和 ASC 等待范围增加回归，prefix 23项通过（1.97秒），记录于
+  `runs/refactor/ast-prefix-checks/prefix-final.log`。全目录 ruff/diff 检查通过。
+- 独立有限测试从实际 SSA 和逐字节访问构造冲突/初始化义务，与实际派发/
+  完成 DAG 对照；不调用生产依赖分析产生答案。仅在明确有限样本内成立。
+- CANN9.1/dav-2201 离线/shared 编译通过。全部卡检查后使用物理卡1→逻辑0，
+  同一 binary 的14组 n/m、每组5次通过，最大处理16,777,224个 f32 元素，
+  误差0、未处理后缀及 guard 不变。负数、非对齐尾部、极大长度、重叠与错位
+  指针等6类调用在 host 返回 -1。没有设备吞吐率结论。
+- 完整源码到 ASC 的首批5次冷进程中位数0.1541秒、最大0.1673秒，RSS约31.5 MiB；
+  当时同时进行回归，记录作为探索测量。最终独立计时中位数0.1542秒、最大
+  0.1592秒、RSS约31.5 MiB，另存 `ast-prefix-cold-final/`。
+- 生成代码只有3个 native 模板、4条局部通道、每 bank 两个 ID；与原 full-tile
+  AST 示例的同步行逐条对照，不增加等待或扩大 release 到整个计算结束。
+
+设备产物源码 hash 为
+`4c774101b2cdc3a9ad1404ce8104a5066fba6c099dcbf4db696aa9d98c3d62f4`。
+源码/IR/ASC/CANN 选项在外层 `runs/refactor/ast-prefix-final/`，设备记录在
+`runs/refactor/ast-prefix-device/`，回归日志在 `runs/refactor/ast-prefix-checks/`。
+
+R1 仍缺标量 SSA 合流/携带、归约设备例和完整 AscendC 性能基线；当前前缀
+子集不支持非32字节 DMA 尾部或多 owner。R2 层次流水摘要、R3/R4 真实 FA
+迁移和设备性能验收均未完成，不能把本切片作为整个重构完成。
+
 ## R1 首个切片：AST → 自动同步 → ASC → 设备
 
 R0 的原型已保存为 `d3a00d0`。新 `N.prim_func` 返回捕获源码的 `PrimFunction`，

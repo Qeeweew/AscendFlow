@@ -10,6 +10,10 @@ import struct
 from dataclasses import dataclass, replace
 from functools import cached_property
 from math import isfinite
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .scalar import Expr
 
 from xdsl.dialects.builtin import IndexType, ModuleOp, f32
 from xdsl.ir import SSAValue
@@ -104,6 +108,7 @@ class Storage:
     external: bool
     initialized: bool
     count_scale: int = 0
+    extent: "Expr | None" = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,24 @@ class Ref:
     core_terms: tuple[tuple[int, int, int], ...] = ()  # byte stride, divisor, modulus
     count_offset: int = 0
     count_core_stride: int = 0
+    prefix_extent: "Expr | None" = None
+    prefix_elements: int = 0
+
+    def actual_segments(self, g, parameters, core=0):
+        """Concrete footprint for an explicitly supplied runtime invocation."""
+        if self.prefix_extent is None:
+            require(
+                not self.count_offset and not self.count_core_stride,
+                "count-translated concrete footprint requires an explicit loop-bound binding",
+            )
+            return self.segments(g, core)
+        valid = min(
+            self.prefix_elements, self.prefix_extent.evaluate(parameters) - g * self.prefix_elements
+        )
+        if valid <= 0:
+            return ()
+        start = self.address(g, core)
+        return ((start, start + valid * ITEMSIZE[self.dtype]),)
 
     def address(self, g: int, core=0) -> int:
         return sum(o + s * ((g // d) % m if m else g // d) for o, s, m, d in self.terms) + sum(
@@ -864,6 +887,10 @@ def extract(module: ModuleOp) -> Program:
                 and optional_int(op.count_offset, 0) == 0
                 and optional_int(op.count_core_stride, 0) == 0,
                 "runtime view translation cannot be ignored by finite extraction",
+            )
+            require(
+                optional_int(op.prefix_elements, 0) == 0,
+                "runtime valid prefix requires the symbolic access checker",
             )
             require(
                 op.generation is stream.body.block.args[0], "view uses a different generation clock"

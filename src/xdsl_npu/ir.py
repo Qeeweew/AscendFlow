@@ -189,6 +189,7 @@ class ViewOp(IRDLOperation):
     core_terms = opt_attr_def(ArrayAttr[ArrayAttr[IntAttr]])
     count_offset = opt_attr_def(IntAttr)
     count_core_stride = opt_attr_def(IntAttr)
+    prefix_elements = opt_attr_def(IntAttr)
     ref = result_def(RefType)
 
 

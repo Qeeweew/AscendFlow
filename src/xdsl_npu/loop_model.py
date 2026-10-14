@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from itertools import pairwise
 from math import lcm
 
+from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType
 
 from .ir import (
@@ -28,7 +29,6 @@ from .ir import (
 from .model import (
     CAPACITY,
     ITEMSIZE,
-    Program,
     Ref,
     Storage,
     Task,
@@ -39,6 +39,19 @@ from .model import (
     round_f32,
     storage_layout,
 )
+from .scalar import ARITHMETIC, Expr, bounded_by, expression, from_ssa, literal, uniform
+
+
+@dataclass(frozen=True)
+class Templates:
+    """One actor's native templates; there is no fictitious zero-trip Program."""
+
+    name: str
+    core: str
+    storages: tuple[Storage, ...]
+    tasks: tuple[Task, ...]
+    config: bool
+    blocks: int
 
 
 @dataclass(frozen=True)
@@ -46,7 +59,7 @@ class Actor:
     name: str
     kernel: KernelOp
     stream: StreamOp
-    program: Program
+    program: Templates
     operations: dict
 
 
@@ -59,6 +72,8 @@ class Loop:
     constant_count: int | None
     period: int
     frames: dict[str, int]
+    parameters: tuple[RuntimeSizeOp, ...]
+    bound: Expr | None
 
     @property
     def groups(self):
@@ -88,16 +103,16 @@ def is_symbolic(module):
     )
 
 
-def _storage(op, limit):
+def _storage(op, limit, uniform_values):
     typ = op.ref.type
     scale = optional_int(op.count_scale, 0)
     require(
-        scale >= 0 and (scale > 0) == (op.extent_count is not None),
+        0 <= scale <= (1 << 63) - 1 and (scale > 0) == (op.extent_count is not None),
         "runtime storage extent must bind its SSA count",
     )
     require(
-        op.extent_count is None or op.extent_count is limit,
-        "buffer extent uses a different runtime length",
+        op.extent_count is None or op.extent_count in uniform_values,
+        "buffer extent needs a declared uniform scalar",
     )
     bank = typ.bank.data
     require(bank in {*CAPACITY, "GM"} and typ.dtype.data in ITEMSIZE, "unknown physical storage")
@@ -110,7 +125,7 @@ def _storage(op, limit):
         "local initialization needs a real writer",
     )
     require(
-        op.nbytes.data >= 0 and (bank == "GM" or op.nbytes.data % 32 == 0),
+        0 <= op.nbytes.data <= (1 << 63) - 1 and (bank == "GM" or op.nbytes.data % 32 == 0),
         "invalid allocation size",
     )
     require(
@@ -133,10 +148,11 @@ def _storage(op, limit):
         bool(op.external.data),
         bool(op.initialized.data),
         scale,
+        None if op.extent_count is None else uniform_values[op.extent_count],
     )
 
 
-def _actor(name, kernel, shared, limit, groups):
+def _actor(name, kernel, shared, limit, groups, uniform_values):
     require(
         kernel.core.data == ("aic" if name == "aic" else "aiv")
         and optional_int(kernel.blocks, 1) == groups,
@@ -146,7 +162,7 @@ def _actor(name, kernel, shared, limit, groups):
     config = False
     for op in kernel.body.block.ops:
         if isinstance(op, BufferOp):
-            declarations[op.ref] = _storage(op, limit)
+            declarations[op.ref] = _storage(op, limit, uniform_values)
         elif isinstance(op, StreamOp):
             streams.append(op)
         elif isinstance(op, FixConfigOp):
@@ -157,7 +173,9 @@ def _actor(name, kernel, shared, limit, groups):
             config = True
         else:
             require(
-                isinstance(op, (RuntimeSizeOp, LoopChannelOp, EndOp)),
+                isinstance(op, (RuntimeSizeOp, LoopChannelOp, EndOp))
+                or (isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC)
+                and all(value in uniform_values for value in op.results),
                 f"unsupported loop kernel effect {op.name}",
             )
     require(len(streams) == 1, "one symbolic task stream per actor required")
@@ -235,10 +253,25 @@ def _actor(name, kernel, shared, limit, groups):
             count_core = (0 if parent is None else parent.count_core_stride) + optional_int(
                 op.count_core_stride, 0
             )
+            prefix_elements = optional_int(op.prefix_elements, 0)
+            require(prefix_elements >= 0, "negative prefix tile extent")
+            prefix_extent = None
+            if prefix_elements:
+                require(
+                    parent is None and op.extent_count in uniform_values,
+                    "valid prefix requires its uniform extent and direct allocation view",
+                )
+                require(
+                    not count_offset and not count_core,
+                    "valid prefix cannot change dynamic ownership",
+                )
+                prefix_extent = uniform_values[op.extent_count]
             require(
                 count_offset >= 0
                 and count_core >= 0
-                and (op.extent_count is None or op.extent_count is limit),
+                and (
+                    op.extent_count is None or op.extent_count is limit or prefix_extent is not None
+                ),
                 "invalid count-dependent address",
             )
             require(
@@ -266,6 +299,8 @@ def _actor(name, kernel, shared, limit, groups):
                 core_terms=core,
                 count_offset=count_offset,
                 count_core_stride=count_core,
+                prefix_extent=prefix_extent,
+                prefix_elements=prefix_elements,
             )
             # Nested periodic views are checked later for every residue, with
             # the same count translation. No bounding box replaces their holes.
@@ -333,8 +368,8 @@ def _actor(name, kernel, shared, limit, groups):
         name,
         kernel,
         stream,
-        Program(
-            name, kernel.core.data, 0, tuple(declarations.values()), tuple(tasks), config, groups
+        Templates(
+            name, kernel.core.data, tuple(declarations.values()), tuple(tasks), config, groups
         ),
         operations,
     ), views
@@ -358,21 +393,40 @@ def extract_loop(module):
         "loop needs bounded groups and a boolean external alias contract",
     )
     sizes = [child for child in op.body.block.ops if isinstance(child, RuntimeSizeOp)]
-    require(len(sizes) <= 1, "one uniform runtime task length currently required")
-    size = sizes[0] if sizes else None
-    limit = None if size is None else size.value
-    if size:
+    require(len({s.sym_name.data for s in sizes}) == len(sizes), "duplicate runtime scalar name")
+    for size in sizes:
         require(
             re.fullmatch(r"[A-Za-z_]\w*", size.sym_name.data) and size.multiple.data > 0,
             "runtime size needs a valid name and positive multiple",
         )
+    names = {s.sym_name.data for s in sizes}
+    uniform_values = {}
+    for child in op.body.block.ops:
+        if isinstance(child, RuntimeSizeOp):
+            uniform_values[child.value] = from_ssa(child.value)
+        elif isinstance(child, arith.ConstantOp) or type(child) in ARITHMETIC:
+            require(
+                all(v in uniform_values for v in child.operands),
+                "uniform scalar expression has undeclared or nonuniform inputs",
+            )
+            value = from_ssa(child.results[0])
+            require(uniform(value, names), "unsupported nonnegative uniform bound expression")
+            uniform_values[child.results[0]] = value
+    streams = [child for child in op.walk() if isinstance(child, StreamOp)]
+    require(streams, "loop program has no stream")
+    limit = streams[0].limit
+    require(
+        limit is None or limit in uniform_values,
+        "stream bound must be a declared uniform expression",
+    )
+    size = limit.owner if limit is not None and isinstance(limit.owner, RuntimeSizeOp) else None
     roots, shared = {}, {}
     for child in op.body.block.ops:
         if isinstance(child, BufferOp) and child.external.data:
             require(child.sym_name.data not in roots, "duplicate GM root")
             roots[child.sym_name.data] = child
             if isinstance(op, MixedOp):
-                shared[child.ref] = _storage(child, limit)
+                shared[child.ref] = _storage(child, limit, uniform_values)
     require(
         len(roots) <= 1 or op.disjoint_external.data,
         "external pointer alias is unknown; declare disjoint_external or use views of one root",
@@ -400,7 +454,7 @@ def extract_loop(module):
     constants = set()
     period = 1
     for name, kernel in kernels:
-        actor, views = _actor(name, kernel, shared, limit, groups)
+        actor, views = _actor(name, kernel, shared, limit, groups, uniform_values)
         actors[name] = actor
         if actor.stream.count is not None:
             constants.add(actor.stream.count.data)
@@ -410,7 +464,7 @@ def extract_loop(module):
                 if stride and modulus:
                     period = lcm(period, modulus * divisor)
     require(
-        len(constants) <= 1 and (size is not None or len(constants) == 1),
+        len(constants) <= 1 and (limit is not None or len(constants) == 1),
         "all actors need the same loop bound",
     )
     constant = next(iter(constants)) if constants else None
@@ -419,9 +473,106 @@ def extract_loop(module):
         period <= 840 and period * sum(len(a.program.tasks) for a in actors.values()) <= 65536,
         "periodic template budget exceeded; no finite-length fallback",
     )
-    loop = Loop(op, actors, roots, size, constant, period, {})
+    loop = Loop(
+        op,
+        actors,
+        roots,
+        size,
+        constant,
+        period,
+        {},
+        tuple(sizes),
+        None if limit is None else uniform_values[limit],
+    )
+    _check_prefixes(loop, all_views)
     _check_accesses(loop, all_views)
     return loop
+
+
+def _check_prefixes(loop, all_views):
+    """Prove when the fixed-cell frontier is exact for a variable final prefix.
+
+    All accesses to each clipped allocation use the same nonempty prefix of aligned
+    equal-sized cells. Only the final generation may be partial, with no subsequent
+    generation. Thus removing its unaccessed suffix changes no RAW/WAR/WAW edge or
+    initialization obligation. Mixing a full reader with a clipped writer is refused.
+    """
+    by_root = {}
+    for actor, views in all_views.items():
+        for ref in views.values():
+            by_root.setdefault(loop.root(actor, ref), []).append(ref)
+    for root, refs in by_root.items():
+        clipped = [ref for ref in refs if ref.prefix_extent is not None]
+        if not clipped:
+            continue
+        require(
+            len(loop.actors) == 1 and next(iter(loop.actors.values())).program.core == "aiv",
+            "valid prefixes currently require one standalone AIV owner",
+        )
+        first = clipped[0]
+        require(
+            len(clipped) == len(refs),
+            f"{root}: full and clipped accesses cannot share prefix proof",
+        )
+        require(
+            loop.bound
+            == expression("ceildiv", first.prefix_extent, literal(first.prefix_elements)),
+            f"{root}: valid prefix disagrees with loop bound",
+        )
+        for ref in refs:
+            require(
+                (ref.prefix_extent, ref.prefix_elements, ref.nbytes, ref.dtype)
+                == (first.prefix_extent, first.prefix_elements, first.nbytes, first.dtype)
+                and ref.dtype == ref.storage.dtype
+                and ref.rows == 1
+                and ref.nbytes == ref.prefix_elements * ITEMSIZE[ref.dtype],
+                f"{root}: prefix aliases require equal cell extent, dtype and clipping",
+            )
+            require(
+                all(ref.address(r) % ref.nbytes == 0 for r in range(loop.period)),
+                f"{root}: clipped aliases must select whole aligned cells",
+            )
+            if ref.storage.external:
+                require(
+                    loop.groups == 1
+                    and not ref.core_terms
+                    and not ref.count_core_stride
+                    and not ref.count_offset
+                    and ref.storage.count_scale == ITEMSIZE[ref.dtype]
+                    and ref.storage.extent is not None
+                    and bounded_by(ref.prefix_extent, ref.storage.extent)
+                    and slope(ref) == ref.nbytes
+                    and all(ref.address(r) == r * ref.nbytes for r in range(loop.period)),
+                    f"{root}: clipped GM view needs a bounded contiguous stream and one owner",
+                )
+    for data in loop.actors.values():
+        for task in data.program.tasks:
+            clips = {(ref.prefix_extent, ref.prefix_elements) for ref in task.refs}
+            if any(extent is not None for extent, _ in clips):
+                require(
+                    len(clips) == 1 and all(ref.prefix_extent is not None for ref in task.refs),
+                    f"{task.uid}: native inputs and output need the same valid prefix",
+                )
+                require(
+                    task.native
+                    in {
+                        "copy",
+                        "muls",
+                        "adds",
+                        "add",
+                        "sub",
+                        "mul",
+                        "div",
+                        "max",
+                        "exp",
+                        "rsqrt",
+                        "fill",
+                        "convert_rn",
+                        "convert_f32",
+                    }
+                    and all(ref.storage.bank in {"GM", "UB"} for ref in task.refs),
+                    f"{task.uid}: variable native footprint is not implemented for this recipe",
+                )
 
 
 def _check_accesses(loop, all_views):
@@ -448,7 +599,13 @@ def _check_accesses(loop, all_views):
             )
             frame = next(iter(drift))
             loop.frames[root] = frame
-            if storage.count_scale:
+            if refs[0].prefix_extent is not None:
+                pass  # Exact final-prefix ownership was checked above.
+            elif storage.count_scale:
+                require(
+                    storage.extent == loop.bound,
+                    f"{root}: unclipped stream requires its actual loop extent",
+                )
                 require(
                     storage.count_scale == loop.groups * frame
                     and all(
@@ -509,7 +666,13 @@ def _check_accesses(loop, all_views):
                 coefficient = ref.count_offset + ref.count_core_stride * core
                 for r in range(loop.period):
                     parts = ref.segments(r, core)
-                    if storage.count_scale:
+                    if ref.prefix_extent is not None and storage.external:
+                        pass  # The upper address is min((g+1)*tile, raw_extent), not padded.
+                    elif storage.count_scale:
+                        require(
+                            storage.extent == loop.bound,
+                            f"{root}: unclipped access needs matching loop/storage extent",
+                        )
                         require(
                             slope(ref) + coefficient <= storage.count_scale
                             and all(

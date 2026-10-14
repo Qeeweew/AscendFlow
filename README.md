@@ -4,9 +4,14 @@
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
 2026-10-14 重新制定了[总体设计](docs/design.md)、[DSL 前端与 CV 多阶段规格](docs/dsl-multistage.md)
-和[重构计划](docs/refactor-plan.md)。受限 AST 已接通完整 tile 的单循环 Vector；
+和[重构计划](docs/refactor-plan.md)。受限 AST 已接通单循环 Vector、运行时原始
+长度与精确对齐尾部；
 嵌套符号同步和真实 FA 迁移尚未完成。新 `prim_func` 不执行设备函数体，遗留
 构造明确使用 `trace_func`。实现边界和历史证据见[重构记录](docs/refactor-progress.md)。
+
+两个独立长度参数、`ceildiv` 循环和有效前缀的可运行例子见
+[ast_prefix.py](examples/ast_prefix.py)；实际同步、拒绝条件和设备命令见
+[运行时尾部](docs/runtime-prefix.md)。
 
 当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
 源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
@@ -124,8 +129,9 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 ## 当前支持边界
 
 下表主要记录已提交的有限物理路径，不能直接套用到未提交的符号循环原型。
-原型支持单个连续外层 runtime task count，但嵌套仍受限/展开；它没有实现新
-规格中的一般嵌套控制和所有权。两条路径的准确边界见[重构记录](docs/refactor-progress.md)。
+AST 路径支持多个非负 uniform 参数及 min/max/ceildiv 上界；对齐尾部目前限于
+单独 AIV 和共同有效前缀。嵌套循环与分支保留为 IR，尚未接通同步 lowering；
+legacy 静态内层仍有展开。两条路径的准确边界见[重构记录](docs/refactor-progress.md)。
 
 | 能力 | 实际支持 |
 |---|---|

@@ -111,6 +111,7 @@ class Kernel:
         extent_count=None,
         count_offset=0,
         count_core_stride=0,
+        prefix_elements=0,
     ) -> SSAValue:
         assert self.task_block is not None
         typ = source.type
@@ -134,6 +135,7 @@ class Kernel:
                 "core_modulus": IntAttr(core_modulus),
                 "count_offset": IntAttr(count_offset),
                 "count_core_stride": IntAttr(count_core_stride),
+                **({"prefix_elements": IntAttr(prefix_elements)} if prefix_elements else {}),
             },
         )
         if index_terms:

@@ -9,11 +9,13 @@ import re
 from dataclasses import dataclass
 from math import prod
 
+from xdsl.dialects import arith
 from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
 
 from .builder import Kernel
 from .mixed import compose, extract_mixed, global_dependencies
 from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
+from .scalar import ARITHMETIC, from_ssa, prefix
 from .source_ir import (
     AllocationOp,
     CopyOp,
@@ -99,7 +101,10 @@ def _work(program, pipeline, family, owner):
                 for iteration in range(op.count.data):
                     local = {**bindings, op.body.block.args[0]: iteration}
                     walk(op.body.block, op, local, stage, phase, label, domain, (*path, iteration))
-            elif isinstance(op, (AllocationOp, ViewOp, PredicateOp, YieldOp)):
+            elif (
+                isinstance(op, (AllocationOp, ViewOp, PredicateOp, YieldOp, arith.ConstantOp))
+                or type(op) in ARITHMETIC
+            ):
                 continue
             elif isinstance(op, (CopyOp, ElementOp, MatmulOp)):
                 require(domain is not None, "mixed work requires a Cube or Vector execution scope")
@@ -168,10 +173,26 @@ class _Actor:
             disjoint_external=bool(program.disjoint_external.data),
         )
         self.runtime = None
+        self.uniform = {}
+        for scalar_op in program.body.block.ops:
+            if isinstance(scalar_op, SizeOp):
+                self.uniform[scalar_op.value] = self.kernel.runtime_size(
+                    scalar_op.sym_name.data, multiple=scalar_op.multiple.data
+                )
+            elif isinstance(scalar_op, arith.ConstantOp) or type(scalar_op) in ARITHMETIC:
+                cloned = scalar_op.clone(self.uniform)
+                self.kernel.block.add_op(cloned)
+                self.uniform.update(zip(scalar_op.results, cloned.results))
         if pipeline.limit is not None:
-            size = pipeline.limit.owner
-            require(isinstance(size, SizeOp), "runtime pipeline needs a uniform size SSA value")
-            self.runtime = self.kernel.runtime_size(size.sym_name.data, multiple=size.multiple.data)
+            require(
+                pipeline.limit in self.uniform, "pipeline bound must be uniform at region entry"
+            )
+            self.runtime = self.uniform[pipeline.limit]
+        self.scalar_cache = {}
+        self.uniform_by_expression = {
+            from_ssa(source, memo=self.scalar_cache): target
+            for source, target in self.uniform.items()
+        }
         self.roots = {}
         used = {_root(ref) for record in self.records for ref in _refs(record.op)}
         for allocation in allocations:
@@ -187,8 +208,8 @@ class _Actor:
             dynamic = bool(allocation.dimensions)
             require(
                 not dynamic
-                or (len(allocation.dimensions) == 1 and allocation.dimensions[0] is pipeline.limit),
-                "GM extent must use the same runtime pipeline length",
+                or (len(allocation.dimensions) == 1 and allocation.dimensions[0] in self.uniform),
+                "GM extent requires a declared uniform scalar expression",
             )
             if allocation.ring.data:
                 size *= program.groups.data
@@ -203,7 +224,7 @@ class _Actor:
                 layout=typ.layout.data,
                 external=external,
                 initialized=allocation.access.data in {"read", "read_write"},
-                extent_count=self.runtime if dynamic else None,
+                extent_count=self.uniform[allocation.dimensions[0]] if dynamic else None,
                 count_scale=size if dynamic else 0,
             )
         self.operand_buffers = {}
@@ -307,6 +328,36 @@ class _Actor:
             width, pitch = columns * strides[-1], strides[0]
         else:
             rows, width, pitch = 1, prod(dimensions) * ITEMSIZE[typ.dtype.data], 0
+        prefix_elements, prefix_extent = 0, None
+        if view.valid_index is not None:
+            require(
+                self.pipeline.limit is not None and rows == 1 and len(dimensions) == 1,
+                "valid prefix currently requires a one-dimensional runtime pipeline tile",
+            )
+            bound = from_ssa(self.pipeline.limit, memo=self.scalar_cache)
+            prefix_elements = dimensions[0]
+            require(
+                bound.kind == "ceildiv" and bound.args[1].constant == prefix_elements,
+                "valid prefix tile must match the pipeline ceildiv divisor",
+            )
+            valid = from_ssa(
+                view.indices[view.valid_index.data],
+                coordinates={self.pipeline.body.block.args[0]: "$g"},
+                memo=self.scalar_cache,
+            )
+            require(
+                valid == prefix(bound.args[0], prefix_elements),
+                "valid must be min(tile, logical_extent - task * tile)",
+            )
+            require(
+                not (count_offset or count_core_stride),
+                "prefix and count-relative ownership cannot be combined yet",
+            )
+            require(
+                bound.args[0] in self.uniform_by_expression,
+                "valid prefix extent must be available at region entry",
+            )
+            prefix_extent = self.uniform_by_expression[bound.args[0]]
         return self.kernel.view(
             self.roots[allocation],
             width,
@@ -315,9 +366,14 @@ class _Actor:
             row_stride=pitch,
             index_terms=generation,
             core_terms=core,
-            extent_count=self.runtime if count_offset or count_core_stride else None,
+            extent_count=prefix_extent
+            if prefix_extent is not None
+            else self.runtime
+            if count_offset or count_core_stride
+            else None,
             count_offset=count_offset,
             count_core_stride=count_core_stride,
+            prefix_elements=prefix_elements,
         )
 
     def emit(self):
@@ -663,7 +719,7 @@ def lower_source(module, *, symbolic=True):
         "expected one typed source program",
     )
     if program.attributes.get("frontend") == StringAttr("ast"):
-        from xdsl.dialects import arith, scf
+        from xdsl.dialects import scf
 
         for operation in program.walk():
             require(
@@ -677,17 +733,12 @@ def lower_source(module, *, symbolic=True):
                     "nested AST pipelines require hierarchical synchronization; "
                     "constant bounds do not authorize implicit unrolling",
                 )
-        require(
-            not any(
-                operation.name.startswith(arith.Arith.name + ".") for operation in program.walk()
-            ),
-            "arithmetic runtime bounds require structured scalar lowering",
-        )
     pipelines = [op for op in program.body.block.ops if isinstance(op, PipelineOp)]
     require(len(pipelines) == 1, "source requires one continuous outer task stream")
     require(
         all(
-            isinstance(op, (AllocationOp, SizeOp, PipelineOp, YieldOp))
+            isinstance(op, (AllocationOp, SizeOp, PipelineOp, YieldOp, arith.ConstantOp))
+            or type(op) in ARITHMETIC
             for op in program.body.block.ops
         ),
         "executable source work must belong to a task pipeline",

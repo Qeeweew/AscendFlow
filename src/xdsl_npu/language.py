@@ -221,7 +221,10 @@ class _Trace:
             if self.location is not None:
                 op.location = self.location
             block = self.op.body.block
-            if block.first_op is None:
+            sizes = [old for old in block.ops if isinstance(old, SizeOp)]
+            if sizes:
+                block.insert_op_after(op, sizes[-1])
+            elif block.first_op is None:
                 block.add_op(op)
             else:
                 block.insert_op_before(op, block.first_op)
@@ -373,7 +376,7 @@ class _View:
             generation=None if generation is None else trace.resolve_index(generation),
         )
 
-    def emit(self):
+    def emit(self, valid=None):
         trace, buffer = _trace(), self.buffer
         bound = self.bound()
         offset = bound.offset
@@ -409,6 +412,15 @@ class _View:
                     _ints((variables.index(variable), coefficient, divisor, modulus))
                 )
         terms = ArrayAttr(static_terms)
+        valid_attrs = {}
+        if valid is not None:
+            require(
+                isinstance(valid, SSAValue) and isinstance(valid.type, IndexType),
+                "valid requires an explicit device index expression",
+            )
+            if valid not in variables:
+                variables.append(valid)
+            valid_attrs["valid_index"] = IntAttr(variables.index(valid))
         op = ViewOp.build(
             operands=[buffer.op.ref, variables],
             result_types=[_type(self.shape, buffer.dtype, buffer.memory, buffer.layout)],
@@ -417,6 +429,7 @@ class _View:
                 "terms": terms,
                 "strides": _ints(self.strides),
                 "dynamic_terms": ArrayAttr(dynamic_terms),
+                **valid_attrs,
             },
         )
         trace.add(op)
@@ -483,6 +496,30 @@ def _index_bounds(index):
 
 def _runtime_axis(index, dimension, width):
     trace = _trace()
+    if trace.op.attributes.get("frontend") == StringAttr("ast") and index.terms:
+        from .scalar import bounded_by, from_ssa, literal
+
+        require(
+            len(index.terms) == 1 and index.constant == 0,
+            "runtime tile view needs one unshifted logical coordinate",
+        )
+        variable, coefficient, divisor, modulus = index.terms[0]
+        pipeline = variable.owner.parent_op()
+        require(
+            isinstance(pipeline, PipelineOp) and pipeline.limit is not None,
+            "runtime tile view requires its pipeline bound",
+        )
+        bound = from_ssa(pipeline.limit)
+        extent = from_ssa(trace.size(dimension))
+        if (coefficient, divisor, modulus) == (width, 1, 0) and (
+            bound == extent
+            and width == 1
+            or bound.kind == "ceildiv"
+            and bound.args[1] == literal(width)
+            and bounded_by(bound.args[0], extent)
+        ):
+            return
+        require(False, "runtime tile view is not bounded by its tensor extent")
     require(
         dimension.scale == 1 and width == 1, "runtime axis currently requires one task per index"
     )
@@ -737,7 +774,7 @@ def trace_func(function=None, *, disjoint_external=False):
     return decorate if function is None else decorate(function)
 
 
-def copy(source, destination):
+def copy(source, destination, *, valid=None):
     src, dst = _view(source), _view(destination).bound()
     require(dst.buffer.op.access.data != "read", "copy cannot write a read-only tensor")
     require(
@@ -745,7 +782,7 @@ def copy(source, destination):
         "copy requires identical typed extents; use explicit cast",
     )
     op = CopyOp.build(
-        operands=[src.emit(), dst.emit(), _deps([source])],
+        operands=[src.emit(valid), dst.emit(valid), _deps([source])],
         result_types=[_tile(dst)],
         attributes={"dependency_inputs": _dependency_inputs([source])},
     )
@@ -754,7 +791,7 @@ def copy(source, destination):
     return _Value(dst, op.value)
 
 
-def _element(kind, values, out, scalar=None):
+def _element(kind, values, out, scalar=None, valid=None):
     dst, inputs = _view(out).bound(), [_view(value) for value in values]
     require(dst.buffer.op.access.data != "read", "arithmetic cannot write a read-only tensor")
     require(
@@ -769,7 +806,7 @@ def _element(kind, values, out, scalar=None):
     if scalar is not None:
         attrs["scalar"] = FloatAttr(round_f32(scalar), ir_f32)
     op = ElementOp.build(
-        operands=[[v.emit() for v in inputs], dst.emit(), _deps(values)],
+        operands=[[v.emit(valid) for v in inputs], dst.emit(valid), _deps(values)],
         result_types=[_tile(dst)],
         attributes=attrs,
     )
@@ -778,11 +815,11 @@ def _element(kind, values, out, scalar=None):
     return _Value(dst, op.value)
 
 
-def mul(lhs, rhs, *, out):
+def mul(lhs, rhs, *, out, valid=None):
     return (
-        _element("mul_scalar", [lhs], out, rhs)
+        _element("mul_scalar", [lhs], out, rhs, valid)
         if isinstance(rhs, (float, int))
-        else _element("mul", [lhs, rhs], out)
+        else _element("mul", [lhs, rhs], out, valid=valid)
     )
 
 
