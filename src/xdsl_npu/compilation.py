@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
+from .budget import limit, poll
 from .codegen import _emit_checked
 from .ir import KernelOp, TaskOp, dump, parse
 from .lowering import lower_source
@@ -29,23 +30,33 @@ class Compilation:
     _timings_json: str
     _schedule_json: str
 
-    def __init__(self, module, *, synchronize=True, host_launcher=True):
+    def __init__(
+        self, module, *, synchronize=True, host_launcher=True, timeout_s=60.0, cancel=None
+    ):
+        with limit(timeout_s, cancel):
+            self._build(module, synchronize=synchronize, host_launcher=host_launcher)
+
+    def _build(self, module, *, synchronize, host_launcher):
         started = perf_counter()
+        poll("frontend")
         require(type(synchronize) is bool, "synchronize must be an explicit boolean policy")
         from .frontend import PrimFunction
 
         if isinstance(module, PrimFunction):
             module = module.to_ir()
         frontend = perf_counter()
+        poll("input ownership")
         module = module.clone()
         owned = perf_counter()
         source = isinstance(module.body.block.first_op, ProgramOp)
+        poll("native lowering")
         if source:
             require(synchronize, "source regions must lower through automatic synchronization")
             physical = lower_source(module)
         else:
             physical = module
         lowered = perf_counter()
+        poll("synchronization planning")
         checked = []
         if synchronize:
             plan = autosync(physical, _capture=checked.append)
@@ -57,8 +68,10 @@ class Compilation:
             checked.append((report, analysis, perf_counter() - checking))
         planned = perf_counter()
         report, analysis, final_check_s = checked[0]
+        poll("ASC emission")
         code = _emit_checked(plan, analysis, host_launcher=host_launcher)
         emitted = perf_counter()
+        poll("IR snapshots")
         schedule = {}
         for kernel in plan.walk():
             if not isinstance(kernel, KernelOp):
@@ -92,6 +105,7 @@ class Compilation:
             "_schedule_json": json.dumps(schedule),
         }
         frozen = perf_counter()
+        poll("completed compilation")
         snapshots["_timings_json"] = json.dumps(
             {
                 "frontend_s": frontend - started,
@@ -144,6 +158,12 @@ class Compilation:
             (directory / "witnesses.json").write_text(json.dumps(self.explain(), indent=2) + "\n")
 
 
-def compile(module, *, synchronize=True, host_launcher=True):
+def compile(module, *, synchronize=True, host_launcher=True, timeout_s=60.0, cancel=None):
     """Typed source or physical IR -> frozen code, proof summary, and IR snapshots."""
-    return Compilation(module, synchronize=synchronize, host_launcher=host_launcher)
+    return Compilation(
+        module,
+        synchronize=synchronize,
+        host_launcher=host_launcher,
+        timeout_s=timeout_s,
+        cancel=cancel,
+    )

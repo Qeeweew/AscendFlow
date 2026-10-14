@@ -169,6 +169,18 @@ class BufferOp(IRDLOperation):
 
 
 @irdl_op_definition
+class FrameOp(IRDLOperation):
+    """One owner/invocation's contiguous GM frame; this is an alias, no DMA."""
+
+    name = "npu.frame"
+    source = operand_def(RefType)
+    invocation = operand_def(IndexType)
+    extent = operand_def(IndexType)
+    scale = attr_def(IntAttr)
+    ref = result_def(RefType)
+
+
+@irdl_op_definition
 class ViewOp(IRDLOperation):
     name = "npu.view"
     source = operand_def(RefType)
@@ -240,6 +252,35 @@ class LoopChannelOp(IRDLOperation):
     residues = attr_def(ArrayAttr[IntAttr])
     event_ids = attr_def(ArrayAttr[IntAttr])
     last = opt_attr_def(IntAttr)
+    carry = opt_attr_def(IntAttr)
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
+class InvocationChannelOp(IRDLOperation):
+    """Local event from a child tail to the next invocation's head.
+
+    A Set captures the producer pipe prefix after source at N-1-source_gap;
+    its Wait precedes destination at destination_index in the next call.
+    Neither endpoint executes outside its real count/parent activation.
+    """
+
+    name = "npu.invocation_channel"
+    sym_name = attr_def(StringAttr)
+    source = attr_def(StringAttr)
+    destination = attr_def(StringAttr)
+    source_gap = attr_def(IntAttr)
+    destination_index = attr_def(IntAttr)
+    event_id = attr_def(IntAttr)
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
+class InvocationSyncOp(IRDLOperation):
+    name = "npu.invocation_sync"
+    generation = operand_def(IndexType)
+    action = attr_def(StringAttr)
+    channel = attr_def(StringAttr)
     traits = traits_def(AsyncEffects())
 
 
@@ -341,11 +382,14 @@ NPU = Dialect(
         StaticDispatchOp,
         StaticCaseOp,
         BufferOp,
+        FrameOp,
         ViewOp,
         StreamOp,
         BoundaryOp,
         RuntimeSizeOp,
         LoopChannelOp,
+        InvocationChannelOp,
+        InvocationSyncOp,
         LoopSyncOp,
         TaskOp,
         FixConfigOp,

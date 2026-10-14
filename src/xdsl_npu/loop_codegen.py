@@ -1,19 +1,27 @@
 """ASC loops with uniform runtime counts and guarded event ordinals."""
 
 from .codegen import QUALIFIER, native_line
-from .ir import MixedOp
+from .ir import InvocationChannelOp, MixedOp
 from .model import ITEMSIZE, storage_layout
 from .scalar import bindings, from_ssa
 
 
-def _guard(command):
+def _guard(command, channel=None):
     terms = []
     if command.last_gap is not None:
         terms.append(f"g == n - {command.last_gap + 1}")
     if command.lower:
-        terms.append(f"g >= {command.lower}")
+        terms.append(
+            f"(g >= {command.lower} || npu_invocation > 0)"
+            if channel is not None and channel.carry
+            else f"g >= {command.lower}"
+        )
     if command.upper:
-        terms.append(f"g < n - {command.upper}")
+        terms.append(
+            f"(g < n - {command.upper} || npu_invocation + 1 < npu_invocations)"
+            if channel is not None and channel.carry
+            else f"g < n - {command.upper}"
+        )
     if command.period != 1:
         terms.append(
             "(" + " || ".join(f"g % {command.period} == {r}" for r in command.residues) + ")"
@@ -55,6 +63,12 @@ def emit_loop(analysis, *, host_launcher=True):
         for ref in task.refs
         if ref.prefix_extent is not None
     ]
+    invocation = loop.invocation
+    invocation_channels = [
+        op for op in loop.op.body.block.ops if isinstance(op, InvocationChannelOp)
+    ]
+    if invocation is not None:
+        expressions += [invocation.bound] + [frame.extent for frame in invocation.frames]
     uniform_names, uniform_lines = bindings(expressions)
     kind = (
         "__mix__(1, 2)"
@@ -70,6 +84,8 @@ def emit_loop(analysis, *, host_launcher=True):
         *uniform_lines,
         f"  const int64_t n = {loop.bound.c(uniform_names) if loop.bound is not None else loop.constant_count};",
     ]
+    if invocation is not None:
+        lines.append(f"  const int64_t npu_invocations = {invocation.bound.c(uniform_names)};")
     tasks = {
         (actor, task.uid): task
         for actor, data in loop.actors.items()
@@ -103,6 +119,16 @@ def emit_loop(analysis, *, host_launcher=True):
         for task in data.program.tasks:
             if task.native == "scalar_load":
                 lines.append(f"  float npu_value_{task.uid} = 0.0f;")
+        if invocation is not None:
+            lines.append(
+                "  for (int64_t npu_invocation = 0; n > 0 && npu_invocation < npu_invocations; ++npu_invocation) {"
+            )
+            for frame in invocation.frames:
+                lines.append(
+                    f"    __gm__ uint8_t* {frame.name} = {frame.root.sym_name.data} + "
+                    f"(core_id * npu_invocations + npu_invocation) * "
+                    f"{frame.extent.c(uniform_names)} * {frame.scale};"
+                )
         lines.append(f"  for (int64_t step = 0; step < n + {maximum}; ++step) {{")
         for command in sequences[actor]:
             task = command.task
@@ -113,11 +139,32 @@ def emit_loop(analysis, *, host_launcher=True):
             ]
             if command.kind == "task":
                 code = native_line(task, "n", "core_id", uniform_names=uniform_names)
+                for protocol in invocation_channels:
+                    source = tuple(protocol.source.data.split("/"))
+                    destination = tuple(protocol.destination.data.split("/"))
+                    gap, index = protocol.source_gap.data, protocol.destination_index.data
+                    a, b = tasks[source].pipe, tasks[destination].pipe
+                    if (actor, task.uid) == destination:
+                        code = (
+                            f"if (npu_invocation > 0 && n > {max(gap, index)} && g == {index}) {{ "
+                            f"asc_sync_wait(PIPE_{a}, PIPE_{b}, event_t({protocol.event_id.data})); }} "
+                            + code
+                        )
+                    if (actor, task.uid) == source:
+                        code += (
+                            f" if (npu_invocation + 1 < npu_invocations && n > {max(gap, index)} "
+                            f"&& g == n - {gap + 1}) {{ asc_sync_notify(PIPE_{a}, PIPE_{b}, "
+                            f"event_t({protocol.event_id.data})); }}"
+                        )
             elif command.kind == "barrier":
                 code = f"asc_sync_pipe(PIPE_{task.pipe});"
             else:
                 channel = channel_map[command.channel]
-                epoch = "g" if command.kind.endswith("set") else f"g - {channel.distance}"
+                epoch = (
+                    "g"
+                    if command.kind.endswith("set") or channel.carry
+                    else f"g - {channel.distance}"
+                )
                 if channel.kind == "cross":
                     function = (
                         "asc_sync_block_arrive"
@@ -129,14 +176,16 @@ def emit_loop(analysis, *, host_launcher=True):
                     a, b = tasks[channel.sources[0]].pipe, tasks[channel.destinations[0]].pipe
                     function = "asc_sync_notify" if command.kind == "set" else "asc_sync_wait"
                     code = f"{function}(PIPE_{a}, PIPE_{b}, event_t({_event(channel, epoch)})); // {channel.name}"
-            guard = _guard(command)
+            guard = _guard(command, channel_map.get(command.channel))
             if guard:
                 body, marker, comment = code.partition("//")
                 code = f"if ({guard}) {{ {body.strip()} }}" + (f" //{comment}" if marker else "")
             lines.append(f"        {code}")
             lines += ["      }", "    }"]
+        lines.append("  }")
+        if invocation is not None:
+            lines.append("  } // serial invocation: no whole-child drain")
         lines += [
-            "  }",
             "  // Final lifetime boundary; no PIPE_ALL in the loop.",
             "  asc_sync_pipe(PIPE_ALL);",
         ]
@@ -168,7 +217,8 @@ def emit_loop(analysis, *, host_launcher=True):
             lines.append(
                 f"  if ({size_arg} < 0 || {size_arg} > {limit} || {size_arg} % {size.multiple.data} != 0) return -1;"
             )
-        lines += uniform_lines
+        _, checked_uniform_lines = bindings(expressions, checked=True)
+        lines += checked_uniform_lines
         if loop.bound is not None:
             stage_margin = max(
                 task.stage for actor in loop.actors.values() for task in actor.program.tasks

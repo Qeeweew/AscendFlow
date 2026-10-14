@@ -1,9 +1,10 @@
 # R2a：父子源码与调用边界分析
 
-这是R2a的实现进展，尚不是完整父子流水闭环。新增
+本页记录 `83d7d09` 的R2a边界分析基础。当时新增
 [hierarchical_gemm](../examples/ast_hierarchical_gemm.py)保留runtime `outputs`父serial
-和runtime `panels`子Pipelined，使用真实的首清末导计算主体。当前能生成结构化
-源IR；physical lowering仍明确拒绝父scf.for，不能编译设备代码或声称已支持嵌套。
+和runtime `panels`子Pipelined，使用真实的首清末导计算主体。该提交能生成结构化
+源IR；当时physical lowering拒绝父scf.for。后续已接通限定local结构的真实闭环，
+当前能力、设备/profiling证据见[运行时层次流水](runtime-hierarchy.md)。
 
 ## 源码地址不再只有一个动态轴
 
@@ -21,8 +22,8 @@ source view保留坐标、SSA步长和allocation root，不按长度生成Python
 
 动态轴要求对应零起点、unit-step的serial/pipeline坐标；错上界、跨轴使用、
 非uniform步长因子拒绝。native tile内部动态pitch尚未接通，需先选中动态轴。
-多维extent的物理ABI、乘法溢出检查和父GM ownership还要随下一步lowering实现；
-当前不能仅凭source verifier就允许launch。参数化乘积最多8个动态因子。
+多维extent的物理ABI、乘法溢出检查和父GM ownership由后续父层实现并验证，
+不能仅凭source verifier允许launch。参数化乘积最多8个动态因子。
 
 ## 精确内存frontier，而非整个child的done
 
@@ -114,6 +115,6 @@ print(dump(hierarchical_gemm.to_ir()))
 PY
 ```
 
-下一步将源程序真正降为保留的物理父子region，验证每个GM frame的范围/owner，
-并把上述memory与event义务接入父层完成图、同步物化和最终检查。其后才进行
-父流水ASC/CANN、同binary双参数设备验证及固定AscendC profiling；R2a仍未验收。
+上述memory/event义务现已接入限定父子结构的完成检查、同步物化和最终验证，
+并完成双参数设备与AscendC profiling。一般多child/多actor和通用循环外工作
+仍待实现，不能把局部摘要或当前主闭环外推为整个R2完成。

@@ -152,6 +152,8 @@ def uniform(expr, names):
         return expr.args[0] in names
     if expr.kind in {"min", "max"}:
         return all(uniform(arg, names) for arg in expr.args)
+    if expr.kind == "mul":
+        return all(uniform(arg, names) for arg in expr.args)
     return (
         expr.kind == "ceildiv"
         and uniform(expr.args[0], names)
@@ -178,11 +180,13 @@ def prefix(extent, tile):
     return expression("min", literal(tile), remaining)
 
 
-def bindings(expressions):
+def bindings(expressions, *, checked=False):
     """Emit each uniform DAG node once; nested min/max never duplicate C text."""
     names, lines = {}, []
+    definitions = 0
 
     def visit(expr):
+        nonlocal definitions
         if expr in names:
             return
         if expr.kind in {"argument", "constant"}:
@@ -190,7 +194,13 @@ def bindings(expressions):
             return
         for arg in expr.args:
             visit(arg)
-        name = f"npu_uniform_{len(lines)}"
+        name = f"npu_uniform_{definitions}"
+        definitions += 1
+        if checked and expr.kind == "mul":
+            a, b = (arg.c(names) for arg in expr.args)
+            lines.append(
+                f"  if ({b} != 0 && {a} > INT64_MAX / {b}) return -1; // uniform product overflow"
+            )
         lines.append(f"  const int64_t {name} = {expr.c(names)};")
         names[expr] = name
 

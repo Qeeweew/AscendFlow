@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from math import prod
 
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
+from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IndexType, IntAttr, StringAttr
 from xdsl.ir import Block, Region
 
 from .builder import Kernel
-from .ir import BoundaryOp, EndOp
+from .ir import BoundaryOp, EndOp, FrameOp
 from .mixed import compose, extract_mixed, global_dependencies
 from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
 from .scalar import ARITHMETIC, expression, from_ssa, literal, prefix
@@ -126,7 +126,10 @@ def _work(program, pipeline, family, owner):
                 _last_condition(op, pipeline)
                 walk(op.true_region.block, clock, bindings, stage, phase, label, domain, path, op)
             elif isinstance(op, PipelineOp):
-                require(boundary is None, "a loop inside a boundary requires hierarchical region analysis")
+                require(
+                    boundary is None,
+                    "a loop inside a boundary requires hierarchical region analysis",
+                )
                 require(op.issue_order is None, "nested issue policies need hierarchical lowering")
                 require(
                     op.limit is None,
@@ -246,8 +249,11 @@ def _initialize(op, record, coordinate=None):
 
 
 class _Actor:
-    def __init__(self, program, pipeline, actor, family, owner, allocations, symbolic=False):
+    def __init__(
+        self, program, pipeline, actor, family, owner, allocations, symbolic=False, invocation=None
+    ):
         self.program, self.pipeline = program, pipeline
+        self.invocation = invocation
         self.records = _work(program, pipeline, family, owner)
         require(self.records, f"{actor}: execution domain has no real work")
         self.kernel = Kernel(
@@ -278,6 +284,7 @@ class _Actor:
             for source, target in self.uniform.items()
         }
         self.roots = {}
+        self.frame_specs = {}
         used = {_root(ref) for record in self.records for ref in _refs(record.op)}
         for allocation in allocations:
             typ = allocation.ref.type
@@ -292,7 +299,10 @@ class _Actor:
             dynamic = bool(allocation.dimensions)
             require(
                 not dynamic
-                or (len(allocation.dimensions) == 1 and allocation.dimensions[0] in self.uniform),
+                or (
+                    all(d in self.uniform for d in allocation.dimensions)
+                    and (len(allocation.dimensions) == 1 or invocation is not None)
+                ),
                 "GM extent requires a declared uniform scalar expression",
             )
             if allocation.ring.data:
@@ -308,9 +318,34 @@ class _Actor:
                 layout=typ.layout.data,
                 external=external,
                 initialized=allocation.access.data in {"read", "read_write"},
-                extent_count=self.uniform[allocation.dimensions[0]] if dynamic else None,
+                extent_count=self.uniform_product(tuple(from_ssa(d) for d in allocation.dimensions))
+                if dynamic
+                else None,
                 count_scale=size if dynamic else 0,
             )
+            if invocation is not None and external:
+                require(
+                    len(dimensions) >= 3, "invocation GM shape needs group/invocation/frame axes"
+                )
+                axes = [d.data for d in allocation.dynamic_axes]
+                values = dict(zip(axes, allocation.dimensions))
+                parent_extent = from_ssa(values[1]) if 1 in values else literal(dimensions[1])
+                require(
+                    len(dimensions) >= 3
+                    and dimensions[0] == program.groups.data
+                    and parent_extent == from_ssa(invocation.ub)
+                    and all(i in {1, 2} for i in axes),
+                    "invocation tensors need leading [group, invocation] axes and bounded frame dimensions",
+                )
+                extent = from_ssa(values[2]) if 2 in values else literal(1)
+                require(
+                    2 not in values
+                    or pipeline.limit is not None
+                    and extent == from_ssa(pipeline.limit),
+                    "dynamic frame axis must match the child pipeline bound",
+                )
+                scale = prod(n for n in dimensions[2:] if n != -1) * ITEMSIZE[typ.dtype.data]
+                self.frame_specs[allocation] = extent, scale
         self.operand_buffers = {}
         for record in self.records:
             op = record.op
@@ -334,6 +369,22 @@ class _Actor:
                 )
         if family == "cube":
             self.kernel.init_fixpipe()
+        if invocation is not None:
+            bound = self.uniform[invocation.ub]
+            frame_values = {
+                allocation: self.uniform_product((extent,))
+                for allocation, (extent, _) in self.frame_specs.items()
+            }
+            parent = self.kernel.invocations(bound)
+            for allocation, (extent, scale) in self.frame_specs.items():
+                root = self.roots[allocation]
+                frame = FrameOp.create(
+                    operands=[root, parent.body.block.args[0], frame_values[allocation]],
+                    attributes={"scale": IntAttr(scale)},
+                    result_types=[root.type],
+                )
+                parent.body.block.add_op(frame)
+                self.roots[allocation] = frame.ref
         self.kernel.loop(
             self.runtime if self.runtime is not None else pipeline.count.data, symbolic=symbolic
         )
@@ -341,6 +392,20 @@ class _Actor:
         self.definitions = {}
         self.readers = {}
         self.scalar_values = {}
+
+    def uniform_product(self, factors):
+        result = literal(1)
+        for factor in factors:
+            result = expression("mul", result, factor)
+        if result not in self.uniform_by_expression:
+            if result.constant is not None:
+                op = arith.ConstantOp.from_int_and_width(result.constant, IndexType())
+            else:
+                require(result.kind == "mul", "unbound uniform frame expression")
+                op = arith.MuliOp(*(self.uniform_product((arg,)) for arg in result.args))
+            self.kernel.block.add_op(op)
+            self.uniform_by_expression[result] = op.results[0]
+        return self.uniform_by_expression[result]
 
     def view(self, value, record, *, matrix=False):
         view, allocation = value.owner, _root(value)
@@ -361,6 +426,23 @@ class _Actor:
         offset = view.offset.data
         generation, core = [], []
         count_offset, count_core_stride = 0, 0
+        translations = {}
+
+        def frame_translation(variable, coefficient, divisor, modulus):
+            if allocation not in self.frame_specs:
+                return False
+            if variable not in {
+                self.program.body.block.args[0],
+                self.invocation.body.block.args[0],
+            }:
+                return False
+            require(
+                divisor == 1 and modulus == 0 and variable not in translations,
+                "GM frame coordinate must be one affine owner/invocation term",
+            )
+            translations[variable] = coefficient
+            return True
+
         for term in view.terms:
             require(len(term) == 4, "source index term must have index/coefficient/divisor/modulus")
             index, coefficient, divisor, modulus = (v.data for v in term)
@@ -369,7 +451,9 @@ class _Actor:
                 "invalid source coordinate",
             )
             variable = view.indices[index]
-            if variable in bindings:
+            if frame_translation(variable, literal(coefficient), divisor, modulus):
+                pass
+            elif variable in bindings:
                 value = bindings[variable] // divisor
                 offset += coefficient * (value % modulus if modulus else value)
             elif variable is self.pipeline.body.block.args[0]:
@@ -392,6 +476,10 @@ class _Actor:
                 "invalid dynamic view term",
             )
             variable, count = view.indices[variable_index], view.indices[count_index]
+            if frame_translation(
+                variable, expression("mul", literal(coefficient), from_ssa(count)), divisor, modulus
+            ):
+                continue
             require(
                 count is self.pipeline.limit and self.runtime is not None,
                 "address uses a different runtime count",
@@ -402,10 +490,30 @@ class _Actor:
                 )
                 count_core_stride += coefficient
             elif variable in bindings:
-                literal = bindings[variable] // divisor
-                count_offset += coefficient * (literal % modulus if modulus else literal)
+                coordinate_value = bindings[variable] // divisor
+                count_offset += coefficient * (
+                    coordinate_value % modulus if modulus else coordinate_value
+                )
             else:
                 require(False, "runtime task stride needs a segmented ownership contract")
+        if allocation in self.frame_specs:
+            from .invocation import factors
+
+            extent, scale = self.frame_specs[allocation]
+            stride = expression("mul", extent, literal(scale))
+            expected = {
+                self.invocation.body.block.args[0]: stride,
+                self.program.body.block.args[0]: expression(
+                    "mul", from_ssa(self.invocation.ub), stride
+                ),
+            }
+            require(
+                all(
+                    factors(translations.get(var, literal(0))) == factors(value)
+                    for var, value in expected.items()
+                ),
+                "GM view must select its actual owner/invocation frame",
+            )
         contiguous = len(dimensions) == 1 or strides[0] == dimensions[1] * strides[-1]
         if typ.layout.data != "linear":
             # Leading axes select complete packed planes. Row-major byte
@@ -922,6 +1030,19 @@ def lower_source(module, *, symbolic=True):
         isinstance(program, ProgramOp) and len(list(module.body.block.ops)) == 1,
         "expected one typed source program",
     )
+    parents = [op for op in program.body.block.ops if isinstance(op, scf.ForOp)]
+    invocation = parents[0] if len(parents) == 1 else None
+    if parents:
+        require(
+            symbolic and invocation is not None and program.kind.data != "mixed",
+            "structured invocation lowering currently requires one local actor and parent",
+        )
+        require(
+            not invocation.iter_args
+            and not invocation.results
+            and all(isinstance(op, (PipelineOp, scf.YieldOp)) for op in invocation.body.block.ops),
+            "structured scf.for synchronization requires one child pipeline and no other effects/carry",
+        )
     if program.attributes.get("frontend") == StringAttr("ast"):
         for operation in program.walk():
             if isinstance(operation, MatmulOp):
@@ -930,21 +1051,23 @@ def lower_source(module, *, symbolic=True):
                     "AST matmul requires explicit L0 operands; implicit L1 recipes are legacy",
                 )
             require(
-                not isinstance(operation, scf.ForOp),
+                not isinstance(operation, scf.ForOp) or operation is invocation,
                 f"{operation.location}: structured {operation.name} synchronization is not "
                 "implemented; AST control flow is never silently expanded or discarded",
             )
             if isinstance(operation, PipelineOp):
                 require(
-                    operation.parent_op() is program,
+                    operation.parent_op() is (program if invocation is None else invocation),
                     "nested AST pipelines require hierarchical synchronization; "
                     "constant bounds do not authorize implicit unrolling",
                 )
-    pipelines = [op for op in program.body.block.ops if isinstance(op, PipelineOp)]
+    scope = program if invocation is None else invocation
+    pipelines = [op for op in scope.body.block.ops if isinstance(op, PipelineOp)]
     require(len(pipelines) == 1, "source requires one continuous outer task stream")
     require(
         all(
             isinstance(op, (AllocationOp, SizeOp, PipelineOp, YieldOp, arith.ConstantOp))
+            or op is invocation
             or type(op) in ARITHMETIC
             for op in program.body.block.ops
         ),
@@ -972,7 +1095,14 @@ def lower_source(module, *, symbolic=True):
     else:
         actors = {
             program.kind.data: _Actor(
-                program, pipeline, program.kind.data, program.kind.data, 0, allocations, symbolic
+                program,
+                pipeline,
+                program.kind.data,
+                program.kind.data,
+                0,
+                allocations,
+                symbolic,
+                invocation=invocation,
             )
         }
         physical = next(iter(actors.values())).emit()

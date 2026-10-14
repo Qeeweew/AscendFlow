@@ -1,5 +1,26 @@
 # 重构的验证记录
 
+## R2a主闭环：实际父子IR、GM frame和跨调用同步
+
+在 `83d7d09` 上，父output×子K已贯通AST、物理scf.for/npu.stream、自动同步、
+最终重检、ASC和设备。Frame保留原GM根及当前owner/调用坐标；L1/L0原credit
+跨调用延续，L0C独立由FIX→MAD保护，只有kernel出口做一次PIPE_ALL。
+一般循环外工作、多child、动态每调用bound和CV层次组合仍未接通。
+
+最终相关291项回归通过（76.19秒），另加纯Vector父子有限事件检查；静态
+百万×百万边界保持6个native模板。编译默认60秒期限和取消回调可在证明查询
+中退出，报告phase/计数。五次冷进程源码→ASC p50=0.6889秒、max=0.7028秒、
+RSS61448 KiB；旧单层K ASC不变，新ASC与已profile库源码hash一致。
+
+两种dtype的同binary双参数设备验证均通过：f16 960 MiB、bf16 360 MiB输入
+大例逐元素精确，空域保留输出，guard不变。固定f16三轮msprof设备p50中位数
+生成/AscendC为1452.268/1451.858 µs，比值1.00028；不外推为FA/ACLNN达标。
+实际工作量、硬件条件模型、源码/前后IR/ASC及复现命令见
+[运行时层次流水](runtime-hierarchy.md)，原始数据在 `runs/refactor/invocations/`。
+
+下一步继续R2a的通用循环外工作以及R2b的状态/guard/布局，再进入R2c多层CV。
+整体R2和R3/R4真实FA迁移仍未完成，算子调参继续暂停。
+
 ## R2a进行中：多维源地址、内存与event调用边界
 
 在 `5c49ab3` 上增加真实父output×子K的AST源码，保留两个runtime轴及共享的

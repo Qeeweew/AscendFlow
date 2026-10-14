@@ -2,9 +2,11 @@
 
 from collections import defaultdict
 
+from xdsl.dialects import scf
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
-from .ir import KernelOp, LoopChannelOp, LoopSyncOp, StreamOp
+from .budget import bounded
+from .ir import InvocationChannelOp, InvocationSyncOp, KernelOp, LoopChannelOp, LoopSyncOp, StreamOp
 from .loop_graph import channels, completion_graph
 from .loop_model import extract_loop, loop_dependencies
 from .model import CompileError, require
@@ -211,8 +213,14 @@ def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True)
     return banks, cross_ids, local_queries
 
 
+@bounded
 def verify_loop(module, *, _details=False):
     loop = extract_loop(module)
+    require(
+        loop.invocation is not None
+        or not any(isinstance(op, (InvocationChannelOp, InvocationSyncOp)) for op in module.walk()),
+        "invocation synchronization requires its actual parent scope",
+    )
     obligations = loop_dependencies(loop)
     channel_map = channels(loop)
     graph, sequence, endpoints, native = completion_graph(loop, channel_map)
@@ -231,7 +239,13 @@ def verify_loop(module, *, _details=False):
                 )
                 scalar_queries += 1
     banks, cross_ids, lifetime_queries = _lifetime(loop, channel_map, graph, endpoints)
+    invocation_report = {}
+    if loop.invocation is not None:
+        from .invocation_sync import verify_invocation
+
+        invocation_report = verify_invocation(loop, channel_map, graph, endpoints, native)
     report = {
+        **invocation_report,
         "kernel": loop.op.sym_name.data,
         "groups": loop.groups,
         "runtime_length": None
@@ -282,6 +296,17 @@ def verify_loop(module, *, _details=False):
             }
         ),
     }
+    for protocol in module.body.block.first_op.body.block.ops:
+        if isinstance(protocol, InvocationChannelOp):
+            source = native[tuple(protocol.source.data.split("/"))]
+            destination = native[tuple(protocol.destination.data.split("/"))]
+            bank = f"{source.actor}:{source.task.pipe}:{destination.task.pipe}"
+            report["event_ids"].setdefault(bank, []).append(protocol.event_id.data)
+            report["event_ids"][bank].sort()
+    if loop.invocation is not None:
+        report["invocation_channels"] = sum(
+            isinstance(op, InvocationChannelOp) for op in module.walk()
+        )
     analysis = loop, channel_map, sequence, graph, (stride, potential)
     return (report, analysis) if _details else report
 
@@ -365,7 +390,9 @@ def _install(loop, specs, barriers):
             }
         )
         first_region = next(
-            child for child in loop.op.body.block.ops if isinstance(child, (StreamOp, KernelOp))
+            child
+            for child in loop.op.body.block.ops
+            if isinstance(child, (StreamOp, KernelOp, scf.ForOp))
         )
         loop.op.body.block.insert_op_before(op, first_region)
         placed = []
@@ -516,4 +543,8 @@ def autosync_loop(module, *, _capture=None):
         )
         op.attributes["event_ids"] = _ints(range(base, base + width))
         banks[key] = base + width
+    if loop.invocation is not None:
+        from .invocation_sync import plan_invocation
+
+        plan_invocation(loop)
     return _finish(result, _capture=_capture)

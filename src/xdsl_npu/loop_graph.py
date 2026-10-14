@@ -9,7 +9,8 @@ This is a parametric proof, not a sampled finite execution graph.
 from collections import deque
 from dataclasses import dataclass
 
-from .ir import EndOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
+from .budget import poll
+from .ir import EndOp, InvocationSyncOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
 from .loop_boundary import stream_operations
 from .model import optional_int, require
 from .periodic import MAX_PERIOD_TEMPLATES, MAX_PROOF_STATES
@@ -26,6 +27,7 @@ class Channel:
     residues: tuple[int, ...]
     ids: tuple[int, ...]
     last: bool = False
+    carry: bool = False
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,7 @@ class Graph:
     def potential(self):
         if self.potentials is not None:
             return self.potentials
+        poll("completion potential", nodes=len(self.nodes), edges=len(self.edges))
         # Choose T larger than any simple family cycle. An interior cycle
         # with net advance<=0 violates these difference constraints.
         stride = len(self.nodes) + 1
@@ -137,7 +140,11 @@ class Graph:
         pending = deque(range(len(self.nodes)))
         queued = [True] * len(self.nodes)
         insertions = [1] * len(self.nodes)
+        iterations = 0
         while pending:
+            iterations += 1
+            if iterations % 256 == 0:
+                poll("completion potential", nodes=len(self.nodes), relaxations=iterations)
             a = pending.popleft()
             queued[a] = False
             for b, delta in self.outgoing[a]:
@@ -157,6 +164,7 @@ class Graph:
     def _potential_full(self, stride):
         ranks = [0] * len(self.nodes)
         for _ in self.nodes:
+            poll("completion cycle diagnosis", nodes=len(self.nodes), edges=len(self.edges))
             changed = False
             for a, b, delta in self.edges:
                 required = ranks[a] + 1 - stride * delta
@@ -172,6 +180,7 @@ class Graph:
         key = residue, first, gap, terminal
         if key in self.domains:
             return self.domains[key]
+        poll("completion domain", cached_states=self.domain_states, first=first, gap=gap)
         if self.potentials is None:
             self.potential()
         stride, ranks = self.potentials
@@ -203,6 +212,8 @@ class Graph:
         successors = [[] for _ in states]
         predecessors = [[] for _ in states]
         for i, (node, cycle) in enumerate(states):
+            if i % 4096 == 0:
+                poll("completion domain", states=len(states), materialized=i)
             for destination, delta in self.outgoing[node]:
                 target = index.get((destination, cycle + delta))
                 if target is not None:
@@ -229,8 +240,13 @@ class Graph:
         *,
         omitted=(),
         _shorten=True,
+        source_point=None,
+        destination_point=None,
+        remaining=None,
+        at_end=False,
     ):
         self.path_queries += 1
+        poll("completion path", queries=self.path_queries, states=self.domain_states)
         p = self.period
         first = max(
             minimum, destination_command.lower, source_command.lower - (source_g - destination_g)
@@ -238,6 +254,9 @@ class Graph:
         residue = destination_g % p
         first += (residue - first) % p
         gap = max(destination_command.upper, source_command.upper + source_g - destination_g)
+        if remaining is not None:
+            require(remaining >= gap, "boundary query excludes an endpoint")
+            gap = remaining
         terminal_gaps = [
             last + shift
             for last, shift in [
@@ -246,8 +265,8 @@ class Graph:
             ]
             if last is not None
         ]
-        terminal = bool(terminal_gaps)
-        if terminal:
+        terminal = bool(terminal_gaps) or at_end
+        if terminal_gaps:
             if len(set(terminal_gaps)) != 1 or terminal_gaps[0] < gap:
                 return ()  # The two endpoint activations have empty intersection.
             gap = terminal_gaps[0]
@@ -303,7 +322,7 @@ class Graph:
                     current = following
                 if current == destination_g:
                     return path + tuple(tail)
-        source_point = (
+        source_point = source_point or (
             "prefix"
             if prefix
             else "end"
@@ -311,11 +330,12 @@ class Graph:
             else "begin"
         )
         source = self.ids[source_command.index, source_g % p, source_point]
-        destination = self.ids[destination_command.index, destination_g % p, "begin"]
+        destination_point = destination_point or (
+            "end" if destination_command.kind in {"set", "cross_set"} else "begin"
+        )
+        destination = self.ids[destination_command.index, destination_g % p, destination_point]
         # A Set's observable notification is its asynchronous end; a Wait
         # consumes at begin. Native dependence endpoints follow the same rule.
-        if destination_command.kind in {"set", "cross_set"}:
-            destination = self.ids[destination_command.index, destination_g % p, "end"]
         domain = self.domain(residue, first, gap, terminal)
         initial = domain.index.get((source, source_g // p - destination_g // p))
         target = domain.index.get((destination, 0))
@@ -427,6 +447,22 @@ def channels(loop, *, virtual=False):
             "event resource assignment missing/invalid",
         )
         terminal = optional_int(op.last, 0)
+        carry = optional_int(op.carry, 0)
+        require(
+            carry in {0, 1}
+            and (
+                not carry
+                or (
+                    op.kind.data == "local"
+                    and not terminal
+                    and period == 1
+                    and op.distance.data > 0
+                    and len(ids) == op.distance.data
+                    and loop.invocation is not None
+                )
+            ),
+            "carried channel requires an invocation and a full local slot-credit ring",
+        )
         require(
             terminal in {0, 1} and (not terminal or op.kind.data == "local"),
             "terminal protocols currently require one local actor",
@@ -445,6 +481,7 @@ def channels(loop, *, virtual=False):
             residues,
             ids,
             bool(terminal),
+            bool(carry),
         )
     return result
 
@@ -476,7 +513,10 @@ def commands(loop, channel_map):
                 else:
                     pending.append(op)
             else:
-                require(isinstance(op, (ViewOp, EndOp)), f"unknown loop stream effect {op.name}")
+                require(
+                    isinstance(op, (ViewOp, InvocationSyncOp, EndOp)),
+                    f"unknown loop stream effect {op.name}",
+                )
         require(not pending, "trailing waits require an explicit drain contract")
         sequence = []
 

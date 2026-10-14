@@ -9,7 +9,7 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 放在一起；下一步是父output×子K循环，不以更多单层例子替代层次流水。
 受限 AST 已接通单循环 Vector、运行时原始
 长度与精确对齐尾部；
-嵌套符号同步和真实 FA 迁移尚未完成。新 `prim_func` 不执行设备函数体，遗留
+一般多层CV同步和真实FA迁移尚未完成。新 `prim_func` 不执行设备函数体，遗留
 构造明确使用 `trace_func`。实现边界和历史证据见[重构记录](docs/refactor-progress.md)。
 
 两个独立长度参数、`ceildiv` 循环和有效前缀的可运行例子见
@@ -30,11 +30,12 @@ ASC 对照、有限逐字节反例、冷编译和大长度设备验证；嵌套�
 400 MiB固定配置的独立 AscendC/profiling、硬件工作量和支持边界见
 [Cube 验证记录](docs/ast-cube.md)。[运行时 K 归约](docs/runtime-reduction.md)进一步
 接通首代清零和末代一次 Fixpipe，960 MiB固定例已对照 AscendC/profiling；
-它仍是单层流，父子流水和跨调用生命周期尚待实现。
+该例本身是单层流；父子流水与跨调用生命周期见下方闭环。
 
-R2a已加入[父输出×子K的源程序](examples/ast_hierarchical_gemm.py)与
-[调用边界分析](docs/hierarchy-boundaries.md)：多runtime轴地址、最后读取和event
-跨调用义务可以参数化表达；父层同步物化仍未接通，该例目前只生成源IR。
+R2a的[父输出×子K程序](examples/ast_hierarchical_gemm.py)已接通物理父子区域、
+GM frame、跨调用同步及最终检查；960 MiB固定例通过AscendC/profiling对照，
+完整源码冷编译p50约0.689秒。支持边界、前后IR/ASC、设备证据和复现命令见
+[运行时层次流水](docs/runtime-hierarchy.md)。一般多层CV及真实FA迁移仍未完成。
 
 当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
 源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
@@ -154,7 +155,8 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 下表主要记录遗留有限物理路径，不能直接套用到当前 AST/符号循环路径。
 AST 路径支持多个非负 uniform 参数及 min/max/ceildiv 上界；对齐尾部目前限于
 单独 AIV 和共同有效前缀。单actor末代effect后缀已接通；一般分支与嵌套循环
-保留为IR，尚未接通同步lowering；
+保留为IR；目前仅接通单local actor的serial父循环×一个pipeline子循环，
+其余结构尚未接通同步lowering；
 legacy 静态内层仍有展开。两条路径的准确边界见[重构记录](docs/refactor-progress.md)。
 
 | 能力 | 实际支持 |

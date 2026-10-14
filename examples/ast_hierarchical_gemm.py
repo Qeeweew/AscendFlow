@@ -1,8 +1,8 @@
 """R2a source: runtime output loop around the runtime K reduction.
 
-Panel-major inputs are explicit. This source currently reaches structured IR;
-physical hierarchy synchronization is under implementation, so compile() still
-rejects it. It must never be routed to finite/tracing unrolling.
+Panel-major inputs are explicit. Parent and child loops are retained through
+physical IR; per-slot credits and final Fixpipe release protect repeated calls.
+An empty child preserves its output. No per-invocation whole-pipe drain.
 """
 
 from __future__ import annotations

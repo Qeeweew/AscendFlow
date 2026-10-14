@@ -82,8 +82,9 @@ def test_parent_and_child_coordinates_and_products_are_retained_in_ir():
             assert _address(external["A"], bindings) == linear * 32 * 64 * 2
             assert _address(external["B"], bindings) == linear * 64 * 64 * 2
             assert _address(external["C"], bindings) == (group * outputs + output) * 32 * 64 * 4
-    with pytest.raises(CompileError, match="structured scf.for"):
-        compile(module)
+    compiled = compile(module)
+    assert compiled.report["invocation_bound"] == "outputs"
+    assert compiled.report["native_templates"] == 6
 
 
 @pytest.mark.parametrize("bounds", ("panels", "1, outputs", "0, outputs, 2"))

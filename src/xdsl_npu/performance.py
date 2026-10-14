@@ -28,44 +28,50 @@ def runtime_work(module, arguments):
     These are instruction-requested bytes/elements, not HBM traffic or FLOPs.
     The caller records actual kernel timings and hardware rate assumptions.
     """
+    from .ir import InvocationChannelOp
     from .loop_sync import verify_loop
     from .scalar import from_ssa
 
-    _, (loop, _, sequences, _, _) = verify_loop(module, _details=True)
+    _, (loop, channels, sequences, _, _) = verify_loop(module, _details=True)
     require(
         set(arguments) == {size.sym_name.data for size in loop.parameters}
         and all(type(value) is int and value >= 0 for value in arguments.values()),
         "runtime accounting needs every nonnegative integer scalar argument",
     )
     count = loop.constant_count if loop.bound is None else loop.bound.evaluate(arguments)
+    invocations = 1 if loop.invocation is None else loop.invocation.bound.evaluate(arguments)
     calls, vectors, memory, transfers, syncs = Counter(), Counter(), Counter(), Counter(), Counter()
     peaks = {}
     for actor, data in loop.actors.items():
         _, peaks[actor] = storage_layout(data.program.storages)
         for task in data.program.tasks:
             iterations = min(count, 1) if task.last else count
-            instances = iterations * loop.groups
+            instances = iterations * loop.groups * invocations
             calls[task.native] += instances
             amounts = []
             for index, (ref, mode) in enumerate(zip(task.refs, task.modes)):
                 amount = (
-                    iterations * ref.total_nbytes
-                    if ref.prefix_extent is None
-                    else (
-                        max(
-                            0,
-                            ref.prefix_extent.evaluate(arguments)
-                            - max(0, count - 1) * ref.prefix_elements,
+                    (
+                        iterations * ref.total_nbytes
+                        if ref.prefix_extent is None
+                        else (
+                            max(
+                                0,
+                                ref.prefix_extent.evaluate(arguments)
+                                - max(0, count - 1) * ref.prefix_elements,
+                            )
+                            if task.last
+                            else ref.prefix_extent.evaluate(arguments)
                         )
-                        if task.last
-                        else ref.prefix_extent.evaluate(arguments)
+                        * ITEMSIZE[ref.dtype]
                     )
-                    * ITEMSIZE[ref.dtype]
-                ) * loop.groups
+                    * loop.groups
+                    * invocations
+                )
                 amounts.append(amount)
                 for access in mode:
                     skipped = (
-                        ref.total_nbytes * loop.groups
+                        ref.total_nbytes * loop.groups * invocations
                         if (count and task.native == "mad_first" and index == 2 and access == "R")
                         else 0
                     )
@@ -94,7 +100,28 @@ def runtime_work(module, arguments):
                     if end > start
                     else 0
                 )
-            syncs[f"{command.kind}:{command.task.pipe}"] += active * loop.groups
+            occurrences = active * invocations
+            channel = channels.get(command.channel)
+            if channel is not None and channel.carry:
+                occurrences += min(count, channel.distance) * max(0, invocations - 1)
+            syncs[f"{command.kind}:{command.task.pipe}"] += occurrences * loop.groups
+    native = {
+        (actor, task.uid): task
+        for actor, data in loop.actors.items()
+        for task in data.program.tasks
+    }
+    for protocol in loop.op.body.block.ops:
+        if isinstance(protocol, InvocationChannelOp):
+            occurrences = (
+                max(0, invocations - 1)
+                * int(count > max(protocol.source_gap.data, protocol.destination_index.data))
+                * loop.groups
+            )
+            for action, endpoint in [
+                ("set", protocol.source.data),
+                ("wait", protocol.destination.data),
+            ]:
+                syncs[f"{action}:{native[tuple(endpoint.split('/'))].pipe}"] += occurrences
     footprint = sum(
         root.nbytes.data
         if root.extent_count is None
@@ -103,7 +130,12 @@ def runtime_work(module, arguments):
     )
     return {
         "arguments": arguments,
-        "tasks_per_group": count,
+        "tasks_per_group": count * invocations,
+        **(
+            {"tasks_per_invocation": count, "invocations_per_group": invocations}
+            if loop.invocation is not None
+            else {}
+        ),
         "groups": loop.groups,
         "native_invocations": dict(calls),
         "vector_requested_elements": dict(vectors),

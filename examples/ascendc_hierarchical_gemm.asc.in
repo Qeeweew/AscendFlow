@@ -1,0 +1,122 @@
+// Independent AscendC serial output/K-panel reduction with carried slot credits.
+// The algorithm/schedule are specified here, not translated from PlanIR.
+#include "kernel_operator.h"
+#include <cstdint>
+using namespace AscendC;
+using Element = @TYPE@;
+constexpr int M = @M@, N = @N@, K = @BK@, GROUPS = @GROUPS@;
+constexpr int L1S = 3, L0S = 2, CS = 1;
+// CANN9.1 TPipe::Init/Destroy owns seeded M_MTE1 IDs 0,1,2 for Matmul.
+// Direct native Mmad does not consume those credits. Keep our ring disjoint.
+constexpr int M_CREDIT_BASE = 3;
+static_assert(M_CREDIT_BASE + L0S <= 8 && 2 * L1S <= 8 && CS <= 8);
+constexpr bool TRANSPOSE_B = @TRANSPOSE@;
+constexpr int BR = TRANSPOSE_B ? N : K, BC = TRANSPOSE_B ? K : N;
+
+template<int R, int C>
+__aicore__ inline void LoadL1(LocalTensor<Element> dst, GlobalTensor<Element> src) {
+  Nd2NzParams p;
+  p.ndNum = 1;
+  p.nValue = R; p.dValue = C;
+  p.srcNdMatrixStride = 0; p.srcDValue = C;
+  p.dstNzC0Stride = R; p.dstNzNStride = 1; p.dstNzMatrixStride = 0;
+  DataCopy(dst, src, p);
+}
+
+extern "C" __global__ __cube__ void hierarchical_reference(
+    __gm__ uint8_t* A, __gm__ uint8_t* B, __gm__ uint8_t* C, int64_t outputs, int64_t tiles) {
+  set_ctrl(get_ctrl() | (uint64_t(1) << 48));
+  TPipe pipe;
+  TBuf<TPosition::A1> a1Buf;
+  TBuf<TPosition::B1> b1Buf;
+  TBuf<TPosition::A2> a0Buf;
+  TBuf<TPosition::B2> b0Buf;
+  TBuf<TPosition::CO1> c0Buf;
+  pipe.InitBuffer(a1Buf, L1S * M * K * sizeof(Element));
+  pipe.InitBuffer(b1Buf, L1S * N * K * sizeof(Element));
+  pipe.InitBuffer(a0Buf, L0S * M * K * sizeof(Element));
+  pipe.InitBuffer(b0Buf, L0S * N * K * sizeof(Element));
+  pipe.InitBuffer(c0Buf, CS * M * N * sizeof(float));
+  auto a1 = a1Buf.Get<Element>(), b1 = b1Buf.Get<Element>();
+  auto a0 = a0Buf.Get<Element>(), b0 = b0Buf.Get<Element>();
+  auto c0 = c0Buf.Get<float>();
+  GlobalTensor<Element> ga, gb;
+  GlobalTensor<float> gc;
+  SetFixpipeNz2ndFlag(1, 0, 0);
+  // CANN9.1 HardEvent omits S_FIX; use the same documented 2201 binary
+  // event instruction directly for this one-time configuration handshake.
+  set_flag(PIPE_S, PIPE_FIX, event_t(0));
+  wait_flag(PIPE_S, PIPE_FIX, event_t(0));
+  for (int64_t call = 0; tiles > 0 && call < outputs; ++call) {
+  const int64_t base = (int64_t(GetBlockIdx()) * outputs + call) * tiles;
+  ga.SetGlobalBuffer((__gm__ Element*)A + base * M * K);
+  gb.SetGlobalBuffer((__gm__ Element*)B + base * N * K);
+  gc.SetGlobalBuffer((__gm__ float*)C + (int64_t(GetBlockIdx()) * outputs + call) * M * N);
+  for (int64_t step = 0; step < tiles + 3; ++step) {
+    if (tiles > 0 && step == tiles + 2) {
+      const int64_t g = step - 3;
+      const auto id = event_t(0);
+      WaitFlag<HardEvent::M_FIX>(id);
+      FixpipeParamsV220 p;
+      p.nSize = N; p.mSize = M; p.srcStride = M; p.dstStride = N;
+      p.quantPre = QuantMode_t::NoQuant; p.reluEn = false; p.unitFlag = 0;
+      Fixpipe<float, float, CFG_ROW_MAJOR>(gc, c0, p);
+      if (call + 1 < outputs) SetFlag<HardEvent::FIX_M>(event_t(0));
+    }
+    if (step < tiles) {
+      const auto aId = event_t(step % L1S), bId = event_t(L1S + step % L1S);
+      if (step >= L1S || call > 0) WaitFlag<HardEvent::MTE1_MTE2>(aId);
+      LoadL1<M, K>(a1[(step % L1S) * M * K], ga[step * M * K]);
+      SetFlag<HardEvent::MTE2_MTE1>(aId);
+      if (step >= L1S || call > 0) WaitFlag<HardEvent::MTE1_MTE2>(bId);
+      LoadL1<BR, BC>(b1[(step % L1S) * N * K], gb[step * N * K]);
+      SetFlag<HardEvent::MTE2_MTE1>(bId);
+    }
+    if (step >= 1 && step - 1 < tiles) {
+      const int64_t g = step - 1;
+      const auto aId = event_t(g % L1S), bId = event_t(L1S + g % L1S);
+      if (g >= L0S || call > 0) WaitFlag<HardEvent::M_MTE1>(event_t(M_CREDIT_BASE + g % L0S));
+      WaitFlag<HardEvent::MTE2_MTE1>(aId);
+      LoadData2DParams p;
+      p.startIndex = 0; p.repeatTimes = K / 16; p.srcStride = M / 16;
+      p.dstGap = 0; p.sid = 0; p.ifTranspose = false;
+      for (int m = 0; m < M / 16; ++m)
+        LoadData(a0[(g % L0S) * M * K + m * K * 16], a1[(g % L1S) * M * K + m * 256], p);
+      if (g + L1S < tiles || call + 1 < outputs) SetFlag<HardEvent::MTE1_MTE2>(aId);
+      WaitFlag<HardEvent::MTE2_MTE1>(bId);
+      if constexpr (TRANSPOSE_B) {
+        p.repeatTimes = N * K / 256; p.srcStride = 1;
+        LoadData(b0[(g % L0S) * N * K], b1[(g % L1S) * N * K], p);
+      } else {
+        p.repeatTimes = N / 16; p.srcStride = K / 16; p.ifTranspose = true;
+        for (int k = 0; k < K / 16; ++k)
+          LoadData(b0[(g % L0S) * N * K + k * N * 16], b1[(g % L1S) * N * K + k * 256], p);
+      }
+      SetFlag<HardEvent::MTE1_M>(event_t(g % L0S));
+      if (g + L1S < tiles || call + 1 < outputs) SetFlag<HardEvent::MTE1_MTE2>(bId);
+    }
+    if (step >= 2 && step - 2 < tiles) {
+      const int64_t g = step - 2;
+      if constexpr ((M / 16) * (N / 16) < 10) {
+        if (g > 0) PipeBarrier<PIPE_M>();
+      }
+      WaitFlag<HardEvent::MTE1_M>(event_t(g % L0S));
+      if (g == 0 && call > 0) WaitFlag<HardEvent::FIX_M>(event_t(0));
+      MmadParams p;
+      p.m = M; p.n = N; p.k = K; p.cmatrixInitVal = (g == 0); p.unitFlag = 0;
+      Mmad(c0, a0[(g % L0S) * M * K], b0[(g % L0S) * N * K], p);
+      if (g == tiles - 1) SetFlag<HardEvent::M_FIX>(event_t(0));
+      if (g + L0S < tiles || call + 1 < outputs) SetFlag<HardEvent::M_MTE1>(event_t(M_CREDIT_BASE + g % L0S));
+    }
+  }
+  } // carried per-slot credits; no whole-child drain
+  PipeBarrier<PIPE_ALL>();
+}
+
+extern "C" int launch_hierarchical_reference(void* stream, void* A, void* B, void* C, int64_t outputs, int64_t tiles) {
+  const int64_t limit = (INT64_MAX - 64) / (GROUPS * (M*K*2 + N*K*2 + M*N*4));
+  if (outputs < 0 || tiles < 0 || outputs > limit || tiles > limit) return -1;
+  if (outputs && tiles > limit / outputs) return -1;
+  hierarchical_reference<<<GROUPS, nullptr, stream>>>((uint8_t*)A, (uint8_t*)B, (uint8_t*)C, outputs, tiles);
+  return 0;
+}

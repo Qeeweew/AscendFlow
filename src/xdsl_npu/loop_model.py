@@ -13,10 +13,13 @@ from math import lcm
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType
 
+from .budget import poll
 from .ir import (
     BufferOp,
     EndOp,
     FixConfigOp,
+    InvocationChannelOp,
+    InvocationSyncOp,
     KernelOp,
     LoopChannelOp,
     LoopSyncOp,
@@ -76,6 +79,7 @@ class Loop:
     frames: dict[str, int]
     parameters: tuple[RuntimeSizeOp, ...]
     bound: Expr | None
+    invocation: object = None
 
     @property
     def protocol_period(self):
@@ -88,6 +92,10 @@ class Loop:
     @property
     def groups(self):
         return optional_int(self.op.blocks, 1)
+
+    @property
+    def access_groups(self):
+        return 1 if self.invocation is not None else self.groups
 
     def root(self, actor, ref):
         return ref.storage.name if ref.storage.external else actor + "/" + ref.storage.name
@@ -164,7 +172,7 @@ def _storage(op, limit, uniform_values):
     )
 
 
-def _actor(name, kernel, shared, limit, groups, uniform_values):
+def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None):
     require(
         kernel.core.data == ("aic" if name == "aic" else "aiv")
         and optional_int(kernel.blocks, 1) == groups,
@@ -177,6 +185,11 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
             declarations[op.ref] = _storage(op, limit, uniform_values)
         elif isinstance(op, StreamOp):
             streams.append(op)
+        elif invocation is not None and op is invocation.op:
+            from .invocation import frame_storage
+
+            declarations.update({frame.op.ref: frame_storage(frame) for frame in invocation.frames})
+            streams.extend(child for child in op.body.block.ops if isinstance(child, StreamOp))
         elif isinstance(op, FixConfigOp):
             require(
                 not config and kernel.core.data == "aic" and not streams,
@@ -185,7 +198,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
             config = True
         else:
             require(
-                isinstance(op, (RuntimeSizeOp, LoopChannelOp, EndOp))
+                isinstance(op, (RuntimeSizeOp, LoopChannelOp, InvocationChannelOp, EndOp))
                 or (isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC)
                 and all(value in uniform_values for value in op.results),
                 f"unsupported loop kernel effect {op.name}",
@@ -342,6 +355,15 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
                 all(ref in views for ref in operands), "native operands need physical bounded views"
             )
             refs = tuple(views[ref] for ref in operands)
+            if invocation is not None:
+                require(
+                    all(
+                        not ref.storage.external
+                        or ref.storage.name in {frame.name for frame in invocation.frames}
+                        for ref in refs
+                    ),
+                    "invocation native GM access must use its checked frame",
+                )
             params = tuple(value.data for value in op.params)
             pipe, modes = native_contract(op.native.data, refs, params)
             require(
@@ -414,7 +436,10 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
             if op.value is not None:
                 scalar_values[op.value] = uid
         else:
-            require(isinstance(op, (LoopSyncOp, EndOp)), f"unsupported symbolic effect {op.name}")
+            require(
+                isinstance(op, (LoopSyncOp, InvocationSyncOp, EndOp)),
+                f"unsupported symbolic effect {op.name}",
+            )
     require(tasks, "actor has no native task template")
     return Actor(
         name,
@@ -502,11 +527,14 @@ def extract_loop(module):
         )
     else:
         kernels = [("aic" if op.core.data == "aic" else "aiv0", op)]
+    from .invocation import extract_invocation
+
+    invocation = None if isinstance(op, MixedOp) else extract_invocation(op, uniform_values)
     actors, all_views = {}, {}
     constants = set()
     storage_periods, view_counts = {}, {}
     for name, kernel in kernels:
-        actor, views = _actor(name, kernel, shared, limit, groups, uniform_values)
+        actor, views = _actor(name, kernel, shared, limit, groups, uniform_values, invocation)
         actors[name] = actor
         if actor.stream.count is not None:
             constants.add(actor.stream.count.data)
@@ -553,6 +581,7 @@ def extract_loop(module):
         {},
         tuple(sizes),
         None if limit is None else uniform_values[limit],
+        invocation,
     )
     _check_prefixes(loop, all_views)
     _check_accesses(loop, all_views)
@@ -605,7 +634,7 @@ def _check_prefixes(loop, all_views):
             )
             if ref.storage.external:
                 require(
-                    loop.groups == 1
+                    loop.access_groups == 1
                     and not ref.core_terms
                     and not ref.count_core_stride
                     and not ref.count_offset
@@ -661,6 +690,7 @@ def _check_accesses(loop, all_views):
         for ref in views.values():
             refs_by_root.setdefault(loop.root(actor, ref), []).append(ref)
     for root, refs in refs_by_root.items():
+        poll("physical access validation", root=root, views=len(refs))
         period = loop.storage_periods[root]
         storage = refs[0].storage
         drift = {slope(ref) for ref in refs}
@@ -679,9 +709,10 @@ def _check_accesses(loop, all_views):
                     f"{root}: unclipped stream requires its actual loop extent",
                 )
                 require(
-                    storage.count_scale == loop.groups * frame
+                    storage.count_scale == loop.access_groups * frame
                     and all(
-                        ref.count_core_stride in ({0, frame} if loop.groups == 1 else {frame})
+                        ref.count_core_stride
+                        in ({0, frame} if loop.access_groups == 1 else {frame})
                         and ref.count_offset == 0
                         and not ref.core_terms
                         for ref in refs
@@ -694,7 +725,9 @@ def _check_accesses(loop, all_views):
                     f"{root}: unbounded stream exceeds its fixed allocation",
                 )
                 translations = {
-                    tuple(ref.address(0, core) - ref.address(0) for core in range(loop.groups))
+                    tuple(
+                        ref.address(0, core) - ref.address(0) for core in range(loop.access_groups)
+                    )
                     for ref in refs
                 }
                 require(
@@ -711,7 +744,7 @@ def _check_accesses(loop, all_views):
                 f"{root}: ring ownership cannot depend on stream length",
             )
             shifts = {
-                tuple(ref.address(0, core) - ref.address(0) for core in range(loop.groups))
+                tuple(ref.address(0, core) - ref.address(0) for core in range(loop.access_groups))
                 for ref in refs
             }
             require(len(shifts) == 1, f"{root}: ring translations disagree")
@@ -721,7 +754,7 @@ def _check_accesses(loop, all_views):
             verify_translated_owners(
                 refs,
                 [(root, lo, hi, "RW") for lo, hi in used],
-                loop.groups,
+                loop.access_groups,
                 translation_error="ring group translations disagree",
                 overlap_error="cross-group ring ownership overlap",
             )
@@ -732,7 +765,7 @@ def _check_accesses(loop, all_views):
             )
             itemsize = ITEMSIZE[ref.dtype]
             require(ref.nbytes % itemsize == 0, "view extent does not match its dtype")
-            for core in range(loop.groups if storage.external else 1):
+            for core in range(loop.access_groups if storage.external else 1):
                 coefficient = ref.count_offset + ref.count_core_stride * core
                 for r in range(period):
                     parts = ref.segments(r, core)
@@ -792,7 +825,7 @@ def _check_accesses(loop, all_views):
                     all(
                         ranges_cover(parent.segments(r, core), ref.segments(r, core))
                         for r in range(period)
-                        for core in range(loop.groups if ref.storage.external else 1)
+                        for core in range(loop.access_groups if ref.storage.external else 1)
                     ),
                     "nested view exceeds actual parent rows/holes",
                 )
@@ -805,7 +838,7 @@ def _check_accesses(loop, all_views):
                     and all(
                         lo % alignment == 0
                         for r in range(period)
-                        for core in range(loop.groups if ref.storage.external else 1)
+                        for core in range(loop.access_groups if ref.storage.external else 1)
                         for lo, _ in ref.segments(r, core)
                     ),
                     f"{task.uid}: native origin alignment violated",
@@ -863,6 +896,9 @@ def access_cells(loop, *, roots=None, include_readonly=False):
         for root, parts in accesses.items():
             by_root.setdefault(root, []).append((actor, task.uid, parts))
     for root, tasks in by_root.items():
+        poll(
+            "physical access cells", root=root, tasks=len(tasks), period=loop.storage_periods[root]
+        )
         frame = loop.frames.get(root, 0)
         for r in range(loop.storage_periods[root]):
             for actor, uid, parts in tasks:

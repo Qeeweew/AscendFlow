@@ -18,9 +18,10 @@
 | 已有证据 | 尚未解决，不能外推 |
 |---|---|
 | AST单循环Vector、对齐尾部、归约/Scalar捕获 | 一般分支、循环外初始化/收尾的物理lowering |
-| 显式L1/L0/C与运行时K归约，首清末导 | 父query/output循环与子K循环的组合 |
+| 显式L1/L0/C、运行时K及限定父output×子K闭环 | 一般父body、多个child/actor和独立状态时钟的组合 |
 | 分离存储周期；5/7槽例冷编译约0.173秒 | 协议周期仍有LCM；跨channel共享与可取消搜索未完成 |
 | K归约冷编译0.242秒，960 MiB例与手排AscendC约等时 | 不能说明真实FA的编译速度或设备性能达标 |
+| 父子闭环冷编译0.689秒、同契约AscendC/profiling约等时 | 一般层次CV和真实FA仍需各自验收 |
 | legacy FA已在examples，有4K/8K设备记录 | AST真实FA迁移未完成；简单CV例没有online softmax |
 
 此前方案的问题在于把“区域摘要”写成黑盒、缺少父子派发语义，并把过多能力
@@ -192,7 +193,8 @@ first/last条件必须按参数化边界归一化，不能把实际N−1当作�
 
 每次记录AST、lowering、依赖、规划、最终验证、ASC、snapshot时间，以及T/A/H、
 周期、图、proof states、查询/重建次数和RSS。当前已有部分计数；缺失的阶段
-拆分、内部取消与真正源码编译缓存列为待办，不能把artifact属性访问称作cache hit。
+拆分与真正源码编译缓存仍有待办；默认deadline及证明内部取消已在R2a接通。
+不能把artifact属性访问称作cache hit。
 
 在同一开发机、Python/xDSL版本及无并发测试负载下，完整源码→ASC初期门槛：
 常用内核cold p50≤1秒，代表性FA≤5秒，至少5个独立进程，max≤相应目标2倍。

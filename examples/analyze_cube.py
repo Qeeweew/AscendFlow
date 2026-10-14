@@ -17,7 +17,9 @@ def main():
     parser.add_argument(
         "--reduction", action="store_true", help="runtime K panels and one terminal output"
     )
+    parser.add_argument("--hierarchical", action="store_true", help="runtime outputs and K panels")
     args = parser.parse_args()
+    reduction = args.reduction or args.hierarchical
     trials = {"generated": [], "ascendc": []}
     identity = None
     for summary_path in sorted(args.profiles.glob("trial-*/*/summary.json")):
@@ -38,8 +40,8 @@ def main():
         )
         contract = (
             device["policy"],
-            case["effective_gemm_shape"] if args.reduction else case["input_a_shape"],
-            device["scope"] if args.reduction else case["input_b_shape"],
+            case["effective_gemm_shape"] if reduction else case["input_a_shape"],
+            device["scope"] if reduction else case["input_b_shape"],
             case["input_sha256"],
             case["output_sha256"],
             case["warmup"],
@@ -84,19 +86,21 @@ def main():
     )
     medians = {v: median(t["p50_us"] for t in ts) for v, ts in trials.items()}
     policy, requested = device["policy"], case["requested_work"]
-    count_key = "panels" if args.reduction else "tiles_per_group"
-    products = case[count_key] * policy["GROUPS"]
-    mads = products if args.reduction else products * (2 if policy["ACCUMULATE"] else 1)
+    count_key = "panels" if reduction else "tiles_per_group"
+    outputs = case["outputs"] if args.hierarchical else 1
+    products = case[count_key] * policy["GROUPS"] * outputs
+    mads = products if reduction else products * (2 if policy["ACCUMULATE"] else 1)
     require(
-        requested["native_invocations"]["mad_first" if args.reduction else "mad"] == mads,
+        requested["native_invocations"]["mad_first" if reduction else "mad"] == mads,
         "physical MAD count differs from policy",
     )
-    if args.reduction:
+    if reduction:
         require(
-            requested["native_invocations"]["fix"] == policy["GROUPS"],
+            requested["native_invocations"]["fix"]
+            == policy["GROUPS"] * outputs * int(case["panels"] > 0),
             "terminal output count differs",
         )
-    flops = 2 * mads * policy["M"] * policy["N"] * policy["BK" if args.reduction else "K"]
+    flops = 2 * mads * policy["M"] * policy["N"] * policy["BK" if reduction else "K"]
     gm = sum(
         value
         for key, value in requested["memory_requested_bytes_by_pipe_bank_mode"].items()
@@ -113,7 +117,12 @@ def main():
     result = {
         "policy": policy,
         count_key: case[count_key],
-        "kind": "panel_reduction" if args.reduction else "native_batch",
+        **({"outputs": outputs} if args.hierarchical else {}),
+        "kind": "nested_panel_reduction"
+        if args.hierarchical
+        else "panel_reduction"
+        if reduction
+        else "native_batch",
         "hardware": device["hardware"],
         "trials": trials,
         "median_of_run_medians_us": medians,

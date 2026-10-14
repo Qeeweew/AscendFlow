@@ -1,5 +1,6 @@
 """Explicit fixed-issue builder; there are no user event IDs or barriers."""
 
+from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp, StringAttr, f32
 from xdsl.ir import Block, Region, SSAValue
 
@@ -35,6 +36,7 @@ class Kernel:
         self.stream: StreamOp | None = None
         self.task_block: Block | None = None
         self.num_tasks = 0
+        self.invocation = None
 
     def buffer(
         self,
@@ -86,8 +88,20 @@ class Kernel:
             | ({"symbolic": IntAttr(1)} if symbolic or isinstance(count, SSAValue) else {}),
             regions=[Region(self.task_block)],
         )
-        self.block.add_op(self.stream)
+        (self.block if self.invocation is None else self.invocation.body.block).add_op(self.stream)
         return self
+
+    def invocations(self, bound):
+        if self.invocation is not None or self.stream is not None:
+            raise ValueError("invocation scope must precede its child stream")
+        zero = arith.ConstantOp.from_int_and_width(0, IndexType())
+        one = arith.ConstantOp.from_int_and_width(1, IndexType())
+        self.block.add_ops([zero, one])
+        self.invocation = scf.ForOp(
+            zero.result, bound, one.result, [], Block(arg_types=[IndexType()])
+        )
+        self.block.add_op(self.invocation)
+        return self.invocation
 
     def view(
         self,
@@ -224,6 +238,8 @@ class Kernel:
     def finish(self) -> ModuleOp:
         assert self.task_block is not None
         self.task_block.add_op(EndOp())
+        if self.invocation is not None:
+            self.invocation.body.block.add_op(scf.YieldOp())
         self.block.add_op(EndOp())
         self.module.verify()
         return self.module

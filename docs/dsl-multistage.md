@@ -11,6 +11,7 @@
 | `serial`、if/else、scalar iter_args/yield | 前端结构化IR | 一般有effects的物理控制 |
 | 首代clear、`if k == bound-1` | 单actor末代effect后缀，[例子](../examples/ast_reduction_gemm.py) | 一般first/last/else与mixed配对 |
 | `Pipelined`嵌套、stage/actor作用域 | AST能保留，嵌套物理lowering拒绝 | 层次frontier/资源摘要 |
+| serial父循环×单pipeline | local物理frame/credit已接通，[设备证据](runtime-hierarchy.md) | 父body其他工作、多child及CV组合 |
 | 显式L0、NN/NT、f16/bf16 | 完整native矩阵平面 | fractal平面内子块、一般尾部 |
 | CV排步、FA宏/数学主体 | legacy CV/FA各有证据 | 新AST真实FA、多级行/原生子流水 |
 
@@ -178,8 +179,8 @@ child上界在其每次入口捕获；默认不把 `parent_iv * child_count + ch
 首次层次支持仅接通这些规则能证明的子集。跨query连续预载是独立任务流的
 后续能力；普通嵌套不保证消除每个query的控制填排开销。性能验收要报告这一限制。
 
-R2a首先接通下面的程序形状，而不是新增另一份单层GEMM。它目前会在nested
-physical lowering处明确拒绝；`outputs`和`panels`均为runtime int64。A/B按
+R2a已接通下面的程序形状及其设备闭环；它仍是限定的local父子结构，参见
+[实现边界](runtime-hierarchy.md)。`outputs`和`panels`均为runtime int64。A/B按
 `[group, output, panel, ...]`显式存放，C按`[group, output, M, N]`存放。
 以下省略签名和前述固定L1/L0/C分配，B采用NT存储：
 
