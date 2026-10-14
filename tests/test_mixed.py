@@ -51,7 +51,10 @@ def test_collective_boundaries_reuse_and_counter_capacity(count, slots):
     assert "__mix__(1, 2)" in asc and asc.count("asc_sync_pipe(PIPE_ALL)") == 3
     assert "asc_get_sub_block_id() == 0" in asc and "asc_get_sub_block_id() == 1" in asc
     if count:
-        assert report["cross_counter_ids"] == {"gm_ready": 0, "gm_credit": 1}
+        expected = {"gm_ready": 0}
+        if count > slots:
+            expected["gm_credit"] = 1
+        assert report["cross_counter_ids"] == expected
     else:
         assert not any(
             isinstance(o, (CrossChannelOp, CrossSyncOp, CrossDrainOp)) for o in plan.walk()
@@ -293,22 +296,34 @@ def test_fused_epilogue_has_explicit_rounding_and_native_row_dma():
     assert verify_plan(plan)["epochs"] == 3
 
 
-@pytest.mark.parametrize("l1_slots,l0_slots", [(1,1), (2,3), (3,2)])
+@pytest.mark.parametrize("l1_slots,l0_slots", [(1, 1), (2, 3), (3, 2)])
 def test_fused_expert_buffer_counts_change_the_actual_retirement_distance(l1_slots, l0_slots):
     source = gemm_bias_silu(
-        48,32,64,tile_m=16,tile_n=16,l1_k=32,l0_k=16,grid_m=1,
-        l1_slots=l1_slots,l0_slots=l0_slots,
+        48,
+        32,
+        64,
+        tile_m=16,
+        tile_n=16,
+        l1_k=32,
+        l0_k=16,
+        grid_m=1,
+        l1_slots=l1_slots,
+        l0_slots=l0_slots,
     )
     dependencies = global_dependencies(extract_mixed(source))
     assert any(
-        o.hazard == "WAR" and o.storage == "aic/l1a"
-        and src[1].generation == 1 and dst[1].generation == 2*l1_slots
-        for src,dst,o in dependencies
+        o.hazard == "WAR"
+        and o.storage == "aic/l1a"
+        and src[1].generation == 1
+        and dst[1].generation == 2 * l1_slots
+        for src, dst, o in dependencies
     )
     assert any(
-        o.hazard == "WAR" and o.storage == "aic/l0a"
-        and src[1].generation == 0 and dst[1].generation == l0_slots
-        for src,dst,o in dependencies
+        o.hazard == "WAR"
+        and o.storage == "aic/l0a"
+        and src[1].generation == 0
+        and dst[1].generation == l0_slots
+        for src, dst, o in dependencies
     )
     assert verify_plan(autosync(source))["epochs"] == 3
 

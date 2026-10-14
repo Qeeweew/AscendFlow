@@ -119,6 +119,7 @@ class Kernel:
         issue_order=None,
         period=1,
         phase=0,
+        logical_phase=0,
     ) -> TaskOp:
         assert self.task_block is not None
         attrs = task_attrs(uid, native, stage, params, scalar)
@@ -129,6 +130,8 @@ class Kernel:
             period=IntAttr(period),
             phase=IntAttr(phase),
         )
+        if logical_phase:
+            attrs["logical_phase"] = IntAttr(logical_phase)
         op = TaskOp.create(
             operands=list(refs),
             result_types=[TaskType(), f32] if native == "scalar_load" else [TaskType()],

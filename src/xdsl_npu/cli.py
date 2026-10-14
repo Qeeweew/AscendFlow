@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .attention import flash_attention
 from .codegen import emit_asc
 from .examples import (
     cube_pipeline,
@@ -36,6 +37,7 @@ def main():
             "mixed",
             "phased",
             "gdn",
+            "flash-attention",
             "ir",
         ],
     )
@@ -48,6 +50,20 @@ def main():
     parser.add_argument("--key-dim", type=int, default=64)
     parser.add_argument("--value-dim", type=int, default=64)
     parser.add_argument("--snapshot-slots", type=int, default=2)
+    parser.add_argument("--query-heads", type=int, default=8)
+    parser.add_argument("--kv-heads", type=int, default=8)
+    parser.add_argument("--query-length", type=int, default=4096)
+    parser.add_argument("--kv-length", type=int, default=4096)
+    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--dtype", choices=["f16", "bf16"], default="f16")
+    parser.add_argument("--block-q", type=int)
+    parser.add_argument("--block-kv", type=int, default=128)
+    parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--query-start", type=int, default=0)
+    parser.add_argument("--q-cache", choices=["l0", "l1"], default="l0")
+    parser.add_argument("--reuse-ub", action="store_true")
+    parser.add_argument("--pipeline", action="store_true")
+    parser.add_argument("--packed-reductions", action="store_true")
     parser.add_argument("--slots", type=int, default=2)
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--columns", type=int, default=128)
@@ -104,6 +120,26 @@ def main():
             value_dim=args.value_dim,
             slots=args.slots,
             snapshot_slots=args.snapshot_slots,
+        )
+    elif args.example == "flash-attention":
+        module = flash_attention(
+            args.batch,
+            args.query_heads,
+            args.kv_heads,
+            args.query_length,
+            args.kv_length,
+            args.head_dim,
+            dtype=args.dtype,
+            block_q=args.block_q,
+            block_kv=args.block_kv,
+            gm_slots=args.gm_slots,
+            local_slots=args.slots,
+            causal=args.causal,
+            query_start=args.query_start,
+            q_cache=args.q_cache,
+            reuse_ub=args.reuse_ub,
+            pipeline=args.pipeline,
+            packed_reductions=args.packed_reductions,
         )
     elif args.example == "batched-matmul":
         module = batched_matmul_nt(

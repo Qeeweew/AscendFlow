@@ -82,7 +82,8 @@ Vector、激活函数或最终输出 store 的完成。source arrive 本身不 f
 局部分析的 `_imports` 只是有条件前提，scratch 的 `initialized` 始终为0。
 最终 verifier 从共享 writer 和真实 effects 重算完整物理依赖；既不信任 reason
 字符串，也不把局部 import 前提作为已经完成的全组证明。局部二值 events 仍
-分别占每 actor 的八 ID 有向 bank。跨核是另外的计数资源，独占 ID0/1；每一
+分别占每 actor 的八 ID 有向 bank。跨核是另外的计数资源；单环示例独占 ID0/1，
+多环最多使用八个独立计数 ID，当前不共享跨核计数器；每一
 通知 ordinal 必须与每个真实参与者的一次消费相配，最大未消费 backlog ≤15。
 
 独立有限交错检查区分 native start、retirement、延迟到达、二值 flag、FIFO
@@ -90,18 +91,29 @@ cross counters、双 AIV quorum 和 controller gates；不读 planner frontier/g
 `scope=all` 的一代次最小流水穷尽1104状态；一代次 GEMM+bias+SiLU 穷尽5212状态。
 两代次完整 kernel 在20万状态预算内尚未穷尽，明确返回 `exhaustive=false`。
 
-显式 `scope=shared` 删除私有工作和 local flags，保留全部共享访问、真实源
-prefix retirement 和全核 cross gates，构造保守的共享协议抽象；它不证明私有
+显式 `scope=shared` 删除私有工作，保留全部共享访问、真实源
+prefix retirement 和全核 cross gates；单环删除 local flags，多环保留 local flags
+和 Scalar gates，避免消掉证明环复用必需的往返路径。它不证明私有
 bank 或数值计算。三代次双槽穷尽1923状态，17代次双槽穷尽14999状态。
 该抽象报告的反例可能来自删除私有同步，不自动等同于具体硬件反例；无反例的
 穷尽结果才构成对应共享协议检查。完整全组图仍重检所有真实私有/共享访问。
 这些结果针对实际有限样本，不能冒充任意规模的形式化证明，也不能取代机器契约。
 
-当前只接受单 GM handoff ring、每 epoch 一个 FIX producer、每个 AIV 一个完整
-GM reader、恒定复用距离、静态 balanced 1:2 collective。多次读取尚需显式
-物化为一个经过审查的完整 reader recipe，否则 AutoSync 拒绝，不能提前 release。
-动态 task stream、动态别名、不平衡参与者、AIV→AIC 计算输入交接、多个环、跨组
-通信和一般混合尾块尚未实现。每 actor 最多4096个实际 task instance；有限检查
+当前接受1..4个独立 GM handoff ring，每个环固定为 FIX→两个 AIV MTE2 reader，
+或两个 AIV MTE3 writer→AIC MTE2 reader。每个真实参与者每 epoch 一个完整
+producer/reader、恒定复用距离、静态 balanced 1:2 collective。逻辑阶段独立于
+物理 stage/issue order；Flash Attention 的 QK/softmax/PV/O 分成四个逻辑阶段。
+多次读取尚需显式物化为一个经过审查的完整 reader recipe，否则 AutoSync 拒绝，
+不能提前 release。所有 ready/credit 提案先完整验证；整条 channel 的通知、等待和
+drain 删除后，若全组 RAW/WAR/WAW、event 生命周期、计数资源和收尾仍通过，才保留删除。
+Flash Attention 的双向往返路径因此通常仅保留三个 ready；不把这个结果硬编码为规则。
+
+静态 cases 按真实 launch group 无洞分区，三个 actor 选择同一 case；每个 case
+单独完成并 drain。最终 verifier 重新检查所有 GM bindings、分支和跨 case ownership。
+这用于 causal 实际 KV 前缀及较大静态 grid，不提供动态分支或动态 ownership。
+
+动态 task stream、动态别名、不平衡参与者、跨组通信和一般混合尾块尚未实现。
+每 actor 最多4096个实际 task instance；有限检查
 的成本也随物理范围及代次数增加。更一般的生命周期扩展必须进入同一全组 proof。
 
 ## 设备与固定性能证据

@@ -12,7 +12,7 @@ QUALIFIER = {
     "L0B": "__cb__",
     "L0C": "__cc__",
 }
-CTYPE = {"f32": "float", "f16": "half"}
+CTYPE = {"f32": "float", "f16": "half", "bf16": "bfloat16_t"}
 
 
 def pointer(ref: Ref, g="g", *, core="0", extra=""):
@@ -66,13 +66,21 @@ def native_line(task, count, core="0"):
             f"{function}({p[1]}, {p[0]}, uint16_t({refs[0].rows}), "
             f"uint16_t({refs[0].nbytes // 32}), uint16_t({gaps[0]}), uint16_t({gaps[1]}));"
         )
+    if task.native in {"convert_f32", "convert_rn"}:
+        source, destination = refs[0].dtype, refs[1].dtype
+        function = (
+            ("asc_half2float" if source == "f16" else "asc_bfloat162float")
+            if task.native == "convert_f32"
+            else ("asc_float2half_rn" if destination == "f16" else "asc_float2bfloat16_rn")
+        )
+        return f"{function}({p[1]}, {p[0]}, uint32_t({length(refs[0], ITEMSIZE[source])}));"
     if task.native in {"muls", "adds"}:
         function = "asc_mul_scalar" if task.native == "muls" else "asc_add_scalar"
         return (
             f"{function}({p[-1]}, {p[0]}, float({task.scalar!r}), "
             f"uint32_t({length(refs[0], ITEMSIZE[refs[0].dtype])}));"
         )
-    if task.native in {"add", "mul", "sub", "div"}:
+    if task.native in {"add", "mul", "sub", "div", "max"}:
         return f"asc_{task.native}({p[2]}, {p[0]}, {p[1]}, uint32_t({length(refs[0], 4)}));"
     if task.native in {"exp", "rsqrt"}:
         return f"asc_{task.native}({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
@@ -88,6 +96,54 @@ def native_line(task, count, core="0"):
         return (
             "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
             f"asc_copy({bits[1]}, {bits[0]}, uint8_t({task.params[0]}), 1, 0, 8, 1);"
+        )
+    if task.native in {"fill", "fill_neg_inf"}:
+        value = "-__builtin_inff()" if task.native == "fill_neg_inf" else f"float({task.scalar!r})"
+        return f"asc_duplicate({p[0]}, {value}, uint32_t({length(refs[0], 4)}));"
+    if task.native == "mask_causal":
+        rows, cols, block_q, qt, first, owner_row, start = task.params
+        dst = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4} + npu_chunk * 256")
+        return (
+            "asc_set_mask_norm(); "
+            f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
+            f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
+            f"int64_t npu_visible = {start + first + owner_row + 1} + ({core} % {qt}) * {block_q} + npu_row - g * {cols} - npu_chunk * 64; "
+            "uint64_t npu_mask = npu_visible >= 64 ? 0 : (npu_visible <= 0 ? UINT64_MAX : UINT64_MAX << npu_visible); "
+            "if (npu_mask) { asc_set_vector_mask(0, npu_mask); "
+            f"asc_duplicate({dst}, -__builtin_inff(), uint8_t(1), 1, 8); }} }} }}"
+        )
+    if task.native == "mask_prefix":
+        rows, cols, prefix = task.params
+        dst = pointer(refs[0], core=core, extra="npu_chunk * 256")
+        return (
+            "asc_set_mask_norm(); "
+            f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
+            f"int64_t npu_visible = {prefix} - g * {cols} - npu_chunk * 64; "
+            "uint64_t npu_mask = npu_visible >= 64 ? 0 : (npu_visible <= 0 ? UINT64_MAX : UINT64_MAX << npu_visible); "
+            "if (npu_mask) { asc_set_vector_mask(0, npu_mask); "
+            f"asc_duplicate({dst}, -__builtin_inff(), uint8_t({rows}), 1, {cols // 8}); }} }}"
+        )
+    if task.native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
+        rows, cols = task.params
+        function = task.native.removesuffix("_row_broadcast")
+        src = pointer(refs[0], core=core, extra="npu_chunk * 256")
+        dst = pointer(refs[2], core=core, extra="npu_chunk * 256")
+        return (
+            "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
+            f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
+            f"asc_{function}({dst}, {src}, {p[1]}, uint8_t({rows}), "
+            f"1, 1, 0, {cols // 8}, {cols // 8}, 1); }}"
+        )
+    if task.native in {"merge_sum_packed", "merge_max_packed"}:
+        rows, partials = task.params
+        function = (
+            "asc_repeat_reduce_sum"
+            if task.native == "merge_sum_packed"
+            else "asc_repeat_reduce_max_only_value"
+        )
+        return (
+            f"asc_set_mask_norm(); asc_set_vector_mask(0, uint64_t({(1 << partials) - 1})); "
+            f"{function}({p[1]}, {p[0]}, uint8_t({rows}), 1, 1, 1);"
         )
     if task.native in {"mul_columns64", "fma_columns64"}:
         function = "asc_fma" if task.native == "fma_columns64" else "asc_mul"
@@ -110,6 +166,20 @@ def native_line(task, count, core="0"):
         return (
             f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
             f"asc_{function}({pp[2]}, {pp[0]}, {pp[1]}, uint32_t({cols})); }}"
+        )
+    if task.native in {"reduce_tile_sum64", "reduce_tile_max64"}:
+        rows, cols = task.params
+        function = (
+            "asc_repeat_reduce_sum"
+            if task.native == "reduce_tile_sum64"
+            else "asc_repeat_reduce_max_only_value"
+        )
+        src = pointer(refs[0], core=core, extra="npu_chunk * 256")
+        dst = pointer(refs[1], core=core, extra=f"npu_chunk * {rows * 4}")
+        return (
+            "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
+            f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
+            f"{function}({dst}, {src}, uint8_t({rows}), 1, 1, {cols // 8}); }}"
         )
     if task.native in {"reduce_sum64", "reduce_max64"}:
         rows, cols = task.params
@@ -184,6 +254,18 @@ def native_line(task, count, core="0"):
     if task.native == "load2d_b_nt":
         rows, cols = task.params
         return f"asc_copy_l12l0b({p[1]}, {p[0]}, 0, {rows * cols // 256}, 1, 0);"
+    if task.native == "load2d_b_nn":
+        rows, cols = task.params  # B[K,N] compact zN -> L0B ZN
+        src = pointer(refs[0], core=core, extra="npu_chunk * 512")
+        dst = pointer(refs[1], core=core, extra=f"npu_chunk * {cols * 32}")
+        # CANN 9.1/2201's public asc_copy_l12l0b has no classic transpose
+        # parameter; the similarly named *_transpose is a 3510 API. Use
+        # the exact audited dav_c220 LoadData2D intrinsic with transpose=true,
+        # not the distinct LoadDataWithTranspose instruction/footprint.
+        return (
+            f"for (int npu_chunk = 0; npu_chunk < {rows // 16}; ++npu_chunk) {{ "
+            f"load_cbuf_to_cb({dst}, {src}, 0, {cols // 16}, {rows // 16}, 0, 0, true, inc); }}"
+        )
     if task.native in {"mad", "mad_cycle"}:
         m, n, k, clear = task.params
         flag = (
@@ -204,7 +286,7 @@ def native_line(task, count, core="0"):
     raise AssertionError("unvalidated native recipe")
 
 
-def _body_lines(p, ex, stream, *, cross=None, drains=()):
+def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
     """Backend helper; callers must verify the entire enclosing program first."""
     tasks = {
         t.uid: t for _, t in sorted(enumerate(p.tasks), key=lambda x: (x[1].issue_order, x[0]))
@@ -229,7 +311,7 @@ def _body_lines(p, ex, stream, *, cross=None, drains=()):
     ]
     offsets, _ = storage_layout(p.storages)
     if p.blocks > 1:
-        lines.append("  const int64_t core_id = asc_get_block_idx();")
+        lines.append(f"  const int64_t core_id = {core_expression or 'asc_get_block_idx()'};")
     for s in p.storages:
         if s.external:
             continue
@@ -315,7 +397,10 @@ def _body_lines(p, ex, stream, *, cross=None, drains=()):
 
 
 def emit_asc(module, *, host_launcher=True):
-    from .ir import MixedOp
+    from .ir import MixedOp, StaticDispatchOp
+
+    if isinstance(module.body.block.first_op, StaticDispatchOp):
+        return _emit_dispatch(module, host_launcher=host_launcher)
 
     if isinstance(module.body.block.first_op, MixedOp):
         return _emit_mixed(module, host_launcher=host_launcher)
@@ -348,7 +433,6 @@ def emit_asc(module, *, host_launcher=True):
 
 
 def _emit_mixed(module, *, host_launcher):
-    from .ir import CrossDrainOp, StreamOp
     from .mixed import mixed_execution, verify_mixed
 
     verify_mixed(module)
@@ -362,22 +446,7 @@ def _emit_mixed(module, *, host_launcher):
         "",
         f'extern "C" __global__ __mix__(1, 2) void {name}({signature}) {{',
     ]
-    for actor, kernel in m.actors.items():
-        guard = "ASC_IS_AIC" if actor == "aic" else "ASC_IS_AIV"
-        # ASC_IS_* expands to constexpr(...), part of the if syntax itself.
-        lines.append(f"  if {guard} {{ // {actor}: private local banks")
-        if actor != "aic":
-            lines.append(f"  if (asc_get_sub_block_id() == {int(actor[-1])}) {{")
-        ex = execution(m.projections[actor])
-        stream = next(o for o in kernel.body.block.ops if isinstance(o, StreamOp))
-        drains = [o for o in kernel.body.block.ops if isinstance(o, CrossDrainOp)]
-        lines.extend(
-            "  " + line
-            for line in _body_lines(ex.program, ex, stream, cross=channels, drains=drains)
-        )
-        if actor != "aic":
-            lines.append("  }")
-        lines.append("  }")
+    lines.extend(_mixed_body_lines(m, channels))
     lines.append("}")
     if host_launcher:
         sig = ", ".join(["void* stream"] + [f"void* arg_{root}" for root in m.roots])
@@ -386,6 +455,75 @@ def _emit_mixed(module, *, host_launcher):
             "",
             f'extern "C" void launch_{name}({sig}) {{',
             f"  {name}<<<{m.op.blocks.data}, nullptr, stream>>>({call});",
+            "}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _mixed_body_lines(m, channels, *, core_expression=None):
+    from .ir import CrossDrainOp, StreamOp
+
+    lines = []
+    for actor, kernel in m.actors.items():
+        guard = "ASC_IS_AIC" if actor == "aic" else "ASC_IS_AIV"
+        # ASC_IS_* expands to constexpr(...), part of the if syntax itself.
+        lines.append(f"  if {guard} {{ // {actor}: private local banks")
+        if actor != "aic":
+            lines.append(f"  if (asc_get_sub_block_id() == {int(actor[-1])}) {{")
+        ex = execution(m.projections[actor], _program=m.programs[actor])
+        stream = next(o for o in kernel.body.block.ops if isinstance(o, StreamOp))
+        drains = [o for o in kernel.body.block.ops if isinstance(o, CrossDrainOp)]
+        lines.extend(
+            "  " + line
+            for line in _body_lines(
+                ex.program,
+                ex,
+                stream,
+                cross=channels,
+                drains=drains,
+                core_expression=core_expression,
+            )
+        )
+        if actor != "aic":
+            lines.append("  }")
+        lines.append("  }")
+    return lines
+
+
+def _emit_dispatch(module, *, host_launcher):
+    from .dispatch import case_module, extract_dispatch, verify_dispatch
+    from .mixed import mixed_execution
+
+    verify_dispatch(module)
+    dispatch = extract_dispatch(module)
+    name, roots = dispatch.op.sym_name.data, dispatch.roots
+    signature = ", ".join(f"__gm__ uint8_t* {root}" for root in roots)
+    lines = [
+        "// xdsl-npu: verified static mixed launch partition for dav-2201",
+        '#include "c_api/asc_simd.h"',
+        "#include <cstdint>",
+        "",
+        f'extern "C" __global__ __mix__(1, 2) void {name}({signature}) {{',
+    ]
+    for case, _ in dispatch.cases:
+        m, channels, _ = mixed_execution(case_module(case))
+        lo, hi = case.lower.data, case.upper.data
+        lines.append(f"  if (asc_get_block_idx() >= {lo} && asc_get_block_idx() < {hi}) {{")
+        lines.extend(
+            "  " + line
+            for line in _mixed_body_lines(
+                m, channels, core_expression=f"asc_get_block_idx() - {lo}"
+            )
+        )
+        lines.append("  }")
+    lines.append("}")
+    if host_launcher:
+        sig = ", ".join(["void* stream"] + [f"void* arg_{root}" for root in roots])
+        call = ", ".join(f"(uint8_t*)arg_{root}" for root in roots)
+        lines += [
+            "",
+            f'extern "C" void launch_{name}({sig}) {{',
+            f"  {name}<<<{dispatch.op.blocks.data}, nullptr, stream>>>({call});",
             "}",
         ]
     return "\n".join(lines) + "\n"

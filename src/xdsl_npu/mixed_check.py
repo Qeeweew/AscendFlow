@@ -36,11 +36,14 @@ def bounded_mixed_check(module, *, max_states=200_000, reduce=True, scope="all")
         else "bounded mixed counterexample"
     )
     if scope == "shared":
-        # Explicit conservative protocol abstraction: private-bank work and
-        # local flags are removed, not treated as instantly completed data.
-        # Source arrivals still capture every retained shared-access prefix;
-        # cross Wait still stops ALL later dispatch on its actor. This proves
-        # only shared GM races/counters, not private banks or numerical data.
+        # Conservative latency abstraction: hide private-bank data work.
+        # Multiple rings retain actual local events: otherwise removing them
+        # loses valid V->MTE3 retirement paths after redundant credits disappear
+        # and reports spurious races. For one ring, removing local flags only
+        # widens its shared interleavings and keeps the small abstraction useful.
+        # Scalar dispatch gates are retained in both cases.
+        # Every source arrival still captures its retained shared prefix.
+        # This checks shared GM/counters, not private-bank data or numerics.
         accesses = defaultdict(set)
         for key in instances:
             for root, _, _, mode in m.physical_effects(key):
@@ -55,15 +58,26 @@ def bounded_mixed_check(module, *, max_states=200_000, reduce=True, scope="all")
         instances = [
             key
             for key in instances
-            if any(root in shared for root, _, _, _ in m.physical_effects(key))
+            if m.programs[key[0]].tasks[key[1].task].pipe == "S"
+            or any(root in shared for root, _, _, _ in m.physical_effects(key))
         ]
         selected = set(instances)
+        retain_local = len(shared) > 1
+        selected_pipes = {
+            (actor, m.programs[actor].tasks[inst.task].pipe) for actor, inst in selected
+        }
         commands = {
             actor: [
                 c
                 for c in sequence
-                if c.kind.startswith("cross_")
-                or (c.kind == "task" and (actor, c.instance) in selected)
+                if c.kind == "task"
+                and (actor, c.instance) in selected
+                or c.kind.startswith("cross_")
+                or retain_local
+                and c.kind in {"set", "wait"}
+                or retain_local
+                and c.kind == "barrier"
+                and (actor, c.pipe) in selected_pipes
             ]
             for actor, sequence in commands.items()
         }

@@ -33,7 +33,7 @@ CAPACITY = {
     "L0B": 64 * 1024,
     "L0C": 128 * 1024,
 }
-ITEMSIZE = {"f32": 4, "f16": 2}
+ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2}
 IMPLICIT_COMPLETION = {"S"}  # Unconditional; short Cube instructions need separate treatment.
 MAX_INSTANCES = 4096
 
@@ -161,6 +161,7 @@ class Task:
     scalar_source: str | None = None
     period: int = 1
     phase: int = 0
+    logical_phase: int = 0
 
     def active(self, g):
         return self.lower <= g < self.upper and g % self.period == self.phase
@@ -249,8 +250,10 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
         if banks[0] == "L1":
             expected = ("NZ", "ZZ" if banks[1] == "L0A" else "ZN")
             require(
-                dtypes == ("f16", "f16") and lengths == (512, 512) and layouts == expected,
-                "L1->L0 v0.1 requires one complete f16 16x16 fractal",
+                dtypes[0] == dtypes[1] in {"f16", "bf16"}
+                and lengths == (512, 512)
+                and layouts == expected,
+                "L1->L0 requires one complete b16 16x16 fractal",
             )
         else:
             require(layouts[0] == layouts[1], "raw DMA must preserve physical layout")
@@ -277,6 +280,24 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "row DMA requires equal, aligned physical rows in GM and UB",
         )
         return ("MTE2" if banks[0] == "GM" else "MTE3"), ("R", "W")
+    if native in {"convert_f32", "convert_rn"}:
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and not params
+            and lengths[0] // ITEMSIZE[dtypes[0]] == lengths[1] // ITEMSIZE[dtypes[1]] > 0
+            and (
+                dtypes[0] in {"f16", "bf16"} and dtypes[1] == "f32"
+                if native == "convert_f32"
+                else dtypes[0] == "f32" and dtypes[1] in {"f16", "bf16"}
+            ),
+            "conversion needs equal element counts in separate contiguous b16/f32 UB views",
+        )
+        # Different-width overlap cannot be repaired by an event or by native
+        # in-place conversion assumptions. Origins are rechecked at extraction.
+        return "V", ("R", "W")
     if native in {
         "muls",
         "adds",
@@ -284,12 +305,13 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
         "mul",
         "sub",
         "div",
+        "max",
         "exp",
         "rsqrt",
         "scale_value",
         "sub_value",
     }:
-        arity = 3 if native in {"add", "mul", "sub", "div"} else 2
+        arity = 3 if native in {"add", "mul", "sub", "div", "max"} else 2
         require(
             len(refs) == arity
             and banks == ("UB",) * arity
@@ -324,6 +346,93 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             and lengths[0] % 4 == 0
             and not params,
             "bitwise Vector copy needs equal contiguous f32 UB footprints",
+        )
+        return "V", ("R", "W")
+    if native in {"fill", "fill_neg_inf"}:
+        require(
+            len(refs) == 1
+            and banks == ("UB",)
+            and dtypes == ("f32",)
+            and layouts == ("linear",)
+            and refs[0].contiguous
+            and lengths[0] > 0
+            and lengths[0] % 4 == 0
+            and not params,
+            "Vector fill needs a contiguous f32 UB destination",
+        )
+        return "V", ("W",)
+    if native == "mask_causal":
+        require(
+            len(params) == 7,
+            "causal mask needs physical rows/columns and a static query-domain map",
+        )
+        rows, cols, block_q, qt, first, owner_row, start = params
+        require(
+            1 <= rows <= 128
+            and cols in {64, 128}
+            and block_q == rows * 2
+            and 1 <= qt <= 1024
+            and first >= 0
+            and owner_row in {0, rows}
+            and start >= 0
+            and max(first, start, qt * block_q) < 2**31
+            and len(refs) == 1
+            and banks == ("UB",)
+            and dtypes == ("f32",)
+            and layouts == ("linear",)
+            and refs[0].contiguous
+            and lengths == (rows * cols * 4,),
+            "causal mask requires a complete f32 score tile and a bounded static query map",
+        )
+        return "V", ("RW",)
+    if native == "mask_prefix":
+        require(len(params) == 3, "prefix mask needs (rows,columns,visible KV prefix)")
+        rows, cols, prefix = params
+        require(
+            1 <= rows <= 128
+            and cols in {64, 128}
+            and 0 < prefix < 2**31
+            and len(refs) == 1
+            and banks == ("UB",)
+            and dtypes == ("f32",)
+            and layouts == ("linear",)
+            and refs[0].contiguous
+            and lengths == (rows * cols * 4,),
+            "prefix mask requires complete f32 rows and an explicit positive prefix",
+        )
+        return "V", ("RW",)
+    if native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
+        require(len(params) == 2, "row broadcast arithmetic needs (rows,columns)")
+        rows, cols = params
+        require(
+            1 <= rows <= 255
+            and 64 <= cols <= 256
+            and cols % 64 == 0
+            and len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and all(r.contiguous for r in refs)
+            and lengths == (rows * cols * 4, rows * 32, rows * cols * 4),
+            "row broadcast arithmetic needs complete f32 rows and eight identical words per row",
+        )
+        return "V", ("R", "R", "W")
+    if native in {"merge_sum_packed", "merge_max_packed"}:
+        require(len(params) == 2, "packed partial reduction needs (rows,partials)")
+        rows, partials = params
+        require(
+            1 <= rows <= 255
+            and 1 <= partials <= 8
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and refs[0].rows == rows
+            and refs[0].nbytes == partials * 4
+            and refs[0].row_stride == 32
+            and refs[1].contiguous
+            and lengths[1] == rows * 4,
+            "packed partial reduction reads masked words in aligned rows and writes compact statistics",
         )
         return "V", ("R", "W")
     if native in {"mul_columns64", "fma_columns64"}:
@@ -398,6 +507,22 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "row binary requires bounded equal f32 rows with aligned origins",
         )
         return "V", ("R", "R", "W")
+    if native in {"reduce_tile_sum64", "reduce_tile_max64"}:
+        require(len(params) == 2, "plane reduction needs (rows,columns)")
+        rows, cols = params
+        require(
+            8 <= rows <= 128
+            and rows % 8 == 0
+            and cols in {64, 128}
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous for r in refs)
+            and lengths == (rows * cols * 4, rows * (cols // 64) * 4),
+            "plane reduction writes one compact row-statistic plane for each aligned 64-column chunk",
+        )
+        return "V", ("R", "W")
     if native in {"reduce_sum64", "reduce_max64"}:
         require(len(params) == 2, "native reduction needs (rows, columns)")
         rows, cols = params
@@ -475,17 +600,19 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "statistics recipe needs aligned f32 words per row",
         )
         return "V", ("W",) if arity == 1 else ("R", "R", "W")
-    if native in {"nd2nz", "load2d_a", "load2d_b_nt"}:
+    if native in {"nd2nz", "load2d_a", "load2d_b_nt", "load2d_b_nn"}:
         require(len(params) == 2, "matrix DMA requires (rows, columns)")
         rows, cols = params
         require(
             16 <= rows <= 256
             and 16 <= cols <= (65520 if native == "nd2nz" else 256)
             and rows % 16 == cols % 16 == 0,
-            "matrix DMA requires complete f16 fractals and bounded native dimensions",
+            "matrix DMA requires complete b16 fractals and bounded native dimensions",
         )
         require(
-            len(refs) == 2 and dtypes == ("f16", "f16") and lengths == (rows * cols * 2,) * 2,
+            len(refs) == 2
+            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and lengths == (rows * cols * 2,) * 2,
             "matrix DMA must expose the full source and destination tile",
         )
         if native == "nd2nz":
@@ -517,11 +644,12 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             all(16 <= dim <= 256 and dim % 16 == 0 for dim in (m, n, k))
             and (clear in {0, 1} if native == "mad" else 1 <= clear <= MAX_INSTANCES)
             and banks == ("L0A", "L0B", "L0C")
-            and dtypes == ("f16", "f16", "f32")
+            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and dtypes[2] == "f32"
             and layouts == ("ZZ", "ZN", "NZ")
             and lengths == (m * k * 2, n * k * 2, m * n * 4)
             and all(r.contiguous for r in refs),
-            "MAD requires exact f16 operand tiles and an f32 accumulator, without padding",
+            "MAD requires exact b16 operand tiles and an f32 accumulator, without padding",
         )
         return "M", ("R", "R", "W" if native == "mad" and clear else "RW")
     if native == "fix":
@@ -726,7 +854,42 @@ def extract(module: ModuleOp) -> Program:
                 row_stride,
                 core_terms,
             )
-            for core in range(blocks if root.external else 1):
+            core_count = blocks if root.external else 1
+            generations = range(max(count, 1))
+            if op.source in roots:
+                # Root allocations have no holes. Core/generation terms are
+                # additive and independent, so exact finite maxima suffice.
+                last_g = max(generations, key=lambda g: ref.address(g) + ref.length(g))
+                last_core = max(range(core_count), key=lambda c: ref.address(0, c))
+                stop = ref.address(last_g, last_core) + (rows - 1) * row_stride + ref.length(last_g)
+                require(
+                    count == 0 and root.external or stop <= root.nbytes,
+                    f"view {root.name} generation {last_g}, core {last_core} end {stop} exceeds its parent",
+                )
+                itemsize = ITEMSIZE[ref.dtype]
+                require(
+                    all(ref.address(g) % itemsize == 0 for g in generations)
+                    and all(
+                        (ref.address(0, c) - ref.address(0)) % itemsize == 0
+                        for c in range(core_count)
+                    )
+                    and (rows == 1 or row_stride % itemsize == 0)
+                    and length % itemsize == 0,
+                    f"view {root.name} is not aligned for its element type",
+                )
+                views[op.ref] = ref
+                continue
+            # With no new core term, a nested view and its already checked
+            # parent share a translation. Sparse-row containment is invariant.
+            check_cores = range(core_count) if core_stride else range(1)
+            require(
+                all(
+                    (ref.address(0, c) - ref.address(0)) % ITEMSIZE[ref.dtype] == 0
+                    for c in range(core_count)
+                ),
+                f"view {root.name} core translation is not aligned for its element type",
+            )
+            for core in check_cores:
                 for g in range(max(count, 1)):
                     parts = ref.segments(g, core)
                     require(
@@ -817,6 +980,8 @@ def extract(module: ModuleOp) -> Program:
                 "task activation must be a bounded contiguous interval",
             )
             period, phase = optional_int(op.period, 1), optional_int(op.phase, 0)
+            logical_phase = optional_int(op.logical_phase, 0)
+            require(0 <= logical_phase <= 255, "logical phase must be in [0,255]")
             require(
                 1 <= period <= MAX_INSTANCES and 0 <= phase < period,
                 "static periodic task activation requires 1<=period<=4096 and 0<=phase<period",
@@ -840,6 +1005,7 @@ def extract(module: ModuleOp) -> Program:
                 scalar_source,
                 period,
                 phase,
+                logical_phase,
             )
             if scalar_source is not None:
                 provider = next(t for t in tasks if t.uid == scalar_source)
@@ -890,7 +1056,6 @@ def extract(module: ModuleOp) -> Program:
 def verify_independent_owners(program):
     if program.blocks == 1:
         return
-    accesses = {}
     instances = program.instances()
     active_tasks = {i.task for i in instances}
     written_roots = {
@@ -899,47 +1064,81 @@ def verify_independent_owners(program):
         for ref, mode in zip(program.tasks[i].refs, program.tasks[i].modes)
         if ref.storage.external and "W" in mode
     }
-    for core in range(program.blocks):
-        translations = {}
-        for i in active_tasks:
-            for ref in program.tasks[i].refs:
-                if ref.storage.name in written_roots:
-                    translations.setdefault(ref.storage.name, set()).add(
-                        ref.address(0, core) - ref.address(0)
-                    )
-        require(
-            all(len(values) == 1 for values in translations.values()),
-            f"core {core}: views of a written GM root must share one core translation; "
-            "core-dependent internal aliases need per-actor synchronization",
+    refs = {
+        ref
+        for i in active_tasks
+        for ref in program.tasks[i].refs
+        if ref.storage.name in written_roots
+    }
+    effects = [
+        (ref.storage.name, lo, hi, mode)
+        for inst in instances
+        for ref, mode in zip(
+            program.tasks[inst.task].refs, program.tasks[inst.task].modes_for(inst.generation)
         )
-        for inst in instances:
-            task = program.tasks[inst.task]
-            for ref, mode in zip(task.refs, task.modes_for(inst.generation)):
-                if ref.storage.external:
-                    for a, b in ref.segments(inst.generation, core):
-                        accesses.setdefault((core, ref.storage.name), []).append((a, b, mode))
-    unions = {}
-    for key, regions in accesses.items():
+        if ref.storage.name in written_roots
+        for lo, hi in ref.segments(inst.generation)
+    ]
+    verify_translated_owners(
+        refs,
+        effects,
+        program.blocks,
+        translation_error="views of a written GM root must share one core translation; core-dependent internal aliases need per-actor synchronization",
+        overlap_error="cross-core ownership overlap; handoff/global synchronization is not implemented",
+    )
+
+
+def verify_translated_owners(refs, effects, blocks, *, translation_error, overlap_error):
+    """Check every core's additive translation and all exact R/W interval unions.
+
+    Materialize real group-0 effects including holes. Check EVERY written-root
+    reference's translation for EVERY core, then sweep ALL translated R/W
+    intervals. No generation/core sample or bounding-box alias assumption.
+    """
+    import heapq
+
+    base = {}
+    for root, lo, hi, mode in effects:
         for access in ("R", "W"):
-            merged = []
-            for a, b in sorted((a, b) for a, b, mode in regions if access in mode):
-                if merged and a <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
-                else:
-                    merged.append((a, b))
-            unions[(*key, access)] = merged
-    for (core, root, access), writes in unions.items():
-        if access != "W" or not writes:
-            continue
-        for other in range(program.blocks):
-            if core == other:
-                continue
-            for mode in ("R", "W"):
-                require(
-                    not ranges_overlap(writes, unions.get((other, root, mode), ())),
-                    f"cross-core {root} ownership overlap {core}->{other}; "
-                    "handoff/global synchronization is not implemented",
+            if access in mode:
+                base.setdefault((root, access), []).append((lo, hi))
+    unions = {}
+    for key, parts in base.items():
+        merged = []
+        for lo, hi in sorted(parts):
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+            else:
+                merged.append((lo, hi))
+        unions[key] = merged
+    translated = {}
+    for core in range(blocks):
+        shifts = {}
+        for ref in refs:
+            shifts.setdefault(ref.storage.name, set()).add(ref.address(0, core) - ref.address(0))
+        for root, values in shifts.items():
+            require(len(values) == 1, f"core {core}, {root}: {translation_error}")
+            shift = next(iter(values))
+            for access in ("R", "W"):
+                translated.setdefault(root, []).extend(
+                    (lo + shift, hi + shift, access, core)
+                    for lo, hi in unions.get((root, access), ())
                 )
+    for root, parts in translated.items():
+        active = {"R": {}, "W": {}}
+        deadlines = []
+        for lo, hi, access, core in sorted(parts):
+            while deadlines and deadlines[0][0] <= lo:
+                end, kind, owner = heapq.heappop(deadlines)
+                if active[kind].get(owner) == end:
+                    del active[kind][owner]
+            conflicts = ("R", "W") if access == "W" else ("W",)
+            require(
+                all(len(active[kind]) == int(core in active[kind]) for kind in conflicts),
+                f"{root}[{lo}:{hi}], core {core}: {overlap_error}",
+            )
+            active[access][core] = hi
+            heapq.heappush(deadlines, (hi, access, core))
 
 
 def storage_layout(storages):

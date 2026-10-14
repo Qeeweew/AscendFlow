@@ -75,8 +75,11 @@ def parts(module):
     return kernel, stream
 
 
-def execution(module: ModuleOp) -> Execution:
-    p = extract(module)
+def execution(module: ModuleOp, *, _program=None) -> Execution:
+    # Internal planning reuses the already verified immutable native effects
+    # while changing only sync placements. Final verification always extracts
+    # those effects again. This is not an input certificate or a fast mode.
+    p = extract(module) if _program is None else _program
     kernel, stream = parts(module)
     task_indices = {t.uid: i for i, t in enumerate(p.tasks)}
     channels = {}
@@ -324,7 +327,13 @@ def completion_graph(ex: Execution):
 
 
 def verify_plan(module: ModuleOp, *, _imports=()) -> dict:
-    from .ir import MixedOp
+    from .ir import MixedOp, StaticDispatchOp
+
+    if isinstance(module.body.block.first_op, StaticDispatchOp):
+        from .dispatch import verify_dispatch
+
+        require(not _imports, "whole launch proofs cannot assume imports")
+        return verify_dispatch(module)
 
     if isinstance(module.body.block.first_op, MixedOp):
         from .mixed import verify_mixed
@@ -413,7 +422,12 @@ def arithmetic_span(epochs):
 
 
 def explain_plan(module: ModuleOp) -> dict:
-    from .ir import MixedOp
+    from .ir import MixedOp, StaticDispatchOp
+
+    if isinstance(module.body.block.first_op, StaticDispatchOp):
+        from .dispatch import explain_dispatch
+
+        return explain_dispatch(module)
 
     if isinstance(module.body.block.first_op, MixedOp):
         from .mixed import explain_mixed
@@ -479,7 +493,13 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
     assumption that the buffer ring equals the event ring. Capacity failure is
     a diagnostic, not permission to serialize or enlarge buffers.
     """
-    from .ir import MixedOp
+    from .ir import MixedOp, StaticDispatchOp
+
+    if isinstance(module.body.block.first_op, StaticDispatchOp):
+        from .dispatch import autosync_dispatch
+
+        require(not _imports, "whole launch planning cannot assume imports")
+        return autosync_dispatch(module)
 
     if isinstance(module.body.block.first_op, MixedOp):
         from .mixed import autosync_mixed
@@ -572,7 +592,7 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
         # Temporarily give each logical channel a private direction namespace by
         # checking only the completion graph. Final physical reuse is checked later.
         try:
-            ex = execution(result)
+            ex = execution(result, _program=p)
             graph, begin, end, _, _ = completion_graph(ex)
             return all(graph.precedes(end[o.source], begin[o.destination]) for o in obs)
         except CompileError:
@@ -597,7 +617,7 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
         candidate = proposals.copy()
         candidate.remove(proposal)
         materialize(candidate, [1] * len(candidate), virtual=True)
-        ex = execution(result)
+        ex = execution(result, _program=p)
         graph, begin, end, _, _ = completion_graph(ex)
         missing = sorted(
             {
@@ -630,7 +650,7 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
             widths[i] = width
             materialize(proposals, widths, virtual=True)
             try:
-                ex = execution(result)
+                ex = execution(result, _program=p)
                 graph, _, _, waits, physical_sets = completion_graph(ex)
             except CompileError:
                 continue

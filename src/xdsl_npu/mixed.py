@@ -35,8 +35,8 @@ from .model import (
     dependencies,
     extract,
     optional_int,
-    ranges_overlap,
     require,
+    verify_translated_owners,
 )
 from .sync import Graph, autosync, execution, parts
 
@@ -116,6 +116,7 @@ class MixedProgram:
             ((actor, inst) for actor, p in self.programs.items() for inst in p.instances()),
             key=lambda key: (
                 key[1].generation // self.divisors[key[0]],
+                self.programs[key[0]].tasks[key[1].task].logical_phase,
                 ACTORS.index(key[0]),
                 key[1].generation,
                 key[1].task,
@@ -235,39 +236,26 @@ def verify_group_owners(m):
         for root, _, _, mode in m.physical_effects(key)
         if "W" in mode and root in m.roots
     }
-    translations = defaultdict(set)
-    effects = defaultdict(list)
-    for core in range(m.op.blocks.data):
-        for actor, p in m.programs.items():
-            for task in p.tasks:
-                for ref in task.refs:
-                    if ref.storage.name in writes:
-                        translations[(core, ref.storage.name)].add(
-                            ref.address(0, core) - ref.address(0)
-                        )
-            for inst in p.instances():
-                for root, a, b, mode in m.physical_effects((actor, inst), core):
-                    if root in m.roots:
-                        for access in ("R", "W"):
-                            if access in mode:
-                                effects[(core, root, access)].append((a, b))
-    require(
-        all(len(t) == 1 for t in translations.values()),
-        "shared written views need identical group translations; core-dependent aliases rejected",
+    refs = {
+        ref
+        for p in m.programs.values()
+        for task in p.tasks
+        for ref in task.refs
+        if ref.storage.name in writes
+    }
+    effects = [
+        effect
+        for key in m.semantic_instances()
+        for effect in m.physical_effects(key)
+        if effect[0] in writes
+    ]
+    verify_translated_owners(
+        refs,
+        effects,
+        m.op.blocks.data,
+        translation_error="shared written views need identical group translations; core-dependent aliases rejected",
+        overlap_error="different mixed groups overlap; no inter-group protocol",
     )
-    effects = {key: merge_ranges(parts) for key, parts in effects.items()}
-    for (core, root, mode), footprint in effects.items():
-        if mode != "W":
-            continue
-        for other in range(m.op.blocks.data):
-            if core != other:
-                require(
-                    all(
-                        not ranges_overlap(footprint, effects.get((other, root, access), ()))
-                        for access in ("R", "W")
-                    ),
-                    f"shared GM {root}: different mixed groups overlap; no inter-group protocol",
-                )
 
 
 def global_dependencies(m):
@@ -328,8 +316,16 @@ class MixedCommand:
     event: tuple[str, str, int] | None = None
 
 
-def mixed_execution(module):
-    m = extract_mixed(module)
+def mixed_execution(module, *, _analysis=None):
+    # Sync-only planning may reuse verified immutable native effects. Actual
+    # commands are rebuilt from the current IR, including every candidate
+    # deletion. Final public verification always extracts effects afresh.
+    m = extract_mixed(module) if _analysis is None else _analysis
+    projections = (
+        m.projections
+        if _analysis is None
+        else {a: project_actor(m.op, actor) for a, actor in m.actors.items()}
+    )
     channels, ids = {}, set()
     for op in m.op.body.block.ops:
         if not isinstance(op, CrossChannelOp):
@@ -351,7 +347,7 @@ def mixed_execution(module):
         channels[name] = CrossChannel(name, sources, destinations, flag_id, count)
     commands = {}
     for actor, kernel in m.actors.items():
-        ex = execution(m.projections[actor])
+        ex = execution(projections[actor], _program=m.programs[actor])
         local = defaultdict(deque)
         for cmd in ex.commands:
             local[(cmd.instance, cmd.kind, cmd.channel)].append(cmd)
@@ -535,9 +531,9 @@ def mixed_graph(m, channels, commands):
     return graph, begin, end, sends, receives, local_sends, local_waits
 
 
-def verify_mixed(module):
-    m, channels, commands = mixed_execution(module)
-    obligations = global_dependencies(m)
+def verify_mixed(module, *, _analysis=None, _obligations=None):
+    m, channels, commands = mixed_execution(module, _analysis=_analysis)
+    obligations = global_dependencies(m) if _obligations is None else _obligations
     graph, begin, end, sends, receives, local_sends, local_waits = mixed_graph(
         m, channels, commands
     )
@@ -595,7 +591,7 @@ def verify_mixed(module):
         "scratch_bytes": sum(
             op.nbytes.data
             for op in m.roots.values()
-            if not op.initialized.data and op.sym_name.data == "scratch"
+            if op.sym_name.data in {o.storage for src, dst, o in obligations if src[0] != dst[0]}
         ),
         "verification": "all static instances and exact group translations; trusted dav-2201 contracts",
         "terminal_drain": "every cross return consumed; each actor drains its issued pipelines",
@@ -696,31 +692,91 @@ def autosync_mixed(module):
     if not m.epochs:
         verify_mixed(result)
         return result
-    roots = {o.storage for _, _, o in cross}
-    require(len(roots) == 1, "first mixed model requires exactly one shared GM handoff ring")
+    roots = sorted({o.storage for _, _, o in cross})
+    require(
+        1 <= len(roots) <= 4, "mixed handoff needs 1..4 independently owned GM rings (8 counters)"
+    )
+    for ring, root in enumerate(roots):
+        prefix = "gm" if len(roots) == 1 else root
+        _plan_gm_ring(m, [item for item in cross if item[2].storage == root], prefix, ring * 2)
+
+    def candidate_valid():
+        return verify_mixed(result, _analysis=m, _obligations=obligations)
+
+    candidate_valid()
+    # Cross read-retirement can also cover actor-local ring WAW. Remove a
+    # conflict barrier only after the whole-group graph proves it redundant.
+    for op in list(result.walk()):
+        if not isinstance(op, SyncOp) or op.action.data != "barrier":
+            continue
+        block, following = op.parent, op.next_op
+        block.detach_op(op)
+        try:
+            candidate_valid()
+        except CompileError:
+            block.insert_op_before(op, following)
+    # Bidirectional handoffs can already retire an earlier ring through a
+    # later ready path. Do not force six notifications into an online loop
+    # merely because it has three logical rings. Remove a whole physical
+    # channel only when the unchanged commands still prove ALL effects,
+    # binary lifetimes, counter bounds and final consumption independently.
+    for channel in list(result.walk()):
+        if not isinstance(channel, CrossChannelOp):
+            continue
+        name = channel.sym_name.data
+        removed = []
+        for op in list(result.walk()):
+            if (
+                op is channel
+                or isinstance(op, (CrossSyncOp, CrossDrainOp))
+                and op.channel.data == name
+            ):
+                removed.append((op.parent, op, op.next_op))
+                op.parent.detach_op(op)
+        try:
+            candidate_valid()
+        except CompileError:
+            for parent, op, following in reversed(removed):
+                parent.insert_op_before(op, following)
+    verify_mixed(result)
+    return result
+
+
+def _plan_gm_ring(m, cross, prefix, flag_base):
+    """Plan one physical ring, either FIX->AIV pair or MTE3 pair->AIC.
+
+    A source/read endpoint executes once per common epoch. The two AIV
+    endpoints own disjoint byte ranges; the global frontier proves their
+    actual coverage, not a nominal tensor shape or a user release marker.
+    """
     raw = [(src, dst, o) for src, dst, o in cross if o.hazard == "RAW"]
+    pairs = {(src[0], dst[0]) for src, dst, _ in raw}
+    forward = pairs == {("aic", "aiv0"), ("aic", "aiv1")}
+    reverse = pairs == {("aiv0", "aic"), ("aiv1", "aic")}
     require(
-        raw and all(src[0] == "aic" and dst[0] in {"aiv0", "aiv1"} for src, dst, _ in raw),
-        "mixed handoff must be FIX -> two AIV GM imports",
+        forward or reverse,
+        f"{prefix}: handoff requires FIX -> both AIV readers or both MTE3 writers -> AIC reader",
     )
-    writers = {src[1].task for src, _, _ in raw}
-    readers = {a: {dst[1].task for _, dst, _ in raw if dst[0] == a} for a in ACTORS[1:]}
+    sources, destinations = (("aic",), ACTORS[1:]) if forward else (ACTORS[1:], ("aic",))
+    writers = {a: {src[1].task for src, _, _ in raw if src[0] == a} for a in sources}
+    readers = {a: {dst[1].task for _, dst, _ in raw if dst[0] == a} for a in destinations}
     require(
-        len(writers) == 1 and all(len(r) == 1 for r in readers.values()),
-        "handoff needs one producer and one last GM reader per AIV/epoch",
+        all(len(indices) == 1 for indices in (*writers.values(), *readers.values())),
+        f"{prefix}: handoff needs one producer and one last GM reader per participant/epoch",
     )
-    writer = writers.pop()
+    writers = {a: indices.pop() for a, indices in writers.items()}
     readers = {a: indices.pop() for a, indices in readers.items()}
-    endpoints = {"aic": writer, **readers}
+    endpoints = {**writers, **readers}
     for actor, index in endpoints.items():
         task = m.programs[actor].tasks[index]
         active = [g for g in range(m.programs[actor].count) if task.active(g)]
         divisor = m.divisors[actor]
+        pipe = ("FIX" if forward else "MTE3") if actor in writers else "MTE2"
         require(
             len(active) == m.epochs
             and active == [active[0] + i * divisor for i in range(m.epochs)]
             and active[0] < divisor
-            and task.pipe == ("FIX" if actor == "aic" else "MTE2"),
+            and task.pipe == pipe,
             "handoff endpoint must execute once per epoch on its real producer/read pipe",
         )
     require(
@@ -736,11 +792,11 @@ def autosync_mixed(module):
         and all(
             src[0] in readers
             and src[1].task == readers[src[0]]
-            and dst[0] == "aic"
-            and dst[1].task == writer
+            and dst[0] in writers
+            and dst[1].task == writers[dst[0]]
             for src, dst, _ in war
         ),
-        "unsupported shared ownership: only producer/last-reader ring RAW and WAR are implemented",
+        f"{prefix}: only producer/last-reader ring RAW and WAR are implemented",
     )
     distances = {
         dst[1].generation // m.divisors[dst[0]] - src[1].generation // m.divisors[src[0]]
@@ -751,18 +807,19 @@ def autosync_mixed(module):
     require(
         1 <= slots <= 15, "handoff in-flight window must fit the 15-notification hardware limit"
     )
-    for index, (name, sources, destinations) in enumerate(
+    ready, credit = prefix + "_ready", prefix + "_credit"
+    for index, (name, channel_sources, channel_destinations) in enumerate(
         (
-            ("gm_ready", ("aic",), ACTORS[1:]),
-            ("gm_credit", ACTORS[1:], ("aic",)),
+            (ready, sources, destinations),
+            (credit, destinations, sources),
         )
     ):
         channel = CrossChannelOp.create(
             attributes={
                 "sym_name": StringAttr(name),
-                "sources": ArrayAttr(StringAttr(a) for a in sources),
-                "destinations": ArrayAttr(StringAttr(a) for a in destinations),
-                "flag_id": IntAttr(index),
+                "sources": ArrayAttr(StringAttr(a) for a in channel_sources),
+                "destinations": ArrayAttr(StringAttr(a) for a in channel_destinations),
+                "flag_id": IntAttr(flag_base + index),
                 "count": IntAttr(m.epochs),
             }
         )
@@ -775,16 +832,16 @@ def autosync_mixed(module):
         divisor = m.divisors[actor]
         phase = next(i for i in range(divisor) if m.programs[actor].tasks[index].active(i))
         hi = m.programs[actor].count
-        if actor == "aic":
+        if actor in writers:
             stream.body.block.insert_op_after(
-                cross_op(g, "set", "gm_ready", phase, hi, divisor, divisor), task
+                cross_op(g, "set", ready, phase, hi, divisor, divisor), task
             )
             if slots < m.epochs:
                 stream.body.block.insert_op_before(
                     cross_op(
                         g,
                         "wait",
-                        "gm_credit",
+                        credit,
                         slots * divisor + phase,
                         hi,
                         divisor,
@@ -795,7 +852,7 @@ def autosync_mixed(module):
                 )
             drain = CrossDrainOp.create(
                 attributes={
-                    "channel": StringAttr("gm_credit"),
+                    "channel": StringAttr(credit),
                     "lower": IntAttr(max(0, m.epochs - slots)),
                     "upper": IntAttr(m.epochs),
                 }
@@ -803,22 +860,8 @@ def autosync_mixed(module):
             kernel.body.block.insert_op_before(drain, kernel.body.block.last_op)
         else:
             stream.body.block.insert_op_before(
-                cross_op(g, "wait", "gm_ready", phase, hi, divisor, divisor), task
+                cross_op(g, "wait", ready, phase, hi, divisor, divisor), task
             )
             stream.body.block.insert_op_after(
-                cross_op(g, "set", "gm_credit", phase, hi, divisor, divisor), task
+                cross_op(g, "set", credit, phase, hi, divisor, divisor), task
             )
-    verify_mixed(result)
-    # Cross read-retirement can also cover actor-local ring WAW. Remove a
-    # conflict barrier only after the whole-group graph proves it redundant.
-    for op in list(result.walk()):
-        if not isinstance(op, SyncOp) or op.action.data != "barrier":
-            continue
-        block, following = op.parent, op.next_op
-        block.detach_op(op)
-        try:
-            verify_mixed(result)
-        except CompileError:
-            block.insert_op_before(op, following)
-    verify_mixed(result)
-    return result

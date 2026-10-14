@@ -88,3 +88,29 @@ MulAddDst 是本阶段的算法输入；动态接受 token/state ID 没有被替
 f32 bitwise snapshot 使用 vcopy，保留源位模式，没有以加0代替复制。
 当前只实现静态 f32、R64 的递推子集，具体接口、拒绝范围与设备证据见
 [recurrent-gdn.md](recurrent-gdn.md)。
+
+## Flash Attention 与硬件性能分析
+
+2026-10-14 延续上述参考 HEAD，没有 pull；安装的 CANN9.1头文件仍是最终
+native contract 来源。没有使用原 TileLang 的构建、虚拟环境、缓存或容器。
+
+| 已核对来源 | 产品实现/修正 |
+|---|---|
+| `tilelang/examples/ascend/flash_attention/910b.md`、`910b.py`、`persistent_910b.py` | FP32 online carry、未舍入 denominator、P operand RN；逻辑BK属于算法。query/state/native时钟独立，不迁移整个TileLang pass体系 |
+| `ops-transformer/attention/flash_attention_score/docs/FA算子设计介绍.md`, 35–54、182–207 | A2交接经过GM/L2；CV通信基本块和核内计算块不同。当前产品BK128仍未复现该源码的BK1024通信组织，明确保留性能差距 |
+| 2201 `cube_datamove_impl/asc_copy_l12l0b_2d_impl.h` | classic wrapper把transpose固定false。NN V使用审查后的 `load_cbuf_to_cb(..., true, inc)`；精确分块映射及f16/bf16矩形设备验证，不增加GM转置 |
+| `asc/include/c_api/cube_datamove/cube_datamove.h` 的 `asc_copy_l12l0b_transpose` | 这个相似名字的接口属于3510路径，不能套用到2201。2201另有不同footprint的 `*_trans` 指令，本实现没有混用 |
+| 2201 `vector_compute_impl/{asc_repeat_reduce_sum_impl.h,asc_repeat_reduce_max_impl.h,asc_brcb_impl.h,vconv}` | 普通异步cast、repeat-stride归约和行广播均展开为原生recipe；没有使用 `_sync` 变体隐藏同步 |
+| `/usr/local/Ascend/cann-9.1.0/aarch64-linux/data/platform_config/Ascend910B3.ini` | 20 AIC/40 AIV、192 MiB L2及各bank容量；原始memory rates单位未核实，不冒充GB/s |
+| `/usr/local/dcmi/dcmi_interface_api.h`, `dcmi_get_device_frequency` | 枚举6/7/9/12查询HBM、当前/最大AIC、当前AIV。未知AIV状态-8255保留；HBM MHz不能直接推导带宽 |
+| msprof `op_summary*.csv`、device `FreqParse` | 设备task时间、重叠的pipe activity比例和运行频率样本，与源码/IR/库/CSV hash绑定；不能仅凭ratio判定因果瓶颈 |
+
+Flash Attention 的双向三环共享同一物理访问/生命周期分析；冗余credit删除后
+重检全部跨核RAW/WAR/WAW、local event、计数器及最终drain。逻辑phase描述算法
+依赖，stage/issue order描述实际派发，二者不能替代异步完成关系。
+
+同卡大规模4K f16 MHA和8K bf16 GQA已经离线编译、采样数值验证及msprof。
+条件Cube峰值模型明确声明8192 ops/core/cycle和1800 MHz假设；没有得到HBM/L2
+持续带宽实测，也没有宣称达到专家流水性能。具体范围、同步反例和数字见
+[Flash Attention](flash-attention.md)。全产品回归288项通过；有界枚举未穷尽的
+FA样本仍如实保留 `exhaustive=false`，没有提高预算来暗示证明。

@@ -91,6 +91,32 @@ class MixedOp(IRDLOperation):
 
 
 @irdl_op_definition
+class StaticDispatchOp(IRDLOperation):
+    """One launch with an exact static partition of mixed group IDs.
+
+    All actors select the same case with their common logical block index.
+    Cases bind their GM roots to the same named launch arguments; the final
+    proof checks accesses across cases as well as within each mixed group.
+    """
+
+    name = "npu.static_dispatch"
+    sym_name = attr_def(StringAttr)
+    target = attr_def(StringAttr)
+    blocks = attr_def(IntAttr)
+    body = region_def("single_block")
+    traits = traits_def(RecursiveMemoryEffect())
+
+
+@irdl_op_definition
+class StaticCaseOp(IRDLOperation):
+    name = "npu.static_case"
+    lower = attr_def(IntAttr)
+    upper = attr_def(IntAttr)
+    body = region_def("single_block")
+    traits = traits_def(RecursiveMemoryEffect())
+
+
+@irdl_op_definition
 class CrossChannelOp(IRDLOperation):
     """Mode-2 counting notification, with explicit collective participants."""
 
@@ -178,6 +204,7 @@ class TaskOp(IRDLOperation):
     issue_order = opt_attr_def(IntAttr)
     period = opt_attr_def(IntAttr)
     phase = opt_attr_def(IntAttr)
+    logical_phase = opt_attr_def(IntAttr)
     params = attr_def(ArrayAttr[IntAttr])
     scalar = attr_def(FloatAttr)
     task = result_def(TaskType)
@@ -245,6 +272,8 @@ NPU = Dialect(
     [
         KernelOp,
         MixedOp,
+        StaticDispatchOp,
+        StaticCaseOp,
         BufferOp,
         ViewOp,
         StreamOp,
