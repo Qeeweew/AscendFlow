@@ -18,7 +18,14 @@ def _ints(values):
 def _obligation_queries(obligation, graph, native):
     o = obligation
     for residue, first in project(o.period, o.residues, graph.period, o.distance):
-        yield (native[o.source], residue - o.distance, native[o.destination], residue, first)
+        yield (
+            native[o.source],
+            residue - o.distance,
+            native[o.destination],
+            residue,
+            first,
+            o.prefix,
+        )
 
 
 def _coverage_queries(obligations, graph, native):
@@ -28,9 +35,9 @@ def _coverage_queries(obligations, graph, native):
     queries = {}
     for o in sorted(obligations, key=lambda o: o.hazard != "WAR"):
         for query in _obligation_queries(o, graph, native):
-            source, _, destination, residue, first = query
-            key = source.index, destination.index, o.distance, residue
-            if key not in queries or first < queries[key][1][-1]:
+            source, _, destination, residue, first, prefix = query
+            key = source.index, destination.index, o.distance, residue, prefix
+            if key not in queries or first < queries[key][1][4]:
                 queries[key] = o, query
     return queries.values()
 
@@ -38,10 +45,10 @@ def _coverage_queries(obligations, graph, native):
 def _coverage(loop, obligations, graph, native):
     queries = _coverage_queries(obligations, graph, native)
     for o, query in queries:
-        _, _, _, residue, first = query
+        _, _, _, residue, first, prefix = query
         if graph.path(*query) is None:
             raise CompileError(
-                f"missing loop {o.hazard} {'read_retired' if o.hazard == 'WAR' else 'write_done'}: "
+                f"missing loop {o.hazard} {'read_retired_prefix' if prefix else 'read_retired' if o.hazard == 'WAR' else 'write_done'}: "
                 f"{o.source} -> {o.destination}, distance {o.distance}, protocol residue "
                 f"{residue}/{graph.period}, first {first}, storage residues "
                 f"{o.residues}/{o.period}, on {o.storage}[{o.start}:{o.stop}]"
@@ -173,6 +180,9 @@ def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True)
                 require(len(banks[key] | reserved) <= 8, "local event bank exhausted")
             width = len(channel.ids)
             require(width > 0, "local event width must be assigned")
+            if channel.last:
+                require(width == 1, "terminal local channel executes at most once per invocation")
+                continue
             for residue in range(graph.period):
                 if residue % channel.period not in channel.residues:
                     continue
@@ -231,6 +241,9 @@ def verify_loop(module, *, _details=False):
         else loop.bound.text(),
         "runtime_parameters": [size.sym_name.data for size in loop.parameters],
         "static_length": loop.constant_count,
+        "terminal_templates": sum(
+            task.last for data in loop.actors.values() for task in data.program.tasks
+        ),
         "native_templates": sum(len(actor.program.tasks) for actor in loop.actors.values()),
         "storage_periods": loop.storage_periods,
         "native_accesses": sum(
@@ -283,7 +296,7 @@ def explain_loop(module):
     witnesses = []
     for o in loop_dependencies(loop):
         for query in _obligation_queries(o, graph, native):
-            _, _, _, residue, first = query
+            _, _, _, residue, first, prefix = query
             path = graph.path(*query)
             witnesses.append(
                 {
@@ -294,6 +307,8 @@ def explain_loop(module):
                     "bytes": [o.start, o.stop],
                     "distance": o.distance,
                     "period": o.period,
+                    "terminal": o.last,
+                    "source_completion_prefix": prefix,
                     "storage_residues": list(o.residues),
                     "protocol_period": graph.period,
                     "destination_residue": residue,
@@ -329,9 +344,9 @@ def _install(loop, specs, barriers):
         data = loop.actors[actor]
         period, chosen = family
         op = _sync(data.stream, "barrier", "", lower, 0, period, chosen)
-        data.stream.body.block.insert_op_before(op, data.operations[uid])
+        data.operations[uid].parent.insert_op_before(op, data.operations[uid])
         operations.append((None, [op]))
-    for number, (kind, sources, destinations, distance, family) in enumerate(specs):
+    for number, (kind, sources, destinations, distance, family, terminal) in enumerate(specs):
         period, chosen = family
         name = f"loop_c{number}"
         op = LoopChannelOp.create(
@@ -346,6 +361,7 @@ def _install(loop, specs, barriers):
                 "period": IntAttr(period),
                 "residues": _ints(chosen),
                 "event_ids": _ints(()),
+                **({"last": IntAttr(1)} if terminal else {}),
             }
         )
         first_region = next(
@@ -356,13 +372,17 @@ def _install(loop, specs, barriers):
         for actor, uid in sources:
             data = loop.actors[actor]
             sync = _sync(data.stream, "set", name, 0, distance, period, chosen)
-            data.stream.body.block.insert_op_after(sync, data.operations[uid])
+            if terminal:
+                sync.attributes["last_gap"] = IntAttr(distance)
+            data.operations[uid].parent.insert_op_after(sync, data.operations[uid])
             placed.append(sync)
         shifted = tuple(sorted((r + distance) % period for r in chosen))
         for actor, uid in destinations:
             data = loop.actors[actor]
             sync = _sync(data.stream, "wait", name, distance, 0, period, shifted)
-            data.stream.body.block.insert_op_before(sync, data.operations[uid])
+            if terminal:
+                sync.attributes["last_gap"] = IntAttr(0)
+            data.operations[uid].parent.insert_op_before(sync, data.operations[uid])
             placed.append(sync)
         operations.append((op, placed))
     return operations
@@ -380,6 +400,7 @@ def _proposals(loop, obligations):
         if o.source[0] != o.destination[0]:
             # Acquire at this actual consumer, joining only its overlapping
             # contributors. A different native subview gets its own gate.
+            require(not o.last, "terminal cross-core protocols require collective region analysis")
             key = o.storage, o.distance, o.hazard, o.destination[1]
             item = cross.setdefault(key, ({}, {}, {}))
             source_actor, destination_actor = o.source[0], o.destination[0]
@@ -396,7 +417,7 @@ def _proposals(loop, obligations):
             item[0] = min(item[0], o.distance)
             item[1].setdefault(o.period, set()).update(o.residues)
         else:
-            local.setdefault((o.source, o.destination, o.distance), {}).setdefault(
+            local.setdefault((o.source, o.destination, o.distance, o.last), {}).setdefault(
                 o.period, set()
             ).update((r - o.distance) % o.period for r in o.residues)
     specs = [
@@ -406,8 +427,9 @@ def _proposals(loop, obligations):
             (destination,),
             distance,
             union(residues, f"channel {source}->{destination}"),
+            terminal,
         )
-        for (source, destination, distance), residues in sorted(local.items())
+        for (source, destination, distance, terminal), residues in sorted(local.items())
     ]
     specs += [
         (
@@ -416,6 +438,7 @@ def _proposals(loop, obligations):
             tuple(sorted(destinations.values())),
             distance,
             union(residues, "cross-core channel"),
+            False,
         )
         for (_, distance, _, _), (sources, destinations, residues) in sorted(cross.items())
     ]
@@ -469,8 +492,8 @@ def autosync_loop(module, *, _capture=None):
             continue
         actor = channel.sources[0][0]
         source, destination = endpoints[actor, name, "set"], endpoints[actor, name, "wait"]
-        width = None
-        for candidate in range(1, 9):
+        width = 1 if channel.last else None
+        for candidate in () if channel.last else range(1, 9):
             if all(
                 graph.path(
                     destination,

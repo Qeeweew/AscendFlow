@@ -9,13 +9,15 @@ import re
 from dataclasses import dataclass
 from math import prod
 
-from xdsl.dialects import arith
+from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
+from xdsl.ir import Block, Region
 
 from .builder import Kernel
+from .ir import BoundaryOp, EndOp
 from .mixed import compose, extract_mixed, global_dependencies
 from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
-from .scalar import ARITHMETIC, from_ssa, prefix
+from .scalar import ARITHMETIC, expression, from_ssa, literal, prefix
 from .source_ir import (
     AllocationOp,
     CopyOp,
@@ -47,6 +49,28 @@ class Work:
     label: str
     order: tuple[int, ...]
     constants: tuple
+    boundary: object = None
+
+
+def _last_condition(op, pipeline):
+    require(
+        not op.results
+        and not list(op.false_region.block.ops)[:-1]
+        and isinstance(op.cond.owner, arith.CmpiOp)
+        and op.cond.owner.predicate.value.data == 0,
+        "structured scf.if synchronization currently needs a last-generation equality with no else/results",
+    )
+    coordinate = pipeline.body.block.args[0]
+    pair = [from_ssa(value, coordinates={coordinate: "$g"}) for value in op.cond.owner.operands]
+    bound = from_ssa(pipeline.limit) if pipeline.limit is not None else literal(pipeline.count.data)
+    require(
+        set(pair)
+        == {
+            from_ssa(coordinate, coordinates={coordinate: "$g"}),
+            expression("sub", bound, literal(1)),
+        },
+        "structured scf.if synchronization requires generation == its pipeline bound - 1",
+    )
 
 
 def _work(program, pipeline, family, owner):
@@ -57,10 +81,11 @@ def _work(program, pipeline, family, owner):
     pinned = pipeline.issue_order is not None and family in pipeline.issue_order.data
     ranks = {label.data: i for i, label in enumerate(issue_order)}
 
-    def walk(block, clock, bindings, stage, phase, label, domain, order):
+    def walk(block, clock, bindings, stage, phase, label, domain, order, boundary=None):
         for position, op in enumerate(block.ops):
             path = (*order, position)
             if isinstance(op, StageOp):
+                require(boundary is None, "place last-generation conditions inside their Stage")
                 if clock is pipeline:
                     walk(
                         op.body.block,
@@ -92,8 +117,16 @@ def _work(program, pipeline, family, owner):
                 if selected != family:
                     continue
                 local = {**bindings, op.body.block.args[0]: owner}
-                walk(op.body.block, clock, local, stage, phase, label, selected, path)
+                walk(op.body.block, clock, local, stage, phase, label, selected, path, boundary)
+            elif isinstance(op, scf.IfOp):
+                require(
+                    boundary is None and clock is pipeline,
+                    "nested boundary predicates need hierarchical analysis",
+                )
+                _last_condition(op, pipeline)
+                walk(op.true_region.block, clock, bindings, stage, phase, label, domain, path, op)
             elif isinstance(op, PipelineOp):
+                require(boundary is None, "a loop inside a boundary requires hierarchical region analysis")
                 require(op.issue_order is None, "nested issue policies need hierarchical lowering")
                 require(
                     op.limit is None,
@@ -109,20 +142,44 @@ def _work(program, pipeline, family, owner):
                     local = {**bindings, op.body.block.args[0]: iteration}
                     walk(op.body.block, op, local, stage, phase, label, domain, (*path, iteration))
             elif (
-                isinstance(op, (AllocationOp, ViewOp, PredicateOp, YieldOp, arith.ConstantOp))
+                isinstance(
+                    op,
+                    (
+                        AllocationOp,
+                        ViewOp,
+                        PredicateOp,
+                        YieldOp,
+                        arith.ConstantOp,
+                        arith.CmpiOp,
+                        scf.YieldOp,
+                    ),
+                )
                 or type(op) in ARITHMETIC
             ):
                 continue
             elif isinstance(op, (CopyOp, ElementOp, MatmulOp, ReduceOp, ScalarReadOp, ScaleOp)):
                 require(domain is not None, "mixed work requires a Cube or Vector execution scope")
                 require(domain == family, "source operation has incompatible execution owner")
-                records.append(Work(op, stage, phase, label, path, tuple(bindings.items())))
+                records.append(
+                    Work(op, stage, phase, label, path, tuple(bindings.items()), boundary)
+                )
             else:
                 raise TypeError(
                     f"unsupported source operation {op.name}; effects cannot be ignored"
                 )
 
     walk(pipeline.body.block, pipeline, {}, 0, 0, "pipeline", default_domain, ())
+    first_boundary = next(
+        (i for i, record in enumerate(records) if record.boundary is not None), len(records)
+    )
+    require(
+        all(r.boundary is not None for r in records[first_boundary:]),
+        "last-generation regions must form a terminal logical effect suffix",
+    )
+    if first_boundary < len(records):
+        require(
+            program.kind.data != "mixed", "mixed boundary protocols need collective region analysis"
+        )
     if pinned:
         require(
             set(ranks) == {record.label for record in records},
@@ -153,8 +210,17 @@ def _root(value):
     return root
 
 
-def _initialize(op, record):
+def _initialize(op, record, coordinate=None):
     predicate = op.initialize.owner
+    if isinstance(predicate, arith.CmpiOp):
+        values = [from_ssa(value, coordinates={coordinate: "$g"}) for value in predicate.operands]
+        require(
+            predicate.predicate.value.data == 0
+            and set(values) == {literal(0), from_ssa(coordinate, coordinates={coordinate: "$g"})},
+            "runtime matmul initialization requires its own generation == 0",
+        )
+        require(record.boundary is None, "a terminal MAD cannot initialize an earlier recurrence")
+        return "first"
     require(isinstance(predicate, PredicateOp), "matmul initialization needs a typed predicate")
     bindings = dict(record.constants)
 
@@ -414,7 +480,22 @@ class _Actor:
             id(record): rank
             for rank, record in enumerate(sorted(self.records, key=lambda r: r.order))
         }
+        stream_block = self.kernel.task_block
+        boundaries = {}
         for number, record in enumerate(self.records):
+            if record.boundary is not None:
+                if record.boundary not in boundaries:
+                    block = Block()
+                    guard = BoundaryOp.create(
+                        operands=[stream_block.args[0]],
+                        attributes={"kind": StringAttr("last")},
+                        regions=[Region(block)],
+                    )
+                    stream_block.add_op(guard)
+                    boundaries[record.boundary] = block
+                self.kernel.task_block = boundaries[record.boundary]
+            else:
+                self.kernel.task_block = stream_block
             op = record.op
             stem = record.label if re.fullmatch(r"[A-Za-z_]\w*", record.label) else "region"
             uid = f"{stem}_{number}"
@@ -599,7 +680,7 @@ class _Actor:
                     self.scalar_values[op.factor],
                 )
             elif isinstance(op, MatmulOp):
-                initialization = _initialize(op, record)
+                initialization = _initialize(op, record, self.pipeline.body.block.args[0])
                 m, k = shape(op.a)
                 n, bk = shape(op.b) if op.transpose_b.data else (shape(op.b)[1], shape(op.b)[0])
                 require(k == bk and shape(op.accumulator) == (m, n), "gemm shapes disagree")
@@ -621,11 +702,11 @@ class _Actor:
                     a, b = self.view(op.a, record), self.view(op.b, record)
                 task(
                     "_mad",
-                    "mad",
+                    "mad_first" if initialization == "first" else "mad",
                     a,
                     b,
                     self.view(op.accumulator, record),
-                    params=(m, n, k, initialization),
+                    params=(m, n, k) if initialization == "first" else (m, n, k, initialization),
                     order_delta=2 if op.a.type.memory.data == "L1" else 0,
                 )
             if isinstance(op, CopyOp):
@@ -648,8 +729,11 @@ class _Actor:
                 explicit = op.a.type.memory.data == "L0A"
                 self.readers[number, 0] = uid + ("_mad" if explicit else "_operand_a")
                 self.readers[number, 1] = uid + ("_mad" if explicit else "_operand_b")
-                if not initialization:
+                if initialization != 1:
                     self.readers[number, 2] = uid + "_mad"
+        for block in boundaries.values():
+            block.add_op(EndOp())
+        self.kernel.task_block = stream_block
         module = self.kernel.finish()
         module.body.block.first_op.attributes["source_schedule"] = ArrayAttr(self.schedule)
         return module
@@ -839,8 +923,6 @@ def lower_source(module, *, symbolic=True):
         "expected one typed source program",
     )
     if program.attributes.get("frontend") == StringAttr("ast"):
-        from xdsl.dialects import scf
-
         for operation in program.walk():
             if isinstance(operation, MatmulOp):
                 require(
@@ -848,7 +930,7 @@ def lower_source(module, *, symbolic=True):
                     "AST matmul requires explicit L0 operands; implicit L1 recipes are legacy",
                 )
             require(
-                not isinstance(operation, (scf.ForOp, scf.IfOp)),
+                not isinstance(operation, scf.ForOp),
                 f"{operation.location}: structured {operation.name} synchronization is not "
                 "implemented; AST control flow is never silently expanded or discarded",
             )
@@ -870,6 +952,10 @@ def lower_source(module, *, symbolic=True):
     )
     allocations = [op for op in program.walk() if isinstance(op, AllocationOp)]
     pipeline = pipelines[0]
+    require(
+        symbolic or not any(isinstance(op, scf.IfOp) for op in pipeline.walk()),
+        "boundary regions require the symbolic compiler; no finite fallback",
+    )
     if program.kind.data == "mixed":
         actors = {
             actor: _Actor(program, pipeline, actor, family, owner, allocations, symbolic)

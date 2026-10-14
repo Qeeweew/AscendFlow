@@ -558,6 +558,8 @@ def _version_index(index, versions):
 
 
 def _predicate(value):
+    if isinstance(value, SSAValue) and value.type == i1:
+        return value
     if type(value) is bool:
         value = _Predicate(int(value), "eq", 1)
     require(isinstance(value, _Predicate), "initialization requires a boolean or task comparison")

@@ -288,10 +288,15 @@ def native_line(task, count, core="0", *, uniform_names=None):
             f"for (int npu_chunk = 0; npu_chunk < {rows // 16}; ++npu_chunk) {{ "
             f"load_cbuf_to_cb({dst}, {src}, 0, {cols // 16}, {rows // 16}, 0, 0, true, inc); }}"
         )
-    if task.native in {"mad", "mad_cycle"}:
-        m, n, k, clear = task.params
+    if task.native in {"mad", "mad_cycle", "mad_first"}:
+        m, n, k = task.params[:3]
+        clear = task.params[3] if task.native != "mad_first" else 0
         flag = (
-            f"(g % {clear} == 0)" if task.native == "mad_cycle" else ("true" if clear else "false")
+            "(g == 0)"
+            if task.native == "mad_first"
+            else f"(g % {clear} == 0)"
+            if task.native == "mad_cycle"
+            else ("true" if clear else "false")
         )
         return f"asc_mmad({p[2]}, {p[0]}, {p[1]}, {m}, {k}, {n}, 0, false, false, {flag});"
     if task.native == "fix":
@@ -438,6 +443,7 @@ def _emit_checked(module, analysis, *, host_launcher=True):
 
     if is_symbolic(module):
         from .loop_codegen import emit_loop
+
         return emit_loop(analysis, host_launcher=host_launcher)
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):

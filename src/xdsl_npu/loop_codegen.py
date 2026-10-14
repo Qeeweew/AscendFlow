@@ -8,6 +8,8 @@ from .scalar import bindings, from_ssa
 
 def _guard(command):
     terms = []
+    if command.last_gap is not None:
+        terms.append(f"g == n - {command.last_gap + 1}")
     if command.lower:
         terms.append(f"g >= {command.lower}")
     if command.upper:

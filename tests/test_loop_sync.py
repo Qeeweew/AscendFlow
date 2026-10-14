@@ -52,6 +52,8 @@ def finite_hardware_dag(loop, sequences, channel_map, count):
                     continue
                 if g % command.period not in command.residues:
                     continue
+                if command.last_gap is not None and g != count - 1 - command.last_gap:
+                    continue
                 pipe = command.task.pipe
                 begin = node(command, g, "begin")
                 end = (
@@ -94,6 +96,8 @@ def finite_hardware_dag(loop, sequences, channel_map, count):
                 issue[pipe] = begin
     for name, channel in channel_map.items():
         for g in range(count - channel.distance):
+            if channel.last and g != count - 1 - channel.distance:
+                continue
             if g % channel.period not in channel.residues:
                 continue
             for actor, _ in channel.sources:

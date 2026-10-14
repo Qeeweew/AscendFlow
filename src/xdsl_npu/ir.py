@@ -204,6 +204,21 @@ class StreamOp(IRDLOperation):
 
 
 @irdl_op_definition
+class BoundaryOp(IRDLOperation):
+    """Conditional native region in its enclosing stream's logical clock.
+
+    kind=last executes only at generation=N-1 with N>0. It is not a drain
+    and cannot certify the completion of any enclosed asynchronous effect.
+    """
+
+    name = "npu.boundary"
+    generation = operand_def(IndexType)
+    kind = attr_def(StringAttr)
+    body = region_def("single_block")
+    traits = traits_def(RecursiveMemoryEffect())
+
+
+@irdl_op_definition
 class RuntimeSizeOp(IRDLOperation):
     """A uniform by-value kernel argument; not a mutable metadata load."""
 
@@ -224,12 +239,14 @@ class LoopChannelOp(IRDLOperation):
     period = attr_def(IntAttr)
     residues = attr_def(ArrayAttr[IntAttr])
     event_ids = attr_def(ArrayAttr[IntAttr])
+    last = opt_attr_def(IntAttr)
     traits = traits_def(AsyncEffects())
 
 
 @irdl_op_definition
 class LoopSyncOp(IRDLOperation):
     name = "npu.loop_sync"
+    last_gap = opt_attr_def(IntAttr)
     generation = operand_def(IndexType)
     action = attr_def(StringAttr)
     channel = attr_def(StringAttr)
@@ -326,6 +343,7 @@ NPU = Dialect(
         BufferOp,
         ViewOp,
         StreamOp,
+        BoundaryOp,
         RuntimeSizeOp,
         LoopChannelOp,
         LoopSyncOp,

@@ -10,7 +10,8 @@ from collections import deque
 from dataclasses import dataclass
 
 from .ir import EndOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
-from .model import require
+from .loop_boundary import stream_operations
+from .model import optional_int, require
 from .periodic import MAX_PERIOD_TEMPLATES, MAX_PROOF_STATES
 
 
@@ -24,6 +25,7 @@ class Channel:
     period: int
     residues: tuple[int, ...]
     ids: tuple[int, ...]
+    last: bool = False
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class Command:
     period: int = 1
     residues: tuple[int, ...] = (0,)
     operation: object = None
+    last_gap: int | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,10 @@ class Node:
     @property
     def upper(self):
         return self.command.upper if self.guard is None else self.guard[1]
+
+    @property
+    def last_gap(self):
+        return self.command.last_gap if self.guard is None else None
 
 
 @dataclass
@@ -161,8 +168,8 @@ class Graph:
                 return self.potentials
         require(False, "symbolic fixed schedule has a completion cycle or non-well-founded carry")
 
-    def domain(self, residue, first, gap):
-        key = residue, first, gap
+    def domain(self, residue, first, gap, terminal=False):
+        key = residue, first, gap, terminal
         if key in self.domains:
             return self.domains[key]
         if self.potentials is None:
@@ -174,6 +181,11 @@ class Graph:
             difference = meta.residue - residue
             lower = -((first + difference - meta.lower) // self.period)
             upper = (gap - meta.upper - difference) // self.period
+            if meta.last_gap is not None:
+                delta = gap - meta.last_gap - difference
+                if not terminal or delta % self.period:
+                    continue
+                lower, upper = max(lower, delta // self.period), min(upper, delta // self.period)
             count += max(0, upper - lower + 1)
             bounds.append((node, lower, upper))
         require(
@@ -213,6 +225,7 @@ class Graph:
         destination_command,
         destination_g,
         minimum=0,
+        prefix=False,
         *,
         omitted=(),
         _shorten=True,
@@ -225,6 +238,27 @@ class Graph:
         residue = destination_g % p
         first += (residue - first) % p
         gap = max(destination_command.upper, source_command.upper + source_g - destination_g)
+        terminal_gaps = [
+            last + shift
+            for last, shift in [
+                (source_command.last_gap, source_g - destination_g),
+                (destination_command.last_gap, 0),
+            ]
+            if last is not None
+        ]
+        terminal = bool(terminal_gaps)
+        if terminal:
+            if len(set(terminal_gaps)) != 1 or terminal_gaps[0] < gap:
+                return ()  # The two endpoint activations have empty intersection.
+            gap = terminal_gaps[0]
+            if self.maximum is not None:
+                actual = self.maximum - gap - 1
+                if actual < first or actual % p != residue:
+                    return ()
+                # Prove the enclosing translation family, not all iterations
+                # from zero to this constant N. `actual` only selects the real
+                # residue; making it the domain's lower bound expands O(N)
+                # history and is unnecessary for this stronger family proof.
         if self.maximum is not None and first + gap >= self.maximum:
             return ()
         if (
@@ -269,14 +303,20 @@ class Graph:
                     current = following
                 if current == destination_g:
                     return path + tuple(tail)
-        source_point = "end" if source_command.kind in {"task", "set", "cross_set"} else "begin"
+        source_point = (
+            "prefix"
+            if prefix
+            else "end"
+            if source_command.kind in {"task", "set", "cross_set"}
+            else "begin"
+        )
         source = self.ids[source_command.index, source_g % p, source_point]
         destination = self.ids[destination_command.index, destination_g % p, "begin"]
         # A Set's observable notification is its asynchronous end; a Wait
         # consumes at begin. Native dependence endpoints follow the same rule.
         if destination_command.kind in {"set", "cross_set"}:
             destination = self.ids[destination_command.index, destination_g % p, "end"]
-        domain = self.domain(residue, first, gap)
+        domain = self.domain(residue, first, gap, terminal)
         initial = domain.index.get((source, source_g // p - destination_g // p))
         target = domain.index.get((destination, 0))
         if initial is None or target is None:
@@ -386,8 +426,25 @@ def channels(loop, *, virtual=False):
             ),
             "event resource assignment missing/invalid",
         )
+        terminal = optional_int(op.last, 0)
+        require(
+            terminal in {0, 1} and (not terminal or op.kind.data == "local"),
+            "terminal protocols currently require one local actor",
+        )
+        require(
+            all(not tasks[endpoint].last or terminal for endpoint in sources + destinations),
+            "a last-only task cannot participate in an unconditional channel",
+        )
         result[name] = Channel(
-            name, op.kind.data, sources, destinations, op.distance.data, period, residues, ids
+            name,
+            op.kind.data,
+            sources,
+            destinations,
+            op.distance.data,
+            period,
+            residues,
+            ids,
+            bool(terminal),
         )
     return result
 
@@ -399,7 +456,11 @@ def commands(loop, channel_map):
     for actor, data in loop.actors.items():
         before, after, pending, previous = {}, {}, [], None
         tasks = {task.uid: task for task in data.program.tasks}
-        for op in data.stream.body.block.ops:
+        parent = None
+        for op, _ in stream_operations(data.stream):
+            if op.parent is not parent:
+                require(not pending, "wait cannot escape its physical boundary region")
+                parent, previous = op.parent, None
             if isinstance(op, TaskOp):
                 before[op.uid.data], pending, previous = pending, [], op.uid.data
             elif isinstance(op, LoopSyncOp):
@@ -422,7 +483,7 @@ def commands(loop, channel_map):
         def add(task, kind, operation=None, *, actor=actor, sequence=sequence):
             nonlocal number
             if operation is None:
-                command = Command(number, actor, task, kind)
+                command = Command(number, actor, task, kind, last_gap=0 if task.last else None)
             else:
                 require(
                     operation.action.data in {"set", "wait", "barrier"},
@@ -448,8 +509,22 @@ def commands(loop, channel_map):
                     period,
                     residues,
                     operation,
+                    optional_int(operation.last_gap, 0)
+                    if operation.last_gap is not None
+                    else 0
+                    if task.last
+                    else None,
                 )
-                require(command.lower >= 0 and command.upper >= 0, "negative sync activation bound")
+                require(
+                    command.lower >= 0
+                    and command.upper >= 0
+                    and (command.last_gap is None or command.last_gap >= 0),
+                    "negative sync activation bound",
+                )
+                require(
+                    not task.last or command.last_gap == 0,
+                    "sync activation disagrees with its last-only enclosing task",
+                )
                 if kind == "barrier":
                     require(
                         command.channel == "" and command.upper == 0,
@@ -458,6 +533,13 @@ def commands(loop, channel_map):
                 else:
                     require(command.channel in channel_map, "sync refers to unknown channel")
                     channel = channel_map[command.channel]
+                    expected_gap = (
+                        (channel.distance if kind.endswith("set") else 0) if channel.last else None
+                    )
+                    require(
+                        command.last_gap == expected_gap,
+                        "Set/Wait terminal activation does not match its channel",
+                    )
                     if kind.endswith("set"):
                         require(
                             (actor, task.uid) in channel.sources
@@ -593,7 +675,7 @@ def completion_graph(loop, channel_map):
                 or (previous_command.kind in {"task", "wait"} and previous_command.task.pipe == "S")
             ):
                 graph.edge(previous_end, milestones["issue"])
-            old, old_milestones, old_begin, old_end, _ = prior_pipe[pipe]
+            old, old_milestones, old_begin, old_end, old_prefix = prior_pipe[pipe]
             for point in ("queue", "retire", "implicit"):
                 graph.edge(old_milestones[point], milestones[point])
             if old_begin is not None:
@@ -601,6 +683,7 @@ def completion_graph(loop, channel_map):
                 graph.edge(old_begin, milestones["queue"])
             if old.kind == "task" and old_end is not None:
                 graph.edge(old_end, milestones["retire"])
+                graph.edge(old_prefix, milestones["retire"])
                 if old.task.implicit_completion:
                     graph.edge(old_end, milestones["implicit"])
             if begin is not None:

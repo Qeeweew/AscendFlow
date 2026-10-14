@@ -26,6 +26,7 @@ from .ir import (
     TaskOp,
     ViewOp,
 )
+from .loop_boundary import stream_operations
 from .model import (
     CAPACITY,
     ITEMSIZE,
@@ -103,6 +104,8 @@ class Dependence:
     storage: str
     start: int
     stop: int
+    last: bool = False
+    prefix: bool = False
 
 
 def is_symbolic(module):
@@ -209,7 +212,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
         )
     views, tasks, operations = {}, [], {}
     scalar_values = {}
-    for op in stream.body.block.ops:
+    for op, last in stream_operations(stream):
         if isinstance(op, ViewOp):
             require(op.generation is stream.body.block.args[0], "view uses a different task clock")
             require(op.source in declarations or op.source in views, "unknown view provenance")
@@ -379,16 +382,32 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
                 issue_order=optional_int(op.issue_order, len(tasks)),
                 logical_phase=optional_int(op.logical_phase, 0),
                 scalar_source=scalar_source,
+                last=last,
             )
             require(0 <= task.issue_order <= 65535, "issue rank outside supported range")
             if scalar_source is not None:
                 provider = next(item for item in tasks if item.uid == scalar_source)
                 require(
-                    provider.stage == task.stage
+                    provider.last == task.last
+                    and provider.stage == task.stage
                     and (provider.issue_order, tasks.index(provider))
                     < (task.issue_order, len(tasks)),
                     "Scalar capture must precede consumption in the same physical step; "
                     "delayed captures require explicit versioned storage",
+                )
+            require(
+                not (last and task.native == "mad_first"),
+                "terminal-only MAD cannot initialize a recurrence",
+            )
+            if last:
+                require(
+                    not isinstance(kernel.parent_op(), MixedOp),
+                    "mixed boundary protocols need collective region analysis",
+                )
+            else:
+                require(
+                    not any(t.last for t in tasks),
+                    "last regions must form a terminal logical effect suffix",
                 )
             tasks.append(task)
             operations[uid] = op
@@ -842,14 +861,18 @@ def loop_dependencies(loop):
                 )
     edges = {}
 
-    def edge(source, destination, hazard, root, lo, hi):
+    task_map = {
+        (actor, t.uid): t for actor, data in loop.actors.items() for t in data.program.tasks
+    }
+
+    def edge(source, destination, hazard, root, lo, hi, terminal=False, prefix=False):
         if source is None or source == destination:
             return
         sg, sa, su = source
         dg, da, du = destination
         distance = dg - sg
         require(distance >= 0, "logical effect order is inconsistent")
-        key = (sa, su, da, du, distance, hazard, root, lo, hi)
+        key = (sa, su, da, du, distance, hazard, root, lo, hi, terminal, prefix)
         edges.setdefault(key, set()).add(dg)
 
     for root, work in cells.items():
@@ -873,40 +896,101 @@ def loop_dependencies(loop):
             if not cell_events:
                 continue
             initialized = cell_events[-1][3]
-            events = [(event, read, write) for event, read, write, _ in cell_events]
-            writes = [i for i, (_, _, write) in enumerate(events) if write]
-            last = writes[-1] if writes else None
-            if root in loop.frames:
-                last = None
-            writer = None if last is None else (events[last][0][0] - period, *events[last][0][1:])
+            steady = [
+                (event, read, write)
+                for event, read, write, _ in cell_events
+                if not task_map[event[1:]].last
+            ]
+            terminal = [
+                (event, read, write)
+                for event, read, write, _ in cell_events
+                if task_map[event[1:]].last
+            ]
+            writes = [i for i, (_, _, write) in enumerate(steady) if write]
+            last = writes[-1] if writes and root not in loop.frames else None
+            writer = None if last is None else (steady[last][0][0] - period, *steady[last][0][1:])
             pending = (
                 []
                 if last is None
                 else [
                     (event[0][0] - period, *event[0][1:])
-                    for event in events[last + 1 :]
+                    for event in steady[last + 1 :]
                     if event[1]
                 ]
             )
-            previous_generation = None
-            for destination, read, write in events:
-                g = destination[0]
-                if root in loop.frames and g != previous_generation:
-                    writer, pending = None, []
-                previous_generation = g
-                active_first = loop.constant_count is None or g < loop.constant_count
-                if read:
-                    require(
-                        initialized or not active_first or (writer is not None and writer[0] >= 0),
-                        f"{destination[1]}/{destination[2]} has an undefined first read on {root}[{lo}:{hi}]",
+            unbounded_readers = not writes and root not in loop.frames
+            if unbounded_readers:
+                pending = [(event[0] - period, *event[1:]) for event, read, _ in steady if read]
+
+            def visit(
+                events,
+                writer,
+                pending,
+                *,
+                terminal=False,
+                root=root,
+                period=period,
+                initialized=initialized,
+                lo=lo,
+                hi=hi,
+                unbounded_readers=unbounded_readers,
+            ):
+                for destination, read, write in events:
+                    g, actor, uid = destination
+                    task = task_map[actor, uid]
+                    first_clear = (
+                        task.native == "mad_first"
+                        and g == 0
+                        and root == loop.root(actor, task.refs[2])
                     )
-                    edge(writer, destination, "RAW", root, lo, hi)
-                    pending.append(destination)
-                if write:
-                    edge(writer, destination, "WAW", root, lo, hi)
-                    for reader in pending:
-                        edge(reader, destination, "WAR", root, lo, hi)
-                    writer, pending = destination, []
+                    active = loop.constant_count is None or g < loop.constant_count
+                    shift = 0
+                    if terminal and loop.constant_count is not None:
+                        active = loop.constant_count > 0 and (loop.constant_count - 1) % period == g
+                        shift = loop.constant_count - 1 - g
+                    if read:
+                        require(
+                            initialized
+                            or first_clear
+                            or not active
+                            or (writer is not None and writer[0] + shift >= 0),
+                            f"{actor}/{uid} has an undefined {'terminal' if terminal else 'first'} read on {root}[{lo}:{hi}]",
+                        )
+                        edge(writer, destination, "RAW", root, lo, hi, terminal)
+                        pending.append(destination)
+                    if write:
+                        edge(writer, destination, "WAW", root, lo, hi, terminal)
+                        # A cell read throughout the stream but written only
+                        # at its end has no finite last-writer window. Prove
+                        # cumulative retirement of each reader family; an
+                        # individual latest read need not retire earlier DMA.
+                        frontier = pending
+                        if terminal and unbounded_readers:
+                            latest = {}
+                            for reader in pending:
+                                latest[reader[1:]] = max(reader, latest.get(reader[1:], reader))
+                            frontier = latest.values()
+                        for reader in frontier:
+                            prefix = (
+                                terminal and unbounded_readers and not task_map[reader[1:]].last
+                            )
+                            edge(reader, destination, "WAR", root, lo, hi, terminal, prefix)
+                        writer, pending = destination, []
+                return writer, pending
+
+            # Boundary effects run on a copy of the actual frontier, then are
+            # discarded. They must never shadow a steady writer/reader in the
+            # next iteration of the periodic proof.
+            by_generation, tails = {}, {}
+            for event in steady:
+                by_generation.setdefault(event[0][0], []).append(event)
+            for event in terminal:
+                tails.setdefault(event[0][0], []).append(event)
+            for g in sorted(by_generation.keys() | tails.keys()):
+                if root in loop.frames:
+                    writer, pending = None, []
+                writer, pending = visit(by_generation.get(g, ()), writer, pending)
+                visit(tails.get(g, ()), writer, list(pending), terminal=True)
     return tuple(
         Dependence(
             (sa, su),
@@ -918,8 +1002,12 @@ def loop_dependencies(loop):
             root,
             lo,
             hi,
+            terminal,
+            prefix,
         )
-        for (sa, su, da, du, distance, hazard, root, lo, hi), residues in sorted(edges.items())
+        for (sa, su, da, du, distance, hazard, root, lo, hi, terminal, prefix), residues in sorted(
+            edges.items()
+        )
     )
 
 

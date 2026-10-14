@@ -43,18 +43,33 @@ def runtime_work(module, arguments):
     for actor, data in loop.actors.items():
         _, peaks[actor] = storage_layout(data.program.storages)
         for task in data.program.tasks:
-            instances = count * loop.groups
+            iterations = min(count, 1) if task.last else count
+            instances = iterations * loop.groups
             calls[task.native] += instances
             amounts = []
-            for ref, mode in zip(task.refs, task.modes):
+            for index, (ref, mode) in enumerate(zip(task.refs, task.modes)):
                 amount = (
-                    count * ref.total_nbytes
+                    iterations * ref.total_nbytes
                     if ref.prefix_extent is None
-                    else ref.prefix_extent.evaluate(arguments) * ITEMSIZE[ref.dtype]
+                    else (
+                        max(
+                            0,
+                            ref.prefix_extent.evaluate(arguments)
+                            - max(0, count - 1) * ref.prefix_elements,
+                        )
+                        if task.last
+                        else ref.prefix_extent.evaluate(arguments)
+                    )
+                    * ITEMSIZE[ref.dtype]
                 ) * loop.groups
                 amounts.append(amount)
                 for access in mode:
-                    memory[f"{task.pipe}:{ref.storage.bank}:{access}"] += amount
+                    skipped = (
+                        ref.total_nbytes * loop.groups
+                        if (count and task.native == "mad_first" and index == 2 and access == "R")
+                        else 0
+                    )
+                    memory[f"{task.pipe}:{ref.storage.bank}:{access}"] += amount - skipped
             if task.pipe == "V":
                 vectors[task.native] += max(
                     amount // ITEMSIZE[ref.dtype] for amount, ref in zip(amounts, task.refs)
@@ -67,14 +82,18 @@ def runtime_work(module, arguments):
             if command.kind == "task":
                 continue
             start, end = command.lower, count - command.upper
-            active = (
-                sum(
-                    max(0, (end - 1 - r) // command.period - (start - 1 - r) // command.period)
-                    for r in command.residues
+            if command.last_gap is not None:
+                g = count - 1 - command.last_gap
+                active = int(start <= g < end and g % command.period in command.residues)
+            else:
+                active = (
+                    sum(
+                        max(0, (end - 1 - r) // command.period - (start - 1 - r) // command.period)
+                        for r in command.residues
+                    )
+                    if end > start
+                    else 0
                 )
-                if end > start
-                else 0
-            )
             syncs[f"{command.kind}:{command.task.pipe}"] += active * loop.groups
     footprint = sum(
         root.nbytes.data
@@ -257,7 +276,7 @@ def physical_work(plan, *, useful_cube_flops=None):
                 task = program.tasks[inst.task]
                 native_instances += groups
                 lengths = [r.length(inst.generation) * r.rows for r in task.refs]
-                if task.native in {"mad", "mad_cycle", "mad16"}:
+                if task.native in {"mad", "mad_cycle", "mad_first", "mad16"}:
                     m, n, k = task.params[:3] if task.native != "mad16" else (16, 16, 16)
                     cube_flops += groups * 2 * m * n * k
                 if task.pipe in {"MTE1", "MTE2", "MTE3", "FIX"}:

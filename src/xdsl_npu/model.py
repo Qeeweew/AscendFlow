@@ -190,6 +190,7 @@ class Task:
     phase: int = 0
     logical_phase: int = 0
     phase_width: int = 1
+    last: bool = False
 
     def active(self, g):
         return (
@@ -198,6 +199,8 @@ class Task:
         )
 
     def modes_for(self, g):
+        if self.native == "mad_first":
+            return ("R", "R", "W" if g == 0 else "RW")
         if self.native == "mad_cycle":
             return ("R", "R", "W" if g % self.params[3] == 0 else "RW")
         return self.modes
@@ -686,12 +689,19 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "Load2D requires complete compact fractals and a legal repeat count",
         )
         return "MTE1", ("R", "W")
-    if native in {"mad", "mad_cycle"}:
-        require(len(params) == 4, "MAD requires (M,N,K,clear or periodic-clear extent)")
-        m, n, k, clear = params
+    if native in {"mad", "mad_cycle", "mad_first"}:
+        require(
+            len(params) == (3 if native == "mad_first" else 4),
+            "MAD requires exact dimensions and initialization policy",
+        )
+        m, n, k = params[:3]
+        clear = params[3] if native != "mad_first" else 0
         require(
             all(16 <= dim <= 256 and dim % 16 == 0 for dim in (m, n, k))
-            and (clear in {0, 1} if native == "mad" else 1 <= clear <= MAX_INSTANCES)
+            and (
+                native == "mad_first"
+                or (clear in {0, 1} if native == "mad" else 1 <= clear <= MAX_INSTANCES)
+            )
             and banks == ("L0A", "L0B", "L0C")
             and dtypes[0] == dtypes[1] in {"f16", "bf16"}
             and dtypes[2] == "f32"

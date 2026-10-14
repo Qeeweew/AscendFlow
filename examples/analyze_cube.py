@@ -14,6 +14,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profiles", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--reduction", action="store_true", help="runtime K panels and one terminal output"
+    )
     args = parser.parse_args()
     trials = {"generated": [], "ascendc": []}
     identity = None
@@ -35,8 +38,8 @@ def main():
         )
         contract = (
             device["policy"],
-            case["input_a_shape"],
-            case["input_b_shape"],
+            case["effective_gemm_shape"] if args.reduction else case["input_a_shape"],
+            device["scope"] if args.reduction else case["input_b_shape"],
             case["input_sha256"],
             case["output_sha256"],
             case["warmup"],
@@ -81,12 +84,19 @@ def main():
     )
     medians = {v: median(t["p50_us"] for t in ts) for v, ts in trials.items()}
     policy, requested = device["policy"], case["requested_work"]
-    products = case["tiles_per_group"] * policy["GROUPS"]
-    mads = products * (2 if policy["ACCUMULATE"] else 1)
+    count_key = "panels" if args.reduction else "tiles_per_group"
+    products = case[count_key] * policy["GROUPS"]
+    mads = products if args.reduction else products * (2 if policy["ACCUMULATE"] else 1)
     require(
-        requested["native_invocations"]["mad"] == mads, "physical MAD count differs from policy"
+        requested["native_invocations"]["mad_first" if args.reduction else "mad"] == mads,
+        "physical MAD count differs from policy",
     )
-    flops = 2 * mads * policy["M"] * policy["N"] * policy["K"]
+    if args.reduction:
+        require(
+            requested["native_invocations"]["fix"] == policy["GROUPS"],
+            "terminal output count differs",
+        )
+    flops = 2 * mads * policy["M"] * policy["N"] * policy["BK" if args.reduction else "K"]
     gm = sum(
         value
         for key, value in requested["memory_requested_bytes_by_pipe_bank_mode"].items()
@@ -102,7 +112,8 @@ def main():
     theory = theoretical_metrics(work, device["hardware"], medians["generated"])
     result = {
         "policy": policy,
-        "tiles_per_group": case["tiles_per_group"],
+        count_key: case[count_key],
+        "kind": "panel_reduction" if args.reduction else "native_batch",
         "hardware": device["hardware"],
         "trials": trials,
         "median_of_run_medians_us": medians,

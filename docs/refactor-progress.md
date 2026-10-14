@@ -1,5 +1,20 @@
 # 重构的验证记录
 
+## R2 第三个切片：运行时 K 与保留的末代区域
+
+在 `f951390` 基础上，新增 `mad_first`、保留的 `npu.boundary last`、末代事件
+激活与累计读取退休前缀。L1/L0/C各自释放；末代只导出一次，零次保留输出。
+最终相关回归221项通过（68.63秒），ruff与产品仓库diff检查通过。详见
+[运行时 K 归约](runtime-reduction.md)，外层证据在 `runs/refactor/dynamic-k/`。
+
+NT/f16、NN/bf16均通过CANN离线/shared编译与设备逐元素验证，panels从0到4096。
+默认960 MiB输入固定配置，生成/AscendC设备p50中位数1449.822/1450.510 µs；
+五次独立冷编译p50=0.2423秒、max=0.2434秒、RSS37652 KiB，最终ASC与profiling
+产物源码hash一致。该性能只证明所选配置保真，没有宣称完整GEMM/FA竞争力。
+
+这仍是一个单层K流。父query/output循环、多运行时存储轴、跨调用生命周期、
+分层摘要以及R3/R4真实FA迁移未完成。末代区域也不等于一般分支支持。
+
 ## R2 第二个切片：显式L0、完整fractal平面和Cube设备闭环
 
 在 `42bd394` 上增加 `alloc_l0a/b`、显式 `copy → matmul`，AST不再借用隐式

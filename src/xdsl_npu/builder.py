@@ -116,7 +116,7 @@ class Kernel:
         assert self.task_block is not None
         typ = source.type
         op = ViewOp.create(
-            operands=[source, self.task_block.args[0]]
+            operands=[source, self.stream.body.block.args[0]]
             + ([] if extent_count is None else [extent_count]),
             result_types=[
                 ref_type(typ.bank.data, dtype or typ.dtype.data, layout or typ.layout.data)
