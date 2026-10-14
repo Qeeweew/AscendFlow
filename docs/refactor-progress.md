@@ -1,5 +1,20 @@
 # 重构的验证记录
 
+## 方案再审：以be957e8保存点为实现基线
+
+按当前请求重写[设计](design.md)、[DSL规格](dsl-multistage.md)和
+[实施计划](refactor-plan.md)。保留P0–P5工作标识，提前P3a的runtime商余/不同代次
+检验；明确统一actor绑定与region入口、组合event寿命、宏的可审查展开、首编
+复杂度和大例性能三项验收。没有把重写方案或旧FA设备记录当作新路径完成。
+
+接手的实现已单独保存为`be957e8`。本次复核sequence/访问组合51项测试通过
+（4.49秒），Ruff通过；state_sum、hierarchical_gemm、reduction_gemm重新生成
+的ASC均匹配已有设备产物hash，核对文件为外层
+`runs/refactor/state-sum/review-source-checks.json`。未重跑设备，未恢复算子调参。
+文档本地链接、四个Python片段与shell片段检查通过；DSL规格的完整scale例
+实际编译到ASC，记录在外层`runs/refactor/design-review/checks.json`。核心源码树
+hash仍与state_sum冷编译/设备记录匹配，根目录没有Git。
+
 ## 根部顺序区域闭环：7771289之后的实现检查点
 
 [state_sum](../examples/ast_state_sum.py)接通AST→物理once/stream→自动同步和

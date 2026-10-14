@@ -80,7 +80,7 @@ QK内层保留4stage load/operand/MAD/FIX；PV保留3stage累加子流水，循�
 | Pipelined内嵌Pipelined及内外两个generation | P2层次CV |
 | first/last合流、NEG_INF fill、UB bitwise copy | P1边界/P2原语 |
 | maximum、packed reduce、带显式scratch的row broadcast | P2通用typed lowering |
-| runtime商余和延迟query/head/kv descriptor | P3规则连续流 |
+| runtime商余和延迟query/head/kv descriptor | P3a先验证关系/规模，P3b接完整FA |
 | GM完整贡献、双AIV quorum、各MTE2最后读与event寿命 | P2/P3同步/资源及最终检查 |
 | 大规模独立AscendC/ACLNN/profiling对照 | P0固定reference、P2/P3设备验收 |
 
@@ -89,8 +89,9 @@ QK内层保留4stage load/operand/MAD/FIX；PV保留3stage累加子流水，循�
 解决一个诊断后还要检查整个表，不应通过缩小任务域或隐藏调用跳过其他缺口。
 
 **P0尚未全部完成**：目标源码/激活/声明资源已固定，独立同policy AscendC源码及
-数值对照仍需落地；没有新的CANN或设备结果。P1访问组合的独立分析可同步开发，
-但其完成关系/代码生成还需接通，见[区域组合](region-sequence.md)。
+数值对照仍需落地；没有新AST FA的CANN或设备结果。P1已接通根部local顺序区域
+的同步、代码生成和设备例，但父体组合及本fixture所需mixed层次仍缺，见
+[区域组合](region-sequence.md)。最新实施次序以[重构方案](refactor-plan.md)为准。
 
 复现源码和有限派发表（不启动设备，也不宣称编译FA）：
 

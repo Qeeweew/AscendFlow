@@ -20,8 +20,8 @@ generation和自己的固定count（若有）。不同调用即使复用同一�
 
 当前接受：stationary精确字节范围、一个共同runtime bound和固定count的
 叶区域。实际effects证明只读的漂移GM允许共享；跨region漂移写、不同runtime
-bound及mixed摘要继续拒绝。没有
-推广为任意深度区域闭包，也没有把用户自带摘要注册为可信契约。生产checker
+bound及mixed摘要继续拒绝。没有推广为任意深度区域闭包，也没有把用户自带
+摘要注册为可信契约。生产checker
 从最终物理IR重建所有输入，不能信任planner的已验证标记。
 
 共同bound必须引用同一个实际SSA值。两个分别捕获的参数即使都打印为`n`、
