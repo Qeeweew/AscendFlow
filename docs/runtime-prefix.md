@@ -93,10 +93,10 @@ native 模板使用独立 `Templates` 表示，已移除假定 `Program(count=0)
 检查全部卡后，显式选择健康空闲物理卡；此次为卡1映射逻辑0：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_prefix.py --output runs/refactor/ast-prefix-device --library runs/refactor/ast-prefix-final/scale_prefix.so --physical 1
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_prefix.py --output runs/refactor/r1-prefix-exact-gates --library runs/refactor/ast-prefix-final/scale_prefix.so --physical 1
 ```
 
-同一 binary 的14组测试，最大16,777,224个处理元素，每组5次，误差0，输出
+同一 binary 的最新17组测试，包含精确0/1/2/4/4096/65536 tiles，最大16,777,224个处理元素，每组5次，误差0，输出
 未处理后缀和 guard 不变；6种非法调用在 host 返回 -1。CANN9.1/dav-2201
 离线及 shared 编译成功。运行数据、before/after IR、最终 ASC、工具链选项和
 hash 均在上述外层目录。此次不记录设备吞吐率，不据此宣称算子性能达标。

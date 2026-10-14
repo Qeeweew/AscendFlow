@@ -98,6 +98,9 @@ def emit_loop(analysis, *, host_launcher=True):
                 "  asc_sync_wait(PIPE_S, PIPE_FIX, event_t(0));",
             ]
         maximum = max(task.stage for task in data.program.tasks)
+        for task in data.program.tasks:
+            if task.native == "scalar_load":
+                lines.append(f"  float npu_value_{task.uid} = 0.0f;")
         lines.append(f"  for (int64_t step = 0; step < n + {maximum}; ++step) {{")
         for command in sequences[actor]:
             task = command.task

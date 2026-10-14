@@ -1,5 +1,14 @@
 # 首轮源码依据
 
+后续 R1 AST normalization 的新增依据：安装9.1.0的
+`asc/impl/c_api/instr_impl/npu_arch_2201/vector_compute_impl/asc_repeat_reduce_sum_impl.h`
+以 count mode 调用 `vcadd`；AscendC `ReduceRepeat<ReduceType::SUM>` 在2201路径
+调用 WholeReduceSumImpl。`kernel_tensor_impl.h:135–195` 的 f32 GetValue 为
+Scalar 读取。独立参考以公开 AscendC API 和手排 flags 编写，没有从 PlanIR
+复制生成代码。ops-nn HEAD 仍为下表版本，`rms_norm_merge_n.h:256–265` 保持
+Sqrt/Duplicate/Div 数值顺序。具体条件、profiling 和局限见
+[AST normalization](ast-normalization.md)。
+
 2026-10-13 在新工作区读取 AGENTS、三份工作区设计/审计报告、910B compiler/
 InsertSync 文档、FA 910B 文档和 materials manifest。开始时 compiler 不存在，
 外层 src/tests/examples 只有 .gitkeep，已保留；未创建外层 Git。

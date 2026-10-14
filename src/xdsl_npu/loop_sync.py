@@ -201,6 +201,18 @@ def verify_loop(module, *, _details=False):
     graph, sequence, endpoints, native = completion_graph(loop, channel_map)
     stride, potential = graph.potential()
     queries = _coverage(loop, obligations, graph, native)
+    scalar_queries = 0
+    for actor, data in loop.actors.items():
+        for task in data.program.tasks:
+            if task.scalar_source is None:
+                continue
+            source, destination = native[actor, task.scalar_source], native[actor, task.uid]
+            for residue in range(loop.period):
+                require(
+                    graph.path(source, residue, destination, residue) is not None,
+                    "Scalar value lacks an actual capture-to-dispatch completion path",
+                )
+                scalar_queries += 1
     banks, cross_ids, lifetime_queries = _lifetime(loop, channel_map, graph, endpoints)
     report = {
         "kernel": loop.op.sym_name.data,
@@ -218,6 +230,7 @@ def verify_loop(module, *, _details=False):
         "completion_node_families": len(graph.nodes),
         "completion_arc_families": len(graph.edges),
         "coverage_queries": queries,
+        "scalar_capture_queries": scalar_queries,
         "binary_lifetime_queries": lifetime_queries,
         "channels": len(channel_map),
         "event_ids": {":".join(key): sorted(values) for key, values in banks.items()},

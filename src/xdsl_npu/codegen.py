@@ -91,7 +91,7 @@ def native_line(task, count, core="0", *, uniform_names=None):
         )
     if task.native in {"add", "mul", "sub", "div", "max"}:
         return f"asc_{task.native}({p[2]}, {p[0]}, {p[1]}, uint32_t({length(refs[0], 4)}));"
-    if task.native in {"exp", "rsqrt"}:
+    if task.native in {"exp", "rsqrt", "sqrt"}:
         return f"asc_{task.native}({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
     if task.native == "scalar_load":
         source = pointer(refs[0], core=core).replace("__ubuf__ float*", "__ubuf__ volatile float*")

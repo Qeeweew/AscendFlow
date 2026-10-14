@@ -20,13 +20,97 @@ from .model import ITEMSIZE, require, storage_layout
 from .toolchain import CANN
 
 
-def profile_evidence(profile, summary, *, physical, warmup, repeats, kernel):
+def runtime_work(module, arguments):
+    """Count a verified loop invocation without enumerating runtime N.
+
+    After final verification, counting visits refs and command residue sets.
+    Verification retains its own graph/search cost; this is not a bound for it.
+    These are instruction-requested bytes/elements, not HBM traffic or FLOPs.
+    The caller records actual kernel timings and hardware rate assumptions.
+    """
+    from .loop_sync import verify_loop
+    from .scalar import from_ssa
+
+    _, (loop, _, sequences, _, _) = verify_loop(module, _details=True)
+    require(
+        set(arguments) == {size.sym_name.data for size in loop.parameters}
+        and all(type(value) is int and value >= 0 for value in arguments.values()),
+        "runtime accounting needs every nonnegative integer scalar argument",
+    )
+    count = loop.constant_count if loop.bound is None else loop.bound.evaluate(arguments)
+    calls, vectors, memory, transfers, syncs = Counter(), Counter(), Counter(), Counter(), Counter()
+    peaks = {}
+    for actor, data in loop.actors.items():
+        _, peaks[actor] = storage_layout(data.program.storages)
+        for task in data.program.tasks:
+            instances = count * loop.groups
+            calls[task.native] += instances
+            amounts = []
+            for ref, mode in zip(task.refs, task.modes):
+                amount = (
+                    count * ref.total_nbytes
+                    if ref.prefix_extent is None
+                    else ref.prefix_extent.evaluate(arguments) * ITEMSIZE[ref.dtype]
+                ) * loop.groups
+                amounts.append(amount)
+                for access in mode:
+                    memory[f"{task.pipe}:{ref.storage.bank}:{access}"] += amount
+            if task.pipe == "V":
+                vectors[task.native] += max(
+                    amount // ITEMSIZE[ref.dtype] for amount, ref in zip(amounts, task.refs)
+                )
+            if task.pipe in {"MTE1", "MTE2", "MTE3", "FIX"}:
+                transfers[f"{task.refs[0].storage.bank}->{task.refs[-1].storage.bank}"] += amounts[
+                    0
+                ]
+        for command in sequences[actor]:
+            if command.kind == "task":
+                continue
+            start, end = command.lower, count - command.upper
+            active = (
+                sum(
+                    max(0, (end - 1 - r) // command.period - (start - 1 - r) // command.period)
+                    for r in command.residues
+                )
+                if end > start
+                else 0
+            )
+            syncs[f"{command.kind}:{command.task.pipe}"] += active * loop.groups
+    footprint = sum(
+        root.nbytes.data
+        if root.extent_count is None
+        else from_ssa(root.extent_count).evaluate(arguments) * root.count_scale.data
+        for root in loop.roots.values()
+    )
+    return {
+        "arguments": arguments,
+        "tasks_per_group": count,
+        "groups": loop.groups,
+        "native_invocations": dict(calls),
+        "vector_requested_elements": dict(vectors),
+        "memory_requested_bytes_by_pipe_bank_mode": dict(memory),
+        "transfer_requested_bytes": dict(transfers),
+        "sync_invocations": dict(syncs),
+        "terminal_drains": len(loop.actors) * loop.groups,
+        "initial_fix_handshakes": sum(data.program.config for data in loop.actors.values())
+        * loop.groups,
+        "local_peak_bytes_per_actor": peaks,
+        "declared_gm_working_set_bytes": footprint,
+        "scope": "instruction-requested footprints; not HBM transactions, measured bandwidth, or hardware FLOP peak",
+    }
+
+
+def profile_evidence(profile, summary, *, physical, warmup, repeats, kernel, task_type="MIX_AIC"):
     """Bind measured counters/clocks to the exact single-kernel timing CSV.
 
     The pipe ratios overlap; they are activity counters, not mutually
     exclusive time fractions or a direct attribution of wait latency.
     FreqParse records are samples, not a frequency trace for every cycle.
     """
+    require(
+        task_type in {"AI_CORE", "AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV"},
+        "counter accounting requires a supported NPU task type",
+    )
     profile = Path(profile).resolve()
     source = Path(summary["csv"]).resolve()
     require(source.is_relative_to(profile), "timing CSV is outside its profiling run")
@@ -43,11 +127,11 @@ def profile_evidence(profile, summary, *, physical, warmup, repeats, kernel):
         len(rows) == warmup + repeats
         and all(
             row["Op Name"] == kernel
-            and row["Task Type"] == "MIX_AIC"
+            and row["Task Type"] == task_type
             and int(row["Device_id"]) == physical
             for row in rows
         ),
-        "counter accounting requires one generated mixed task per launch",
+        "counter accounting requires one matching device task per launch",
     )
     measured = rows[warmup:]
     durations = [float(row["Task Duration(us)"]) for row in measured]

@@ -355,6 +355,7 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
         "max",
         "exp",
         "rsqrt",
+        "sqrt",
         "scale_value",
         "sub_value",
     }:

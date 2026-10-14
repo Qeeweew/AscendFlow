@@ -13,6 +13,11 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 [ast_prefix.py](examples/ast_prefix.py)；实际同步、拒绝条件和设备命令见
 [运行时尾部](docs/runtime-prefix.md)。
 
+归约、Scalar 最后读取及专家派发顺序已在
+[normalization 示例](examples/ast_normalize.py)接通；其独立 AscendC 对照、
+8192×4096设备 profiling 和硬件工作量分析见[验证记录](docs/ast-normalization.md)。
+前端已有整数/布尔 SSA 合流与循环携带值，一般结构化控制的物理同步仍待实现。
+
 当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
 源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
 实际同步。软件 stage、buffer versions 和硬件 event 资源各自独立。

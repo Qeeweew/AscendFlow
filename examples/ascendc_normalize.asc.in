@@ -1,0 +1,75 @@
+// Independent AscendC reference, fixed schedule and FP32 numerical contract.
+// No compiler PlanIR, AutoSync output, or operator-specific compiler adapter.
+#include "kernel_operator.h"
+#include <cstdint>
+using namespace AscendC;
+
+extern "C" __global__ __vector__ void normalize_reference(
+    __gm__ uint8_t* X, __gm__ uint8_t* Y, int64_t rows) {
+  constexpr uint32_t D = @D@;
+  constexpr uint32_t P = D / 64;
+  constexpr uint32_t PAD_P = (P + 7) / 8 * 8;
+  set_ctrl(get_ctrl() | (uint64_t(1) << 48));
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> storage;
+  pipe.InitBuffer(storage, (4 * D + PAD_P + 16) * sizeof(float));
+  auto local = storage.Get<float>();
+  auto partial = local[4 * D];
+  auto statistic = local[4 * D + PAD_P];
+  auto one = local[4 * D + PAD_P + 8];
+  GlobalTensor<float> input, output;
+  input.SetGlobalBuffer((__gm__ float*)X);
+  output.SetGlobalBuffer((__gm__ float*)Y);
+  const int64_t base = int64_t(GetBlockIdx()) * rows * D;
+  for (int64_t step = 0; step < rows + 2; ++step) {
+    // Issue old store before a current Scalar wait can gate dispatch.
+    if (step >= 2 && step - 2 < rows) {
+      const int64_t g = step - 2;
+      const auto id = event_t(g % 2);
+      WaitFlag<HardEvent::V_MTE3>(id);
+      DataCopy(output[base + g * D], local[2 * D + (g % 2) * D], D);
+      if (g + 2 < rows) SetFlag<HardEvent::MTE3_V>(id);
+    }
+    if (step < rows) {
+      const auto id = event_t(step % 2);
+      if (step >= 2) WaitFlag<HardEvent::V_MTE2>(id);
+      DataCopy(local[(step % 2) * D], input[base + step * D], D);
+      SetFlag<HardEvent::MTE2_V>(id);
+    }
+    if (step >= 1 && step - 1 < rows) {
+      const int64_t g = step - 1;
+      const auto id = event_t(g % 2);
+      auto x = local[(g % 2) * D];
+      auto work = local[2 * D + (g % 2) * D];
+      WaitFlag<HardEvent::MTE2_V>(id);
+      if (g >= 2) WaitFlag<HardEvent::MTE3_V>(id);
+      Mul(work, x, x, D);
+      PipeBarrier<PIPE_V>();
+      ReduceRepeat<ReduceType::SUM>(partial, work, 64, P, 1, 1, 8);
+      PipeBarrier<PIPE_V>();
+      ReduceRepeat<ReduceType::SUM>(statistic, partial, P, 1, 1, 1, 8);
+      PipeBarrier<PIPE_V>();
+      Muls(statistic, statistic, float(1.0f / D), 1);
+      PipeBarrier<PIPE_V>();
+      Adds(statistic, statistic, float(@EPS@), 1);
+      PipeBarrier<PIPE_V>();
+      Sqrt(statistic, statistic, 1);
+      Duplicate(one, 1.0f, 1);
+      PipeBarrier<PIPE_V>();
+      Div(statistic, one, statistic, 1);
+      SetFlag<HardEvent::V_S>(event_t(0));
+      WaitFlag<HardEvent::V_S>(event_t(0));
+      float inverse = statistic.GetValue(0);
+      Muls(work, x, inverse, D);
+      if (g + 2 < rows) SetFlag<HardEvent::V_MTE2>(id);
+      SetFlag<HardEvent::V_MTE3>(id);
+    }
+  }
+  PipeBarrier<PIPE_ALL>();
+}
+
+extern "C" int launch_normalize_reference(void* stream, void* X, void* Y, int64_t rows) {
+  if (rows < 0 || rows > (INT64_MAX - 64) / (@GROUPS@ * @D@ * 4)) return -1;
+  normalize_reference<<<@GROUPS@, nullptr, stream>>>((uint8_t*)X, (uint8_t*)Y, rows);
+  return 0;
+}

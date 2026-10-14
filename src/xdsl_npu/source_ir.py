@@ -4,7 +4,16 @@ Logical tile results express data dependence. Their SSA identity does not
 promise asynchronous completion; lowering supplies actual physical effects.
 """
 
-from xdsl.dialects.builtin import ArrayAttr, FloatAttr, IndexType, IntAttr, StringAttr, f32, i1
+from xdsl.dialects.builtin import (
+    ArrayAttr,
+    DictionaryAttr,
+    FloatAttr,
+    IndexType,
+    IntAttr,
+    StringAttr,
+    f32,
+    i1,
+)
 from xdsl.ir import Dialect, ParametrizedAttribute, TypeAttribute
 from xdsl.irdl import (
     AttrSizedOperandSegments,
@@ -172,6 +181,7 @@ class PipelineOp(IRDLOperation):
     limit = opt_operand_def(IndexType)
     stages = attr_def(IntAttr)
     order = attr_def(StringAttr)
+    issue_order = opt_attr_def(DictionaryAttr)
     body = region_def("single_block")
     values = var_result_def(TileType)
     traits = traits_def(RecursiveMemoryEffect())
@@ -196,6 +206,24 @@ class PipelineOp(IRDLOperation):
         for op in self.body.block.ops:
             if isinstance(op, StageOp) and not 0 <= op.offset.data < self.stages.data:
                 raise VerifyException("Stage offset lies outside this pipeline's stage horizon")
+        if self.issue_order is not None:
+            parent = self.parent_op()
+            while parent is not None and not isinstance(parent, ProgramOp):
+                parent = parent.parent_op()
+            allowed = (
+                {"cube", "vector"}
+                if parent is None or parent.kind.data == "mixed"
+                else {parent.kind.data}
+            )
+            for actor, labels in self.issue_order.data.items():
+                if (
+                    actor not in allowed
+                    or not isinstance(labels, ArrayAttr)
+                    or any(not isinstance(label, StringAttr) for label in labels)
+                ):
+                    raise VerifyException("issue_order needs actor names and stage label arrays")
+                if len({label.data for label in labels}) != len(labels):
+                    raise VerifyException("issue_order stage labels must be unique")
 
 
 @irdl_op_definition
@@ -354,10 +382,13 @@ class ElementOp(IRDLOperation):
             "mul_scalar": 1,
             "add_scalar": 1,
             "exp": 1,
+            "sqrt": 1,
+            "rsqrt": 1,
             "cast": 1,
             "mul": 2,
             "add": 2,
             "sub": 2,
+            "div": 2,
         }
         if self.kind.data not in arity or len(self.inputs) != arity[self.kind.data]:
             raise VerifyException("unknown element operation or incorrect operand count")
@@ -369,6 +400,84 @@ class ElementOp(IRDLOperation):
             v.type.dtype.data != "f32" for v in (*self.inputs, self.destination)
         ):
             raise VerifyException("arithmetic currently requires explicit f32 operands")
+
+
+@irdl_op_definition
+class ReduceOp(IRDLOperation):
+    name = "npu_source.reduce"
+    source = operand_def(TensorType)
+    scratch = operand_def(TensorType)
+    destination = operand_def(TensorType)
+    dependencies = var_operand_def(TileType)
+    dependency_inputs = attr_def(ArrayAttr[IntAttr])
+    kind = attr_def(StringAttr)
+    order = attr_def(StringAttr)
+    axis = attr_def(IntAttr)
+    value = result_def(TileType)
+    traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        _verify_result(self, self.destination)
+        _verify_dependencies(self, [self.source])
+        shape = tuple(n.data for n in self.source.type.shape)
+        if len(shape) not in {1, 2} or self.axis.data != len(shape) - 1:
+            raise VerifyException("reduction currently requires the final axis of a vector/matrix")
+        cols = shape[-1]
+        if cols < 64 or cols > 4096 or cols % 64:
+            raise VerifyException("reduction needs 64-aligned columns in [64,4096]")
+        if tuple(n.data for n in self.scratch.type.shape) != (*shape[:-1], cols // 64) or tuple(
+            n.data for n in self.destination.type.shape
+        ) != (*shape[:-1], 1):
+            raise VerifyException(
+                "reduction scratch/result must expose exact partial/statistic shapes"
+            )
+        if self.kind.data not in {"sum", "max"} or self.order.data != "r64_then_native_merge":
+            raise VerifyException("reduction requires an explicit supported order")
+        if any(
+            v.type.memory.data != "UB" or v.type.dtype.data != "f32"
+            for v in (self.source, self.scratch, self.destination)
+        ):
+            raise VerifyException("reduction requires f32 UB views")
+
+
+@irdl_op_definition
+class ScalarReadOp(IRDLOperation):
+    name = "npu_source.scalar_read"
+    source = operand_def(TensorType)
+    dependencies = var_operand_def(TileType)
+    dependency_inputs = attr_def(ArrayAttr[IntAttr])
+    value = result_def(f32)
+    traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        _verify_dependencies(self, [self.source])
+        if (
+            self.source.type.memory.data != "UB"
+            or self.source.type.dtype.data != "f32"
+            or any(n.data != 1 for n in self.source.type.shape)
+        ):
+            raise VerifyException("Scalar read requires exactly one f32 UB element")
+
+
+@irdl_op_definition
+class ScaleOp(IRDLOperation):
+    name = "npu_source.scale_value"
+    source = operand_def(TensorType)
+    destination = operand_def(TensorType)
+    factor = operand_def(f32)
+    dependencies = var_operand_def(TileType)
+    dependency_inputs = attr_def(ArrayAttr[IntAttr])
+    value = result_def(TileType)
+    traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        _verify_result(self, self.destination)
+        _verify_dependencies(self, [self.source])
+        if self.source.type.shape != self.destination.type.shape or any(
+            v.type.dtype.data != "f32" or v.type.memory.data != "UB"
+            for v in (self.source, self.destination)
+        ):
+            raise VerifyException("scalar multiplication requires equal f32 UB views")
 
 
 @irdl_op_definition
@@ -417,6 +526,9 @@ SOURCE = Dialect(
         PredicateOp,
         CopyOp,
         ElementOp,
+        ReduceOp,
+        ScalarReadOp,
+        ScaleOp,
         MatmulOp,
         YieldOp,
     ],

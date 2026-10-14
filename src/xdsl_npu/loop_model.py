@@ -199,6 +199,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
             f"{bank} capacity/owner violation",
         )
     views, tasks, operations = {}, [], {}
+    scalar_values = {}
     for op in stream.body.block.ops:
         if isinstance(op, ViewOp):
             require(op.generation is stream.body.block.args[0], "view uses a different task clock")
@@ -317,10 +318,18 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
                 re.fullmatch(r"[A-Za-z_]\w*", uid) and uid not in operations,
                 "duplicate/invalid task UID",
             )
+            operands, scalar_source = tuple(op.refs), None
+            if op.native.data in {"scale_value", "sub_value"}:
+                require(
+                    len(operands) == 3 and operands[-1] in scalar_values,
+                    "native scalar argument needs a preceding Scalar capture",
+                )
+                scalar_source = scalar_values[operands[-1]]
+                operands = operands[:-1]
             require(
-                all(ref in views for ref in op.refs), "native operands need physical bounded views"
+                all(ref in views for ref in operands), "native operands need physical bounded views"
             )
-            refs = tuple(views[ref] for ref in op.refs)
+            refs = tuple(views[ref] for ref in operands)
             params = tuple(value.data for value in op.params)
             pipe, modes = native_contract(op.native.data, refs, params)
             require(
@@ -335,7 +344,10 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
                 and optional_int(op.phase_width, 1) == 1,
                 "conditional native activation needs an explicit symbolic region contract",
             )
-            require(op.value is None, "symbolic Scalar capture is not yet lowered")
+            require(
+                (op.value is not None) == (op.native.data == "scalar_load"),
+                "only Scalar load may produce a numerical native SSA value",
+            )
             require(
                 (kernel.core.data == "aiv")
                 == (
@@ -357,10 +369,22 @@ def _actor(name, kernel, shared, limit, groups, uniform_values):
                 params,
                 issue_order=optional_int(op.issue_order, len(tasks)),
                 logical_phase=optional_int(op.logical_phase, 0),
+                scalar_source=scalar_source,
             )
             require(0 <= task.issue_order <= 65535, "issue rank outside supported range")
+            if scalar_source is not None:
+                provider = next(item for item in tasks if item.uid == scalar_source)
+                require(
+                    provider.stage == task.stage
+                    and (provider.issue_order, tasks.index(provider))
+                    < (task.issue_order, len(tasks)),
+                    "Scalar capture must precede consumption in the same physical step; "
+                    "delayed captures require explicit versioned storage",
+                )
             tasks.append(task)
             operations[uid] = op
+            if op.value is not None:
+                scalar_values[op.value] = uid
         else:
             require(isinstance(op, (LoopSyncOp, EndOp)), f"unsupported symbolic effect {op.name}")
     require(tasks, "actor has no native task template")

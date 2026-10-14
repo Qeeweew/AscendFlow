@@ -1,5 +1,43 @@
 # 重构的验证记录
 
+## R1 第三个切片：归约、Scalar 捕获、专家排步及 AscendC profiling
+
+在 `10d345c` 上增加 typed reduce（显式 scratch/order）、Scalar UB read 和
+捕获值乘法，统一进入原生 effects、generation 和最终同步验证。统计量最后
+读取归于 Scalar read，Scale 只消费已捕获 f32 值；缺少 V→S ready、capture
+晚于 consumer 或错 stage 均拒绝。`issue_order` 可按 Cube/Vector 固定 Stage
+派发顺序，数值顺序继续按源程序定义。详细实现、数值/ASC和复现命令见
+[AST normalization](ast-normalization.md)。
+
+整数/布尔 `scf.if` results 和 `scf.for` iter_args/yields 已在前端接通，独立
+解释测试覆盖零次循环、入口上界捕获、分支合流和 constexpr unroll 更新。
+一般分支/嵌套循环的物理同步仍未接通；延迟 Scalar 描述符还需要版本化存储。
+
+已完成的验证：
+
+- 216项相关归约、前端、prefix、loop、编译和既有物理/算子回归通过（50.81秒）。
+  增补空排步、CV policy、运行时工作量及 Vector profiling 检查后，相关30项
+  通过（6.01秒）；不是把两个测试数相加作为全量覆盖。
+- 独立 AscendC 源码与生成代码均通过 CANN9.1/dav-2201 离线/shared 编译；
+  在物理卡1→逻辑0运行0/1/2/4/256 rows/group，最大8192×4096 f32。两者输出
+  hash 一致，CPU参考最大绝对误差2.384185791015625e-7，guard通过。
+- 每个版本3轮独立 msprof、每轮5 warmup+30 samples：设备 p50 的中位数
+  为218.314 / 234.316 µs，生成版本比本例 AscendC 对照延迟低约6.8%。本例
+  不含 gamma/bias，不能代替完整 RMSNorm/ACLNN 或 FA 的性能结论。
+- 5次完整源码到 ASC 冷编译 p50=0.2895秒、max=0.2900秒、RSS约37.2 MiB。
+- 原 prefix binary 补齐两独立参数下精确0/1/2/4/4096/65536 tiles 的门槛，
+  最新17组调用均通过。记录在 `runs/refactor/r1-prefix-exact-gates/`。
+
+性能分析绑定真实910B3的40 AIV、192 KiB UB/AIV、192 MiB L2；固定配置使用
+32 AIV、UB65856字节/AIV，GM请求256 MiB。AIV持续频率、HBM流量/带宽仍未知，
+报告只给工作量、请求口径intensity与条件下界形式，没有伪造硬件利用率峰值。
+数据在 `runs/refactor/ast-normalize-comparison/`、`ast-normalize-profiles/`、
+`ast-normalize-cold/`；回归日志在 `ast-normalize-checks/`。
+
+下一步是 R2 的结构化物理控制/层次摘要、独立 buffer 时钟和可组合状态生命周期。
+R0 其余算子的源码基线、完整例子迁移、唯一生产路径和 R3/R4 的真实 FA/变体/
+大规模性能验收仍有未完成项。当前没有宣称整个重构完成。
+
 ## R1 第二个切片：原始元素长度、双参数与真实尾块
 
 在 `b79025e` 基础上，增加非负 uniform 标量表达式的物理 lowering，保留

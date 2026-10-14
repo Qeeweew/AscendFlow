@@ -25,6 +25,9 @@ from .source_ir import (
     PipelineOp,
     PredicateOp,
     ProgramOp,
+    ReduceOp,
+    ScalarReadOp,
+    ScaleOp,
     SizeOp,
     StageOp,
     ViewOp,
@@ -50,6 +53,9 @@ def _work(program, pipeline, family, owner):
     records = []
     phases = {op: i for i, op in enumerate(pipeline.body.block.ops) if isinstance(op, StageOp)}
     default_domain = None if program.kind.data == "mixed" else program.kind.data
+    issue_order = () if pipeline.issue_order is None else pipeline.issue_order.data.get(family, ())
+    pinned = pipeline.issue_order is not None and family in pipeline.issue_order.data
+    ranks = {label.data: i for i, label in enumerate(issue_order)}
 
     def walk(block, clock, bindings, stage, phase, label, domain, order):
         for position, op in enumerate(block.ops):
@@ -64,7 +70,7 @@ def _work(program, pipeline, family, owner):
                         phases[op],
                         op.label.data,
                         domain,
-                        path,
+                        (ranks.get(op.label.data, -1), *path) if ranks else path,
                     )
                 else:
                     # The final component identifies this inner iteration's
@@ -88,6 +94,7 @@ def _work(program, pipeline, family, owner):
                 local = {**bindings, op.body.block.args[0]: owner}
                 walk(op.body.block, clock, local, stage, phase, label, selected, path)
             elif isinstance(op, PipelineOp):
+                require(op.issue_order is None, "nested issue policies need hierarchical lowering")
                 require(
                     op.limit is None,
                     "nested runtime pipelines need hierarchical loop synchronization; "
@@ -106,7 +113,7 @@ def _work(program, pipeline, family, owner):
                 or type(op) in ARITHMETIC
             ):
                 continue
-            elif isinstance(op, (CopyOp, ElementOp, MatmulOp)):
+            elif isinstance(op, (CopyOp, ElementOp, MatmulOp, ReduceOp, ScalarReadOp, ScaleOp)):
                 require(domain is not None, "mixed work requires a Cube or Vector execution scope")
                 require(domain == family, "source operation has incompatible execution owner")
                 records.append(Work(op, stage, phase, label, path, tuple(bindings.items())))
@@ -116,12 +123,23 @@ def _work(program, pipeline, family, owner):
                 )
 
     walk(pipeline.body.block, pipeline, {}, 0, 0, "pipeline", default_domain, ())
+    if pinned:
+        require(
+            set(ranks) == {record.label for record in records},
+            f"{family}: issue_order must name every active Stage exactly once",
+        )
+        labels = [op.label.data for op in pipeline.body.block.ops if isinstance(op, StageOp)]
+        require(len(labels) == len(set(labels)), "issue_order requires unambiguous Stage names")
     return records
 
 
 def _refs(op):
-    if isinstance(op, CopyOp):
+    if isinstance(op, (CopyOp, ScaleOp)):
         return op.source, op.destination
+    if isinstance(op, ScalarReadOp):
+        return (op.source,)
+    if isinstance(op, ReduceOp):
+        return op.source, op.scratch, op.destination
     if isinstance(op, ElementOp):
         return (*op.inputs, op.destination)
     return op.a, op.b, op.accumulator
@@ -252,6 +270,7 @@ class _Actor:
         self.schedule = []
         self.definitions = {}
         self.readers = {}
+        self.scalar_values = {}
 
     def view(self, value, record, *, matrix=False):
         view, allocation = value.owner, _root(value)
@@ -420,6 +439,7 @@ class _Actor:
                         }
                     )
                 )
+                return operation
 
             if isinstance(op, CopyOp):
                 require(
@@ -477,6 +497,9 @@ class _Actor:
                     "add": "add",
                     "sub": "sub",
                     "exp": "exp",
+                    "sqrt": "sqrt",
+                    "rsqrt": "rsqrt",
+                    "div": "div",
                 }.get(op.kind.data)
                 if op.kind.data == "cast":
                     require(len(op.inputs) == 1, "cast takes one source tile")
@@ -496,6 +519,52 @@ class _Actor:
                     native,
                     *refs,
                     scalar=0.0 if op.scalar is None else op.scalar.value.data,
+                )
+            elif isinstance(op, ReduceOp):
+                require(
+                    _root(op.scratch).access.data != "read"
+                    and _root(op.destination).access.data != "read",
+                    "reduction writes a read-only buffer",
+                )
+                rows, cols = (
+                    (1, shape(op.source)[0]) if len(shape(op.source)) == 1 else shape(op.source)
+                )
+                source, temporary, destination = (
+                    self.view(value, record, matrix=True)
+                    for value in (op.source, op.scratch, op.destination)
+                )
+                task(
+                    "_partial",
+                    "reduce_" + op.kind.data + "64",
+                    source,
+                    temporary,
+                    params=(rows, cols),
+                )
+                task(
+                    "_merge",
+                    "merge_" + op.kind.data,
+                    temporary,
+                    destination,
+                    params=(rows, cols // 64),
+                    order_delta=1,
+                )
+            elif isinstance(op, ScalarReadOp):
+                captured = task("_capture", "scalar_load", self.view(op.source, record))
+                self.scalar_values[op.value] = captured.value
+            elif isinstance(op, ScaleOp):
+                require(
+                    op.factor in self.scalar_values and op.factor.owner.parent is op.parent,
+                    "captured scalar must be read earlier in the same source scope",
+                )
+                require(
+                    _root(op.destination).access.data != "read", "scale writes a read-only buffer"
+                )
+                task(
+                    "_scale",
+                    "scale_value",
+                    self.view(op.source, record),
+                    self.view(op.destination, record),
+                    self.scalar_values[op.factor],
                 )
             elif isinstance(op, MatmulOp):
                 initialization = _initialize(op, record)
@@ -537,6 +606,13 @@ class _Actor:
                 self.definitions[number] = uid + "_" + op.kind.data
                 for i in range(len(op.inputs)):
                     self.readers[number, i] = self.definitions[number]
+            elif isinstance(op, ReduceOp):
+                self.definitions[number] = uid + "_merge"
+                self.readers[number, 0] = uid + "_partial"
+            elif isinstance(op, ScalarReadOp):
+                self.definitions[number] = self.readers[number, 0] = uid + "_capture"
+            elif isinstance(op, ScaleOp):
+                self.definitions[number] = self.readers[number, 0] = uid + "_scale"
             else:
                 self.definitions[number] = uid + "_mad"
                 self.readers[number, 0] = uid + "_operand_a"
@@ -556,7 +632,10 @@ def _tile_producer(value, outer):
             require(region.count.data > 0, "a zero-trip inner pipeline has no tile result")
             final_bindings[region.body.block.args[0]] = region.count.data - 1
         value = region.body.block.last_op.values[value.index]
-    require(isinstance(value.owner, (CopyOp, ElementOp, MatmulOp)), "unknown logical tile producer")
+    require(
+        isinstance(value.owner, (CopyOp, ElementOp, MatmulOp, ReduceOp, ScaleOp)),
+        "unknown logical tile producer",
+    )
     return value.owner, final_bindings
 
 

@@ -10,7 +10,16 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from math import prod
 
-from xdsl.dialects.builtin import ArrayAttr, FloatAttr, IndexType, IntAttr, ModuleOp, StringAttr, i1
+from xdsl.dialects.builtin import (
+    ArrayAttr,
+    DictionaryAttr,
+    FloatAttr,
+    IndexType,
+    IntAttr,
+    ModuleOp,
+    StringAttr,
+    i1,
+)
 from xdsl.dialects.builtin import f32 as ir_f32
 from xdsl.ir import Block, OpResult, Region, SSAValue, SSAValues
 
@@ -24,6 +33,9 @@ from .source_ir import (
     PipelineOp,
     PredicateOp,
     ProgramOp,
+    ReduceOp,
+    ScalarReadOp,
+    ScaleOp,
     SizeOp,
     StageOp,
     TensorType,
@@ -693,7 +705,7 @@ class Vector(Cube):
 
 
 class Pipelined:
-    def __init__(self, count, *, stages, order="source"):
+    def __init__(self, count, *, stages, order="source", issue_order=None):
         trace = _trace()
         require(
             (type(count) is int and 0 <= count <= (1 << 31) - 1) or isinstance(count, _Dimension),
@@ -712,6 +724,7 @@ class Pipelined:
                 **({} if isinstance(count, _Dimension) else {"count": IntAttr(count)}),
                 "stages": IntAttr(stages),
                 "order": StringAttr(order),
+                **_issue_order(issue_order),
             },
             regions=[Region(Block(arg_types=[IndexType()]))],
         )
@@ -725,6 +738,26 @@ class Pipelined:
         finally:
             trace.pipelines.pop()
             trace.leave(self.op)
+
+
+def _issue_order(order):
+    if order is None:
+        return {}
+    require(
+        type(order) is dict
+        and all(
+            type(key) is str
+            and type(labels) is tuple
+            and all(type(label) is str for label in labels)
+            for key, labels in order.items()
+        ),
+        "issue_order requires a literal actor-to-stage-label mapping",
+    )
+    return {
+        "issue_order": DictionaryAttr(
+            {key: ArrayAttr(StringAttr(label) for label in labels) for key, labels in order.items()}
+        )
+    }
 
 
 def prim_func(function=None, *, disjoint_external=False):
@@ -816,6 +849,18 @@ def _element(kind, values, out, scalar=None, valid=None):
 
 
 def mul(lhs, rhs, *, out, valid=None):
+    if isinstance(rhs, _Scalar):
+        require(valid is None, "masked captured-scalar multiplication is not implemented")
+        src, dst = _view(lhs), _view(out).bound()
+        require(dst.buffer.op.access.data != "read", "multiplication writes a read-only view")
+        op = ScaleOp.build(
+            operands=[src.emit(), dst.emit(), rhs.value, _deps([lhs])],
+            result_types=[_tile(dst)],
+            attributes={"dependency_inputs": _dependency_inputs([lhs])},
+        )
+        _trace().add(op)
+        _trace().record(op.value)
+        return _Value(dst, op.value)
     return (
         _element("mul_scalar", [lhs], out, rhs, valid)
         if isinstance(rhs, (float, int))
@@ -837,6 +882,66 @@ def sub(lhs, rhs, *, out):
 
 def exp(source, *, out):
     return _element("exp", [source], out)
+
+
+def sqrt(source, *, out):
+    return _element("sqrt", [source], out)
+
+
+def rsqrt(source, *, out):
+    return _element("rsqrt", [source], out)
+
+
+def div(lhs, rhs, *, out):
+    return _element("div", [lhs, rhs], out)
+
+
+@dataclass(frozen=True)
+class _Scalar:
+    value: SSAValue
+
+
+def load_scalar(source):
+    src = _view(source)
+    op = ScalarReadOp.build(
+        operands=[src.emit(), _deps([source])],
+        result_types=[ir_f32],
+        attributes={"dependency_inputs": _dependency_inputs([source])},
+    )
+    _trace().add(op)
+    return _Scalar(op.value)
+
+
+def _reduce(kind, source, *, axis, out, scratch, order):
+    src, dst, temporary = _view(source), _view(out).bound(), _view(scratch).bound()
+    require(
+        all(v.buffer.op.access.data != "read" for v in (dst, temporary)),
+        "reduction output and scratch must be writable",
+    )
+    require(type(axis) is int, "reduction axis is a constexpr integer")
+    if axis < 0:
+        axis += len(src.shape)
+    op = ReduceOp.build(
+        operands=[src.emit(), temporary.emit(), dst.emit(), _deps([source])],
+        result_types=[_tile(dst)],
+        attributes={
+            "kind": StringAttr(kind),
+            "order": StringAttr(order),
+            "axis": IntAttr(axis),
+            "dependency_inputs": _dependency_inputs([source]),
+        },
+    )
+    _trace().add(op)
+    _trace().record(op.value)
+    return _Value(dst, op.value)
+
+
+def reduce_sum(source, *, axis, out, scratch, order):
+    return _reduce("sum", source, axis=axis, out=out, scratch=scratch, order=order)
+
+
+def reduce_max(source, *, axis, out, scratch, order):
+    return _reduce("max", source, axis=axis, out=out, scratch=scratch, order=order)
 
 
 def cast(source, *, out):

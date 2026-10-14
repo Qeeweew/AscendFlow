@@ -16,8 +16,8 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import FileLineColLoc, IndexType, IntAttr, ModuleOp, StringAttr
-from xdsl.ir import Block, Region, SSAValue
+from xdsl.dialects.builtin import FileLineColLoc, IndexType, IntAttr, ModuleOp, StringAttr, i1
+from xdsl.ir import Block, OpResult, Region, SSAValue, SSAValues
 
 from . import language as N
 from .model import CompileError, require
@@ -50,6 +50,12 @@ _CALLS = {
     "cast",
     "fill",
     "gemm",
+    "sqrt",
+    "rsqrt",
+    "div",
+    "load_scalar",
+    "reduce_sum",
+    "reduce_max",
 }
 _SYNTAX = {"serial", "unroll", "Pipelined", "ceildiv", "min", "max", "int64", "constexpr"}
 _CONSTANTS = {"f32", "f16", "bf16"}
@@ -59,6 +65,7 @@ _BINARY = {
     ast.Mult: operator.mul,
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
+    ast.Div: operator.truediv,
 }
 _COMPARE = {
     ast.Eq: ("eq", operator.eq),
@@ -326,10 +333,17 @@ class _Parser:
             for value in iterations:
                 self.env[node.target.id] = value
                 self.body(node.body)
-            self.env = original
+            if node.target.id in original:
+                self.env[node.target.id] = original[node.target.id]
+            else:
+                self.env.pop(node.target.id, None)
             return
         if symbol.name == "Pipelined":
-            if len(args) != 1 or set(kwargs) - {"stages", "order"} or "stages" not in kwargs:
+            if (
+                len(args) != 1
+                or set(kwargs) - {"stages", "order", "issue_order"}
+                or "stages" not in kwargs
+            ):
                 self.fail(call, "Pipelined requires one bound and explicit stages")
             limit = args[0]
             if type(limit) is int or isinstance(limit, N._Dimension):
@@ -341,6 +355,7 @@ class _Parser:
                         "uid": StringAttr(self.trace.name("pipeline")),
                         "stages": IntAttr(kwargs["stages"]),
                         "order": StringAttr(kwargs.get("order", "source")),
+                        **N._issue_order(kwargs.get("issue_order")),
                     },
                     regions=[Region(Block(arg_types=[IndexType()]))],
                 )
@@ -360,18 +375,35 @@ class _Parser:
             )
             if type(step) is not int or step <= 0:
                 self.fail(call, "serial step must be a positive constexpr")
-            block = Block(arg_types=[IndexType()])
-            operation = scf.ForOp(self.scalar(lb), self.scalar(ub), self.scalar(step), [], block)
+            assigned = {
+                item.id
+                for statement in node.body
+                for item in ast.walk(statement)
+                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
+            }
+            carried = sorted((assigned & original.keys()) - {node.target.id})
+            initial = [self.scalar_result(original[name], node) for name in carried]
+            block = Block(arg_types=[IndexType(), *(value.type for value in initial)])
+            operation = scf.ForOp(
+                self.scalar(lb), self.scalar(ub), self.scalar(step), initial, block
+            )
             self.trace.add(operation)
             self.trace.blocks.append(block)
             self.trace.values.append([])
+            self.env.update(zip(carried, block.args[1:]))
             self.env[node.target.id] = N._coordinate(block.args[0])
             try:
                 self.body(node.body)
-                self.trace.add(scf.YieldOp())
+                results = [self.scalar_result(self.env[name], node) for name in carried]
+                if tuple(value.type for value in results) != tuple(value.type for value in initial):
+                    self.fail(node, "loop-carried scalar types must remain invariant")
+                self.trace.add(scf.YieldOp(*results))
             finally:
                 self.trace.values.pop()
                 self.trace.blocks.pop()
+            self.env = original
+            self.env.update(zip(carried, operation.results))
+            return
         # Explicit state writes are supported; scalar/tile loop results require
         # iter_args/yields, never the last Python iteration's binding.
         for name, value in original.items():
@@ -384,28 +416,58 @@ class _Parser:
         if type(condition) is bool:
             self.body(node.body if condition else node.orelse)
             return
-        if not isinstance(condition, SSAValue):
+        if not isinstance(condition, SSAValue) or condition.type != i1:
             self.fail(node.test, "if requires a scalar comparison")
         before = dict(self.env)
         blocks = [Block(), Block()]
         operation = scf.IfOp(condition, [], *(Region(block) for block in blocks))
         self.trace.add(operation)
+        environments = []
         for block, statements in zip(blocks, (node.body, node.orelse)):
             self.env = dict(before)
             self.trace.blocks.append(block)
             self.trace.values.append([])
             try:
                 self.body(statements)
-                for name, value in before.items():
-                    if self.env.get(name) is not value:
-                        self.fail(
-                            node, f"branch-carried binding {name} needs explicit SSA merge support"
-                        )
-                self.trace.add(scf.YieldOp())
+                environments.append(dict(self.env))
             finally:
                 self.trace.values.pop()
                 self.trace.blocks.pop()
+        left, right = environments
+        merged = sorted(
+            name
+            for name in left.keys() & right.keys()
+            if left[name] is not before.get(name) or right[name] is not before.get(name)
+        )
+        results = []
+        for block, values in zip(blocks, environments):
+            self.trace.blocks.append(block)
+            try:
+                returned = [self.scalar_result(values[name], node) for name in merged]
+                self.trace.add(scf.YieldOp(*returned))
+                results.append(returned)
+            finally:
+                self.trace.blocks.pop()
+        if tuple(value.type for value in results[0]) != tuple(value.type for value in results[1]):
+            self.fail(node, "if branches must produce matching scalar types")
+        operation.results = SSAValues(
+            OpResult(value.type, operation, i) for i, value in enumerate(results[0])
+        )
         self.env = before
+        self.env.update(zip(merged, operation.results))
+
+    def scalar_result(self, value, node):
+        if type(value) is bool:
+            return self.trace.add(arith.ConstantOp.from_int_and_width(int(value), i1)).result
+        if isinstance(value, SSAValue) and value.type == i1:
+            return value
+        try:
+            return self.scalar(value)
+        except CompileError:
+            self.fail(
+                node,
+                "structured SSA results must be integer/boolean scalars; write buffers explicitly",
+            )
 
     def scalar(self, value):
         if isinstance(value, SSAValue):
@@ -458,6 +520,13 @@ class _Parser:
             self.fail(node, f"unknown DSL operation {node.attr}")
         if isinstance(node, ast.Tuple):
             return tuple(self.expr(item) for item in node.elts)
+        if isinstance(node, ast.Dict):
+            if any(key is None for key in node.keys):
+                self.fail(node, "policy mappings cannot unpack host dictionaries")
+            keys = [self.expr(key) for key in node.keys]
+            if not all(type(key) is str for key in keys) or len(set(keys)) != len(keys):
+                self.fail(node, "policy mappings need unique literal string keys")
+            return dict(zip(keys, (self.expr(value) for value in node.values)))
         if isinstance(node, ast.Slice):
             return slice(
                 *(
@@ -475,6 +544,10 @@ class _Parser:
             return value * (-1 if isinstance(node.op, ast.USub) else 1)
         if isinstance(node, ast.BinOp) and type(node.op) in _BINARY:
             lhs, rhs = self.expr(node.left), self.expr(node.right)
+            if isinstance(node.op, ast.Div):
+                if type(lhs) not in {int, float} or type(rhs) not in {int, float}:
+                    self.fail(node, "device integer division requires // or N.ceildiv")
+                return lhs / rhs
             if isinstance(lhs, SSAValue) or isinstance(rhs, SSAValue):
                 ops = {
                     ast.Add: arith.AddiOp,

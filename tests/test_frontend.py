@@ -197,7 +197,7 @@ def test_branch_rebinding_cannot_silently_select_the_host_value():
                     if i == 0:
                         value = 1
     """)
-    with pytest.raises(FrontendError, match="branch-carried binding value"):
+    with pytest.raises(FrontendError, match="loop-carried binding value"):
         definition.to_ir()
 
 
