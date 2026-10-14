@@ -9,7 +9,8 @@ NN 的 V 在原生 L1→L0B Load2D 中转置，没有全形状 GM 转置或额�
 ## 实际接口和数值契约
 
 ```python
-from xdsl_npu import flash_attention, autosync, verify_plan, emit_asc
+from flash_attention import flash_attention  # compiler/examples 在 Python 路径中
+from xdsl_npu import autosync, verify_plan, emit_asc
 
 source = flash_attention(
     1,
@@ -203,9 +204,9 @@ GM请求可命中L2，全部分配小于名义L2容量不保证全部驻留。3.
 ```bash
 .venv/bin/pip install --no-build-isolation -e 'compiler[validation]'
 .venv/bin/pytest -q compiler/tests/test_attention.py compiler/tests/test_performance.py
-.venv/bin/xdsl-npu flash-attention --batch 1 --query-heads 2 --kv-heads 1 --query-length 128 --kv-length 192 --head-dim 64 --block-q 32 --block-kv 64 --causal --query-start 17 --shared --output runs/attention/causal-example
+.venv/bin/python compiler/examples/flash_attention.py --batch 1 --query-heads 2 --kv-heads 1 --query-length 128 --kv-length 192 --head-dim 64 --block-q 32 --block-kv 64 --causal --query-start 17 --shared --output runs/attention/causal-example
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python compiler/examples/run_attention.py runs/attention/causal-example --physical 1
-.venv/bin/xdsl-npu flash-attention --batch 1 --query-heads 8 --kv-heads 8 --query-length 4096 --kv-length 4096 --head-dim 128 --block-q 128 --q-cache l1 --reuse-ub --pipeline --packed-reductions --shared --output runs/attention/mha-4k-reproduce
+.venv/bin/python compiler/examples/flash_attention.py --batch 1 --query-heads 8 --kv-heads 8 --query-length 4096 --kv-length 4096 --head-dim 128 --block-q 128 --q-cache l1 --reuse-ub --pipeline --packed-reductions --shared --output runs/attention/mha-4k-reproduce
 
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof \

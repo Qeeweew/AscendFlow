@@ -1,8 +1,9 @@
 import pytest
+from flash_attention import flash_attention
 from xdsl.dialects.builtin import IntAttr
 from xdsl.transforms.dead_code_elimination import dce
 
-from xdsl_npu import autosync, emit_asc, flash_attention, verify_plan
+from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.ir import (
     BufferOp,
     CrossChannelOp,
@@ -176,7 +177,7 @@ def test_static_selector_and_cross_case_ownership_are_rechecked(causal_plan, mut
 
 def test_causal_numerical_oracle_uses_absolute_query_positions(causal_plan):
     np = pytest.importorskip("numpy")
-    from xdsl_npu.attention_oracle import attention_inputs, decode, rounded
+    from attention_oracle import attention_inputs, decode, rounded
 
     raw, expected, selected, report = attention_inputs(causal_plan, data_case="uniform")
     v = decode(raw["v"], "f16", (1, 1, 192, 64))
@@ -247,7 +248,7 @@ def test_unsupported_inputs_cannot_fallback(change, diagnostic):
 
 def test_independent_oracle_gqa_mapping_and_b16_tie_rounding():
     np = pytest.importorskip("numpy")
-    from xdsl_npu.attention_oracle import attention_inputs, decode, encode, online_attention
+    from attention_oracle import attention_inputs, decode, encode, online_attention
 
     ties = np.array([1 + 2**-8, 1 + 3 * 2**-8, -(1 + 2**-8)], dtype=np.float32)
     assert np.array_equal(
@@ -311,7 +312,7 @@ def test_lookahead_aliases_and_compact_reductions_have_actual_retirement_effects
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 def test_packed_decode_keeps_one_absolute_position_for_all_head_rows(dtype):
     np = pytest.importorskip("numpy")
-    from xdsl_npu.attention_oracle import attention_inputs, decode, rounded
+    from attention_oracle import attention_inputs, decode, rounded
 
     source = flash_attention(
         2,

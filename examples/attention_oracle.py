@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from time import perf_counter
 
-from .model import require
+from xdsl_npu.model import require
 
 
 def encode(values, dtype):
@@ -43,11 +43,11 @@ def rounded(values, dtype):
 
 
 def attention_description(plan):
-    from .ir import StaticDispatchOp
-    from .mixed import extract_mixed
+    from xdsl_npu.ir import StaticDispatchOp
+    from xdsl_npu.mixed import extract_mixed
 
     if isinstance(plan.body.block.first_op, StaticDispatchOp):
-        from .dispatch import extract_dispatch
+        from xdsl_npu.dispatch import extract_dispatch
 
         dispatch = extract_dispatch(plan)
         mixed = dispatch.cases[0][1]
@@ -144,14 +144,15 @@ def attention_inputs(plan, *, scope="full", data_case="standard"):
         selected = np.arange(sq)
     else:
         # Both AIV owners and every query tile, plus sequence endpoints.
+        native_tile = attrs.get("attention_native_tile")
+        sample_step = native_tile.data[1].data if native_tile is not None else block_q // 2
         selected = np.array(
             sorted(
                 {
                     row
                     for tile in range(sq // block_q)
                     for row in (
-                        tile * block_q,
-                        tile * block_q + block_q // 2,
+                        *(tile * block_q + offset for offset in range(0, block_q, sample_step)),
                         tile * block_q + block_q - 1,
                     )
                 }
@@ -196,6 +197,7 @@ def attention_inputs(plan, *, scope="full", data_case="standard"):
         "query_start": query_start,
         "oracle": "NumPy FP32 online recurrence, FP32 denominator, RN operand P and output",
         "recipe_policies": [n.data for n in attrs.get("attention_policies", ())],
+        "native_cube_kv_vector_rows": [n.data for n in attrs.get("attention_native_tile", ())],
     }
     return raw, expected, selected, report
 
@@ -214,9 +216,9 @@ def run_attention(
 ):
     import numpy as np
 
-    from .codegen import emit_asc
-    from .device import ACL, health_snapshot
-    from .sync import verify_plan
+    from xdsl_npu.codegen import emit_asc
+    from xdsl_npu.device import ACL, health_snapshot
+    from xdsl_npu.sync import verify_plan
 
     verification = verify_plan(plan)
     roots, attrs, name = attention_description(plan)
@@ -254,7 +256,7 @@ def run_attention(
             def launch():
                 kernel(runtime.stream, *args)
         else:
-            from .cann_reference import FlashAttentionReference
+            from attention_reference import FlashAttentionReference
 
             baseline = FlashAttentionReference(
                 runtime,
@@ -315,14 +317,15 @@ def run_attention(
             library=str(shared_library.resolve()),
         )
         if baseline is not None:
-            from . import cann_reference
-            from .toolchain import CANN
+            import attention_reference
+
+            from xdsl_npu.toolchain import CANN
 
             report.update(
                 reference_interface=baseline.interface,
                 reference_workspace_bytes=baseline.workspace_size.value,
                 reference_auxiliary_bytes=baseline.auxiliary_bytes,
-                reference_adapter_sha256=sha(Path(cann_reference.__file__).read_bytes()),
+                reference_adapter_sha256=sha(Path(attention_reference.__file__).read_bytes()),
                 reference_opapi_sha256=sha((CANN / "lib64/libopapi.so").read_bytes()),
                 reference_numerical_contract="CANN native tiling/rounding may differ from the specified logical BK; comparison uses stated tolerances",
             )

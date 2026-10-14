@@ -44,7 +44,7 @@ ACTORS = ("aic", "aiv0", "aiv1")
 MAX_CROSS_BACKLOG = 15
 
 
-def compose(name, cube, vector0, vector1, *, cube_epoch=1, disjoint_external=False):
+def compose(name, cube, vector0, vector1, *, cube_epoch=1, vector_epoch=1, disjoint_external=False):
     """Capture matching external declarations into explicit shared SSA roots.
 
     Source order within each common epoch is AIC, AIV0, AIV1. This declares
@@ -54,7 +54,9 @@ def compose(name, cube, vector0, vector1, *, cube_epoch=1, disjoint_external=Fal
     block = Block()
     roots = {}
     kernels = []
-    for actor, module, divisor in zip(ACTORS, (cube, vector0, vector1), (cube_epoch, 1, 1)):
+    for actor, module, divisor in zip(
+        ACTORS, (cube, vector0, vector1), (cube_epoch, vector_epoch, vector_epoch)
+    ):
         clone = module.clone()
         program = extract(clone)
         kernel, _ = parts(clone)
@@ -290,6 +292,10 @@ def global_dependencies(m):
                 upper=1,
                 period=1,
                 phase=0,
+                # Origins already encode the complete epoch/phase order.
+                # The flattened one-generation frontier must preserve it.
+                logical_phase=0,
+                phase_width=1,
             )
         )
     flat = Program(m.op.sym_name.data, "mixed", 1, tuple(storages.values()), tuple(tasks), False)
@@ -745,7 +751,7 @@ def autosync_mixed(module):
 def _plan_gm_ring(m, cross, prefix, flag_base):
     """Plan one physical ring, either FIX->AIV pair or MTE3 pair->AIC.
 
-    A source/read endpoint executes once per common epoch. The two AIV
+    Native segments contribute to a complete common epoch. The two AIV
     endpoints own disjoint byte ranges; the global frontier proves their
     actual coverage, not a nominal tensor shape or a user release marker.
     """
@@ -761,24 +767,29 @@ def _plan_gm_ring(m, cross, prefix, flag_base):
     writers = {a: {src[1].task for src, _, _ in raw if src[0] == a} for a in sources}
     readers = {a: {dst[1].task for _, dst, _ in raw if dst[0] == a} for a in destinations}
     require(
-        all(len(indices) == 1 for indices in (*writers.values(), *readers.values())),
-        f"{prefix}: handoff needs one producer and one last GM reader per participant/epoch",
+        all(indices for indices in (*writers.values(), *readers.values())),
+        f"{prefix}: handoff needs real producer/reader contributions from every participant",
     )
-    writers = {a: indices.pop() for a, indices in writers.items()}
-    readers = {a: indices.pop() for a, indices in readers.items()}
     endpoints = {**writers, **readers}
-    for actor, index in endpoints.items():
-        task = m.programs[actor].tasks[index]
-        active = [g for g in range(m.programs[actor].count) if task.active(g)]
+    spans = {}
+    for actor, indices in endpoints.items():
+        program = m.programs[actor]
         divisor = m.divisors[actor]
         pipe = ("FIX" if forward else "MTE3") if actor in writers else "MTE2"
         require(
-            len(active) == m.epochs
-            and active == [active[0] + i * divisor for i in range(m.epochs)]
-            and active[0] < divisor
-            and task.pipe == pipe,
-            "handoff endpoint must execute once per epoch on its real producer/read pipe",
+            all(program.tasks[index].pipe == pipe for index in indices),
+            "handoff segments must use their real producer/read pipe",
         )
+        issued = program.issued()
+        spans[actor] = []
+        for epoch in range(m.epochs):
+            contributions = [
+                inst
+                for inst in issued
+                if inst.task in indices and inst.generation // divisor == epoch
+            ]
+            require(contributions, "handoff requires nonempty static participation in every epoch")
+            spans[actor].append((contributions[0], contributions[-1]))
     require(
         all(
             src[1].generation // m.divisors[src[0]] == dst[1].generation // m.divisors[dst[0]]
@@ -791,9 +802,9 @@ def _plan_gm_ring(m, cross, prefix, flag_base):
         len(war) == len(cross) - len(raw)
         and all(
             src[0] in readers
-            and src[1].task == readers[src[0]]
+            and src[1].task in readers[src[0]]
             and dst[0] in writers
-            and dst[1].task == writers[dst[0]]
+            and dst[1].task in writers[dst[0]]
             for src, dst, _ in war
         ),
         f"{prefix}: only producer/last-reader ring RAW and WAR are implemented",
@@ -824,32 +835,44 @@ def _plan_gm_ring(m, cross, prefix, flag_base):
             }
         )
         m.op.body.block.insert_op_before(channel, m.actors["aic"])
-    for actor, index in endpoints.items():
+    for actor in endpoints:
         kernel = m.actors[actor]
         stream = next(o for o in kernel.body.block.ops if isinstance(o, StreamOp))
-        task = [o for o in stream.body.block.ops if isinstance(o, TaskOp)][index]
+        task_ops = [o for o in stream.body.block.ops if isinstance(o, TaskOp)]
         g = stream.body.block.args[0]
         divisor = m.divisors[actor]
-        phase = next(i for i in range(divisor) if m.programs[actor].tasks[index].active(i))
-        hi = m.programs[actor].count
+        gates = defaultdict(list)
+        for epoch, (first, last) in enumerate(spans[actor]):
+            if actor in writers:
+                gates[(last.task, "set", ready, 0)].append(last.generation)
+                if epoch >= slots:
+                    gates[(first.task, "wait", credit, -slots)].append(first.generation)
+            else:
+                gates[(first.task, "wait", ready, 0)].append(first.generation)
+                gates[(last.task, "set", credit, 0)].append(last.generation)
+        from .sync import arithmetic_span
+
+        for (index, action, channel, offset), generations in gates.items():
+            # Compress only exact arithmetic spans. Static guarded endpoints
+            # may alternate task kinds; retain every actual activation.
+            try:
+                intervals = [arithmetic_span(generations)]
+            except CompileError:
+                import itertools
+
+                intervals = [
+                    arithmetic_span([value for _, value in group])
+                    for _, group in itertools.groupby(
+                        enumerate(generations), lambda pair: pair[1] - pair[0]
+                    )
+                ]
+            for lo, hi, stride in intervals:
+                op = cross_op(g, action, channel, lo, hi, stride, divisor, offset)
+                if action == "set":
+                    stream.body.block.insert_op_after(op, task_ops[index])
+                else:
+                    stream.body.block.insert_op_before(op, task_ops[index])
         if actor in writers:
-            stream.body.block.insert_op_after(
-                cross_op(g, "set", ready, phase, hi, divisor, divisor), task
-            )
-            if slots < m.epochs:
-                stream.body.block.insert_op_before(
-                    cross_op(
-                        g,
-                        "wait",
-                        credit,
-                        slots * divisor + phase,
-                        hi,
-                        divisor,
-                        divisor,
-                        -slots,
-                    ),
-                    task,
-                )
             drain = CrossDrainOp.create(
                 attributes={
                     "channel": StringAttr(credit),
@@ -858,10 +881,3 @@ def _plan_gm_ring(m, cross, prefix, flag_base):
                 }
             )
             kernel.body.block.insert_op_before(drain, kernel.body.block.last_op)
-        else:
-            stream.body.block.insert_op_before(
-                cross_op(g, "wait", ready, phase, hi, divisor, divisor), task
-            )
-            stream.body.block.insert_op_after(
-                cross_op(g, "set", credit, phase, hi, divisor, divisor), task
-            )

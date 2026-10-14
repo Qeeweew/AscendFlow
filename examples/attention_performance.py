@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from attention_oracle import attention_description
+
 from xdsl_npu.codegen import emit_asc
 from xdsl_npu.ir import parse
 from xdsl_npu.performance import (
@@ -41,8 +43,15 @@ evidence = profile_evidence(
     physical=args.physical,
     warmup=device["warmup"],
     repeats=device["repeats"],
+    kernel=device["kernel"],
 )
-work = physical_work(plan)
+_, attributes, _ = attention_description(plan)
+b, h, _, sq, sk, d = [n.data for n in attributes["attention_shape"]]
+cells = sq * sk
+if attributes["attention_causal"].data:
+    start = attributes["attention_start"].data
+    cells = sum(min(sk, start + row + 1) for row in range(sq))
+work = physical_work(plan, useful_cube_flops=4 * b * h * d * cells)
 hardware = hardware_snapshot(args.physical)
 record = {
     "hardware": hardware,

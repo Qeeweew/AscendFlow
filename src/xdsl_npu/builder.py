@@ -119,6 +119,7 @@ class Kernel:
         issue_order=None,
         period=1,
         phase=0,
+        phase_width=1,
         logical_phase=0,
     ) -> TaskOp:
         assert self.task_block is not None
@@ -129,6 +130,7 @@ class Kernel:
             issue_order=IntAttr(self.num_tasks if issue_order is None else issue_order),
             period=IntAttr(period),
             phase=IntAttr(phase),
+            phase_width=IntAttr(phase_width),
         )
         if logical_phase:
             attrs["logical_phase"] = IntAttr(logical_phase)

@@ -1,14 +1,17 @@
 import pytest
+from flash_attention import flash_attention
 
-from xdsl_npu import autosync, flash_attention
+from xdsl_npu import autosync
 from xdsl_npu.model import CompileError
 from xdsl_npu.performance import physical_work, profile_evidence, theoretical_metrics
 
 
 def test_exact_typed_dma_and_cube_work_distinguish_cache_footprint_from_requests():
-    baseline = physical_work(autosync(flash_attention(1, 2, 1, 64, 256, 64)))
+    baseline = physical_work(
+        autosync(flash_attention(1, 2, 1, 64, 256, 64)), useful_cube_flops=4 * 2 * 64 * 256 * 64
+    )
     assert baseline["native_cube_flops"] == 4 * 2 * 64 * 256 * 64
-    assert baseline["native_cube_flops"] == baseline["useful_attention_cube_flops"]
+    assert baseline["native_cube_flops"] == baseline["useful_cube_flops"]
     assert baseline["gm_instruction_requests_by_root"]["k:R"] == 2 * 256 * 64 * 2
     assert baseline["gm_instruction_request_bytes"] == 688128
     assert baseline["unique_gm_io_allocation_bytes"] == 98304
@@ -21,16 +24,17 @@ def test_exact_typed_dma_and_cube_work_distinguish_cache_footprint_from_requests
 
 def test_causal_physical_work_counts_visited_tile_padding_separately_from_useful_cells():
     work = physical_work(
-        autosync(flash_attention(1, 32, 1, 1, 128, 64, causal=True, query_start=17))
+        autosync(flash_attention(1, 32, 1, 1, 128, 64, causal=True, query_start=17)),
+        useful_cube_flops=4 * 32 * 18 * 64,
     )
     assert work["native_cube_flops"] == 4 * 32 * 128 * 64
-    assert work["useful_attention_cube_flops"] == 4 * 32 * 18 * 64
+    assert work["useful_cube_flops"] == 4 * 32 * 18 * 64
 
 
 def test_roofline_uses_explicit_array_and_bandwidth_assumptions():
     work = {
         "native_cube_flops": 68_719_476_736,
-        "useful_attention_cube_flops": 68_719_476_736,
+        "useful_cube_flops": 68_719_476_736,
         "gm_instruction_request_bytes": 1234567,
         "unique_gm_io_allocation_bytes": 33554432,
     }
@@ -66,11 +70,17 @@ def test_profile_counters_reject_stale_timing_and_wrong_card(tmp_path):
     with sqlite3.connect(db) as database:
         database.execute("CREATE TABLE FreqParse(syscnt INTEGER, freq INTEGER)")
         database.execute("INSERT INTO FreqParse VALUES (100, 1800)")
-    evidence = profile_evidence(tmp_path, summary, physical=1, warmup=1, repeats=2)
+    evidence = profile_evidence(
+        tmp_path, summary, physical=1, warmup=1, repeats=2, kernel="flash_attention"
+    )
     assert evidence["pipe_activity_medians"]["aic_mac_ratio"] == pytest.approx(0.3)
     assert evidence["frequency_records"][0]["samples_syscnt_mhz"] == [(100, 1800)]
     with pytest.raises(CompileError, match="one generated mixed task"):
-        profile_evidence(tmp_path, summary, physical=0, warmup=1, repeats=2)
+        profile_evidence(
+            tmp_path, summary, physical=0, warmup=1, repeats=2, kernel="flash_attention"
+        )
     source.write_text(source.read_text().replace(",12,", ",120,"))
     with pytest.raises(CompileError, match="CSV changed"):
-        profile_evidence(tmp_path, summary, physical=1, warmup=1, repeats=2)
+        profile_evidence(
+            tmp_path, summary, physical=1, warmup=1, repeats=2, kernel="flash_attention"
+        )

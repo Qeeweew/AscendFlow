@@ -142,8 +142,8 @@ msprof 内核时间，记录当前性能证据及其限制。
 Flash Attention 示例及完整自动同步前后 IR：
 
 ```bash
-.venv/bin/xdsl-npu flash-attention --batch 1 --query-heads 2 --kv-heads 1 --query-length 64 --kv-length 256 --head-dim 64 --shared --output runs/attention/example
-.venv/bin/xdsl-npu flash-attention --batch 1 --query-heads 8 --kv-heads 8 --query-length 4096 --kv-length 4096 --head-dim 128 --block-q 128 --q-cache l1 --reuse-ub --pipeline --packed-reductions --shared --output runs/attention/mha-4k-d128
+.venv/bin/python compiler/examples/flash_attention.py --batch 1 --query-heads 2 --kv-heads 1 --query-length 64 --kv-length 256 --head-dim 64 --shared --output runs/attention/example
+.venv/bin/python compiler/examples/flash_attention.py --batch 1 --query-heads 8 --kv-heads 8 --query-length 4096 --kv-length 4096 --head-dim 128 --block-q 128 --q-cache l1 --reuse-ub --pipeline --packed-reductions --shared --output runs/attention/mha-4k-d128
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python compiler/examples/run_attention.py runs/attention/example --physical 1
 ```
 

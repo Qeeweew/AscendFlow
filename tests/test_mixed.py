@@ -22,6 +22,7 @@ from xdsl_npu.ir import (
     task_attrs,
 )
 from xdsl_npu.mixed import (
+    ACTORS,
     cross_op,
     extract_mixed,
     global_dependencies,
@@ -148,6 +149,40 @@ def test_release_is_read_retirement_and_does_not_wait_for_vector_or_store():
         assert not graph.precedes(credit, begin[scale])
     report = explain_plan(plan)
     assert any(o["milestone"] == "read_retired" for o in report["cross_obligations"])
+
+
+@pytest.mark.parametrize("segments", [2, 4, 8])
+def test_segmented_epoch_notifies_once_after_all_real_native_accesses(segments):
+    plan = autosync(mixed_pipeline(3, 2, segments=segments, local_slots=2))
+    report = verify_plan(parse(dump(plan)))
+    assert report["epochs"] == 3 and report["tasks_per_group"] == segments * 36
+    m, channels, commands = mixed_execution(plan)
+    graph, begin, end, sends, receives, _, _ = mixed_graph(m, channels, commands)
+    assert all(d == segments for d in m.divisors.values())
+    assert len([c for c in commands["aic"] if c.kind == "cross_set"]) == 3
+    for epoch in range(3):
+        producer = next(i for i, t in enumerate(m.programs["aic"].tasks) if t.uid == "export")
+        for piece in range(segments):
+            inst = ("aic", Instance(epoch * segments + piece, producer))
+            assert graph.precedes(end[inst], sends[("aic", "gm_ready", epoch)])
+        for actor in ACTORS[1:]:
+            tasks = {t.uid: i for i, t in enumerate(m.programs[actor].tasks)}
+            for piece in range(segments):
+                read = (actor, Instance(epoch * segments + piece, tasks["import_tile"]))
+                assert graph.precedes(receives[(actor, "gm_ready", epoch)], begin[read])
+                assert graph.precedes(end[read], sends[(actor, "gm_credit", epoch)])
+            post = (actor, Instance(epoch * segments + segments - 1, tasks["store"]))
+            assert not graph.precedes(end[post], sends[(actor, "gm_credit", epoch)])
+
+
+@pytest.mark.parametrize("channel,hazard", [("gm_ready", "RAW"), ("gm_credit", "WAR")])
+def test_publishing_or_releasing_before_the_last_segment_is_rejected(channel, hazard):
+    plan = autosync(mixed_pipeline(3, 2, segments=2, local_slots=2))
+    for op in plan.walk():
+        if isinstance(op, CrossSyncOp) and op.action.data == "set" and op.channel.data == channel:
+            op.attributes["lower"] = IntAttr(0)
+    with pytest.raises(CompileError, match=f"missing mixed {hazard}"):
+        verify_plan(plan)
 
 
 def test_2201_cross_wait_is_controller_gate_not_an_mte2_queue_entry():

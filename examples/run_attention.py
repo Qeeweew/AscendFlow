@@ -4,7 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from xdsl_npu.attention_oracle import run_attention
+from attention_oracle import run_attention
+
 from xdsl_npu.ir import parse
 
 parser = argparse.ArgumentParser()

@@ -20,7 +20,7 @@ from .model import ITEMSIZE, require, storage_layout
 from .toolchain import CANN
 
 
-def profile_evidence(profile, summary, *, physical, warmup, repeats):
+def profile_evidence(profile, summary, *, physical, warmup, repeats, kernel):
     """Bind measured counters/clocks to the exact single-kernel timing CSV.
 
     The pipe ratios overlap; they are activity counters, not mutually
@@ -42,12 +42,12 @@ def profile_evidence(profile, summary, *, physical, warmup, repeats):
     require(
         len(rows) == warmup + repeats
         and all(
-            row["Op Name"] == "flash_attention"
+            row["Op Name"] == kernel
             and row["Task Type"] == "MIX_AIC"
             and int(row["Device_id"]) == physical
             for row in rows
         ),
-        "FA counter accounting requires one generated mixed task per launch",
+        "counter accounting requires one generated mixed task per launch",
     )
     measured = rows[warmup:]
     durations = [float(row["Task Duration(us)"]) for row in measured]
@@ -131,7 +131,7 @@ def hardware_snapshot(physical):
     }
 
 
-def physical_work(plan):
+def physical_work(plan, *, useful_cube_flops=None):
     """Count EVERY finite native activation, weighted by its actual group grid."""
     from .dispatch import extract_dispatch
     from .ir import StaticDispatchOp
@@ -194,24 +194,17 @@ def physical_work(plan):
                         and not task.refs[1].contiguous
                     ):
                         calls = task.params[0]
+                    elif task.native.endswith("_row_broadcast"):
+                        calls = min(task.params[0], task.params[1] // 64)
                     elif task.native in {
                         "reduce_tile_sum64",
                         "reduce_tile_max64",
-                    } or task.native.endswith("_row_broadcast"):
+                    }:
                         calls = task.params[1] // 64
                     elif task.native in {"mask_causal", "mask_prefix"}:
                         calls = task.params[0] * task.params[1] // 64
                     vector_calls[task.native] += groups * calls
     roots = mixed_programs[0].roots
-    attrs = mixed_programs[0].op.attributes
-    useful = None
-    if "attention_shape" in attrs:
-        b, h, _, sq, sk, d = [n.data for n in attrs["attention_shape"]]
-        cells = sq * sk
-        if attrs["attention_causal"].data:
-            start = attrs["attention_start"].data
-            cells = sum(min(sk, start + row + 1) for row in range(sq))
-        useful = 4 * b * h * d * cells
     unique_io = sum(
         root.nbytes.data
         for name, root in roots.items()
@@ -219,7 +212,7 @@ def physical_work(plan):
     )
     return {
         "native_cube_flops": cube_flops,
-        "useful_attention_cube_flops": useful,
+        "useful_cube_flops": useful_cube_flops,
         "native_instances": native_instances,
         "dma_source_bytes_by_route": dict(dma),
         "gm_instruction_requests_by_root": dict(gm),
@@ -253,13 +246,11 @@ def theoretical_metrics(
     peak = hardware["aic_cores"] * mhz * 1e6 * cube_ops_per_core_cycle
     flop = work["native_cube_flops"]
     requested = work["gm_instruction_request_bytes"]
-    useful = work["useful_attention_cube_flops"]
+    useful = work["useful_cube_flops"]
     report = {
         "measured_us": duration_us,
         "native_cube_tflops": flop / duration_us / 1e6,
-        "useful_cube_tflops": work["useful_attention_cube_flops"] / duration_us / 1e6
-        if work["useful_attention_cube_flops"] is not None
-        else None,
+        "useful_cube_tflops": useful / duration_us / 1e6 if useful is not None else None,
         "conditional_cube_peak_tflops": peak / 1e12,
         "conditional_cube_only_min_us": flop / peak * 1e6,
         "fraction_of_conditional_cube_peak": flop / (duration_us * 1e-6) / peak,

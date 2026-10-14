@@ -204,6 +204,7 @@ class TaskOp(IRDLOperation):
     issue_order = opt_attr_def(IntAttr)
     period = opt_attr_def(IntAttr)
     phase = opt_attr_def(IntAttr)
+    phase_width = opt_attr_def(IntAttr)
     logical_phase = opt_attr_def(IntAttr)
     params = attr_def(ArrayAttr[IntAttr])
     scalar = attr_def(FloatAttr)

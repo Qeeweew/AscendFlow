@@ -110,7 +110,7 @@ def phased_pipeline(phases=9, phase_length=1, tile=16):
     return k.finish()
 
 
-def mixed_pipeline(count=3, slots=2, *, aiv1_delay=0):
+def mixed_pipeline(count=3, slots=2, *, aiv1_delay=0, segments=1, local_slots=None):
     """Minimal real FIX -> GM ring -> two AIVs, including zero/reuse boundaries."""
     from xdsl.dialects.builtin import IntAttr, StringAttr
 
@@ -120,25 +120,28 @@ def mixed_pipeline(count=3, slots=2, *, aiv1_delay=0):
     from .sync import parts
 
     require(isinstance(aiv1_delay, int) and 0 <= aiv1_delay <= 64, "AIV delay must be in [0,64]")
+    require(type(segments) is int and 1 <= segments <= 16, "static segments must be in [1,16]")
+    local_slots = slots if local_slots is None else local_slots
+    native_count, gm_slots = count * segments, slots * segments
 
-    cube = cube_pipeline(count, slots)
+    cube = cube_pipeline(native_count, local_slots)
     kernel, stream = parts(cube)
     root = next(
         o for o in kernel.body.block.ops if isinstance(o, BufferOp) and o.sym_name.data == "c"
     )
-    root.attributes.update({"sym_name": StringAttr("scratch"), "nbytes": IntAttr(slots * 1024)})
+    root.attributes.update({"sym_name": StringAttr("scratch"), "nbytes": IntAttr(gm_slots * 1024)})
     view = next(o for o in stream.body.block.ops if isinstance(o, ViewOp) and o.source is root.ref)
-    view.attributes["modulus"] = IntAttr(slots)
+    view.attributes["modulus"] = IntAttr(gm_slots)
     vectors = []
     for subblock in range(2):
         v = Kernel("consumer", disjoint_external=True)
-        gm = v.buffer("scratch", "GM", slots * 1024, external=True)
-        y = v.buffer("y", "GM", count * 1024, external=True)
-        ub = v.buffer("tile", "UB", slots * 512)
+        gm = v.buffer("scratch", "GM", gm_slots * 1024, external=True)
+        y = v.buffer("y", "GM", native_count * 1024, external=True)
+        ub = v.buffer("tile", "UB", local_slots * 512)
         delay = v.buffer("delay_word", "UB", 32) if subblock == 1 and aiv1_delay else None
-        v.loop(count)
-        src = v.view(gm, 512, offset=subblock * 512, stride=1024, slots=slots)
-        local = v.view(ub, 512, stride=512, slots=slots)
+        v.loop(native_count)
+        src = v.view(gm, 512, offset=subblock * 512, stride=1024, slots=gm_slots)
+        local = v.view(ub, 512, stride=512, slots=local_slots)
         dst = v.view(y, 512, offset=subblock * 512, stride=1024)
         if delay is not None:
             word = v.view(delay, 4)
@@ -155,4 +158,11 @@ def mixed_pipeline(count=3, slots=2, *, aiv1_delay=0):
         v.task("scale", "muls", local, local, scalar=2, stage=1, issue_order=10)
         v.task("store", "copy", local, dst, stage=2, issue_order=0)
         vectors.append(v.finish())
-    return compose("mixed_pipeline", cube, *vectors, disjoint_external=True)
+    return compose(
+        "mixed_pipeline",
+        cube,
+        *vectors,
+        cube_epoch=segments,
+        vector_epoch=segments,
+        disjoint_external=True,
+    )

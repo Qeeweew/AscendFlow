@@ -126,6 +126,19 @@ def native_line(task, count, core="0"):
     if task.native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
         rows, cols = task.params
         function = task.native.removesuffix("_row_broadcast")
+        if rows < cols // 64:
+            # Repeat across the columns of one row. The eight identical
+            # scalar words stay fixed (block/repeat strides 0/0); the full
+            # matrix footprint and the exact in-place policy are unchanged.
+            src = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4}")
+            scalar = pointer(refs[1], core=core, extra="npu_row * 32")
+            dst = pointer(refs[2], core=core, extra=f"npu_row * {cols * 4}")
+            return (
+                "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
+                f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
+                f"asc_{function}({dst}, {src}, {scalar}, uint8_t({cols // 64}), "
+                "1, 1, 0, 8, 8, 0); }"
+            )
         src = pointer(refs[0], core=core, extra="npu_chunk * 256")
         dst = pointer(refs[2], core=core, extra="npu_chunk * 256")
         return (
@@ -143,7 +156,7 @@ def native_line(task, count, core="0"):
         )
         return (
             f"asc_set_mask_norm(); asc_set_vector_mask(0, uint64_t({(1 << partials) - 1})); "
-            f"{function}({p[1]}, {p[0]}, uint8_t({rows}), 1, 1, 1);"
+            f"{function}({p[1]}, {p[0]}, uint8_t({rows}), 1, 1, {refs[0].row_stride // 32});"
         )
     if task.native in {"mul_columns64", "fma_columns64"}:
         function = "asc_fma" if task.native == "fma_columns64" else "asc_mul"
@@ -370,7 +383,11 @@ def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
             current_task = task
             guard = f"step >= {task.lower + task.stage} && step < {task.upper + task.stage}"
             if task.period != 1:
-                guard += f" && (step - {task.stage}) % {task.period} == {task.phase}"
+                position = f"(step - {task.stage}) % {task.period}"
+                if task.phase_width == 1:
+                    guard += f" && {position} == {task.phase}"
+                elif task.phase_width != task.period:
+                    guard += f" && {position} >= {task.phase} && {position} < {task.phase + task.phase_width}"
             lines += [
                 f"    // {task.uid}: {task.pipe}, logical generation = step - {task.stage}",
                 f"    if ({guard}) {{",

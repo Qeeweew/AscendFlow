@@ -10,9 +10,9 @@ from math import sqrt
 
 from xdsl.dialects.builtin import ArrayAttr, FloatAttr, IntAttr, f32
 
-from .builder import Kernel
-from .mixed import compose
-from .model import require, round_f32
+from xdsl_npu.builder import Kernel
+from xdsl_npu.mixed import compose
+from xdsl_npu.model import require, round_f32
 
 
 def _flash_attention_group(
@@ -708,7 +708,7 @@ def flash_attention(
     )
     if not causal and batch * query_heads * (query_length // block_q) <= 1024:
         return _flash_attention_group(*args, **options, query_start=query_start)
-    from .dispatch import static_dispatch
+    from xdsl_npu.dispatch import static_dispatch
 
     tiles = query_length // block_q
     total_groups = batch * query_heads * tiles
@@ -747,3 +747,67 @@ def flash_attention(
         cursor += batch * query_heads * (stop - first)
         first = stop
     return static_dispatch("flash_attention", cases)
+
+
+def main():
+    import argparse
+    import json
+    from pathlib import Path
+
+    from xdsl_npu.cli import build_module
+
+    parser = argparse.ArgumentParser(
+        description="Flash Attention example for the xDSL NPU compiler"
+    )
+    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--query-heads", type=int, default=8)
+    parser.add_argument("--kv-heads", type=int, default=8)
+    parser.add_argument("--query-length", type=int, default=4096)
+    parser.add_argument("--kv-length", type=int, default=4096)
+    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--dtype", choices=["f16", "bf16"], default="f16")
+    parser.add_argument("--block-q", type=int)
+    parser.add_argument("--block-kv", type=int, default=128)
+    parser.add_argument("--gm-slots", type=int, default=2)
+    parser.add_argument("--slots", type=int, default=2)
+    parser.add_argument("--softmax-scale", type=float)
+    parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--query-start", type=int, default=0)
+    parser.add_argument("--q-cache", choices=["l0", "l1"], default="l0")
+    parser.add_argument("--reuse-ub", action="store_true")
+    parser.add_argument("--pipeline", action="store_true")
+    parser.add_argument("--packed-reductions", action="store_true")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--shared", action="store_true")
+    args = parser.parse_args()
+    module = flash_attention(
+        args.batch,
+        args.query_heads,
+        args.kv_heads,
+        args.query_length,
+        args.kv_length,
+        args.head_dim,
+        dtype=args.dtype,
+        block_q=args.block_q,
+        block_kv=args.block_kv,
+        gm_slots=args.gm_slots,
+        local_slots=args.slots,
+        softmax_scale=args.softmax_scale,
+        causal=args.causal,
+        query_start=args.query_start,
+        q_cache=args.q_cache,
+        reuse_ub=args.reuse_ub,
+        pipeline=args.pipeline,
+        packed_reductions=args.packed_reductions,
+    )
+    print(
+        json.dumps(
+            build_module(module, args.output, compile_asc=args.compile, shared=args.shared),
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

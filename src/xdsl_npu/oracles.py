@@ -192,7 +192,7 @@ def mixed_inputs(module):
             [buffers.get(name, b"\xcd" * root.nbytes.data) for name, root in m.roots.items()],
             array("f", (f32(v * 2) for v in product)),
             (0, 0),
-            [m.epochs, 16, 16, 16],
+            [m.programs["aic"].count, 16, 16, 16],
         )
     if m.op.sym_name.data != "gemm_bias_silu":
         raise ValueError("no numerical oracle for this mixed algorithm")

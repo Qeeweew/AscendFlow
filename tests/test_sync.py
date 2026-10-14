@@ -73,6 +73,32 @@ def test_ssa_last_use_does_not_release_async_store_input():
         verify_plan(plan)
 
 
+def test_last_native_piece_can_release_a_lower_generation_in_a_later_phase():
+    k = Kernel("signed_generation", disjoint_external=True)
+    x = k.buffer("x", "GM", 32, external=True, initialized=True)
+    y = k.buffer("y", "GM", 64, external=True)
+    ub = k.buffer("tile", "UB", 32)
+    k.loop(2)
+    src, tile, dst = k.view(x, 32), k.view(ub, 32), k.view(y, 32, stride=32)
+    k.task("load", "copy", src, tile, active=(0, 1))
+    k.task("store", "copy", tile, dst, stage=1)
+    k.task("reuse", "adds", tile, tile, scalar=1, stage=3, active=(0, 1), logical_phase=1)
+    source = k.finish()
+    source.body.block.first_op.attributes["epoch_divisor"] = IntAttr(2)
+    plan = autosync(parse(dump(source)))
+    release = next(
+        c for c in channels(plan) if c.source.data == "store" and c.destination.data == "reuse"
+    )
+    assert release.distance.data == -1 and release.lower.data == 1
+    assert verify_plan(plan)["tasks"] == 4
+    assert bounded_check(plan).exhaustive
+    remove_channel(plan, release)
+    with pytest.raises(CompileError, match="missing WAR"):
+        verify_plan(plan)
+    with pytest.raises(CompileError, match="counterexample"):
+        bounded_check(plan)
+
+
 def test_binary_event_ring_reduction_needs_reverse_completion():
     plan = autosync(vector_pipeline(6))
     ch = next(c for c in channels(plan) if c.source.data == "load")

@@ -102,7 +102,7 @@ def execution(module: ModuleOp, *, _program=None) -> Execution:
             optional_int(op.stride, 1),
         )
         require(
-            0 <= d and 0 <= lo < hi <= p.count and hi + d <= p.count and 1 <= stride <= 4096,
+            0 <= lo < hi <= p.count and 0 <= lo + d < hi + d <= p.count and 1 <= stride <= 4096,
             f"{name}: unsupported activation/generation span",
         )
         require(
@@ -146,7 +146,6 @@ def execution(module: ModuleOp, *, _program=None) -> Execution:
             require(action in {"set", "wait", "barrier"}, f"unknown sync action {action}")
             require(
                 0 <= op.lower.data < op.upper.data <= p.count
-                and op.distance.data >= 0
                 and 1 <= optional_int(op.stride, 1) <= 4096,
                 "sync has invalid active generation span",
             )
@@ -555,7 +554,8 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
                     sync_op(g, "barrier", "", b.pipe, lo + d, hi + d, d, stride), task_ops[dst]
                 )
                 continue
-            name = f"c{i}_{a.uid}_{b.uid}_d{d}"
+            shift = str(d) if d >= 0 else f"neg{-d}"
+            name = f"c{i}_{a.uid}_{b.uid}_d{shift}"
             epochs = len(range(lo, hi, stride))
             w = widths[i] if widths is not None else min(8, epochs)
             # Before allocation, logical pairs are independent in the completion graph.
@@ -654,7 +654,8 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
                 graph, _, _, waits, physical_sets = completion_graph(ex)
             except CompileError:
                 continue
-            name = f"c{i}_{p.tasks[src].uid}_{p.tasks[dst].uid}_d{d}"
+            shift = str(d) if d >= 0 else f"neg{-d}"
+            name = f"c{i}_{p.tasks[src].uid}_{p.tasks[dst].uid}_d{shift}"
             pairs = [[item for item in seq if item[1] == name] for seq in physical_sets.values()]
             if all(
                 graph.precedes(waits[(a[1], a[2])], b[0])

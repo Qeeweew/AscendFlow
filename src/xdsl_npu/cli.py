@@ -2,7 +2,6 @@ import argparse
 import json
 from pathlib import Path
 
-from .attention import flash_attention
 from .codegen import emit_asc
 from .examples import (
     cube_pipeline,
@@ -37,7 +36,6 @@ def main():
             "mixed",
             "phased",
             "gdn",
-            "flash-attention",
             "ir",
         ],
     )
@@ -50,21 +48,8 @@ def main():
     parser.add_argument("--key-dim", type=int, default=64)
     parser.add_argument("--value-dim", type=int, default=64)
     parser.add_argument("--snapshot-slots", type=int, default=2)
-    parser.add_argument("--query-heads", type=int, default=8)
-    parser.add_argument("--kv-heads", type=int, default=8)
-    parser.add_argument("--query-length", type=int, default=4096)
-    parser.add_argument("--kv-length", type=int, default=4096)
-    parser.add_argument("--head-dim", type=int, default=128)
-    parser.add_argument("--dtype", choices=["f16", "bf16"], default="f16")
-    parser.add_argument("--block-q", type=int)
-    parser.add_argument("--block-kv", type=int, default=128)
-    parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--query-start", type=int, default=0)
-    parser.add_argument("--q-cache", choices=["l0", "l1"], default="l0")
-    parser.add_argument("--reuse-ub", action="store_true")
-    parser.add_argument("--pipeline", action="store_true")
-    parser.add_argument("--packed-reductions", action="store_true")
     parser.add_argument("--slots", type=int, default=2)
+    parser.add_argument("--segments", type=int, default=1, help="native pieces per mixed GM epoch")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--columns", type=int, default=128)
     parser.add_argument("--row-block", type=int)
@@ -107,7 +92,9 @@ def main():
     elif args.example == "cube":
         module = cube_pipeline(args.count, args.slots)
     elif args.example == "mixed":
-        module = mixed_pipeline(args.count, args.slots, aiv1_delay=args.aiv1_delay)
+        module = mixed_pipeline(
+            args.count, args.slots, aiv1_delay=args.aiv1_delay, segments=args.segments
+        )
     elif args.example == "scalar":
         module = scalar_pipeline(args.count, args.blocks)
     elif args.example == "phased":
@@ -120,26 +107,6 @@ def main():
             value_dim=args.value_dim,
             slots=args.slots,
             snapshot_slots=args.snapshot_slots,
-        )
-    elif args.example == "flash-attention":
-        module = flash_attention(
-            args.batch,
-            args.query_heads,
-            args.kv_heads,
-            args.query_length,
-            args.kv_length,
-            args.head_dim,
-            dtype=args.dtype,
-            block_q=args.block_q,
-            block_kv=args.block_kv,
-            gm_slots=args.gm_slots,
-            local_slots=args.slots,
-            causal=args.causal,
-            query_start=args.query_start,
-            q_cache=args.q_cache,
-            reuse_ub=args.reuse_ub,
-            pipeline=args.pipeline,
-            packed_reductions=args.packed_reductions,
         )
     elif args.example == "batched-matmul":
         module = batched_matmul_nt(
@@ -188,9 +155,31 @@ def main():
         module = vector_pipeline(
             args.count, slots=args.slots, late_reader=args.example == "last-read", tail=args.tail
         )
+    report = build_module(
+        module,
+        args.output,
+        compile_asc=args.compile,
+        shared=args.shared,
+        check_interleavings=args.check_interleavings,
+        max_check_states=args.max_check_states,
+    )
+    print(json.dumps(report, indent=2))
+
+
+def build_module(
+    module,
+    output,
+    *,
+    compile_asc=False,
+    shared=False,
+    check_interleavings=None,
+    max_check_states=200_000,
+):
+    """Build any physical IR; algorithm examples supply their own factories."""
+    output = Path(output)
     plan = autosync(module)
     report = verify_plan(plan)
-    if args.check_interleavings:
+    if check_interleavings:
         from dataclasses import asdict
 
         from .check import bounded_check
@@ -199,24 +188,24 @@ def main():
 
         if isinstance(plan.body.block.first_op, MixedOp):
             checked = bounded_mixed_check(
-                plan, scope=args.check_interleavings, max_states=args.max_check_states
+                plan, scope=check_interleavings, max_states=max_check_states
             )
-        elif args.check_interleavings == "all":
-            checked = bounded_check(plan, max_states=args.max_check_states)
+        elif check_interleavings == "all":
+            checked = bounded_check(plan, max_states=max_check_states)
         else:
-            parser.error("shared interleaving scope requires a mixed kernel")
+            raise ValueError("shared interleaving scope requires a mixed kernel")
         report["bounded_interleavings"] = asdict(checked)
     source = emit_asc(plan)
-    args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "before.xdsl").write_text(dump(module))
-    (args.output / "after.xdsl").write_text(dump(plan))
-    (args.output / "witnesses.json").write_text(json.dumps(explain_plan(plan), indent=2) + "\n")
-    (args.output / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "before.xdsl").write_text(dump(module))
+    (output / "after.xdsl").write_text(dump(plan))
+    (output / "witnesses.json").write_text(json.dumps(explain_plan(plan), indent=2) + "\n")
+    (output / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
     name = plan.body.block.first_op.sym_name.data
-    (args.output / f"{name}.asc").write_text(source)
-    if args.compile or args.shared:
-        report["cann"] = offline_compile(source, args.output.resolve(), name, shared=args.shared)
-    print(json.dumps(report, indent=2))
+    (output / f"{name}.asc").write_text(source)
+    if compile_asc or shared:
+        report["cann"] = offline_compile(source, output.resolve(), name, shared=shared)
+    return report
 
 
 if __name__ == "__main__":

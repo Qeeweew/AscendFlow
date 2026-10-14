@@ -162,9 +162,13 @@ class Task:
     period: int = 1
     phase: int = 0
     logical_phase: int = 0
+    phase_width: int = 1
 
     def active(self, g):
-        return self.lower <= g < self.upper and g % self.period == self.phase
+        return (
+            self.lower <= g < self.upper
+            and self.phase <= g % self.period < self.phase + self.phase_width
+        )
 
     def modes_for(self, g):
         if self.native == "mad_cycle":
@@ -209,14 +213,24 @@ class Program:
     tasks: tuple[Task, ...]
     config: bool
     blocks: int = 1
+    epoch_divisor: int = 1
 
     def instances(self):
-        return [
+        instances = [
             Instance(g, t)
             for g in range(self.count)
             for t, task in enumerate(self.tasks)
             if task.active(g)
         ]
+        return sorted(
+            instances,
+            key=lambda i: (
+                i.generation // self.epoch_divisor,
+                self.tasks[i.task].logical_phase,
+                i.generation,
+                i.task,
+            ),
+        )
 
     def issued(self):
         return sorted(
@@ -406,7 +420,7 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
         rows, cols = params
         require(
             1 <= rows <= 255
-            and 64 <= cols <= 256
+            and 64 <= cols <= 1024
             and cols % 64 == 0
             and len(refs) == 3
             and banks == ("UB",) * 3
@@ -422,14 +436,15 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
         rows, partials = params
         require(
             1 <= rows <= 255
-            and 1 <= partials <= 8
+            and 1 <= partials <= 64
             and len(refs) == 2
             and banks == ("UB", "UB")
             and dtypes == ("f32", "f32")
             and layouts == ("linear", "linear")
             and refs[0].rows == rows
             and refs[0].nbytes == partials * 4
-            and refs[0].row_stride == 32
+            and refs[0].row_stride % 32 == 0
+            and partials * 4 <= refs[0].row_stride <= 255 * 32
             and refs[1].contiguous
             and lengths[1] == rows * 4,
             "packed partial reduction reads masked words in aligned rows and writes compact statistics",
@@ -980,11 +995,14 @@ def extract(module: ModuleOp) -> Program:
                 "task activation must be a bounded contiguous interval",
             )
             period, phase = optional_int(op.period, 1), optional_int(op.phase, 0)
+            phase_width = optional_int(op.phase_width, 1)
             logical_phase = optional_int(op.logical_phase, 0)
             require(0 <= logical_phase <= 255, "logical phase must be in [0,255]")
             require(
-                1 <= period <= MAX_INSTANCES and 0 <= phase < period,
-                "static periodic task activation requires 1<=period<=4096 and 0<=phase<period",
+                1 <= period <= MAX_INSTANCES
+                and 0 <= phase < period
+                and 1 <= phase_width <= period - phase,
+                "static periodic task activation requires a nonempty phase interval inside period<=4096",
             )
             issue_order = optional_int(op.issue_order, len(tasks))
             require(
@@ -1006,6 +1024,7 @@ def extract(module: ModuleOp) -> Program:
                 period,
                 phase,
                 logical_phase,
+                phase_width,
             )
             if scalar_source is not None:
                 provider = next(t for t in tasks if t.uid == scalar_source)
@@ -1040,6 +1059,13 @@ def extract(module: ModuleOp) -> Program:
         sum(sum(t.active(g) for g in range(count)) for t in tasks) <= MAX_INSTANCES,
         f"finite verifier budget exceeded ({MAX_INSTANCES} task instances); no unchecked fallback",
     )
+    epoch_divisor = optional_int(kernel.epoch_divisor, 1)
+    require(
+        type(epoch_divisor) is int
+        and 1 <= epoch_divisor <= MAX_INSTANCES
+        and count % epoch_divisor == 0,
+        "native generation clock must form complete static logical epochs",
+    )
     program = Program(
         kernel.sym_name.data,
         kernel.core.data,
@@ -1048,6 +1074,7 @@ def extract(module: ModuleOp) -> Program:
         tuple(tasks),
         config,
         blocks,
+        epoch_divisor,
     )
     verify_independent_owners(program)
     return program
