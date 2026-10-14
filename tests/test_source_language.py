@@ -6,10 +6,15 @@ from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import CrossChannelOp, CrossSyncOp, dump, parse
-from xdsl_npu.lowering import lower_source
+from xdsl_npu.lowering import lower_source as _lower_source
 from xdsl_npu.mixed import extract_mixed
 from xdsl_npu.model import CompileError
 from xdsl_npu.source_ir import AllocationOp, DomainOp, PipelineOp, StageOp, ViewOp
+
+
+# Legacy finite-interleaving regressions explicitly select the diagnostic backend.
+def finite_lower_source(module):
+    return _lower_source(module, symbolic=False)
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 4])
@@ -83,7 +88,7 @@ def test_typed_copy_requires_an_explicit_rounding_conversion():
 
 @pytest.mark.parametrize("count", [0, 1, 2, 4])
 def test_source_vector_closes_through_physical_sync_and_asc(count):
-    plan = autosync(lower_source(parse(dump(vector_source(count)))))
+    plan = autosync(finite_lower_source(parse(dump(vector_source(count)))))
     assert verify_plan(plan)["tasks"] == 3 * count
     if count <= 2:
         assert bounded_check(plan).exhaustive
@@ -95,7 +100,7 @@ def test_source_vector_closes_through_physical_sync_and_asc(count):
 
 @pytest.mark.parametrize("count", [0, 1, 2, 4])
 def test_source_cv_preserves_shared_stage_and_actual_handoff(count):
-    plan = autosync(lower_source(parse(dump(cv_source(count)))))
+    plan = autosync(finite_lower_source(parse(dump(cv_source(count)))))
     report = verify_plan(plan)
     assert report["epochs"] == count
     mixed = extract_mixed(plan)
@@ -138,7 +143,7 @@ def test_a_logical_value_is_not_a_snapshot_of_overwritten_storage():
                     N.copy(result, Y[task, :])
 
     with pytest.raises(CompileError, match="was overwritten"):
-        lower_source(stale)
+        finite_lower_source(stale)
 
 
 def test_nested_pipeline_result_preserves_the_producer_descriptor_and_slot():
@@ -159,7 +164,7 @@ def test_nested_pipeline_result_preserves_the_producer_descriptor_and_slot():
 
     from xdsl_npu.model import extract
 
-    physical = lower_source(parse(dump(nested)))
+    physical = finite_lower_source(parse(dump(nested)))
     program = extract(physical)
     store = next(t for t in program.tasks if t.uid.startswith("store_"))
     # Inner final part=2 maps to slot 0 for EVERY outer task. Re-evaluating
@@ -181,7 +186,7 @@ def test_two_logical_values_may_share_one_root_with_disjoint_input_views():
                 result = N.add(left, right, out=y)
                 N.copy(result, Y[task, :])
 
-    assert verify_plan(autosync(lower_source(slices)))["tasks"] == 4
+    assert verify_plan(autosync(finite_lower_source(slices)))["tasks"] == 4
 
 
 def test_source_axis_bounds_are_checked_before_flattening_addresses():
@@ -212,7 +217,7 @@ def test_region_yield_types_are_verified_after_source_roundtrip():
 def test_segmented_cv_uses_inner_prefetch_and_complete_outer_handoffs(count, segments):
     from multistage import segmented_cv_source
 
-    physical = lower_source(parse(dump(segmented_cv_source(count, segments))))
+    physical = finite_lower_source(parse(dump(segmented_cv_source(count, segments))))
     plan = autosync(physical)
     report = verify_plan(plan)
     mixed = extract_mixed(plan)
@@ -249,7 +254,7 @@ def test_unimplemented_runtime_initialization_is_rejected_explicitly():
                 N.gemm(a, b, c, initialize=(task == 0))
 
     with pytest.raises(CompileError, match="runtime matmul initialization"):
-        lower_source(invalid)
+        finite_lower_source(invalid)
 
 
 def test_all_segment_contributions_precede_ready_and_an_early_ready_is_rejected():
@@ -259,7 +264,7 @@ def test_all_segment_contributions_precede_ready_and_an_early_ready_is_rejected(
     from xdsl_npu.mixed import mixed_execution, mixed_graph
     from xdsl_npu.model import Instance
 
-    plan = autosync(lower_source(segmented_cv_source(1, 3, 1)))
+    plan = autosync(finite_lower_source(segmented_cv_source(1, 3, 1)))
     mixed, channels, commands = mixed_execution(plan)
     graph, _, end, sends, *_ = mixed_graph(mixed, channels, commands)
     exports = [

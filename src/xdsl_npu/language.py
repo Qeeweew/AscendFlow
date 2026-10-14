@@ -24,6 +24,7 @@ from .source_ir import (
     PipelineOp,
     PredicateOp,
     ProgramOp,
+    SizeOp,
     StageOp,
     TensorType,
     TileType,
@@ -47,8 +48,37 @@ def _ints(values):
 
 def _type(shape, dtype, memory, layout):
     return TensorType(
-        _ints(shape), StringAttr(DType(dtype).value), StringAttr(memory), StringAttr(layout)
+        _ints(-1 if isinstance(n, _Dimension) else n for n in shape),
+        StringAttr(DType(dtype).value),
+        StringAttr(memory),
+        StringAttr(layout),
     )
+
+
+@dataclass(frozen=True)
+class _Dimension:
+    name: str
+    multiple: int = 1
+    scale: int = 1
+
+    def __mul__(self, factor):
+        require(
+            type(factor) is int and factor >= 0,
+            "one runtime extent times a static integer required",
+        )
+        return 0 if factor == 0 else replace(self, scale=self.scale * factor)
+
+    __rmul__ = __mul__
+
+    def __bool__(self):
+        raise TypeError("runtime lengths cannot control Python branches")
+
+
+def dynamic(name, *, multiple_of=1):
+    """Uniform runtime length. Local/native tile dimensions remain static."""
+    require(type(name) is str and name.isidentifier(), "runtime size needs an identifier")
+    require(type(multiple_of) is int and multiple_of > 0, "size multiple must be positive")
+    return _Dimension(name, multiple_of)
 
 
 @dataclass(frozen=True)
@@ -83,7 +113,10 @@ class _Index:
     __radd__ = __add__
 
     def __mul__(self, factor):
-        require(type(factor) is int, "index multiplication requires a static integer")
+        require(type(factor) is int or isinstance(factor, _Dimension), "unsupported index product")
+        if isinstance(factor, _Dimension):
+            constant = _index(self.constant * factor) if self.constant else _Index()
+            return constant + _Index(tuple((v, factor * c, d, m) for v, c, d, m in self.terms))
         return _Index(
             tuple((v, c * factor, d, m) for v, c, d, m in self.terms), self.constant * factor
         )
@@ -134,6 +167,8 @@ class _Index:
 def _index(value):
     if isinstance(value, _Index):
         return value
+    if isinstance(value, _Dimension):
+        return _Index(((_trace().size(value), value.scale, 1, 0),))
     require(type(value) is int, "tensor indices must be static integers or pipeline coordinates")
     return _Index(constant=value)
 
@@ -163,6 +198,26 @@ class _Trace:
         self.pipelines = []
         self.kernel_entered = False
         self.counter = 0
+        self.sizes = {}
+
+    def size(self, dimension):
+        if dimension.name not in self.sizes:
+            op = SizeOp.create(
+                result_types=[IndexType()],
+                attributes={
+                    "sym_name": StringAttr(dimension.name),
+                    "multiple": IntAttr(dimension.multiple),
+                },
+            )
+            block = self.op.body.block
+            if block.first_op is None:
+                block.add_op(op)
+            else:
+                block.insert_op_before(op, block.first_op)
+            self.sizes[dimension.name] = op
+        op = self.sizes[dimension.name]
+        require(op.multiple.data == dimension.multiple, "inconsistent contracts for runtime size")
+        return op.value
 
     def add(self, op):
         self.blocks[-1].add_op(op)
@@ -184,6 +239,9 @@ class _Trace:
         """An exported tile keeps its producer's descriptor and storage version."""
         result = _Index(constant=index.constant)
         for value, coefficient, divisor, modulus in index.terms:
+            if isinstance(value.owner, SizeOp):
+                result += _Index(((value, coefficient, divisor, modulus),))
+                continue
             if value.owner in self.blocks:
                 result += _Index(((value, coefficient, divisor, modulus),))
                 continue
@@ -271,15 +329,21 @@ class _View:
                 require(start.terms == stop.terms, "slice width must be a static integer")
                 width = stop.constant - start.constant
                 require(width > 0, "empty or negative source slice")
-                lo, hi = _index_bounds(start)
-                require(0 <= lo and hi + width <= size, "source slice exceeds its logical axis")
+                if isinstance(size, _Dimension):
+                    _runtime_axis(start, size, width)
+                else:
+                    lo, hi = _index_bounds(start)
+                    require(0 <= lo and hi + width <= size, "source slice exceeds its logical axis")
                 offset += start * stride
                 shape.append(width)
                 strides.append(stride)
             else:
                 index = _index(index)
-                lo, hi = _index_bounds(index)
-                require(0 <= lo and hi < size, "source index exceeds its logical axis")
+                if isinstance(size, _Dimension):
+                    _runtime_axis(index, size, 1)
+                else:
+                    lo, hi = _index_bounds(index)
+                    require(0 <= lo and hi < size, "source index exceeds its logical axis")
                 offset += index * stride
         require(shape, "Scalar accesses need an explicit Scalar operation")
         return _View(self.buffer, tuple(shape), tuple(strides), offset, self.generation)
@@ -311,7 +375,28 @@ class _View:
                 buffer.versions * prod(buffer.shape) * ITEMSIZE[buffer.dtype.value]
             )
         variables = list(dict.fromkeys(v for v, _, _, _ in offset.terms))
-        terms = ArrayAttr(_ints((variables.index(v), c, d, m)) for v, c, d, m in offset.terms)
+        dynamic_terms, static_terms = [], []
+        for variable, coefficient, divisor, modulus in offset.terms:
+            if isinstance(coefficient, _Dimension):
+                count = trace.size(coefficient)
+                if count not in variables:
+                    variables.append(count)
+                dynamic_terms.append(
+                    _ints(
+                        (
+                            variables.index(variable),
+                            variables.index(count),
+                            coefficient.scale,
+                            divisor,
+                            modulus,
+                        )
+                    )
+                )
+            else:
+                static_terms.append(
+                    _ints((variables.index(variable), coefficient, divisor, modulus))
+                )
+        terms = ArrayAttr(static_terms)
         op = ViewOp.build(
             operands=[buffer.op.ref, variables],
             result_types=[_type(self.shape, buffer.dtype, buffer.memory, buffer.layout)],
@@ -319,6 +404,7 @@ class _View:
                 "offset": IntAttr(offset.constant),
                 "terms": terms,
                 "strides": _ints(self.strides),
+                "dynamic_terms": ArrayAttr(dynamic_terms),
             },
         )
         trace.add(op)
@@ -352,15 +438,42 @@ def _index_bounds(index):
         if isinstance(region, ProgramOp):
             count = region.groups.data
         elif isinstance(region, PipelineOp):
-            count = max(1, region.count.data)
+            if region.limit is not None:
+                require(modulus > 0, "runtime index on a static axis needs a bounded mapping")
+                count = divisor * modulus
+            else:
+                count = max(1, region.count.data)
         else:
             require(isinstance(region, DomainOp), "unknown source index scope")
             count = 2 if region.kind.data == "vector" and trace.op.kind.data == "mixed" else 1
-        values = [g // divisor % modulus if modulus else g // divisor for g in range(count)]
-        endpoints = coefficient * min(values), coefficient * max(values)
+        maximum = (count - 1) // divisor
+        if modulus:
+            maximum = min(modulus - 1, maximum)
+        endpoints = 0, coefficient * maximum
         lo += min(endpoints)
         hi += max(endpoints)
     return lo, hi
+
+
+def _runtime_axis(index, dimension, width):
+    trace = _trace()
+    require(
+        dimension.scale == 1 and width == 1, "runtime axis currently requires one task per index"
+    )
+    if not index.terms and index.constant == 0:
+        return
+    require(
+        len(index.terms) == 1 and index.constant == 0,
+        "runtime axis requires its logical task coordinate",
+    )
+    variable, coefficient, divisor, modulus = index.terms[0]
+    pipeline = variable.owner.parent_op()
+    require(
+        isinstance(pipeline, PipelineOp)
+        and pipeline.limit is trace.size(dimension)
+        and (coefficient, divisor, modulus) == (1, 1, 0),
+        "runtime axis must use the corresponding pipeline limit and coordinate",
+    )
 
 
 def _version_index(index, versions):
@@ -412,18 +525,26 @@ def _allocate(
     trace = _trace()
     shape = tuple(shape)
     require(
-        shape and all(type(n) is int and n > 0 for n in shape),
-        "positive static allocation shape required",
+        shape and all((type(n) is int and n > 0) or isinstance(n, _Dimension) for n in shape),
+        "positive static or explicit runtime allocation dimensions required",
+    )
+    axes = [i for i, n in enumerate(shape) if isinstance(n, _Dimension)]
+    require(not axes or memory == "GM", "local native tile shapes must be static")
+    require(
+        len(axes) <= 1 and all(shape[i].scale == 1 for i in axes),
+        "one unscaled runtime tensor axis currently required",
     )
     dtype = DType(dtype)
     name = name or trace.name(memory.lower())
     op = AllocationOp.create(
+        operands=[trace.size(shape[i]) for i in axes],
         result_types=[_type(shape, dtype, memory, layout)],
         attributes={
             "sym_name": StringAttr(name),
             "versions": IntAttr(versions),
             "access": StringAttr(access),
             "ring": IntAttr(int(ring)),
+            "dynamic_axes": _ints(axes),
         },
     )
     trace.add(op)
@@ -512,16 +633,20 @@ class Pipelined:
     def __init__(self, count, *, stages, order="source"):
         trace = _trace()
         require(
-            type(count) is int and 0 <= count <= 4096, "static pipeline count in [0,4096] required"
+            (type(count) is int and 0 <= count <= (1 << 31) - 1) or isinstance(count, _Dimension),
+            "pipeline limit must be an integer or explicit runtime size",
         )
+        if isinstance(count, _Dimension):
+            require(count.scale == 1, "runtime pipeline limit must be an unscaled size")
         require(
             order == "source",
             "automatic schedule is not implemented; use explicit Stage/source order",
         )
         self.op = PipelineOp.create(
+            operands=[trace.size(count)] if isinstance(count, _Dimension) else [],
             attributes={
                 "uid": StringAttr(trace.name("pipeline")),
-                "count": IntAttr(count),
+                **({} if isinstance(count, _Dimension) else {"count": IntAttr(count)}),
                 "stages": IntAttr(stages),
                 "order": StringAttr(order),
             },

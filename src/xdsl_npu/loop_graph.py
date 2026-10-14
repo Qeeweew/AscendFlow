@@ -1,0 +1,604 @@
+"""Weighted completion graph: node families repeat by a fixed storage period.
+
+An arc (u,v,d) means u[k] precedes v[k+d] for every active translation.
+Integer potentials prove well-foundedness. Coverage paths must satisfy every
+node's lower/upper guard for the whole query domain, including fill and drain.
+This is a parametric proof, not a sampled finite execution graph.
+"""
+
+from collections import deque
+from dataclasses import dataclass
+
+from .ir import EndOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
+from .model import require
+
+
+@dataclass(frozen=True)
+class Channel:
+    name: str
+    kind: str
+    sources: tuple[tuple[str, str], ...]
+    destinations: tuple[tuple[str, str], ...]
+    distance: int
+    period: int
+    residues: tuple[int, ...]
+    ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Command:
+    index: int
+    actor: str
+    task: object
+    kind: str
+    channel: str = ""
+    lower: int = 0
+    upper: int = 0
+    period: int = 1
+    residues: tuple[int, ...] = (0,)
+    operation: object = None
+
+
+@dataclass(frozen=True)
+class Node:
+    command: Command
+    residue: int
+    point: str
+    guard: tuple[int, int] | None = None
+
+    @property
+    def lower(self):
+        return self.command.lower if self.guard is None else self.guard[0]
+
+    @property
+    def upper(self):
+        return self.command.upper if self.guard is None else self.guard[1]
+
+
+@dataclass
+class Domain:
+    index: dict
+    successors: list
+    predecessors: list
+    ancestors: dict
+
+    def reaching(self, target):
+        if target not in self.ancestors:
+            # Most domains serve only a few completion targets. Computing
+            # ALL node-to-node closure multiplies every arc by a large bitset,
+            # particularly in counter-lifetime domains spanning 15 sends.
+            seen = {target}
+            pending = [target]
+            while pending:
+                for prior in self.predecessors[pending.pop()]:
+                    if prior not in seen:
+                        seen.add(prior)
+                        pending.append(prior)
+            bits = bytearray((len(self.predecessors) + 7) // 8)
+            for node in seen:
+                bits[node // 8] |= 1 << (node % 8)
+            self.ancestors[target] = int.from_bytes(bits, "little")
+        return self.ancestors[target]
+
+
+class Graph:
+    def __init__(self, period, maximum):
+        self.period, self.maximum = period, maximum
+        self.nodes, self.ids, self.edges = [], {}, []
+        self.outgoing = []
+        self.domains = {}
+        self.potentials = None
+        self._arcs = set()
+
+    def node(self, command, residue, point, *, guard=None):
+        key = command.index, residue, point
+        if key not in self.ids:
+            self.ids[key] = len(self.nodes)
+            self.nodes.append(Node(command, residue, point, guard))
+            self.outgoing.append([])
+        else:
+            require(self.nodes[self.ids[key]].guard == guard, "completion milestone guard changed")
+        return self.ids[key]
+
+    def edge(self, source, destination):
+        a, ac = source
+        b, bc = destination
+        arc = a, b, bc - ac
+        if arc in self._arcs:
+            return
+        self._arcs.add(arc)
+        self.edges.append(arc)
+        self.outgoing[a].append((b, bc - ac))
+
+    def potential(self):
+        if self.potentials is not None:
+            return self.potentials
+        # Choose T larger than any simple family cycle. An interior cycle
+        # with net advance<=0 violates these difference constraints.
+        stride = len(self.nodes) + 1
+        ranks = [0] * len(self.nodes)
+        if self.maximum == 0:
+            self.potentials = stride, ranks
+            return self.potentials
+        # Only successors of an increased rank can need relaxation. Keep the
+        # exact full relaxation below as the cycle diagnostic if a difficult
+        # graph exceeds the queue budget; the fast path grants no new edges.
+        pending = deque(range(len(self.nodes)))
+        queued = [True] * len(self.nodes)
+        insertions = [1] * len(self.nodes)
+        while pending:
+            a = pending.popleft()
+            queued[a] = False
+            for b, delta in self.outgoing[a]:
+                required = ranks[a] + 1 - stride * delta
+                if required <= ranks[b]:
+                    continue
+                ranks[b] = required
+                if not queued[b]:
+                    insertions[b] += 1
+                    if insertions[b] > len(self.nodes):
+                        return self._potential_full(stride)
+                    pending.append(b)
+                    queued[b] = True
+        self.potentials = stride, ranks
+        return self.potentials
+
+    def _potential_full(self, stride):
+        ranks = [0] * len(self.nodes)
+        for _ in self.nodes:
+            changed = False
+            for a, b, delta in self.edges:
+                required = ranks[a] + 1 - stride * delta
+                if required > ranks[b]:
+                    ranks[b] = required
+                    changed = True
+            if not changed:
+                self.potentials = stride, ranks
+                return self.potentials
+        require(False, "symbolic fixed schedule has a completion cycle or non-well-founded carry")
+
+    def domain(self, residue, first, gap):
+        key = residue, first, gap
+        if key in self.domains:
+            return self.domains[key]
+        if self.potentials is None:
+            self.potential()
+        stride, ranks = self.potentials
+        states = []
+        for node, meta in enumerate(self.nodes):
+            difference = meta.residue - residue
+            lower = -((first + difference - meta.lower) // self.period)
+            upper = (gap - meta.upper - difference) // self.period
+            states.extend((node, cycle) for cycle in range(lower, upper + 1))
+        states.sort(key=lambda state: state[1] * stride + ranks[state[0]])
+        index = {state: i for i, state in enumerate(states)}
+        successors = [[] for _ in states]
+        predecessors = [[] for _ in states]
+        for i, (node, cycle) in enumerate(states):
+            for destination, delta in self.outgoing[node]:
+                target = index.get((destination, cycle + delta))
+                if target is not None:
+                    require(
+                        target > i, "integer potential does not order an actual translated edge"
+                    )
+                    successors[i].append((target, (node, destination, delta)))
+                    predecessors[target].append(i)
+            successors[i].sort()
+        value = Domain(index, successors, predecessors, {})
+        self.domains[key] = value
+        return value
+
+    def path(
+        self,
+        source_command,
+        source_g,
+        destination_command,
+        destination_g,
+        *,
+        omitted=(),
+        _shorten=True,
+    ):
+        p = self.period
+        first = max(destination_command.lower, source_command.lower - (source_g - destination_g))
+        residue = destination_g % p
+        first += (residue - first) % p
+        gap = max(destination_command.upper, source_command.upper + source_g - destination_g)
+        if self.maximum is not None and first + gap >= self.maximum:
+            return ()
+        if (
+            _shorten
+            and source_command.kind == "cross_wait"
+            and destination_command.kind == "cross_set"
+            and source_command.channel == destination_command.channel
+        ):
+            # Mode-2 sends of one channel retire in FIFO order. Prove a
+            # nearby release, then append the ACTUAL send-FIFO arcs up to the
+            # requested fifteenth send. Every intervening Set is active when
+            # both endpoints of the long query are active. This composes
+            # guarded paths; it does not weaken the backlog obligation.
+            first_send = source_g - source_command.lower + 1
+            for early in range(first_send, destination_g):
+                if early % destination_command.period not in destination_command.residues:
+                    continue
+                path = self.path(
+                    source_command,
+                    source_g,
+                    destination_command,
+                    early,
+                    omitted=omitted,
+                    _shorten=False,
+                )
+                if path is None:
+                    continue
+                tail = []
+                current = early
+                while current < destination_g:
+                    following = current + 1
+                    while (
+                        following % destination_command.period not in destination_command.residues
+                    ):
+                        following += 1
+                    a = self.ids[destination_command.index, current % self.period, "end"]
+                    b = self.ids[destination_command.index, following % self.period, "end"]
+                    arc = a, b, following // self.period - current // self.period
+                    if arc not in self._arcs or a in omitted or b in omitted:
+                        break
+                    tail.append(arc)
+                    current = following
+                if current == destination_g:
+                    return path + tuple(tail)
+        source_point = "end" if source_command.kind in {"task", "set", "cross_set"} else "begin"
+        source = self.ids[source_command.index, source_g % p, source_point]
+        destination = self.ids[destination_command.index, destination_g % p, "begin"]
+        # A Set's observable notification is its asynchronous end; a Wait
+        # consumes at begin. Native dependence endpoints follow the same rule.
+        if destination_command.kind in {"set", "cross_set"}:
+            destination = self.ids[destination_command.index, destination_g % p, "end"]
+        domain = self.domain(residue, first, gap)
+        initial = domain.index.get((source, source_g // p - destination_g // p))
+        target = domain.index.get((destination, 0))
+        if initial is None or target is None:
+            return None
+        reaching = domain.reaching(target)
+        successors = domain.successors
+        if not reaching & (1 << initial):
+            return None
+        if omitted:
+            if source in omitted or destination in omitted:
+                return None
+            # The immutable closure is an upper bound after deletion. A
+            # concrete search must skip EVERY arc incident on a removed
+            # command, including a cross Wait's controller-gate edges.
+            if initial == target:
+                return ()
+            seen = {initial}
+            stack = [(initial, iter(reversed(successors[initial])))]
+            path = []
+            while stack:
+                _, following = stack[-1]
+                for node, arc in following:
+                    if arc[0] in omitted or arc[1] in omitted or node in seen:
+                        continue
+                    if not reaching & (1 << node):
+                        continue
+                    seen.add(node)
+                    path.append(arc)
+                    if node == target:
+                        return tuple(path)
+                    stack.append((node, iter(reversed(successors[node]))))
+                    break
+                else:
+                    stack.pop()
+                    if path:
+                        path.pop()
+            return None
+        path = []
+        while initial != target:
+            following, arc = next(
+                (node, arc) for node, arc in reversed(successors[initial]) if reaching & (1 << node)
+            )
+            path.append(arc)
+            initial = following
+        return tuple(path)
+
+
+def channels(loop, *, virtual=False):
+    result = {}
+    tasks = {
+        (actor, task.uid): task
+        for actor, data in loop.actors.items()
+        for task in data.program.tasks
+    }
+    for op in loop.op.body.block.ops:
+        if not isinstance(op, LoopChannelOp):
+            continue
+        name = op.sym_name.data
+        sources = tuple(tuple(value.data.split("/", 1)) for value in op.sources)
+        destinations = tuple(tuple(value.data.split("/", 1)) for value in op.destinations)
+        require(
+            name not in result
+            and sources
+            and destinations
+            and set(sources + destinations) <= tasks.keys(),
+            "channel references missing/duplicate endpoints",
+        )
+        require(
+            len({actor for actor, _ in sources}) == len(sources)
+            and len({actor for actor, _ in destinations}) == len(destinations),
+            "channel needs one endpoint per participant",
+        )
+        require(op.kind.data in {"local", "cross"}, "unknown channel mechanism")
+        if op.kind.data == "local":
+            require(
+                len(sources) == len(destinations) == 1
+                and sources[0][0] == destinations[0][0]
+                and tasks[sources[0]].pipe != tasks[destinations[0]].pipe,
+                "local event needs one actor and different pipes",
+            )
+        else:
+            require(
+                ({a for a, _ in sources}, {a for a, _ in destinations})
+                in [({"aic"}, {"aiv0", "aiv1"}), ({"aiv0", "aiv1"}, {"aic"})],
+                "cross counter requires the real AIC/two-AIV quorum",
+            )
+        period = op.period.data
+        residues = tuple(v.data for v in op.residues)
+        ids = tuple(v.data for v in op.event_ids)
+        require(
+            period > 0
+            and loop.period % period == 0
+            and residues == tuple(sorted(set(residues)))
+            and residues
+            and all(0 <= r < period for r in residues)
+            and op.distance.data >= 0,
+            "invalid symbolic epoch family",
+        )
+        require(
+            virtual
+            or (
+                ids
+                and len(set(ids)) == len(ids)
+                and all(0 <= n < 8 for n in ids)
+                and (op.kind.data != "cross" or len(ids) == 1)
+            ),
+            "event resource assignment missing/invalid",
+        )
+        result[name] = Channel(
+            name, op.kind.data, sources, destinations, op.distance.data, period, residues, ids
+        )
+    return result
+
+
+def commands(loop, channel_map):
+    result, endpoints, native = {}, {}, {}
+    number = 0
+    for actor, data in loop.actors.items():
+        before, after, pending, previous = {}, {}, [], None
+        tasks = {task.uid: task for task in data.program.tasks}
+        for op in data.stream.body.block.ops:
+            if isinstance(op, TaskOp):
+                before[op.uid.data], pending, previous = pending, [], op.uid.data
+            elif isinstance(op, LoopSyncOp):
+                require(
+                    op.generation is data.stream.body.block.args[0],
+                    "sync uses a different task coordinate",
+                )
+                if op.action.data == "set":
+                    require(
+                        previous is not None and not pending, "Set must follow its native producer"
+                    )
+                    after.setdefault(previous, []).append(op)
+                else:
+                    pending.append(op)
+            else:
+                require(isinstance(op, (ViewOp, EndOp)), f"unknown loop stream effect {op.name}")
+        require(not pending, "trailing waits require an explicit drain contract")
+        sequence = []
+
+        def add(task, kind, operation=None, *, actor=actor, sequence=sequence):
+            nonlocal number
+            if operation is None:
+                command = Command(number, actor, task, kind)
+            else:
+                require(
+                    operation.action.data in {"set", "wait", "barrier"},
+                    "unknown synchronization action",
+                )
+                period, residues = operation.period.data, tuple(v.data for v in operation.residues)
+                require(
+                    period > 0
+                    and loop.period % period == 0
+                    and residues == tuple(sorted(set(residues)))
+                    and residues
+                    and all(0 <= r < period for r in residues),
+                    "invalid sync epoch family",
+                )
+                command = Command(
+                    number,
+                    actor,
+                    task,
+                    kind,
+                    operation.channel.data,
+                    operation.lower.data,
+                    operation.upper_gap.data,
+                    period,
+                    residues,
+                    operation,
+                )
+                require(command.lower >= 0 and command.upper >= 0, "negative sync activation bound")
+                if kind == "barrier":
+                    require(
+                        command.channel == "" and command.upper == 0,
+                        "barrier cannot acquire a hidden resource",
+                    )
+                else:
+                    require(command.channel in channel_map, "sync refers to unknown channel")
+                    channel = channel_map[command.channel]
+                    if kind.endswith("set"):
+                        require(
+                            (actor, task.uid) in channel.sources
+                            and (command.lower, command.upper, command.period, command.residues)
+                            == (0, channel.distance, channel.period, channel.residues),
+                            "Set activation/producer does not match its channel",
+                        )
+                    else:
+                        shifted = tuple(
+                            sorted(
+                                (r + channel.distance) % channel.period for r in channel.residues
+                            )
+                        )
+                        require(
+                            (actor, task.uid) in channel.destinations
+                            and (command.lower, command.upper, command.period, command.residues)
+                            == (channel.distance, 0, channel.period, shifted),
+                            "Wait activation/consumer does not match its channel",
+                        )
+                    key = actor, command.channel, "set" if kind.endswith("set") else "wait"
+                    require(key not in endpoints, "duplicate symbolic notification endpoint")
+                    endpoints[key] = command
+            number += 1
+            sequence.append(command)
+            if kind == "task":
+                native[actor, task.uid] = command
+
+        positions = {uid: i for i, uid in enumerate(tasks)}
+        for task in sorted(
+            tasks.values(), key=lambda task: (task.issue_order, positions[task.uid])
+        ):
+            for op in before[task.uid]:
+                channel = channel_map.get(op.channel.data)
+                kind = op.action.data
+                if channel is not None and channel.kind == "cross":
+                    kind = "cross_" + kind
+                add(task, kind, op)
+            add(task, "task")
+            for op in reversed(after.get(task.uid, ())):
+                channel = channel_map.get(op.channel.data)
+                add(
+                    task,
+                    "cross_set" if channel is not None and channel.kind == "cross" else "set",
+                    op,
+                )
+        result[actor] = sequence
+    for name, channel in channel_map.items():
+        require(
+            all(
+                (actor, name, kind) in endpoints
+                for kind, participants in [("set", channel.sources), ("wait", channel.destinations)]
+                for actor, _ in participants
+            ),
+            "channel has an unpaired symbolic endpoint",
+        )
+    return result, endpoints, native
+
+
+def completion_graph(loop, channel_map):
+    """Linear guarded prefixes; no pairwise guard-bypass arcs.
+
+    Analysis-only issue/queue/retire/implicit milestones exist at each physical
+    clock position, even when that position's instruction is skipped. They
+    summarize dispatch, starts and captured retirement SEPARATELY. They add no
+    ASC instructions or storage. A removed Wait loses all its semantic edges;
+    a pure prefix cannot retain that Wait's controller gate.
+    """
+    sequences, endpoints, native = commands(loop, channel_map)
+    graph = Graph(loop.period, loop.constant_count)
+    period = loop.period
+    for actor, sequence in sequences.items():
+        maximum = max(command.task.stage for command in sequence)
+        timeline = []
+        for step in range(period):
+            for command in sequence:
+                generation = step - command.task.stage
+                residue, cycle = generation % period, generation // period
+                # These prefixes summarize the physical for-loop position:
+                # 0 <= generation + stage < N + maximum.
+                guard = -command.task.stage, command.task.stage - maximum
+                milestones = {
+                    point: (graph.node(command, residue, point, guard=guard), cycle)
+                    for point in ("issue", "queue", "retire", "implicit")
+                }
+                begin = end = prefix = None
+                if residue % command.period in command.residues:
+                    begin = graph.node(command, residue, "begin"), cycle
+                    end = (
+                        (graph.node(command, residue, "end"), cycle)
+                        if command.kind in {"task", "set", "cross_set"}
+                        else begin
+                    )
+                    if end != begin:
+                        graph.edge(begin, end)
+                    if command.kind == "task":
+                        prefix = graph.node(command, residue, "prefix"), cycle
+                        graph.edge(end, prefix)
+                timeline.append((command, milestones, begin, end, prefix))
+
+        def shift(point):
+            return None if point is None else (point[0], point[1] - 1)
+
+        previous_period = [
+            (
+                command,
+                {name: shift(point) for name, point in milestones.items()},
+                shift(begin),
+                shift(end),
+                shift(prefix),
+            )
+            for command, milestones, begin, end, prefix in timeline
+        ]
+        prior_pipe, prior_send = {}, {}
+        for item in previous_period:
+            command, _, _, end, _ = item
+            prior_pipe[command.task.pipe] = item
+            if command.kind == "cross_set" and end is not None:
+                prior_send[command.channel] = end
+        prior_global = previous_period[-1]
+        for item in timeline:
+            command, milestones, begin, end, prefix = item
+            pipe = command.task.pipe
+            previous_command, previous_milestones, _, previous_end, _ = prior_global
+            graph.edge(previous_milestones["issue"], milestones["issue"])
+            if previous_end is not None and (
+                previous_command.kind == "cross_wait"
+                or (previous_command.kind in {"task", "wait"} and previous_command.task.pipe == "S")
+            ):
+                graph.edge(previous_end, milestones["issue"])
+            old, old_milestones, old_begin, old_end, _ = prior_pipe[pipe]
+            for point in ("queue", "retire", "implicit"):
+                graph.edge(old_milestones[point], milestones[point])
+            if old_begin is not None:
+                # FIFO start/consumption order, NEVER a Notify's completion.
+                graph.edge(old_begin, milestones["queue"])
+            if old.kind == "task" and old_end is not None:
+                graph.edge(old_end, milestones["retire"])
+                if old.task.implicit_completion:
+                    graph.edge(old_end, milestones["implicit"])
+            if begin is not None:
+                graph.edge(milestones["issue"], begin)
+                graph.edge(milestones["queue"], begin)
+                if command.kind == "task":
+                    graph.edge(milestones["implicit"], begin)
+                    graph.edge(milestones["retire"], prefix)
+                elif command.kind in {"set", "cross_set", "barrier"}:
+                    graph.edge(milestones["retire"], end)
+                if command.kind == "cross_set":
+                    if command.channel in prior_send:
+                        graph.edge(prior_send[command.channel], end)
+                    prior_send[command.channel] = end
+            prior_pipe[pipe] = prior_global = item
+    for name, channel in channel_map.items():
+        for residue in range(period):
+            if residue % channel.period not in channel.residues:
+                continue
+            for actor, _ in channel.sources:
+                source = endpoints[actor, name, "set"]
+                for destination_actor, _ in channel.destinations:
+                    destination = endpoints[destination_actor, name, "wait"]
+                    graph.edge(
+                        (graph.node(source, residue, "end"), 0),
+                        (
+                            graph.node(destination, (residue + channel.distance) % period, "begin"),
+                            (residue + channel.distance) // period,
+                        ),
+                    )
+    return graph, sequences, endpoints, native

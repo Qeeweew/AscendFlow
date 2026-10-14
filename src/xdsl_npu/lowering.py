@@ -23,6 +23,7 @@ from .source_ir import (
     PipelineOp,
     PredicateOp,
     ProgramOp,
+    SizeOp,
     StageOp,
     ViewOp,
     YieldOp,
@@ -85,6 +86,16 @@ def _work(program, pipeline, family, owner):
                 local = {**bindings, op.body.block.args[0]: owner}
                 walk(op.body.block, clock, local, stage, phase, label, selected, path)
             elif isinstance(op, PipelineOp):
+                require(
+                    op.limit is None,
+                    "nested runtime pipelines need hierarchical loop synchronization; "
+                    "only static native tile subdivisions are currently supported",
+                )
+                require(
+                    op.count.data <= 64,
+                    "native tile subdivision exceeds 64 templates; "
+                    "an input-length loop must remain the outer runtime pipeline",
+                )
                 for iteration in range(op.count.data):
                     local = {**bindings, op.body.block.args[0]: iteration}
                     walk(op.body.block, op, local, stage, phase, label, domain, (*path, iteration))
@@ -146,7 +157,7 @@ def _initialize(op, record):
 
 
 class _Actor:
-    def __init__(self, program, pipeline, actor, family, owner, allocations):
+    def __init__(self, program, pipeline, actor, family, owner, allocations, symbolic=False):
         self.program, self.pipeline = program, pipeline
         self.records = _work(program, pipeline, family, owner)
         require(self.records, f"{actor}: execution domain has no real work")
@@ -156,13 +167,29 @@ class _Actor:
             blocks=program.groups.data,
             disjoint_external=bool(program.disjoint_external.data),
         )
+        self.runtime = None
+        if pipeline.limit is not None:
+            size = pipeline.limit.owner
+            require(isinstance(size, SizeOp), "runtime pipeline needs a uniform size SSA value")
+            self.runtime = self.kernel.runtime_size(size.sym_name.data, multiple=size.multiple.data)
         self.roots = {}
         used = {_root(ref) for record in self.records for ref in _refs(record.op)}
         for allocation in allocations:
             typ = allocation.ref.type
             if allocation not in used and typ.memory.data != "GM":
                 continue
-            size = prod(shape(allocation.ref)) * ITEMSIZE[typ.dtype.data] * allocation.versions.data
+            dimensions = shape(allocation.ref)
+            size = (
+                prod(n if n != -1 else 1 for n in dimensions)
+                * ITEMSIZE[typ.dtype.data]
+                * allocation.versions.data
+            )
+            dynamic = bool(allocation.dimensions)
+            require(
+                not dynamic
+                or (len(allocation.dimensions) == 1 and allocation.dimensions[0] is pipeline.limit),
+                "GM extent must use the same runtime pipeline length",
+            )
             if allocation.ring.data:
                 size *= program.groups.data
             external = typ.memory.data == "GM"
@@ -171,11 +198,13 @@ class _Actor:
             self.roots[allocation] = self.kernel.buffer(
                 allocation.sym_name.data,
                 typ.memory.data,
-                size,
+                0 if dynamic else size,
                 typ.dtype.data,
                 layout=typ.layout.data,
                 external=external,
                 initialized=allocation.access.data in {"read", "read_write"},
+                extent_count=self.runtime if dynamic else None,
+                count_scale=size if dynamic else 0,
             )
         self.operand_buffers = {}
         for record in self.records:
@@ -196,7 +225,9 @@ class _Actor:
                 )
         if family == "cube":
             self.kernel.init_fixpipe()
-        self.kernel.loop(pipeline.count.data)
+        self.kernel.loop(
+            self.runtime if self.runtime is not None else pipeline.count.data, symbolic=symbolic
+        )
         self.schedule = []
         self.definitions = {}
         self.readers = {}
@@ -219,6 +250,7 @@ class _Actor:
         bindings = dict(record.constants)
         offset = view.offset.data
         generation, core = [], []
+        count_offset, count_core_stride = 0, 0
         for term in view.terms:
             require(len(term) == 4, "source index term must have index/coefficient/divisor/modulus")
             index, coefficient, divisor, modulus = (v.data for v in term)
@@ -236,6 +268,34 @@ class _Actor:
                 core.append((coefficient, divisor, modulus))
             else:
                 raise ValueError("coordinate escaped its task or execution-domain scope")
+        for term in () if view.dynamic_terms is None else view.dynamic_terms:
+            require(
+                len(term) == 5,
+                "dynamic coordinate needs variable/count/coefficient/divisor/modulus",
+            )
+            variable_index, count_index, coefficient, divisor, modulus = (v.data for v in term)
+            require(
+                0 <= variable_index < len(view.indices)
+                and 0 <= count_index < len(view.indices)
+                and divisor > 0
+                and modulus >= 0,
+                "invalid dynamic view term",
+            )
+            variable, count = view.indices[variable_index], view.indices[count_index]
+            require(
+                count is self.pipeline.limit and self.runtime is not None,
+                "address uses a different runtime count",
+            )
+            if variable is self.program.body.block.args[0]:
+                require(
+                    divisor == 1 and modulus == 0, "runtime group translation needs an affine owner"
+                )
+                count_core_stride += coefficient
+            elif variable in bindings:
+                literal = bindings[variable] // divisor
+                count_offset += coefficient * (literal % modulus if modulus else literal)
+            else:
+                require(False, "runtime task stride needs a segmented ownership contract")
         contiguous = len(dimensions) == 1 or strides[0] == dimensions[1] * strides[-1]
         if typ.layout.data != "linear":
             require(
@@ -255,6 +315,9 @@ class _Actor:
             row_stride=pitch,
             index_terms=generation,
             core_terms=core,
+            extent_count=self.runtime if count_offset or count_core_stride else None,
+            count_offset=count_offset,
+            count_core_stride=count_core_stride,
         )
 
     def emit(self):
@@ -447,6 +510,10 @@ def _check_values(physical, actors, outer):
     Actual native RAW writers must be the declared numerical producer.
     Reading a stale tile is rejected; there is no hidden snapshot copy.
     """
+    from .loop_model import is_symbolic
+
+    if is_symbolic(physical):
+        return _check_loop_values(physical, actors, outer)
     if len(actors) == 3:
         mixed = extract_mixed(physical)
         programs = mixed.programs
@@ -528,7 +595,63 @@ def _check_values(physical, actors, outer):
                     )
 
 
-def lower_source(module):
+def _check_loop_values(physical, actors, outer):
+    from .loop_model import extract_loop, loop_dependencies
+
+    loop = extract_loop(physical)
+    raw = [o for o in loop_dependencies(loop) if o.hazard == "RAW"]
+    for actor, lowering in actors.items():
+        owner = actor if len(actors) == 3 else ("aic" if actor == "cube" else "aiv0")
+        tasks = {t.uid: t for t in loop.actors[owner].program.tasks}
+        for number, record in enumerate(lowering.records):
+            for value, input_index in zip(record.op.dependencies, record.op.dependency_inputs):
+                producer, final = _tile_producer(value, outer)
+                root = _root(_refs(producer)[-1])
+                private = root.ref.type.memory.data != "GM"
+                bindings = {**dict(record.constants), **final}
+                candidates = []
+                for source_actor, source_lowering in actors.items():
+                    if private and source_actor != actor:
+                        continue
+                    for source_number, source_record in enumerate(source_lowering.records):
+                        if source_record.op is producer and all(
+                            bindings.get(var, literal) == literal
+                            for var, literal in source_record.constants
+                        ):
+                            source_owner = (
+                                source_actor
+                                if len(actors) == 3
+                                else ("aic" if source_actor == "cube" else "aiv0")
+                            )
+                            candidates.append(
+                                (source_owner, source_lowering.definitions[source_number])
+                            )
+                require(len(candidates) == 1, "logical tile producer has ambiguous ownership")
+                index = input_index.data
+                read_uid = lowering.readers[number, index]
+                task = tasks[read_uid]
+                native_index = 0 if isinstance(record.op, MatmulOp) and index < 2 else index
+                ref = task.refs[native_index]
+                root_name = loop.root(owner, ref)
+                for r in range(loop.period):
+                    produced = [
+                        (o.start, o.stop)
+                        for o in raw
+                        if o.source == candidates[0]
+                        and o.destination == (owner, read_uid)
+                        and o.distance == 0
+                        and r in o.residues
+                        and o.storage == root_name
+                    ]
+                    frame = loop.frames.get(root_name, 0)
+                    needed = [(lo - r * frame, hi - r * frame) for lo, hi in ref.segments(r)]
+                    require(
+                        ranges_cover(produced, needed),
+                        f"logical tile from {candidates[0][1]} was overwritten before {read_uid}",
+                    )
+
+
+def lower_source(module, *, symbolic=True):
     module.verify()
     program = module.body.block.first_op
     require(
@@ -538,14 +661,17 @@ def lower_source(module):
     pipelines = [op for op in program.body.block.ops if isinstance(op, PipelineOp)]
     require(len(pipelines) == 1, "source requires one continuous outer task stream")
     require(
-        all(isinstance(op, (AllocationOp, PipelineOp, YieldOp)) for op in program.body.block.ops),
+        all(
+            isinstance(op, (AllocationOp, SizeOp, PipelineOp, YieldOp))
+            for op in program.body.block.ops
+        ),
         "executable source work must belong to a task pipeline",
     )
     allocations = [op for op in program.walk() if isinstance(op, AllocationOp)]
     pipeline = pipelines[0]
     if program.kind.data == "mixed":
         actors = {
-            actor: _Actor(program, pipeline, actor, family, owner, allocations)
+            actor: _Actor(program, pipeline, actor, family, owner, allocations, symbolic)
             for actor, family, owner in [
                 ("aic", "cube", 0),
                 ("aiv0", "vector", 0),
@@ -559,7 +685,7 @@ def lower_source(module):
     else:
         actors = {
             program.kind.data: _Actor(
-                program, pipeline, program.kind.data, program.kind.data, 0, allocations
+                program, pipeline, program.kind.data, program.kind.data, 0, allocations, symbolic
             )
         }
         physical = next(iter(actors.values())).emit()

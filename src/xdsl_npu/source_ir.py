@@ -14,6 +14,7 @@ from xdsl.irdl import (
     irdl_op_definition,
     operand_def,
     opt_attr_def,
+    opt_operand_def,
     region_def,
     result_def,
     traits_def,
@@ -108,6 +109,8 @@ class AllocationOp(IRDLOperation):
     versions = attr_def(IntAttr)
     access = attr_def(StringAttr)
     ring = attr_def(IntAttr)
+    dimensions = var_operand_def(IndexType)
+    dynamic_axes = opt_attr_def(ArrayAttr[IntAttr])
     ref = result_def(TensorType)
     traits = traits_def(AsyncEffects())
 
@@ -115,7 +118,7 @@ class AllocationOp(IRDLOperation):
         typ = self.ref.type
         if (
             not typ.shape
-            or any(n.data <= 0 for n in typ.shape)
+            or any(n.data == 0 or n.data < -1 for n in typ.shape)
             or typ.dtype.data not in {"f16", "bf16", "f32"}
             or typ.memory.data not in {"GM", "UB", "L1", "L0A", "L0B", "L0C"}
             or typ.layout.data not in {"linear", "NZ", "ZZ", "ZN"}
@@ -134,13 +137,39 @@ class AllocationOp(IRDLOperation):
             )
         if self.ring.data not in {0, 1}:
             raise VerifyException("task ring marker must be boolean")
+        axes = [] if self.dynamic_axes is None else [axis.data for axis in self.dynamic_axes]
+        if axes != [i for i, n in enumerate(typ.shape) if n.data == -1] or len(axes) != len(
+            self.dimensions
+        ):
+            raise VerifyException("dynamic shape axes must bind actual SSA dimensions")
+        if axes and (typ.memory.data != "GM" or self.ring.data or self.versions.data != 1):
+            raise VerifyException(
+                "runtime dimensions are GM extents; native/local tiles stay static"
+            )
+
+
+@irdl_op_definition
+class SizeOp(IRDLOperation):
+    name = "npu_source.size"
+    sym_name = attr_def(StringAttr)
+    multiple = attr_def(IntAttr)
+    value = result_def(IndexType)
+
+    def verify_(self):
+        if not self.sym_name.data.isidentifier() or self.multiple.data <= 0:
+            raise VerifyException(
+                "runtime size requires a name and a positive divisibility contract"
+            )
+        if not isinstance(self.parent_op(), ProgramOp):
+            raise VerifyException("runtime size is a uniform program parameter")
 
 
 @irdl_op_definition
 class PipelineOp(IRDLOperation):
     name = "npu_source.pipeline"
     uid = attr_def(StringAttr)
-    count = attr_def(IntAttr)
+    count = opt_attr_def(IntAttr)
+    limit = opt_operand_def(IndexType)
     stages = attr_def(IntAttr)
     order = attr_def(StringAttr)
     body = region_def("single_block")
@@ -150,13 +179,16 @@ class PipelineOp(IRDLOperation):
     def verify_(self):
         _verify_yield(self)
         if (
-            not 0 <= self.count.data <= 4096
+            (self.count is None) == (self.limit is None)
+            or (self.count is not None and not 0 <= self.count.data <= (1 << 31) - 1)
             or not 1 <= self.stages.data <= 33
             or self.order.data != "source"
         ):
             raise VerifyException(
                 "fixed pipeline needs bounded count/stage horizon and source order"
             )
+        if self.limit is not None and not isinstance(self.limit.owner, SizeOp):
+            raise VerifyException("runtime pipeline length must be a uniform SSA size parameter")
         if len(self.body.block.args) != 1 or not isinstance(
             self.body.block.args[0].type, IndexType
         ):
@@ -214,6 +246,7 @@ class ViewOp(IRDLOperation):
     indices = var_operand_def(IndexType)
     offset = attr_def(IntAttr)
     terms = attr_def(ArrayAttr[ArrayAttr[IntAttr]])
+    dynamic_terms = opt_attr_def(ArrayAttr[ArrayAttr[IntAttr]])
     strides = attr_def(ArrayAttr[IntAttr])
     ref = result_def(TensorType)
 
@@ -234,6 +267,20 @@ class ViewOp(IRDLOperation):
             index, _, divisor, modulus = (v.data for v in term)
             if not 0 <= index < len(self.indices) or divisor <= 0 or modulus < 0:
                 raise VerifyException("invalid view coordinate term")
+        for term in self.dynamic_terms or ():
+            if len(term) != 5:
+                raise VerifyException(
+                    "runtime view term requires coordinate/size/coefficient/divisor/modulus"
+                )
+            index, size, _, divisor, modulus = (v.data for v in term)
+            if (
+                not 0 <= index < len(self.indices)
+                or not 0 <= size < len(self.indices)
+                or not isinstance(self.indices[size].owner, SizeOp)
+                or divisor <= 0
+                or modulus < 0
+            ):
+                raise VerifyException("invalid runtime view coordinate/size term")
 
 
 @irdl_op_definition
@@ -359,6 +406,7 @@ SOURCE = Dialect(
     [
         ProgramOp,
         AllocationOp,
+        SizeOp,
         PipelineOp,
         StageOp,
         DomainOp,

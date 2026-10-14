@@ -26,6 +26,7 @@ from xdsl.irdl import (
     irdl_op_definition,
     operand_def,
     opt_attr_def,
+    opt_operand_def,
     opt_result_def,
     region_def,
     result_def,
@@ -161,6 +162,8 @@ class BufferOp(IRDLOperation):
     nbytes = attr_def(IntAttr)
     external = attr_def(IntAttr)
     initialized = attr_def(IntAttr)
+    extent_count = opt_operand_def(IndexType)
+    count_scale = opt_attr_def(IntAttr)
     ref = result_def(RefType)
     traits = traits_def(AsyncEffects())
 
@@ -170,6 +173,7 @@ class ViewOp(IRDLOperation):
     name = "npu.view"
     source = operand_def(RefType)
     generation = operand_def(IndexType)
+    extent_count = opt_operand_def(IndexType)
     offset = attr_def(IntAttr)
     stride = attr_def(IntAttr)
     modulus = attr_def(IntAttr)
@@ -183,15 +187,56 @@ class ViewOp(IRDLOperation):
     core_modulus = opt_attr_def(IntAttr)
     index_terms = opt_attr_def(ArrayAttr[ArrayAttr[IntAttr]])
     core_terms = opt_attr_def(ArrayAttr[ArrayAttr[IntAttr]])
+    count_offset = opt_attr_def(IntAttr)
+    count_core_stride = opt_attr_def(IntAttr)
     ref = result_def(RefType)
 
 
 @irdl_op_definition
 class StreamOp(IRDLOperation):
     name = "npu.stream"
-    count = attr_def(IntAttr)
+    count = opt_attr_def(IntAttr)
+    limit = opt_operand_def(IndexType)
+    symbolic = opt_attr_def(IntAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
+
+
+@irdl_op_definition
+class RuntimeSizeOp(IRDLOperation):
+    """A uniform by-value kernel argument; not a mutable metadata load."""
+
+    name = "npu.runtime_size"
+    sym_name = attr_def(StringAttr)
+    multiple = attr_def(IntAttr)
+    value = result_def(IndexType)
+
+
+@irdl_op_definition
+class LoopChannelOp(IRDLOperation):
+    name = "npu.loop_channel"
+    sym_name = attr_def(StringAttr)
+    kind = attr_def(StringAttr)
+    sources = attr_def(ArrayAttr[StringAttr])
+    destinations = attr_def(ArrayAttr[StringAttr])
+    distance = attr_def(IntAttr)
+    period = attr_def(IntAttr)
+    residues = attr_def(ArrayAttr[IntAttr])
+    event_ids = attr_def(ArrayAttr[IntAttr])
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
+class LoopSyncOp(IRDLOperation):
+    name = "npu.loop_sync"
+    generation = operand_def(IndexType)
+    action = attr_def(StringAttr)
+    channel = attr_def(StringAttr)
+    lower = attr_def(IntAttr)
+    upper_gap = attr_def(IntAttr)
+    period = attr_def(IntAttr)
+    residues = attr_def(ArrayAttr[IntAttr])
+    traits = traits_def(AsyncEffects())
 
 
 @irdl_op_definition
@@ -280,6 +325,9 @@ NPU = Dialect(
         BufferOp,
         ViewOp,
         StreamOp,
+        RuntimeSizeOp,
+        LoopChannelOp,
+        LoopSyncOp,
         TaskOp,
         FixConfigOp,
         ChannelOp,

@@ -23,6 +23,13 @@ class CheckResult:
 
 def bounded_check(module, *, max_states=200_000) -> CheckResult:
     from .ir import MixedOp
+    from .loop_model import is_symbolic
+
+    require(
+        not is_symbolic(module),
+        "bounded interleaving check requires an explicit finite test instance; "
+        "it cannot certify a symbolic runtime loop",
+    )
 
     if isinstance(module.body.block.first_op, MixedOp):
         from .mixed_check import bounded_mixed_check

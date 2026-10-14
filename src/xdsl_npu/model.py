@@ -103,6 +103,7 @@ class Storage:
     layout: str
     external: bool
     initialized: bool
+    count_scale: int = 0
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,8 @@ class Ref:
     rows: int = 1
     row_stride: int = 0
     core_terms: tuple[tuple[int, int, int], ...] = ()  # byte stride, divisor, modulus
+    count_offset: int = 0
+    count_core_stride: int = 0
 
     def address(self, g: int, core=0) -> int:
         return sum(o + s * ((g // d) % m if m else g // d) for o, s, m, d in self.terms) + sum(
@@ -732,6 +735,10 @@ def extract(module: ModuleOp) -> Program:
         len(streams) == 1, "one finite stream is required; dynamic/nested streams are unsupported"
     )
     stream = streams[0]
+    require(
+        stream.limit is None and stream.symbolic is None,
+        "symbolic loop must use the loop checker; finite extraction is only for explicit diagnostics",
+    )
     count = stream.count.data
     require(
         isinstance(count, int) and 0 <= count <= MAX_INSTANCES,
@@ -749,6 +756,10 @@ def extract(module: ModuleOp) -> Program:
         if isinstance(op, StreamOp):
             seen_stream = True
         elif isinstance(op, BufferOp):
+            require(
+                op.extent_count is None and optional_int(op.count_scale, 0) == 0,
+                "runtime buffer extent cannot be ignored by finite extraction",
+            )
             require(not seen_stream, "storage declarations must precede the stream")
             typ = op.ref.type
             require(isinstance(typ, RefType), "invalid buffer type")
@@ -848,6 +859,12 @@ def extract(module: ModuleOp) -> Program:
 
     for op in stream.body.block.ops:
         if isinstance(op, ViewOp):
+            require(
+                op.extent_count is None
+                and optional_int(op.count_offset, 0) == 0
+                and optional_int(op.count_core_stride, 0) == 0,
+                "runtime view translation cannot be ignored by finite extraction",
+            )
             require(
                 op.generation is stream.body.block.args[0], "view uses a different generation clock"
             )

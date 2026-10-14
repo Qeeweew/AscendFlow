@@ -6,7 +6,7 @@ from xdsl.dialects.builtin import FloatAttr, f32
 
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.compilation import Compilation, compile
-from xdsl_npu.ir import CrossSyncOp, TaskOp
+from xdsl_npu.ir import LoopChannelOp, LoopSyncOp, TaskOp
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.model import CompileError
 
@@ -49,9 +49,13 @@ def test_cached_code_owns_no_externally_mutable_ir_or_verification_flag():
 def test_an_edited_exported_plan_is_rechecked_and_cannot_reuse_the_artifact_proof():
     result = compile(cv_source(1))
     plan = result.plan
+    channel = next(
+        op for op in plan.walk() if isinstance(op, LoopChannelOp) and op.kind.data == "cross"
+    )
     for op in list(plan.walk()):
-        if isinstance(op, CrossSyncOp) and op.channel.data == "scores_ready":
+        if isinstance(op, LoopSyncOp) and op.channel == channel.sym_name:
             op.parent.erase_op(op)
+    channel.parent.erase_op(channel)
     with pytest.raises(CompileError):
         emit_asc(plan)
     with pytest.raises(CompileError):

@@ -8,6 +8,7 @@ from .ir import (
     EndOp,
     FixConfigOp,
     KernelOp,
+    RuntimeSizeOp,
     StreamOp,
     TaskOp,
     TaskType,
@@ -36,15 +37,27 @@ class Kernel:
         self.num_tasks = 0
 
     def buffer(
-        self, name, bank, nbytes, dtype="f32", *, layout="linear", external=False, initialized=False
+        self,
+        name,
+        bank,
+        nbytes,
+        dtype="f32",
+        *,
+        layout="linear",
+        external=False,
+        initialized=False,
+        extent_count=None,
+        count_scale=0,
     ) -> SSAValue:
         op = BufferOp.create(
+            operands=[] if extent_count is None else [extent_count],
             result_types=[ref_type(bank, dtype, layout)],
             attributes={
                 "sym_name": StringAttr(name),
                 "nbytes": IntAttr(nbytes),
                 "external": IntAttr(int(external)),
                 "initialized": IntAttr(int(initialized)),
+                "count_scale": IntAttr(count_scale),
             },
         )
         self.block.add_op(op)
@@ -54,13 +67,24 @@ class Kernel:
     def init_fixpipe(self):
         self.block.add_op(FixConfigOp())
 
-    def loop(self, count: int):
+    def runtime_size(self, name, *, multiple=1):
+        op = RuntimeSizeOp.create(
+            result_types=[IndexType()],
+            attributes={"sym_name": StringAttr(name), "multiple": IntAttr(multiple)},
+        )
+        self.block.add_op(op)
+        return op.value
+
+    def loop(self, count: int | SSAValue, *, symbolic=False):
         if self.stream is not None:
             raise ValueError("v0.1 supports one finite task stream per kernel")
         self.task_block = Block(arg_types=[IndexType()])
         self.task_block.args[0].name_hint = "generation"
         self.stream = StreamOp.create(
-            attributes={"count": IntAttr(count)}, regions=[Region(self.task_block)]
+            operands=[count] if isinstance(count, SSAValue) else [],
+            attributes=({} if isinstance(count, SSAValue) else {"count": IntAttr(count)})
+            | ({"symbolic": IntAttr(1)} if symbolic or isinstance(count, SSAValue) else {}),
+            regions=[Region(self.task_block)],
         )
         self.block.add_op(self.stream)
         return self
@@ -84,11 +108,15 @@ class Kernel:
         core_modulus=0,
         index_terms=(),
         core_terms=(),
+        extent_count=None,
+        count_offset=0,
+        count_core_stride=0,
     ) -> SSAValue:
         assert self.task_block is not None
         typ = source.type
         op = ViewOp.create(
-            operands=[source, self.task_block.args[0]],
+            operands=[source, self.task_block.args[0]]
+            + ([] if extent_count is None else [extent_count]),
             result_types=[
                 ref_type(typ.bank.data, dtype or typ.dtype.data, layout or typ.layout.data)
             ],
@@ -104,6 +132,8 @@ class Kernel:
                 "core_stride": IntAttr(core_stride),
                 "core_divisor": IntAttr(core_divisor),
                 "core_modulus": IntAttr(core_modulus),
+                "count_offset": IntAttr(count_offset),
+                "count_core_stride": IntAttr(count_core_stride),
             },
         )
         if index_terms:

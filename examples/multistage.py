@@ -7,11 +7,15 @@ They are not attention algorithms or performance benchmarks.
 from xdsl_npu import language as N
 
 
+def _extent(count):
+    return max(1, count) if type(count) is int else count
+
+
 def vector_source(count=4):
     @N.prim_func(disjoint_external=True)
     def scale(
-        X: N.Tensor((2, max(1, count), 64), N.f32),
-        Y: N.Tensor((2, max(1, count), 64), N.f32, access="write"),
+        X: N.Tensor((2, _extent(count), 64), N.f32),
+        Y: N.Tensor((2, _extent(count), 64), N.f32, access="write"),
     ):
         with N.Kernel(2, kind="vector") as group:
             inputs = N.alloc_ub((64,), versions=2, name="inputs")
@@ -28,7 +32,7 @@ def vector_source(count=4):
 
 
 def cv_source(count=4):
-    shape = (1, max(1, count), 16, 16)
+    shape = (1, _extent(count), 16, 16)
 
     @N.prim_func(disjoint_external=True)
     def cv(
@@ -82,8 +86,8 @@ def segmented_cv_source(count=4, segments=3, groups=2):
     and accumulates them in chunk order; it publishes one complete output.
     This is a synchronization example, not online softmax.
     """
-    q_shape = (groups, max(1, count), 16, 16)
-    kv_shape = (groups, max(1, count), segments, 16, 16)
+    q_shape = (groups, _extent(count), 16, 16)
+    kv_shape = (groups, _extent(count), segments, 16, 16)
 
     @N.prim_func(disjoint_external=True)
     def segmented_cv(
@@ -150,16 +154,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kind", choices=["vector", "cv", "segmented-cv"])
     parser.add_argument("--count", type=int, default=4)
+    parser.add_argument("--runtime", action="store_true", help="one by-value SSA tile-count parameter")
     parser.add_argument("--segments", type=int, default=3)
     parser.add_argument("--groups", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--shared", action="store_true")
     args = parser.parse_args()
+    count = N.dynamic("tasks") if args.runtime else args.count
     source = (
-        segmented_cv_source(args.count, args.segments, args.groups)
+        segmented_cv_source(count, args.segments, args.groups)
         if args.kind == "segmented-cv"
-        else {"vector": vector_source, "cv": cv_source}[args.kind](args.count)
+        else {"vector": vector_source, "cv": cv_source}[args.kind](count)
     )
     report = build_module(source, args.output, compile_asc=args.compile, shared=args.shared)
     print(json.dumps(report, indent=2))

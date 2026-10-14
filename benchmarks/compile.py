@@ -49,7 +49,7 @@ def worker(path, output):
         "verification": result.report,
         "python": sys.version,
         "machine": platform.machine(),
-        "scope": "fresh Python process; full finite verification; no cProfile, CANN, or NPU timing",
+        "scope": "fresh Python process; complete final physical verification; no cProfile, CANN, or NPU timing",
     }
 
 

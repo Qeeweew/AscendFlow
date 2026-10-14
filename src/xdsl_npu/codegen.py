@@ -17,6 +17,10 @@ CTYPE = {"f32": "float", "f16": "half", "bf16": "bfloat16_t"}
 
 def pointer(ref: Ref, g="g", *, core="0", extra=""):
     terms = []
+    if ref.count_offset:
+        terms.append(f"n * {ref.count_offset}")
+    if ref.count_core_stride:
+        terms.append(f"n * ({core}) * {ref.count_core_stride}")
     for offset, stride, modulus, divisor in ref.terms:
         if offset:
             terms.append(str(offset))
@@ -425,6 +429,11 @@ def _emit_checked(module, analysis, *, host_launcher=True):
     No verified flag, historical witness, or user analysis is accepted there.
     """
     from .ir import MixedOp, StaticDispatchOp
+    from .loop_model import is_symbolic
+
+    if is_symbolic(module):
+        from .loop_codegen import emit_loop
+        return emit_loop(analysis, host_launcher=host_launcher)
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):
         return _emit_dispatch(analysis, host_launcher=host_launcher)

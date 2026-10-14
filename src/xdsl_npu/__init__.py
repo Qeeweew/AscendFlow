@@ -6,8 +6,8 @@ from .compilation import Compilation, compile
 from .sync import autosync, verify_plan
 
 __all__ = [
-    "Kernel",
     "Compilation",
+    "Kernel",
     "autosync",
     "compile",
     "emit_asc",

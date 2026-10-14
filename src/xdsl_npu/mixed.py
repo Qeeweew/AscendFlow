@@ -51,6 +51,11 @@ def compose(name, cube, vector0, vector1, *, cube_epoch=1, vector_epoch=1, disjo
     logical effects, not a physical dispatch/completion order between actors.
     All three source kernels are cloned; the caller's modules stay untouched.
     """
+    from .loop_model import compose_loop, is_symbolic
+
+    if any(is_symbolic(module) for module in (cube, vector0, vector1)):
+        require(cube_epoch == vector_epoch == 1, "symbolic region clocks must not be flattened")
+        return compose_loop(name, cube, vector0, vector1, disjoint_external=disjoint_external)
     block = Block()
     roots = {}
     kernels = []

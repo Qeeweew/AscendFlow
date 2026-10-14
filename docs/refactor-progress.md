@@ -1,5 +1,17 @@
 # 重构的验证记录
 
+## R0：实现现场保存与重新验证
+
+设计提交 `a80aadd` 后重新检查符号循环工作树。执行
+`../.venv/bin/pytest -q tests/test_loop_sync.py tests/test_source_language.py tests/test_compilation.py --durations=10`，
+66项通过，38.45秒；包含之前未复测的图搜索顺序微调。原始日志位于外层
+`runs/refactor/r0-checkpoint/tests.log`。`git diff --check` 通过；全目录 ruff
+发现已有 `tests/test_planning.py:110` 的 pairwise 写法问题，另步修正。
+
+本次 checkpoint 保存此前全部符号循环源码、回归和 runner，不宣称 R0 的全部
+基线或新设计已验收。后续首先接入不执行用户函数体的 AST 前端，保留自动同步
+和最终实际 IR 检查。固定 AscendC 对照及完整前端编译口径仍待补齐。
+
 2026-10-14 的[总体设计](design.md)、[DSL 规格](dsl-multistage.md)和
 [重构计划](refactor-plan.md)已重写；它们规定后续目标，不能作为实现证明。
 本次文档修订没有改运行时代码、运行编译回归或启动设备实验。算子调参暂停。

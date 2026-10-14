@@ -374,6 +374,12 @@ def completion_graph(ex: Execution, *, controls=None):
 
 
 def verify_plan(module: ModuleOp, *, _imports=(), _details=False):
+    from .loop_model import is_symbolic
+
+    if is_symbolic(module):
+        from .loop_sync import verify_loop
+        require(not _imports, "symbolic proof cannot assume finite imports")
+        return verify_loop(module, _details=_details)
     from .ir import MixedOp, StaticDispatchOp
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):
@@ -487,6 +493,12 @@ def arithmetic_span(epochs):
 
 def explain_plan(module: ModuleOp) -> dict:
     from .ir import MixedOp, StaticDispatchOp
+    from .loop_model import is_symbolic
+
+    if is_symbolic(module):
+        from .loop_sync import explain_loop
+
+        return explain_loop(module)
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):
         from .dispatch import explain_dispatch
@@ -608,6 +620,12 @@ def autosync(module: ModuleOp, *, _imports=(), _capture=None) -> ModuleOp:
     a diagnostic, not permission to serialize or enlarge buffers.
     """
     from .ir import MixedOp, StaticDispatchOp
+    from .loop_model import is_symbolic
+
+    if is_symbolic(module):
+        from .loop_sync import autosync_loop
+        require(not _imports, "symbolic planning cannot assume finite imports")
+        return autosync_loop(module, _capture=_capture)
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):
         from .dispatch import autosync_dispatch
