@@ -1,5 +1,33 @@
 # 重构的验证记录
 
+## R2 第二个切片：显式L0、完整fractal平面和Cube设备闭环
+
+在 `42bd394` 上增加 `alloc_l0a/b`、显式 `copy → matmul`，AST不再借用隐式
+L0的legacy gemm。leading slot axes可选择完整NZ/ZZ/ZN矩阵平面；平面内子视图
+仍拒绝。NN/NT的逻辑转置与真实Load2D打包分开，Borrowed B producer独立检查。
+数值路径支持显式首次clear与随后FP32累加；短MAD保留必要的M完成约束。
+
+默认动态batch例有6个native模板、L1/L0/L0C分别3/2/2槽。L1 release源为MTE1
+最后读取，L0 release源为MAD，L0C release源为FIX；不扩大到整个任务结束。
+189项相关回归通过（58.16秒）；增加AST IR旁路和未初始化累加负例后，相关52项
+通过（21.99秒），计数有重叠。已有Vector/normalization/CV/分段CV的ASC逐字不变。
+
+真实设备覆盖NN/NT、f16/bf16以及短MAD二次累加，零次和多轮槽复用均检查。
+固定大例20×1024个32×64乘64×64，输出41943040元素，GM工作集400 MiB；
+独立AscendC与生成版本逐元素精确相等，guard通过。3轮独立msprof每轮5warmup+
+30samples，p50中位数456.450 / 455.440 µs，比值1.0022；当前配置无超过5%的
+退化，不外推为完整GEMM或FA性能达标。工作量5.369 GFLOPs、12.8 FLOP/GM请求
+字节；结合真实20AIC/1800MHz条件模型及MTE2/MAC/FIX活动计数分析，不伪造HBM带宽。
+
+手写对照曾触发ACL507015/L0B读写冲突，源码核查定位到TPipe预置M_MTE1的
+0/1/2号事件与手写credit碰撞。改用3/4后在同卡复验通过，没有增加barrier或
+改变缓冲。旧失败产物保留，未reset/换卡。源代码、源码依据、同步前后、性能
+口径及命令见[AST Cube](ast-cube.md)，原始证据在 `runs/refactor/ast-cube/`。
+
+最终5次冷进程完整源码→ASC p50=0.2286秒、max=0.2400秒、peak RSS最高36832 KiB，
+记录于 `cold-final/`。本例保持一个运行时task stream；动态内层K、嵌套物理
+region、层次里程碑摘要及R3/R4真实FA迁移仍未完成，下一步继续这些必需项。
+
 ## R2 第一个切片：存储周期与协议周期分离
 
 在 `7ace2dc` 上改为按物理分配分析地址余数，按实际同步执行条件构造完成图。

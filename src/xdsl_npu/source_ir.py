@@ -348,14 +348,26 @@ class CopyOp(IRDLOperation):
     destination = operand_def(TensorType)
     dependencies = var_operand_def(TileType)
     dependency_inputs = attr_def(ArrayAttr[IntAttr])
+    transpose = opt_attr_def(IntAttr)
     value = result_def(TileType)
     traits = traits_def(AsyncEffects())
 
     def verify_(self):
         _verify_result(self, self.destination)
         _verify_dependencies(self, [self.source])
+        transpose = 0 if self.transpose is None else self.transpose.data
+        if transpose not in {0, 1}:
+            raise VerifyException("copy transpose policy must be boolean")
+        if transpose and (
+            (self.source.type.memory.data, self.destination.type.memory.data) != ("L1", "L0B")
+            or len(self.source.type.shape) != 2
+        ):
+            raise VerifyException("transposed copy requires a complete L1→L0B matrix")
+        expected = (
+            ArrayAttr(reversed(self.source.type.shape.data)) if transpose else self.source.type.shape
+        )
         if (
-            self.source.type.shape != self.destination.type.shape
+            expected != self.destination.type.shape
             or self.source.type.dtype != self.destination.type.dtype
         ):
             raise VerifyException("copy requires the same typed tile extent; use explicit cast")
@@ -496,6 +508,15 @@ class MatmulOp(IRDLOperation):
     def verify_(self):
         _verify_result(self, self.accumulator)
         _verify_dependencies(self, [self.a, self.b, self.accumulator])
+        banks = (
+            self.a.type.memory.data,
+            self.b.type.memory.data,
+            self.accumulator.type.memory.data,
+        )
+        if banks not in {("L1", "L1", "L0C"), ("L0A", "L0B", "L0C")}:
+            raise VerifyException("matmul requires L0A/L0B/L0C or explicit legacy L1 operands")
+        if banks[0] == "L0A" and self.transpose_b.data:
+            raise VerifyException("L0B is already packed for matmul; transpose its L1 copy")
         if self.transpose_b.data not in {0, 1}:
             raise VerifyException("matmul transpose policy must be boolean")
         if any(len(v.type.shape) != 2 for v in (self.a, self.b, self.accumulator)):

@@ -248,7 +248,11 @@ class _Actor:
         self.operand_buffers = {}
         for record in self.records:
             op = record.op
-            if isinstance(op, MatmulOp) and op not in self.operand_buffers:
+            if (
+                isinstance(op, MatmulOp)
+                and op.a.type.memory.data == "L1"
+                and op not in self.operand_buffers
+            ):
                 require(family == "cube", "matmul requires a Cube execution domain")
                 dtype = op.a.type.dtype.data
                 m, k = shape(op.a)
@@ -338,9 +342,19 @@ class _Actor:
                 require(False, "runtime task stride needs a segmented ownership contract")
         contiguous = len(dimensions) == 1 or strides[0] == dimensions[1] * strides[-1]
         if typ.layout.data != "linear":
+            # Leading axes select complete packed planes. Row-major byte
+            # slicing INSIDE a fractal plane is not a valid layout mapping.
+            plane = shape(allocation.ref)[-2:]
+            plane_bytes = prod(plane) * ITEMSIZE[typ.dtype.data]
             require(
-                contiguous and dimensions == shape(allocation.ref),
-                "fractal subviews need an explicit layout conversion contract",
+                contiguous
+                and len(dimensions) == 2
+                and dimensions == plane
+                and offset % plane_bytes == 0
+                and all(coefficient % plane_bytes == 0 for coefficient, _, _ in generation + core)
+                and not (count_offset or count_core_stride),
+                "fractal view must select a complete matrix plane; "
+                "partial-plane slices need an explicit layout mapping",
             )
         if len(dimensions) == 2 and typ.layout.data == "linear" and (matrix or not contiguous):
             rows, columns = dimensions
@@ -446,7 +460,12 @@ class _Actor:
                     _root(op.destination).access.data != "read", "copy writes a read-only tensor"
                 )
                 require(
-                    shape(op.source) == shape(op.destination)
+                    (
+                        shape(op.source)[::-1]
+                        if op.transpose is not None and op.transpose.data
+                        else shape(op.source)
+                    )
+                    == shape(op.destination)
                     and op.source.type.dtype == op.destination.type.dtype,
                     "copy must preserve element type/extent; use an explicit cast",
                 )
@@ -457,6 +476,19 @@ class _Actor:
                         "_copy",
                         "nd2nz",
                         self.view(op.source, record, matrix=True),
+                        self.view(op.destination, record),
+                        params=shape(op.source),
+                    )
+                elif banks in {("L1", "L0A"), ("L1", "L0B")}:
+                    transpose = op.transpose is not None and op.transpose.data
+                    task(
+                        "_copy",
+                        "load2d_a"
+                        if banks[1] == "L0A"
+                        else "load2d_b_nt"
+                        if transpose
+                        else "load2d_b_nn",
+                        self.view(op.source, record),
                         self.view(op.destination, record),
                         params=shape(op.source),
                     )
@@ -568,27 +600,25 @@ class _Actor:
                 )
             elif isinstance(op, MatmulOp):
                 initialization = _initialize(op, record)
-                require(
-                    op.a.type.memory.data == op.b.type.memory.data == "L1"
-                    and op.accumulator.type.memory.data == "L0C",
-                    "gemm requires declared L1 inputs and L0C accumulator",
-                )
                 m, k = shape(op.a)
                 n, bk = shape(op.b) if op.transpose_b.data else (shape(op.b)[1], shape(op.b)[0])
                 require(k == bk and shape(op.accumulator) == (m, n), "gemm shapes disagree")
-                a_buffer, b_buffer = self.operand_buffers[op]
-                dtype = op.a.type.dtype.data
-                a = self.kernel.view(a_buffer, m * k * ITEMSIZE[dtype])
-                b = self.kernel.view(b_buffer, n * k * ITEMSIZE[dtype])
-                task("_operand_a", "load2d_a", self.view(op.a, record), a, params=(m, k))
-                task(
-                    "_operand_b",
-                    "load2d_b_nt" if op.transpose_b.data else "load2d_b_nn",
-                    self.view(op.b, record),
-                    b,
-                    params=shape(op.b),
-                    order_delta=1,
-                )
+                if op.a.type.memory.data == "L1":
+                    a_buffer, b_buffer = self.operand_buffers[op]
+                    dtype = op.a.type.dtype.data
+                    a = self.kernel.view(a_buffer, m * k * ITEMSIZE[dtype])
+                    b = self.kernel.view(b_buffer, n * k * ITEMSIZE[dtype])
+                    task("_operand_a", "load2d_a", self.view(op.a, record), a, params=(m, k))
+                    task(
+                        "_operand_b",
+                        "load2d_b_nt" if op.transpose_b.data else "load2d_b_nn",
+                        self.view(op.b, record),
+                        b,
+                        params=shape(op.b),
+                        order_delta=1,
+                    )
+                else:
+                    a, b = self.view(op.a, record), self.view(op.b, record)
                 task(
                     "_mad",
                     "mad",
@@ -596,7 +626,7 @@ class _Actor:
                     b,
                     self.view(op.accumulator, record),
                     params=(m, n, k, initialization),
-                    order_delta=2,
+                    order_delta=2 if op.a.type.memory.data == "L1" else 0,
                 )
             if isinstance(op, CopyOp):
                 suffix = "_export" if op.source.type.memory.data == "L0C" else "_copy"
@@ -615,8 +645,9 @@ class _Actor:
                 self.definitions[number] = self.readers[number, 0] = uid + "_scale"
             else:
                 self.definitions[number] = uid + "_mad"
-                self.readers[number, 0] = uid + "_operand_a"
-                self.readers[number, 1] = uid + "_operand_b"
+                explicit = op.a.type.memory.data == "L0A"
+                self.readers[number, 0] = uid + ("_mad" if explicit else "_operand_a")
+                self.readers[number, 1] = uid + ("_mad" if explicit else "_operand_b")
                 if not initialization:
                     self.readers[number, 2] = uid + "_mad"
         module = self.kernel.finish()
@@ -709,7 +740,11 @@ def _check_values(physical, actors, outer):
                 task_index = indices[actor][read_uid]
                 read_task = programs[actor].tasks[task_index]
                 native_index = (
-                    0 if isinstance(record.op, MatmulOp) and read_index < 2 else read_index
+                    0
+                    if isinstance(record.op, MatmulOp)
+                    and record.op.a.type.memory.data == "L1"
+                    and read_index < 2
+                    else read_index
                 )
                 ref = read_task.refs[native_index]
                 for generation in range(programs[actor].count):
@@ -765,7 +800,13 @@ def _check_loop_values(physical, actors, outer):
                 index = input_index.data
                 read_uid = lowering.readers[number, index]
                 task = tasks[read_uid]
-                native_index = 0 if isinstance(record.op, MatmulOp) and index < 2 else index
+                native_index = (
+                    0
+                    if isinstance(record.op, MatmulOp)
+                    and record.op.a.type.memory.data == "L1"
+                    and index < 2
+                    else index
+                )
                 ref = task.refs[native_index]
                 root_name = loop.root(owner, ref)
                 for r in range(loop.storage_periods[root_name]):
@@ -801,6 +842,11 @@ def lower_source(module, *, symbolic=True):
         from xdsl.dialects import scf
 
         for operation in program.walk():
+            if isinstance(operation, MatmulOp):
+                require(
+                    operation.a.type.memory.data == "L0A",
+                    "AST matmul requires explicit L0 operands; implicit L1 recipes are legacy",
+                )
             require(
                 not isinstance(operation, (scf.ForOp, scf.IfOp)),
                 f"{operation.location}: structured {operation.name} synchronization is not "

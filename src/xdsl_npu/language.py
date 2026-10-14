@@ -635,6 +635,14 @@ def alloc_l1(shape, dtype=f16, *, versions=1, name=None):
     return _allocate(shape, dtype, "L1", versions=versions, layout="NZ", name=name)
 
 
+def alloc_l0a(shape, dtype=f16, *, versions=1, name=None):
+    return _allocate(shape, dtype, "L0A", versions=versions, layout="ZZ", name=name)
+
+
+def alloc_l0b(shape, dtype=f16, *, versions=1, name=None):
+    return _allocate(shape, dtype, "L0B", versions=versions, layout="ZN", name=name)
+
+
 def alloc_l0c(shape, dtype=f32, *, versions=1, name=None):
     return _allocate(shape, dtype, "L0C", versions=versions, layout="NZ", name=name)
 
@@ -807,17 +815,29 @@ def trace_func(function=None, *, disjoint_external=False):
     return decorate if function is None else decorate(function)
 
 
-def copy(source, destination, *, valid=None):
+def copy(source, destination, *, valid=None, transpose=False):
     src, dst = _view(source), _view(destination).bound()
     require(dst.buffer.op.access.data != "read", "copy cannot write a read-only tensor")
+    require(type(transpose) is bool, "copy transpose policy must be constexpr boolean")
+    if transpose:
+        require(
+            (src.buffer.memory, dst.buffer.memory) == ("L1", "L0B")
+            and len(src.shape) == 2
+            and valid is None,
+            "transposed copy currently requires a complete L1→L0B matrix",
+        )
     require(
-        src.shape == dst.shape and src.buffer.dtype == dst.buffer.dtype,
+        (src.shape[::-1] if transpose else src.shape) == dst.shape
+        and src.buffer.dtype == dst.buffer.dtype,
         "copy requires identical typed extents; use explicit cast",
     )
     op = CopyOp.build(
         operands=[src.emit(valid), dst.emit(valid), _deps([source])],
         result_types=[_tile(dst)],
-        attributes={"dependency_inputs": _dependency_inputs([source])},
+        attributes={
+            "dependency_inputs": _dependency_inputs([source]),
+            **({"transpose": IntAttr(1)} if transpose else {}),
+        },
     )
     _trace().add(op)
     _trace().record(op.value)
@@ -952,7 +972,30 @@ def fill(destination, value):
     return _element("fill", [], destination, value)
 
 
+def matmul(a, b, *, accum, initialize=True):
+    """Native L0A[M,K] × L0B[K,N] → L0C[M,N], without hidden operands.
+
+    L1→L0 copies and every buffer slot are explicit. For stored Bᵀ[N,K],
+    use copy(..., transpose=True) into an L0B[K,N] tile before this operation.
+    """
+    require(
+        (_view(a).buffer.memory, _view(b).buffer.memory, _view(accum).buffer.memory)
+        == ("L0A", "L0B", "L0C"),
+        "matmul requires explicit L0A, L0B and L0C tiles; copy L1 operands first",
+    )
+    return _matmul(a, b, accum, transpose_b=False, initialize=initialize)
+
+
 def gemm(a, b, accumulator, *, transpose_b=False, initialize=True):
+    """Legacy L1 recipe; AST programs use explicit L0 storage and matmul."""
+    require(
+        _view(a).buffer.memory == _view(b).buffer.memory == "L1",
+        "legacy gemm requires L1 operands; use matmul for explicit L0 tiles",
+    )
+    return _matmul(a, b, accumulator, transpose_b=transpose_b, initialize=initialize)
+
+
+def _matmul(a, b, accumulator, *, transpose_b, initialize):
     av, bv, cv = _view(a), _view(b), _view(accumulator).bound()
     require(all(len(v.shape) == 2 for v in (av, bv, cv)), "gemm requires matrix tiles")
     m, k = av.shape

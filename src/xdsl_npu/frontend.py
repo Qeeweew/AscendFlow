@@ -41,6 +41,8 @@ _CALLS = {
     "Vector",
     "alloc_ub",
     "alloc_l1",
+    "alloc_l0a",
+    "alloc_l0b",
     "alloc_l0c",
     "copy",
     "mul",
@@ -50,6 +52,7 @@ _CALLS = {
     "cast",
     "fill",
     "gemm",
+    "matmul",
     "sqrt",
     "rsqrt",
     "div",
@@ -520,6 +523,15 @@ class _Parser:
             self.fail(node, f"unknown DSL operation {node.attr}")
         if isinstance(node, ast.Tuple):
             return tuple(self.expr(item) for item in node.elts)
+        if isinstance(node, ast.IfExp):
+            condition = self.expr(node.test)
+            if type(condition) is not bool:
+                self.fail(
+                    node,
+                    "conditional expressions require a constexpr boolean; "
+                    "use structured if/else for device conditions",
+                )
+            return self.expr(node.body if condition else node.orelse)
         if isinstance(node, ast.Dict):
             if any(key is None for key in node.keys):
                 self.fail(node, "policy mappings cannot unpack host dictionaries")
@@ -594,6 +606,12 @@ class _Parser:
                 return self.trace.add(cls(self.scalar(a), self.scalar(b))).result
             if name not in _CALLS:
                 self.fail(node, f"{name} is only valid in its declaration/control position")
+            if name == "gemm":
+                self.fail(
+                    node,
+                    "AST matmul uses explicit L0 buffers and N.copy → N.matmul; "
+                    "N.gemm is the legacy implicit-L0 recipe",
+                )
             if name.startswith("alloc_") and "versions" in kwargs:
                 self.fail(node, "AST allocations use explicit slot axes, not implicit versions")
             return getattr(N, name)(*args, **kwargs)

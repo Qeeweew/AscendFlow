@@ -1,5 +1,13 @@
 # 首轮源码依据
 
+R2 AST Cube 新增依据：CATLASS HEAD仍为 `698379e0d4b1b94d12728e7181df2cf83a958e8f`，
+工作区干净，未更新。`block_mmad_preload_async_with_callback.hpp:278–375` 明确
+在最后一次L1→L0读取后释放L1；L0和L0C另有M/FIX交接。安装CANN9.1的
+`asc/impl/basic_api/kernel_tpipe_impl.h:97–111` 在TPipe初始化预置M_MTE1的
+ID0/1/2，约533–538行回收。手写AscendC对照必须为此保留资源，本例改用3/4
+作为L0 credit；失败、修复和设备对照见[AST Cube](ast-cube.md)。这不是编译器
+原生ASC的隐式行为，也不能把TPipe包装器当作没有effects的普通分配函数。
+
 后续 R1 AST normalization 的新增依据：安装9.1.0的
 `asc/impl/c_api/instr_impl/npu_arch_2201/vector_compute_impl/asc_repeat_reduce_sum_impl.h`
 以 count mode 调用 `vcadd`；AscendC `ReduceRepeat<ReduceType::SUM>` 在2201路径

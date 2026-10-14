@@ -22,6 +22,11 @@ R2 已将存储地址周期与同步执行条件周期分开，避免无关 buff
 复制整个完成图。[互素槽位示例与证明边界](docs/factored-periods.md)包含最终
 ASC 对照、有限逐字节反例、冷编译和大长度设备验证；嵌套流水仍待接通。
 
+[显式 Cube 示例](examples/ast_cube.py)已接通 L1/L0A/L0B/L0C 独立槽位、
+`copy → matmul → Fixpipe`，支持已验证的完整 native tile NN/NT 与 f16/bf16。
+400 MiB固定配置的独立 AscendC/profiling、硬件工作量和支持边界见
+[Cube 验证记录](docs/ast-cube.md)；运行时内层K归约仍待层次控制实现。
+
 当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
 源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
 实际同步。软件 stage、buffer versions 和硬件 event 资源各自独立。
