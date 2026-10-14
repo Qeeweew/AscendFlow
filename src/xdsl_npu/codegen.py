@@ -261,6 +261,10 @@ def _body_lines(p, ex, stream, *, cross=None, drains=()):
             if ch.stride != 1:
                 epoch = f"({epoch}) / {ch.stride}"
             event_id = f"{ch.base} + (({epoch}) % {ch.width})"
+            if ch.event_ids is not None:
+                from .events import selection_expression
+
+                event_id = selection_expression(ch.event_ids, epoch)
             function = "asc_sync_notify" if op.action.data == "set" else "asc_sync_wait"
             code = f"{function}(PIPE_{a}, PIPE_{b}, {event_id});"
             comment = f" // {ch.name}"

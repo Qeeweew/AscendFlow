@@ -125,7 +125,8 @@ def test_fixed_snapshot_ring_cannot_be_shrunk_to_fit_ub():
 
 def test_event_pressure_cannot_silently_change_input_slots_or_issue_order():
     # Three independent input readiness streams already pressure MTE2->V.
-    # This allocator cannot pack their finite event lifetimes into eight IDs.
+    # Under the current completion contracts, their finite lifetimes need nine
+    # distinct IDs; packing cannot invent a missing consumption path.
     source = recurrent_gdn(1, 5, value_dim=8, slots=3)
     before = dump(source)
     with pytest.raises(CompileError, match="event bank has 8 IDs"):

@@ -103,9 +103,10 @@ CPU oracle 独立计算所有 token 的 attention 与 snapshot，使用 libm `fm
 当前支持 T=0…128、Dv 为8…128的8倍数、Dk64、静态独立序列和有限预算内的计划。
 一般 tails、数据相关分支、ragged 序列、动态/间接 state ID、gk、低精度输入或
 snapshot、跨核状态 ownership 尚未实现。缺少 disjoint 外部契约、UB 超容量、
-event bank 超8 ID 均明确报错。当前局部 event 分配器尚未跨 channel 打包不相交的
-生命周期；例如 T5、Dv8 的三输入槽计划会超过其 MTE2→V bank，不能用改变槽数
-或任意 barrier 修复。更多 event packing 是明确待办，拒绝不表示硬件不可排该计划。
+event bank 超8 ID 均明确报错。局部 event 分配器现已支持跨 channel 的有限
+生命周期打包；T5、Dv8 的三输入槽计划在当前完成契约下仍至少需要9个 ID，
+诊断明确列出不可比较的通知集合，不能用改变槽数或任意 barrier 修复。
+该诊断不外推为所有排步均硬件不可行，详见 [event-allocation.md](event-allocation.md)。
 
 ## 设备证据与复现
 

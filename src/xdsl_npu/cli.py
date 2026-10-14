@@ -3,7 +3,13 @@ import json
 from pathlib import Path
 
 from .codegen import emit_asc
-from .examples import cube_pipeline, mixed_pipeline, scalar_pipeline, vector_pipeline
+from .examples import (
+    cube_pipeline,
+    mixed_pipeline,
+    phased_pipeline,
+    scalar_pipeline,
+    vector_pipeline,
+)
 from .ir import dump, parse
 from .kernels import batched_matmul_nt, gemm_bias_silu, gemm_nt, rms_norm, rope, softmax, swiglu
 from .recurrent import recurrent_gdn
@@ -28,12 +34,15 @@ def main():
             "gemm",
             "gemm-bias-silu",
             "mixed",
+            "phased",
             "gdn",
             "ir",
         ],
     )
     parser.add_argument("--input", type=Path, help="physical unsynchronized xDSL for example=ir")
     parser.add_argument("--count", type=int, default=6)
+    parser.add_argument("--phases", type=int, default=9)
+    parser.add_argument("--phase-length", type=int, default=1)
     parser.add_argument("--sequences", type=int, default=1)
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--key-dim", type=int, default=64)
@@ -85,6 +94,8 @@ def main():
         module = mixed_pipeline(args.count, args.slots, aiv1_delay=args.aiv1_delay)
     elif args.example == "scalar":
         module = scalar_pipeline(args.count, args.blocks)
+    elif args.example == "phased":
+        module = phased_pipeline(args.phases, args.phase_length, args.columns)
     elif args.example == "gdn":
         module = recurrent_gdn(
             args.sequences,

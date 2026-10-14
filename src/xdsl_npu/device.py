@@ -235,8 +235,21 @@ def run_example(
 
         require(not reference and data_case == "standard", "GDN runner requires standard inputs")
         contents, expected, tolerance, shape = recurrent_inputs(p)
-    elif p.name in {"rms_norm", "rope", "softmax", "swiglu", "batched_matmul_nt", "gemm_nt"}:
+    elif p.name in {
+        "rms_norm",
+        "rope",
+        "softmax",
+        "swiglu",
+        "batched_matmul_nt",
+        "gemm_nt",
+        "phased_pipeline",
+    }:
         from .oracles import operator_inputs
+
+        require(
+            p.name != "phased_pipeline" or not reference,
+            "phased pipeline has its own numerical contract; reference adapter unavailable",
+        )
 
         contents, expected, tolerance, shape = operator_inputs(p, data_case=data_case)
     else:

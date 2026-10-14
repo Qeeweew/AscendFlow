@@ -36,6 +36,13 @@ class Channel:
     base: int
     reason: str
     stride: int = 1
+    event_ids: tuple[int, ...] | None = None
+
+    def physical_id(self, epoch):
+        ordinal = (epoch - self.lower) // self.stride
+        if self.event_ids is not None:
+            return self.event_ids[ordinal]
+        return self.base + ordinal % self.width
 
 
 @dataclass(frozen=True)
@@ -99,12 +106,23 @@ def execution(module: ModuleOp) -> Execution:
             1 <= w <= 8 and 0 <= base and base + w <= 8,
             f"{name}: local binary event bank has 8 IDs",
         )
+        event_ids = None if op.event_ids is None else tuple(a.data for a in op.event_ids)
+        if event_ids is not None:
+            require(
+                (base, w) == (0, 1),
+                f"{name}: explicit event IDs require neutral base=0,width=1",
+            )
+            require(
+                len(event_ids) == len(range(lo, hi, stride))
+                and all(isinstance(e, int) and 0 <= e < 8 for e in event_ids),
+                f"{name}: explicit event IDs must select [0,7] for every notification ordinal",
+            )
         a, b = p.tasks[source].pipe, p.tasks[destination].pipe
         require(
             a != b, f"{name}: same-pipe synchronization must use its native completion contract"
         )
         channels[name] = Channel(
-            name, source, destination, d, lo, hi, w, base, op.reason.data, stride
+            name, source, destination, d, lo, hi, w, base, op.reason.data, stride, event_ids
         )
         usage[(a, b)].update(range(base, base + w))
     before = defaultdict(list)
@@ -181,7 +199,7 @@ def execution(module: ModuleOp) -> Execution:
         event = (
             p.tasks[ch.source].pipe,
             p.tasks[ch.destination].pipe,
-            ch.base + ((epoch - ch.lower) // ch.stride) % ch.width,
+            ch.physical_id(epoch),
         )
         return Command(action, pipe, inst, name, epoch, event)
 
@@ -354,6 +372,9 @@ def verify_plan(module: ModuleOp, *, _imports=()) -> dict:
         "obligations": len(obligations),
         "channels": len(ex.channels),
         "event_ids": {k: sorted(v) for k, v in bank.items()},
+        "event_selection_tables": {
+            ch.name: list(ch.event_ids) for ch in ex.channels.values() if ch.event_ids is not None
+        },
         "storage_bytes": {**peaks, "GM": sum(s.nbytes for s in ex.program.storages if s.external)},
         "verification": (
             "conditional actor-local proof; shared imports still need a whole-group proof"
@@ -601,6 +622,7 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
                 proposals = candidate + [narrowed]
     # Find width by actual old-Wait->next-Set paths, never by storage count.
     widths = [1] * len(proposals)
+    needs_lifetime_packing = False
     for i, (src, dst, d, lo, hi, stride, reason) in enumerate(proposals):
         if p.tasks[src].pipe == p.tasks[dst].pipe:
             continue
@@ -621,10 +643,20 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
             ):
                 break
         else:
-            raise CompileError(
-                f"{p.tasks[src].pipe}->{p.tasks[dst].pipe}: no legal width <=8 "
-                f"for {p.tasks[src].uid}->{p.tasks[dst].uid}, distance {d}"
-            )
-    materialize(proposals, widths)
+            # A finite nonperiodic ID assignment can fit even when this
+            # channel cannot use a rotating ring. Do not change its commands.
+            widths[i] = 1
+            needs_lifetime_packing = True
+    banks = defaultdict(int)
+    for i, (src, dst, *_) in enumerate(proposals):
+        a, b = p.tasks[src].pipe, p.tasks[dst].pipe
+        if a != b:
+            banks[(a, b)] += widths[i]
+    needs_lifetime_packing |= any(size > 8 for size in banks.values())
+    materialize(proposals, widths, virtual=needs_lifetime_packing)
+    if needs_lifetime_packing:
+        from .events import pack_event_lifetimes
+
+        pack_event_lifetimes(result)
     verify_plan(result, _imports=_imports)
     return result

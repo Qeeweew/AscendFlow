@@ -84,6 +84,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 | Cube | f16 矩形 MAD、逐输出 f32 clear/跨 K 累加、NZ→ND Fixpipe；短 MAD 的实际 M 完成约束 |
 | 搬运 | GM↔UB（含原生二维 DMA）、GM→L1、原生 GM ND→L1 NZ、完整 tile 的 L1→L0A/B |
 | 同步 | 本地二值事件、必要同流水 barrier；混合组 mode-2 计数、双 AIV read-retirement quorum 和尾部 credit drain |
+| Event分配 | 每有向bank八ID；跨channel共享已证明不相交的生命周期；有限epoch映射与资源压力诊断 |
 | 保护 | executing ops 的 xDSL effects 防止普通 DCE/CSE 删除异步工作 |
 
 不支持的动态 task count、数据相关分支/带洞激活、间接 gather/scatter、任意 native extern、
@@ -97,6 +98,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 [混合核 GM ownership](docs/mixed-ownership.md)。
 递推 carry、snapshot 的独立最后读取及当前 event packing 限制见
 [静态 GDN](docs/recurrent-gdn.md)。
+局部 channel 生命周期共享及输入代次选择见 [event 分配](docs/event-allocation.md)。
 
 同步生成使用有限图提案和最终重检；有界交错检查独立探索 task 开始、退休、Set
 发射、生效和 Wait 消费。两者共享受审查的 native effect 表，不能当作独立硬件

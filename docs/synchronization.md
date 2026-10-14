@@ -78,6 +78,9 @@ kernel 入口 `asc_init` 和出口唯一 `asc_sync_pipe(PIPE_ALL)` 属于 CANN �
 事件 ID 的银行是 `(physical core, source pipe, destination pipe)`，每方向八 ID。
 buffer ring 和 event ring 是不同资源。分配前采用逻辑 channel，删除冗余候选必须
 重新建立覆盖；event ring 从实际 old-Wait→next-Set 路径确定。
+不相交的不同 channel 生命周期也可以共享 ID；rotating ring 放不下时，有限
+偏序分配仅选择 ID，不增加完成边或扩大等待。不可证明的八 ID 计划给出实际
+通知集合诊断。表编码、最小反例与设备验证见 [event-allocation.md](event-allocation.md)。
 本版不实现跨 channel 的主动 ID 共享搜索，但 verifier 可以检查最终真实冲突。
 分配失败诊断是当前方案的失败，不宣称硬件上不存在别的合法方案。
 

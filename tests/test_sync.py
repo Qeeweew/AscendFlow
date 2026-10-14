@@ -250,7 +250,7 @@ def test_independent_components_cannot_copy_event_numbers():
 def test_event_pressure_cannot_trigger_silent_serialization():
     source = vector_pipeline(20, slots=9)
     before = dump(source)
-    with pytest.raises(CompileError, match="no legal width <=8"):
+    with pytest.raises(CompileError, match="event bank has 8 IDs"):
         autosync(source)
     assert dump(source) == before
 

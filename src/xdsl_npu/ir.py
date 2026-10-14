@@ -209,6 +209,7 @@ class ChannelOp(IRDLOperation):
     stride = opt_attr_def(IntAttr)
     width = attr_def(IntAttr)
     base = attr_def(IntAttr)
+    event_ids = opt_attr_def(ArrayAttr[IntAttr])
     reason = attr_def(StringAttr)
     traits = traits_def(AsyncEffects())
 

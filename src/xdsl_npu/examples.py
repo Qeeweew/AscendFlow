@@ -74,6 +74,42 @@ def cube_pipeline(count=5, slots=2, *, stages=(0, 1, 2, 3)):
     return k.finish()
 
 
+def phased_pipeline(phases=9, phase_length=1, tile=16):
+    """Static phases share buffers; logical channel count is not flag usage.
+
+    Input has one slot; output has two. Each phase deliberately has distinct
+    task identities while preserving the same native pipeline and aliases.
+    There is no phase barrier or buffer expansion at the boundaries.
+    """
+    from .model import require
+
+    require(isinstance(phases, int) and 1 <= phases <= 64, "phases must be in [1,64]")
+    require(
+        isinstance(phase_length, int) and 1 <= phase_length <= 16, "phase length must be in [1,16]"
+    )
+    require(
+        isinstance(tile, int) and 8 <= tile <= 4096 and tile % 8 == 0,
+        "phase tile must be a multiple of eight in [8,4096]",
+    )
+    count, nbytes = phases * phase_length, tile * 4
+    k = Kernel("phased_pipeline", disjoint_external=True)
+    x = k.buffer("x", "GM", count * nbytes, external=True, initialized=True)
+    y = k.buffer("y", "GM", count * nbytes, external=True)
+    a = k.buffer("input_slots", "UB", nbytes)
+    b = k.buffer("output_slots", "UB", 2 * nbytes)
+    k.loop(count)
+    src = k.view(x, nbytes, stride=nbytes)
+    dst = k.view(y, nbytes, stride=nbytes)
+    inp = k.view(a, nbytes)
+    out = k.view(b, nbytes, stride=nbytes, slots=2)
+    for phase in range(phases):
+        active = (phase * phase_length, (phase + 1) * phase_length)
+        k.task(f"load_{phase}", "copy", src, inp, active=active)
+        k.task(f"scale_{phase}", "muls", inp, out, scalar=2, stage=1, active=active)
+        k.task(f"store_{phase}", "copy", out, dst, stage=2, issue_order=0, active=active)
+    return k.finish()
+
+
 def mixed_pipeline(count=3, slots=2, *, aiv1_delay=0):
     """Minimal real FIX -> GM ring -> two AIVs, including zero/reuse boundaries."""
     from xdsl.dialects.builtin import IntAttr, StringAttr

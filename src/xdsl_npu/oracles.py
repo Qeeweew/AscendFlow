@@ -15,6 +15,15 @@ def operator_inputs(program, *, data_case="standard"):
         raise ValueError(f"unknown numerical input case {data_case}")
     if data_case != "standard" and program.name != "rms_norm":
         raise ValueError("numerical-edges currently applies to RMSNorm")
+    if program.name == "phased_pipeline":
+        tile = program.tasks[0].refs[0].nbytes // 4
+        x = array("f", ((i % 97 - 48) / 8 for i in range(program.count * tile)))
+        return (
+            [x.tobytes(), b"\xcd" * len(x) * 4],
+            array("f", (f32(v * 2) for v in x)),
+            (0, 0),
+            [program.count, tile],
+        )
     if program.name == "gemm_nt":
         reduction = next(t for t in program.tasks if t.uid == "load_a").refs[0].row_stride // 2
         m = next(s.nbytes for s in program.storages if s.name == "a") // (reduction * 2)
