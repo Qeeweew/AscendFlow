@@ -857,9 +857,31 @@ def extract(module: ModuleOp) -> Program:
             )
             if core_stride:
                 core_terms += ((core_stride, core_divisor, core_modulus),)
+            extra_terms = []
+            for term in () if op.index_terms is None else op.index_terms:
+                require(len(term) == 3, "view index terms require stride/divisor/modulus")
+                coefficient, scale, modulus = (value.data for value in term)
+                require(
+                    coefficient >= 0
+                    and 1 <= scale <= MAX_INSTANCES
+                    and 0 <= modulus <= MAX_INSTANCES,
+                    "invalid additional generation coordinate",
+                )
+                extra_terms.append((0, coefficient, modulus, scale))
+            for term in () if op.core_terms is None else op.core_terms:
+                require(len(term) == 3, "view core terms require stride/divisor/modulus")
+                coefficient, scale, modulus = (value.data for value in term)
+                require(
+                    coefficient >= 0
+                    and (root.external or coefficient == 0)
+                    and 1 <= scale <= 1024
+                    and 0 <= modulus <= 1024,
+                    "invalid additional core coordinate",
+                )
+                core_terms += ((coefficient, scale, modulus),)
             ref = Ref(
                 root,
-                terms + ((o, s, m, divisor),),
+                terms + ((o, s, m, divisor),) + tuple(extra_terms),
                 length,
                 typ.dtype.data,
                 typ.layout.data,
@@ -896,7 +918,9 @@ def extract(module: ModuleOp) -> Program:
                 continue
             # With no new core term, a nested view and its already checked
             # parent share a translation. Sparse-row containment is invariant.
-            check_cores = range(core_count) if core_stride else range(1)
+            check_cores = (
+                range(core_count) if core_stride or op.core_terms is not None else range(1)
+            )
             require(
                 all(
                     (ref.address(0, c) - ref.address(0)) % ITEMSIZE[ref.dtype] == 0
@@ -1187,12 +1211,18 @@ def dependencies(program: Program, *, _imports=()) -> tuple[Obligation, ...]:
     subview cannot kill another reader. RW processes the read before the write.
     """
     cuts = {s.name: {0, s.nbytes} for s in program.storages}
+    effects = []
     for instance in program.instances():
-        for ref in program.tasks[instance.task].refs:
-            for interval in ref.segments(instance.generation):
-                cuts[ref.storage.name].update(interval)
-    segments = {
-        name: tuple(zip(sorted(points), sorted(points)[1:])) for name, points in cuts.items()
+        task = program.tasks[instance.task]
+        accesses = []
+        for ref, mode in zip(task.refs, task.modes_for(instance.generation)):
+            for start, stop in ref.segments(instance.generation):
+                cuts[ref.storage.name].update((start, stop))
+                accesses.append((ref.storage.name, start, stop, mode))
+        effects.append((instance, accesses))
+    points = {name: tuple(sorted(values)) for name, values in cuts.items()}
+    positions = {
+        name: {point: i for i, point in enumerate(values)} for name, values in points.items()
     }
     writers = {}
     readers = {}
@@ -1210,16 +1240,15 @@ def dependencies(program: Program, *, _imports=()) -> tuple[Obligation, ...]:
                 )
             )
 
-    for instance in program.instances():
+    for instance, footprints in effects:
         task = program.tasks[instance.task]
         accesses = []
-        for ref, mode in zip(task.refs, task.modes_for(instance.generation)):
-            for start, stop in ref.segments(instance.generation):
-                accesses.extend(
-                    ((ref.storage.name, a, b), mode)
-                    for a, b in segments[ref.storage.name]
-                    if start <= a and b <= stop
-                )
+        for root, start, stop, mode in footprints:
+            boundaries, index = points[root], positions[root]
+            accesses.extend(
+                ((root, boundaries[i], boundaries[i + 1]), mode)
+                for i in range(index[start], index[stop])
+            )
         for key, mode in accesses:
             if "R" in mode:
                 require(

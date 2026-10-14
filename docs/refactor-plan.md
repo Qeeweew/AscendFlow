@@ -39,24 +39,31 @@
 
 ## DSL 方向
 
-首版采用受限、类型明确的 Python 构造接口，直接形成 xDSL；不先实现通用 Python
-AST 编译器。语义操作、存储和执行排步分别表达，收敛为三类对象：
+根据用户补充，重新核对 TileLang 的 `persistent_910b.py:224–371`、Ascend
+`language/loop.py` 和 `schedule_hint.py`（参考 HEAD `6ba65d2`）。源语言采用
+TileLang 风格的 `Pipelined`、`Stage`、`Cube/Vector` 嵌套作用域，直接对应 NPU
+multi-stage 程序。此前仅用外置 Schedule 调整计算调用的方案不足以表达这个模型。
+首版仍使用受限、类型明确的 Python 构造，直接形成 xDSL，分为：
 
 - `Tile/Value` 表达计算结果、shape、dtype 与明确的数值操作顺序。
 - `Buffer/View/Ring` 表达 memory space、布局、别名、有效范围、slot 和所有权。
-- `Pipeline/Schedule` 用具名操作组和数据 tile 表达预取、执行顺序及驻留政策。
-  native segment、通知 ordinal 和具体 event ID 由 lowering/同步器产生。
+- `Pipelined/Stage` 在源程序中显式表达任务流及阶段。`Cube/Vector` 表达执行域，
+  搬运、Vector、Cube、Fixpipe 的实际 pipe 由操作和放置确定。Schedule 用于
+  补充或锁定作用域内排步；native segment、通知 ordinal 和 event ID 由编译器产生。
 
 拟议的最小语法，尚未实现：
 
 ```python
-with npu.kernel("scale", grid=grid) as k:
-    inputs = npu.buffer((T,), dtype=npu.f32, memory=npu.UB, slots=2)
-    outputs = npu.buffer((T,), dtype=npu.f32, memory=npu.UB, slots=2)
-    with npu.pipeline(npu.tiles(X, size=T), prefetch=1) as tile:
-        x = npu.load(X[tile], into=inputs.slot(tile))
-        y = npu.mul(x, 2.0, out=outputs.slot(tile))
-        npu.store(Y[tile], y)
+with N.Kernel(grid, kind="vector"):
+    x = N.alloc_ub((T,), N.f32, versions=2)
+    y = N.alloc_ub((T,), N.f32, versions=2)
+    for t in N.Pipelined(tiles, stages=3, order="source"):
+        with N.Stage(0, name="load"):
+            N.copy(X[t], x)
+        with N.Stage(1, name="compute"), N.Vector():
+            N.mul(x, 2.0, out=y)
+        with N.Stage(2, name="store"):
+            N.copy(y, Y[t])
 ```
 
 Cube 使用具名 `matmul(a=..., b=..., accum=..., initialize=...)`、具名 transfer
@@ -64,15 +71,23 @@ Cube 使用具名 `matmul(a=..., b=..., accum=..., initialize=...)`、具名 tra
 检查 shape、布局、内存空间和 dtype。精度转换、P 舍入、FP32 rescale/add 和递推
 状态更新保持显式，不由所谓融合或默认政策改变数值边界。
 
-专家通过独立 Schedule 指定真实操作组的相对排步和缓存，而不是在每条计算
-调用里混入 `stage`、`logical_phase` 和任意 `issue_order` 数字。Schedule 必须
-降低为可打印的物理派发表，供审查和生成 ASC；不能用它宣称操作已经完成。
+CV 首个语义闭环必须直接表达一个连续流：Stage0/QK，Stage1/Vector softmax，
+Stage1/Cube PV，Stage2/Vector update。两处 Stage1 是不同的 region，不能合并
+成一个同步完成点。所有 region 使用同一逻辑任务 `t`；编译器移动 task descriptor、
+访存与激活条件，生成 fill/drain，不要求用户写 `t-1/t-2` 或 `tasks+2`。
+stage 深度、buffer versions、query-state slots 与 event ring 分开；嵌套核内
+`Pipelined` 有独立 clock，不能把外层 CV stage 直接乘一个全局 native index。
+
+专家在这个源结构上固定 stage 和 region issue 顺序，后续自动排步也修改同一
+作用域表示。最终必须输出可检查的逻辑 task/stage→物理派发表；Stage 本身不
+代表 ready 或 retirement。详细 CV 语义与必须增加的反例见
+[multi-stage DSL](dsl-multistage.md)。
 
 默认和专家入口均进入同一物理 effect、last-read、ownership、event 和 drain
 验证。SSA value 的就绪不能代替 native retirement；不同逻辑值不能代替物理
 不别名。无法证明的动态访问仍明确拒绝，首轮不扩大当前动态控制支持范围。
 
-先用双缓冲 Vector 和一个 Cube/Fixpipe 程序验证接口表达力，再迁移现有算子。
+先用双缓冲 Vector、Cube/Fixpipe 和双向 CV 三阶段程序验证接口，再迁移现有算子。
 物理 TaskIR 可以作为后端表示保留，但不继续作为算子的公共源语言。
 
 ## Python 编译性能改造
@@ -133,7 +148,7 @@ peak RSS、实际 task/interval/graph 数量及候选次数；CANN/Bisheng 耗�
 |---|---|---|
 | 0. 保存与基线 | 重构前 Git checkpoint；CPU profile；固定复现集 | 记录已验证/未验证范围，所有运行数据在产品 Git 外 |
 | 1. 编译管线 | immutable analysis/产物、区间和完成图改造、按阶段计时 | 旧负例继续拒绝；有限差分/交错检查；生成排步与同步范围不退化；编译时间验收 |
-| 2. 最小 DSL | typed 计算/存储/独立 Schedule；Vector 与 Cube 两个示例 | 不写 native 字符串、位置参数 tuple、event/credit；能生成可审查物理 IR 与 ASC |
+| 2. 最小 DSL | typed 计算/存储；Pipelined/Stage/Cube/Vector；局部与双向 CV 闭环 | 不写 native 字符串、位置参数 tuple、event/credit、手工延迟任务；生成可审查 stage 映射、物理 IR 与 ASC |
 | 3. 全部算子迁移 | examples 中的算法、oracle、AscendC/ACLNN runner | 包内无算子 dispatch；完整回归；代表程序 ASC 离线编译及必要设备正确性 |
 | 4. 恢复性能工作 | 同契约 AscendC 与设备 profiling 的成套比较 | DSL 与编译耗时已可用，结果可溯源；本轮不执行此阶段 |
 

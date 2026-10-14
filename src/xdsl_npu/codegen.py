@@ -414,15 +414,24 @@ def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
 
 
 def emit_asc(module, *, host_launcher=True):
+    _, analysis = verify_plan(module, _details=True)
+    return _emit_checked(module, analysis, host_launcher=host_launcher)
+
+
+def _emit_checked(module, analysis, *, host_launcher=True):
+    """Format the exact final extraction owned by this compilation invocation.
+
+    External/mutable modules enter through emit_asc and are always checked.
+    No verified flag, historical witness, or user analysis is accepted there.
+    """
     from .ir import MixedOp, StaticDispatchOp
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):
-        return _emit_dispatch(module, host_launcher=host_launcher)
+        return _emit_dispatch(analysis, host_launcher=host_launcher)
 
     if isinstance(module.body.block.first_op, MixedOp):
-        return _emit_mixed(module, host_launcher=host_launcher)
-    verify_plan(module)
-    ex = execution(module)
+        return _emit_mixed(analysis, host_launcher=host_launcher)
+    ex = analysis
     p = ex.program
     _, stream = parts(module)
     args = [s for s in p.storages if s.external]
@@ -449,11 +458,8 @@ def emit_asc(module, *, host_launcher=True):
     return "\n".join(lines) + "\n"
 
 
-def _emit_mixed(module, *, host_launcher):
-    from .mixed import mixed_execution, verify_mixed
-
-    verify_mixed(module)
-    m, channels, _ = mixed_execution(module)
+def _emit_mixed(analysis, *, host_launcher):
+    m, channels, _ = analysis
     signature = ", ".join(f"__gm__ uint8_t* {name}" for name in m.roots)
     name = m.op.sym_name.data
     lines = [
@@ -507,12 +513,8 @@ def _mixed_body_lines(m, channels, *, core_expression=None):
     return lines
 
 
-def _emit_dispatch(module, *, host_launcher):
-    from .dispatch import case_module, extract_dispatch, verify_dispatch
-    from .mixed import mixed_execution
-
-    verify_dispatch(module)
-    dispatch = extract_dispatch(module)
+def _emit_dispatch(analysis, *, host_launcher):
+    dispatch, checked = analysis
     name, roots = dispatch.op.sym_name.data, dispatch.roots
     signature = ", ".join(f"__gm__ uint8_t* {root}" for root in roots)
     lines = [
@@ -522,8 +524,7 @@ def _emit_dispatch(module, *, host_launcher):
         "",
         f'extern "C" __global__ __mix__(1, 2) void {name}({signature}) {{',
     ]
-    for case, _ in dispatch.cases:
-        m, channels, _ = mixed_execution(case_module(case))
+    for (case, _), (m, channels, _) in zip(dispatch.cases, checked):
         lo, hi = case.lower.data, case.upper.data
         lines.append(f"  if (asc_get_block_idx() >= {lo} && asc_get_block_idx() < {hi}) {{")
         lines.extend(

@@ -172,8 +172,8 @@ def extract_dispatch(module):
     return Dispatch(op, cases, roots)
 
 
-def autosync_dispatch(module):
-    from .sync import autosync
+def autosync_dispatch(module, *, _capture=None):
+    from .sync import _finish, autosync
 
     result = module.clone()
     dispatch = extract_dispatch(result)
@@ -184,16 +184,16 @@ def autosync_dispatch(module):
         old = case.body.block.first_op
         case.body.block.insert_op_before(new, old)
         case.body.block.erase_op(old)
-    verify_dispatch(result)
-    return result
+    return _finish(result, _capture=_capture)
 
 
-def verify_dispatch(module):
+def verify_dispatch(module, *, _details=False):
     from .mixed import verify_mixed
 
     dispatch = extract_dispatch(module)
-    reports = [verify_mixed(case_module(case)) for case, _ in dispatch.cases]
-    return {
+    checked = [verify_mixed(case_module(case), _details=True) for case, _ in dispatch.cases]
+    reports = [report for report, _ in checked]
+    report = {
         "kernel": dispatch.op.sym_name.data,
         "groups": dispatch.op.blocks.data,
         "static_cases": len(reports),
@@ -202,6 +202,7 @@ def verify_dispatch(module):
         "scratch_bytes": max((report["scratch_bytes"] for report in reports), default=0),
         "verification": "exact static selectors, all branch effects and cross-case GM ownership",
     }
+    return (report, (dispatch, [analysis for _, analysis in checked])) if _details else report
 
 
 def explain_dispatch(module):

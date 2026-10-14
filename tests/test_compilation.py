@@ -1,0 +1,68 @@
+from dataclasses import FrozenInstanceError
+
+import pytest
+from multistage import cv_source, segmented_cv_source, vector_source
+from xdsl.dialects.builtin import FloatAttr, f32
+
+from xdsl_npu import autosync, emit_asc, verify_plan
+from xdsl_npu.compilation import Compilation, compile
+from xdsl_npu.ir import CrossSyncOp, TaskOp
+from xdsl_npu.lowering import lower_source
+from xdsl_npu.model import CompileError
+
+
+@pytest.mark.parametrize("factory", [vector_source, cv_source, segmented_cv_source])
+def test_frozen_compile_matches_independent_public_physical_path(factory, tmp_path):
+    source = factory(2)
+    result = compile(source)
+    physical = lower_source(source)
+    plan = autosync(physical)
+    assert result.asc == emit_asc(plan)
+    assert result.report == verify_plan(plan)
+    assert result.schedule
+    assert result.timings["total_s"] > 0
+    result.write(tmp_path)
+    assert not (tmp_path / "witnesses.json").exists()
+    assert (tmp_path / "after.xdsl").read_text() == result.plan_ir
+    assert (tmp_path / "source.xdsl").read_text() == result.source_ir
+
+
+def test_cached_code_owns_no_externally_mutable_ir_or_verification_flag():
+    physical = lower_source(vector_source(2))
+    result = Compilation(physical)
+    expected = result.asc
+    compute = next(
+        op for op in physical.walk() if isinstance(op, TaskOp) and op.native.data == "muls"
+    )
+    compute.attributes["scalar"] = FloatAttr(3.0, f32)
+    assert result.asc == expected
+    assert compile(physical).asc != expected
+    report = result.report
+    report["channels"] = -1
+    assert result.report["channels"] >= 0
+    with pytest.raises(FrozenInstanceError):
+        result.asc = "unsafe"
+    with pytest.raises(TypeError):
+        Compilation(physical, verified=True)
+
+
+def test_an_edited_exported_plan_is_rechecked_and_cannot_reuse_the_artifact_proof():
+    result = compile(cv_source(1))
+    plan = result.plan
+    for op in list(plan.walk()):
+        if isinstance(op, CrossSyncOp) and op.channel.data == "scores_ready":
+            op.parent.erase_op(op)
+    with pytest.raises(CompileError):
+        emit_asc(plan)
+    with pytest.raises(CompileError):
+        compile(plan, synchronize=False)
+    # The export is a copy; the frozen result still has its original complete plan.
+    assert emit_asc(result.plan) == result.asc
+
+
+def test_expert_synchronization_has_the_same_final_check():
+    plan = autosync(lower_source(vector_source(2)))
+    result = compile(plan, synchronize=False, host_launcher=False)
+    assert result.asc == emit_asc(plan, host_launcher=False)
+    with pytest.raises(CompileError, match="missing"):
+        compile(lower_source(vector_source(2)), synchronize=False)

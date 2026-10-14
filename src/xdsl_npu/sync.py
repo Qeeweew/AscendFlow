@@ -7,6 +7,7 @@ edge. Event ID reuse is checked only after real command placement is known.
 import itertools
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from time import perf_counter
 
 from xdsl.dialects.builtin import IntAttr, ModuleOp, StringAttr
 
@@ -53,6 +54,7 @@ class Command:
     channel: str = ""
     epoch: int = 0
     event: tuple[str, str, int] | None = None
+    proposal: int = -1
 
 
 @dataclass
@@ -230,6 +232,7 @@ class Graph:
         self.edges: list[set[int]] = []
         self.labels: list[str] = []
         self.reach: list[int] | None = None
+        self.order: tuple[int, ...] = ()
 
     def node(self, label):
         n = len(self.edges)
@@ -241,9 +244,14 @@ class Graph:
         if a != b:
             self.edges[a].add(b)
 
-    def close(self):
+    def close(self, omitted=None):
+        edges = (
+            self.edges
+            if not omitted
+            else [targets - omitted.get(a, frozenset()) for a, targets in enumerate(self.edges)]
+        )
         indegree = [0] * len(self.edges)
-        for targets in self.edges:
+        for targets in edges:
             for b in targets:
                 indegree[b] += 1
         queue = deque(i for i, d in enumerate(indegree) if not d)
@@ -251,16 +259,17 @@ class Graph:
         while queue:
             a = queue.popleft()
             order.append(a)
-            for b in self.edges[a]:
+            for b in edges[a]:
                 indegree[b] -= 1
                 if not indegree[b]:
                     queue.append(b)
         if len(order) != len(self.edges):
             blocked = [self.labels[i] for i, d in enumerate(indegree) if d][:6]
             raise CompileError(f"fixed issue plan has a completion/wait cycle: {blocked}")
+        self.order = tuple(order)
         reach = [0] * len(self.edges)
         for a in reversed(order):
-            for b in self.edges[a]:
+            for b in edges[a]:
                 reach[a] |= (1 << b) | reach[b]
         self.reach = reach
 
@@ -269,14 +278,48 @@ class Graph:
         return bool(self.reach[a] & (1 << b))
 
 
-def completion_graph(ex: Execution):
+class CompletionPrefixes:
+    """Linear DAG representation of captured native retirements.
+
+    Prefix nodes summarize only native ends. They neither depend on a Set's
+    effect nor fence subsequently issued source work. Repeated captures with
+    no intervening tasks share the same summary.
+    """
+
+    def __init__(self, graph):
+        self.graph = graph
+        self.pending = defaultdict(list)
+        self.prefix = {}
+
+    def record(self, pipe, end):
+        self.pending[pipe].append(end)
+
+    def capture(self, pipe, destination):
+        pending = self.pending[pipe]
+        if pending:
+            node = self.graph.node(f"{pipe}.retirement_prefix[{destination}]")
+            if pipe in self.prefix:
+                self.graph.edge(self.prefix[pipe], node)
+            for end in pending:
+                self.graph.edge(end, node)
+            self.prefix[pipe] = node
+            pending.clear()
+        if pipe in self.prefix:
+            self.graph.edge(self.prefix[pipe], destination)
+            return self.prefix[pipe], destination
+        return None
+
+
+def completion_graph(ex: Execution, *, controls=None):
     graph = Graph()
     begin, end = {}, {}
     notifications, waits = {}, {}
     physical_sets = defaultdict(list)
+    proposal_keys = {}
     previous_issue, previous_fence = {}, {}
     dispatch_gate = None
-    tasks_in_pipe = defaultdict(list)
+    prefixes = CompletionPrefixes(graph)
+    last_end = {}
     previous_native = {}
     for cmd in ex.commands:
         inst, pipe = cmd.instance, cmd.pipe
@@ -295,8 +338,9 @@ def completion_graph(ex: Execution):
         if cmd.kind == "task":
             begin[inst], end[inst] = start, finish
             if pipe in previous_native and previous_native[pipe].implicit_completion:
-                graph.edge(tasks_in_pipe[pipe][-1], start)
-            tasks_in_pipe[pipe].append(finish)
+                graph.edge(last_end[pipe], start)
+            last_end[pipe] = finish
+            prefixes.record(pipe, finish)
             previous_native[pipe] = ex.program.tasks[inst.task]
             if pipe == "S":
                 # Scalar UB load is synchronous and its by-value result is
@@ -304,8 +348,9 @@ def completion_graph(ex: Execution):
                 dispatch_gate = finish
         else:
             if cmd.kind in {"set", "barrier"}:
-                for done in tasks_in_pipe[pipe]:
-                    graph.edge(done, finish)
+                arc = prefixes.capture(pipe, finish)
+                if controls is not None and cmd.kind == "barrier" and arc is not None:
+                    controls[cmd.proposal].append((inst.generation, arc))
             # Set publishes after prior work, but is NOT a source-pipe fence.
             # Following native instructions may begin before the Set takes effect.
             if cmd.kind in {"wait", "barrier"}:
@@ -313,6 +358,7 @@ def completion_graph(ex: Execution):
             if cmd.kind == "set":
                 notifications[(cmd.channel, cmd.epoch)] = finish
                 physical_sets[cmd.event].append((finish, cmd.channel, cmd.epoch))
+                proposal_keys[(cmd.channel, cmd.epoch)] = cmd.proposal
             elif cmd.kind == "wait":
                 waits[(cmd.channel, cmd.epoch)] = finish
                 if pipe == "S":
@@ -321,36 +367,43 @@ def completion_graph(ex: Execution):
                     dispatch_gate = finish
     for key, producer in notifications.items():
         graph.edge(producer, waits[key])
+        if controls is not None:
+            controls[proposal_keys[key]].append((key[1], (producer, waits[key])))
     graph.close()
     return graph, begin, end, waits, physical_sets
 
 
-def verify_plan(module: ModuleOp, *, _imports=()) -> dict:
+def verify_plan(module: ModuleOp, *, _imports=(), _details=False):
     from .ir import MixedOp, StaticDispatchOp
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):
         from .dispatch import verify_dispatch
 
         require(not _imports, "whole launch proofs cannot assume imports")
-        return verify_dispatch(module)
+        return verify_dispatch(module, _details=_details)
 
     if isinstance(module.body.block.first_op, MixedOp):
         from .mixed import verify_mixed
 
         require(not _imports, "whole mixed proofs cannot assume imports")
-        return verify_mixed(module)
+        return verify_mixed(module, _details=_details)
     ex = execution(module)
     obligations = dependencies(ex.program, _imports=_imports)  # recomputed from final effects.
     graph, begin, end, waits, physical_sets = completion_graph(ex)
     # Diagnose a missing physical release before its secondary lost ready paths.
+    checked = set()
     for o in sorted(obligations, key=lambda o: o.hazard != "WAR"):
-        require(
-            graph.precedes(end[o.source], begin[o.destination]),
-            f"missing {o.hazard} {o.milestone}: "
-            f"{ex.program.tasks[o.source.task].uid}[{o.source.generation}] -> "
-            f"{ex.program.tasks[o.destination.task].uid}[{o.destination.generation}] "
-            f"on {o.storage}[{o.start}:{o.stop}]",
-        )
+        pair = (end[o.source], begin[o.destination])
+        if pair in checked:
+            continue
+        if not graph.precedes(*pair):
+            raise CompileError(
+                f"missing {o.hazard} {o.milestone}: "
+                f"{ex.program.tasks[o.source.task].uid}[{o.source.generation}] -> "
+                f"{ex.program.tasks[o.destination.task].uid}[{o.destination.generation}] "
+                f"on {o.storage}[{o.start}:{o.stop}]"
+            )
+        checked.add(pair)
     indices = {task.uid: i for i, task in enumerate(ex.program.tasks)}
     for inst in ex.program.instances():
         task = ex.program.tasks[inst.task]
@@ -374,7 +427,7 @@ def verify_plan(module: ModuleOp, *, _imports=()) -> dict:
     if ex.program.config:
         bank["aic:S->FIX"].add(0)
     _, peaks = storage_layout(ex.program.storages)
-    return {
+    report = {
         "tasks": len(begin),
         "independent_cores": ex.program.blocks,
         "obligations": len(obligations),
@@ -392,6 +445,18 @@ def verify_plan(module: ModuleOp, *, _imports=()) -> dict:
         "conditional_imports": list(_imports),
         "terminal_drain": "kernel return drains all issued pipelines",
     }
+    return (report, ex) if _details else report
+
+
+def _finish(module, *, _imports=(), _capture=None):
+    """Final independent extraction; its owned result may feed emission once."""
+    if _capture is None:
+        verify_plan(module, _imports=_imports)
+    else:
+        started = perf_counter()
+        report, analysis = verify_plan(module, _imports=_imports, _details=True)
+        _capture((report, analysis, perf_counter() - started))
+    return module
 
 
 def sync_op(g, action, channel, pipe, lower, upper, distance=0, stride=1):
@@ -485,7 +550,57 @@ def explain_plan(module: ModuleOp) -> dict:
     }
 
 
-def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
+def proposal_execution(program, proposals, issued):
+    """Immutable logical candidate, independent of xDSL and physical event IDs.
+
+    Match final insertion order exactly: waits follow proposal order; sets
+    inserted after the same task appear in reverse proposal order.
+    """
+    before, after = defaultdict(list), defaultdict(list)
+    channels = {}
+    for i, (src, dst, distance, lo, hi, stride, reason) in enumerate(proposals):
+        a, b = program.tasks[src], program.tasks[dst]
+        if a.pipe == b.pipe:
+            before[dst].append(("barrier", "", lo + distance, hi + distance, stride, i))
+            continue
+        shift = str(distance) if distance >= 0 else f"neg{-distance}"
+        name = f"c{i}_{a.uid}_{b.uid}_d{shift}"
+        channels[name] = Channel(name, src, dst, distance, lo, hi, 1, 0, reason, stride)
+        before[dst].append(("wait", name, lo + distance, hi + distance, stride, i))
+        after[src].append(("set", name, lo, hi, stride, i))
+    commands = []
+    seen = {"set": set(), "wait": set()}
+
+    def append(specs, inst):
+        for kind, name, lo, hi, stride, proposal in specs:
+            generation = inst.generation
+            if lo <= generation < hi and (generation - lo) % stride == 0:
+                event, epoch = None, 0
+                if name:
+                    channel = channels[name]
+                    epoch = generation - (channel.distance if kind == "wait" else 0)
+                    event = (
+                        program.tasks[channel.source].pipe,
+                        program.tasks[channel.destination].pipe,
+                        0,
+                    )
+                    seen[kind].add((name, epoch))
+                commands.append(
+                    Command(kind, program.tasks[inst.task].pipe, inst, name, epoch, event, proposal)
+                )
+
+    for inst in issued:
+        append(before[inst.task], inst)
+        commands.append(Command("task", program.tasks[inst.task].pipe, inst))
+        append(reversed(after[inst.task]), inst)
+    expected = {
+        (ch.name, g) for ch in channels.values() for g in range(ch.lower, ch.upper, ch.stride)
+    }
+    require(seen["set"] == seen["wait"] == expected, "candidate has inactive event endpoints")
+    return Execution(program, commands, channels)
+
+
+def autosync(module: ModuleOp, *, _imports=(), _capture=None) -> ModuleOp:
     """Preserve issue/stage/storage. Reduce redundant *whole channels* with witnesses.
 
     The finite proof permits testing ring widths and removing channels, with no
@@ -498,13 +613,13 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
         from .dispatch import autosync_dispatch
 
         require(not _imports, "whole launch planning cannot assume imports")
-        return autosync_dispatch(module)
+        return autosync_dispatch(module, _capture=_capture)
 
     if isinstance(module.body.block.first_op, MixedOp):
         from .mixed import autosync_mixed
 
         require(not _imports, "whole mixed planning cannot assume imports")
-        return autosync_mixed(module)
+        return autosync_mixed(module, _capture=_capture)
     result = module.clone()
     p = extract(result)
     kernel, stream = parts(result)
@@ -513,6 +628,8 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
         "AutoSync expects unsynchronized physical IR",
     )
     obs = dependencies(p, _imports=_imports)
+    issued = tuple(p.issued())
+    required_pairs = tuple({(o.source, o.destination) for o in obs})
     groups = defaultdict(list)
     for o in obs:
         a, b = p.tasks[o.source.task], p.tasks[o.destination.task]
@@ -587,38 +704,28 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
 
     # Allocate provisional banks independently of final hardware IDs to test coverage.
     # Width=1 can initially fail reuse, so coverage/cycle checking precedes reuse checking.
-    def covered(candidate):
-        materialize(candidate, [1] * len(candidate), virtual=True)
-        # Temporarily give each logical channel a private direction namespace by
-        # checking only the completion graph. Final physical reuse is checked later.
-        try:
-            ex = execution(result, _program=p)
-            graph, begin, end, _, _ = completion_graph(ex)
-            return all(graph.precedes(end[o.source], begin[o.destination]) for o in obs)
-        except CompileError:
-            return False
+    controls = defaultdict(list)
+    template = tuple(proposals)
+    ex = proposal_execution(p, template, issued)
+    graph, begin, end, _, _ = completion_graph(ex, controls=controls)
+    from .reachability import ProofSearch
 
-    # Large provisional banks are unnecessary: remove redundant channels first.
-    require(
-        covered(proposals),
-        "fixed schedule cannot cover its physical dependencies within local banks",
-    )
-    for proposal in list(reversed(proposals)):
-        candidate = proposals.copy()
-        candidate.remove(proposal)
-        if covered(candidate):
-            proposals = candidate
+    search = ProofSearch(graph, ((end[src], begin[dst]) for src, dst in required_pairs))
+    # Deleted commands remain transparent issue nodes. Only captured
+    # completion constraints are removed, never native effects or ordering.
+    retained = list(range(len(template)))
+    for index in reversed(retained.copy()):
+        if search.remove(arc for _, arc in controls[index]):
+            retained.remove(index)
     # Restrict a barrier only when a real destination completion path covers
     # the removed epochs. Source notifications alone cannot provide that path.
-    for proposal in list(proposals):
+    replacements = {}
+    for index in retained.copy():
+        proposal = template[index]
         src, dst, d, lo, hi, stride, reason = proposal
         if p.tasks[src].pipe != p.tasks[dst].pipe:
             continue
-        candidate = proposals.copy()
-        candidate.remove(proposal)
-        materialize(candidate, [1] * len(candidate), virtual=True)
-        ex = execution(result, _program=p)
-        graph, begin, end, _, _ = completion_graph(ex)
+        arcs = tuple(arc for _, arc in controls[index])
         missing = sorted(
             {
                 o.source.generation
@@ -629,7 +736,7 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
                     o.destination.generation - o.source.generation,
                 )
                 == (src, dst, d)
-                and not graph.precedes(end[o.source], begin[o.destination])
+                and not search.precedes_without((end[o.source], begin[o.destination]), arcs)
             }
         )
         if missing:
@@ -638,29 +745,29 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
             except CompileError:
                 continue
             narrowed = (src, dst, d, *span, reason)
-            if covered(candidate + [narrowed]):
-                proposals = candidate + [narrowed]
+            kept = {generation + d for generation in missing}
+            if search.remove(arc for generation, arc in controls[index] if generation not in kept):
+                replacements[index] = narrowed
+                retained.remove(index)
+                retained.append(index)
+    proposals = [replacements.get(index, template[index]) for index in retained]
     # Find width by actual old-Wait->next-Set paths, never by storage count.
     widths = [1] * len(proposals)
     needs_lifetime_packing = False
+    ex = proposal_execution(p, tuple(proposals), issued)
+    graph, _, _, waits, physical_sets = completion_graph(ex)
+    arrivals = {(name, epoch): node for seq in physical_sets.values() for node, name, epoch in seq}
     for i, (src, dst, d, lo, hi, stride, reason) in enumerate(proposals):
         if p.tasks[src].pipe == p.tasks[dst].pipe:
             continue
-        for width in range(1, min(8, len(range(lo, hi, stride))) + 1):
+        epochs = tuple(range(lo, hi, stride))
+        shift = str(d) if d >= 0 else f"neg{-d}"
+        name = f"c{i}_{p.tasks[src].uid}_{p.tasks[dst].uid}_d{shift}"
+        for width in range(1, min(8, len(epochs)) + 1):
             widths[i] = width
-            materialize(proposals, widths, virtual=True)
-            try:
-                ex = execution(result, _program=p)
-                graph, _, _, waits, physical_sets = completion_graph(ex)
-            except CompileError:
-                continue
-            shift = str(d) if d >= 0 else f"neg{-d}"
-            name = f"c{i}_{p.tasks[src].uid}_{p.tasks[dst].uid}_d{shift}"
-            pairs = [[item for item in seq if item[1] == name] for seq in physical_sets.values()]
             if all(
-                graph.precedes(waits[(a[1], a[2])], b[0])
-                for seq in pairs
-                for a, b in itertools.pairwise(seq)
+                graph.precedes(waits[(name, old)], arrivals[(name, new)])
+                for old, new in zip(epochs, epochs[width:])
             ):
                 break
         else:
@@ -679,5 +786,4 @@ def autosync(module: ModuleOp, *, _imports=()) -> ModuleOp:
         from .events import pack_event_lifetimes
 
         pack_event_lifetimes(result)
-    verify_plan(result, _imports=_imports)
-    return result
+    return _finish(result, _imports=_imports, _capture=_capture)

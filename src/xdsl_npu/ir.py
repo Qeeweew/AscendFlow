@@ -181,6 +181,8 @@ class ViewOp(IRDLOperation):
     core_stride = opt_attr_def(IntAttr)
     core_divisor = opt_attr_def(IntAttr)
     core_modulus = opt_attr_def(IntAttr)
+    index_terms = opt_attr_def(ArrayAttr[ArrayAttr[IntAttr]])
+    core_terms = opt_attr_def(ArrayAttr[ArrayAttr[IntAttr]])
     ref = result_def(RefType)
 
 
@@ -298,9 +300,12 @@ def dump(module: ModuleOp) -> str:
 
 
 def parse(text: str) -> ModuleOp:
+    from .source_ir import SOURCE
+
     ctx = Context()
     ctx.load_dialect(Builtin)
     ctx.load_dialect(NPU)
+    ctx.load_dialect(SOURCE)
     module = Parser(ctx, text).parse_module()
     module.verify()
     return module

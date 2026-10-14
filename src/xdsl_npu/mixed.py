@@ -320,6 +320,7 @@ class MixedCommand:
     channel: str = ""
     epoch: int = 0
     event: tuple[str, str, int] | None = None
+    control: int = -1
 
 
 def mixed_execution(module, *, _analysis=None):
@@ -398,7 +399,7 @@ def mixed_execution(module, *, _analysis=None):
                     return None
                 cmd = local[(inst, op.action.data, op.channel.data)].popleft()
                 return MixedCommand(
-                    actor, cmd.kind, cmd.pipe, inst, cmd.channel, cmd.epoch, cmd.event
+                    actor, cmd.kind, cmd.pipe, inst, cmd.channel, cmd.epoch, cmd.event, id(op)
                 )
             if not (op.lower.data <= g < op.upper.data and (g - op.lower.data) % stride == 0):
                 return None
@@ -448,13 +449,17 @@ def mixed_execution(module, *, _analysis=None):
     return m, channels, commands
 
 
-def mixed_graph(m, channels, commands):
+def mixed_graph(m, channels, commands, *, controls=None):
+    from .sync import CompletionPrefixes
+
     graph = Graph()
     begin, end, sends, receives = {}, {}, {}, {}
     local_sends, local_waits = defaultdict(list), {}
+    local_arrivals = {}
     for actor, sequence in commands.items():
         previous_issue, previous_fence, previous_native = {}, {}, {}
-        prefixes = defaultdict(list)
+        prefixes = CompletionPrefixes(graph)
+        last_end = {}
         gate = None
         cross_order = {}
         for cmd in sequence:
@@ -476,19 +481,24 @@ def mixed_graph(m, channels, commands):
                 key = (actor, inst)
                 begin[key], end[key] = start, finish
                 if pipe in previous_native and previous_native[pipe].implicit_completion:
-                    graph.edge(prefixes[pipe][-1], start)
-                prefixes[pipe].append(finish)
+                    graph.edge(last_end[pipe], start)
+                last_end[pipe] = finish
+                prefixes.record(pipe, finish)
                 previous_native[pipe] = m.programs[actor].tasks[inst.task]
                 if pipe == "S":
                     gate = finish
             else:
                 if cmd.kind in {"set", "cross_set", "barrier"}:
-                    for done in prefixes[pipe]:
-                        graph.edge(done, finish)
+                    arc = prefixes.capture(pipe, finish)
+                    if controls is not None and cmd.kind == "barrier" and arc is not None:
+                        controls[("barrier", cmd.control)].append(arc)
                 if cmd.kind in {"wait", "barrier"}:
                     previous_fence[pipe] = finish
                 if cmd.kind == "set":
                     local_sends[(actor, cmd.event)].append((finish, cmd.channel, cmd.epoch))
+                    key = (actor, cmd.channel, cmd.epoch)
+                    require(key not in local_arrivals, "duplicate local event producer")
+                    local_arrivals[key] = finish
                 elif cmd.kind == "wait":
                     local_waits[(actor, cmd.channel, cmd.epoch)] = finish
                     if pipe == "S":
@@ -523,32 +533,35 @@ def mixed_graph(m, channels, commands):
             for src in channel.sources:
                 for dst in channel.destinations:
                     graph.edge(sends[(src, name, epoch)], receives[(dst, name, epoch)])
+                    if controls is not None:
+                        controls[("cross", name)].append(
+                            (sends[(src, name, epoch)], receives[(dst, name, epoch)])
+                        )
     for (actor, name, epoch), wait in local_waits.items():
-        matches = [
-            node
-            for (a, _), items in local_sends.items()
-            if a == actor
-            for node, ch, g in items
-            if ch == name and g == epoch
-        ]
-        require(len(matches) == 1, "local event pair is missing in the mixed graph")
-        graph.edge(matches[0], wait)
+        key = (actor, name, epoch)
+        require(key in local_arrivals, "local event pair is missing in the mixed graph")
+        graph.edge(local_arrivals[key], wait)
     graph.close()
     return graph, begin, end, sends, receives, local_sends, local_waits
 
 
-def verify_mixed(module, *, _analysis=None, _obligations=None):
+def verify_mixed(module, *, _analysis=None, _obligations=None, _details=False):
     m, channels, commands = mixed_execution(module, _analysis=_analysis)
     obligations = global_dependencies(m) if _obligations is None else _obligations
     graph, begin, end, sends, receives, local_sends, local_waits = mixed_graph(
         m, channels, commands
     )
+    checked = set()
     for source, destination, o in sorted(obligations, key=lambda x: x[2].hazard != "WAR"):
-        require(
-            graph.precedes(end[source], begin[destination]),
-            f"missing mixed {o.hazard} {o.milestone}: {source} -> {destination} "
-            f"on {o.storage}[{o.start}:{o.stop}]",
-        )
+        pair = (end[source], begin[destination])
+        if pair in checked:
+            continue
+        if not graph.precedes(*pair):
+            raise CompileError(
+                f"missing mixed {o.hazard} {o.milestone}: {source} -> {destination} "
+                f"on {o.storage}[{o.start}:{o.stop}]"
+            )
+        checked.add(pair)
     for actor, program in m.programs.items():
         ids = {task.uid: index for index, task in enumerate(program.tasks)}
         for inst in program.instances():
@@ -585,7 +598,7 @@ def verify_mixed(module, *, _analysis=None, _obligations=None):
                         f"{name}: notification backlog can exceed 15; no unsafe counter overflow",
                     )
         peaks[name] = peak
-    return {
+    report = {
         "kernel": m.op.sym_name.data,
         "groups": m.op.blocks.data,
         "physical_actors_per_group": {"aic": 1, "aiv": 2},
@@ -602,6 +615,7 @@ def verify_mixed(module, *, _analysis=None, _obligations=None):
         "verification": "all static instances and exact group translations; trusted dav-2201 contracts",
         "terminal_drain": "every cross return consumed; each actor drains its issued pipelines",
     }
+    return (report, (m, channels, commands)) if _details else report
 
 
 def cross_op(g, action, channel, lo, hi, stride=1, divisor=1, offset=0):
@@ -678,7 +692,9 @@ def install_actor(m, name, module):
     m.op.body.block.erase_op(old)
 
 
-def autosync_mixed(module):
+def autosync_mixed(module, *, _capture=None):
+    from .sync import _finish
+
     result = module.clone()
     m = extract_mixed(result)
     require(
@@ -696,8 +712,7 @@ def autosync_mixed(module):
         install_actor(m, actor, autosync(projection, _imports=m.imports))
     m = extract_mixed(result)
     if not m.epochs:
-        verify_mixed(result)
-        return result
+        return _finish(result, _capture=_capture)
     roots = sorted({o.storage for _, _, o in cross})
     require(
         1 <= len(roots) <= 4, "mixed handoff needs 1..4 independently owned GM rings (8 counters)"
@@ -706,21 +721,53 @@ def autosync_mixed(module):
         prefix = "gm" if len(roots) == 1 else root
         _plan_gm_ring(m, [item for item in cross if item[2].storage == root], prefix, ring * 2)
 
-    def candidate_valid():
-        return verify_mixed(result, _analysis=m, _obligations=obligations)
+    verify_mixed(result, _analysis=m, _obligations=obligations)
+    from .reachability import ProofSearch
 
-    candidate_valid()
+    controls = defaultdict(list)
+    _, channels, commands = mixed_execution(result, _analysis=m)
+    graph, begin, end, sends, receives, local_sends, local_waits = mixed_graph(
+        m, channels, commands, controls=controls
+    )
+    shared = {(end[source], begin[destination]) for source, destination, _ in obligations}
+    for (actor, _), sequence in local_sends.items():
+        shared.update(
+            (local_waits[(actor, name, epoch)], next_set)
+            for (_, name, epoch), (next_set, _, _) in itertools.pairwise(sequence)
+        )
+    for actor, program in m.programs.items():
+        indices = {t.uid: i for i, t in enumerate(program.tasks)}
+        shared.update(
+            (
+                end[
+                    (
+                        actor,
+                        Instance(inst.generation, indices[program.tasks[inst.task].scalar_source]),
+                    )
+                ],
+                begin[(actor, inst)],
+            )
+            for inst in program.instances()
+            if program.tasks[inst.task].scalar_source is not None
+        )
+    counter_queries = {
+        name: {
+            (receives[(dst, name, i - MAX_CROSS_BACKLOG)], sends[(src, name, i)])
+            for src in channel.sources
+            for dst in channel.destinations
+            for i in range(MAX_CROSS_BACKLOG, channel.count)
+        }
+        for name, channel in channels.items()
+    }
+    search = ProofSearch(graph, shared | set().union(*counter_queries.values()))
+    removed_ops = []
     # Cross read-retirement can also cover actor-local ring WAW. Remove a
     # conflict barrier only after the whole-group graph proves it redundant.
     for op in list(result.walk()):
         if not isinstance(op, SyncOp) or op.action.data != "barrier":
             continue
-        block, following = op.parent, op.next_op
-        block.detach_op(op)
-        try:
-            candidate_valid()
-        except CompileError:
-            block.insert_op_before(op, following)
+        if search.remove(controls[("barrier", id(op))]):
+            removed_ops.append(op)
     # Bidirectional handoffs can already retire an earlier ring through a
     # later ready path. Do not force six notifications into an online loop
     # merely because it has three logical rings. Remove a whole physical
@@ -730,22 +777,21 @@ def autosync_mixed(module):
         if not isinstance(channel, CrossChannelOp):
             continue
         name = channel.sym_name.data
-        removed = []
-        for op in list(result.walk()):
-            if (
-                op is channel
+        others = shared | set().union(
+            *(queries for other, queries in counter_queries.items() if other != name)
+        )
+        if search.remove(controls[("cross", name)], drop_queries=counter_queries[name] - others):
+            counter_queries.pop(name)
+            removed_ops.extend(
+                op
+                for op in result.walk()
+                if op is channel
                 or isinstance(op, (CrossSyncOp, CrossDrainOp))
                 and op.channel.data == name
-            ):
-                removed.append((op.parent, op, op.next_op))
-                op.parent.detach_op(op)
-        try:
-            candidate_valid()
-        except CompileError:
-            for parent, op, following in reversed(removed):
-                parent.insert_op_before(op, following)
-    verify_mixed(result)
-    return result
+            )
+    for op in removed_ops:
+        op.parent.erase_op(op)
+    return _finish(result, _capture=_capture)
 
 
 def _plan_gm_ring(m, cross, prefix, flag_base):

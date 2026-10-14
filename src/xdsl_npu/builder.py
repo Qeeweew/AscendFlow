@@ -1,6 +1,6 @@
 """Explicit fixed-issue builder; there are no user event IDs or barriers."""
 
-from xdsl.dialects.builtin import IndexType, IntAttr, ModuleOp, StringAttr, f32
+from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp, StringAttr, f32
 from xdsl.ir import Block, Region, SSAValue
 
 from .ir import (
@@ -82,6 +82,8 @@ class Kernel:
         core_stride=0,
         core_divisor=1,
         core_modulus=0,
+        index_terms=(),
+        core_terms=(),
     ) -> SSAValue:
         assert self.task_block is not None
         typ = source.type
@@ -104,6 +106,14 @@ class Kernel:
                 "core_modulus": IntAttr(core_modulus),
             },
         )
+        if index_terms:
+            op.attributes["index_terms"] = ArrayAttr(
+                ArrayAttr(IntAttr(n) for n in term) for term in index_terms
+            )
+        if core_terms:
+            op.attributes["core_terms"] = ArrayAttr(
+                ArrayAttr(IntAttr(n) for n in term) for term in core_terms
+            )
         self.task_block.add_op(op)
         return op.ref
 
