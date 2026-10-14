@@ -1,5 +1,10 @@
 # Flash Attention：三环自动同步与大规模设备验证
 
+本页记录 **legacy物理构造路径** 的功能与实验，不是新AST DSL的支持列表。
+截至 `b98d541`，真实FA尚未完成结构化前端迁移；新的语言/连续流水/性能验收
+以[总体设计](design.md)和[重构方案](refactor-plan.md)为准。下文结果保留其原有
+源码、数值配置和测量范围，不作为尚未实现的新路径证据。
+
 `flash_attention` 将前向 online attention 展开为真实 xDSL physical IR：
 一个 AIC 执行 QK/PV，两个 AIV 各处理半个 query tile，三个有界 GM 环分别
 交接 scores、operand-dtype P 和 FP32 PV。Q/K/V/O 为连续 BNSD；K/V 保持原布局，

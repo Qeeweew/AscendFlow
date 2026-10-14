@@ -3,10 +3,11 @@
 基于 xDSL 0.73.0 的独立 Python 编译器，目标 Ascend 910B / dav-2201，直接输出
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
-2026-10-14对照实现 `872bf6e` 重写了[总体设计](docs/design.md)、
+2026-10-14对照实现 `b98d541` 重写了[总体设计](docs/design.md)、
 [DSL 前端与 CV 多阶段规格](docs/dsl-multistage.md)和[重构计划](docs/refactor-plan.md)。
-新计划将父子派发/异步出口、跨调用event生命周期、编译预算和固定性能验收
-放在一起；下一步是父output×子K循环，不以更多单层例子替代层次流水。
+新计划分别验收语言表达、编译成本和最终机器执行；规则跨query连续CV流水
+进入本轮范围，动态任务队列另行扩展。限定父output×子K闭环已经完成，下一步
+固定真实FA源码/性能合同，再接通普通区域前后工作、只读共享与层次组合。
 受限 AST 已接通单循环 Vector、运行时原始
 长度与精确对齐尾部；
 一般多层CV同步和真实FA迁移尚未完成。新 `prim_func` 不执行设备函数体，遗留
@@ -188,7 +189,7 @@ legacy 静态内层仍有展开。两条路径的准确边界见[重构记录](d
 [静态 GDN](docs/recurrent-gdn.md)。
 局部 channel 生命周期共享及输入代次选择见 [event 分配](docs/event-allocation.md)。
 
-Flash Attention 的数值契约、三环同步、变体和大规模性能见
+legacy Flash Attention 的数值契约、三环同步、变体和大规模性能见
 [Flash Attention](docs/flash-attention.md)。4K MHA/8K GQA 新生成代码相对初版分别
 快2.43/2.50倍，仍约为安装的 CANN 内核时间的2.01/2.13倍；没有宣称性能达到专家目标。
 
