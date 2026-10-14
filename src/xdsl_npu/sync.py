@@ -377,6 +377,13 @@ def completion_graph(ex: Execution, *, controls=None):
 @bounded
 def verify_plan(module: ModuleOp, *, _imports=(), _details=False):
     from .loop_model import is_symbolic
+    from .sequence_model import is_sequence
+
+    if is_sequence(module):
+        from .sequence_sync import verify_sequence
+
+        require(not _imports, "sequential proof must discharge its actual entry reads")
+        return verify_sequence(module, _details=_details)
 
     if is_symbolic(module):
         from .loop_sync import verify_loop
@@ -626,6 +633,13 @@ def autosync(module: ModuleOp, *, _imports=(), _capture=None) -> ModuleOp:
     """
     from .ir import MixedOp, StaticDispatchOp
     from .loop_model import is_symbolic
+    from .sequence_model import is_sequence
+
+    if is_sequence(module):
+        from .sequence_sync import autosync_sequence
+
+        require(not _imports, "sequential planning must discharge its actual entry reads")
+        return autosync_sequence(module, _capture=_capture)
 
     if is_symbolic(module):
         from .loop_sync import autosync_loop

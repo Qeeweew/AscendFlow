@@ -73,16 +73,20 @@ def _last_condition(op, pipeline):
     )
 
 
-def _work(program, pipeline, family, owner):
+def _work(program, pipeline, family, owner, *, operations=None):
     records = []
     phases = {op: i for i, op in enumerate(pipeline.body.block.ops) if isinstance(op, StageOp)}
     default_domain = None if program.kind.data == "mixed" else program.kind.data
     issue_order = () if pipeline.issue_order is None else pipeline.issue_order.data.get(family, ())
-    pinned = pipeline.issue_order is not None and family in pipeline.issue_order.data
+    pinned = (
+        operations is None
+        and pipeline.issue_order is not None
+        and family in pipeline.issue_order.data
+    )
     ranks = {label.data: i for i, label in enumerate(issue_order)}
 
     def walk(block, clock, bindings, stage, phase, label, domain, order, boundary=None):
-        for position, op in enumerate(block.ops):
+        for position, op in enumerate(block if isinstance(block, tuple) else block.ops):
             path = (*order, position)
             if isinstance(op, StageOp):
                 require(boundary is None, "place last-generation conditions inside their Stage")
@@ -171,7 +175,16 @@ def _work(program, pipeline, family, owner):
                     f"unsupported source operation {op.name}; effects cannot be ignored"
                 )
 
-    walk(pipeline.body.block, pipeline, {}, 0, 0, "pipeline", default_domain, ())
+    walk(
+        pipeline.body.block if operations is None else tuple(operations),
+        pipeline,
+        {},
+        0,
+        0,
+        "pipeline",
+        default_domain,
+        (),
+    )
     first_boundary = next(
         (i for i, record in enumerate(records) if record.boundary is not None), len(records)
     )
@@ -250,11 +263,28 @@ def _initialize(op, record, coordinate=None):
 
 class _Actor:
     def __init__(
-        self, program, pipeline, actor, family, owner, allocations, symbolic=False, invocation=None
+        self,
+        program,
+        pipeline,
+        actor,
+        family,
+        owner,
+        allocations,
+        symbolic=False,
+        invocation=None,
+        records=None,
+        once=False,
+        region_name=None,
     ):
         self.program, self.pipeline = program, pipeline
         self.invocation = invocation
-        self.records = _work(program, pipeline, family, owner)
+        self.records = _work(program, pipeline, family, owner) if records is None else records
+        self.once, self.region_name = once, region_name
+        require(
+            not once
+            or all(record.boundary is None and record.stage == 0 for record in self.records),
+            "ordinary source work cannot borrow a child stage or boundary predicate",
+        )
         require(self.records, f"{actor}: execution domain has no real work")
         self.kernel = Kernel(
             program.sym_name.data,
@@ -385,9 +415,14 @@ class _Actor:
                 )
                 parent.body.block.add_op(frame)
                 self.roots[allocation] = frame.ref
-        self.kernel.loop(
-            self.runtime if self.runtime is not None else pipeline.count.data, symbolic=symbolic
-        )
+        if once:
+            self.kernel.once(region_name)
+        else:
+            self.kernel.loop(
+                self.runtime if self.runtime is not None else pipeline.count.data, symbolic=symbolic
+            )
+            if region_name is not None:
+                self.kernel.stream.attributes["uid"] = StringAttr(region_name)
         self.schedule = []
         self.definitions = {}
         self.readers = {}
@@ -409,6 +444,10 @@ class _Actor:
 
     def view(self, value, record, *, matrix=False):
         view, allocation = value.owner, _root(value)
+        require(
+            not self.once or self.pipeline.body.block.args[0] not in view.indices,
+            "ordinary work cannot use a child generation outside its region",
+        )
         typ = value.type
         require(
             (typ.memory, typ.dtype, typ.layout)
@@ -457,6 +496,9 @@ class _Actor:
                 value = bindings[variable] // divisor
                 offset += coefficient * (value % modulus if modulus else value)
             elif variable is self.pipeline.body.block.args[0]:
+                require(
+                    not self.once, "ordinary work cannot use a child generation outside its region"
+                )
                 generation.append((coefficient, divisor, modulus))
             elif variable is self.program.body.block.args[0]:
                 core.append((coefficient, divisor, modulus))
@@ -606,7 +648,7 @@ class _Actor:
                 self.kernel.task_block = stream_block
             op = record.op
             stem = record.label if re.fullmatch(r"[A-Za-z_]\w*", record.label) else "region"
-            uid = f"{stem}_{number}"
+            uid = ("" if self.region_name is None else self.region_name + "_") + f"{stem}_{number}"
             order = ranks[id(record)] * 4
 
             def task(
@@ -957,11 +999,11 @@ def _check_values(physical, actors, outer):
                     )
 
 
-def _check_loop_values(physical, actors, outer):
+def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=()):
     from .loop_model import extract_loop, loop_dependencies
 
-    loop = extract_loop(physical)
-    raw = [o for o in loop_dependencies(loop) if o.hazard == "RAW"]
+    loop = extract_loop(physical) if extracted is None else extracted
+    raw = [o for o in loop_dependencies(loop, live_in=live_in) if o.hazard == "RAW"]
     for actor, lowering in actors.items():
         owner = actor if len(actors) == 3 else ("aic" if actor == "cube" else "aiv0")
         tasks = {t.uid: t for t in loop.actors[owner].program.tasks}
@@ -1030,6 +1072,11 @@ def lower_source(module, *, symbolic=True):
         isinstance(program, ProgramOp) and len(list(module.body.block.ops)) == 1,
         "expected one typed source program",
     )
+    from .sequence_lowering import lower_sequence, needs_sequence
+
+    if needs_sequence(program):
+        require(symbolic, "sequential source regions require retained control")
+        return lower_sequence(program)
     parents = [op for op in program.body.block.ops if isinstance(op, scf.ForOp)]
     invocation = parents[0] if len(parents) == 1 else None
     if parents:

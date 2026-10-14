@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from .budget import poll
-from .ir import EndOp, InvocationSyncOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
+from .ir import EndOp, InvocationSyncOp, LoopChannelOp, LoopSyncOp, RegionSyncOp, TaskOp, ViewOp
 from .loop_boundary import stream_operations
 from .model import optional_int, require
 from .periodic import MAX_PERIOD_TEMPLATES, MAX_PROOF_STATES
@@ -392,7 +392,7 @@ def channels(loop, *, virtual=False):
         for actor, data in loop.actors.items()
         for task in data.program.tasks
     }
-    for op in loop.op.body.block.ops:
+    for op in loop.protocol_scope.body.block.ops:
         if not isinstance(op, LoopChannelOp):
             continue
         name = op.sym_name.data
@@ -514,7 +514,9 @@ def commands(loop, channel_map):
                     pending.append(op)
             else:
                 require(
-                    isinstance(op, (ViewOp, InvocationSyncOp, EndOp)),
+                    isinstance(op, (ViewOp, InvocationSyncOp, EndOp))
+                    or loop.region is not None
+                    and isinstance(op, (LoopChannelOp, RegionSyncOp)),
                     f"unknown loop stream effect {op.name}",
                 )
         require(not pending, "trailing waits require an explicit drain contract")

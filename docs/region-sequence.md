@@ -1,8 +1,11 @@
 # P1：顺序区域的精确访问组合
 
-本切片实现[region_sequence.py](../src/xdsl_npu/region_sequence.py)的访问分析，
-**尚未接通一般prelude/child/epilogue的同步规划与ASC生成**。它产生待解决义务，
-不产生完成证书或whole-child barrier；没有新增设备能力或性能结论。
+本切片已从[精确访问组合](../src/xdsl_npu/region_sequence.py)接通根部单actor的
+普通工作→流水→普通工作，以及共享存储的多个兄弟流水。实现见
+[sequence_lowering](../src/xdsl_npu/sequence_lowering.py)、
+[sequence_sync](../src/xdsl_npu/sequence_sync.py)与
+[sequence_codegen](../src/xdsl_npu/sequence_codegen.py)。这是受限的根部组合，
+不是任意层次region闭包；serial父体和mixed层次组合仍未接通。
 
 ## 数据来自哪些实际事实
 
@@ -15,10 +18,11 @@ generation和自己的固定count（若有）。不同调用即使复用同一�
 初始化这样的固定一次工作与runtime child可以组合；固定百万次child也不会
 按次数遍历，ReadSpan仍是参数化范围。
 
-当前接受：stationary精确字节范围、一个共同runtime bound和任意固定count的
-叶区域。来自不同runtime bound的区域、frame漂移和mixed摘要继续拒绝；没有
+当前接受：stationary精确字节范围、一个共同runtime bound和固定count的
+叶区域。实际effects证明只读的漂移GM允许共享；跨region漂移写、不同runtime
+bound及mixed摘要继续拒绝。没有
 推广为任意深度区域闭包，也没有把用户自带摘要注册为可信契约。生产checker
-后续须从最终物理IR重建所有输入，不能信任planner的已验证标记。
+从最终物理IR重建所有输入，不能信任planner的已验证标记。
 
 共同bound必须引用同一个实际SSA值。两个分别捕获的参数即使都打印为`n`、
 表达式文本相同，也不能推断相等；这与allocation身份的检查分别进行。
@@ -65,6 +69,57 @@ reader、物理孔洞、同名不同分配、两个child、末代writer，以及
 .venv/bin/python -m pytest -q compiler/tests/test_region_sequence.py compiler/tests/test_hierarchy.py compiler/tests/test_invocations.py
 ```
 
-下一步将普通物理工作接到此合同，导出并验证完成/事件边界，使这些开放义务
-在最终IR上得到真实路径。只读共享GM、源lowering、一般顺序region的codegen
-和设备闭环仍未完成；不能仅凭本切片宣布P1通过。
+## 实际同步前后与设备闭环
+
+[state_sum](../examples/ast_state_sum.py)有真实Initial加载、双槽输入和FP32
+逐代累加，最后导出；N=0输出Initial。插入前的物理IR投影为：
+
+```text
+once r0: MTE2 Initial -> state
+stream r1(N): stage0 MTE2 X[t] -> x[t%2]
+              stage1 V add(state, x[t%2]) -> state
+once r2: MTE3 state -> Output
+```
+
+同步后（投影省略实际槽位ID表达式）：
+
+```text
+r0: load Initial; if N==0 Set(MTE2,MTE3)
+r1.load[t]: if t>=2 Wait(V,MTE2, t-2); load X[t]; Set(MTE2,V,t)
+r1.add[t]:  if t>=1 Pipe(V); Wait(MTE2,V,t); add
+            if t==N-1 Set(V,MTE3)
+            if t<N-2 Set(V,MTE2,t)
+r2: if N==0 Wait(MTE2,MTE3) else Wait(V,MTE3); store
+kernel exit: Pipe(ALL)
+```
+
+N>0时第一个X的MTE2通知覆盖更早的Initial加载，无需另一个入口event。
+input槽释放取Vector读取退休，不等输出搬运；state递推的V等待有实际RAW依据。
+普通region退出不drain。N=0使用独立匹配的MTE2→MTE3路径，不能等待不存在的add。
+
+叶规划使用条件入口假设，最终sequence checker从真实前驱写及物化Set/Wait
+独立解除这些假设；不能把内部`live_in`当作公开的免检初始化声明。
+跨region事件暂用互不相交ID，可能拒绝本可通过寿命复用的组合；boundary消除
+目前使用一个bridge加叶路径，不宣称最少同步。固定大count以覆盖它的静态边界
+族证明，避免把首尾绝对距离变为百万个查询状态。
+
+已有记录：相关316项回归通过，最后位置检查改动后24项sequence测试通过，
+两次测试范围重叠。独立有限指令/逐字节oracle覆盖N=0/1/2/3/4/7/17及破坏协议
+的负例。CANN编译、设备小例和X=1 GiB大例通过；独立AscendC对照见
+[验证记录](refactor-progress.md)。这些证据不覆盖未接通的父体组合或新AST FA。
+
+工作区根目录运行：
+
+```bash
+.venv/bin/python compiler/examples/run_state_sum.py --output runs/refactor/state-sum --build
+.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_state_sum.py --entry state_sum --trials 5 --output runs/refactor/state-sum/cold-review
+```
+
+设备命令在全部卡健康/空闲检查后选择物理卡；已有证据使用物理1→逻辑0：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_state_sum.py --output runs/refactor/state-sum --physical 1
+```
+
+仍缺父serial体内前后工作、跨调用共享只读GM的统一组合、一般frame转换、
+跨region借用数值/Scalar捕获、mixed层次与event寿命复用；P1整体未完成。

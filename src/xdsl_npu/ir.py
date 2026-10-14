@@ -208,11 +208,63 @@ class ViewOp(IRDLOperation):
 @irdl_op_definition
 class StreamOp(IRDLOperation):
     name = "npu.stream"
+    uid = opt_attr_def(StringAttr)
     count = opt_attr_def(IntAttr)
     limit = opt_operand_def(IndexType)
     symbolic = opt_attr_def(IntAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
+
+
+@irdl_op_definition
+class OnceOp(IRDLOperation):
+    """One ordinary block per enclosing invocation, including when a child is empty.
+
+    The single index argument is exactly zero, not a runtime loop or completion
+    token. Exiting the block does not retire its asynchronous operations.
+    """
+
+    name = "npu.once"
+    uid = attr_def(StringAttr)
+    body = region_def("single_block")
+    traits = traits_def(RecursiveMemoryEffect())
+
+    @property
+    def count(self):
+        return IntAttr(1)
+
+    @property
+    def limit(self):
+        return None
+
+
+@irdl_op_definition
+class RegionChannelOp(IRDLOperation):
+    """A guarded single notification (or same-pipe fence) across local regions."""
+
+    name = "npu.region_channel"
+    sym_name = attr_def(StringAttr)
+    source_region = attr_def(StringAttr)
+    source_task = attr_def(StringAttr)
+    source_end = attr_def(IntAttr)
+    source_offset = attr_def(IntAttr)
+    destination_region = attr_def(StringAttr)
+    destination_task = attr_def(StringAttr)
+    destination_end = attr_def(IntAttr)
+    destination_offset = attr_def(IntAttr)
+    # (period, residue, exact or -1, minimum); guards refer to the shared N.
+    domains = attr_def(ArrayAttr[ArrayAttr[IntAttr]])
+    event_id = attr_def(IntAttr)  # -1 denotes a same-pipe fence.
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
+class RegionSyncOp(IRDLOperation):
+    name = "npu.region_sync"
+    generation = operand_def(IndexType)
+    action = attr_def(StringAttr)
+    channel = attr_def(StringAttr)
+    traits = traits_def(AsyncEffects())
 
 
 @irdl_op_definition
@@ -385,6 +437,9 @@ NPU = Dialect(
         FrameOp,
         ViewOp,
         StreamOp,
+        OnceOp,
+        RegionChannelOp,
+        RegionSyncOp,
         BoundaryOp,
         RuntimeSizeOp,
         LoopChannelOp,

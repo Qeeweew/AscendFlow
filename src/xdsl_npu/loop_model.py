@@ -24,6 +24,9 @@ from .ir import (
     LoopChannelOp,
     LoopSyncOp,
     MixedOp,
+    OnceOp,
+    RegionChannelOp,
+    RegionSyncOp,
     RuntimeSizeOp,
     StreamOp,
     TaskOp,
@@ -80,11 +83,16 @@ class Loop:
     parameters: tuple[RuntimeSizeOp, ...]
     bound: Expr | None
     invocation: object = None
+    region: object = None
+
+    @property
+    def protocol_scope(self):
+        return self.op if self.region is None else self.region
 
     @property
     def protocol_period(self):
         period = 1
-        for op in self.op.walk():
+        for op in self.protocol_scope.walk():
             if isinstance(op, (LoopChannelOp, LoopSyncOp)):
                 period = bounded_period(lcm(period, op.period.data), "synchronization predicates")
         return period
@@ -118,7 +126,9 @@ class Dependence:
 
 def is_symbolic(module):
     return any(
-        isinstance(op, StreamOp) and (op.limit is not None or op.symbolic is not None)
+        isinstance(op, OnceOp)
+        or isinstance(op, StreamOp)
+        and (op.limit is not None or op.symbolic is not None)
         for op in module.walk()
     )
 
@@ -172,7 +182,7 @@ def _storage(op, limit, uniform_values):
     )
 
 
-def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None):
+def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None, region=None):
     require(
         kernel.core.data == ("aic" if name == "aic" else "aiv")
         and optional_int(kernel.blocks, 1) == groups,
@@ -183,7 +193,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None)
     for op in kernel.body.block.ops:
         if isinstance(op, BufferOp):
             declarations[op.ref] = _storage(op, limit, uniform_values)
-        elif isinstance(op, StreamOp):
+        elif isinstance(op, StreamOp) or region is not None and isinstance(op, OnceOp):
             streams.append(op)
         elif invocation is not None and op is invocation.op:
             from .invocation import frame_storage
@@ -199,12 +209,17 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None)
         else:
             require(
                 isinstance(op, (RuntimeSizeOp, LoopChannelOp, InvocationChannelOp, EndOp))
+                or region is not None
+                and isinstance(op, RegionChannelOp)
                 or (isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC)
                 and all(value in uniform_values for value in op.results),
                 f"unsupported loop kernel effect {op.name}",
             )
-    require(len(streams) == 1, "one symbolic task stream per actor required")
-    stream = streams[0]
+    require(
+        len(streams) == 1 if region is None else region in streams and invocation is None,
+        "one symbolic task stream per actor required outside sequence analysis",
+    )
+    stream = streams[0] if region is None else region
     require(
         stream.limit is limit and (stream.count is None) == (limit is not None),
         "all actors must share one immutable task count",
@@ -365,6 +380,10 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None)
                     "invocation native GM access must use its checked frame",
                 )
             params = tuple(value.data for value in op.params)
+            require(
+                not isinstance(stream, OnceOp) or op.stage.data == 0,
+                "ordinary block operations cannot have a pipeline stage offset",
+            )
             pipe, modes = native_contract(op.native.data, refs, params)
             require(
                 0 <= op.stage.data <= 32 and 0 <= optional_int(op.logical_phase, 0) <= 255,
@@ -437,7 +456,9 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None)
                 scalar_values[op.value] = uid
         else:
             require(
-                isinstance(op, (LoopSyncOp, InvocationSyncOp, EndOp)),
+                isinstance(op, (LoopSyncOp, InvocationSyncOp, EndOp))
+                or region is not None
+                and isinstance(op, (LoopChannelOp, RegionSyncOp)),
                 f"unsupported symbolic effect {op.name}",
             )
     require(tasks, "actor has no native task template")
@@ -456,7 +477,7 @@ def slope(ref):
     return sum(stride for _, stride, modulus, _ in ref.terms if not modulus)
 
 
-def extract_loop(module):
+def extract_loop(module, *, region=None):
     module.verify()
     require(len(list(module.body.block.ops)) == 1, "one loop program per compilation")
     op = module.body.block.first_op
@@ -489,7 +510,18 @@ def extract_loop(module):
             value = from_ssa(child.results[0])
             require(uniform(value, names), "unsupported nonnegative uniform bound expression")
             uniform_values[child.results[0]] = value
-    streams = [child for child in op.walk() if isinstance(child, StreamOp)]
+    if region is not None:
+        require(
+            isinstance(op, KernelOp)
+            and isinstance(region, (OnceOp, StreamOp))
+            and region.parent_op() is op,
+            "leaf extraction requires its actual local root region",
+        )
+    streams = (
+        [region]
+        if region is not None
+        else [child for child in op.walk() if isinstance(child, StreamOp)]
+    )
     require(streams, "loop program has no stream")
     limit = streams[0].limit
     require(
@@ -534,7 +566,9 @@ def extract_loop(module):
     constants = set()
     storage_periods, view_counts = {}, {}
     for name, kernel in kernels:
-        actor, views = _actor(name, kernel, shared, limit, groups, uniform_values, invocation)
+        actor, views = _actor(
+            name, kernel, shared, limit, groups, uniform_values, invocation, region
+        )
         actors[name] = actor
         if actor.stream.count is not None:
             constants.add(actor.stream.count.data)
@@ -582,6 +616,7 @@ def extract_loop(module):
         tuple(sizes),
         None if limit is None else uniform_values[limit],
         invocation,
+        region,
     )
     _check_prefixes(loop, all_views)
     _check_accesses(loop, all_views)
@@ -935,7 +970,7 @@ def access_cells(loop, *, roots=None, include_readonly=False):
                 yield root, lo, hi, cell_events
 
 
-def loop_dependencies(loop):
+def loop_dependencies(loop, *, live_in=()):
     """Exact periodic frontier and startup obligations, independent of N."""
     edges = {}
     task_map = {
@@ -1004,6 +1039,7 @@ def loop_dependencies(loop):
                 if read:
                     require(
                         initialized
+                        or root in live_in
                         or first_clear
                         or not active
                         or (writer is not None and writer[0] + shift >= 0),

@@ -28,11 +28,58 @@ def runtime_work(module, arguments):
     These are instruction-requested bytes/elements, not HBM traffic or FLOPs.
     The caller records actual kernel timings and hardware rate assumptions.
     """
-    from .ir import InvocationChannelOp
+    from .sequence_model import is_sequence
+
+    if is_sequence(module):
+        from .sequence_sync import _task, verify_sequence
+
+        _, checked = verify_sequence(module, _details=True)
+        parts = [_runtime_leaf(analysis, arguments) for analysis in checked.analyses.values()]
+        result = dict(parts[0])
+        for key in (
+            "native_invocations",
+            "vector_requested_elements",
+            "memory_requested_bytes_by_pipe_bank_mode",
+            "transfer_requested_bytes",
+            "sync_invocations",
+        ):
+            total = Counter()
+            for part in parts:
+                total.update(part[key])
+            result[key] = dict(total)
+        count = (
+            0
+            if checked.sequence.summary.bound is None
+            else checked.sequence.summary.bound.evaluate(arguments)
+        )
+        for bridge in checked.bridges:
+            if not any(d.contains(count) for d in bridge.domains):
+                continue
+            for action, point in (
+                (("set", bridge.source), ("wait", bridge.destination))
+                if bridge.event_id >= 0
+                else (("barrier", bridge.destination),)
+            ):
+                key = f"{action}:{_task(checked.sequence, point).pipe}"
+                result["sync_invocations"][key] = (
+                    result["sync_invocations"].get(key, 0) + result["groups"]
+                )
+        result.pop("tasks_per_group")
+        result["region_tasks_per_group"] = {
+            name: part["tasks_per_group"] for name, part in zip(checked.analyses, parts)
+        }
+        return result
     from .loop_sync import verify_loop
+
+    _, analysis = verify_loop(module, _details=True)
+    return _runtime_leaf(analysis, arguments)
+
+
+def _runtime_leaf(analysis, arguments):
+    from .ir import InvocationChannelOp
     from .scalar import from_ssa
 
-    _, (loop, channels, sequences, _, _) = verify_loop(module, _details=True)
+    loop, channels, sequences, _, _ = analysis
     require(
         set(arguments) == {size.sym_name.data for size in loop.parameters}
         and all(type(value) is int and value >= 0 for value in arguments.values()),

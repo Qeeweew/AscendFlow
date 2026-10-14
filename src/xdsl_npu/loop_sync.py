@@ -221,7 +221,16 @@ def verify_loop(module, *, _details=False):
         or not any(isinstance(op, (InvocationChannelOp, InvocationSyncOp)) for op in module.walk()),
         "invocation synchronization requires its actual parent scope",
     )
-    obligations = loop_dependencies(loop)
+    return _verify_leaf(loop, _details=_details)
+
+
+def _verify_leaf(loop, *, live_in=(), _details=False):
+    """Conditional leaf proof; its parent must discharge every live-in byte.
+
+    This is not a public successful-kernel verifier. Only verify_loop with no
+    live-ins, or the complete sequence verifier, grants that result.
+    """
+    obligations = loop_dependencies(loop, live_in=live_in)
     channel_map = channels(loop)
     graph, sequence, endpoints, native = completion_graph(loop, channel_map)
     stride, potential = graph.potential()
@@ -296,7 +305,9 @@ def verify_loop(module, *, _details=False):
             }
         ),
     }
-    for protocol in module.body.block.first_op.body.block.ops:
+    if live_in:
+        report["open_entry_roots"] = sorted(live_in)
+    for protocol in loop.op.body.block.ops:
         if isinstance(protocol, InvocationChannelOp):
             source = native[tuple(protocol.source.data.split("/"))]
             destination = native[tuple(protocol.destination.data.split("/"))]
@@ -305,7 +316,7 @@ def verify_loop(module, *, _details=False):
             report["event_ids"][bank].sort()
     if loop.invocation is not None:
         report["invocation_channels"] = sum(
-            isinstance(op, InvocationChannelOp) for op in module.walk()
+            isinstance(op, InvocationChannelOp) for op in loop.op.walk()
         )
     analysis = loop, channel_map, sequence, graph, (stride, potential)
     return (report, analysis) if _details else report
@@ -389,12 +400,15 @@ def _install(loop, specs, barriers):
                 **({"last": IntAttr(1)} if terminal else {}),
             }
         )
-        first_region = next(
-            child
-            for child in loop.op.body.block.ops
-            if isinstance(child, (StreamOp, KernelOp, scf.ForOp))
+        scope = loop.protocol_scope.body.block
+        first_region = (
+            scope.first_op
+            if loop.region is not None
+            else next(
+                child for child in scope.ops if isinstance(child, (StreamOp, KernelOp, scf.ForOp))
+            )
         )
-        loop.op.body.block.insert_op_before(op, first_region)
+        scope.insert_op_before(op, first_region)
         placed = []
         for actor, uid in sources:
             data = loop.actors[actor]
@@ -481,9 +495,15 @@ def autosync_loop(module, *, _capture=None):
 
     result = module.clone()
     loop = extract_loop(result)
-    obligations = loop_dependencies(loop)
+    _plan_leaf(loop)
+    return _finish(result, _capture=_capture)
+
+
+def _plan_leaf(loop, *, live_in=(), banks=None):
+    """Plan an owned leaf under explicit, still-open entry assumptions."""
+    obligations = loop_dependencies(loop, live_in=live_in)
     require(
-        not any(isinstance(op, (LoopChannelOp, LoopSyncOp)) for op in result.walk()),
+        not any(isinstance(op, (LoopChannelOp, LoopSyncOp)) for op in loop.protocol_scope.walk()),
         "AutoSync expects an unsynchronized symbolic loop",
     )
     specs, barriers = _proposals(loop, obligations)
@@ -507,10 +527,12 @@ def autosync_loop(module, *, _capture=None):
             for op in ([channel] if channel is not None else []) + operations:
                 op.parent.erase_op(op)
     graph, channel_map, endpoints, _ = check()
-    banks, cross_id = defaultdict(int), 0
+    banks, cross_id = (defaultdict(int) if banks is None else banks), 0
     for name, channel in channel_map.items():
         op = next(
-            op for op in result.walk() if isinstance(op, LoopChannelOp) and op.sym_name.data == name
+            op
+            for op in loop.protocol_scope.walk()
+            if isinstance(op, LoopChannelOp) and op.sym_name.data == name
         )
         if channel.kind == "cross":
             require(cross_id < 8, "symbolic mode-2 counter bank exhausted")
@@ -547,4 +569,3 @@ def autosync_loop(module, *, _capture=None):
         from .invocation_sync import plan_invocation
 
         plan_invocation(loop)
-    return _finish(result, _capture=_capture)

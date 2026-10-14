@@ -440,6 +440,12 @@ def _emit_checked(module, analysis, *, host_launcher=True):
     """
     from .ir import MixedOp, StaticDispatchOp
     from .loop_model import is_symbolic
+    from .sequence_model import is_sequence
+
+    if is_sequence(module):
+        from .sequence_codegen import emit_sequence
+
+        return emit_sequence(analysis, host_launcher=host_launcher)
 
     if is_symbolic(module):
         from .loop_codegen import emit_loop

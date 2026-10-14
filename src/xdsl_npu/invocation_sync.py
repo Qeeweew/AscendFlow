@@ -40,6 +40,7 @@ class Site:
     point: str
     channel: str = ""
     action: str = ""
+    direct: object = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,8 @@ class Inside:
         self.queries = 0
 
     def command(self, site):
+        if site.direct is not None:
+            return site.direct
         return (
             self.endpoints[site.task[0], site.channel, site.action]
             if site.channel

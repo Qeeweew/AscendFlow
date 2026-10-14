@@ -1,6 +1,39 @@
 # 重构的验证记录
 
+## 根部顺序区域闭环：7771289之后的实现检查点
+
+[state_sum](../examples/ast_state_sum.py)接通AST→物理once/stream→自动同步和
+最终重检→ASC/CANN→设备。四个native模板、保留的runtime循环、一个kernel
+最终drain；正N复用入口MTE2完成前缀，零N有自己的匹配出口协议。支持与拒绝
+边界、同步前后对照见[顺序区域](region-sequence.md)。仍不支持父serial体内
+一般前后工作、层次CV或新AST FA，不能将这个检查点登记为P1整体完成。
+
+此前同一工作树验证记录在外层`runs/refactor/state-sum/`：
+
+- 相关316项回归82.53秒；最后同步位置约束修改后24项sequence回归3.64秒。
+  范围重叠，不累加。有限指令/逐字节oracle覆盖0/1/2/3/4/7/17及多reader、
+  错clock/零guard/漏端点/容量/ownership等反例，不是任意N形式化证明。
+- 五个独立冷进程完整源码→ASC，p50=0.1853秒、max=0.1870秒，RSS最大30992 KiB；
+  import另约0.39秒，CANN另计。产物属性访问不算编译缓存命中。
+- 物理卡1→逻辑0，generated与独立AscendC均通过0/1/2/3/7/17及2048 tiles；
+  大例32组×4096元素×2048 tiles，X=1 GiB，全部输出精确，输入/guard完好。
+  另有`(2^24+1)-2^24==0`的FP32顺序反例；主要精确输入为有界整数/32。
+- 同卡交替的三批profile，每批warmup5/repeats30；generated的p50分别
+  709.254/710.124/708.642 µs，AscendC为711.454/709.802/710.842 µs。
+  批中位数比0.99777，表示这份固定政策在观测波动内一致，不声称加速。
+- 实机910B3为20 AIC/40 AIV、L2=192 MiB，本例使用32 AIV、每AIV UB48 KiB。
+  请求工作量268435456次FP32 add、1074790400 GM字节，约0.24976 ops/请求字节；
+  GM请求速率约1515 GB/s，**不是HBM实测带宽**。MTE2 activity约0.986、
+  Vector约0.251可重叠，尚无可用的持续Vector/HBM吞吐峰值来给出数值roofline。
+
+最终ASC SHA256为`22e5aebd2afaf2cef5a77a908818ad9777470b2533df92f6162dbd709ec45dfd`。
+证据文件为`regressions.log`、`final-sequence-tests.log`、`device-small.json`、
+`device-large.json`、`cold-final/benchmark.json`和`profiles/comparison.json`。
+本次方案重审仅复核已有记录及源码一致性，没有新增设备计时或恢复算子调参。
+
 ## P0目标源码与P1顺序访问组合
+
+本节为7771289时的历史状态；根部顺序区域的新状态见上节。
 
 在 `fafeea3` 上增加[真实FA目标源码](attention-target.md)：BNSD、BK1024、
 Cube128子块、Vector8行、FP32 online状态、P舍入与reciprocal+mul输出。
