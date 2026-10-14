@@ -1,156 +1,207 @@
-# 下一阶段：DSL、编译耗时与产品边界重构
+# 重构实施计划：语法、编译复杂度与流水性能共同验收
 
-2026-10-14。原算子优化目标保持暂停。`06fce4d` 保存重构前代码；这份计划不代表
-新的 DSL 或编译性能改进已实现。本阶段不增加算子变体、不继续调算子排步。
+2026-10-14 重写。本计划取代此前“静态 DSL 包装 → 有限图提速 → 最后迁移算子”
+的顺序。以[总体设计](design.md)和[DSL 规格](dsl-multistage.md)为目标，不表示
+实现已经完成。算子调参暂停；固定配置的代码/设备对照属于重构保真验收。
 
-## 已确认的问题
+## 1. 当前现场与可复用资产
 
-1. `Kernel.task(uid, native, *refs, params=..., stage=..., issue_order=...,
-   logical_phase=..., period=..., phase_width=...)` 同时承担指令选择、物理访问、
-   算法顺序和派发。字符串、位置参数和多个整数时钟使算子难读，也容易把语义
-   阶段与执行阶段弄混。给这个接口增加几个缩写不能解决分层问题。
-2. 依赖分析对每个访问扫描 root 的全部切分区间；完成图给每个 Set/barrier
-   连上该 pipe 的全部历史 task retirement。候选同步删除、宽度选择再反复
-   重建同样的图。`build_module`、ASC 输出、witness 导出有重复验证和提取。
-   这些成本存在明显的非线性增长，需以 CPU profile 确定修复优先级。
-3. FA 已移到 examples，但 `kernels.py`、`recurrent.py`、对应数值 oracle、
-   CANN 算子适配器和 CLI 分支仍在包内。编译器核心仍包含具体算法知识。
-4. 当前优化证据主要是生成 ASC、参考 AscendC 源码和安装 ACLNN 的 profiling。
-   缺少可运行、数值契约明确的 AscendC 对照闭环。参考源码组织相近不能证明
-   与安装二进制采用同样排步，也不能替代设备性能证据。
+本次修订开始时产品 HEAD 为 `7c5d0a9`。更早 checkpoint 为 `06fce4d`，旧计划提交为
+`9b40e2f`，多阶段原型为 `ec45a38`。工作树已有符号循环、codegen、示例及回归
+修改，必须单独检查、保存，不能回退覆盖。根目录不建 Git，只提交产品文件。
 
-一次 CPU profile 已完成：输入为已保存的 dense 小例 IR，B1/H1/Sq128/Sk2048/D128，
-单 mixed group、950 个实际 task。原始结果在产品仓库外的
-`runs/refactor/cpu-baseline.log` 和 `.prof`；输入 SHA256 为
-`08656eaa89ab69f71748ed9b5ee108dbb89f9891334d55884dc90306df4062e8`。
+| 保留并验证 | 必须替换/收敛 |
+|---|---|
+| 审查过的 dav-2201 native effects、布局、精确范围 | 用 Python 循环执行/展开设备循环的前端 |
+| 线性 completion prefix、访问索引、受影响义务重查 | 单 runtime 参数、最近循环隐式版本绑定 |
+| 最终实际 IR 重检、不可变 Compilation | `Program(count=0)` 模板约定、全局周期 LCM |
+| ASC/CANN 工具链、设备 runner、数值 oracle | 有限/符号两条长期生产路径及重复分析 |
+| examples 内算法与已记录的源码/设备基线 | 用已序列化 IR 计时代表全部前端编译 |
 
-| 带 cProfile 的阶段 wall time | 秒 |
-|---|---:|
-| AutoSync | 100.03 |
-| 再调用公共 verify | 4.95 |
-| 公共 ASC emission（含内部重检） | 5.58 |
-| witness 与 JSON 导出 | 9.53 |
+单外层符号循环已经有局部可运行原型，不再从零重写；但嵌套/分支/多状态摘要
+尚未成立，现有 FA 仍走遗留路径。当前 checker 重新提取最终 IR 是必要防线，
+其共享算法意味着它还需要独立测试 oracle，不能直接称为独立形式化证明。
 
-调用统计约8292万次，局部完成图构造320次、图闭包361次、依赖分析12次、全组
-依赖分析6次、全组验证41次；`Graph.edge` 被调用约2807万次。区间全扫描和
-图闭包各占约25.9/25.7秒 self time。这是带 profiler 的单次测量，不是正常编译
-计时，也不包含 CANN、NPU 执行或 Python 导入。它已足以确定重复分析、历史边
-和区间扫描是首要改造点；下一阶段另建不带 profiler 的固定基线。
+## 2. 阶段与依赖
 
-## DSL 方向
-
-根据用户补充，重新核对 TileLang 的 `persistent_910b.py:224–371`、Ascend
-`language/loop.py` 和 `schedule_hint.py`（参考 HEAD `6ba65d2`）。源语言采用
-TileLang 风格的 `Pipelined`、`Stage`、`Cube/Vector` 嵌套作用域，直接对应 NPU
-multi-stage 程序。此前仅用外置 Schedule 调整计算调用的方案不足以表达这个模型。
-首版仍使用受限、类型明确的 Python 构造，直接形成 xDSL，分为：
-
-- `Tile/Value` 表达计算结果、shape、dtype 与明确的数值操作顺序。
-- `Buffer/View/Ring` 表达 memory space、布局、别名、有效范围、slot 和所有权。
-- `Pipelined/Stage` 在源程序中显式表达任务流及阶段。`Cube/Vector` 表达执行域，
-  搬运、Vector、Cube、Fixpipe 的实际 pipe 由操作和放置确定。Schedule 用于
-  补充或锁定作用域内排步；native segment、通知 ordinal 和 event ID 由编译器产生。
-
-拟议的最小语法，尚未实现：
-
-```python
-with N.Kernel(grid, kind="vector"):
-    x = N.alloc_ub((T,), N.f32, versions=2)
-    y = N.alloc_ub((T,), N.f32, versions=2)
-    for t in N.Pipelined(tiles, stages=3, order="source"):
-        with N.Stage(0, name="load"):
-            N.copy(X[t], x)
-        with N.Stage(1, name="compute"), N.Vector():
-            N.mul(x, 2.0, out=y)
-        with N.Stage(2, name="store"):
-            N.copy(y, Y[t])
+```text
+R0 固定现场/基线
+  → R1 AST + 单结构化循环 + Vector/归约闭环
+  → R2 嵌套摘要/状态 + Cube/CV 资源闭环
+  → R3 真实 dense FA，固定专家排步与大规模设备验收
+  → R4 GQA/MQA/causal/tails，收敛唯一生产路径
+  → R5 动态 metadata/paged/sparse/persistent（独立后续范围）
 ```
 
-Cube 使用具名 `matmul(a=..., b=..., accum=..., initialize=...)`、具名 transfer
-和布局/operand placement，替代 `params=(m,n,k,...)`。所有操作由类型与命名参数
-检查 shape、布局、内存空间和 dtype。精度转换、P 舍入、FP32 rescale/add 和递推
-状态更新保持显式，不由所谓融合或默认政策改变数值边界。
+性能记录从 R0 开始，每阶段检查最终 ASC。不是等 R4 结束才发现语法或分析迫使
+流水串行。R3 的数值主体和固定 AscendC 配置在 R0 就确定，避免以同步小例代替
+真实算子的设计验收。以下门槛未通过，就修复该阶段，不继续堆算子变体。
 
-CV 首个语义闭环必须直接表达一个连续流：Stage0/QK，Stage1/Vector softmax，
-Stage1/Cube PV，Stage2/Vector update。两处 Stage1 是不同的 region，不能合并
-成一个同步完成点。所有 region 使用同一逻辑任务 `t`；编译器移动 task descriptor、
-访存与激活条件，生成 fill/drain，不要求用户写 `t-1/t-2` 或 `tasks+2`。
-stage 深度、buffer versions、query-state slots 与 event ring 分开；嵌套核内
-`Pipelined` 有独立 clock，不能把外层 CV stage 直接乘一个全局 native index。
+### R0：保存现场并建立可比较基线
 
-专家在这个源结构上固定 stage 和 region issue 顺序，后续自动排步也修改同一
-作用域表示。最终必须输出可检查的逻辑 task/stage→物理派发表；Stage 本身不
-代表 ready 或 retirement。详细 CV 语义与必须增加的反例见
-[multi-stage DSL](dsl-multistage.md)。
+交付：
 
-默认和专家入口均进入同一物理 effect、last-read、ownership、event 和 drain
-验证。SSA value 的就绪不能代替 native retirement；不同逻辑值不能代替物理
-不别名。无法证明的动态访问仍明确拒绝，首轮不扩大当前动态控制支持范围。
+1. 先 review 当前 diff，再单独提交现有实现 checkpoint；记录 HEAD、脏文件和
+   未验证变更。不得把本次 docs-only 提交称为当前运行时代码已完整保存。
+2. 固定 Vector、归约、递推切片、分层 Cube、CV 及 dense FA 的源码、数值契约、
+   tile/layout/slots/排步。保存当前能生成的 before/after IR、ASC 和编译选项。
+3. 建立统一阶段计时/结构计数输出；保留旧慢输入用于定位，但不反复等待无预算
+   的大例。记录现有路径哪里按输入展开，哪里有重复分析或资源搜索热点。
+4. 选定可运行的同契约 AscendC 对照。优先适配已有专家/ops-transformer 实现；
+   若无法独立运行所选源码，记录缺口，先保留可运行手排基线，不能拿 ACLNN
+   二进制冒充该源码结果。FA 对照至少保持逻辑 BK、P 舍入和 FP32 更新顺序。
 
-先用双缓冲 Vector、Cube/Fixpipe 和双向 CV 三阶段程序验证接口，再迁移现有算子。
-物理 TaskIR 可以作为后端表示保留，但不继续作为算子的公共源语言。
+退出条件：相关实现回归通过或失败已定位；最新图搜索改动重新验证；每个基线
+都有可复现入口和明确测量口径。旧记录的测试通过次数不能替代本次工作树结果。
 
-## Python 编译性能改造
+### R1：受限 AST、显式槽位和运行时循环
 
-先建立固定 CPU benchmark，分开记录 source construction、lowering、访问分析、
-同步规划、最终验证、ASC emission 和可选诊断导出。记录 cold compile、重复编译、
-peak RSS、实际 task/interval/graph 数量及候选次数；CANN/Bisheng 耗时独立统计。
-正常计时与带 profiler 的计时必须区分。
+交付：
 
-按 profile 处理下列问题，不先换语言或引入新的构建栈：
+- `@prim_func` AST 捕获、两遍签名解析、源码诊断；多运行时标量、constexpr、
+  基础 if/for/算术，生成 xDSL arith/scf 与最小 NPU region。
+- `serial/Pipelined` 不执行 Python 迭代，不按常量或运行时 N 默认展开；
+  显式 `unroll` 有结构预算。buffer leading slot axes 和范围/别名检查。
+- 现有单循环符号分析接入结构化 IR；放弃伪造 `count=0` 容器，保留已审查
+  native effects 和最终检查路径。首阶段暂不支持的嵌套必须精确诊断。
+- examples 中双缓冲 raw-length Vector、归约/normalization 原语小例；尾部
+  先支持可实现的对齐子集，不以 padded shape 掩盖原始长度。
 
-1. 用 immutable 分析对象规划候选，不在每次试探中擦除/重建 xDSL。IR、访问和
-   ownership 不变时复用对应分析；排步、存储、effects 或激活变化必须失效。
-2. 精确区间索引代替每次扫描全部 cuts；只访问重叠区间，保留 holes 和真实
-   native footprint。绝不以 bounding box 或忽略别名换取速度。
-3. 用线性 completion-prefix 节点压缩重复历史边。prefix 只汇总此前退休，
-   不增加后续源 task 的完成约束，不能重新引入“Notify 是 source fence”的错误。
-4. event 宽度/ID 选择复用与 ID 无关的完成关系；冗余同步删除按受影响义务检查，
-   避免逐候选全程序重建。最终独立 checker 仍从最终物理 IR 检查全部义务。
-5. `compile` 返回拥有已冻结 PlanIR 的编译产物，供 ASC 和诊断消费。同一不可变
-   产物避免重复完整验证；接收外部或可变 IR 的入口仍重新验证。不能凭一个
-   可伪造的 `verified=True` 或历史 witness 放行。
-6. 普通 compile 只生成代码和必要摘要；逐字节 witness、完整图和有界交错是
-   显式诊断选项。关闭诊断不关闭同步正确性检查，也不改变同步序列。
+退出条件：
 
-暂定的可用性验收目标：在同一开发机上，常用静态内核的纯编译阶段不超过1秒，
-4K/8K FA 不超过5秒，未修改 IR 的复用不超过100毫秒。它们是待实现目标，需用
-固定 benchmark 的多次中位数和尾延迟验收；不能把 cProfile 时间当作正常计时。
-还要检查规模翻倍的增长与峰值内存，不只对单个 shape 优化。达不到时记录具体
-热点并调整实现，不通过缩减验证规模或增加同步来满足计时门槛。
+1. 同一生成 binary 运行 N=0/1/2/4/4096/65536 个 tile，独立改变至少两个 runtime
+   参数；AST 到 ASC 不含按 N 实例化，模板/图/code size 与 N 无关。
+2. 输入范围、溢出、未知调用、错 scope/slot、别名覆盖、零次结果未初始化有负例。
+3. 前后 IR 和实际 ASC 展示 ready/WAR/最后读取/drain；CANN 离线成功；设备
+   Vector/归约正确。不能只以 xDSL verifier 通过验收。
+4. 冷编译包含前端，达到常用内核目标；保留与手排 ASC 的搬运/缓冲/等待对照。
 
-## 目录与验证边界
+### R2：分层摘要、循环携带状态和资源规划
 
-- `src/xdsl_npu/` 只保留 DSL、xDSL IR/lowering、dav-2201 契约、物理分析、同步
-  规划/验证、ASC 后端和通用 CANN toolchain。
-- 所有具体算子与算法放 `examples/`，包括 GEMM、normalization、RoPE、GDN、
-  FA 及变体。数值 oracle、算子专属 ACLNN 适配器、AscendC 对照和 benchmark
-  随示例组织；共享运行辅助代码集中，避免每个算子复制 runner。
-- 编译器 CLI 接收 IR/编译配置，示例自己提供 shape/dtype/算法选项；编译器
-  核心不按算子名选择分支。
-- 最小 hazard 程序作为测试 fixture 使用。编译器本体可安装、导入和测试通用
-  编译能力，且不需要 examples、NumPy 或研究 checkout。
+交付：
 
-后续恢复算子优化时，每次必须同时保存和审查：
+- 保留嵌套循环、actor/guard 和多维代次；区域摘要导出精确访问、入口条件、
+  last-read/ready/reuse 与存活资源，不以 child 全完成代替所有出口。
+- 独立周期按耦合关系求解，取消全局 LCM；分支/零次/一次/稳定段/尾部各有
+  检查规则。纯 scalar 捕获与有 effects 的 metadata 读取分开。
+- event 位置/宽度/ID 一起参与规划；本地共享 ID 需要寿命证明，CV 保留真实
+  2 AIV 参与者及 gate。支持范围有限时明确报错，不能当不存在可行排步。
+- GDN 风格 carry/snapshot 微例、动态内层分层 GEMM、完整贡献后发布的多 segment
+  CV，均放 examples；从这三类程序检验摘要，避免只为 FA 设计。
+- 独立有限实例化访问 oracle 与有界交错测试，不调用生产依赖分析产生答案。
 
-1. DSL、最终物理 IR 和 ASC：搬运、缓冲、预取、Wait 的实际阻塞范围。
-2. 可运行 AscendC 对照：源码版本、kernel/tiling、算法/数值契约和编译选项。
-   同契约手排基线用于比较编译开销；安装 ACLNN 作为额外产品基线。契约不同
-   的实现要明确区分，不宣称复现同一个 kernel。
-3. 大规模同卡设备正确性与 profiler：多次独立 trial，区分 device task 时间、
-   stream 间隔、冷/热缓存和连续重复采样。检查所有卡，显式物理卡→逻辑0。
-4. 硬件模型：实际 Cube 工作量、Vector 工作、GM 请求与 cache footprint、
-   条件峰值/带宽假设。请求量不能当作 HBM 实测，活动比例不能当作因果证明。
+退出条件：
 
-## 实施顺序与交付门槛
+1. 外层、内层长度分别变化不改变模板规模；两个无关 ring 的周期不相乘。
+   有耦合大周期和复杂 guard 时，预算/取消可响应并给出具体结构计数。
+2. 删除早 release 所需的某个 reader、提前 ready、错代次、通知不平衡、ID
+   提前复用、漏 drain 都有可重现反例；最终 materialized IR checker 能拒绝。
+3. AIC 完整新 QK 的派发在旧 P gate 之前；L1/L0/L0C 的释放点分开，能证明
+   输入早复用时不等待整个计算或父 region 结束。ASC 对照和设备数值均通过。
+4. 同一固定配置的设备性能没有无法解释的退化；大型 native body 的编译图
+   规模、proof 查询和 RSS 有记录，不以小模板结果外推复杂 FA。
 
-| 阶段 | 交付 | 进入下一阶段前必须满足 |
-|---|---|---|
-| 0. 保存与基线 | 重构前 Git checkpoint；CPU profile；固定复现集 | 记录已验证/未验证范围，所有运行数据在产品 Git 外 |
-| 1. 编译管线 | immutable analysis/产物、区间和完成图改造、按阶段计时 | 旧负例继续拒绝；有限差分/交错检查；生成排步与同步范围不退化；编译时间验收 |
-| 2. 最小 DSL | typed 计算/存储；Pipelined/Stage/Cube/Vector；局部与双向 CV 闭环 | 不写 native 字符串、位置参数 tuple、event/credit、手工延迟任务；生成可审查 stage 映射、物理 IR 与 ASC |
-| 3. 全部算子迁移 | examples 中的算法、oracle、AscendC/ACLNN runner | 包内无算子 dispatch；完整回归；代表程序 ASC 离线编译及必要设备正确性 |
-| 4. 恢复性能工作 | 同契约 AscendC 与设备 profiling 的成套比较 | DSL 与编译耗时已可用，结果可溯源；本轮不执行此阶段 |
+### R3：真实 dense Flash Attention，性能保真提前验收
 
-每阶段为可回退的小提交。保留原同步反例、机器契约和必要的独立最终验证，
-重构时以当前保存点做差分参考，不能把本轮未验证排步当作设备正确性的基准。
+交付：
+
+- `examples/` 中完整真实 FA：Q cache、FP32 online m/l/O、P 显式舍入、QK /
+  softmax / PV / UpdateO 多阶段，运行时 KV 长度和嵌套 native/row 子流水。
+- 单独 qk/pv/reduce 宏只表达算法与 typed operations，显式传 scratch；
+  不加入编译器算子名分支或手工同步旁路。
+- 一份固定专家配置先验证实现保真，再检查较大通信 BK 的分层表达；不能用
+  小 BK、逐 query 全 drain 或额外 GM 转置作为迁移完成的隐含前提。
+- 同契约 AscendC 和 ACLNN 分别运行并 profiling，绑定相应源码/库/tiling。
+
+退出条件：
+
+1. 小例逐元素 oracle；固定大例 B1/H8/Sq=Sk4096/D128 f16 的采样数值及完整
+   finite 检查通过。误差阈值、归约树/exp 实现和采样策略在运行前固定。
+2. 同一内核覆盖多种 KV 长度；全部源码到 ASC 冷编译达到代表性 FA 目标，
+   不能只测旧 source.xdsl 到 ASC，不能将 artifact 属性访问记成编译缓存命中。
+3. 生成 ASC 复现所选专家搬运、容量、复用和 gate 顺序；差异逐项记录。
+4. 提交设备 task 时间、profiling、实际 native FLOPs/流量与条件理论下界。
+   固定手排配置下无新增等待/搬运仍不等于性能相同，必须有设备证据。
+
+本阶段允许结论为“重构保真成立，但仍落后 ACLNN”，前提是量化并解释差距，
+不能宣称达到最终性能目标。此时另列通信粒度、流水/容量或指令效率问题；
+恢复算子调优要形成下一独立任务，不在重构中无界搜索 tile。
+
+### R4：基本 FA 变体及唯一生产路径
+
+交付：GQA/MQA 的 head 映射、causal、对齐/非对齐尾部及空域契约逐项实现。
+这里的 FA 范围为 forward；GQA 明确 Hq/Hkv 整除和映射，非方形 causal 明确
+左上/右下对齐与绝对位置，不能只以一个含糊的 causal 开关共用数值 oracle。
+新增 B1/Hq8/Hkv2/Sq=Sk8192/D128 bf16 固定 GQA 大例；长 KV decode 单列
+吞吐模型，不能用 prefill 的有效 FLOPs 解释 decode。
+
+退出条件：
+
+- 各变体前端只使用普通参数、控制流和原语；没有新增算法特判。
+- causal 全 mask 行/尾块/两 AIV 参与不对称有明确数值及通知契约，不能死锁。
+- 迁移边界内所有示例走同一结构化 compiler；普通公开入口不再按隐藏 marker
+  选择有限后端。未迁移算法继续明确标为 legacy，不能覆盖为新 API 示例。
+- 有限 planner 移至测试参考/显式 legacy 工具；在承诺支持的旧示例迁移和
+  回归替代完成后删除生产分支。旧物理 IR 导入必须显式选格式并完整验证，
+  不提供静默 fallback。核心独立安装不依赖 examples/reference。
+
+### R5：后续动态任务与高性能变体
+
+varlen、paged、sparse、persistent FA、动态 grouped matmul/MoE 分阶段做，
+每项先定义 metadata 读取、task descriptor 捕获、动态 ownership 和交接契约。
+连续 query 的 state first/last 必须随任务移动；跨组/全局阶段不能沿用核内 event。
+这些不阻塞 R1 的局部闭环，但不能在 R4 后被自动登记为“已支持各种 FA”。
+
+## 3. 统一验收矩阵
+
+### 编译可用性与复杂度
+
+| 维度 | 固定测试/记录 |
+|---|---|
+| 运行时 N | 0/1/2/4/4096/1048576，固定源码/constexpr；检验模板、图和 ASC 不变 |
+| 源码结构 | 模板数量、嵌套深度、access pieces、真实 overlap、guard 分支数分别增长 |
+| 周期/资源 | 独立与耦合 ring，互素 slot 数；event 资源压力与寿命共享 |
+| 阶段计时 | AST/宏、源 IR、native lowering、effects、规划、最终验证、ASC、可选导出 |
+| 内存/搜索 | peak RSS、T/A/H/C/P/V/E/D/R、重建/失效次数、最慢义务 |
+| 运行方式 | 至少5个冷进程、p50/max；真正编译缓存命中另测；import/CANN 分开 |
+
+目标：常用内核 p50≤1秒，固定代表性 FA p50≤5秒，真实缓存命中≤100毫秒；
+初期 max 门槛为相应目标2倍，RSS 和结构增长需解释。独立 N 变化不允许线性
+实例化，即使缓存后很快也不通过。结构变大可变慢，但必须给出上述成本分解。
+
+CPU 实验先设60秒单 case 总预算及可取消搜索；超时保存最近阶段/计数/profile
+摘要后结束。优先用较小静态结构定位热点，再对同一修复复测；禁止持续重复
+运行未改代码的同一个大例等结果。内部查询预算与总 wall time 都记录。
+
+### 设备性能
+
+固定手排基线保真与 ACLNN 差距是两项指标。前者用于防止重构退化，后者体现
+最终竞争力。默认退化阈值为同卡、相同缓存/计时政策下中位数超过基线5%；
+先用重复批次估计波动。波动覆盖阈值时结论为未决，不能强报通过或反复择优。
+至少报告 p50/p90 和误差范围，设备时间与 host/stream 时间分开。
+
+大规模 Vector 可固定2^24个 f32 元素；normalization 可固定8192×4096，按
+算法容量选择固定合法 tile。FA 大例见 R3/R4，decode 后续固定 Sk≥32768。
+热重复和总工作集大于192 MiB L2 的轮换分别记录，避免以缓存差异误判 HBM。
+
+每次实验一并审查最终 ASC、可运行 AscendC 和 profiler；从有效/原生 FLOPs、
+各路径流量、依赖关键路径及实际硬件信息解释差距。未知 HBM/L2 持续带宽不
+填猜测值，不把 GM 请求量直接除以标称 HBM 带宽当作可靠运行时间。
+
+## 4. 代码边界与交付纪律
+
+按职责逐步提取，不先一次性改所有目录。前端/结构化 lowering 接替 `language.py`
+和 `lowering.py` 的展开职责；`loop_*` 成为结构化同步的内部实现，复用必要的
+graph/frontier 原语。`sync.py` 的双路径分流在 R4 收敛；`model.py/check.py`
+的有限逻辑保留期间标明 legacy/test。避免让源码模块和物理模块互相调用形成环。
+
+每个小步提供：实现 diff、适用范围、精确拒绝诊断、相关测试、编译/运行命令、
+前后 IR/ASC 与性能证据。文档只引用工作区外运行数据，Git 内只放产品源码、
+测试、示例和文档。环境、缓存、构建、profiler 原始数据不提交；不 push/publish。
+
+设备执行前检查所有卡；选健康空闲卡并显式物理卡映射逻辑0。不 reset、不用
+`/tmp` 锁、不换卡掩盖错误。需要新增目标机器契约时先源码核查，再离线/设备
+验证；既有模型证明不能替代硬件依据。
+
+下一次实施从 R0 的当前 diff 审查和 checkpoint 开始，紧接 R1 的 AST 单循环
+纵向闭环。不要先迁移全部 FA、扩展动态任务框架或恢复算子调参。

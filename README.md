@@ -3,6 +3,11 @@
 基于 xDSL 0.73.0 的独立 Python 编译器，目标 Ascend 910B / dav-2201，直接输出
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
+2026-10-14 重新制定了[总体设计](docs/design.md)、[DSL 前端与 CV 多阶段规格](docs/dsl-multistage.md)
+和[重构计划](docs/refactor-plan.md)。规格中的受限 AST、嵌套符号循环和真实 FA
+迁移属于待实现目标。下方代码是现有原型 API，不能与新规格混用；当前工作树的
+单循环实验和历史证据见[重构记录](docs/refactor-progress.md)。
+
 当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
 源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
 实际同步。软件 stage、buffer versions 和硬件 event 资源各自独立。
@@ -34,13 +39,14 @@ CV 示例直接写 Stage0/Cube、Stage1/Vector、Stage1/Cube、Stage2/Vector。
 两处 Stage1 是独立 region；Cube region 内仍有 MTE2、MTE1、Cube、Fixpipe 的
 各自最后读取和复用约束。静态内层预取拥有独立 clock，不把整个 CV task 改成
 一个扁平微步索引。具体语义、分段例子和设备结果见
-[multi-stage DSL](docs/dsl-multistage.md)。
+[重构记录](docs/refactor-progress.md)；目标语义见[multi-stage DSL](docs/dsl-multistage.md)。
 
 实现路径：typed source → xDSL source regions → NPU physical IR → AutoSync →
-独立最终检查 → ASC → CANN。逻辑 tile 是物理 buffer 的借用值，不是隐式快照，
+最终实际 IR 检查 → ASC → CANN。逻辑 tile 是物理 buffer 的借用值，不是隐式快照，
 SSA use-def 不承诺异步完成。覆盖后的旧 tile 会拒绝；不会加入隐藏搬运。
 `compile()` 返回不可变 ASC、IR 字符串和验证摘要，重复消费避免完整重检。
-外部可变 physical/PlanIR 仍经过独立 verifier；底层物理 builder 保留给专家及反例。
+外部可变 physical/PlanIR 仍重新验证；checker 与 planner 共享部分分析，不能称
+完全独立证明。底层物理 builder 当前保留给专家及反例。
 
 编译器包只包含 DSL、IR、同步、后端和通用工具。RMSNorm、RoPE、Softmax、
 SwiGLU、GEMM、GDN、Flash Attention 及其 oracle、AscendC/ACLNN 对照均在
@@ -102,6 +108,10 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 
 ## 当前支持边界
 
+下表主要记录已提交的有限物理路径，不能直接套用到未提交的符号循环原型。
+原型支持单个连续外层 runtime task count，但嵌套仍受限/展开；它没有实现新
+规格中的一般嵌套控制和所有权。两条路径的准确边界见[重构记录](docs/refactor-progress.md)。
+
 | 能力 | 实际支持 |
 |---|---|
 | 执行域 | 独立 AIV/AIC grid；或每组 1 AIC+2 AIV 的静态 GM handoff；各组 GM ownership 不重叠 |
@@ -118,7 +128,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 | Event分配 | 每有向bank八ID；跨channel共享已证明不相交的生命周期；有限epoch映射与资源压力诊断 |
 | 保护 | executing ops 的 xDSL effects 防止普通 DCE/CSE 删除异步工作 |
 
-不支持的动态 task count、数据相关分支/带洞激活、间接 gather/scatter、任意 native extern、
+遗留有限路径不支持动态 task count；数据相关分支/带洞激活、间接 gather/scatter、任意 native extern、
 动态或不平衡跨核 ownership、跨 mixed group 交接、全局 phase 和通信会被拒绝。
 没有直接 L0C→UB 路径、事件溢出的 mutex fallback，或静默缩小 tile/扩大 buffer。
 融合 FFN、varlen/paged/sparse/persistent attention、间接 routing 和动态 grouped matmul 尚未实现。GEMM

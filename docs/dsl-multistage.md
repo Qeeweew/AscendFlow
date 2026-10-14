@@ -1,135 +1,301 @@
-# DSL 的 multi-stage 源程序与完成语义
+# DSL 前端、结构化循环与 CV 多阶段语义
 
-2026-10-14，按用户要求修正重构方向。以下语法是正在实现的目标，不是当前支持
-声明。参考为只读 TileLang snapshot `6ba65d204c937fcb1c43b1a22b32979506595655`，
-尤其 `examples/ascend/flash_attention/persistent_910b.py:224–371`。借鉴其作用域
-和任务位移语义，前端和 lowering 使用 xDSL，不依赖 TileLang/TVM 构建。
+2026-10-14 修订。本文是待实现规格，代码块展示目标语法，不能作为当前可运行
+API 使用。现有 tracing/单循环原型的能力和设备记录见[重构记录](refactor-progress.md)。
+架构约束见[总体设计](design.md)，实施顺序见[重构计划](refactor-plan.md)。
 
-## 同一流水模型覆盖两种并行
-
-核内 GM→UB→Vector→GM 可以表达成 load/compute/store 三阶段，也可以在同一
-阶段中暴露搬运和计算。数据依赖由逻辑值表达；DMA ready、最后读取、slot 复用
-和实际完成仍由 native effects 决定。
-
-CV 多阶段必须直接出现在源程序结构中。Attention 的示意如下，省略算法宏的
-具体数学和 buffer 声明；这些宏属于 examples，并必须展开为普通 typed 操作：
+## 1. 采用 TileLang 风格作用域，明确 Python 与设备的边界
 
 ```python
-with N.Kernel(groups, kind="mixed"):
-    # Score/P/PV 是 group-private task ring，各有明确 versions。
-    # Q cache 和 query 的 m/l/O state 有独立生命周期。
-    for t in N.Pipelined(tasks, stages=3, order="source"):
-        query, kv = decode_task(t)
-        with N.Stage(0, name="qk"), N.Cube():
-            qk_and_export(query, kv, Score[t])
-        with N.Stage(1, name="softmax"), N.Vector():
-            online_softmax(query, kv, Score[t], P[t])
-        with N.Stage(1, name="pv"), N.Cube():
-            pv_and_export(kv, P[t], PV[t])
-        with N.Stage(2, name="update_o"), N.Vector():
-            update_output(query, kv, PV[t])
+from __future__ import annotations
+import xdsl_npu.language as N
+
+@N.prim_func(disjoint_external=True)
+def scale(
+    X: N.Tensor((n,), N.f32),
+    Y: N.Tensor((n,), N.f32, access="write"),
+    n: N.int64,
+    B: N.constexpr = 256,
+):
+    with N.Kernel(1, kind="vector"):
+        x = N.alloc_ub((2, B), N.f32)
+        y = N.alloc_ub((2, B), N.f32)
+        for t in N.Pipelined(N.ceildiv(n, B), stages=3):
+            slot = t % 2
+            valid = N.min(B, n - t * B)
+            with N.Stage(0, name="load"):
+                N.copy(X[t * B:(t + 1) * B], x[slot, :], valid=valid)
+            with N.Stage(1, name="compute"), N.Vector():
+                N.mul(x[slot, :], 2.0, out=y[slot, :], valid=valid)
+            with N.Stage(2, name="store"):
+                N.copy(y[slot, :], Y[t * B:(t + 1) * B], valid=valid)
 ```
 
-源码中的 `t` 表示同一逻辑任务，编译器将每个 stage 的访问和 descriptor 一起
-延后。稳定段的派发意图为：
+该例用一个 AIV 演示语义，大规模性能例另按核划分工作。`n` 是运行时元素长度，
+`B` 是显式特化 tile。`n=0` 时没有读写或虚构的 stage task。初始实现可要求
+`n % 8 == 0`、`B % 8 == 0`，使 f32 DMA 有效长度满足32字节契约；未实现精确
+非对齐尾搬运时诊断拒绝。不能为了让例子运行而静默越界读取或填充用户分配。
 
-| 物理 outer step j | AIC | AIV0/1 |
-|---|---|---|
-| Stage0 | QK[j]，发布完整 Score[j] | |
-| Stage1 | 导入 P[j−1]，PV[j−1] | Softmax[j−1]，发布 P[j−1] |
-| Stage2 | | 导入 PV[j−2]，UpdateO[j−2] |
+`valid` 限制实际访问与 Vector mask，名义 tile 可跨逻辑尾部，实际访问不能
+跨越有效范围。若某操作需要 padding，用户显式指定值，lowering 展示相应
+写入/effects；不存在默认隐藏补零。tail 和 align 条件进入输入/运行时启动检查。
 
-这是排步意图，不能作为异步完成保证。AIC 必须先发射新的 QK，才进入旧 P 的
-controller Wait；否则会阻止 QK 与 Vector 的重叠。AIV 也必须把已有输出工作
-放在可能阻塞的新输入 gate 的合适位置。固定 issue 导致环时拒绝编译，不能
-通过随意改 stage、补全局 barrier 或扩 buffer 静默修复。
+### 前端执行规则
 
-软件 stage 不等于硬件 pipe：一次 Cube region 可包含 MTE2、MTE1、Cube 与 FIX，
-Vector region 可包含 MTE2、Vector、MTE3 和 Scalar。region 内仍有独立的 ready、
-read-retired 和 buffer reuse；给 region 一个 stage 不把它视作整体完成。
+- 装饰器取得 AST、源码位置和受限环境；函数体不通过 Python 迭代器执行。
+- 先解析 scalar/constexpr 参数，再解析张量形状，支持形状引用后声明的 `n`。
+  future annotations 中的字符串只经过 DSL 解析器，不能执行任意注解表达式。
+- `for`、设备 `if/else`、局部标量赋值、切片、具名 DSL 调用和注册宏构成首版
+  子集。动态 `while`、异常、生成器、任意 Python 对象调用先明确拒绝。
+- constexpr 条件可选择静态分支；runtime 条件形成 `scf.if`，不能被 Python
+  `bool()` 求值。标量合流/循环携带使用 SSA yield，buffer 是可变存储。
+- host 工厂在函数外选择 tile/layout/stages。闭包只捕获有限不可变常量；宏
+  参数与展开 provenance 进入 IR 和缓存键。宏不得隐式创建同步或更改数值边界。
 
-## 必须分开表示的数量
+`disjoint_external=True` 是全部独立外部 tensor 分配的字节范围不重叠契约，
+host 包装器必须能依据指针/长度检查；同一 root 的显式 views 仍允许别名。
+不能检查的间接地址需要更具体契约或拒绝。运行时长度还需非负、地址与索引
+算术不溢出等约束；不得把注解当作未经验证的安全假设。
 
-| 数量 | 语义 |
+## 2. 最小语法与存储语义
+
+| 写法 | 语义 |
 |---|---|
-| `Stage(k)` | 本 pipeline 的 logical task 延迟/派发阶段 |
-| `Pipelined(..., stages=S)` | 本 pipeline 的执行 stage horizon；不是 buffer 数 |
-| `versions=B` | 某个 task-ring 的物理存储版本预算 |
-| query/state slots | 算法状态的 owner 生命周期，可能跨多个 KV task |
-| native segment/grain | 核内 Cube/Vector 的真实工作划分，独立于 CV 交互块 |
-| event ring | 编译器根据消费及复用路径证明的硬件通知资源 |
+| `N.serial(start, stop, step)` | 设备顺序循环，常量边界也保留；首版 step 为正编译期常量 |
+| `N.Pipelined(stop, stages=S, ...)` | 设备逻辑任务循环；省略 start/step 为0/1；固定 stage 排步 |
+| `N.unroll(...)` | 用户明确请求 constexpr 展开，超过模板预算报错 |
+| `N.Stage(k, name=...)` | 所属 pipeline 中逻辑任务的派发位移，不是完成边 |
+| `N.Cube()` / `N.Vector()` | AIC / AIV 执行域；混合核中 Vector 可返回 lane 0/1 |
+| `N.alloc_ub/l1/l0a/l0b/l0c(...)` | 固定形状、dtype、layout、执行域的物理存储 |
+| `N.copy / matmul / cast / reduce_* / ...` | typed 原语，明确输入/输出、布局和舍入参数 |
+| `buf[iv % slots, ...]` | 显式物理 slot，代次由真实写入与所属逻辑任务决定 |
 
-不照搬 TileLang 将 `num_stages` 同时用作版本上限的语义。普通和专家代码使用
-同一 region IR：专家固定 stage/order/versions，后续自动排步在同一表示上选择
-合法配置。初版只实现明确固定排步；未实现的自动排步模式必须给出诊断。
+外部 tensor 形状可动态，片上容量与 tile shape 首版固定。内置布局用实际字节
+映射定义；转换只能由明确操作完成，不能因为 view 改名而多出搬运。
+切片、转置视图、跨 dtype alias 都要保留 allocation identity 与精确 footprint。
+重复使用一个 Python 名字是绑定操作，不产生 buffer 副本。
 
-嵌套核内 `Pipelined` 有自己的迭代域：例如外层一个 BK1024 的 CV task，内部
-Cube 执行八个 N128/K128 segment，Vector 执行多组8行。外层 handoff 要覆盖
-全部真实贡献；只发布第一个 segment 或先归还尚有 reader 的 slot 都不合法。
-这些 native 操作必须按 region 层次降低，不能用一个全局扁平微步时钟改变
-“完整下一块 QK 在旧 PV Wait 之前发射”的源意图。有限静态内循环可先展开为
-同一 outer task 的 typed native 操作；较大或动态嵌套不能偷偷省略检查。
+混合核局部 allocation 在对应 `Cube/Vector` 域内声明，handle 可以被同 actor
+后续 region 引用；每个 AIV 的 UB 是各自私有存储，不因同名产生跨核别名。
+GM scratch 作为显式参数提供并按 group/row 分区，local handle 跨 actor 使用
+被拒绝。`with` 里的 lane/group 符号是受域约束的设备坐标，不是 host 整数。
 
-## 向 xDSL 与物理执行 IR 降低
+`N.matmul(a=a_l0, b=b_l0, accum=c_l0c, initialize=first)` 显式表达操作数与累加
+存储，shape/layout 决定合法 native recipe。`reduce_sum` 的归约树、`exp` 的
+近似实现及 NaN/Inf 行为属于版本化原语契约；省略策略不允许后端任意换算法。
+首次 FA 基线固定同一归约 recipe。Mul/Add 不自动缩并为 FMA，显式 cast 的舍入
+边界不能被融合越过；若需要不同数值策略，使用显式 policy 并纳入特化键。
 
-源 IR 显式保留 pipeline、stage、执行域、typed 操作、task descriptor 和 Buffer/View。
-逻辑依赖顺序沿源 task/region 建立；实际 issue 从 pipeline/stage/order 降低。
-不同 region 可处于同一 Stage，不能靠 stage 数字排序改变数值定义顺序。
+逻辑 tile value 不能保证原存储内容永远存在：若借用 view 对应的版本已覆盖，
+后续读取被拒绝。需要保留旧值就显式分配存储并复制。跨 stage 的 scalar 若
+来自内存，需在正确任务发射时捕获并携带；不能按物理 step 再读。编译器若需要
+保存 descriptor，应在计划中显示其存储与生命周期，不能隐藏数据搬运成本。
 
-Lowering 在 GM/片上布局、实际 native footprint、owner、task generation、SPR
-effects 和指令完成点确定后，再生成同步 PlanIR。SSA use-def 只提供逻辑依赖，
-不提供 DMA/MAD/FIX 的完成边。外部 disjoint 契约、两 AIV 的真实 slice/quorum、
-Counter pairing/backlog 和 terminal drain 沿用同一最终 verifier。
+当前 `versions=2` 糖衣默认关联最近 pipeline 的规则不保留为核心语义。未来
+保留兼容糖衣也必须无歧义地降到显式 slot，歧义时拒绝，不能猜测 query/KV/chunk。
 
-第一次实现保留静态范围，不用未实现的 persistent/动态接口冒充支持。连续
-query 流必须表达 state reset 与末次读退休；first/last-KV predicate 随所属 task
-移动，不能按物理 step 重新计算。Scalar 从内存读出的动态 descriptor 不能当作
-可自由重算的纯表达式；需要明确捕获/存储和 ownership 契约。
+### 独立嵌套循环
 
-## 实现与验收
+```python
+for kv in N.Pipelined(N.ceildiv(Sk, BK), stages=3):
+    with N.Stage(0, name="qk"), N.Cube():
+        for chunk in N.Pipelined(N.ceildiv(D, DK), stages=2):
+            with N.Stage(0, name="load_k"):
+                N.copy(Q[:, chunk * DK:(chunk + 1) * DK],
+                       q_l1[chunk % 2, :, :])
+                N.copy(K[kv * BK:(kv + 1) * BK,
+                         chunk * DK:(chunk + 1) * DK],
+                       k_l1[chunk % 2, :, :])
+            with N.Stage(1, name="mad"):
+                # 示例宏展开为显式 L1→L0 copy 和 matmul；scratch 由调用者提供。
+                qk_chunk(q_l1[chunk % 2, :, :], k_l1[chunk % 2, :, :],
+                         a_l0, b_l0, score_l0c,
+                         chunk=chunk, initialize=(chunk == 0))
+```
 
-1. 局部三阶段 Vector 和 Cube/Fixpipe 使用普通 typed copy/math/matmul。
-2. 双向 CV：Stage0/Cube、Stage1/Vector、Stage1/Cube、Stage2/Vector，共同 task
-   clock，两个 AIV 真实参与；生成完整可解析的 stage→physical issue 映射。
-3. 零/一/两次迭代、填排、中间段、收尾、task-ring 复用和跨 query state 边界。
-4. 至少一个多 segment CV task 与独立核内预取；对早 ready、早 credit、删除
-   channel、错误 descriptor 代次和不可行固定 gate 顺序给出反例。
-5. 最终 ASC 检查完整 QK 发射相对 P Wait 的位置，并离线编译、设备验证。
-   pipeline 声明或 verifier 通过不能代替这些证据。
+这是完整块索引片段，要求 D 可被 DK 整除；宏和固定大小的 Q/K 双槽 storage
+定义在示例侧，不分配运行时大小的片上 Q cache。内层循环既不在 Python 展开，
+也不把外层 CV step 乘成统一微步时钟。运行时 `initialize` 可形成 native 条件
+或结构化分支，必须保持首次 clear 和其余顺序累加；不能修改 FP32 累计顺序。
 
-编译性能改造继续执行，但要对这个 stage/region 模型建立固定 benchmark；不能
-通过将 multi-stage 全部串行化来降低编译成本，也不先恢复算子调参。
+这个语法不保证任意 D 都有低成本可行排步。动态尾部、容量或分析域不受支持时
+给具体诊断。独立环可写为 `state[query % QSlots]`、`score[kv % KVSlots]`、
+`k_l1[chunk % L1Slots]`；需要外内两层同时存活时显式用两个槽位轴。
 
-## 本轮已经接通的路径
+## 3. CV multi-stage 的精确定义
 
-源语法和 region IR 现已实现于 `language.py` / `source_ir.py`；
-`lowering.py` 降到现有物理执行 IR，再进入统一 AutoSync。可运行算法示例在
-`examples/multistage.py`，没有放入编译器内部。这些是同步示例，不是 FA。
+同一 pipeline 中所有 stage 源码引用同一个逻辑 `kv`。stage k 在物理 step j
+处理 `kv=j-k`，只有该逻辑任务在域内才激活。地址、slot、guard、first/last
+及 descriptor 一起位移。编译器产生 prologue/steady state/epilogue；用户不写
+`t-1/t-2` 和 `tasks+2`。零次循环不产生伪通知，边界只实例化实际存在的工作。
 
-- `vector_source`：双缓冲 load/compute/store；零次循环保持空派发和最终 drain。
-- `cv_source`：QK、Vector 舍入、PV、输出；两个 Stage1 保持独立逻辑 phase。
-- `segmented_cv_source`：每个 CV task 有三个 QK/P 贡献；内层 K、P/V 双槽预取，
-  PV 仅首 chunk 初始化，其余按源顺序 FP32 累计。外层仍是三个 stage。
-- Stage 的返回 tile 与 typed view、数值 producer 分开。借用 tile 被原 buffer
-  覆盖后再读会拒绝；不会增加隐藏复制。每个输入单独检查，允许同 root 的
-  不相交子视图分别来自不同 writer。
-- 从内层导出的最后一个结果保留 producer descriptor 和 slot；不能按 consumer
-  的外层任务重新选择版本。零次内层循环不能导出有效 tile。
-- 逻辑轴 bounds、yield/result 类型和执行域归属都有负例；不忽略未知 effects。
+词法顺序定义同任务的数值/effect 顺序；loop-carried 依赖维持算法递推顺序。
+物理 issue 可通过每 actor 的 stage 标签排列显式约束：
 
-2026-10-14 的分段 CV 验证：2 groups、4 tasks、3 segments、f16 输入、f32 输出；
-CANN 9.1 / dav-2201 离线和 shared 编译成功。全部卡健康且无进程后，物理卡1
-映射逻辑0执行10次，独立 CPU 计算最大绝对误差为0。数值契约是
-`sum_chunk RN_f16(2 * QK_chunk^T) @ V_chunk`，没有 softmax。
-源码、IR、ASC、选项、设备和输入哈希在产品 Git 外的
-`/workspace/xdsl-910b/runs/refactor/segmented-cv/`。
+```python
+for kv in N.Pipelined(
+    N.ceildiv(Sk, BK), stages=3,
+    issue_order={"cube": ("qk", "pv"),
+                 "vector": ("update_o", "softmax")},
+):
+    with N.Stage(0, name="qk"), N.Cube():
+        qk_export(kv)
+    with N.Stage(1, name="softmax"), N.Vector() as lane:
+        softmax_and_publish(kv, lane)
+    with N.Stage(1, name="pv"), N.Cube():
+        pv_export(kv)
+    with N.Stage(2, name="update_o"), N.Vector() as lane:
+        update_output(kv, lane)
+```
 
-最终 ASC 中全部新 QK segment 在旧 `probabilities_ready` Wait 前发射；
-内部预取先于上一个 segment 的 Cube 指令。同步验证另检查每个 QK export 都先于
-Score-ready，人工将 ready 移到第一个 segment 后会拒绝。设备正确性和这些顺序
-检查不是吞吐率证据，本轮未进行算子性能调参。
+此片段只说明排步，真实 softmax 展开见下节。默认同 actor 使用源码顺序；标签
+按嵌套 region 路径限定。首版显式 order 要列全该 actor 的直接 stage regions，
+缺失/重复/跨作用域标签拒绝。内层 issue 顺序由内层作用域指定。
 
-当前边界：静态完整 native tile、一个连续外层流、静态内层展开、source order。
-`initialize=(chunk == 0)` 支持静态内层；依赖运行时 outer task 的初始化仍明确
-拒绝。动态任务/ownership、运行时条件 region、query-state clock 和自动排步还未
-接通；现有 FA 示例还需要迁移到此源语法，不能把 CV 同步小例当作迁移完成。
+| 同一物理 step j | AIC 发射顺序 | 每个 AIV 发射顺序 |
+|---|---|---|
+| 稳定段 | QK[j] → acquire P[j−1] → PV[j−1] | acquire PV[j−2] → UpdateO[j−2] → acquire Score[j−1] → Softmax[j−1] |
+
+箭头是控制器派发顺序，完成边仍由访问分析生成。AIC 在可能阻塞的旧 P Wait
+之前发射新 QK；AIV 先处理旧输出，避免新 Score gate 阻挡它。两处 Stage1 是
+独立 region，不能合成共同完成点。这是可表达的专家策略，不承诺所有 tile/
+slot/guard 都可行：planner 必须结合跨核 gate、依赖和资源检查死锁/复用。
+
+软件 stage 数、buffer slots、query state 数、native segment 数、event 环宽度
+分别定义。完整 Score ready 需覆盖该任务所有实际 FIX 贡献；相应 credit 只
+等待真正读取该 GM 槽的两 AIV MTE2，不能拖到 softmax 或最终 O 完成。
+
+## 4. 用真实 Flash Attention 检验语言
+
+所有宏、算法和变体放 examples；编译器没有 `flash_attention` 内建分支。
+首个迁移目标是固定 query tile、运行时 KV 长度的 dense attention，保留三个
+GM 交接环和明确的 FP32 状态。GQA/MQA、causal/tails 另有语义与验证门槛。
+
+### 存储与数值契约
+
+| 存储 | 所属/生命周期 |
+|---|---|
+| `q_l1` | AIC 的 query cache，循环前加载，全部 QK 最后读取后可复用 |
+| `Score[2,BQ,BK]`、`P[2,BQ,BK]`、`PV[2,BQ,D]` | group-private GM scratch，KV 槽复用；两个 AIV 操作不相交行片 |
+| `m[2,R]`、`l[R]`、`o[R,D]` | 每 AIV 的 query state，R 为该 lane 行数；不能绑定到 native chunk |
+| `alpha[2,R]` | Stage1 产生，延迟的 Stage2 消费，按 KV 槽保存 |
+| score/probability/row reduction/temporary UB | 由明确布局和容量约束分配；只在最后读取后复用 |
+| L1/L0A/L0B/L0C scratch | native 子流水自己的 slot 和 read-retired，不共享一个整体 release |
+
+以下为最小完整数学主体的目标语法片段；scratch 和 GM 参数按上表由示例分配，
+`qk_export/pv_export` 是接受显式 scratch 的示例宏，此处缩写实参。初始值为
+`m[0,:]=-inf`、`l=0`、`o=0`。首次版本要求 `Sk>0`、完整 tile、每行存在有效
+key，BQ 可均分给两 AIV，所有显式 scratch 满足容量/对齐；不把全 mask/空
+attention 的行为交给偶然的 `-inf - -inf`。BQ/BK/D 的具体选择固定于示例策略。
+
+```python
+for kv in N.Pipelined(
+    N.ceildiv(Sk, BK), stages=3,
+    issue_order={"cube": ("qk", "pv"),
+                 "vector": ("update_o", "softmax")},
+):
+    s = kv % 2
+    old = kv % 2
+    new = (kv + 1) % 2
+    with N.Stage(0, name="qk"), N.Cube():
+        qk_export(kv, out=Score[s, :, :])
+    with N.Stage(1, name="softmax"), N.Vector() as lane:
+        rows = N.row_partition(BQ, lane, parts=2)
+        N.copy(Score[s, rows, :], scores)
+        N.mul(scores, scale, out=scores)
+        N.reduce_max(scores, axis=1, out=row_max)
+        N.maximum(m[old, :], row_max, out=m[new, :])
+        N.sub(m[old, :], m[new, :], out=alpha[s, :])
+        N.exp(alpha[s, :], out=alpha[s, :])
+        N.sub(scores, m[new, :, None], out=scores)
+        N.exp(scores, out=scores)
+        N.reduce_sum(scores, axis=1, out=row_sum)
+        N.mul(l, alpha[s, :], out=l)
+        N.add(l, row_sum, out=l)
+        N.cast(scores, N.f16, rounding="rn", out=p_local)
+        N.copy(p_local, P[s, rows, :])
+    with N.Stage(1, name="pv"), N.Cube():
+        pv_export(kv, P[s, :, :], out=PV[s, :, :])
+    with N.Stage(2, name="update_o"), N.Vector() as lane:
+        rows = N.row_partition(BQ, lane, parts=2)
+        N.copy(PV[s, rows, :], pv_local)
+        N.mul(o, alpha[s, :, None], out=o)
+        N.add(o, pv_local, out=o)
+
+# 每 lane 最后一次 l 与 o 更新完成后，输出各自的 query 行片。
+with N.Vector() as lane:
+    N.div(o, l[:, None], out=normalized)
+    N.cast(normalized, output_dtype, rounding="rn", out=output_local)
+    N.copy(output_local, O[N.row_partition(BQ, lane, parts=2), :])
+```
+
+`m` 交替保存前后状态，不为消除覆盖问题增加统计量副本。每次 KV 的数学为：
+
+```text
+scores = scale * Q @ K^T
+m_new = max(m_old, row_max(scores))
+alpha = exp(m_old - m_new)
+p32 = exp(scores - m_new)
+l_new = alpha * l_old + row_sum(p32)
+o_new = alpha * o_old + RN_operand(p32) @ V
+O = RN_output(o_final / l_final)
+```
+
+denominator 使用未舍入的 p32。P 舍入边界属于逻辑通信 BK；把 BK 拆成多个
+native Cube 块不得改成每块独立 softmax、改累计顺序或重新舍入中间 O。
+bf16 变体显式修改 operand cast 和对应 matmul 类型，不由后端猜测。
+
+`qk_export` 展开为 K 的 GM→L1、Q/K 的 L1→L0、显式初始化/累加 matmul、
+FIX 到 Score；`pv_export` 展开 P/V 搬运、PV matmul 和 FIX。两者均接受调用者
+声明的 scratch/layout/tile 参数，不能隐藏额外全局搬运或手工 event。
+较大 BK 下 AIV 可按少量行分段，Cube 可按 native 矩阵块分段；这需要嵌套 region
+和精确摘要，不能为了让代码片段放得下而强制所有高性能配置使用小 BK。
+
+这个片段用于确定语义，不宣称其配置已达到高性能。第一份真实实现必须同时
+给出可编译完整示例、独立 oracle、同契约 AscendC 基线和固定配置的生成 ASC。
+
+## 5. 分支、尾部和动态任务的边界
+
+- 分支的 effects 保留 guard。互斥分支不人为建立冲突；合流后的 read 必须在
+  所有可达分支有有效版本。通知的生产、消费和参与者 guard 必须一致或可证明
+  配对，不能让一个 AIV 跳过另一个仍等待的通知。
+- 尾部谓词属于逻辑任务，随 stage 移动。causal 无效位置在 reduce/exp 前按
+  数值契约处理；全 mask 行需单独定义，不能仅屏蔽最终 store。
+- 零次 KV 在通用语言中合法；FA 首版可拒绝 `Sk=0`，后续必须选择并测试明确
+  输出契约。子循环结果在零次情况下未定义时，使用点给出诊断。
+- runtime sizes 和静态 owner 的规则循环先实现；数据依赖 task stream、页表/
+  稀疏索引和变长任务随后增加 metadata 捕获与输入契约，不能混称“支持动态”。
+- 将来 persistent query 流沿同一 region/ownership 表示扩展。语言不规定每个
+  query 必须清空所有 pipe；实现未支持跨 query 连续排步时明确声明子集。
+
+## 6. 一个最小同步反例及应有输出
+
+双槽流水中 `load[t+2]` 覆盖 `x[t%2]`。同步前结构片段为：
+
+```text
+pipeline t in [0,N), stages=3:
+  stage 0: MTE2 load X[t] -> x[t%2]
+  stage 1: V    mul x[t%2] -> y[t%2]
+  stage 2: MTE3 store y[t%2] -> Y[t]
+```
+
+所需义务及抽象同步后片段（表示完成关系，不是完整 ASC 或已分配的 event ID）：
+
+```text
+load.write_done[t]   -> ready_x[t] -> mul.dispatch[t]       # RAW
+mul.read_retired[t]  -> free_x[t]  -> load.dispatch[t+2]    # WAR
+mul.write_done[t]    -> ready_y[t] -> store.dispatch[t]     # RAW
+store.read_retired[t]-> free_y[t] -> mul.dispatch[t+2]     # WAR
+exit: 等待剩余输出写完成，并收齐实际未消费的 event/credit
+```
+
+跨 pipe 实例通常选择 MTE2→V ready、V→MTE2 release、V→MTE3 ready、
+MTE3→V release；最终是否可复用/删去 channel 由真实完成路径和 ID 生命周期
+决定。prologue 不等待不存在的 `free[t-2]`，末尾不留下无消费者的 Set。
+若去掉 x 的 WAR，快 MTE2 可覆盖仍被 Vector 读取的槽；若等到 store 完成才
+释放 x，则扩大等待范围，抹掉合法预取重叠。最后读取的意义就在这个区别。
+
+每类关键问题都按此格式交付实际 before/after IR、ASC 序列和反例，包括：
+partial view WAW、同槽多 reader、内层最后一次读取、提前发布部分 Score、
+旧 P Wait 阻挡新 QK、错 generation、分支漏通知、零次循环和最终 drain。
+示意关系通过并不代替最终 ASC、CANN 编译和设备证据。
