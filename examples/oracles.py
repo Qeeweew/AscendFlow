@@ -180,11 +180,11 @@ def mixed_inputs(module):
     """Independent f32 boundary oracle; shared scratch starts with poison bytes."""
     from dataclasses import replace
 
-    from .mixed import extract_mixed
+    from xdsl_npu.mixed import extract_mixed
 
     m = extract_mixed(module)
     if m.op.sym_name.data == "mixed_pipeline":
-        from .device import input_and_oracle
+        from xdsl_npu.device import input_and_oracle
 
         data, product = input_and_oracle(replace(m.programs["aic"], name="cube_pipeline"))
         buffers = {"a": data[0], "b": data[1]}

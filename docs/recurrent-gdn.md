@@ -137,9 +137,9 @@ AI_VECTOR_CORE task；设备 task 时间中位数为26.842微秒，min/max为
 
 ```bash
 .venv/bin/pytest -q compiler/tests/test_recurrent.py
-.venv/bin/xdsl-npu gdn --sequences 1 --steps 1 --value-dim 8 --slots 1 --snapshot-slots 1 --check-interleavings all --output runs/gdn/one-token --compile --shared
-.venv/bin/xdsl-npu gdn --sequences 2 --steps 5 --value-dim 8 --slots 2 --snapshot-slots 1 --check-interleavings all --output runs/gdn/five-token-single-snapshot --compile --shared
-.venv/bin/xdsl-npu gdn --sequences 32 --steps 16 --value-dim 64 --slots 2 --snapshot-slots 2 --output runs/gdn/32-16-64 --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py gdn --sequences 1 --steps 1 --value-dim 8 --slots 1 --snapshot-slots 1 --check-interleavings all --output runs/gdn/one-token --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py gdn --sequences 2 --steps 5 --value-dim 8 --slots 2 --snapshot-slots 1 --check-interleavings all --output runs/gdn/five-token-single-snapshot --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py gdn --sequences 32 --steps 16 --value-dim 64 --slots 2 --snapshot-slots 2 --output runs/gdn/32-16-64 --compile --shared
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/gdn/32-16-64 --physical 1 --repeats 30
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/gdn/profile-generated \

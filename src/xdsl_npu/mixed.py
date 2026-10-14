@@ -759,7 +759,11 @@ def autosync_mixed(module, *, _capture=None):
         }
         for name, channel in channels.items()
     }
-    search = ProofSearch(graph, shared | set().union(*counter_queries.values()))
+    search = ProofSearch(
+        graph,
+        shared | set().union(*counter_queries.values()),
+        removable=(arc for records in controls.values() for arc in records),
+    )
     removed_ops = []
     # Cross read-retirement can also cover actor-local ring WAW. Remove a
     # conflict barrier only after the whole-group graph proves it redundant.

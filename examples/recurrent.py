@@ -7,9 +7,10 @@ need separate contracts and are not silently substituted for this program.
 
 from math import sqrt
 
-from .builder import Kernel
-from .kernels import align32
-from .model import require, round_f32
+from kernels import align32
+
+from xdsl_npu.builder import Kernel
+from xdsl_npu.model import require, round_f32
 
 
 def recurrent_gdn(

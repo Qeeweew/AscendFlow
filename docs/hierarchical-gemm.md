@@ -143,7 +143,7 @@ ACL stream interval包含提交间隙，另存于`device.json/reference.json`，
 扩展物理/native/ownership契约后进入同一最终验证，不能在 ASC层藏入实现。
 
 ```bash
-.venv/bin/xdsl-npu gemm --m 512 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/gemm/persistent-512-1024-768 --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py gemm --m 512 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/gemm/persistent-512-1024-768 --compile --shared
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/gemm/persistent-512-1024-768 --physical 1
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reference.py runs/gemm/persistent-512-1024-768 --physical 1
 ```

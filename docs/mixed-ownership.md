@@ -165,12 +165,12 @@ ACL event stream 间隔含宿主派发空隙，不能当作上述内核时间。
 
 ```bash
 .venv/bin/pytest -q compiler/tests
-.venv/bin/xdsl-npu mixed --count 17 --slots 2 --check-interleavings shared --output runs/mixed/17-epochs --shared
-.venv/bin/xdsl-npu mixed --count 0 --slots 2 --check-interleavings all --output runs/mixed/zero-epoch --shared
-.venv/bin/xdsl-npu mixed --count 5 --slots 2 --aiv1-delay 32 --check-interleavings shared --output runs/mixed/uneven-participants --shared
-.venv/bin/xdsl-npu gemm-bias-silu --m 16 --n 16 --k 16 --tile-m 16 --tile-n 16 --l1-k 16 --l0-k 16 --gm-slots 1 --ub-slots 1 --check-interleavings all --output runs/mixed/one-epoch --shared
-.venv/bin/xdsl-npu gemm-bias-silu --m 768 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/mixed/768-1024-768 --shared
-.venv/bin/xdsl-npu gemm-bias-silu --m 80 --n 32 --k 64 --tile-m 16 --tile-n 16 --l1-k 32 --l0-k 16 --l1-slots 3 --l0-slots 2 --grid-m 1 --c-slots 2 --gm-slots 1 --ub-slots 1 --check-interleavings shared --output runs/mixed/asymmetric-rings --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py mixed --count 17 --slots 2 --check-interleavings shared --output runs/mixed/17-epochs --shared
+.venv/bin/python compiler/examples/build_legacy.py mixed --count 0 --slots 2 --check-interleavings all --output runs/mixed/zero-epoch --shared
+.venv/bin/python compiler/examples/build_legacy.py mixed --count 5 --slots 2 --aiv1-delay 32 --check-interleavings shared --output runs/mixed/uneven-participants --shared
+.venv/bin/python compiler/examples/build_legacy.py gemm-bias-silu --m 16 --n 16 --k 16 --tile-m 16 --tile-n 16 --l1-k 16 --l0-k 16 --gm-slots 1 --ub-slots 1 --check-interleavings all --output runs/mixed/one-epoch --shared
+.venv/bin/python compiler/examples/build_legacy.py gemm-bias-silu --m 768 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/mixed/768-1024-768 --shared
+.venv/bin/python compiler/examples/build_legacy.py gemm-bias-silu --m 80 --n 32 --k 64 --tile-m 16 --tile-n 16 --l1-k 32 --l0-k 16 --l1-slots 3 --l0-slots 2 --grid-m 1 --c-slots 2 --gm-slots 1 --ub-slots 1 --check-interleavings shared --output runs/mixed/asymmetric-rings --compile --shared
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/mixed/768-1024-768 --physical 1 --repeats 30
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reference.py runs/mixed/768-1024-768 --physical 1 --repeats 30
 ```

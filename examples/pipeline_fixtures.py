@@ -1,6 +1,6 @@
 """Small real recipes, plus storage-lifetime counterexamples used by regressions."""
 
-from .builder import Kernel
+from xdsl_npu.builder import Kernel
 
 
 def scalar_pipeline(count=3, blocks=1):
@@ -81,7 +81,7 @@ def phased_pipeline(phases=9, phase_length=1, tile=16):
     task identities while preserving the same native pipeline and aliases.
     There is no phase barrier or buffer expansion at the boundaries.
     """
-    from .model import require
+    from xdsl_npu.model import require
 
     require(isinstance(phases, int) and 1 <= phases <= 64, "phases must be in [1,64]")
     require(
@@ -114,10 +114,10 @@ def mixed_pipeline(count=3, slots=2, *, aiv1_delay=0, segments=1, local_slots=No
     """Minimal real FIX -> GM ring -> two AIVs, including zero/reuse boundaries."""
     from xdsl.dialects.builtin import IntAttr, StringAttr
 
-    from .ir import BufferOp, ViewOp
-    from .mixed import compose
-    from .model import require
-    from .sync import parts
+    from xdsl_npu.ir import BufferOp, ViewOp
+    from xdsl_npu.mixed import compose
+    from xdsl_npu.model import require
+    from xdsl_npu.sync import parts
 
     require(isinstance(aiv1_delay, int) and 0 <= aiv1_delay <= 64, "AIV delay must be in [0,64]")
     require(type(segments) is int and 1 <= segments <= 16, "static segments must be in [1,16]")

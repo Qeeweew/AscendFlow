@@ -2,7 +2,8 @@ import argparse
 import json
 from pathlib import Path
 
-from xdsl_npu.cann_reference import run_reference
+from cann_reference import run_reference
+
 from xdsl_npu.ir import parse
 
 parser = argparse.ArgumentParser()

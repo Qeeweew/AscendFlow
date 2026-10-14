@@ -6,8 +6,8 @@ events or hidden scratch/communication are introduced after synchronization.
 
 from math import isfinite
 
-from .builder import Kernel
-from .model import CAPACITY, CompileError, require, round_f32
+from xdsl_npu.builder import Kernel
+from xdsl_npu.model import CAPACITY, CompileError, require, round_f32
 
 
 def align32(n):
@@ -517,9 +517,9 @@ def gemm_bias_silu(
     """
     from xdsl.dialects.builtin import IntAttr, StringAttr
 
-    from .ir import BufferOp, ViewOp
-    from .mixed import compose
-    from .sync import parts
+    from xdsl_npu.ir import BufferOp, ViewOp
+    from xdsl_npu.mixed import compose
+    from xdsl_npu.sync import parts
 
     require(
         isinstance(gm_slots, int)

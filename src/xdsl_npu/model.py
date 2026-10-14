@@ -8,6 +8,7 @@ The first version deliberately bounds finite expansion, and emits compact loops.
 import re
 import struct
 from dataclasses import dataclass, replace
+from functools import cached_property
 from math import isfinite
 
 from xdsl.dialects.builtin import IndexType, ModuleOp, f32
@@ -215,22 +216,28 @@ class Program:
     blocks: int = 1
     epoch_divisor: int = 1
 
-    def instances(self):
+    @cached_property
+    def _semantic_instances(self):
         instances = [
             Instance(g, t)
             for g in range(self.count)
             for t, task in enumerate(self.tasks)
             if task.active(g)
         ]
-        return sorted(
-            instances,
-            key=lambda i: (
-                i.generation // self.epoch_divisor,
-                self.tasks[i.task].logical_phase,
-                i.generation,
-                i.task,
+        return tuple(
+            sorted(
+                instances,
+                key=lambda i: (
+                    i.generation // self.epoch_divisor,
+                    self.tasks[i.task].logical_phase,
+                    i.generation,
+                    i.task,
+                ),
             ),
         )
+
+    def instances(self):
+        return self._semantic_instances
 
     def issued(self):
         return sorted(
@@ -807,6 +814,38 @@ def extract(module: ModuleOp) -> Program:
     scalar_values: dict[SSAValue, str] = {}
     tasks = []
     uids = set()
+    # These caches belong to this extraction of actual IR. Ref is immutable;
+    # equal refs have exactly the same finite addresses, extents, and holes.
+    ref_pool = {}
+    addresses = {}
+    translations = {}
+    alignments = {}
+
+    def finite_addresses(ref):
+        key = id(ref)
+        if key not in addresses:
+            addresses[key] = tuple(ref.address(g) for g in range(max(count, 1)))
+        return addresses[key]
+
+    def core_translations(ref):
+        key = id(ref)
+        if key not in translations:
+            base = ref.address(0)
+            translations[key] = tuple(
+                ref.address(0, core) - base for core in range(blocks if ref.storage.external else 1)
+            )
+        return translations[key]
+
+    def aligned_origins(ref, alignment):
+        key = id(ref), alignment
+        if key not in alignments:
+            alignments[key] = (
+                all(address % alignment == 0 for address in finite_addresses(ref))
+                and all(shift % alignment == 0 for shift in core_translations(ref))
+                and (ref.rows == 1 or ref.row_stride % alignment == 0)
+            )
+        return alignments[key]
+
     for op in stream.body.block.ops:
         if isinstance(op, ViewOp):
             require(
@@ -891,27 +930,29 @@ def extract(module: ModuleOp) -> Program:
                 row_stride,
                 core_terms,
             )
+            ref = ref_pool.setdefault(ref, ref)
             core_count = blocks if root.external else 1
             generations = range(max(count, 1))
             if op.source in roots:
                 # Root allocations have no holes. Core/generation terms are
                 # additive and independent, so exact finite maxima suffice.
-                last_g = max(generations, key=lambda g: ref.address(g) + ref.length(g))
-                last_core = max(range(core_count), key=lambda c: ref.address(0, c))
-                stop = ref.address(last_g, last_core) + (rows - 1) * row_stride + ref.length(last_g)
+                values = finite_addresses(ref)
+                shifts = core_translations(ref)
+                last_g = max(generations, key=lambda g: values[g] + ref.length(g))
+                last_core = max(range(core_count), key=shifts.__getitem__)
+                stop = (
+                    values[last_g]
+                    + shifts[last_core]
+                    + (rows - 1) * row_stride
+                    + ref.length(last_g)
+                )
                 require(
                     count == 0 and root.external or stop <= root.nbytes,
                     f"view {root.name} generation {last_g}, core {last_core} end {stop} exceeds its parent",
                 )
                 itemsize = ITEMSIZE[ref.dtype]
                 require(
-                    all(ref.address(g) % itemsize == 0 for g in generations)
-                    and all(
-                        (ref.address(0, c) - ref.address(0)) % itemsize == 0
-                        for c in range(core_count)
-                    )
-                    and (rows == 1 or row_stride % itemsize == 0)
-                    and length % itemsize == 0,
+                    aligned_origins(ref, itemsize) and length % itemsize == 0,
                     f"view {root.name} is not aligned for its element type",
                 )
                 views[op.ref] = ref
@@ -922,10 +963,7 @@ def extract(module: ModuleOp) -> Program:
                 range(core_count) if core_stride or op.core_terms is not None else range(1)
             )
             require(
-                all(
-                    (ref.address(0, c) - ref.address(0)) % ITEMSIZE[ref.dtype] == 0
-                    for c in range(core_count)
-                ),
+                all(shift % ITEMSIZE[ref.dtype] == 0 for shift in core_translations(ref)),
                 f"view {root.name} core translation is not aligned for its element type",
             )
             for core in check_cores:
@@ -973,14 +1011,7 @@ def extract(module: ModuleOp) -> Program:
             for ref in refs:
                 alignment = 4 if pipe == "S" else 32
                 require(
-                    (
-                        not ref.storage.external
-                        or blocks == 1
-                        or all(ref.address(0, core) % alignment == 0 for core in range(blocks))
-                    )
-                    and all(
-                        a % alignment == 0 for g in range(max(count, 1)) for a, _ in ref.segments(g)
-                    ),
+                    aligned_origins(ref, alignment),
                     f"{uid}: {pipe} operand origin requires {alignment}-byte alignment",
                 )
             if any(r.tail_nbytes for r in refs):
@@ -996,7 +1027,7 @@ def extract(module: ModuleOp) -> Program:
                 for ref in refs:
                     if ref.storage.bank != "GM":
                         require(
-                            all(ref.address(g) % 512 == 0 for g in range(max(count, 1))),
+                            all(address % 512 == 0 for address in finite_addresses(ref)),
                             f"{uid}: Cube/Fixpipe local origin must be 512-byte aligned",
                         )
             require(
@@ -1065,12 +1096,12 @@ def extract(module: ModuleOp) -> Program:
             if pipe == "V":
                 for r in refs[:-1]:
                     dst = refs[-1]
+                    if r.storage != dst.storage or r is dst:
+                        continue
                     for g in range(count):
                         old, new = r.segments(g), dst.segments(g)
                         require(
-                            r.storage != dst.storage
-                            or old == new
-                            or not any(a < d and c < b for a, b in old for c, d in new),
+                            old == new or not ranges_overlap(old, new),
                             f"{uid}: shifted in-place Vector overlap is unsupported",
                         )
             tasks.append(task)
@@ -1224,46 +1255,78 @@ def dependencies(program: Program, *, _imports=()) -> tuple[Obligation, ...]:
     positions = {
         name: {point: i for i, point in enumerate(values)} for name, values in points.items()
     }
-    writers = {}
-    readers = {}
-    # These are conditional actor-local premises, never a GM initialization
-    # claim. The mixed verifier must discharge them from actual shared writers.
+    # Dense cells index exact cut intervals, including every hole. This avoids
+    # re-allocating/hashing a (root, start, stop) key for every native access.
+    writers = {name: [None] * (len(values) - 1) for name, values in points.items()}
+    readers = {name: [None] * (len(values) - 1) for name, values in points.items()}
     require(set(_imports) <= {s.name for s in program.storages if s.external}, "invalid imports")
     initialized = {s.name: s.initialized or s.name in _imports for s in program.storages}
-    obligations = set()
+    edges = {}
 
     def edge(src, dst, kind, root, a, b):
-        if src is not None and src != dst:
-            obligations.add(
-                Obligation(
-                    src, dst, kind, root, a, b, "read_retired" if kind == "WAR" else "write_done"
-                )
-            )
+        if src is None or src == dst:
+            return
+        spans = edges.setdefault((src, dst, kind, root), [])
+        if spans and spans[-1][0] <= a <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(b, spans[-1][1]))
+        else:
+            spans.append((a, b))
 
     for instance, footprints in effects:
         task = program.tasks[instance.task]
-        accesses = []
+        # Process ALL reads before any write, even with multiple aliased refs.
         for root, start, stop, mode in footprints:
+            if "R" not in mode:
+                continue
             boundaries, index = points[root], positions[root]
-            accesses.extend(
-                ((root, boundaries[i], boundaries[i + 1]), mode)
-                for i in range(index[start], index[stop])
-            )
-        for key, mode in accesses:
-            if "R" in mode:
+            previous, pending = writers[root], readers[root]
+            for cell in range(index[start], index[stop]):
+                a, b = boundaries[cell], boundaries[cell + 1]
                 require(
-                    key in writers or initialized[key[0]],
-                    f"{task.uid}[{instance.generation}] reads undefined {key[0]}[{key[1]}:{key[2]}]",
+                    previous[cell] is not None or initialized[root],
+                    f"{task.uid}[{instance.generation}] reads undefined {root}[{a}:{b}]",
                 )
-                edge(writers.get(key), instance, "RAW", *key)
-                readers.setdefault(key, set()).add(instance)
-        for key, mode in accesses:
-            if "W" in mode:
-                edge(writers.get(key), instance, "WAW", *key)
-                for src in readers.get(key, ()):
-                    edge(src, instance, "WAR", *key)
-                readers[key] = set()
-                writers[key] = instance
+                edge(previous[cell], instance, "RAW", root, a, b)
+                if pending[cell] is None:
+                    pending[cell] = set()
+                pending[cell].add(instance)
+        for root, start, stop, mode in footprints:
+            if "W" not in mode:
+                continue
+            boundaries, index = points[root], positions[root]
+            previous, pending = writers[root], readers[root]
+            for cell in range(index[start], index[stop]):
+                a, b = boundaries[cell], boundaries[cell + 1]
+                edge(previous[cell], instance, "WAW", root, a, b)
+                for src in pending[cell] or ():
+                    edge(src, instance, "WAR", root, a, b)
+                pending[cell] = None
+                previous[cell] = instance
+    obligations = []
+    for (src, dst, kind, root), spans in edges.items():
+        merged = []
+        for a, b in sorted(spans):
+            if merged and a <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+            else:
+                merged.append((a, b))
+        obligations.extend(
+            Obligation(
+                src, dst, kind, root, a, b, "read_retired" if kind == "WAR" else "write_done"
+            )
+            for a, b in merged
+        )
     return tuple(
-        sorted(obligations, key=lambda o: (o.destination, o.source, o.hazard, o.storage, o.start))
+        sorted(
+            obligations,
+            key=lambda o: (
+                o.destination.generation,
+                o.destination.task,
+                o.source.generation,
+                o.source.task,
+                o.hazard,
+                o.storage,
+                o.start,
+            ),
+        )
     )

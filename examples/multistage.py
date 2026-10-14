@@ -146,8 +146,6 @@ def main():
     from pathlib import Path
 
     from xdsl_npu.cli import build_module
-    from xdsl_npu.ir import dump
-    from xdsl_npu.lowering import lower_source
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kind", choices=["vector", "cv", "segmented-cv"])
@@ -163,10 +161,7 @@ def main():
         if args.kind == "segmented-cv"
         else {"vector": vector_source, "cv": cv_source}[args.kind](args.count)
     )
-    report = build_module(
-        lower_source(source), args.output, compile_asc=args.compile, shared=args.shared
-    )
-    (args.output / "source.xdsl").write_text(dump(source))
+    report = build_module(source, args.output, compile_asc=args.compile, shared=args.shared)
     print(json.dumps(report, indent=2))
 
 

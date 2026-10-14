@@ -1,12 +1,13 @@
 import itertools
 
 import pytest
+from pipeline_fixtures import phased_pipeline, vector_pipeline
+from recurrent import recurrent_gdn
 from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
-from xdsl_npu import autosync, emit_asc, recurrent_gdn, verify_plan
+from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.events import minimum_chains, pack_event_lifetimes, selection_expression
-from xdsl_npu.examples import phased_pipeline, vector_pipeline
 from xdsl_npu.ir import ChannelOp, dump, parse
 from xdsl_npu.model import CompileError, extract
 from xdsl_npu.sync import explain_plan

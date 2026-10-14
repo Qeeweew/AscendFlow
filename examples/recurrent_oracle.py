@@ -9,7 +9,7 @@ import ctypes
 from array import array
 from math import exp
 
-from .oracles import f32
+from oracles import f32
 
 
 def gdn_reference(q, keys, values, g, beta, initial, *, sequences, steps, value_dim, scale):

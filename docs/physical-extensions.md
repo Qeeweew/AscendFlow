@@ -35,7 +35,7 @@ Scalar→Vector 双缓冲、count=5、四核 grid 已通过 CANN 编译和物理
 normalization/RoPE/GEMM 等复杂算子已经交付。
 
 ```bash
-.venv/bin/xdsl-npu scalar --count 5 --blocks 4 --output runs/stage2/scalar-grid --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py scalar --count 5 --blocks 4 --output runs/stage2/scalar-grid --compile --shared
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/stage2/scalar-grid --physical 1
 ```
 

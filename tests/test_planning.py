@@ -2,9 +2,9 @@ import random
 from collections import defaultdict
 
 import pytest
+from pipeline_fixtures import cube_pipeline, vector_pipeline
 
 from xdsl_npu import autosync
-from xdsl_npu.examples import cube_pipeline, vector_pipeline
 from xdsl_npu.reachability import ProofSearch
 from xdsl_npu.sync import CompletionPrefixes, Graph, completion_graph, execution
 
@@ -75,3 +75,41 @@ def test_native_pipeline_graph_edges_grow_with_commands(factory):
     ex = execution(autosync(factory(24)))
     graph, *_ = completion_graph(ex)
     assert sum(map(len, graph.edges)) < 10 * len(ex.commands)
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_shared_suffixes_and_control_only_invalidation_match_full_closure(seed):
+    rng = random.Random(seed)
+    graph = Graph()
+    for i in range(48):
+        graph.node(str(i))
+    arcs = {(a, a + 1) for a in range(47)}
+    arcs |= {(a, b) for a in range(48) for b in range(a + 2, 48) if rng.random() < 0.1}
+    for a, b in arcs:
+        graph.edge(a, b)
+    graph.close()
+    queries = {(source, target) for source in range(24) for target in [32, 40, 47]}
+    removable = rng.sample(sorted(arcs), len(arcs) // 2)
+    search = ProofSearch(graph, queries, removable=removable)
+    omitted = set()
+    rng.shuffle(removable)
+    for start in range(0, len(removable), 4):
+        batch = set(removable[start : start + 4])
+        exclusions = defaultdict(set)
+        for a, b in omitted | batch:
+            exclusions[a].add(b)
+        graph.close(exclusions)
+        expected = all(graph.precedes(a, b) for a, b in queries)
+        graph.close()
+        assert search.remove(batch) == expected
+        if expected:
+            omitted |= batch
+        for query, path in search.paths.items():
+            arcs_in_path = tuple(path)
+            assert arcs_in_path[0][0] == query[0] and arcs_in_path[-1][1] == query[1]
+            assert all(b == c for (_, b), (c, _) in zip(arcs_in_path, arcs_in_path[1:]))
+            assert not set(arcs_in_path) & omitted
+            assert all(b in graph.edges[a] for a, b in arcs_in_path)
+    untracked = next(arc for arc in arcs if arc not in removable)
+    with pytest.raises(ValueError, match="untracked native"):
+        search.remove([untracked])

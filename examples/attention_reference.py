@@ -2,7 +2,7 @@
 
 import ctypes as ct
 
-from xdsl_npu.cann_reference import OperatorReference
+from cann_reference import OperatorReference
 
 
 class FlashAttentionReference(OperatorReference):

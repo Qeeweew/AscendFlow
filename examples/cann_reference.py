@@ -6,10 +6,11 @@ import json
 import struct
 from pathlib import Path
 
-from .device import ACL, health_snapshot
-from .model import extract, require
-from .oracles import operator_inputs
-from .toolchain import CANN
+from oracles import operator_inputs
+
+from xdsl_npu.device import ACL, health_snapshot
+from xdsl_npu.model import extract, require
+from xdsl_npu.toolchain import CANN
 
 
 class OperatorReference:
@@ -189,7 +190,7 @@ class GemmBiasSiluReference:
 
 
 def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_case="standard"):
-    from .ir import MixedOp
+    from xdsl_npu.ir import MixedOp
 
     mixed = isinstance(plan.body.block.first_op, MixedOp)
     if mixed:
@@ -205,7 +206,7 @@ def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_
     require(repeats > 0 and warmup > 0, "correctness and timing require positive launch counts")
     health = health_snapshot(physical, output)
     if mixed:
-        from .oracles import mixed_inputs
+        from oracles import mixed_inputs
 
         require(data_case == "standard", "mixed baseline requires standard inputs")
         contents, expected, tolerance, shape = mixed_inputs(plan)

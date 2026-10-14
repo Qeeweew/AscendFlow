@@ -98,7 +98,7 @@ rotating width 不合适就提前拒绝。
 
 ```bash
 .venv/bin/pytest -q compiler/tests/test_events.py
-.venv/bin/xdsl-npu phased --phases 9 --phase-length 1 --columns 16 --check-interleavings all --output runs/events/nine-phases --compile --shared
-.venv/bin/xdsl-npu phased --phases 5 --phase-length 3 --columns 16 --check-interleavings all --output runs/events/epoch-selection --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py phased --phases 9 --phase-length 1 --columns 16 --check-interleavings all --output runs/events/nine-phases --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py phased --phases 5 --phase-length 3 --columns 16 --check-interleavings all --output runs/events/epoch-selection --compile --shared
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/events/epoch-selection --physical 1 --repeats 10
 ```

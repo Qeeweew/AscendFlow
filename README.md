@@ -3,52 +3,80 @@
 基于 xDSL 0.73.0 的独立 Python 编译器，目标 Ascend 910B / dav-2201，直接输出
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
-当前可编译运行固定 shape 的 RMSNorm、rotate-half RoPE、稳定 Softmax、SwiGLU
-和带 K 块累加的矩形 batched NT matmul、普通/连续 NT GEMM、混合核 GEMM+bias+SiLU、
-静态 f32 GDN 递推，以及 f16/bf16 Flash Attention 的 dense/causal MHA、GQA、MQA
-和完整 head tile 的 packed decode。Attention 的三个 GM 环、双向 AIC/AIV 交接和
-FP32 online carry 都经过同一自动同步核心；支持显式 lookahead 排步和物理别名复用。
-GEMM 支持二维
-输出 grid、独立 L1/L0 K 分块、L0C 多槽及显式 B 驻留政策。所有算子展开为
-同一个物理 IR，并经过
-局部/混合核 AutoSync、最终 verifier 和 ASC 后端。独立核 grid、Scalar 捕获、strided
-访问和多级 buffer 复用均由共享模型检查。
-`Kernel` builder 明确表达原生计算、搬运、物理布局、子视图、slot 和固定 stage。
-专家指定的 issue 顺序、stage 和 buffer 不会被同步器重排或扩大。
-源码、测试和文档属于本产品 Git；环境和运行产物放在外层工作区。
+当前源语言用 `Pipelined / Stage / Cube / Vector` 表达核内和 CV 多阶段程序。
+源程序只写一个逻辑任务 `t`；编译器位移访问及 descriptor，生成填排、收尾和
+实际同步。软件 stage、buffer versions 和硬件 event 资源各自独立。
 
 ```python
-from xdsl_npu import autosync, emit_asc, verify_plan
-from xdsl_npu.examples import vector_pipeline
+from xdsl_npu import language as N
+from xdsl_npu import compile
 
-physical_ir = vector_pipeline(count=6, tile=128, slots=2)
-plan_ir = autosync(physical_ir)
-print(verify_plan(plan_ir))
-print(emit_asc(plan_ir))
+@N.prim_func(disjoint_external=True)
+def scale(X: N.Tensor((4, 64), N.f32),
+          Y: N.Tensor((4, 64), N.f32, access="write")):
+    with N.Kernel(kind="vector"):
+        x = N.alloc_ub((64,), versions=2)
+        y = N.alloc_ub((64,), versions=2)
+        for t in N.Pipelined(4, stages=3):
+            with N.Stage(0, name="load"):
+                value = N.copy(X[t, :], x)
+            with N.Stage(1, name="compute"), N.Vector():
+                result = N.mul(value, 2.0, out=y)
+            with N.Stage(2, name="store"):
+                N.copy(result, Y[t, :])
+
+compiled = compile(scale)
+print(compiled.asc)
+print(compiled.report)
 ```
 
-实现路径：builder → xDSL NPU physical IR → 物理访问依赖 → 同步 PlanIR →
-独立最终验证 → ASC → CANN。task 的 SSA 结果是身份，不能作为异步完成证明。
-buffer/view 保留分配身份和字节范围；任务的效果来自封闭的原生 recipe 表。
-生成的同步保留 RAW/WAR/WAW 原因、物理范围、代次和最终完成路径。
+CV 示例直接写 Stage0/Cube、Stage1/Vector、Stage1/Cube、Stage2/Vector。
+两处 Stage1 是独立 region；Cube region 内仍有 MTE2、MTE1、Cube、Fixpipe 的
+各自最后读取和复用约束。静态内层预取拥有独立 clock，不把整个 CV task 改成
+一个扁平微步索引。具体语义、分段例子和设备结果见
+[multi-stage DSL](docs/dsl-multistage.md)。
+
+实现路径：typed source → xDSL source regions → NPU physical IR → AutoSync →
+独立最终检查 → ASC → CANN。逻辑 tile 是物理 buffer 的借用值，不是隐式快照，
+SSA use-def 不承诺异步完成。覆盖后的旧 tile 会拒绝；不会加入隐藏搬运。
+`compile()` 返回不可变 ASC、IR 字符串和验证摘要，重复消费避免完整重检。
+外部可变 physical/PlanIR 仍经过独立 verifier；底层物理 builder 保留给专家及反例。
+
+编译器包只包含 DSL、IR、同步、后端和通用工具。RMSNorm、RoPE、Softmax、
+SwiGLU、GEMM、GDN、Flash Attention 及其 oracle、AscendC/ACLNN 对照均在
+`examples/`。这些旧算法仍在迁移源语法；其物理构造入口为
+`examples/build_legacy.py`，不能当作新 DSL 已覆盖全部算子。算子调参仍暂停，
+Python 编译性能和目录重构的进度见 [重构记录](docs/refactor-progress.md)。
+源码、回归、示例和产品文档属于独立产品 Git；环境和运行数据在外层工作区。
 
 ## 重现首个闭环
 
-在 `/workspace/xdsl-910b` 执行：
+在 `/workspace/xdsl-910b` 执行。新 DSL 的局部和双向 CV 闭环：
+
+```bash
+.venv/bin/python compiler/examples/multistage.py vector --count 4 --output runs/refactor/vector --shared
+.venv/bin/python compiler/examples/multistage.py segmented-cv --count 4 --segments 3 --groups 2 --output runs/refactor/segmented-cv --shared
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_multistage.py runs/refactor/segmented-cv --physical 1
+```
+
+`source.xdsl`、`before.xdsl`、`after.xdsl` 和 `schedule.json` 对照源 region 与实际
+派发；所有新 QK segment 在旧 P-ready Wait 之前发射。分段 CV 是同步和数值例子，
+不是 FA 或吞吐率 benchmark。遗留物理反例仍可重现：
 
 ```bash
 .venv/bin/pip install --no-build-isolation -e compiler
 .venv/bin/pytest -q compiler/tests
 .venv/bin/ruff check compiler
 
-.venv/bin/xdsl-npu vector --count 6 --output runs/stage1/vector --compile --shared
-.venv/bin/xdsl-npu last-read --count 5 --tail 24 --output runs/stage1/last-read-tail --compile --shared
-.venv/bin/xdsl-npu cube --count 5 --output runs/stage1/cube --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py vector --count 6 --output runs/stage1/vector --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py last-read --count 5 --tail 24 --output runs/stage1/last-read-tail --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py cube --count 5 --output runs/stage1/cube --compile --shared
 ```
 
-每个输出目录包含 `before.xdsl`、`after.xdsl`、`witnesses.json`、验证摘要、ASC、
+每个输出目录包含 `before.xdsl`、`after.xdsl`、验证摘要、编译阶段计时、ASC、
 设备 ELF、可选 host launch 库，以及精确编译命令、版本和文件 SHA256。
-`xdsl-npu ir --input ... --output ...` 也接受未同步的文本 xDSL IR。
+`xdsl-npu --input ... --output ...` 接受 typed source 或未同步物理 IR；
+`--synchronized` 检查专家 PlanIR，`--explain` 显式导出逐访问 witnesses。
 当前静态有限验证预算是每 actor 4096 个 task instance，超出后拒绝，不运行未经检查的计划。
 
 设备运行需先选择健康空闲卡。runner 在每个进程加载 ACL 前重新检查全部卡的
@@ -120,15 +148,15 @@ Flash Attention 的数值契约、三环同步、变体和大规模性能见
 在工作区执行；运行前依据全部卡的健康和占用选择物理卡，下面使用物理卡1、逻辑0：
 
 ```bash
-.venv/bin/xdsl-npu rms-norm --rows 256 --columns 1024 --blocks 8 --output runs/operators/rms --compile --shared
-.venv/bin/xdsl-npu rope --rows 4096 --columns 128 --blocks 32 --output runs/operators/rope --compile --shared
-.venv/bin/xdsl-npu softmax --rows 256 --columns 1024 --blocks 8 --output runs/operators/softmax --compile --shared
-.venv/bin/xdsl-npu swiglu --rows 256 --columns 1024 --blocks 8 --output runs/operators/swiglu --compile --shared
-.venv/bin/xdsl-npu batched-matmul --batch 8 --m 64 --n 64 --k 256 --k-block 64 --output runs/operators/matmul --compile --shared
-.venv/bin/xdsl-npu gemm --m 512 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/gemm/persistent-512-1024-768 --compile --shared
-.venv/bin/xdsl-npu mixed --count 17 --slots 2 --check-interleavings shared --output runs/mixed/17-epochs --shared
-.venv/bin/xdsl-npu gemm-bias-silu --m 768 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/mixed/768-1024-768 --shared
-.venv/bin/xdsl-npu gdn --sequences 32 --steps 16 --value-dim 64 --slots 2 --snapshot-slots 2 --output runs/gdn/32-16-64 --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py rms-norm --rows 256 --columns 1024 --blocks 8 --output runs/operators/rms --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py rope --rows 4096 --columns 128 --blocks 32 --output runs/operators/rope --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py softmax --rows 256 --columns 1024 --blocks 8 --output runs/operators/softmax --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py swiglu --rows 256 --columns 1024 --blocks 8 --output runs/operators/swiglu --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py batched-matmul --batch 8 --m 64 --n 64 --k 256 --k-block 64 --output runs/operators/matmul --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py gemm --m 512 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/gemm/persistent-512-1024-768 --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py mixed --count 17 --slots 2 --check-interleavings shared --output runs/mixed/17-epochs --shared
+.venv/bin/python compiler/examples/build_legacy.py gemm-bias-silu --m 768 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/mixed/768-1024-768 --shared
+.venv/bin/python compiler/examples/build_legacy.py gdn --sequences 32 --steps 16 --value-dim 64 --slots 2 --snapshot-slots 2 --output runs/gdn/32-16-64 --compile --shared
 
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/operators/matmul --physical 1
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reference.py runs/operators/rms --physical 1

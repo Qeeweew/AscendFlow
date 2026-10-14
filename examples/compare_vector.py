@@ -7,8 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from pipeline_fixtures import vector_pipeline
+
 from xdsl_npu import autosync, emit_asc, verify_plan
-from xdsl_npu.examples import vector_pipeline
 from xdsl_npu.ir import dump
 from xdsl_npu.toolchain import offline_compile
 

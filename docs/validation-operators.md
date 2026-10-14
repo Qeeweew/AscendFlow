@@ -123,7 +123,7 @@ generation，不能从此配置宣称跨 generation 的流水重叠。原8核政
 32核配置可显式重现：
 
 ```bash
-.venv/bin/xdsl-npu softmax --rows 256 --columns 1024 --blocks 32 --output runs/operators/softmax-256-1024-32cores --compile --shared
+.venv/bin/python compiler/examples/build_legacy.py softmax --rows 256 --columns 1024 --blocks 32 --output runs/operators/softmax-256-1024-32cores --compile --shared
 ```
 
 ## 复现

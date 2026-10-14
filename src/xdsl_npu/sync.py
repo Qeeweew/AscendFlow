@@ -710,7 +710,11 @@ def autosync(module: ModuleOp, *, _imports=(), _capture=None) -> ModuleOp:
     graph, begin, end, _, _ = completion_graph(ex, controls=controls)
     from .reachability import ProofSearch
 
-    search = ProofSearch(graph, ((end[src], begin[dst]) for src, dst in required_pairs))
+    search = ProofSearch(
+        graph,
+        ((end[src], begin[dst]) for src, dst in required_pairs),
+        removable=(arc for records in controls.values() for _, arc in records),
+    )
     # Deleted commands remain transparent issue nodes. Only captured
     # completion constraints are removed, never native effects or ordering.
     retained = list(range(len(template)))

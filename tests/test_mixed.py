@@ -1,10 +1,12 @@
 import pytest
+from kernels import gemm_bias_silu
+from oracles import mixed_inputs
+from pipeline_fixtures import mixed_pipeline
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 from xdsl.transforms.dead_code_elimination import dce
 
-from xdsl_npu import autosync, emit_asc, gemm_bias_silu, verify_plan
+from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
-from xdsl_npu.examples import mixed_pipeline
 from xdsl_npu.ir import (
     BufferOp,
     CrossChannelOp,
@@ -31,7 +33,6 @@ from xdsl_npu.mixed import (
 )
 from xdsl_npu.mixed_check import bounded_mixed_check
 from xdsl_npu.model import CompileError, Instance
-from xdsl_npu.oracles import mixed_inputs
 from xdsl_npu.sync import explain_plan
 from xdsl_npu.sync import verify_plan as local_verify
 

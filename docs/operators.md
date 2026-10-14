@@ -102,7 +102,7 @@ barrier。后续 `sin_low` 是 X 的最后 reader，其 release 放在 `rotate_h
 witness 可复现为：
 
 ```bash
-.venv/bin/xdsl-npu rope --rows 3 --columns 64 --row-block 1 --output runs/operators/rope-war
+.venv/bin/python compiler/examples/build_legacy.py rope --rows 3 --columns 64 --row-block 1 --output runs/operators/rope-war
 ```
 
 `before.xdsl`、`after.xdsl`、`witnesses.json` 和生成 ASC 保存在该外层目录。

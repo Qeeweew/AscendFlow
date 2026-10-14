@@ -1,11 +1,12 @@
 import pytest
+from recurrent import recurrent_gdn
+from recurrent_oracle import gdn_reference, recurrent_inputs
 from xdsl.transforms.dead_code_elimination import dce
 
-from xdsl_npu import Kernel, autosync, emit_asc, recurrent_gdn, verify_plan
+from xdsl_npu import Kernel, autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import SyncOp, TaskOp, dump, parse
 from xdsl_npu.model import CompileError, Instance, dependencies, extract
-from xdsl_npu.recurrent_oracle import gdn_reference, recurrent_inputs
 from xdsl_npu.sync import completion_graph, execution
 
 

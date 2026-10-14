@@ -254,6 +254,7 @@ def test_unimplemented_runtime_initialization_is_rejected_explicitly():
 
 def test_all_segment_contributions_precede_ready_and_an_early_ready_is_rejected():
     from multistage import segmented_cv_source
+
     from xdsl_npu.ir import TaskOp
     from xdsl_npu.mixed import mixed_execution, mixed_graph
     from xdsl_npu.model import Instance
