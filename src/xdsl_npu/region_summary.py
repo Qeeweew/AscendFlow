@@ -145,6 +145,86 @@ def _event_reuse(channel, bank):
             )
 
 
+def fixed_event_reuse(channel, bank: tuple[str, str, str], count: int) -> tuple[EventReuse, ...]:
+    """Return exact event reuse endpoints without enumerating the child clock.
+
+    The caller validates the actual Set/Wait operations separately. Source
+    epochs are ordered by ``(period quotient, residue rank)``; event IDs rotate
+    over that ordinal, including when their values are not an arithmetic list.
+    Only IDs with a real notification in this fixed invocation get a boundary.
+    """
+    require(type(count) is int and count >= 0, "fixed event count must be nonnegative")
+    require(channel.kind == "local", "hierarchical counters require participant analysis")
+    require(not channel.carry, "fixed child events cannot carry invocation credits")
+    require(channel.ids, "child event IDs must be assigned before resource summarization")
+    require(
+        len(set(channel.ids)) == len(channel.ids),
+        "child event IDs must be distinct",
+    )
+    require(
+        len(channel.sources) == len(channel.destinations) == 1
+        and channel.sources[0][0] == channel.destinations[0][0],
+        "child local events need one source and destination in one actor",
+    )
+    require(
+        type(channel.period) is int
+        and channel.period > 0
+        and type(channel.distance) is int
+        and channel.distance >= 0
+        and channel.residues,
+        "invalid fixed child event activation",
+    )
+    previous = -1
+    for residue in channel.residues:
+        require(
+            type(residue) is int and previous < residue < channel.period,
+            "fixed child event residues must be sorted, distinct and in range",
+        )
+        previous = residue
+    (source,), (destination,) = channel.sources, channel.destinations
+    width = len(channel.ids)
+    if channel.last:
+        require(width == 1, "a terminal child channel needs one event ID")
+        first = count - channel.distance - 1
+        if first < 0 or first % channel.period not in channel.residues:
+            return ()
+        boundaries = ((channel.ids[0], first, count - 1),)
+    else:
+        stop = count - channel.distance
+        if stop <= 0:
+            return ()
+        cycles, tail = divmod(stop, channel.period)
+        ranks = len(channel.residues)
+        notifications = cycles * ranks + bisect_left(channel.residues, tail)
+        if not notifications:
+            return ()
+
+        def epoch(ordinal):
+            cycle, rank = divmod(ordinal, ranks)
+            return cycle * channel.period + channel.residues[rank]
+
+        boundaries = (
+            (
+                event_id,
+                epoch(index),
+                epoch(index + (notifications - 1 - index) // width * width) + channel.distance,
+            )
+            for index, event_id in enumerate(channel.ids[: min(width, notifications)])
+        )
+    domain = CountDomain(1, 0, exact=count)
+    return tuple(
+        EventReuse(
+            channel.name,
+            event_id,
+            bank,
+            domain,
+            Access(destination, Position(False, last)),
+            Access(source, Position(False, first)),
+        )
+        for event_id, first, last in boundaries
+    )
+
+
 def summarize_local_events(loop):
     """Read actual child Set/Wait operations and retain cross-call obligations."""
     from .loop_graph import channels, commands
@@ -164,11 +244,17 @@ def summarize_local_events(loop):
             tasks[channel.sources[0]].pipe,
             tasks[channel.destinations[0]].pipe,
         )
-        result.extend(
-            item
-            for item in _event_reuse(channel, bank)
-            if loop.constant_count is None or item.domain.contains(loop.constant_count)
-        )
+        if loop.constant_count is not None and not channel.carry:
+            result.extend(fixed_event_reuse(channel, bank, loop.constant_count))
+        else:
+            # Carried invocation credits have a different cross-call contract.
+            # Keep their established domains even for a fixed-length child;
+            # retained scope children reject carry before resource analysis.
+            result.extend(
+                item
+                for item in _event_reuse(channel, bank)
+                if loop.constant_count is None or item.domain.contains(loop.constant_count)
+            )
         require(len(result) <= MAX_SUMMARY_VISITS, "child event summary budget exceeded")
     return tuple(result)
 

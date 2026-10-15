@@ -8,15 +8,15 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from .budget import bounded, poll
 from .child_completion import ChildPort, project_fixed_child
-from .completion import Position, Site
 from .ir import LoopChannelOp, ScopeChannelOp, ScopeSyncOp, TaskOp
 from .loop_graph import Command
-from .loop_sync import _lifetime, _plan_leaf, _requirements, _successor, _verify_leaf
+from .loop_sync import _lifetime, _plan_leaf, _requirements, _verify_leaf
 from .model import require
 from .native_order import instruction_points, prefix_inputs
 from .periodic import bounded_period, project
 from .region_summary import summarize_local_events
 from .scope_completion import compose_calls
+from .scope_events import event_choices, resource_inputs, resource_sites
 from .scope_model import extract_scopes
 
 
@@ -51,7 +51,7 @@ def _point(site, point):
 
 
 class ParentCompletion:
-    def __init__(self, program, analyses, access, period):
+    def __init__(self, program, analyses, access, period, *, resource_inputs=None):
         self.program, self.access = program, access
         self.events, self.protocols = {}, []
         marks = defaultdict(set)
@@ -75,24 +75,16 @@ class ParentCompletion:
         for uid, analysis in analyses.items():
             poll("child event resource projection")
             leaf = program.leaves[uid]
-            for resource in summarize_local_events(analysis[0]):
+            resources = (
+                summarize_local_events(analysis[0])
+                if resource_inputs is None
+                else resource_inputs.get(uid, ())
+            )
+            for resource in resources:
                 if not resource.domain.contains(analysis[0].constant_count):
                     continue
-                sites = []
-                for old, point, action in (
-                    (resource.consumed, "begin", "wait"),
-                    (resource.republished, "end", "set"),
-                ):
-                    site = Site(
-                        (leaf.actor, old.task[1]),
-                        Position(False, old.position.evaluate(analysis[0].constant_count)),
-                        point,
-                        resource.channel,
-                        action,
-                        region=uid,
-                    )
-                    marks[uid].add(site)
-                    sites.append(site)
+                sites = resource_sites(uid, leaf.actor, analysis[0].constant_count, resource)
+                marks[uid].update(sites)
                 self.resource_pairs.append((uid, *sites, resource))
         calls = {}
         for uid, leaf in program.leaves.items():
@@ -252,16 +244,24 @@ class ParentCompletion:
                     self.completion.edge(source, (target[0], generation // self.graph.period))
 
     def check_child_resources(self):
+        queries = 0
         for uid, consumed, republished, resource in self.resource_pairs:
             poll("child event reuse verification")
-            queries = [
-                self.completion.query(uid, consumed, r, uid, republished, r + 1, minimum=1)
-                for r in range(self.graph.period)
-            ]
             require(
-                all(self.graph.covered_many(queries)),
+                self.resource_covered(uid, consumed, republished),
                 f"{uid}/{resource.channel}: child event {resource.event_id} may be re-Set before its previous parent call Wait",
             )
+            queries += self.graph.period
+        return queries
+
+    def resource_covered(self, uid, consumed, republished):
+        """A selected ID's final Wait is consumed before this call republishes it."""
+        return all(
+            self.graph.covered_many(
+                self.completion.query(uid, consumed, r, uid, republished, r + 1, minimum=1)
+                for r in range(self.graph.period)
+            )
+        )
 
 
 def _analyses(program):
@@ -338,16 +338,24 @@ def _install(program, access, protocols):
                 task.parent.insert_op_before(sync, task)
 
 
-def _leaf_banks(program, analyses):
+def _configuration_banks(program, analyses):
     used = defaultdict(set)
     for uid, analysis in analyses.items():
-        leaf, loop, channels = program.leaves[uid], analysis[0], analysis[1]
-        data = next(iter(loop.actors.values()))
-        tasks = {task.uid: task for task in data.program.tasks}
+        leaf = program.leaves[uid]
+        data = next(iter(analysis[0].actors.values()))
         if data.program.config:
             used[leaf.actor, "S", "FIX"].add(0)
         if data.program.load3d is not None:
             used[leaf.actor, "S", "MTE1"].add(0)
+    return used
+
+
+def _leaf_banks(program, analyses):
+    used = _configuration_banks(program, analyses)
+    for uid, analysis in analyses.items():
+        leaf, loop, channels = program.leaves[uid], analysis[0], analysis[1]
+        data = next(iter(loop.actors.values()))
+        tasks = {task.uid: task for task in data.program.tasks}
         for channel in channels.values():
             require(
                 channel.kind == "local" and not channel.carry,
@@ -364,6 +372,62 @@ def _leaf_banks(program, analyses):
             )
             used[key].update(channel.ids)
     return used
+
+
+def _allocate_child_resources(program, analyses, access, proof, selected):
+    """Extend a leaf's ID rotation only when its actual parent lifetime needs it.
+
+    Common valid plans reuse their existing projection and IDs. If a boundary
+    fails, all locally legal widths share one enlarged parent projection; no
+    native or synchronization instruction is added, moved, or removed.
+    """
+    valid = all(
+        proof.resource_covered(uid, consumed, republished)
+        for uid, consumed, republished, _ in proof.resource_pairs
+    )
+    if valid:
+        return proof, _leaf_banks(program, analyses)
+    choices = event_choices(program, analyses)
+    proof = ParentCompletion(
+        program, analyses, access, proof.graph.period, resource_inputs=resource_inputs(choices)
+    )
+    for protocol in selected:
+        proof.insert(protocol)
+    proof.graph.potential()
+    used = _configuration_banks(program, analyses)
+    for (uid, name), choice in choices.items():
+        poll("parent-aware child event allocation", call=uid, channel=name)
+        option = next(
+            (
+                option
+                for option in choice.options
+                if all(
+                    proof.resource_covered(
+                        uid, *resource_sites(uid, choice.bank[0], choice.count, resource)
+                    )
+                    for resource in option.resources
+                )
+            ),
+            None,
+        )
+        require(
+            option is not None,
+            f"{uid}/{name}: no child event width <=8 proves consumption before the next parent call Set",
+        )
+        free = [i for i in range(8) if i not in used[choice.bank]]
+        require(
+            len(free) >= option.width,
+            f"{choice.bank}: parent-aware child event pools exhaust 8 IDs",
+        )
+        ids = tuple(free[: option.width])
+        declaration = next(
+            op
+            for op in program.leaves[uid].stream.walk()
+            if isinstance(op, LoopChannelOp) and op.sym_name.data == name
+        )
+        declaration.attributes["event_ids"] = _ints(ids)
+        used[choice.bank].update(ids)
+    return proof, used
 
 
 @bounded
@@ -441,8 +505,11 @@ def autosync_scopes(module, *, _capture=None):
         )
         selected.append(p)
     proof.graph.potential()
-    proof.check_child_resources()
-    used, cross_id = _leaf_banks(program, analyses), 0
+    proof, used = _allocate_child_resources(program, analyses, access, proof, selected)
+    from .scope_event_pools import allocate_parent_pools
+
+    selected, _ = allocate_parent_pools(selected, proof, used)
+    cross_id = 0
     allocated = []
     for p in selected:
         if p.kind == "barrier":
@@ -452,31 +519,7 @@ def autosync_scopes(module, *, _capture=None):
             require(cross_id < 8, "nested CV counter bank exhausted")
             ids, cross_id = (cross_id,), cross_id + 1
         else:
-            actor = p.sources[0][0]
-            source, destination = (
-                proof.events[actor, p.name, "set"],
-                proof.events[actor, p.name, "wait"],
-            )
-            width = next(
-                (
-                    width
-                    for width in range(1, 9)
-                    if all(
-                        proof.graph.covered_many(
-                            (destination, r + p.distance, source, _successor(p, r, width, period))
-                            for r in range(period)
-                            if r % p.period in p.residues
-                        )
-                    )
-                ),
-                None,
-            )
-            require(width is not None, f"{p.name}: no proved parent binary event reuse width <=8")
-            key = actor, source.task.pipe, destination.task.pipe
-            free = [i for i in range(8) if i not in used[key]]
-            require(len(free) >= width, f"{key}: nested event bank exhausted")
-            ids = tuple(free[:width])
-            used[key].update(ids)
+            ids = p.ids
         allocated.append(replace(p, ids=ids))
     _install(program, access, allocated)
     return _finish(result, _capture=_capture)
@@ -489,7 +532,8 @@ def _read_protocols(program, access, analyses):
     tasks = {(a, t.uid): t for a, d in access.loop.actors.items() for t in d.program.tasks}
     channels, expected = {}, {}
     expected_order, actual_order = defaultdict(list), defaultdict(list)
-    used = _leaf_banks(program, analyses)
+    reserved = _leaf_banks(program, analyses)
+    used = defaultdict(set, {key: set(ids) for key, ids in reserved.items()})
     cross_ids = set()
     for op in program.module.walk():
         if not isinstance(op, ScopeChannelOp):
@@ -538,7 +582,7 @@ def _read_protocols(program, access, analyses):
             )
             key = sources[0][0], tasks[sources[0]].pipe, tasks[destinations[0]].pipe
             require(
-                not used[key].intersection(ids),
+                not reserved[key].intersection(ids),
                 "parent event overlaps a child/configuration resource",
             )
             used[key].update(ids)
@@ -656,8 +700,14 @@ def verify_scopes(module, *, _details=False):
             f"missing scoped {obligation.hazard}: {obligation.source} -> {obligation.destination}, "
             f"distance {obligation.distance} on {obligation.storage}[{obligation.start}:{obligation.stop}]",
         )
-    proof.check_child_resources()
-    _, counters, lifetimes = _lifetime(access.loop, channels, proof.graph, proof.events)
+    child_lifetimes = proof.check_child_resources()
+    from .scope_event_pools import verify_parent_pools
+
+    pool_statistics = {}
+    banks = verify_parent_pools(
+        channels.values(), proof, _leaf_banks(program, analyses), statistics=pool_statistics
+    )
+    _, counters, _ = _lifetime(access.loop, channels, proof.graph, proof.events, local=False)
     report = {
         "kernel": program.root.sym_name.data,
         "verification": "actual retained child proofs, parent physical frontiers, guarded completion, and event lifetimes",
@@ -673,7 +723,9 @@ def verify_scopes(module, *, _details=False):
         "parent_memory_obligations": len(access.obligations),
         "parent_access_visits": access.visits,
         "parent_channels": len(channels),
-        "parent_binary_lifetime_queries": lifetimes,
+        "parent_binary_lifetime_queries": pool_statistics["self_queries"],
+        "child_parent_lifetime_queries": child_lifetimes,
+        "parent_event_pool_proof": pool_statistics,
         "event_ids": {":".join(key): sorted(ids) for key, ids in banks.items()},
         "cross_counter_ids": sorted(counters),
         "progress_stride": potential[0],

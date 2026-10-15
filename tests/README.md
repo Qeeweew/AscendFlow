@@ -25,6 +25,7 @@ minimum/multiple从AST贯通launcher（CPU测试仅替换设备派发行）；
 | 最终 IR 验证 | `sync/test_plan_validation.py` | 删除/移动同步、错误时钟、event 冲突、伪造 ownership 后必须拒绝 |
 | 嵌套固定child | `test_scope_address.py`、`test_scope_access.py`、`test_scope_completion.py`、`test_scope_codegen.py` | 祖先地址别名、独立byte oracle、父子时钟、投影可达性与实际ASC |
 | 父同步负例 | `test_scope_protocol_review.py`、`test_scope_lifetimes.py` | 实际Wait顺序、event消费与FIFO、尚未支持的共享L0C独立生命周期 |
+| 事件池与实际指令模型 | `test_fixed_event_summary.py`、`test_scope_events.py`、`test_scope_event_pools.py`、`test_scope_event_device_model.py` | 固定通知ordinal、跨父消费、完整pool共享及逐字节/物理ID的独立有限检查 |
 | 独立有限执行模型 | `models/local_sequence.py` | 解释实际命令、逐字节 RAW/WAR/WAW、二值 event 覆盖和死锁 |
 
 ```bash
@@ -60,3 +61,7 @@ workspace槽、输入和guard。它没有FA或吞吐量性能结论。先检查�
 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --output runs/refactor/nested-cv/build --build
 ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --output runs/refactor/nested-cv/build --physical 6
 ```
+
+同一runner加`--entry nested_copy`可复现两个child共用UB时的事件池回归；产物应
+写入单独目录。`models/scoped_local.py`是独立的single-AIV有限指令模型，读取
+实际双时钟IR与物理ID配对，不导入生产完成关系/摘要/分配器；不宣称覆盖Cube/CV。

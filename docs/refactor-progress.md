@@ -11,7 +11,71 @@ tracer入口已删除；没有绕行内部构造器的兼容example。runtime BN
 一层固定child的嵌套CV已通过CANN与设备正确性；完整FA还受共享存储生命周期、
 first/last和多运行时钟限制，[计划](refactor-plan.md)规定其退出条件。
 
-## 当前推进：保留实际父子流水与跨核协议
+## 当前推进：跨父调用的事件宽度与安全池共享
+
+此前明确拒绝的`tests/fixtures/nested.py:nested_copy`现已通过公开DSL、CANN及
+设备正确性。它保留两个固定child、4个native模板、4个父channel、原来的128字节
+UB和全部搬运/同步位置；只改变已证明合法的event ID分配。
+
+- child的固定Set/Wait边界改用通知ordinal直接算first Set/last Wait，每个实际
+  使用的ID一条记录，不枚举child长度或整个period×width域。runtime与carried
+  invocation仍使用其原有合同。
+- 先检查现有ID的跨父调用寿命；只有失败时，才批量检查同一leaf图上的1..8种
+  硬件宽度，并为候选端点构建一次父投影，不逐候选重编译。两个ready child
+  都需要width=4，原来的2或3不足；增加ID不改变任何完成关系。
+- 若各parent channel独占pool，反向bank需要child的4个ID加parent的6个，共10。
+  两组ready/release通过实际消费路径共享width=2的pool后，parent只用4个ID，
+  反向bank恰好8个；正向bank也恰好8个。没有增加buffer、barrier或搬运。
+
+其中一组共享关系如下，`g`是父代次，子位置来自实际native前后：
+
+```text
+produce(g).store(j=2): Set c0, ID = 4 + g%2
+consume(g).load(j=0): Wait c0
+consume(g).store(j=2): Set c2, ID = 4 + g%2  // 仅g+2<N
+produce(g+2).load(j=0): Wait c2
+produce(g+2).store(j=2): 下一次Set c0
+```
+
+检查器从实际ID tuple重建每个channel的自复用证明及共享成员之间的Wait→Set
+证明。仅支持同bank、同period/residues、完整相同tuple的共享；部分重叠、tuple
+顺序不同、child/config冲突均拒绝。每个channel的自复用检查仍必需，因为尾部
+有些成员不再发送，不能用共享关系的真空覆盖代替收尾检查。
+分配采用有明确成本预算的确定性合并，不宣称全局最优，也不以ID相同制造顺序。
+
+独立有限模型直接解释实际Call/Capture及父子Set/Wait，覆盖N=0/1/2/3/7的字节
+依赖和真实物理ID消息配对；46项模型测试还覆盖旧width=2的event覆盖、错位
+共享ID、漏Wait、RAW/WAR/WAW与死锁。模型不导入生产完成图或分配器，不是任意N
+的形式化证明。设备使用物理6→逻辑0，一份binary在N=0/1/2/3/7/31/257各10次，
+Y/O与输入精确一致，guard不变；全卡状态已记录（物理2当时有其他进程）。
+源码→CANN/shared总构建6.671秒，受同一个300秒期限约束。
+
+最终相关回归435项通过（74.53秒）；五个独立冷进程的源码→ASC结果为：
+
+| 输入 | p50 / max | RSS峰值 |
+|---|---|---|
+| nested_copy | 1.3343 / 1.3421秒 | 39756 KiB |
+| 原nested_cv | 1.6814 / 1.7103秒 | 40956 KiB |
+
+原CV上阶段为1.6563/1.6663秒；本批不能据此宣称编译提速。两例均未达到常用
+内核p50≤1秒目标。冷计时在`cold-copy/`与`cold-cv/`，每个进程的最终compiler
+tree hash一致，ASC hash与设备所用CANN manifest一致。copy的ASC SHA256为
+`12207bdcbd46233172fa7d2a50f0192ea7e38bfbeac8eda8a1dadeef52d753e0`。
+
+证据在`runs/refactor/scoped-events/`，设备记录为
+`build/nested_copy/device/result.json`，ASC及同步前后IR同目录。复现：
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --entry nested_copy --output runs/refactor/scoped-events/build/nested_copy --build
+ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --entry nested_copy --output runs/refactor/scoped-events/build/nested_copy --physical 6
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/tests/fixtures/nested.py --entry nested_copy --output runs/refactor/scoped-events/cold-copy
+```
+
+这仍是编译器正确性闭环，没有FA或ACLNN吞吐量结论。原`nested_cv`的ASC与
+`4e23713`设备验证版本逐字节一致。单通知child每次调用都重启ordinal时，扩大
+inner宽度仍不能解决所有跨父复用；缺少消费路径的情况继续拒绝。
+
+## 已保存阶段 4e23713：保留实际父子流水与跨核协议
 
 公开`compile(prim_func)`已接入实际`CallOp`与`CaptureOp`，外层`Pipelined(n)`
 保持runtime参数，固定child保留独立时钟与native模板。capture只是原allocation
@@ -73,10 +137,10 @@ ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/pyt
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/tests/fixtures/nested.py --entry nested_cv --output runs/refactor/nested-cv/cold-release
 ```
 
-**尚未解决的两个具体反例：**
+**该阶段记录的两个具体反例：**
 
 - `nested_copy`的child本地event只按inner generation轮转；跨parent调用仍可能
-  在上次Wait前re-Set，当前拒绝。不能用新增buffer或child drain掩盖。
+  在上次Wait前re-Set；已在本页当前阶段通过宽度与事件池证明解决。
 - `shared_l0c_qk_pv`保留共享L0C，QK/PV操作数独立。现有logical frontier要求
   `PV(t).FIX → QK(t+1).MAD`，与显式`QK(t+1) → PV(t)`派发相冲突，当前报cycle。
   后续先固定逻辑RAW及RW recurrence，再对独立结果的物理生命周期推导复用；
@@ -217,7 +281,7 @@ AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是
 | INDEX | 原始轴SSA与受限runtime商余已贯通局部流水；runtime row pitch/多时钟动态stride仍拒绝 | 延伸同一范围/ownership合同，不把合法长度放入编译键 |
 | CV | `scope_lowering`已保留直接固定child与父代次capture；更深层、first/last和多时钟仍拒绝 | 从当前真实call继续扩展；完整 QK/softmax/PV/update 纵向闭环 |
 | MEMORY | cyclic局部不等长/空group已证明；共享 Q/K/V、间接地址及跨 child 复用仍不足 | 真实范围、有效域、最后读取和 owner 分区；buffer 分配/布局/可见性与同步一同验证 |
-| SYNC | runtime叶与直接固定child已有双AIV quorum；跨parent的leaf event轮转、独立定义复用和legacy候选试删仍待处理 | 共用硬件完成语义，分开物理访问与事件寿命；最终从实际 IR 检查，不能旁路或加任意 barrier |
+| SYNC | runtime叶与直接固定child已有双AIV quorum；已接跨parent事件宽度与parent池共享；更一般的parent epoch轮转、独立定义复用和legacy候选试删仍待处理 | 共用硬件完成语义，分开物理访问与事件寿命；最终从实际 IR 检查，不能旁路或加任意 barrier |
 | EFFECT | 细粒度 native 已能在最后 reader 后早 release，但主要使用 task end；SPR/入口协议另有特殊处理 | 明确每个 native 的读退休、写完成与配置资源合同；不能让高层 recipe 隐藏多个里程碑 |
 | EVENT | 已有有限表分段周期压缩和标准整数 pass；有限 ID 表仍随 generation 增长，runtime 跨 channel/region 共享不足 | 从符号寿命直接分配/表达 ID；化简不得改变配对、代次或等待位置 |
 | COMPILE | 查询域拓扑已共享；条件记录扫描、激活绑定、父层重复工作仍需测量 | 拒绝用结构改善代替真实耗时；事实成本和父层计数继续跟踪 |
