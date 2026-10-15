@@ -73,6 +73,11 @@ def runtime_work(module, arguments):
         result["region_tasks_per_group"] = {
             name: part["tasks_per_group"] for name, part in zip(checked.analyses, parts)
         }
+        if checked.sequence.invocation is not None:
+            result.pop("tasks_per_invocation")
+            result["region_tasks_per_invocation"] = {
+                name: part["tasks_per_invocation"] for name, part in zip(checked.analyses, parts)
+            }
         return result
     from .loop_sync import verify_loop
 

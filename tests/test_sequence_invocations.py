@@ -37,6 +37,10 @@ def test_parent_and_child_are_retained_and_zero_child_executes_init_use(artifact
         work = runtime_work(artifact.plan, {"outputs": calls, "tiles": count})
         assert work["native_invocations"]["copy"] == calls * (count + 2)
         assert work["native_invocations"]["add"] == calls * count
+        assert "tasks_per_invocation" not in work
+        assert work["invocations_per_group"] == calls
+        assert work["region_tasks_per_invocation"] == {"r0": 1, "r1": count, "r2": 1}
+        assert work["region_tasks_per_group"] == {"r0": calls, "r1": calls * count, "r2": calls}
         assert work["terminal_drains"] == 1
         assert work["sync_invocations"].get("wait:MTE2", 0) == calls * max(0, count - 2) + max(
             0, calls - 1

@@ -5,7 +5,8 @@
 [sequence_lowering](../src/xdsl_npu/sequence_lowering.py)、
 [sequence_sync](../src/xdsl_npu/sequence_sync.py)与
 [sequence_codegen](../src/xdsl_npu/sequence_codegen.py)。这是受限的根部组合，
-不是任意层次region闭包；serial父体和mixed层次组合仍未接通。
+不是任意层次region闭包。后续已接通严格frame下的serial父体init/多个child/use，
+见[跨调用同步与设备证据](runtime-sequence-calls.md)；mixed层次仍未接通。
 
 源码lowering现在使用[ActorBindings](../src/xdsl_npu/lowering_context.py)共享一个
 actor的物理Kernel、allocation身份和uniform表达式；各region直接写入同一IR，

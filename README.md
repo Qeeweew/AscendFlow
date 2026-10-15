@@ -23,6 +23,8 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 及独立AscendC/profile证据，历史冷源码→ASC p50约0.185秒。
 [父体init/child/use](examples/ast_grouped_state_sum.py)已接通严格frame子集，
 含多个child的21项回归及小设备对照通过，五次冷源码→ASC p50为0.8804秒。
+后续已完成[1GiB完整正确性和三批profile](docs/runtime-sequence-calls.md)：
+generated/独立AscendC批p50中位数为753.352/756.924μs，未观察到明显退化。
 一般GM ownership、跨region事件ID复用和mixed层次仍缺，不能由此推断FA达标。
 
 P1a已共享actor分配/标量绑定，并移除逐叶重复验证全IR的开销。同一32流静态

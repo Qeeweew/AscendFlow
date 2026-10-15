@@ -1,5 +1,15 @@
 # 重构的验证记录
 
+## G0收尾：父体1GiB设备与三批profile
+
+修复父体工作量继承首个once的错误聚合字段，按region报告每次调用/每group任务数。
+303项相关回归通过、Ruff通过，旧三个AST例及新父体ASC hash不变。
+1GiB固定例全部输出精确一致且输入/guard完好；同卡交替三批profile，generated
+批p50中位数753.352μs，独立AscendC756.924μs，比值0.99528，未观察到明显退化。
+同期非profile stream间隔单列，未混作kernel时间。详细IR、credit序列、命令、
+硬件工作量和证据限制见[父体组合闭环](runtime-sequence-calls.md)。
+G0已收尾；后面的2026-10-15设计重审条目保留当时尚未收尾的状态，不代表最新结果。
+
 ## 2026-10-15：设计重审与父体保存点 ed87249
 
 本轮按用户要求重写[设计](design.md)、[DSL规格](dsl-multistage.md)和

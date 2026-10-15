@@ -1,4 +1,4 @@
-"""Fixed-policy Vector recurrence: code-bound timing, work and hardware evidence."""
+"""Fixed-policy Vector recurrence, optionally repeated in a retained parent loop."""
 
 import argparse
 import hashlib
@@ -36,6 +36,7 @@ def main():
         )
         contract = (
             device["policy"],
+            case.get("outputs", 1),
             case["tiles"],
             case["input_sha256"],
             case["output_sha256"],
@@ -87,10 +88,12 @@ def main():
         n for key, n in work["memory_requested_bytes_by_pipe_bank_mode"].items() if ":UB:" in key
     )
     ops = work["vector_requested_elements"]["add"]
-    expected = device["policy"]["GROUPS"] * case["tiles"] * device["policy"]["B"]
+    outputs = case.get("outputs", 1)
+    expected = device["policy"]["GROUPS"] * outputs * case["tiles"] * device["policy"]["B"]
     require(ops == expected, "physical add work disagrees with the ordered recurrence")
     result = {
         "policy": device["policy"],
+        "outputs": outputs,
         "tiles": case["tiles"],
         "hardware": device["hardware"],
         "trials": trials,
