@@ -214,8 +214,16 @@ def _refs(op):
     if isinstance(op, ReduceOp):
         return op.source, op.scratch, op.destination
     if isinstance(op, ElementOp):
-        return (*op.inputs, op.destination)
+        return (*op.inputs, *((op.scratch,) if op.scratch is not None else ()), op.destination)
     return op.a, op.b, op.accumulator
+
+
+def _native_input_index(op, index):
+    if isinstance(op, MatmulOp) and op.a.type.memory.data == "L1" and index < 2:
+        return 0  # Each input is read by a separate Load2D.
+    if isinstance(op, ElementOp) and op.kind.data.endswith("_rows") and index == 1:
+        return 0  # The row statistic's last reader is BRCB, not the arithmetic.
+    return index
 
 
 def _root(value):
@@ -655,7 +663,29 @@ class _Actor:
                     "sqrt": "sqrt",
                     "rsqrt": "rsqrt",
                     "div": "div",
+                    "maximum": "max",
                 }.get(op.kind.data)
+                if op.kind.data.endswith("_rows"):
+                    require(op.scratch is not None, "row broadcast requires scratch")
+                    rows, cols = shape(op.destination)
+                    source, statistic, destination = (
+                        self.view(value, record) for value in (*op.inputs, op.destination)
+                    )
+                    temporary = self.view(op.scratch, record)
+                    task("_broadcast", "brcb8", statistic, temporary, params=(rows,))
+                    task(
+                        "_" + op.kind.data,
+                        op.kind.data.removesuffix("_rows") + "_row_broadcast",
+                        source,
+                        temporary,
+                        destination,
+                        params=(rows, cols),
+                        order_delta=1,
+                    )
+                    self.definitions[number] = uid + "_" + op.kind.data
+                    self.readers[number, 0] = self.definitions[number]
+                    self.readers[number, 1] = uid + "_broadcast"
+                    continue
                 if op.kind.data == "cast":
                     require(len(op.inputs) == 1, "cast takes one source tile")
                     source_dtype, destination_dtype = (
@@ -697,7 +727,9 @@ class _Actor:
                 )
                 task(
                     "_merge",
-                    "merge_" + op.kind.data,
+                    "merge_"
+                    + op.kind.data
+                    + ("_packed" if op.order.data == "r64_then_packed_merge" else ""),
                     temporary,
                     destination,
                     params=(rows, cols // 64),
@@ -863,13 +895,7 @@ def _check_values(physical, actors, outer):
                 read_uid = lowering.readers[number, read_index]
                 task_index = indices[actor][read_uid]
                 read_task = programs[actor].tasks[task_index]
-                native_index = (
-                    0
-                    if isinstance(record.op, MatmulOp)
-                    and record.op.a.type.memory.data == "L1"
-                    and read_index < 2
-                    else read_index
-                )
+                native_index = _native_input_index(record.op, read_index)
                 ref = read_task.refs[native_index]
                 for generation in range(programs[actor].count):
                     expected = (
@@ -924,13 +950,7 @@ def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=()):
                 index = input_index.data
                 read_uid = lowering.readers[number, index]
                 task = tasks[read_uid]
-                native_index = (
-                    0
-                    if isinstance(record.op, MatmulOp)
-                    and record.op.a.type.memory.data == "L1"
-                    and index < 2
-                    else index
-                )
+                native_index = _native_input_index(record.op, index)
                 ref = task.refs[native_index]
                 root_name = loop.root(owner, ref)
                 for r in range(loop.storage_periods[root_name]):

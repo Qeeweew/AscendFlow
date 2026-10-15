@@ -23,6 +23,19 @@
 
 ## 无设备验证
 
+新增AST softmax复用normalization入口：
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.normalization.run --operator softmax --output runs/softmax --build
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.normalization.run --operator softmax --output runs/softmax --physical 1 --rows 1024 --variant all --warmup 5 --repeats 30
+```
+
+第二条须先检查所有卡并选择空闲健康卡；物理1仅示例。shape为32768×1024 f32，
+`--rows` 是每group行数；`--variant all` 包含独立AscendC和安装版ACLNN。
+zero/短循环使用 `--variant both --rows 0 8 16 24`，同一binary无需重新编译。
+三批profile可用下文通用包装器，并以 `benchmarks.normalization.analyze ...
+--variants generated ascendc aclnn` 汇总。完整证据见[Vector算子验证](../docs/vector-row-performance.md)。
+
 ```bash
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/state/frame_snapshot.py --entry frame_state_sum --trials 5 --output runs/cleanup/cold
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run_grouped --frame-snapshot --output runs/cleanup/frame --build

@@ -403,6 +403,14 @@ class _View:
 
     def __getitem__(self, indices):
         indices = indices if isinstance(indices, tuple) else (indices,)
+        if any(index is None for index in indices):
+            require(
+                indices[-1] is None and sum(index is None for index in indices) == 1,
+                "broadcast supports only one trailing new axis",
+            )
+            source = self[indices[:-1]]
+            require(len(source.shape) == 1, "row broadcast requires one packed vector")
+            return _RowBroadcast(source)
         require(len(indices) <= len(self.shape), "too many tensor axes")
         indices += (slice(None),) * (len(self.shape) - len(indices))
         shape, strides, offset = [], [], self.offset
@@ -517,6 +525,23 @@ class _Value:
     @property
     def shape(self):
         return self.view.shape
+
+    def __getitem__(self, indices):
+        require(
+            isinstance(indices, tuple)
+            and len(indices) == 2
+            and isinstance(indices[0], slice)
+            and indices[0] == slice(None)
+            and indices[1] is None
+            and len(self.shape) == 1,
+            "tile values support only [:, None]; slice the physical view explicitly",
+        )
+        return _RowBroadcast(self)
+
+
+@dataclass(frozen=True)
+class _RowBroadcast:
+    source: object
 
 
 def _view(value):
@@ -920,11 +945,18 @@ def copy(source, destination, *, valid=None, transpose=False):
     return _Value(dst, op.value)
 
 
-def _element(kind, values, out, scalar=None, valid=None):
+def _element(kind, values, out, scalar=None, valid=None, scratch=None):
     dst, inputs = _view(out).bound(), [_view(value) for value in values]
     require(dst.buffer.op.access.data != "read", "arithmetic cannot write a read-only tensor")
+    if not kind.endswith("_rows"):
+        require(
+            all(v.shape == dst.shape for v in inputs),
+            "elementwise operands require equal tile shape",
+        )
+    temporary = None if scratch is None else _view(scratch).bound()
     require(
-        all(v.shape == dst.shape for v in inputs), "elementwise operands require equal tile shape"
+        temporary is None or temporary.buffer.op.access.data != "read",
+        "broadcast scratch must be writable",
     )
     if kind != "cast":
         require(
@@ -935,7 +967,12 @@ def _element(kind, values, out, scalar=None, valid=None):
     if scalar is not None:
         attrs["scalar"] = FloatAttr(round_f32(scalar), ir_f32)
     op = ElementOp.build(
-        operands=[[v.emit(valid) for v in inputs], dst.emit(valid), _deps(values)],
+        operands=[
+            [v.emit(valid) for v in inputs],
+            dst.emit(valid),
+            _deps(values),
+            None if temporary is None else temporary.emit(),
+        ],
         result_types=[_tile(dst)],
         attributes=attrs,
     )
@@ -944,7 +981,16 @@ def _element(kind, values, out, scalar=None, valid=None):
     return _Value(dst, op.value)
 
 
-def mul(lhs, rhs, *, out, valid=None):
+def _rows(kind, lhs, rhs, out, scratch):
+    require(scratch is not None, "row broadcast needs explicit scratch=(rows,8) UB storage")
+    return _element(kind + "_rows", [lhs, rhs.source], out, scratch=scratch)
+
+
+def mul(lhs, rhs, *, out, valid=None, scratch=None):
+    if isinstance(rhs, _RowBroadcast):
+        require(valid is None, "masked row broadcast is not implemented")
+        return _rows("mul", lhs, rhs, out, scratch)
+    require(scratch is None, "scratch requires a row broadcast operand")
     if isinstance(rhs, _Scalar):
         require(valid is None, "masked captured-scalar multiplication is not implemented")
         src, dst = _view(lhs), _view(out).bound()
@@ -972,8 +1018,15 @@ def add(lhs, rhs, *, out):
     )
 
 
-def sub(lhs, rhs, *, out):
+def sub(lhs, rhs, *, out, scratch=None):
+    if isinstance(rhs, _RowBroadcast):
+        return _rows("sub", lhs, rhs, out, scratch)
+    require(scratch is None, "scratch requires a row broadcast operand")
     return _element("sub", [lhs, rhs], out)
+
+
+def maximum(lhs, rhs, *, out):
+    return _element("maximum", [lhs, rhs], out)
 
 
 def exp(source, *, out):
@@ -988,7 +1041,10 @@ def rsqrt(source, *, out):
     return _element("rsqrt", [source], out)
 
 
-def div(lhs, rhs, *, out):
+def div(lhs, rhs, *, out, scratch=None):
+    if isinstance(rhs, _RowBroadcast):
+        return _rows("div", lhs, rhs, out, scratch)
+    require(scratch is None, "scratch requires a row broadcast operand")
     return _element("div", [lhs, rhs], out)
 
 

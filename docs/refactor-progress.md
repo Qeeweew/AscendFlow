@@ -4,6 +4,12 @@
 大规模设备证据。[同步已知问题](sync-known-issues.md)记录最新符号迁移保存点。
 下文直接生成与首尾窗口计数属于 `20b4869` 基线，不代表当前工作树仍使用窗口。
 
+新DSL已接通packed行归约、maximum和带显式scratch的行广播，新增examples
+softmax。32768×1024 f32三批profile：generated217.914μs、AscendC240.054μs、
+ACLNN284.696μs；已有8192×4096 RMS normalization：218.346/235.884μs。
+均有全输出检查，政策、限制、复现和硬件分析见[Vector算子验证](vector-row-performance.md)。
+完整新AST FA仍未贯通。以下保留直接生成基线的实现记录。
+
 更新：2026-10-15。直接生成迁移以 `61c5d06` / `760278f` 为审查基线。
 **叶流水已删除候选路线搜索；层次状态压缩、一般nested CV和完整AST FA尚未完成。**
 当前路线见[计划](refactor-plan.md)，算法与复杂度见[设计](design.md)。

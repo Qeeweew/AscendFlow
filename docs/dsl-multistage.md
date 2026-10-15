@@ -142,5 +142,34 @@ FA 保持 FP32 m/l/O、p32 denominator、P RN、CK 累计、rescale/add 和最�
 边界。改变逻辑 BK、reduce 树或融合运算属于算法/数值变化，不能当同步优化。
 宏未来仅做透明 AST 内联，scratch/effects 可见，内部普通循环仍保留。
 
+## 已接通的 FA Vector 基元
+
+[softmax](../examples/normalization/softmax.py) 是可编译运行的新 AST 示例，
+使用同一个 runtime `tiles` binary、显式双缓冲和三阶段流水：
+
+```python
+maximum = T.reduce_max(x, axis=1, out=statistic, scratch=partial[:, :D//64],
+                       order="r64_then_packed_merge")
+T.sub(x, maximum[:, None], out=y, scratch=broadcast)
+T.exp(y, out=y)
+total = T.reduce_sum(y, axis=1, out=statistic, scratch=partial[:, :D//64],
+                     order="r64_then_packed_merge")
+T.div(y, total[:, None], out=y, scratch=broadcast)
+```
+
+`packed_merge` 把每行统计写到紧凑的 `(R,)` 向量，归约依次是R64部分结果和
+原生merge；partial每行的物理stride必须32字节对齐，例子显式分配padding再取view。
+`[:, None]` 表示行广播意图，不分配完整矩阵。`sub/mul/div` 要求显式 `(R,8)`
+f32 UB scratch，lowering生成BRCB和行算术两个有真实effects的操作。
+统计量的最后reader是BRCB，scratch的最后reader是后续算术；仍检查旧借用值
+被覆盖的问题。没有Vector→Scalar的GetValue或由编译器分配的广播tensor。
+
+当前广播要求R为8的倍数、完整连续f32 UB行、64对齐列数且不超过1024；
+还需满足每AIV的192KiB容量。`T.maximum(a,b,out=c)` 已接通相同shape的f32
+Vector max。`from_source` 同时识别 `T` 和 `N` 两个DSL命名空间。
+
+这些基元不会自动接通完整online FA：runtime BNSD地址、多时钟和一般nested
+CV仍受前述边界限制。性能与复现见[Vector算子验证](vector-row-performance.md)。
+
 报错要区分非法、不支持和预算未决，并带源位置、两端代次、字节范围与分析阶段。
 新 AST 不静默 fallback 到 legacy、裸 ASC 或整算子 CANN 调用。

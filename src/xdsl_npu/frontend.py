@@ -48,6 +48,7 @@ _CALLS = {
     "mul",
     "add",
     "sub",
+    "maximum",
     "exp",
     "cast",
     "fill",
@@ -145,9 +146,9 @@ def from_source(source, *, constants=None, filename="<dsl>", disjoint_external=F
     """Parse explicit source; this function does not use exec/eval or import it."""
     require(type(source) is str, "DSL source must be a string")
     require(type(disjoint_external) is bool, "disjoint_external must be a boolean contract")
-    environment = {"N": N}
+    environment = {"N": N, "T": N}
     for name, value in (constants or {}).items():
-        require(name != "N" and name.isidentifier(), "invalid captured constant name")
+        require(name not in {"N", "T"} and name.isidentifier(), "invalid captured constant name")
         environment[name] = _constant(value)
     return PrimFunction(
         textwrap.dedent(source), filename, 1, MappingProxyType(environment), disjoint_external

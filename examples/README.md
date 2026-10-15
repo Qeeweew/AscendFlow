@@ -11,6 +11,7 @@
 | [vector/prefix.py](vector/prefix.py) | 两长度、对齐有效前缀 | `benchmarks.vector.run_prefix` |
 | [vector/independent_rings.py](vector/independent_rings.py) | 独立输入/输出槽位周期 | `benchmarks.vector.run_rings` |
 | [normalization/rms_norm.py](normalization/rms_norm.py) | 归约、Scalar 最后读取 | `benchmarks.normalization.run` |
+| [normalization/softmax.py](normalization/softmax.py) | packed行统计、显式广播scratch、Vector三阶段 | 同上，加 `--operator softmax` |
 | [gemm/batched.py](gemm/batched.py) | L1/L0/MAD/FIX 多缓冲 | `benchmarks.gemm.run` |
 | [gemm/reduction.py](gemm/reduction.py) | runtime K 归约 | `benchmarks.gemm.run_reduction` |
 | [gemm/hierarchical.py](gemm/hierarchical.py) | 串行 output × K pipeline | `benchmarks.gemm.run_hierarchical` |

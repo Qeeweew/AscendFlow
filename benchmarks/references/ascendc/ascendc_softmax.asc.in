@@ -1,0 +1,92 @@
+// Independent AscendC: R64 partials, packed row statistics, BRCB and FP32 Div.
+#include "kernel_operator.h"
+#include <cstdint>
+using namespace AscendC;
+
+namespace {
+constexpr int R = @R@, D = @D@, P = D / 64, TILE = R * D;
+constexpr int PP = (P + 7) / 8 * 8;
+template<ReduceType KIND>
+__aicore__ inline void ReduceRows(LocalTensor<float> out, LocalTensor<float> in,
+                                  LocalTensor<float> partial) {
+  if constexpr(P == PP && R*P <= 255) {
+    ReduceRepeat<KIND>(partial, in, 64, R*P, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+  } else {
+    for (int r = 0; r < R; ++r)
+      ReduceRepeat<KIND>(partial[r*PP], in[r*D], 64, P, 1, 1, 8,
+                         ReduceOrder::ORDER_ONLY_VALUE);
+  }
+  PipeBarrier<PIPE_V>();
+  ReduceRepeat<KIND>(out, partial, P, R, 1, 1, PP/8, ReduceOrder::ORDER_ONLY_VALUE);
+}
+template<bool SUBTRACT>
+__aicore__ inline void RowBinary(LocalTensor<float> out, LocalTensor<float> in,
+                                 LocalTensor<float> broadcast) {
+  BinaryRepeatParams p(1,1,0,8,8,0);
+  for (int r = 0; r < R; ++r) {
+    if constexpr(SUBTRACT) Sub(out[r*D], in[r*D], broadcast[r*8], 64, D/64, p);
+    else Div(out[r*D], in[r*D], broadcast[r*8], 64, D/64, p);
+  }
+}
+}
+
+extern "C" __global__ __vector__ void softmax_reference(
+    __gm__ uint8_t* X, __gm__ uint8_t* Y, int64_t tiles) {
+  set_ctrl(get_ctrl() | (uint64_t(1) << 48));
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> storage;
+  pipe.InitBuffer(storage, (4*TILE + R*PP + R + R*8)*4);
+  auto local = storage.Get<float>();
+  auto partial = local[4*TILE];
+  auto statistic = local[4*TILE + R*PP];
+  auto broadcast = local[4*TILE + R*PP + R];
+  GlobalTensor<float> input, output;
+  input.SetGlobalBuffer((__gm__ float*)X);
+  output.SetGlobalBuffer((__gm__ float*)Y);
+  const int64_t base = int64_t(GetBlockIdx()) * tiles * TILE;
+  for (int64_t step = 0; step < tiles + 2; ++step) {
+    if (step >= 2 && step - 2 < tiles) {
+      const int64_t g = step - 2;
+      const auto id = event_t(g % 2);
+      WaitFlag<HardEvent::V_MTE3>(id);
+      DataCopy(output[base+g*TILE], local[2*TILE+(g%2)*TILE], TILE);
+      if (g+2 < tiles) SetFlag<HardEvent::MTE3_V>(id);
+    }
+    if (step < tiles) {
+      const auto id = event_t(step % 2);
+      if (step >= 2) WaitFlag<HardEvent::V_MTE2>(id);
+      DataCopy(local[(step%2)*TILE], input[base+step*TILE], TILE);
+      SetFlag<HardEvent::MTE2_V>(id);
+    }
+    if (step >= 1 && step - 1 < tiles) {
+      const int64_t g = step - 1;
+      const auto id = event_t(g % 2);
+      auto x = local[(g%2)*TILE];
+      auto y = local[2*TILE+(g%2)*TILE];
+      WaitFlag<HardEvent::MTE2_V>(id);
+      ReduceRows<ReduceType::MAX>(statistic,x,partial);
+      PipeBarrier<PIPE_V>();
+      Brcb(broadcast,statistic,R/8,BrcbRepeatParams(1,8));
+      PipeBarrier<PIPE_V>();
+      if (g >= 2) WaitFlag<HardEvent::MTE3_V>(id);
+      RowBinary<true>(y,x,broadcast);
+      if (g+2 < tiles) SetFlag<HardEvent::V_MTE2>(id);
+      PipeBarrier<PIPE_V>();
+      Exp(y,y,TILE);
+      PipeBarrier<PIPE_V>();
+      ReduceRows<ReduceType::SUM>(statistic,y,partial);
+      PipeBarrier<PIPE_V>();
+      Brcb(broadcast,statistic,R/8,BrcbRepeatParams(1,8));
+      PipeBarrier<PIPE_V>();
+      RowBinary<false>(y,y,broadcast);
+      SetFlag<HardEvent::V_MTE3>(id);
+    }
+  }
+  PipeBarrier<PIPE_ALL>();
+}
+
+extern "C" int launch_softmax_reference(void* stream, void* X, void* Y, int64_t tiles) {
+  if (tiles < 0 || tiles > (INT64_MAX - 64) / (@GROUPS@*TILE*4)) return -1;
+  softmax_reference<<<@GROUPS@, nullptr, stream>>>((uint8_t*)X, (uint8_t*)Y, tiles);
+  return 0;
+}

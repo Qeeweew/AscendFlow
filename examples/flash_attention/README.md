@@ -14,3 +14,7 @@
 下一部分先迁移完整固定政策 FA，再逐项验收 f16/bf16、MHA/GQA/MQA、
 prefill/decode、causal/非方形/tails；varlen/paged/sparse/persistent 需要额外
 ownership/descriptor 合同。不会靠目录名或空接口宣称变体已完成。
+
+新DSL的packed行归约、maximum、带scratch的行广播已经接通，并用于
+[softmax示例](../normalization/softmax.py)。它验证FA所需的Vector基元；
+完整online softmax的状态、QK/PV及nested CV仍待接通。

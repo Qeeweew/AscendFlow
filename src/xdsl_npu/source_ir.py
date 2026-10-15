@@ -376,7 +376,9 @@ class CopyOp(IRDLOperation):
         ):
             raise VerifyException("transposed copy requires a complete L1→L0B matrix")
         expected = (
-            ArrayAttr(reversed(self.source.type.shape.data)) if transpose else self.source.type.shape
+            ArrayAttr(reversed(self.source.type.shape.data))
+            if transpose
+            else self.source.type.shape
         )
         if (
             expected != self.destination.type.shape
@@ -391,6 +393,7 @@ class ElementOp(IRDLOperation):
     inputs = var_operand_def(TensorType)
     destination = operand_def(TensorType)
     dependencies = var_operand_def(TileType)
+    scratch = opt_operand_def(TensorType)
     dependency_inputs = attr_def(ArrayAttr[IntAttr])
     kind = attr_def(StringAttr)
     scalar = opt_attr_def(FloatAttr[f32])
@@ -413,10 +416,35 @@ class ElementOp(IRDLOperation):
             "add": 2,
             "sub": 2,
             "div": 2,
+            "maximum": 2,
+            "mul_rows": 2,
+            "sub_rows": 2,
+            "div_rows": 2,
         }
         if self.kind.data not in arity or len(self.inputs) != arity[self.kind.data]:
             raise VerifyException("unknown element operation or incorrect operand count")
-        if any(v.type.shape != self.destination.type.shape for v in self.inputs):
+        if self.kind.data.endswith("_rows"):
+            shape = tuple(n.data for n in self.destination.type.shape)
+            if (
+                len(shape) != 2
+                or not 8 <= shape[0] <= 248
+                or shape[0] % 8
+                or self.inputs[0].type.shape != self.destination.type.shape
+                or tuple(n.data for n in self.inputs[1].type.shape) != (shape[0],)
+                or self.scratch is None
+                or tuple(n.data for n in self.scratch.type.shape) != (shape[0], 8)
+            ):
+                raise VerifyException(
+                    "row broadcast needs a matrix, packed row values and explicit (rows,8) scratch; rows must be a multiple of eight"
+                )
+            if any(
+                v.type.memory.data != "UB" or v.type.dtype.data != "f32"
+                for v in (*self.inputs, self.destination, self.scratch)
+            ):
+                raise VerifyException("row broadcast requires f32 UB views")
+        elif self.scratch is not None:
+            raise VerifyException("only row broadcast arithmetic uses scratch")
+        elif any(v.type.shape != self.destination.type.shape for v in self.inputs):
             raise VerifyException("element operands require equal tile shape")
         if (self.kind.data in {"fill", "mul_scalar", "add_scalar"}) != (self.scalar is not None):
             raise VerifyException("scalar policy must match element operation")
@@ -449,13 +477,21 @@ class ReduceOp(IRDLOperation):
         cols = shape[-1]
         if cols < 64 or cols > 4096 or cols % 64:
             raise VerifyException("reduction needs 64-aligned columns in [64,4096]")
-        if tuple(n.data for n in self.scratch.type.shape) != (*shape[:-1], cols // 64) or tuple(
-            n.data for n in self.destination.type.shape
-        ) != (*shape[:-1], 1):
+        packed = self.order.data == "r64_then_packed_merge"
+        result_shape = shape[:-1] if packed else (*shape[:-1], 1)
+        if packed and len(shape) != 2:
+            raise VerifyException("packed reduction requires a matrix")
+        if (
+            tuple(n.data for n in self.scratch.type.shape) != (*shape[:-1], cols // 64)
+            or tuple(n.data for n in self.destination.type.shape) != result_shape
+        ):
             raise VerifyException(
                 "reduction scratch/result must expose exact partial/statistic shapes"
             )
-        if self.kind.data not in {"sum", "max"} or self.order.data != "r64_then_native_merge":
+        if self.kind.data not in {"sum", "max"} or self.order.data not in {
+            "r64_then_native_merge",
+            "r64_then_packed_merge",
+        }:
             raise VerifyException("reduction requires an explicit supported order")
         if any(
             v.type.memory.data != "UB" or v.type.dtype.data != "f32"
