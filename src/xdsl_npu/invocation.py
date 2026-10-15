@@ -101,8 +101,8 @@ def extract_invocation(kernel, uniform_values, *, sequence=False):
         bool(streams) if sequence else len(streams) == 1,
         "each invocation requires its actual retained execution regions",
     )
-    roots = {op for op in kernel.body.block.ops if isinstance(op, BufferOp) and op.external.data}
-    require(used == roots, "every invocation GM root requires an explicit frame")
+    # Unframed roots may be shared inputs. Native effect extraction separately
+    # requires initialized reads and forbids raw aliases of an existing frame.
     return Invocation(parent, bound, tuple(frames))
 
 

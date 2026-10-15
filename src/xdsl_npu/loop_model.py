@@ -101,9 +101,14 @@ class Loop:
     def groups(self):
         return optional_int(self.op.blocks, 1)
 
-    @property
-    def access_groups(self):
-        return 1 if self.invocation is not None else self.groups
+    def access_groups(self, storage):
+        """Frame coordinates are stripped; shared inputs retain real groups."""
+        return (
+            1
+            if self.invocation is not None
+            and any(frame.name == storage.name for frame in self.invocation.frames)
+            else self.groups
+        )
 
     def root(self, actor, ref):
         return ref.storage.name if ref.storage.external else actor + "/" + ref.storage.name
@@ -374,21 +379,29 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 all(ref in views for ref in operands), "native operands need physical bounded views"
             )
             refs = tuple(views[ref] for ref in operands)
-            if invocation is not None:
-                require(
-                    all(
-                        not ref.storage.external
-                        or ref.storage.name in {frame.name for frame in invocation.frames}
-                        for ref in refs
-                    ),
-                    "invocation native GM access must use its checked frame",
-                )
             params = tuple(value.data for value in op.params)
             require(
                 not isinstance(stream, OnceOp) or op.stage.data == 0,
                 "ordinary block operations cannot have a pipeline stage offset",
             )
             pipe, modes = native_contract(op.native.data, refs, params)
+            if invocation is not None:
+                frames = {frame.name for frame in invocation.frames}
+                framed_roots = {frame.root.sym_name.data for frame in invocation.frames}
+                require(
+                    all(
+                        not ref.storage.external
+                        or ref.storage.name in frames
+                        or (
+                            ref.storage.name not in framed_roots
+                            and mode == "R"
+                            and ref.storage.initialized
+                        )
+                        for ref, mode in zip(refs, modes)
+                    ),
+                    "unframed invocation GM must be initialized and read-only; "
+                    "native accesses to a framed root must use its checked frame",
+                )
             require(
                 0 <= op.stage.data <= 32 and 0 <= optional_int(op.logical_phase, 0) <= 255,
                 "invalid stage/phase",
@@ -692,7 +705,7 @@ def _check_prefixes(loop, all_views):
             )
             if ref.storage.external:
                 require(
-                    loop.access_groups == 1
+                    loop.access_groups(ref.storage) == 1
                     and not ref.core_terms
                     and not ref.count_core_stride
                     and not ref.count_offset
@@ -751,6 +764,7 @@ def _check_accesses(loop, all_views):
         poll("physical access validation", root=root, views=len(refs))
         period = loop.storage_periods[root]
         storage = refs[0].storage
+        groups = loop.access_groups(storage)
         drift = {slope(ref) for ref in refs}
         if root in writes and storage.external and any(drift):
             require(
@@ -767,10 +781,9 @@ def _check_accesses(loop, all_views):
                     f"{root}: unclipped stream requires its actual loop extent",
                 )
                 require(
-                    storage.count_scale == loop.access_groups * frame
+                    storage.count_scale == groups * frame
                     and all(
-                        ref.count_core_stride
-                        in ({0, frame} if loop.access_groups == 1 else {frame})
+                        ref.count_core_stride in ({0, frame} if groups == 1 else {frame})
                         and ref.count_offset == 0
                         and not ref.core_terms
                         for ref in refs
@@ -783,9 +796,7 @@ def _check_accesses(loop, all_views):
                     f"{root}: unbounded stream exceeds its fixed allocation",
                 )
                 translations = {
-                    tuple(
-                        ref.address(0, core) - ref.address(0) for core in range(loop.access_groups)
-                    )
+                    tuple(ref.address(0, core) - ref.address(0) for core in range(groups))
                     for ref in refs
                 }
                 require(
@@ -802,7 +813,7 @@ def _check_accesses(loop, all_views):
                 f"{root}: ring ownership cannot depend on stream length",
             )
             shifts = {
-                tuple(ref.address(0, core) - ref.address(0) for core in range(loop.access_groups))
+                tuple(ref.address(0, core) - ref.address(0) for core in range(groups))
                 for ref in refs
             }
             require(len(shifts) == 1, f"{root}: ring translations disagree")
@@ -812,7 +823,7 @@ def _check_accesses(loop, all_views):
             verify_translated_owners(
                 refs,
                 [(root, lo, hi, "RW") for lo, hi in used],
-                loop.access_groups,
+                groups,
                 translation_error="ring group translations disagree",
                 overlap_error="cross-group ring ownership overlap",
             )
@@ -823,7 +834,7 @@ def _check_accesses(loop, all_views):
             )
             itemsize = ITEMSIZE[ref.dtype]
             require(ref.nbytes % itemsize == 0, "view extent does not match its dtype")
-            for core in range(loop.access_groups if storage.external else 1):
+            for core in range(groups if storage.external else 1):
                 coefficient = ref.count_offset + ref.count_core_stride * core
                 for r in range(period):
                     parts = ref.segments(r, core)
@@ -883,7 +894,9 @@ def _check_accesses(loop, all_views):
                     all(
                         ranges_cover(parent.segments(r, core), ref.segments(r, core))
                         for r in range(period)
-                        for core in range(loop.access_groups if ref.storage.external else 1)
+                        for core in range(
+                            loop.access_groups(ref.storage) if ref.storage.external else 1
+                        )
                     ),
                     "nested view exceeds actual parent rows/holes",
                 )
@@ -896,7 +909,9 @@ def _check_accesses(loop, all_views):
                     and all(
                         lo % alignment == 0
                         for r in range(period)
-                        for core in range(loop.access_groups if ref.storage.external else 1)
+                        for core in range(
+                            loop.access_groups(ref.storage) if ref.storage.external else 1
+                        )
                         for lo, _ in ref.segments(r, core)
                     ),
                     f"{task.uid}: native origin alignment violated",

@@ -65,7 +65,7 @@ def scalar(value, n, calls):
     return scalar(op.lhs, n, calls) * scalar(op.rhs, n, calls)
 
 
-def cells(value, g, n, *, call=0, calls=1):
+def cells(value, g, n, *, call=0, calls=1, group=0):
     view = value.owner
     assert isinstance(view, ViewOp)
     root = view.source.owner
@@ -79,16 +79,30 @@ def cells(value, g, n, *, call=0, calls=1):
     for term in view.index_terms or ():
         coefficient, divisor, modulus = [v.data for v in term]
         address += coefficient * ((g // divisor) % modulus if modulus else g // divisor)
+    core = group // view.core_divisor.data
+    address += view.core_stride.data * (
+        core % view.core_modulus.data if view.core_modulus.data else core
+    )
+    for term in view.core_terms or ():
+        coefficient, divisor, modulus = [v.data for v in term]
+        address += coefficient * ((group // divisor) % modulus if modulus else group // divisor)
     address += (0 if view.count_offset is None else view.count_offset.data) * n
+    address += (0 if view.count_core_stride is None else view.count_core_stride.data) * n * group
     if frame is not None:
-        address += call * scalar(frame.extent, n, calls) * frame.scale.data
+        address += (group * calls + call) * scalar(frame.extent, n, calls) * frame.scale.data
+    extent = (
+        root.nbytes.data
+        if root.extent_count is None
+        else scalar(root.extent_count, n, calls) * root.count_scale.data
+    )
     for row in range(1 if view.rows is None else view.rows.data):
         start = address + row * (0 if view.row_stride is None else view.row_stride.data)
         for byte in range(start, start + view.nbytes.data):
+            assert 0 <= byte < extent, f"{root.sym_name.data}: actual native byte out of bounds"
             yield root, byte
 
 
-def finite_check(plan, n, *, invocations=1):
+def finite_check(plan, n, *, invocations=1, group=0):
     regions = physical_regions(plan)
     boundary = {o.sym_name.data: o for o in plan.walk() if isinstance(o, RegionChannelOp)}
     ids, edges = {}, []
@@ -269,7 +283,9 @@ def finite_check(plan, n, *, invocations=1):
                 }[task.native.data]
                 touched = {}
                 for value, mode in zip(task.refs, modes):
-                    for byte in cells(value, g, counts[region], call=call, calls=invocations):
+                    for byte in cells(
+                        value, g, counts[region], call=call, calls=invocations, group=group
+                    ):
                         touched.setdefault(byte, set()).update(mode)
                 key = call, region, g, task
                 for byte, mode in touched.items():

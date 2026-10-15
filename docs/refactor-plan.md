@@ -57,7 +57,8 @@ P2b/P3b→G3；P4→G4；P5→G5。未迁移的 GDN snapshot 切片保留为 G2/
 ## 3. G1：公共区域合同，用替换验证重构
 
 进度：源码结构准入和actor构造已收敛到共同`region_lowering`，代表例ASC不变；
-旧物理证明适配器仍保留，边界/ownership及多参数扩展尚未完成。证据见
+旧物理证明适配器仍保留；共享只读GM及其真实group范围检查已接通，跨region
+可写ownership、共同边界及多参数扩展尚未完成。证据见
 [G1记录](refactor-progress.md)。以下表格仍是整个G1的退出要求。
 
 目标只覆盖现有能力加真实 FA 必需的局部组合，不做一般整数求解器。

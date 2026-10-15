@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from ast_grouped_state_sum import grouped_state_sum
+from ast_shared_state_sum import shared_state_sum
 from run_state_sum import inputs_and_oracle
 
 from xdsl_npu import compile
@@ -16,14 +17,23 @@ from xdsl_npu.performance import hardware_snapshot, runtime_work
 from xdsl_npu.toolchain import offline_compile
 
 
-def reference_source(tile, groups):
-    return (
+def reference_source(tile, groups, *, shared_inputs=False):
+    source = (
         Path(__file__)
         .with_name("ascendc_grouped_state.asc.in")
         .read_text()
         .replace("@B@", str(tile))
         .replace("@GROUPS@", str(groups))
     )
+    if shared_inputs:
+        # Change only the independently handwritten GM input bases. The output
+        # still has a distinct frame per call; storage and issue policy agree.
+        for pointer in ("initial", "input"):
+            before = f"(__gm__ float*){pointer} + (int64_t(GetBlockIdx()) * outputs + call)"
+            require(source.count(before) == 1, "reference input base changed")
+            source = source.replace(before, f"(__gm__ float*){pointer} + int64_t(GetBlockIdx())")
+        source = source.replace("grouped_state_reference", "shared_state_reference")
+    return source
 
 
 def main():
@@ -38,6 +48,7 @@ def main():
     )
     parser.add_argument("--variant", choices=["generated", "ascendc", "both"], default="both")
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--shared-inputs", action="store_true")
     parser.add_argument("--physical", type=int)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
@@ -58,15 +69,20 @@ def main():
         all(
             len(case) == 2
             and all(0 <= v <= 65536 for v in case)
-            and args.groups * case[0] * case[1] * args.tile * 4 <= 4 * 1024**3
+            and args.groups * (1 if args.shared_inputs else case[0]) * case[1] * args.tile * 4
+            <= 4 * 1024**3
             for case in cases
         ),
         "validation cases require nonnegative bounded counts and at most 4 GiB input each",
     )
-    artifact = compile(grouped_state_sum.specialize(B=args.tile, GROUPS=args.groups))
+    definition = shared_state_sum if args.shared_inputs else grouped_state_sum
+    artifact = compile(definition.specialize(B=args.tile, GROUPS=args.groups))
     sources = {
         "generated": (artifact.name, artifact.asc),
-        "ascendc": ("grouped_state_reference", reference_source(args.tile, args.groups)),
+        "ascendc": (
+            "shared_state_reference" if args.shared_inputs else "grouped_state_reference",
+            reference_source(args.tile, args.groups, shared_inputs=args.shared_inputs),
+        ),
     }
     variants = list(sources) if args.variant == "both" else [args.variant]
     if args.build or args.physical is None:
@@ -106,9 +122,16 @@ def main():
                 [] if args.skip_rounding_case else [(3, 2, True)]
             ):
                 initial, x, expected = inputs_and_oracle(
-                    args.groups * calls, tiles, args.tile, rounding=rounding
+                    args.groups * (1 if args.shared_inputs else calls),
+                    tiles,
+                    args.tile,
+                    rounding=rounding,
                 )
-                expected = expected.reshape(args.groups, calls, args.tile)
+                expected = (
+                    np.repeat(expected[:, None, :], calls, axis=1)
+                    if args.shared_inputs
+                    else expected.reshape(args.groups, calls, args.tile)
+                )
                 guard = b"\x5a" * 512
                 original = b"\xcd" * expected.nbytes + guard
                 initial, x = initial + guard, x + guard
@@ -164,7 +187,11 @@ def main():
                     "repeats": args.repeats,
                     "stream_interval_us": elapsed.value * 1000 / args.repeats,
                     "timing_scope": "ACL stream interval including host gaps; not kernel-only",
-                    "cache_policy": "same group/call/tiles-major buffers reused, no flush",
+                    "cache_policy": (
+                        "same group/tiles-major read-only inputs shared across calls; buffers reused, no flush"
+                        if args.shared_inputs
+                        else "same group/call/tiles-major buffers reused, no flush"
+                    ),
                     "input_sha256": [hashlib.sha256(v).hexdigest() for v in (initial, x)],
                     "output_sha256": hashlib.sha256(raw).hexdigest(),
                     "requested_work": runtime_work(
@@ -183,7 +210,11 @@ def main():
     output.write_text(
         json.dumps(
             {
-                "policy": {"B": args.tile, "GROUPS": args.groups},
+                "policy": {
+                    "B": args.tile,
+                    "GROUPS": args.groups,
+                    **({"shared_inputs": True} if args.shared_inputs else {}),
+                },
                 "health": health,
                 "hardware": hardware,
                 "variants": manifests,

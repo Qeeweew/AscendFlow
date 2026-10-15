@@ -66,7 +66,8 @@ tiles 份 Python 对象。一般尾部要明确 valid/padding；已有对齐 pre
 真实初始化、循环、导出见 [state_sum](../examples/ast_state_sum.py)；两个 runtime
 轴见 [grouped_state_sum](../examples/ast_grouped_state_sum.py)：父循环内初始化，
 子流水累加，最后导出。child=0 仍执行初始化和导出；parent=0 不执行 body。
-当前父体要求严格 GM frame，不代表所有共享输入均已支持。
+当前父体可写GM要求严格 frame，实际只读输入可跨调用共享，见
+[共享输入合同](shared-invocation-inputs.md)；一般多参数/间接访问仍未支持。
 
 ## 3. Stage 的精确定义
 

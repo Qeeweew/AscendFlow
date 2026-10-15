@@ -1,5 +1,17 @@
 # 重构的验证记录
 
+## G1共享只读GM：实际effects与完整group域
+
+父调用可重读无frame的初始化GM；每条native effect必须为R，禁止无frame写及
+绕过已存在frame的raw访问。group范围改为逐storage判断，保留共享输入的实际
+group坐标，修复直接放宽frame限制会漏掉后续group越界的问题。
+[shared_state_sum](../examples/ast_shared_state_sum.py)有12项专用回归及235项相关
+回归；大例共享X本身1GiB，16次调用全部输出精确正确。三批kernel中位数
+generated11284.756μs、AscendC11286.864μs，比值0.999813，未见明显退化。
+五次冷源码→ASC p50约0.864s。完整合同、反例、硬件账本和复现见
+[共享输入](shared-invocation-inputs.md)。一般多参数GM地址、跨sibling可写frame、
+共同物理边界、层次CV仍待接通，G1及整体重构仍未完成。
+
 ## G1第一步：统一源码区域入口
 
 删除`needs_sequence/lower_sequence`及`lower_source`中的独立父体/单流actor构造，

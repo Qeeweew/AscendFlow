@@ -216,6 +216,9 @@ B1/H32/S8192/D128 dense 的 Cube-only 下界约3.728ms。这不含 Vector/搬运
 | 跨 region ID 复用、一般层次 CV、规则 task/query 时钟 | 未接通；legacy mixed 不等于新 AST 支持 |
 | AST 宏、新 AST 完整 FA、真编译缓存 | 待实现；fixture 和独立参考不算迁移完成 |
 
+此表保留设计保存点的状态。后续G1已统一源码区域入口，并接通
+[跨父调用共享只读GM](shared-invocation-inputs.md)；最新结果见验证记录。
+
 保存点不代表本轮全量回归或新例大性能验收，父体 aggregate 工作量字段也有
 待清理项。更广反例持续覆盖 normalization/RoPE 的 scratch/多 reader、MoE 的
 间接 ownership/早 release、GMM/量化/FFN 的空组与联合发布、GDN carry/snapshot、

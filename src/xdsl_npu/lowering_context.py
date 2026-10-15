@@ -119,17 +119,24 @@ class ActorBindings:
                 count_scale=size if dynamic else 0,
             )
             if invocation is not None and external:
-                require(
-                    len(dimensions) >= 3, "invocation GM shape needs group/invocation/frame axes"
-                )
                 values = dict(zip((d.data for d in allocation.dynamic_axes), allocation.dimensions))
-                parent_extent = from_ssa(values[1]) if 1 in values else literal(dimensions[1])
-                require(
-                    dimensions[0] == program.groups.data
-                    and parent_extent == from_ssa(invocation.ub)
-                    and all(i in {1, 2} for i in values),
-                    "invocation tensors need leading [group, invocation] axes and bounded frame dimensions",
+                parent_extent = (
+                    from_ssa(values[1])
+                    if 1 in values
+                    else literal(dimensions[1])
+                    if len(dimensions) > 1
+                    else None
                 )
+                if not (
+                    len(dimensions) >= 3
+                    and dimensions[0] == program.groups.data
+                    and parent_extent == from_ssa(invocation.ub)
+                    and all(i in {1, 2} for i in values)
+                ):
+                    # Unpartitioned inputs keep their real group coordinates.
+                    # Physical extraction checks EVERY native effect is a read;
+                    # initialized/access annotations alone do not prove that.
+                    continue
                 extent = from_ssa(values[2]) if 2 in values else literal(1)
                 require(
                     2 not in values

@@ -30,6 +30,8 @@ generated/独立AscendC批p50中位数为753.352/756.924μs，未观察到明显
 G1已将单流、父体、顺序组合和mixed单流的源码准入/actor构造统一到
 [region_lowering](src/xdsl_npu/region_lowering.py)，四个代表例ASC保持一致。
 物理边界和ownership继续收敛中，完整层次CV尚未接通。
+[跨父调用共享只读GM](docs/shared-invocation-inputs.md)也已接通：实际effects只读
+检查及完整group边界验证，1GiB共享输入的设备/AscendC/profile闭环通过。
 
 P1a已共享actor分配/标量绑定，并移除逐叶重复验证全IR的开销。同一32流静态
 压力样本的完整冷源码→ASC p50从2.188秒降到0.773秒，最终ASC和验证报告保持
@@ -181,7 +183,7 @@ AST 路径支持多个非负 uniform 参数及 min/max/ceildiv 上界；对齐�
 单独 AIV 和共同有效前缀。单actor末代effect后缀已接通；一般分支与嵌套循环
 保留为IR；目前接通单local actor的serial父循环×一个pipeline子循环，以及
 根部单actor普通工作与流水的顺序组合。父体init/多个child/use已接通严格frame
-子集；无frame共享GM、跨sibling写同frame及mixed层次仍拒绝；
+子集及无frame只读共享GM；无frame写、跨sibling写同frame及mixed层次仍拒绝；
 legacy 静态内层仍有展开。两条路径的准确边界见[重构记录](docs/refactor-progress.md)。
 
 | 能力 | 实际支持 |

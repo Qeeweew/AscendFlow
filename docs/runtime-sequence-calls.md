@@ -58,8 +58,9 @@ kernel exit: Pipe(ALL)
   native工作。父次数为0/1/2、子为空/短于ring/跨ring都有对应激活路径。
 
 生产分析只用符号相邻调用p/p+1，不展开outputs或tiles。最后writer及所有pending
-readers保留真实root，GM frame跨调用独占。尚不支持无frame共享GM、跨sibling写
-同frame、不同child runtime bound或mixed层次。叶入口假设在最终组合重新检查。
+readers保留真实root，GM frame跨调用独占。后续G1已接通
+[无frame只读共享GM](shared-invocation-inputs.md)；跨sibling写同frame、不同child
+runtime bound或mixed层次仍不支持。叶入口假设在最终组合重新检查。
 
 ## 验证
 
