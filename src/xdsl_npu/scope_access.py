@@ -8,6 +8,7 @@ the original BufferOp, including private buffers shared by sibling calls.
 
 from dataclasses import dataclass, replace
 from math import lcm
+from typing import TYPE_CHECKING
 
 from xdsl.ir import SSAValue
 
@@ -29,6 +30,9 @@ from .region_summary import Access, RegionSummary, summarize_fixed_storage
 from .scalar import facts_from_sizes, from_ssa
 from .scope_model import ScopedProgram
 
+if TYPE_CHECKING:
+    from .scope_query_access import QueryAccessMap
+
 MAX_SCOPE_ACCESS_SEGMENTS = 1_000_000
 MAX_SCOPE_ACCESS_VISITS = 1_000_000
 
@@ -46,6 +50,7 @@ class ScopeAccess:
     capture_roots: dict
     definition_roots: frozenset[str]
     lifetime_report: dict | None = None
+    query: "QueryAccessMap | None" = None
 
 
 def _coordinate(atom):
@@ -145,6 +150,11 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
     strides and mixed parent/core atoms fail explicitly.
     """
     require(isinstance(program, ScopedProgram), "scope accesses need an extracted ScopedProgram")
+    query = None
+    if program.invocations:
+        from .scope_query_access import normalize_query_access
+
+        query = normalize_query_access(program)
     facts = facts_from_sizes(program.parameters)
     uniforms = {size.value: from_ssa(size.value, facts=facts) for size in program.parameters}
     for parent in program.parents.values():
@@ -172,6 +182,8 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
                 uniforms[root.extent_count] = from_ssa(root.extent_count, facts=facts)
             storage = _storage(root, program.parents[leaf.actor].limit, uniforms)
             name = storage.name if storage.external else leaf.actor + "/" + storage.name
+            if query is not None:
+                storage = query.storages.get((leaf.actor, name), storage)
             require(
                 name not in origins or origins[name] is root.ref,
                 "scope root name loses actual allocation identity",
@@ -180,7 +192,8 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
             if storage.external:
                 roots[name] = root
             storages[leaf.actor, name] = storage
-            offset = _offset(capture.offset, program.bound, facts, external=storage.external)
+            actual_offset = capture.offset if query is None else query.offsets[uid, name]
+            offset = _offset(actual_offset, program.bound, facts, external=storage.external)
             alias = (
                 capture.op.sym_name.data
                 if storage.external
@@ -436,4 +449,5 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
         by_root,
         {key: item[0] for key, item in captures.items()},
         definition_roots,
+        query=query,
     )

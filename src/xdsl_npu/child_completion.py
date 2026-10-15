@@ -9,7 +9,7 @@ captured facts on its own pipe, not completion of the child as a whole.
 from dataclasses import dataclass
 
 from .budget import poll
-from .completion import Position, Site, covers
+from .completion import Position, Site
 from .completion_flow import ALL
 from .model import require
 from .native_order import prefix_inputs
@@ -69,6 +69,51 @@ class FixedChildProjection:
             "relations": len(self.relations),
             **dict(self.fact_statistics),
         }
+
+
+def _fixed_origins(flow, node, point):
+    """Read every covered origin once at one constant, unconditional point.
+
+    This specialization belongs to the fixed-child construction below. Its
+    native horizons, port links and seed points are constants; every seed and
+    arc has guard ALL. Propagation therefore retains constant intervals with
+    guard ALL, so interval membership suffices for each fact's entire mask.
+    Parent count-conditioned facts do not satisfy this contract.
+    """
+    family = flow.families[node]
+    require(
+        point[0] == family.horizon[0] == 0 and (family.last is None or family.last[0] == 0),
+        "fixed child coverage requires constant points and family bounds",
+    )
+    if family.residue_guard(point) is None:
+        return 0
+    result = 0
+    for (lo, hi, guard), bits in flow.facts.get(node, {}).items():
+        require(
+            lo[0] == hi[0] == 0 and guard == ALL,
+            "fixed child coverage requires constant intervals and unconditional facts",
+        )
+        if lo[1] <= point[1] <= hi[1]:
+            result |= bits
+    return result
+
+
+def _fixed_relations(flow, sources, targets, bindings):
+    covered, relations = {}, set()
+    for index, target in enumerate(targets):
+        if index % 128 == 0:
+            poll("fixed child endpoint coverage", target=index, sources=len(sources))
+        binding = bindings[target]
+        if binding not in covered:
+            covered[binding] = _fixed_origins(flow, *binding)
+        bits = covered[binding]
+        while bits:
+            bit = bits & -bits
+            bits ^= bit
+            source = sources[bit.bit_length() - 1]
+            if source != target:
+                relations.add((source, target))
+    return frozenset(relations)
 
 
 def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
@@ -273,18 +318,13 @@ def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
         node, point = bindings[source]
         flow.seed(node, point, ALL, 1 << bit)
     flow.propagate()
-    relations = set()
-    for bit, source in enumerate(sources):
-        poll("fixed child endpoint coverage", source=bit, targets=len(targets))
-        for target in targets:
-            if source != target and covers(ALL, flow.coverage(*bindings[target], 1 << bit, ALL)):
-                relations.add((source, target))
+    relations = _fixed_relations(flow, sources, targets, bindings)
     return FixedChildProjection(
         count,
         tuple(inputs),
         tuple(outputs),
         endpoints,
-        frozenset(relations),
+        relations,
         len(flow.families),
         flow.edge_count,
         sum(command.kind == "task" for sequence in streams.values() for command in sequence),

@@ -13,7 +13,65 @@ tracer入口已删除；没有绕行内部构造器的兼容example。runtime BN
 保留query/KV/child时钟的物理IR。**跨query内存与event寿命尚未证明，完整FA
 仍不能生成可执行ASC**，[计划](refactor-plan.md)规定其退出条件。
 
-## 本轮：真实 FA 的三个时钟与 UB 原样复制
+## 当前：query 地址证明、完成关系组合与编译开销
+
+单 query 的访问分析现直接读取真实 Capture/native effects，进入原有 parent
+规划与检查。按同一物理 root 的全部 actor/首末分支分类：只读且已初始化的 GM、
+cyclic query 独占输出、全局 epoch 环，以及原位复用的存储。分析中的地址归一化
+不改实际 Capture、GM ABI、私有容量或布局；环保留真实
+`(query*kv_tiles)%slots` 相位。当前仅接纳 cyclic query，普通 uniform query
+在这一步明确拒绝。Q/K/V 的只读性来自全 root 实际 effects，不能由参数名推断。
+
+两个真实 IR 反例已固定：Score reader 改为 `(epoch+query)%2` 虽然仍能通过
+物理范围提取，但相位证明拒绝；把末次 O 写入重绑定到 K 后，全 root 扫描发现
+隐藏写入，不再允许只读归一化。地址 oracle 检查奇偶 KV、空 owner、不等长 owner
+及 native 行片段，不能把它当作同步证明。
+
+内部 `_plan_scope_parent` / `_verify_scope_parent` 与普通公开编译共用同一实现。
+小型 mixed recurrence 已通过单 query 的实际协议生成与复核；返回报告明确标记
+`cross_query_verified=false`。autosync、专家物理验证及 ASC 门禁仍保留。
+外层完成关系适配器复用原来的硬件拓扑和符号求解器，按静态份数连接各 actor/pipe
+实际出口到入口；保留 inactive call 的透明 prefix，绝不把 child exit 当完成。
+它只查询完成关系，尚未生成跨 query 协议或验证外层事件配对和进展。
+
+两槽环在 KV=1 时隔两个 query 才复用同一槽，不能只看相邻 query；静态三份
+拓扑的测试覆盖该距离，生产算法尚需从真实槽周期及未触及字节的 identity transfer
+推导边界。只在首次 KV 写入的 qa 还需保留所有 KV/chunk reader span；末次 O
+store 的 state 读取和旧 Wait 消费也各有独立义务。缺少投影的真实端点会报错，
+不会因没有节点而声称已经完成。
+
+真实原 FA 的单 query 规划和独立复核现已通过。首次构建约76秒触发原2M
+传播工作量上限。一次诊断复现记录：4236节点/6285边、575候选、534 origins、
+254次传播、2000180次边传递、约1988万次事实比较；新增边 replay 只有1774次。
+主因是逐候选加入少量 origin 后重复传播，不是运行长度展开。候选、child event
+和不同bank的最小width现批量登记，逐边选择、case覆盖与最终验证保留；没有提高
+预算。fixed child另将逐source/target重复扫描改为每个真实target一次求origin
+mask，保留完整relations及不同Site身份。无需actor重命名时直接复用projection。
+
+最终同一原FA源码到单query实际IR规划累计52.59秒，独立复核后累计84.74秒；
+watchdog覆盖的进程总时间86.50秒。保持72个native模板、12个call、11个父协议，
+最终图4303节点/6503边，复核623168次传播。该阶段优化前后生成的parent-only IR
+SHA256完全相同。这里只是单次构建证据，仍远未达到完整FA的5秒目标，没有ASC。
+证据位于外层 `runs/refactor/query-sync/parent-final/`；这些 parent-only IR
+不能用于设备执行。较早失败及逐flow诊断也保留，不用成功的小例覆盖真实失败。
+
+最终相关集成回归 **597项通过，111.22秒**，包含实际IR破坏、固定child/条件
+关系差分、独立有限query执行图、地址别名与事件复用。此有界检查不等于任意规模
+形式化证明。五个已有设备证据的fixture重新生成ASC，均与原设备源逐字节一致：
+ub_copy、native_guarded_recurrence、nested_copy、nested_cv、shared_l0c_qk_pv。
+没有重新运行设备，也没有给FA借用这些成绩。Ruff/格式/diff检查通过。
+
+在工作区根目录可复现本层检查：
+
+```bash
+.venv/bin/python -m pytest -q compiler/tests/test_scope_query_access.py compiler/tests/test_scope_query_completion.py compiler/tests/test_scope_query_parent.py
+```
+
+尚无本阶段完整 FA ASC、CANN、设备正确性或性能结果。下一步完成外层
+memory/event 边界与实际同步，
+之后才迁入可运行 examples 和进行大规模 AscendC/ACLNN/profile 对比。
+
+## 已保存阶段 2fcceee：真实 FA 的三个时钟与 UB 原样复制
 
 原[FA主体](design/attention_target.py.in)未改。现在source→physical路径保留
 20组AIC/双AIV、12个call、72个native模板及原始buffer、数学运算和排步。

@@ -9,7 +9,8 @@ from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.child_completion import ChildPort, project_fixed_child
-from xdsl_npu.completion import Position, Site
+from xdsl_npu.completion import CountDomain, Position, Site, covers
+from xdsl_npu.completion_flow import ALL
 from xdsl_npu.ir import LoopSyncOp, TaskOp, dump
 from xdsl_npu.loop_graph import Command, Graph
 from xdsl_npu.loop_sync import verify_loop
@@ -17,6 +18,7 @@ from xdsl_npu.mixed import compose
 from xdsl_npu.model import CompileError
 from xdsl_npu.native_order import instruction_points
 from xdsl_npu.sequence_sync import verify_sequence
+from xdsl_npu.symbolic_completion import Family, SymbolicCompletion
 
 
 def checked(module):
@@ -647,3 +649,154 @@ def test_ambiguous_barrier_command_cuts_are_rejected(barrier_child):
     native = next(c for c in analysis[2][actor] if c.kind == "task")
     endpoint = command_site(native, 1, "prefix")
     assert project_fixed_child(analysis, (endpoint,), insertion_cuts=True).endpoints == (endpoint,)
+
+
+def _literal_projection_relations(flow, sources, targets, bindings):
+    """Finite native-instance BFS, independent of stored completion facts."""
+    instances = {
+        (node, generation)
+        for node, family in enumerate(flow.families)
+        for generation in range(family.lower, family.horizon[1] + 1)
+        if generation % family.period == family.residue
+        and (family.last is None or generation == family.last[1])
+    }
+    following = defaultdict(set)
+    for node, generation in instances:
+        family = flow.families[node]
+        if family.monotone and (node, generation + family.period) in instances:
+            following[node, generation].add((node, generation + family.period))
+        for target, shift, source_point, target_point, guard in flow.edges[node]:
+            assert guard == ALL
+            if source_point is None:
+                destination = target, generation + shift
+            elif generation == source_point[1]:
+                assert source_point[0] == target_point[0] == 0
+                destination = target, target_point[1]
+            else:
+                continue
+            if destination in instances:
+                following[node, generation].add(destination)
+    result = set()
+    for source in sources:
+        node, point = bindings[source]
+        assert point[0] == 0
+        seen, pending = {(node, point[1])}, [(node, point[1])]
+        while pending:
+            for destination in following[pending.pop()]:
+                if destination not in seen:
+                    seen.add(destination)
+                    pending.append(destination)
+        for target in targets:
+            node, point = bindings[target]
+            if source != target and (node, point[1]) in seen:
+                result.add((source, target))
+    return frozenset(result)
+
+
+@pytest.mark.parametrize("fixture", ("one_copy", "cube", "barrier_child", "mixed_child"))
+@pytest.mark.parametrize("insertion_cuts", (False, True))
+def test_complete_relation_set_matches_literal_paths_and_scans_each_target_binding_once(
+    request, fixture, insertion_cuts, monkeypatch
+):
+    import xdsl_npu.child_completion as child
+
+    _, analysis = request.getfixturevalue(fixture)
+    count = analysis[0].constant_count
+    endpoints = []
+    for sequence in analysis[2].values():
+        for command in sequence:
+            generation = count - 1 - command.upper
+            if generation < command.lower or generation % command.period not in command.residues:
+                continue
+            if command.last_gap is not None and generation != count - 1 - command.last_gap:
+                continue
+            points = ("begin", "end", "prefix") if command.kind == "task" else ("begin", "end")
+            if insertion_cuts:
+                points += ("issue", "queue", "admit_issue", "admit_queue")
+                if command.kind == "task":
+                    points += ("after_queue",)
+            for point in points:
+                site = command_site(command, generation, point)
+                endpoints.append(site)
+                if point == "begin":
+                    endpoints.append(replace(site, position=Position(True, count - 1 - generation)))
+
+    class TargetReads(dict):
+        reads = 0
+        records = 0
+
+        def get(self, key, default=None):
+            facts = super().get(key, default)
+            self.reads += 1
+            self.records += len(facts)
+            return facts
+
+    original = child._fixed_relations
+    measured = []
+
+    def checked_relations(flow, sources, targets, bindings):
+        facts = flow.facts
+        flow.facts = counted = TargetReads(facts)
+        try:
+            result = original(flow, sources, targets, bindings)
+        finally:
+            flow.facts = facts
+        unique = {bindings[target] for target in targets}
+        assert counted.reads == len(unique)
+        assert counted.records == sum(len(facts.get(node, {})) for node, _ in unique)
+        # Retain the exact previous all-count coverage oracle as well as an
+        # independent instance graph. Every Site alias remains a separate pair.
+        expected = frozenset(
+            (source, target)
+            for bit, source in enumerate(sources)
+            for target in targets
+            if source != target and covers(ALL, flow.coverage(*bindings[target], 1 << bit, ALL))
+        )
+        assert result == expected == _literal_projection_relations(flow, sources, targets, bindings)
+        old_reads = sum(source != target for source in sources for target in targets)
+        assert counted.reads < old_reads
+        assert len(unique) < len(targets)  # Constant and end-relative Site aliases.
+        measured.append((len(result), counted.reads, old_reads))
+        return result
+
+    monkeypatch.setattr(child, "_fixed_relations", checked_relations)
+    projection = project_fixed_child(analysis, endpoints, insertion_cuts=insertion_cuts)
+    assert measured and measured[0][0] == len(projection.relations)
+    assert projection.endpoints == tuple(endpoints)
+    assert all(source != target for source, target in projection.relations)
+
+
+def test_fixed_projection_does_not_query_each_source_bit_again(one_copy, monkeypatch):
+    _, analysis = one_copy
+    actor = next(iter(analysis[2]))
+    command = next(command for command in analysis[2][actor] if command.kind == "task")
+    endpoints = tuple(command_site(command, 0, point) for point in ("begin", "end", "prefix"))
+
+    def no_pairwise_coverage(*args, **kwargs):
+        pytest.fail("fixed projection rescanned target facts for one source bit")
+
+    monkeypatch.setattr(SymbolicCompletion, "coverage", no_pairwise_coverage)
+    projection = project_fixed_child(analysis, endpoints, insertion_cuts=True)
+    assert projection.reaches(endpoints[0], endpoints[1])
+
+
+@pytest.mark.parametrize("guard", (CountDomain(1, 0, exact=1), CountDomain(2, 0, minimum=0)))
+def test_fixed_origin_masks_reject_parent_count_conditioned_facts(guard):
+    from xdsl_npu.child_completion import _fixed_origins
+
+    flow = SymbolicCompletion()
+    node = flow.node(Family(0, (0, 0)))
+    flow.seed(node, (0, 0), guard, 1)
+    flow.propagate()
+    with pytest.raises(CompileError, match="unconditional facts"):
+        _fixed_origins(flow, node, (0, 0))
+
+
+@pytest.mark.parametrize("point,horizon", (((1, -1), (0, 3)), ((0, 0), (1, -1))))
+def test_fixed_origin_masks_reject_unresolved_parent_points_and_horizons(point, horizon):
+    from xdsl_npu.child_completion import _fixed_origins
+
+    flow = SymbolicCompletion()
+    node = flow.node(Family(0, horizon))
+    with pytest.raises(CompileError, match="constant points and family bounds"):
+        _fixed_origins(flow, node, point)

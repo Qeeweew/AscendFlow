@@ -109,12 +109,18 @@ query tile 分给20组已经产生12/13差异，不能追加长度整除组数�
    `ceildiv(max(0,total_queries-group),groups)`域；覆盖12/13次与零工作owner。
    KV保持uniform runtime bound，三块GM双槽和local状态跨query复用同一root。
    这些域不自动证明GM写入不别名；最终ownership仍须进入同步分析。
-3. **下一步：**按实际capture区分Q/O的query tile、K/V的共享只读head映射、
-   stationary私有状态与Score/P/PV/alpha的全局epoch环。环相位是
-   `(query*kv_tiles)%2`，不得改成每query重置槽位。先在冻结query的KV域内
-   证明真实访问，再将query尾的全部最后读取、退休和旧Wait消费投影到下query
-   的重写/初始化与新Set；复用现有符号完成关系与原生端点，不插query drain。
-4. 同结构mixed递推已经通过source顺序数值/地址及实际物理IR时钟负测；下一步
+3. **地址分类已接线，跨query证明未完成：**实际全root effects区分只读Q/K/V、
+   O的cyclic query frame、stationary私有状态与Score/P/PV/alpha的全局epoch环。
+   原Capture和buffer不变；归一化只供单query访问分析，相位
+   `(query*kv_tiles)%2`作为真实合同保留。小型mixed recurrence和原FA均通过
+   单query规划与复核。通过批量登记真实候选/资源查询消除了本次2M工作量失败，
+   没有提高上限；原FA该阶段仍需约85秒，尚未达到编译耗时目标。
+4. **跨query下一步：**从实际字节frontier保留首次覆盖、全部最后reader、旧Wait
+   消费和未触字节的identity transfer。KV=1两槽环会隔两个query复用；证明范围
+   按静态槽周期确定，不按query数量展开。仅首KV写入的cache需完整reader span。
+   在同一ParentCompletion投影实际边界端点，再验证/生成所缺的memory与event
+   协议；adapter不能替代协议物化、有限资源、双AIV参与或进展检查。不插query drain。
+5. 同结构mixed递推已经通过source顺序数值/地址及实际物理IR时钟负测；下一步
    补跨query的独立有限同步模型→ASC/CANN→设备
    闭环，覆盖query=0/1/2/3和KV=1/2/3、漏一方AIV及错clock/root；随后用原FA
    source验证下一具体阻塞。小反例不代替FA数值或性能验收。

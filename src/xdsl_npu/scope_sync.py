@@ -148,6 +148,8 @@ class ParentCompletion:
                     if site.task[1] in natives and (not site.channel or site.channel in analysis[1])
                 )
                 projection = project_fixed_child(analysis, local, insertion_cuts=True)
+                if local_actor == leaf.actor:
+                    return projection
                 renamed = {
                     point: (
                         replace(point, actor=leaf.actor)
@@ -467,75 +469,86 @@ class ParentCompletion:
                     self.completion.edge(source, (target[0], generation // self.graph.period))
 
     def check_child_resources(self):
-        if any(leaf.cases for leaf in self.program.leaves.values()):
-            for uid, consumed, republished, resource in self.resource_pairs:
-                require(
-                    self.resource_covered(uid, consumed, republished),
-                    f"{uid}/{resource.channel}: conditional child event {resource.event_id} may be re-Set before its previous Wait",
-                )
-            return len(self.resource_pairs) * self.graph.period
-        if self.node_activations:
-            answers = self.guarded().covered_many(
-                (
-                    self.completion.commands[uid, consumed],
-                    self.completion.commands[uid, republished],
-                    1,
-                    legacy_activation(1),
-                )
-                for uid, consumed, republished, _ in self.resource_pairs
-            )
-            for (uid, _, _, resource), valid in zip(self.resource_pairs, answers, strict=True):
-                require(
-                    valid,
-                    f"{uid}/{resource.channel}: child event {resource.event_id} may be re-Set before its previous parent call Wait",
-                )
-            return len(self.resource_pairs) * self.graph.period
-        queries = 0
-        for uid, consumed, republished, resource in self.resource_pairs:
+        conditional = any(leaf.cases for leaf in self.program.leaves.values())
+        answers = self.resource_covered_many(
+            (uid, consumed, republished) for uid, consumed, republished, _ in self.resource_pairs
+        )
+        for (uid, _, _, resource), valid in zip(self.resource_pairs, answers, strict=True):
             poll("child event reuse verification")
             require(
-                self.resource_covered(uid, consumed, republished),
-                f"{uid}/{resource.channel}: child event {resource.event_id} may be re-Set before its previous parent call Wait",
+                valid,
+                (
+                    f"{uid}/{resource.channel}: conditional child event {resource.event_id} may be re-Set before its previous Wait"
+                    if conditional
+                    else f"{uid}/{resource.channel}: child event {resource.event_id} may be re-Set before its previous parent call Wait"
+                ),
             )
-            queries += self.graph.period
-        return queries
+        return len(self.resource_pairs) * self.graph.period
 
     def resource_covered(self, uid, consumed, republished):
         """A selected ID's final Wait is consumed before this call republishes it."""
+        return self.resource_covered_many(((uid, consumed, republished),))[0]
+
+    def resource_covered_many(self, resources):
+        """Seed every real resource/case before shared completion propagation.
+
+        Conditional children also need their actual first-to-last reuse path:
+        an interior invocation can omit the channel entirely. Keep that check
+        per resource and per native case, while registering its origins once
+        for the whole resource batch. Neither protocol placement nor IDs change.
+        """
+        resources = tuple(resources)
+        if not resources:
+            return []
+        groups, queries = [], []
         if self.node_activations:
             from .completion import CountDomain, Position
 
-            pairs = tuple(
-                (a, b)
-                for a in self.completion.commands_for(uid, consumed)
-                for b in self.completion.commands_for(uid, republished)
-            )
-            if not all(
-                self.guarded().covered_many((a, b, 1, legacy_activation(1)) for a, b in pairs)
-            ):
-                return False
-            if self.program.leaves[uid].cases:
-                # Native case sets can skip every interior invocation. The
-                # next actual publication then spans first to last, not g+1.
-                return all(
-                    self.anchored().covered_many(
-                        (
-                            a,
-                            b,
-                            Position(False, 0),
-                            Position(True, 0),
-                            Activation(CountDomain(1, 0, minimum=2)),
-                        )
-                        for a, b in pairs
-                    )
+            pairs = []
+            for uid, consumed, republished in resources:
+                poll("child event resource batch", call=uid)
+                current = tuple(
+                    (a, b)
+                    for a in self.completion.commands_for(uid, consumed)
+                    for b in self.completion.commands_for(uid, republished)
                 )
-            return True
-        return all(
-            self.graph.covered_many(
+                pairs.append(current)
+                first = len(queries)
+                queries.extend((a, b, 1, legacy_activation(1)) for a, b in current)
+                groups.append((first, len(queries)))
+            answers = self.guarded().covered_many(queries)
+            results = [all(answers[first:last]) for first, last in groups]
+            anchored_groups, anchored_queries = [], []
+            for index, (uid, _, _) in enumerate(resources):
+                if not results[index] or not self.program.leaves[uid].cases:
+                    continue
+                first = len(anchored_queries)
+                anchored_queries.extend(
+                    (
+                        a,
+                        b,
+                        Position(False, 0),
+                        Position(True, 0),
+                        Activation(CountDomain(1, 0, minimum=2)),
+                    )
+                    for a, b in pairs[index]
+                )
+                anchored_groups.append((index, first, len(anchored_queries)))
+            if anchored_queries:
+                answers = self.anchored().covered_many(anchored_queries)
+                for index, first, last in anchored_groups:
+                    results[index] = all(answers[first:last])
+            return results
+        for uid, consumed, republished in resources:
+            poll("child event resource batch", call=uid)
+            first = len(queries)
+            queries.extend(
                 self.completion.query(uid, consumed, r, uid, republished, r + 1, minimum=1)
                 for r in range(self.graph.period)
             )
-        )
+            groups.append((first, len(queries)))
+        answers = self.graph.covered_many(queries)
+        return [all(answers[first:last]) for first, last in groups]
 
 
 def _analyses(program):
@@ -547,10 +560,6 @@ def _analyses(program):
 def _scope_access(program):
     from .scope_access import analyze_scope_access
 
-    require(
-        not program.invocations,
-        "nested serial invocations need cross-query memory and event lifetime synchronization",
-    )
     access = analyze_scope_access(program, definitions=True)
     if any(leaf.cases for leaf in program.leaves.values()):
         from .scope_guarded_access import analyze_guarded_access
@@ -727,8 +736,9 @@ def _allocate_child_resources(program, analyses, access, proof, selected):
     native or synchronization instruction is added, moved, or removed.
     """
     valid = all(
-        proof.resource_covered(uid, consumed, republished)
-        for uid, consumed, republished, _ in proof.resource_pairs
+        proof.resource_covered_many(
+            (uid, consumed, republished) for uid, consumed, republished, _ in proof.resource_pairs
+        )
     )
     if valid:
         return proof, _leaf_banks(program, analyses)
@@ -800,6 +810,18 @@ def autosync_scopes(module, *, _capture=None):
         not program.invocations,
         "nested serial invocations need cross-query memory and event lifetime synchronization",
     )
+    _plan_scope_parent(program)
+    return _finish(result, _capture=_capture)
+
+
+def _plan_scope_parent(program):
+    """Install child/parent protocols in an owned actual program.
+
+    This composes one invocation only. Query normalization retains the outer
+    lifetime contracts, but does not discharge them. The public entry point
+    must separately prove those contracts before returning an executable plan.
+    """
+    result = program.module
     banks = defaultdict(lambda: defaultdict(int))
     for leaf in program.leaves.values():
         poll("child synchronization planning")
@@ -848,6 +870,13 @@ def autosync_scopes(module, *, _capture=None):
             -max((tasks[s].issue_order for s in item[0].sources), default=0),
         ),
     )
+    if proof.node_activations:
+        # Register the actual candidate sources together. Otherwise every
+        # candidate injects a few new bits and scans their reachable graph
+        # again. Bitsets share that work when origins enter one propagation.
+        # These answers add no edges: selection still rechecks each candidate
+        # against only the protocols already accepted below.
+        proof.covered_obligations(o for _, obligations in ordered for o in obligations)
     selected = []
     for candidate, obligations in ordered:
         poll("parent synchronization selection")
@@ -894,7 +923,6 @@ def autosync_scopes(module, *, _capture=None):
             ids = p.ids
         allocated.append(replace(p, ids=ids))
     _install(program, access, allocated)
-    return _finish(result, _capture=_capture)
 
 
 def _read_protocols(program, access, analyses):
@@ -1064,6 +1092,19 @@ def _read_protocols(program, access, analyses):
 @bounded
 def verify_scopes(module, *, _details=False):
     program = extract_scopes(module)
+    require(
+        not program.invocations,
+        "nested serial invocations need cross-query memory and event lifetime synchronization",
+    )
+    report, checked, _ = _verify_scope_parent(program)
+    return (report, checked) if _details else report
+
+
+def _verify_scope_parent(program):
+    """Rebuild the actual invocation proof, retaining it for outer composition.
+
+    An invocation-local report alone never verifies serial query execution.
+    """
     access = _scope_access(program)
     reports, analyses = _analyses(program)
     channels, banks = _read_protocols(program, access, analyses)
@@ -1123,5 +1164,11 @@ def verify_scopes(module, *, _details=False):
         "progress_stride": potential[0],
         "terminal_drain": "only kernel actor return; child exit is not completion",
     }
+    if program.invocations:
+        report["verification"] = (
+            "invocation-local child and parent proof only; "
+            "cross-query memory and event lifetimes remain unverified"
+        )
+        report["cross_query_verified"] = False
     checked = CheckedScopes(program, analyses, access, channels)
-    return (report, checked) if _details else report
+    return report, checked, proof

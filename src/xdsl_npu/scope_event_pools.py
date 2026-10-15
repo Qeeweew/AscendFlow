@@ -266,18 +266,24 @@ def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
     banks = defaultdict(list)
     for local in locals_:
         banks[local.bank].append(local)
+    # Banks share a completion topology even though their IDs are independent.
+    # Register each required width across banks in one fact propagation; the
+    # minimum widths and subsequent deterministic allocation stay unchanged.
+    pending, minimum = list(locals_), {}
+    for width in range(1, 9):
+        checks.selfs(pending, (width,))
+        for local in pending:
+            if checks.self_ok(local, width):
+                minimum[local.protocol.name] = width
+        pending = [local for local in pending if local.protocol.name not in minimum]
+        if not pending:
+            break
+    require(
+        not pending,
+        f"{pending[0].bank if pending else ''}: no proved parent self reuse width <=8",
+    )
     merges, shared, allocated = 0, 0, 0
     for bank, members in banks.items():
-        pending, minimum = list(members), {}
-        for width in range(1, 9):
-            checks.selfs(pending, (width,))
-            for local in pending:
-                if checks.self_ok(local, width):
-                    minimum[local.protocol.name] = width
-            pending = [local for local in pending if local.protocol.name not in minimum]
-            if not pending:
-                break
-        require(not pending, f"{bank}: no proved parent self reuse width <=8")
         pools = [((index,), minimum[local.protocol.name]) for index, local in enumerate(members)]
         free = [i for i in range(8) if i not in used[bank]]
         cost = sum(width for _, width in pools)
