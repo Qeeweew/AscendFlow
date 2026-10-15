@@ -5,7 +5,7 @@ from collections import defaultdict
 
 import pytest
 
-from xdsl_npu.completion import CountDomain, LeafCompletion
+from xdsl_npu.completion import CountDomain
 from xdsl_npu.completion_flow import ALL, CompletionFlow
 
 
@@ -54,13 +54,11 @@ def test_frame_planning_and_verification_do_not_call_pairwise_leaf_oracle(monkey
     def forbidden(*args, **kwargs):
         raise AssertionError("region composition called a pairwise leaf oracle")
 
-    monkeypatch.setattr(LeafCompletion, "prove", forbidden)
+    monkeypatch.setattr(Graph, "path", forbidden)
     artifact = compile(frame_state_sum.specialize(B=16, GROUPS=1))
     assert artifact.report["native_templates"] == 7
     assert artifact.report["sequence_native_relation_checks"] == 0
     assert artifact.report["invocation_path_visits"] == 0
     assert artifact.asc.count("for (int64_t") == 2
-    # Re-extract the final IR with the old path search disabled entirely.
-    # Leaf planning still has legacy pruning; the final local checker does not.
-    monkeypatch.setattr(Graph, "path", forbidden)
+    # Both selection and final-IR re-extraction use facts, not the old oracle.
     assert verify_plan(artifact.plan) == artifact.report

@@ -46,7 +46,7 @@ def select_bridges(sequence, proof, candidates, banks, *, carried=False):
         if not missing:
             continue
         source, destination = candidate.source, candidate.destination
-        sp, dp = _task(sequence, source).pipe, _task(sequence, destination).pipe
+        sp, dp = _task(sequence.regions, source).pipe, _task(sequence.regions, destination).pipe
         bridge = Bridge(source, destination, missing, -1 if sp == dp else 0, carried=carried)
         selected.append(bridge)
         proof.add_bridge(bridge)
@@ -72,10 +72,10 @@ def select_bridges(sequence, proof, candidates, banks, *, carried=False):
     assigned = []
     for bridge in selected:
         if bridge.event_id >= 0:
-            sp, dp = _task(sequence, bridge.source).pipe, _task(sequence, bridge.destination).pipe
+            sp, dp = _task(sequence.regions, bridge.source).pipe, _task(sequence.regions, bridge.destination).pipe
             key = actor, sp, dp
             reserved = int(
-                (sp, dp) == ("S", "FIX") and _data(sequence, bridge.source.region).program.config
+                (sp, dp) == ("S", "FIX") and _data(sequence.regions, bridge.source.region).program.config
             )
             event_id = max(banks[key], reserved)
             require(event_id < 8, f"{key}: sequence event bank exhausted; no drain fallback")

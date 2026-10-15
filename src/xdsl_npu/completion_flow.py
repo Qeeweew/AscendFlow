@@ -5,7 +5,7 @@ reachability oracle. Bits name demanded source milestones. A fact's predicate
 is the conjunction along its real path; alternative paths retain their guards.
 """
 
-from collections import deque
+from heapq import heappop, heappush
 
 from .budget import poll
 from .completion import CountDomain, _first, canonical, intersection
@@ -53,7 +53,8 @@ def _includes(outer, inner):
 class CompletionFlow:
     def __init__(self):
         self.edges, self.facts = [], []
-        self.pending = deque()
+        self.pending = []
+        self.delta = {}
         self.transfers = 0
         self.edge_count = 0
 
@@ -81,7 +82,11 @@ class CompletionFlow:
                 else:
                     del known[prior]
         known[guard] = known.get(guard, 0) | bits
-        self.pending.append((node, guard, bits))
+        if node not in self.delta:
+            self.delta[node] = {}
+            heappush(self.pending, node)
+        pending = self.delta[node]
+        pending[guard] = pending.get(guard, 0) | bits
 
     def edge(self, source, destination, guard=ALL):
         if guard is None or source == destination:
@@ -98,15 +103,16 @@ class CompletionFlow:
 
     def propagate(self):
         while self.pending:
-            source, domain, bits = self.pending.popleft()
-            bits &= self.facts[source].get(domain, 0)
-            if not bits:
-                continue
-            for target, guard in self.edges[source]:
-                self.transfers += 1
-                if self.transfers % 1024 == 0:
-                    poll("completion fact propagation", transfers=self.transfers)
-                require(self.transfers <= 2_000_000, "completion fact transfer budget exceeded")
-                overlap = intersection(domain, guard)
-                if overlap is not None:
-                    self.add_fact(target, overlap, bits)
+            source = heappop(self.pending)
+            for domain, bits in self.delta.pop(source).items():
+                bits &= self.facts[source].get(domain, 0)
+                if not bits:
+                    continue
+                for target, guard in self.edges[source]:
+                    self.transfers += 1
+                    if self.transfers % 1024 == 0:
+                        poll("completion fact propagation", transfers=self.transfers)
+                    require(self.transfers <= 2_000_000, "completion fact transfer budget exceeded")
+                    overlap = intersection(domain, guard)
+                    if overlap is not None:
+                        self.add_fact(target, overlap, bits)

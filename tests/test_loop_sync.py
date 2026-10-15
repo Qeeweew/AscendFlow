@@ -194,7 +194,7 @@ def test_normal_compilation_never_instantiates_input_length(monkeypatch):
     assert len(set(sizes)) == 1
 
 
-def test_candidate_pruning_builds_three_graphs_not_one_per_candidate(monkeypatch):
+def test_selection_builds_three_graphs_without_a_path_oracle(monkeypatch):
     import xdsl_npu.loop_sync as sync
 
     original, calls = sync.completion_graph, []
@@ -204,9 +204,15 @@ def test_candidate_pruning_builds_three_graphs_not_one_per_candidate(monkeypatch
         return original(*args, **kwargs)
 
     monkeypatch.setattr(sync, "completion_graph", counted)
+    from xdsl_npu.loop_graph import Graph
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("planning or final verification called the old path oracle")
+
+    monkeypatch.setattr(Graph, "path", forbidden)
     result = compile(cv_source(N.dynamic("tasks")))
     assert result.report["channels"] > 10
-    assert len(calls) == 3  # candidate graph, trimmed graph, independent final graph
+    assert len(calls) == 3  # detached candidates, selected instructions, independent final graph
 
 
 @pytest.mark.parametrize("width", [1, 8, 24])

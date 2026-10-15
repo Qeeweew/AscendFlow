@@ -20,14 +20,14 @@ def memory_requirements(sequence):
     for dep in sequence.invocation_dependencies():
         # Invocation GM frames are distinct; these are actual reused local bytes.
         require(not dep.storage.owner.external.data, "call transfer includes unpartitioned GM")
-        source = _point(sequence, dep.source, dep.domain, source=True)
-        destination = _point(sequence, dep.destination, dep.domain, source=False)
+        source = _point(sequence.regions, dep.source, dep.domain, source=True)
+        destination = _point(sequence.regions, dep.destination, dep.domain, source=False)
         access = dep.source.access
         point = "end" if isinstance(access, Access) or access.first == access.last else "prefix"
         result.append(
             Requirement(
-                mark(sequence, source, point),
-                mark(sequence, destination, "begin", 1),
+                mark(sequence.regions, source, point),
+                mark(sequence.regions, destination, "begin", 1),
                 dep.domain,
                 f"{dep.hazard} {dep.storage.owner.sym_name.data}[{dep.start}:{dep.stop}]",
             )
@@ -43,14 +43,14 @@ def event_requirements(sequence):
             domain = event.domain if loop.constant_count is None else CountDomain(1, 0, minimum=0)
             left = Site(
                 event.consumed.task,
-                position(sequence, name, event.consumed.position),
+                position(sequence.regions, name, event.consumed.position),
                 "begin",
                 event.channel,
                 "wait",
             )
             right = Site(
                 event.republished.task,
-                position(sequence, name, event.republished.position),
+                position(sequence.regions, name, event.republished.position),
                 "end",
                 event.channel,
                 "set",
@@ -79,8 +79,8 @@ def boundary_requirements(sequence, bridges):
             # resource endpoints. They never retire a buffer on Wait alone.
             result.append(
                 Requirement(
-                    mark(sequence, bridge.destination, "begin"),
-                    mark(sequence, bridge.source, "prefix", 0 if bridge.carried else 1),
+                    mark(sequence.regions, bridge.destination, "begin"),
+                    mark(sequence.regions, bridge.source, "prefix", 0 if bridge.carried else 1),
                     domain,
                     f"event {bridge.name} Wait-before-Set",
                 )
@@ -93,7 +93,7 @@ def verify_calls(sequence, analyses, bridges):
         return {}
     memory = memory_requirements(sequence)
     events = event_requirements(sequence) + boundary_requirements(sequence, bridges)
-    proof = RegionCompletion(sequence, analyses, memory + events, bridges=bridges)
+    proof = RegionCompletion(sequence.regions, analyses, memory + events, bridges=bridges)
     for requirement in memory + events:
         require(
             proof.covered(requirement),
@@ -117,14 +117,14 @@ def plan_calls(sequence, analyses, forward, banks):
     if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
         return []
     memory, events = memory_requirements(sequence), event_requirements(sequence)
-    proof = RegionCompletion(sequence, analyses, memory + events, bridges=forward)
+    proof = RegionCompletion(sequence.regions, analyses, memory + events, bridges=forward)
     # A late reader release often covers an earlier writer and several input
     # rings. Examine real cross-pipe WARs before manufacturing same-pipe fences.
     ordered = sorted(
         memory,
         key=lambda r: (
             not r.reason.startswith("WAR"),
-            _task(sequence, r.source.location).pipe == _task(sequence, r.destination.location).pipe,
+            _task(sequence.regions, r.source.location).pipe == _task(sequence.regions, r.destination.location).pipe,
             -proof.order[r.source.region],
             proof.order[r.destination.region],
             repr(r),

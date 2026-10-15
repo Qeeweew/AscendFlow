@@ -11,11 +11,11 @@ from xdsl_npu.completion import (
     CountDomain,
     Position,
     Site,
-    covered_path,
     covers,
     intersection,
     uncovered,
 )
+from xdsl_npu.completion_flow import CompletionFlow
 
 
 def site(name, *, call=0, point="end"):
@@ -24,7 +24,16 @@ def site(name, *, call=0, point="end"):
 
 def prove(source, target, edges, domain=None):
     domain = CountDomain(1, 0, minimum=0) if domain is None else domain
-    return covered_path(source, target, domain, edges, lambda *_: (), lambda *_: True)
+    flow = CompletionFlow()
+    values = {source, target, *edges}
+    values.update(dst for items in edges.values() for dst, _ in items)
+    nodes = {value: flow.node() for value in values}
+    for value, items in edges.items():
+        for dst, predicate in items:
+            flow.edge(nodes[value], nodes[dst], predicate)
+    flow.add_fact(nodes[source], domain, 1)
+    flow.propagate()
+    return covers(domain, [g for g, bits in flow.facts[nodes[target]].items() if bits & 1])
 
 
 def test_disjoint_guards_cannot_be_composed_as_one_unconditional_path():

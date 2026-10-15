@@ -42,11 +42,11 @@ class CheckedSequence:
 def _requirements(sequence):
     result = []
     for obligation in sequence.summary.obligations:
-        source = _point(sequence, obligation.source, obligation.domain, source=True)
-        destination = _point(sequence, obligation.destination, obligation.domain, source=False)
+        source = _point(sequence.regions, obligation.source, obligation.domain, source=True)
+        destination = _point(sequence.regions, obligation.destination, obligation.domain, source=False)
         require(
-            _valid_point(sequence, source, obligation.domain)
-            and _valid_point(sequence, destination, obligation.domain),
+            _valid_point(sequence.regions, source, obligation.domain)
+            and _valid_point(sequence.regions, destination, obligation.domain),
             "memory frontier points outside its actual region activation",
         )
         result.append((source, destination, obligation.domain, obligation))
@@ -56,7 +56,7 @@ def _requirements(sequence):
 def _plan_boundaries(sequence, analyses, banks):
     requirements = _requirements(sequence)
     queries = tuple(memory_requirement(sequence, *r) for r in requirements)
-    proof = RegionCompletion(sequence, analyses, queries, calls=(0,))
+    proof = RegionCompletion(sequence.regions, analyses, queries, calls=(0,))
     # Select actual releases before ready edges targeting the same region.
     # Earlier destination regions establish the context for later transfers.
     # Only already selected protocols may justify coverage: no circular
@@ -64,9 +64,9 @@ def _plan_boundaries(sequence, analyses, banks):
     order = proof.order
 
     def consumer_issue(point):
-        task = _task(sequence, point)
+        task = _task(sequence.regions, point)
         generation = -1 - point.position.offset if point.position.end else point.position.offset
-        tasks = _data(sequence, point.region).program.tasks
+        tasks = _data(sequence.regions, point.region).program.tasks
         return point.position.end, generation + task.stage, task.issue_order, tasks.index(task)
 
     ordered = sorted(
@@ -76,7 +76,7 @@ def _plan_boundaries(sequence, analyses, banks):
             consumer_issue(r[1]),
             r[3].hazard != "WAR",
             -order[r[0].region],
-            _task(sequence, r[0]).pipe == _task(sequence, r[1]).pipe,
+            _task(sequence.regions, r[0]).pipe == _task(sequence.regions, r[1]).pipe,
             repr(r[:3]),
         ),
     )
@@ -122,7 +122,7 @@ def _install(sequence, bridges):
         for action, point in (
             (("set", s), ("wait", d)) if bridge.event_id >= 0 else (("barrier", d),)
         ):
-            data = _data(sequence, point.region)
+            data = _data(sequence.regions, point.region)
             operation = RegionSyncOp.create(
                 operands=[data.stream.body.block.args[0]],
                 attributes={"action": StringAttr(action), "channel": StringAttr(bridge.name)},
@@ -139,7 +139,7 @@ def _read_bridges(sequence, analyses):
     bridges, names = [], set()
     usage = defaultdict(set)
     actor = next(iter(next(iter(sequence.regions.values())).actors))
-    if _data(sequence, next(iter(sequence.regions))).program.config:
+    if _data(sequence.regions, next(iter(sequence.regions))).program.config:
         usage["S", "FIX"].add(0)
     for analysis in analyses.values():
         loop, channel_map, _, _, _ = analysis
@@ -168,7 +168,7 @@ def _read_bridges(sequence, analyses):
         ):
             require(
                 region.data in sequence.regions
-                and task.data in _data(sequence, region.data).operations
+                and task.data in _data(sequence.regions, region.data).operations
                 and end.data in (0, 1)
                 and offset.data >= 0,
                 "invalid region endpoint",
@@ -208,10 +208,10 @@ def _read_bridges(sequence, analyses):
             domains.append(domain)
         require(domains and len(set(domains)) == len(domains), "empty/duplicate region activation")
         require(
-            all(_valid_point(sequence, point, domain) for point in points for domain in domains),
+            all(_valid_point(sequence.regions, point, domain) for point in points for domain in domains),
             "region event has no actual producer/consumer for its activation",
         )
-        sp, dp = _task(sequence, source).pipe, _task(sequence, destination).pipe
+        sp, dp = _task(sequence.regions, source).pipe, _task(sequence.regions, destination).pipe
         event_id = op.event_id.data
         if sp == dp:
             require(event_id == -1, "same-pipe region synchronization requires a native fence")
@@ -291,7 +291,7 @@ def verify_sequence(module, *, _details=False):
     forward = tuple(b for b in bridges if not b.carried)
     requirements = _requirements(sequence)
     queries = tuple(memory_requirement(sequence, *r) for r in requirements)
-    proof = RegionCompletion(sequence, analyses, queries, calls=(0,), bridges=forward)
+    proof = RegionCompletion(sequence.regions, analyses, queries, calls=(0,), bridges=forward)
     inherited = 0
     for source, destination, domain, obligation in requirements:
         poll("sequence boundary coverage", obligations=len(sequence.summary.obligations))

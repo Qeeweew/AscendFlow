@@ -65,7 +65,7 @@ def runtime_work(module, arguments):
                 if bridge.event_id >= 0
                 else (("barrier", bridge.destination),)
             ):
-                key = f"{action}:{_task(checked.sequence, point).pipe}"
+                key = f"{action}:{_task(checked.sequence.regions, point).pipe}"
                 result["sync_invocations"][key] = result["sync_invocations"].get(key, 0) + result[
                     "groups"
                 ] * (max(0, invocations - 1) if bridge.carried else invocations)

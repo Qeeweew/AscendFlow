@@ -20,19 +20,20 @@ from .completion import (
 )
 from .completion_flow import ALL, CompletionFlow
 from .model import require
+from .native_order import instruction_points, prefix_inputs
 from .region_summary import Access
 
 
-def _data(sequence, name):
-    return next(iter(sequence.regions[name].actors.values()))
+def _data(regions, name):
+    return next(iter(regions[name].actors.values()))
 
 
-def _task(sequence, point):
-    return next(t for t in _data(sequence, point.region).program.tasks if t.uid == point.task)
+def _task(regions, point):
+    return next(t for t in _data(regions, point.region).program.tasks if t.uid == point.task)
 
 
-def _expression(sequence, point):
-    count = sequence.regions[point.region].constant_count
+def _expression(regions, point):
+    count = regions[point.region].constant_count
     p = point.position
     if count is not None:
         return 0, p.evaluate(count)
@@ -43,10 +44,10 @@ def _nonnegative(a, b, domain):
     return a * _first(domain) + b >= 0 and (domain.exact is not None or a >= 0)
 
 
-def _valid_point(sequence, point, domain):
-    task = _task(sequence, point)
-    a, b = _expression(sequence, point)
-    count = sequence.regions[point.region].constant_count
+def _valid_point(regions, point, domain):
+    task = _task(regions, point)
+    a, b = _expression(regions, point)
+    count = regions[point.region].constant_count
     ca, cb = (1, 0) if count is None else (0, count)
     return (
         _nonnegative(a, b, domain)
@@ -61,13 +62,11 @@ def _valid_point(sequence, point, domain):
     )
 
 
-def _point(sequence, endpoint, domain, *, source):
+def _point(regions, endpoint, domain, *, source):
     access = endpoint.access
     p = access.position if isinstance(access, Access) else access.last if source else access.first
     count = endpoint.constant_count
-    task = next(
-        t for t in _data(sequence, endpoint.region).program.tasks if t.uid == access.task[1]
-    )
+    task = next(t for t in _data(regions, endpoint.region).program.tasks if t.uid == access.task[1])
     if count is not None:
         p = Position(False, p.evaluate(count))
     elif domain.exact is not None and (source or task.last):
@@ -75,19 +74,19 @@ def _point(sequence, endpoint, domain, *, source):
     return Point(endpoint.region, access.task[1], p)
 
 
-def position(sequence, region, point):
-    count = sequence.regions[region].constant_count
+def position(regions, region, point):
+    count = regions[region].constant_count
     if count is None:
         return point
     index = point.evaluate(count)
     return Position(False, index) if index <= count // 2 else Position(True, count - 1 - index)
 
 
-def mark(sequence, point, milestone, call=0):
-    actor = next(iter(sequence.regions[point.region].actors))
+def mark(regions, point, milestone, call=0):
+    actor = next(iter(regions[point.region].actors))
     return Site(
         (actor, point.task),
-        position(sequence, point.region, point.position),
+        position(regions, point.region, point.position),
         milestone,
         region=point.region,
         call=call,
@@ -126,9 +125,9 @@ class RegionCompletion:
     Interior paths absent from this summary cannot establish coverage.
     """
 
-    def __init__(self, sequence, analyses, requirements, *, calls=(0, 1), bridges=()):
-        self.sequence, self.analyses, self.calls = sequence, analyses, calls
-        self.order = {name: i for i, name in enumerate(sequence.regions)}
+    def __init__(self, regions, analyses, requirements, *, calls=(0, 1), bridges=()):
+        self.regions, self.analyses, self.calls = regions, analyses, calls
+        self.order = {name: i for i, name in enumerate(regions)}
         self.requirements = tuple(requirements)
         self.flow = CompletionFlow()
         self.flow.node()  # Open entry prefixes; no completion facts originate here.
@@ -139,19 +138,19 @@ class RegionCompletion:
         self.bindings = defaultdict(list)
         marks = {s for r in self.requirements for s in (r.source, r.destination)}
         for r in self.requirements:
-            marks.add(mark(sequence, r.source.location, "prefix", r.source.call))
+            marks.add(mark(regions, r.source.location, "prefix", r.source.call))
         for bridge in bridges:
             for call in calls:
                 target = call + int(bridge.carried)
                 if target in calls:
-                    marks.add(mark(sequence, bridge.source, "prefix", call))
-                    marks.add(mark(sequence, bridge.destination, "begin", target))
+                    marks.add(mark(regions, bridge.source, "prefix", call))
+                    marks.add(mark(regions, bridge.destination, "begin", target))
         self.marks = defaultdict(list)
         for m in sorted(marks, key=repr):
             self.marks[m.call, m.region, m.task, m.channel, m.action].append(m)
         state = {}
         for call in calls:
-            for region in sequence.regions:
+            for region in regions:
                 self._region(call, region, state)
         for site, bit in self.sources.items():
             for node, guard in self.bindings[site]:
@@ -162,7 +161,7 @@ class RegionCompletion:
             self.add_bridge(bridge)
 
     def _expr(self, region, a, b):
-        count = self.sequence.regions[region].constant_count
+        count = self.regions[region].constant_count
         return (a, b) if count is None else (0, a * count + b)
 
     def _activation(self, region, command, generation, guard):
@@ -250,24 +249,22 @@ class RegionCompletion:
                     queue = state.get((*pipe, "queue"), 0)
                     retire = state.get((*pipe, "retire"), 0)
                     implicit = state.get((*pipe, "implicit"), 0)
-                    begin = self._join((issue, guard), (queue, guard))
-                    if command.kind == "task":
-                        self.flow.edge(implicit, begin, guard)
-                    end = begin
-                    if command.kind in {"task", "set"}:
-                        end = self._join((begin, guard))
-                    if command.kind in {"set", "barrier"}:
-                        self.flow.edge(retire, end, guard)
-                    state[*pipe, "queue"] = self._join((queue, ALL), (begin, guard))
-                    native_points = {"begin": begin, "end": end}
-                    if command.kind == "task":
-                        prefix = self._join((retire, ALL), (end, guard))
-                        state[*pipe, "retire"] = prefix
-                        native_points["prefix"] = prefix
-                        if command.task.implicit_completion:
-                            state[*pipe, "implicit"] = self._join((implicit, ALL), (end, guard))
-                    if command.task.pipe == "S" and command.kind in {"task", "wait"}:
-                        state[actor, "issue"] = self._join((issue, ALL), (end, guard))
+                    before = {
+                        "issue": issue,
+                        "queue": queue,
+                        "retire": retire,
+                        "implicit": implicit,
+                    }
+                    native_points = instruction_points(
+                        command,
+                        before,
+                        lambda _: self.flow.node(),
+                        lambda source, target, active=guard: self.flow.edge(source, target, active),
+                    )
+                    for key, point in prefix_inputs(command, native_points).items():
+                        state_key = (actor, "issue") if key == "issue" else (*pipe, key)
+                        state[state_key] = self._join((before[key], ALL), (point, guard))
+                    begin, end = native_points["begin"], native_points["end"]
                     self._bind(call, region, command, generation, guard, native_points)
                     if command.kind == "set":
                         sends[command.channel].append((generation, end, guard))
@@ -288,8 +285,8 @@ class RegionCompletion:
             target_call = call + int(bridge.carried)
             if target_call not in self.calls:
                 continue
-            source = mark(self.sequence, bridge.source, "prefix", call)
-            destination = mark(self.sequence, bridge.destination, "begin", target_call)
+            source = mark(self.regions, bridge.source, "prefix", call)
+            destination = mark(self.regions, bridge.destination, "begin", target_call)
             require(
                 source in self.bindings and destination in self.bindings,
                 "protocol endpoint missing from native completion transfers",
@@ -329,8 +326,8 @@ def memory_requirement(sequence, source, destination, domain, obligation):
     access = obligation.source.access
     point = "end" if isinstance(access, Access) or access.first == access.last else "prefix"
     return Requirement(
-        mark(sequence, source, point),
-        mark(sequence, destination, "begin"),
+        mark(sequence.regions, source, point),
+        mark(sequence.regions, destination, "begin"),
         domain,
         obligation.hazard,
     )

@@ -8,7 +8,7 @@ def region_boundary(checked, region):
     from .sequence_sync import _data, _task
 
     before, after, pending, previous = {}, {}, [], None
-    data = _data(checked.sequence, region)
+    data = _data(checked.sequence.regions, region)
     bridges = {b.name: b for b in checked.bridges}
     for op, _ in stream_operations(data.stream):
         if isinstance(op, TaskOp):
@@ -45,7 +45,7 @@ def region_boundary(checked, region):
                 if action == "set"
                 else " && npu_invocation > 0"
             )
-        a, b = _task(checked.sequence, source).pipe, _task(checked.sequence, destination).pipe
+        a, b = _task(checked.sequence.regions, source).pipe, _task(checked.sequence.regions, destination).pipe
         if bridge.event_id == -1:
             sync = f"asc_sync_pipe(PIPE_{b});"
         else:

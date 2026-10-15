@@ -7,23 +7,22 @@ and event reuse. No finite parent/child expansion participates in this proof.
 """
 
 from dataclasses import dataclass, replace
-from math import lcm
 
 from xdsl.dialects.builtin import IntAttr, StringAttr
 
-from .completion import LeafCompletion, Site, _first, canonical, covered_path
+from .completion import Point, Requirement, Site, intersection
 from .ir import InvocationChannelOp, InvocationSyncOp, LoopChannelOp, TaskOp
 from .loop_boundary import stream_operations
 from .model import require
-from .periodic import MAX_PERIOD_TEMPLATES
+from .region_completion import RegionCompletion
 from .region_summary import (
     Access,
     CountDomain,
     Position,
-    ReadSpan,
     summarize_local_events,
     summarize_reused_storage,
 )
+from .sequence_plan import Bridge as RegionBridge
 
 
 @dataclass(frozen=True)
@@ -156,89 +155,87 @@ def _site(access, *, source):
     )
 
 
-def _domains(domain, period, maximum):
-    if domain.exact is not None:
-        return (domain,) if maximum is None or domain.exact == maximum else ()
-    joint = lcm(domain.period, period)
-    require(joint <= MAX_PERIOD_TEMPLATES, "coupled invocation predicate budget exceeded")
-    return tuple(
-        d
-        for r in range(domain.residue, joint, domain.period)
-        if (d := CountDomain(joint, r, minimum=_first(domain), maximum=domain.maximum))
-        and (maximum is None or d.contains(maximum))
+def _domain(loop, domain):
+    if loop.constant_count is None:
+        return domain
+    return (
+        CountDomain(1, 0, exact=loop.constant_count)
+        if domain.contains(loop.constant_count)
+        else None
     )
 
 
-def _covered(left, right, domain, groups, inside):
-    if inside.loop.constant_count is not None and not domain.contains(inside.loop.constant_count):
-        return True
-    # Adjacent calls remain distinct identities. Only actual carried protocols
-    # connect them; lexical position does not supply completion.
-    right = replace(right, call=1)
-    edges, nodes = {}, {left, right}
-    for group in groups.values():
-        for bridge in group:
-            source, destination = bridge.source, replace(bridge.destination, call=1)
-            edges.setdefault(source, []).append((destination, canonical(bridge.domain)))
-            nodes.update((source, destination))
-    nodes = tuple(sorted(nodes, key=repr))
-
-    def successors(site, guard):
-        for candidate in nodes:
-            if candidate != site and candidate.call == site.call:
-                for source_guard in inside.activation(site, guard):
-                    for predicate in inside.activation(candidate, source_guard):
-                        if inside.prove(site, candidate, predicate):
-                            yield candidate, predicate
-
-    return covered_path(
-        left, right, domain, edges, successors, lambda site, guard: inside.prove(site, site, guard)
+def _requirement(loop, left, right, domain, reason, *, across=False):
+    domain = _domain(loop, domain)
+    if domain is None:
+        return None
+    return Requirement(
+        replace(left, region="child"),
+        replace(right, region="child", call=int(across)),
+        domain,
+        reason,
     )
 
 
-def verify_invocation(loop, channel_map, graph, endpoints, native):
-    require(
-        loop.invocation is not None and len(loop.actors) == 1,
-        "invocation verification needs one retained local child",
-    )
-    bridges = _protocols(loop, channel_map)
-    groups = {}
-    for bridge in bridges:
-        groups.setdefault(bridge.name, []).append(bridge)
-    roots = {
-        loop.root(a, r)
-        for a, d in loop.actors.items()
-        for t in d.program.tasks
-        for r in t.refs
-        if not r.storage.external
-    }
-    summary = summarize_reused_storage(loop, roots)
-    inside = LeafCompletion(loop, graph, native, endpoints)
-    obligations = summary.invocation_dependencies()
-    resources = summarize_local_events(loop)
-    repeated = loop.invocation.bound.constant is None or loop.invocation.bound.constant > 1
-    if repeated:
-        for dep in obligations:
-            if (
-                isinstance(dep.destination, ReadSpan)
-                and dep.destination.first != dep.destination.last
-            ):
-                require(
-                    inside.prefix_monotonic(dep.destination.task, "begin"),
-                    "child reader family lacks FIFO start order",
-                )
-            require(
-                _covered(
-                    _site(dep.source, source=True),
-                    _site(dep.destination, source=False),
-                    dep.domain,
-                    groups,
-                    inside,
-                ),
-                f"missing invocation {dep.hazard}: {dep.storage}[{dep.start}:{dep.stop}], "
-                f"{dep.source} -> {dep.destination}, {dep.domain}",
+def _memory_requirements(loop, summary):
+    result = []
+    for dep in summary.invocation_dependencies():
+        left, right = _site(dep.source, source=True), _site(dep.destination, source=False)
+        domain = _domain(loop, dep.domain)
+        if domain is None:
+            continue
+        if not left.position.end and domain.exact is not None:
+            left = replace(left, position=Position(True, domain.exact - 1 - left.position.offset))
+        result.append(
+            _requirement(
+                loop,
+                left,
+                right,
+                domain,
+                f"missing invocation {dep.hazard}: {dep.storage}[{dep.start}:{dep.stop}]",
+                across=True,
             )
+        )
+    return tuple(result)
+
+
+def _resource_requirements(loop, resources, bridges):
+    result = []
+    for resource in resources:
+        left = Site(
+            resource.consumed.task, resource.consumed.position, "begin", resource.channel, "wait"
+        )
+        right = Site(
+            resource.republished.task, resource.republished.position, "end", resource.channel, "set"
+        )
+        result.append(
+            _requirement(
+                loop,
+                left,
+                right,
+                resource.domain,
+                f"{resource.channel}: event {resource.event_id} can be re-Set across invocations",
+                across=True,
+            )
+        )
+    for bridge in bridges:
+        result.append(
+            _requirement(
+                loop,
+                bridge.destination,
+                bridge.source,
+                bridge.domain,
+                f"{bridge.name}: boundary credit may be re-Set before its head Wait",
+            )
+        )
+        if not bridge.carried:
+            continue
         for resource in resources:
+            if (resource.channel, resource.event_id) != (bridge.name, bridge.event_id):
+                continue
+            domain = intersection(resource.domain, bridge.domain)
+            if domain is None:
+                continue
             left = Site(
                 resource.consumed.task,
                 resource.consumed.position,
@@ -253,55 +250,78 @@ def verify_invocation(loop, channel_map, graph, endpoints, native):
                 resource.channel,
                 "set",
             )
-            require(
-                _covered(left, right, resource.domain, groups, inside),
-                f"{resource.channel}: event {resource.event_id} can be re-Set across invocations",
-            )
-        for bridge in bridges:
-            domain = bridge.domain
-            if loop.constant_count is not None and not domain.contains(loop.constant_count):
-                continue
-            # Its head Wait is consumed before the next tail Set of the same
-            # boundary ID, even when the child has no interior credit pair.
-            require(
-                inside.prove(bridge.destination, bridge.source, domain),
-                f"{bridge.name}: boundary credit may be re-Set before its head Wait",
-            )
-            if not bridge.carried:
-                continue
-            # A carried ID is also used inside the child. Check both seams.
-            for resource in resources:
-                if (resource.channel, resource.event_id) != (bridge.name, bridge.event_id):
-                    continue
-                for case in _domains(resource.domain, domain.period, loop.constant_count):
-                    if not domain.contains(_first(case)):
-                        continue
-                    left = Site(
-                        resource.consumed.task,
-                        resource.consumed.position,
-                        "begin",
-                        resource.channel,
-                        "wait",
-                    )
-                    right = Site(
-                        resource.republished.task,
-                        resource.republished.position,
-                        "end",
-                        resource.channel,
-                        "set",
-                    )
-                    require(
-                        inside.prove(left, bridge.source, case)
-                        and inside.prove(bridge.destination, right, case),
+            for source, target in ((left, bridge.source), (bridge.destination, right)):
+                result.append(
+                    _requirement(
+                        loop,
+                        source,
+                        target,
+                        domain,
                         f"{bridge.name}: carried/interior event lifetimes overlap",
                     )
+                )
+    return tuple(r for r in result if r is not None)
+
+
+def _transfer(loop, bridge):
+    domain = _domain(loop, bridge.domain)
+    if domain is None:
+        return None
+    return RegionBridge(
+        Point("child", bridge.source.task[1], bridge.source.position),
+        Point("child", bridge.destination.task[1], bridge.destination.position),
+        (domain,),
+        bridge.event_id,
+        bridge.name,
+        True,
+    )
+
+
+def _proof(loop, channel_map, graph, streams, requirements, bridges):
+    # One actual retained child is a serial scope, using the SAME native
+    # transfers as multi-region calls. No separate completion semantics.
+    return RegionCompletion(
+        {"child": loop},
+        {"child": (loop, channel_map, streams, graph, None)},
+        requirements,
+        bridges=tuple(b for old in bridges if (b := _transfer(loop, old)) is not None),
+    )
+
+
+def _summary(loop):
+    roots = {
+        loop.root(actor, ref)
+        for actor, data in loop.actors.items()
+        for task in data.program.tasks
+        for ref in task.refs
+        if not ref.storage.external
+    }
+    return summarize_reused_storage(loop, roots)
+
+
+def verify_invocation(loop, channel_map, graph, streams):
+    require(
+        loop.invocation is not None and len(loop.actors) == 1,
+        "invocation verification needs one retained local child",
+    )
+    bridges = _protocols(loop, channel_map)
+    summary, resources = _summary(loop), summarize_local_events(loop)
+    memory = _memory_requirements(loop, summary)
+    requirements = memory + _resource_requirements(loop, resources, bridges)
+    repeated = loop.invocation.bound.constant is None or loop.invocation.bound.constant > 1
+    proof = None
+    if repeated:
+        proof = _proof(loop, channel_map, graph, streams, requirements, bridges)
+        for requirement in requirements:
+            require(proof.covered(requirement), requirement.reason)
     return {
         "invocation_bound": loop.invocation.bound.text(),
         "invocation_frames": len(loop.invocation.frames),
-        "invocation_memory_obligations": len(obligations),
+        "invocation_memory_obligations": len(memory),
         "invocation_event_domains": len(resources),
         "invocation_bridges": len(bridges),
-        "invocation_proof_queries": inside.queries,
+        "invocation_proof_queries": 0 if proof is None else proof.queries,
+        "invocation_fact_transfers": 0 if proof is None else proof.flow.transfers,
     }
 
 
@@ -322,37 +342,24 @@ def plan_invocation(loop):
         ):
             op.attributes["carry"] = IntAttr(1)
     channel_map = channels(loop)
-    graph, _, endpoints, native = completion_graph(loop, channel_map)
+    graph, streams, _, native = completion_graph(loop, channel_map)
     bridges = _protocols(loop, channel_map)
-    groups = {}
-    for bridge in bridges:
-        groups.setdefault(bridge.name, []).append(bridge)
-    roots = {
-        loop.root(a, r)
-        for a, d in loop.actors.items()
-        for t in d.program.tasks
-        for r in t.refs
-        if not r.storage.external
-    }
-    inside = LeafCompletion(loop, graph, native, endpoints)
-    summary = summarize_reused_storage(loop, roots)
+    summary = _summary(loop)
+    requirements = _memory_requirements(loop, summary)
+    proof = _proof(loop, channel_map, graph, streams, requirements, bridges)
     candidates = {}
-    for dep in summary.invocation_dependencies():
-        left, right = _site(dep.source, source=True), _site(dep.destination, source=False)
-        if _covered(left, right, dep.domain, groups, inside):
+    for requirement in requirements:
+        if proof.covered(requirement):
             continue
-        if not left.position.end and dep.domain.exact is not None:
-            left = Site(
-                left.task, Position(True, dep.domain.exact - 1 - left.position.offset), left.point
-            )
+        left, right = requirement.source, requirement.destination
         require(
             left.position.end and not right.position.end,
             "uncovered invocation relation needs an explicit tail-to-head protocol",
         )
         key = left.task, right.task, left.position.offset, right.position.offset
-        candidates.setdefault(key, []).append((left, right, dep.domain))
+        candidates.setdefault(key, []).append(requirement)
     for (source, destination, gap, index), required in candidates.items():
-        if all(_covered(left, right, domain, groups, inside) for left, right, domain in required):
+        if all(proof.covered(requirement) for requirement in required):
             continue
         a, b = native[source].task, native[destination].task
         if a.pipe == b.pipe:
@@ -401,7 +408,7 @@ def plan_invocation(loop):
             else:
                 task.parent.insert_op_before(sync, task)
         for bridge in _protocols(loop, channel_map):
-            if bridge.name == name:
-                groups.setdefault(name, []).append(bridge)
+            if bridge.name == name and (transfer := _transfer(loop, bridge)):
+                proof.add_bridge(transfer)
     # autosync_loop performs the mandatory final check from materialized IR.
     # Do not repeat that same full parent proof as a planner preflight.

@@ -51,14 +51,14 @@ def test_notify_effect_does_not_fence_later_same_pipe_work(grouped_artifact):
     seq = checked.sequence
     channel = next(c for c in checked.analyses["r1"][1].values() if c.distance == 0)
     source = Site(channel.sources[0], Position(False, 0), "end", channel.name, "set", region="r1")
-    target = mark(seq, Point("r1", channel.sources[0][1], Position(False, 1)), "prefix")
+    target = mark(seq.regions, Point("r1", channel.sources[0][1], Position(False, 1)), "prefix")
     required = Requirement(source, target, CountDomain(1, 0, exact=3), "Set is not a fence")
-    proof = RegionCompletion(seq, checked.analyses, (required,))
+    proof = RegionCompletion(seq.regions, checked.analyses, (required,))
     assert not proof.covered(required)
 
 
 def test_fifo_begin_composition_matches_the_actual_native_graph(grouped_artifact):
-    from xdsl_npu.completion import CountDomain, LeafCompletion, Position, Requirement, Site
+    from xdsl_npu.completion import CountDomain, Position, Requirement, Site
     from xdsl_npu.region_completion import RegionCompletion
     from xdsl_npu.sequence_sync import verify_sequence
 
@@ -71,13 +71,7 @@ def test_fifo_begin_composition_matches_the_actual_native_graph(grouped_artifact
             for c in commands
             if c.kind == "task"
         }
-        endpoints = {
-            (actor, c.channel, c.kind): c
-            for actor, commands in streams.items()
-            for c in commands
-            if c.kind in {"set", "wait"}
-        }
-        oracles[region] = LeafCompletion(loop, graph, native, endpoints)
+        oracles[region] = loop.constant_count, graph, native
         for a in native:
             for b in native:
                 for point in ("begin", "end", "prefix"):
@@ -89,11 +83,26 @@ def test_fifo_begin_composition_matches_the_actual_native_graph(grouped_artifact
                             "native relation",
                         )
                     )
-    proof = RegionCompletion(checked.sequence, checked.analyses, requirements, calls=(0,))
+    proof = RegionCompletion(checked.sequence.regions, checked.analyses, requirements, calls=(0,))
     for r in requirements:
         # Old per-pair proof is an oracle in this test, never called by planning.
         if proof.covered(r):
-            assert oracles[r.source.region].prove(r.source, r.destination, r.domain)
+            count, graph, native = oracles[r.source.region]
+            count = 3 if count is None else count
+            assert (
+                graph.path(
+                    native[r.source.task],
+                    0,
+                    native[r.destination.task],
+                    0,
+                    source_point=r.source.point,
+                    destination_point=r.destination.point,
+                    remaining=count - 1,
+                    at_end=True,
+                    _shorten=False,
+                )
+                is not None
+            )
 
 
 def test_shared_stationary_frame_writes_compose_inside_the_actual_call():
@@ -153,12 +162,12 @@ def test_parent_scalar_reader_is_retired_without_promoting_wait_to_completion():
     from xdsl_npu.completion import Requirement
 
     required = Requirement(
-        mark(seq, p, "end"),
-        mark(seq, p, "begin"),
+        mark(seq.regions, p, "end"),
+        mark(seq.regions, p, "begin"),
         CountDomain(1, 0, exact=1),
         "Scalar end cannot precede its start",
     )
-    proof = RegionCompletion(seq, checked.analyses, (required,))
+    proof = RegionCompletion(seq.regions, checked.analyses, (required,))
     assert not proof.covered(required)
 
 

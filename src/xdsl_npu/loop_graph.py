@@ -14,6 +14,7 @@ from .completion_flow import propagate_ordered
 from .ir import EndOp, InvocationSyncOp, LoopChannelOp, LoopSyncOp, RegionSyncOp, TaskOp, ViewOp
 from .loop_boundary import stream_operations
 from .model import optional_int, require
+from .native_order import instruction_points, prefix_inputs
 from .periodic import MAX_PERIOD_TEMPLATES, MAX_PROOF_STATES
 
 
@@ -450,15 +451,15 @@ class Graph:
         return tuple(path)
 
 
-def channels(loop, *, virtual=False):
-    protocol_period = loop.protocol_period
+def channels(loop, *, virtual=False, declarations=None, period=None):
+    protocol_period = loop.protocol_period if period is None else period
     result = {}
     tasks = {
         (actor, task.uid): task
         for actor, data in loop.actors.items()
         for task in data.program.tasks
     }
-    for op in loop.protocol_scope.body.block.ops:
+    for op in loop.protocol_scope.body.block.ops if declarations is None else declarations:
         if not isinstance(op, LoopChannelOp):
             continue
         name = op.sym_name.data
@@ -552,8 +553,8 @@ def channels(loop, *, virtual=False):
     return result
 
 
-def commands(loop, channel_map):
-    protocol_period = loop.protocol_period
+def commands(loop, channel_map, *, additions=(), period=None):
+    protocol_period = loop.protocol_period if period is None else period
     result, endpoints, native = {}, {}, {}
     number = 0
     for actor, data in loop.actors.items():
@@ -586,6 +587,15 @@ def commands(loop, channel_map):
                     f"unknown loop stream effect {op.name}",
                 )
         require(not pending, "trailing waits require an explicit drain contract")
+        for owner, uid, op in additions:
+            if owner != actor:
+                continue
+            require(uid in tasks, "candidate instruction targets a missing native task")
+            if op.action.data == "set":
+                # Match insert-after materialization and the reversal below.
+                after.setdefault(uid, []).insert(0, op)
+            else:
+                before.setdefault(uid, []).append(op)
         sequence = []
 
         def add(task, kind, operation=None, *, actor=actor, sequence=sequence):
@@ -706,7 +716,7 @@ def commands(loop, channel_map):
     return result, endpoints, native
 
 
-def completion_graph(loop, channel_map):
+def completion_graph(loop, channel_map, *, additions=(), period=None):
     """Linear guarded prefixes; no pairwise guard-bypass arcs.
 
     Analysis-only issue/queue/retire/implicit milestones exist at each physical
@@ -715,8 +725,8 @@ def completion_graph(loop, channel_map):
     ASC instructions or storage. A removed Wait loses all its semantic edges;
     a pure prefix cannot retain that Wait's controller gate.
     """
-    sequences, endpoints, native = commands(loop, channel_map)
-    period = loop.protocol_period
+    sequences, endpoints, native = commands(loop, channel_map, additions=additions, period=period)
+    period = loop.protocol_period if period is None else period
     count = sum(len(sequence) for sequence in sequences.values())
     require(
         period * count <= MAX_PERIOD_TEMPLATES,
@@ -740,17 +750,13 @@ def completion_graph(loop, channel_map):
                 }
                 begin = end = prefix = None
                 if residue % command.period in command.residues:
-                    begin = graph.node(command, residue, "begin"), cycle
-                    end = (
-                        (graph.node(command, residue, "end"), cycle)
-                        if command.kind in {"task", "set", "cross_set"}
-                        else begin
+                    points = instruction_points(
+                        command,
+                        milestones,
+                        lambda point, c=command, r=residue, k=cycle: (graph.node(c, r, point), k),
+                        graph.edge,
                     )
-                    if end != begin:
-                        graph.edge(begin, end)
-                    if command.kind == "task":
-                        prefix = graph.node(command, residue, "prefix"), cycle
-                        graph.edge(end, prefix)
+                    begin, end, prefix = points["begin"], points["end"], points.get("prefix")
                 timeline.append((command, milestones, begin, end, prefix))
 
         def shift(point):
@@ -778,34 +784,26 @@ def completion_graph(loop, channel_map):
             pipe = command.task.pipe
             previous_command, previous_milestones, _, previous_end, _ = prior_global
             graph.edge(previous_milestones["issue"], milestones["issue"])
-            if previous_end is not None and (
-                previous_command.kind == "cross_wait"
-                or (previous_command.kind in {"task", "wait"} and previous_command.task.pipe == "S")
-            ):
-                graph.edge(previous_end, milestones["issue"])
+            if previous_end is not None:
+                previous_points = {
+                    "begin": prior_global[2],
+                    "end": previous_end,
+                    "prefix": prior_global[4],
+                }
+                if gate := prefix_inputs(previous_command, previous_points).get("issue"):
+                    graph.edge(gate, milestones["issue"])
             old, old_milestones, old_begin, old_end, old_prefix = prior_pipe[pipe]
             for point in ("queue", "retire", "implicit"):
                 graph.edge(old_milestones[point], milestones[point])
             if old_begin is not None:
-                # FIFO start/consumption order, NEVER a Notify's completion.
-                graph.edge(old_begin, milestones["queue"])
-            if old.kind == "task" and old_end is not None:
-                graph.edge(old_end, milestones["retire"])
-                graph.edge(old_prefix, milestones["retire"])
-                if old.task.implicit_completion:
-                    graph.edge(old_end, milestones["implicit"])
-            if begin is not None:
-                graph.edge(milestones["issue"], begin)
-                graph.edge(milestones["queue"], begin)
-                if command.kind == "task":
-                    graph.edge(milestones["implicit"], begin)
-                    graph.edge(milestones["retire"], prefix)
-                elif command.kind in {"set", "cross_set", "barrier"}:
-                    graph.edge(milestones["retire"], end)
-                if command.kind == "cross_set":
-                    if command.channel in prior_send:
-                        graph.edge(prior_send[command.channel], end)
-                    prior_send[command.channel] = end
+                previous_points = {"begin": old_begin, "end": old_end, "prefix": old_prefix}
+                for point, source in prefix_inputs(old, previous_points).items():
+                    if point != "issue":
+                        graph.edge(source, milestones[point])
+            if command.kind == "cross_set" and end is not None:
+                if command.channel in prior_send:
+                    graph.edge(prior_send[command.channel], end)
+                prior_send[command.channel] = end
             prior_pipe[pipe] = prior_global = item
     for name, channel in channel_map.items():
         for residue in range(period):

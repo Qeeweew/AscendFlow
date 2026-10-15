@@ -1,6 +1,7 @@
 """Automatic synchronization and independent parametric loop checking."""
 
 from collections import defaultdict
+from math import lcm
 
 from xdsl.dialects import scf
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
@@ -9,8 +10,9 @@ from .budget import bounded
 from .ir import InvocationChannelOp, InvocationSyncOp, KernelOp, LoopChannelOp, LoopSyncOp, StreamOp
 from .loop_graph import channels, completion_graph
 from .loop_model import extract_loop, loop_dependencies
+from .loop_planning import Candidate, ProtocolSelection
 from .model import CompileError, require
-from .periodic import project, union
+from .periodic import bounded_period, project, union
 
 
 def _ints(values):
@@ -87,78 +89,6 @@ def _counter_queries(period, channel_map, endpoints):
                     )
 
 
-class _ProofSearch:
-    """Delete command families without rebuilding the guarded completion graph.
-
-    Stored paths are concrete, not just reachability bits. Removing a command
-    invalidates its FIFO, capture, notification AND controller-gate edges.
-    Only queries whose current path used that command need another search.
-    The final public verifier reconstructs a graph from actual IR independently.
-    """
-
-    def __init__(self, loop, obligations, graph, native, channel_map, endpoints):
-        self.graph = graph
-        self.queries, self.paths, self.watched = {}, {}, {}
-        self.users = defaultdict(set)
-        self.channel_queries = defaultdict(set)
-        self.omitted = frozenset()
-        self.removable = frozenset(
-            i
-            for i, node in enumerate(graph.nodes)
-            if node.command.kind != "task" and node.point in {"begin", "end"}
-        )
-        self.searches = 0
-        for _, query in _coverage_queries(obligations, graph, native):
-            self._add(query)
-        for name, query in _counter_queries(graph.period, channel_map, endpoints):
-            key = self._add(query)
-            self.channel_queries[name].add(key)
-
-    def _add(self, query):
-        source, sg, destination, dg, *minimum = query
-        key = source.index, sg, destination.index, dg, tuple(minimum)
-        if key not in self.queries:
-            self.queries[key] = query
-            path = self.graph.path(*query)
-            require(path is not None, "fixed loop schedule cannot cover a required completion")
-            self._install(key, path)
-        return key
-
-    def _install(self, key, path):
-        for node in self.watched.get(key, ()):
-            self.users[node].discard(key)
-        self.paths[key] = path
-        nodes = frozenset(n for a, b, _ in path for n in (a, b) if n in self.removable)
-        self.watched[key] = nodes
-        for node in nodes:
-            self.users[node].add(key)
-
-    def remove(self, operations, channel):
-        operations = set(operations)
-        removed = frozenset(
-            i for i in self.removable if self.graph.nodes[i].command.operation in operations
-        )
-        dropped = self.channel_queries.get(channel, set())
-        affected = set().union(*(self.users[node] for node in removed)) - dropped
-        candidate = self.omitted | removed
-        replacements = {}
-        for key in sorted(affected):
-            self.searches += 1
-            path = self.graph.path(*self.queries[key], omitted=candidate)
-            if path is None:
-                return False
-            replacements[key] = path
-        for key, path in replacements.items():
-            self._install(key, path)
-        for key in dropped:
-            self.queries.pop(key)
-            self.paths.pop(key)
-            for node in self.watched.pop(key):
-                self.users[node].discard(key)
-        self.omitted = candidate
-        return True
-
-
 def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True):
     banks, cross_ids = defaultdict(set), set()
     local_checks = []
@@ -205,9 +135,10 @@ def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True)
     for (name, _), valid in zip(local_checks, graph.covered_many(q for _, q in local_checks)):
         require(valid, f"{name}: binary event re-Set can precede its old Wait")
     if counters:
-        for name, query in _counter_queries(graph.period, channel_map, endpoints):
+        checks = tuple(_counter_queries(graph.period, channel_map, endpoints))
+        for (name, _), valid in zip(checks, graph.covered_many(q for _, q in checks)):
             require(
-                graph.path(*query) is not None,
+                valid,
                 f"{name}: mode-2 notification backlog may exceed 15",
             )
     return banks, cross_ids, len(local_checks)
@@ -252,7 +183,7 @@ def _verify_leaf(loop, *, live_in=(), _details=False):
     if loop.invocation is not None and loop.region is None:
         from .invocation_sync import verify_invocation
 
-        invocation_report = verify_invocation(loop, channel_map, graph, endpoints, native)
+        invocation_report = verify_invocation(loop, channel_map, graph, sequence)
     report = {
         **invocation_report,
         "kernel": loop.op.sym_name.data,
@@ -377,14 +308,13 @@ def _sync(stream, action, channel, lower, upper, period, residues):
     )
 
 
-def _install(loop, specs, barriers):
+def _candidates(loop, specs, barriers):
     operations = []
     for actor, uid, lower, family in barriers:
         data = loop.actors[actor]
         period, chosen = family
         op = _sync(data.stream, "barrier", "", lower, 0, period, chosen)
-        data.operations[uid].parent.insert_op_before(op, data.operations[uid])
-        operations.append((None, [op]))
+        operations.append(Candidate(None, ((actor, uid, op),)))
     for number, (kind, sources, destinations, distance, family, terminal) in enumerate(specs):
         period, chosen = family
         name = f"loop_c{number}"
@@ -403,33 +333,44 @@ def _install(loop, specs, barriers):
                 **({"last": IntAttr(1)} if terminal else {}),
             }
         )
-        scope = loop.protocol_scope.body.block
-        first_region = (
-            scope.first_op
-            if loop.region is not None
-            else next(
-                child for child in scope.ops if isinstance(child, (StreamOp, KernelOp, scf.ForOp))
-            )
-        )
-        scope.insert_op_before(op, first_region)
         placed = []
         for actor, uid in sources:
             data = loop.actors[actor]
             sync = _sync(data.stream, "set", name, 0, distance, period, chosen)
             if terminal:
                 sync.attributes["last_gap"] = IntAttr(distance)
-            data.operations[uid].parent.insert_op_after(sync, data.operations[uid])
-            placed.append(sync)
+            placed.append((actor, uid, sync))
         shifted = tuple(sorted((r + distance) % period for r in chosen))
         for actor, uid in destinations:
             data = loop.actors[actor]
             sync = _sync(data.stream, "wait", name, distance, 0, period, shifted)
             if terminal:
                 sync.attributes["last_gap"] = IntAttr(0)
-            data.operations[uid].parent.insert_op_before(sync, data.operations[uid])
-            placed.append(sync)
-        operations.append((op, placed))
+            placed.append((actor, uid, sync))
+        operations.append(Candidate(op, tuple(placed)))
     return operations
+
+
+def _materialize(loop, candidates, selected):
+    scope = loop.protocol_scope.body.block
+    first = (
+        scope.first_op
+        if loop.region is not None
+        else next(op for op in scope.ops if isinstance(op, (StreamOp, KernelOp, scf.ForOp)))
+    )
+    for index, candidate in enumerate(candidates):
+        if not selected & (1 << index):
+            for _, _, op in candidate.placements:
+                op.drop_all_references()
+            continue
+        if candidate.declaration is not None:
+            scope.insert_op_before(candidate.declaration, first)
+        for actor, uid, op in candidate.placements:
+            target = loop.actors[actor].operations[uid]
+            if op.action.data == "set":
+                target.parent.insert_op_after(op, target)
+            else:
+                target.parent.insert_op_before(op, target)
 
 
 def _proposals(loop, obligations):
@@ -510,26 +451,61 @@ def _plan_leaf(loop, *, live_in=(), banks=None):
         "AutoSync expects an unsynchronized symbolic loop",
     )
     specs, barriers = _proposals(loop, obligations)
-    installed = _install(loop, specs, barriers)
-
-    def check():
-        channel_map = channels(loop, virtual=True)
-        graph, _, endpoints, native = completion_graph(loop, channel_map)
-        graph.potential()
-        _coverage(loop, obligations, graph, native)
-        _lifetime(loop, channel_map, graph, endpoints, local=False)
-        return graph, channel_map, endpoints, native
-
-    graph, channel_map, endpoints, native = check()
-    search = _ProofSearch(loop, obligations, graph, native, channel_map, endpoints)
-    # Whole-group paths can retire local storage as well. Every deletion is
-    # checked over the same symbolic query domains, including boundary guards.
-    for channel, operations in reversed(installed):
-        name = None if channel is None else channel.sym_name.data
-        if search.remove(operations, name):
-            for op in ([channel] if channel is not None else []) + operations:
-                op.parent.erase_op(op)
-    graph, channel_map, endpoints, _ = check()
+    candidates = _candidates(loop, specs, barriers)
+    additions = tuple(p for c in candidates for p in c.placements)
+    period = 1
+    for _, _, op in additions:
+        period = bounded_period(lcm(period, op.period.data), "candidate synchronization predicates")
+    declarations = [c.declaration for c in candidates if c.declaration is not None]
+    channel_map = channels(loop, virtual=True, declarations=declarations, period=period)
+    graph, _, endpoints, native = completion_graph(
+        loop, channel_map, additions=additions, period=period
+    )
+    # Establish producer->consumer readiness before storage reuse, and inspect
+    # the latest real reader first at a common consumer. A selected prefix can
+    # then cover earlier accesses without manufacturing extra notifications.
+    # These are selection priorities; all coverage still needs real edges.
+    memory = tuple(
+        sorted(
+            _coverage_queries(obligations, graph, native),
+            key=lambda item: (
+                {"RAW": 0, "WAR": 1, "WAW": 2}[item[0].hazard],
+                item[1][2].task.stage,
+                item[1][2].index,
+                -(item[1][1] + item[1][0].task.stage - item[1][3]),
+                -item[1][0].index,
+            ),
+        )
+    )
+    counters = tuple(_counter_queries(graph.period, channel_map, endpoints))
+    selection = ProtocolSelection(
+        graph, candidates, [q for _, q in memory] + [q for _, q in counters]
+    )
+    for obligation, query in memory:
+        selection.ensure(
+            query,
+            f"fixed schedule cannot cover {obligation.hazard}: "
+            f"{obligation.source} -> {obligation.destination}",
+        )
+    # Newly selected cross-core channels introduce real finite backlog duties.
+    # Activate support for these duties too; each pass only adds protocols.
+    owners = {
+        c.declaration.sym_name.data: i
+        for i, c in enumerate(candidates)
+        if c.declaration is not None
+    }
+    previous = -1
+    while previous != selection.selected:
+        previous = selection.selected
+        for name, query in counters:
+            if selection.selected & (1 << owners[name]):
+                selection.ensure(query, f"{name}: mode-2 notification backlog may exceed 15")
+    _materialize(loop, candidates, selection.selected)
+    channel_map = channels(loop, virtual=True)
+    graph, _, endpoints, native = completion_graph(loop, channel_map)
+    graph.potential()
+    _coverage(loop, obligations, graph, native)
+    _lifetime(loop, channel_map, graph, endpoints, local=False)
     banks, cross_id = (defaultdict(int) if banks is None else banks), 0
     for name, channel in channel_map.items():
         op = next(
