@@ -31,12 +31,19 @@ class Compilation:
     _schedule_json: str
 
     def __init__(
-        self, module, *, synchronize=True, host_launcher=True, timeout_s=60.0, cancel=None
+        self,
+        module,
+        *,
+        synchronize=True,
+        host_launcher=True,
+        timeout_s=60.0,
+        cancel=None,
+        load3d=False,
     ):
         with limit(timeout_s, cancel):
-            self._build(module, synchronize=synchronize, host_launcher=host_launcher)
+            self._build(module, synchronize=synchronize, host_launcher=host_launcher, load3d=load3d)
 
-    def _build(self, module, *, synchronize, host_launcher):
+    def _build(self, module, *, synchronize, host_launcher, load3d):
         started = perf_counter()
         poll("frontend")
         require(type(synchronize) is bool, "synchronize must be an explicit boolean policy")
@@ -55,6 +62,14 @@ class Compilation:
             physical = lower_source(module)
         else:
             physical = module
+        require(
+            type(load3d) is bool and (not load3d or synchronize),
+            "Load3D selection requires an unsynchronized compilation",
+        )
+        if load3d:
+            from .load3d import select_load3d
+
+            physical = select_load3d(physical)
         lowered = perf_counter()
         poll("synchronization planning")
         checked = []
@@ -158,7 +173,9 @@ class Compilation:
             (directory / "witnesses.json").write_text(json.dumps(self.explain(), indent=2) + "\n")
 
 
-def compile(module, *, synchronize=True, host_launcher=True, timeout_s=60.0, cancel=None):
+def compile(
+    module, *, synchronize=True, host_launcher=True, timeout_s=60.0, cancel=None, load3d=False
+):
     """Typed source or physical IR -> frozen code, proof summary, and IR snapshots."""
     return Compilation(
         module,
@@ -166,4 +183,5 @@ def compile(module, *, synchronize=True, host_launcher=True, timeout_s=60.0, can
         host_launcher=host_launcher,
         timeout_s=timeout_s,
         cancel=cancel,
+        load3d=load3d,
     )

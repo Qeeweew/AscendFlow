@@ -1,6 +1,7 @@
 """ASC loops with uniform runtime counts and guarded event ordinals."""
 
-from .codegen import QUALIFIER, native_line
+from .asc_scalar import ScalarScope
+from .codegen import QUALIFIER, load3d_init, native_line
 from .ir import InvocationChannelOp, MixedOp, OnceOp
 from .model import ITEMSIZE, storage_layout
 from .scalar import bindings, from_ssa
@@ -29,20 +30,25 @@ def _guard(command, channel=None):
     return " && ".join(terms)
 
 
-def _ordinal(channel, epoch):
-    if channel.period == 1:
-        return epoch
-    rank = " + ".join(f"(({epoch}) % {channel.period} >= {r})" for r in channel.residues)
-    return f"(({epoch}) / {channel.period} * {len(channel.residues)} + {rank} - 1)"
-
-
-def _event(channel, epoch):
+def _event(channel, epoch, scalar):
     if len(channel.ids) == 1:
-        return str(channel.ids[0])
-    ordinal = _ordinal(channel, epoch)
-    choices = str(channel.ids[-1])
+        return scalar.value(channel.ids[0])
+    if channel.period == 1:
+        ordinal = epoch
+    else:
+        rank = scalar.value(0)
+        for residue in channel.residues:
+            rank = scalar.add(
+                rank, scalar.select_lt(scalar.rem(epoch, channel.period), residue, 0, 1)
+            )
+        ordinal = scalar.sub(
+            scalar.add(scalar.mul(scalar.div(epoch, channel.period), len(channel.residues)), rank),
+            1,
+        )
+    index = scalar.rem(ordinal, len(channel.ids))
+    choices = scalar.value(channel.ids[-1])
     for i in range(len(channel.ids) - 2, -1, -1):
-        choices = f"(({ordinal}) % {len(channel.ids)} == {i} ? {channel.ids[i]} : {choices})"
+        choices = scalar.select_eq(index, i, channel.ids[i], choices)
     return choices
 
 
@@ -82,13 +88,14 @@ def _region_lines(
         lines.append(f"  for (int64_t step = 0; step < n + {maximum}; ++step) {{")
     for command in sequences[actor]:
         task = command.task
+        scalar = ScalarScope()
         lines += [
             f"    {{ // {actor}/{task.uid}: {command.kind}, stage {task.stage}",
             f"      const int64_t g = step - {task.stage};",
             "      if (g >= 0 && g < n) {",
         ]
         if command.kind == "task":
-            code = native_line(task, "n", "core_id", uniform_names=uniform_names)
+            code = native_line(task, "n", "core_id", uniform_names=uniform_names, scalar=scalar)
             if boundary is not None:
                 code = boundary(task, code)
             for protocol in invocation_channels:
@@ -113,7 +120,9 @@ def _region_lines(
         else:
             channel = channel_map[command.channel]
             epoch = (
-                "g" if command.kind.endswith("set") or channel.carry else f"g - {channel.distance}"
+                scalar.value("g")
+                if command.kind.endswith("set") or channel.carry
+                else scalar.sub("g", channel.distance)
             )
             if channel.kind == "cross":
                 function = (
@@ -125,12 +134,12 @@ def _region_lines(
             else:
                 a, b = tasks[channel.sources[0]].pipe, tasks[channel.destinations[0]].pipe
                 function = "asc_sync_notify" if command.kind == "set" else "asc_sync_wait"
-                code = f"{function}(PIPE_{a}, PIPE_{b}, event_t({_event(channel, epoch)})); // {channel.name}"
+                code = f"{function}(PIPE_{a}, PIPE_{b}, event_t({scalar.use(_event(channel, epoch, scalar))})); // {channel.name}"
         guard = _guard(command, channel_map.get(command.channel))
         if guard:
             body, marker, comment = code.partition("//")
             code = f"if ({guard}) {{ {body.strip()} }}" + (f" //{comment}" if marker else "")
-        lines.append(f"        {code}")
+        lines.extend(f"        {line}" for line in scalar.finish([code]))
         lines += ["      }", "    }"]
     lines.append("  }")
     if invocation is not None:
@@ -218,6 +227,7 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
                 "  asc_sync_notify(PIPE_S, PIPE_FIX, event_t(0));",
                 "  asc_sync_wait(PIPE_S, PIPE_FIX, event_t(0));",
             ]
+        lines += load3d_init(data.program.load3d)
         if sequence is None:
             lines += _region_lines(
                 actor,

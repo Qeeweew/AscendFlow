@@ -25,15 +25,12 @@ def run_attention(
 
     from xdsl_npu.codegen import emit_asc
     from xdsl_npu.device import ACL, health_snapshot
+    from xdsl_npu.performance import hardware_snapshot
     from xdsl_npu.sync import verify_plan
 
     verification = verify_plan(plan)
-    roots, attrs, name = attention_description(plan)
+    roots, _, name = attention_description(plan)
     require(backend in {"generated", "aclnn"}, "attention backend must be generated or aclnn")
-    require(
-        backend != "aclnn" or not attrs["attention_causal"].data,
-        "the ACLNN comparison currently implements the dense BNSD variant",
-    )
     manifest = json.loads(shared_library.with_suffix(".compile.json").read_text())
     sha = lambda data: hashlib.sha256(data).hexdigest()
     require(
@@ -48,12 +45,14 @@ def run_attention(
     raw, expected, selected, report = attention_inputs(plan, scope=scope, data_case=data_case)
     # Snapshot ALL cards after host preparation, immediately before ACL use.
     health = health_snapshot(physical, output)
+    hardware = hardware_snapshot(physical)
     runtime = ACL()
     baseline = None
     try:
         parameters = list(roots)
         selected_parameters = parameters if backend == "generated" else ["q", "k", "v", "output"]
-        pointers = {root: runtime.allocate(raw[root]) for root in selected_parameters}
+        guard = b"\x5a" * 128
+        pointers = {root: runtime.allocate(raw[root] + guard) for root in selected_parameters}
         if backend == "generated":
             library = ct.CDLL(str(shared_library.resolve()))
             kernel = getattr(library, f"launch_{name}")
@@ -71,6 +70,8 @@ def run_attention(
                 report["shape_b_hq_hkv_sq_sk_d"],
                 report["dtype"],
                 report["softmax_scale_f32"],
+                causal=report["causal"],
+                query_start=report["query_start"],
             )
             launch = baseline
         for _ in range(warmup):
@@ -105,10 +106,20 @@ def run_attention(
             start,
             stop,
         )
+        for root, pointer in pointers.items():
+            require(
+                runtime.read(ct.c_void_p(pointer.value + len(raw[root])), len(guard)) == guard,
+                f"{root} allocation guard changed",
+            )
+            if root in {"q", "k", "v"}:
+                require(runtime.read(pointer, len(raw[root])) == raw[root], f"input {root} changed")
+        after = runtime.read(pointers["output"], len(raw["output"]))
+        require(after == actual_bytes, "repeated launches changed the checked output")
         report.update(
             kernel=name,
             backend=backend,
             health=health,
+            hardware=hardware,
             verification=verification,
             warmup=warmup,
             repeats=repeats,
@@ -118,6 +129,8 @@ def run_attention(
             finite_output_elements=int(actual.size),
             stream_interval_us_per_launch=elapsed.value * 1000 / repeats,
             timing_scope="ACL event stream interval; includes submission gaps; not kernel-only",
+            guards_checked=list(pointers),
+            inputs_unchanged=True,
             compiled_source_sha256=manifest["source_sha256"],
             shared_sha256=manifest["shared_sha256"],
             argument_sha256={root: sha(raw[root]) for root in parameters},

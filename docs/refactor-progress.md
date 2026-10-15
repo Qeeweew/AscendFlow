@@ -10,6 +10,15 @@ ACLNN284.696μs；已有8192×4096 RMS normalization：218.346/235.884μs。
 均有全输出检查，政策、限制、复现和硬件分析见[Vector算子验证](vector-row-performance.md)。
 完整新AST FA仍未贯通。以下保留直接生成基线的实现记录。
 
+ASC输出的地址偏移和event编号已接入xDSL现成`canonicalize/cse`，异步指令不参与
+这些pass；没有追加范围/guard优化。25项定向回归通过，同一4K FA的新ASC已离线
+编译，尚无新设备测量。[范围与复现](event-allocation.md#asc纯整数表达式接入标准pass)。
+
+随后对legacy FA的ASC与ops-transformer进行源码/设备对照：整块Vec2等待位置和
+分层max归约使4K MHA从同批旧政策1310.356μs降到三批中位数698.726μs；ACLNN
+512.678μs，仍慢36%。8K BF16 GQA单批2262.544/1687.266μs。最终代码包含上述
+标准pass；性能、数值范围、硬件条件分析及300秒构建命令见[FA记录](flash-attention.md)。
+
 更新：2026-10-15。直接生成迁移以 `61c5d06` / `760278f` 为审查基线。
 **叶流水已删除候选路线搜索；层次状态压缩、一般nested CV和完整AST FA尚未完成。**
 当前路线见[计划](refactor-plan.md)，算法与复杂度见[设计](design.md)。

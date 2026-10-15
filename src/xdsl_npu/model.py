@@ -24,6 +24,7 @@ from .ir import (
     EndOp,
     FixConfigOp,
     KernelOp,
+    Load3DConfigOp,
     RefType,
     StreamOp,
     SyncOp,
@@ -244,6 +245,7 @@ class Program:
     config: bool
     blocks: int = 1
     epoch_divisor: int = 1
+    load3d: tuple[int, int] | None = None
 
     @cached_property
     def _semantic_instances(self):
@@ -280,6 +282,10 @@ class Program:
 
 
 def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...]):
+    if native in {"load3d_a", "load3d_b_nn"}:
+        # Complete b16 matrix, unit filters/strides, zero padding. Layout and
+        # byte footprints are identical to the corresponding audited Load2D.
+        return native_contract("load2d_a" if native == "load3d_a" else "load2d_b_nn", refs, params)
     banks = tuple(r.storage.bank for r in refs)
     dtypes = tuple(r.dtype for r in refs)
     lengths = tuple(r.total_nbytes for r in refs)
@@ -575,6 +581,20 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "plane reduction writes one compact row-statistic plane for each aligned 64-column chunk",
         )
         return "V", ("R", "W")
+    if native == "reduce_max8":
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous for r in refs)
+            and lengths[0] >= 256
+            and lengths[0] % 256 == 0
+            and lengths[0] == 8 * lengths[1]
+            and not params,
+            "datablock max needs contiguous f32 UB, whole 64-element repeats, and one result per eight inputs",
+        )
+        return "V", ("R", "W")
     if native in {"reduce_sum64", "reduce_max64"}:
         require(len(params) == 2, "native reduction needs (rows, columns)")
         rows, cols = params
@@ -785,6 +805,7 @@ def extract(module: ModuleOp) -> Program:
     roots: dict[SSAValue, Storage] = {}
     names = set()
     config = False
+    load3d = None
     seen_stream = False
     for op in kernel.body.block.ops:
         if isinstance(op, StreamOp):
@@ -804,7 +825,18 @@ def extract(module: ModuleOp) -> Program:
             )
             names.add(name)
             require(
-                name not in {"g", "step", "core_id", "stream", "npu_row", "npu_chunk"}
+                name
+                not in {
+                    "g",
+                    "step",
+                    "core_id",
+                    "stream",
+                    "npu_row",
+                    "npu_chunk",
+                    "npu_fa",
+                    "npu_fb",
+                    "npu_rpt",
+                }
                 and not name.startswith("npu_value_"),
                 "storage name conflicts with internal ASC variables",
             )
@@ -840,6 +872,16 @@ def extract(module: ModuleOp) -> Program:
                 "FIX configuration must be unique, unconditional and before the stream",
             )
             config = True
+        elif isinstance(op, Load3DConfigOp):
+            require(
+                not seen_stream and load3d is None and kernel.core.data == "aic",
+                "Load3D configuration must be unique, unconditional and before the stream",
+            )
+            load3d = op.a_width.data, op.b_width.data
+            require(
+                all(16 <= w <= 256 and w % 16 == 0 for w in load3d),
+                "invalid invariant Load3D fmatrix width",
+            )
         elif not isinstance(op, (ChannelOp, EndOp)):
             raise CompileError(f"unsupported kernel operation {op.name}; cannot ignore effects")
     require(kernel.disjoint_external.data in {0, 1}, "noalias contract must be boolean")
@@ -1165,6 +1207,7 @@ def extract(module: ModuleOp) -> Program:
                 f"unsupported stream operation {op.name}; dynamic control needs a contract"
             )
     require(tasks, "stream must contain native tasks")
+    check_load3d(tasks, load3d)
     require(
         sum(sum(t.active(g) for g in range(count)) for t in tasks) <= MAX_INSTANCES,
         f"finite verifier budget exceeded ({MAX_INSTANCES} task instances); no unchecked fallback",
@@ -1185,9 +1228,26 @@ def extract(module: ModuleOp) -> Program:
         config,
         blocks,
         epoch_divisor,
+        load3d,
     )
     verify_independent_owners(program)
     return program
+
+
+def check_load3d(tasks, config):
+    """Only the explicit root initializer may write the Load3D register state.
+
+    All other admitted natives preserve it; opaque/external calls are rejected
+    by native_contract. The initializer's local S->MTE1 pair is fully consumed
+    before stream dispatch, so event ID0 has no lifetime inside any loop.
+    """
+    for task in tasks:
+        if task.native in {"load3d_a", "load3d_b_nn"}:
+            index = 0 if task.native == "load3d_a" else 1
+            require(
+                config is not None and config[index] == task.params[0],
+                "Load3D needs a preceding matching invariant FMATRIX configuration",
+            )
 
 
 def verify_independent_owners(program):

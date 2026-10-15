@@ -202,6 +202,7 @@ def _runtime_leaf(analysis, arguments):
         "terminal_drains": len(loop.actors) * loop.groups,
         "initial_fix_handshakes": sum(data.program.config for data in loop.actors.values())
         * loop.groups,
+        "initial_load3d_handshakes": sum(data.program.load3d is not None for data in loop.actors.values()) * loop.groups,
         "local_peak_bytes_per_actor": peaks,
         "declared_gm_working_set_bytes": footprint,
         "scope": "instruction-requested footprints; not HBM transactions, measured bandwidth, or hardware FLOP peak",
@@ -416,6 +417,7 @@ def physical_work(plan, *, useful_cube_flops=None):
         "sync_instructions": dict(syncs),
         "local_bank_bytes_by_actor": capacities,
         "terminal_pipe_all_calls": sum(m.op.blocks.data * 3 for m in mixed_programs),
+        "initial_load3d_handshakes": sum(m.op.blocks.data * sum(p.load3d is not None for p in m.programs.values()) for m in mixed_programs),
         "scope": "exact finite Cube/DMA work; masked Vector call counts are upper bounds; no inferred DRAM misses or CANN reference traffic",
     }
 

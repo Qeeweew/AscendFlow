@@ -21,6 +21,7 @@ from .ir import (
     InvocationChannelOp,
     InvocationSyncOp,
     KernelOp,
+    Load3DConfigOp,
     LoopChannelOp,
     LoopSyncOp,
     MixedOp,
@@ -39,6 +40,7 @@ from .model import (
     Ref,
     Storage,
     Task,
+    check_load3d,
     native_contract,
     optional_int,
     ranges_overlap,
@@ -60,6 +62,7 @@ class Templates:
     tasks: tuple[Task, ...]
     config: bool
     blocks: int
+    load3d: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +198,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
     )
     declarations, streams = dict(shared), []
     config = False
+    load3d = None
     for op in kernel.body.block.ops:
         if isinstance(op, BufferOp):
             declarations[op.ref] = _storage(op, limit, uniform_values)
@@ -215,6 +219,16 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 "FIX config is unique and precedes the stream",
             )
             config = True
+        elif isinstance(op, Load3DConfigOp):
+            require(
+                load3d is None and kernel.core.data == "aic" and not streams,
+                "Load3D configuration must be unique and precede the stream",
+            )
+            load3d = op.a_width.data, op.b_width.data
+            require(
+                all(16 <= w <= 256 and w % 16 == 0 for w in load3d),
+                "invalid invariant Load3D fmatrix width",
+            )
         else:
             require(
                 isinstance(op, (RuntimeSizeOp, LoopChannelOp, InvocationChannelOp, EndOp))
@@ -479,12 +493,19 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 f"unsupported symbolic effect {op.name}",
             )
     require(tasks, "actor has no native task template")
+    check_load3d(tasks, load3d)
     return Actor(
         name,
         kernel,
         stream,
         Templates(
-            name, kernel.core.data, tuple(declarations.values()), tuple(tasks), config, groups
+            name,
+            kernel.core.data,
+            tuple(declarations.values()),
+            tuple(tasks),
+            config,
+            groups,
+            load3d,
         ),
         operations,
     ), views

@@ -1,5 +1,8 @@
 """ASC emission consumes verified final IR; no instruction selection or hidden DMA."""
 
+from functools import partial
+
+from .asc_scalar import ScalarScope
 from .ir import TaskOp
 from .model import ITEMSIZE, Ref, optional_int, storage_layout
 from .sync import execution, parts, verify_plan
@@ -15,34 +18,42 @@ QUALIFIER = {
 CTYPE = {"f32": "float", "f16": "half", "bf16": "bfloat16_t"}
 
 
-def pointer(ref: Ref, g="g", *, core="0", extra=""):
-    terms = []
+def pointer(ref: Ref, g="g", *, core="0", extra="", scalar):
+    address = scalar.value(0)
     if ref.count_offset:
-        terms.append(f"n * {ref.count_offset}")
+        address = scalar.add(address, scalar.mul("n", ref.count_offset))
     if ref.count_core_stride:
-        terms.append(f"n * ({core}) * {ref.count_core_stride}")
+        address = scalar.add(address, scalar.mul(scalar.mul("n", core), ref.count_core_stride))
     for offset, stride, modulus, divisor in ref.terms:
-        if offset:
-            terms.append(str(offset))
+        address = scalar.add(address, offset)
         if stride:
-            index = f"({g} / {divisor})" if divisor != 1 else g
-            index = f"({index} % {modulus})" if modulus else index
-            terms.append(f"{stride} * {index}")
+            index = scalar.div(g, divisor)
+            if modulus:
+                index = scalar.rem(index, modulus)
+            address = scalar.add(address, scalar.mul(stride, index))
     if core != "0":
         for stride, divisor, modulus in ref.core_terms:
-            index = f"({core} / {divisor})" if divisor != 1 else core
-            index = f"({index} % {modulus})" if modulus else index
-            terms.append(f"{stride} * {index}")
+            index = scalar.div(core, divisor)
+            if modulus:
+                index = scalar.rem(index, modulus)
+            address = scalar.add(address, scalar.mul(stride, index))
+    address = scalar.use(address)
     if extra:
-        terms.append(extra)
-    address = " + ".join(terms) or "0"
+        # These are indices of native-internal row/chunk loops. Keep them in
+        # those loops; the scalar scope only owns the task's base address.
+        address += f" + {extra}"
     q = QUALIFIER[ref.storage.bank]
     return f"({q} {CTYPE[ref.dtype]}*)({ref.storage.name} + ({address}))"
 
 
-def native_line(task, count, core="0", *, uniform_names=None):
+def native_line(task, count, core="0", *, uniform_names=None, scalar=None):
+    if scalar is None:
+        scalar = ScalarScope()
+        code = native_line(task, count, core, uniform_names=uniform_names, scalar=scalar)
+        return "\n".join(scalar.finish([code]))
+    ptr = partial(pointer, scalar=scalar)
     refs = task.refs
-    p = [pointer(r, core=core) for r in refs]
+    p = [ptr(r, core=core) for r in refs]
 
     def length(ref, unit=1):
         base = ref.total_nbytes // unit
@@ -94,7 +105,7 @@ def native_line(task, count, core="0", *, uniform_names=None):
     if task.native in {"exp", "rsqrt", "sqrt"}:
         return f"asc_{task.native}({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
     if task.native == "scalar_load":
-        source = pointer(refs[0], core=core).replace("__ubuf__ float*", "__ubuf__ volatile float*")
+        source = ptr(refs[0], core=core).replace("__ubuf__ float*", "__ubuf__ volatile float*")
         return f"npu_value_{task.uid} = *({source});"
     if task.native in {"vector_copy", "brcb8", "broadcast_rows64"}:
         bits = [value.replace("float*", "uint32_t*") for value in p]
@@ -111,7 +122,7 @@ def native_line(task, count, core="0", *, uniform_names=None):
         return f"asc_duplicate({p[0]}, {value}, uint32_t({length(refs[0], 4)}));"
     if task.native == "mask_causal":
         rows, cols, block_q, qt, first, owner_row, start = task.params
-        dst = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4} + npu_chunk * 256")
+        dst = ptr(refs[0], core=core, extra=f"npu_row * {cols * 4} + npu_chunk * 256")
         return (
             "asc_set_mask_norm(); "
             f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
@@ -123,7 +134,7 @@ def native_line(task, count, core="0", *, uniform_names=None):
         )
     if task.native == "mask_prefix":
         rows, cols, prefix = task.params
-        dst = pointer(refs[0], core=core, extra="npu_chunk * 256")
+        dst = ptr(refs[0], core=core, extra="npu_chunk * 256")
         return (
             "asc_set_mask_norm(); "
             f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
@@ -139,17 +150,17 @@ def native_line(task, count, core="0", *, uniform_names=None):
             # Repeat across the columns of one row. The eight identical
             # scalar words stay fixed (block/repeat strides 0/0); the full
             # matrix footprint and the exact in-place policy are unchanged.
-            src = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4}")
-            scalar = pointer(refs[1], core=core, extra="npu_row * 32")
-            dst = pointer(refs[2], core=core, extra=f"npu_row * {cols * 4}")
+            src = ptr(refs[0], core=core, extra=f"npu_row * {cols * 4}")
+            scalar = ptr(refs[1], core=core, extra="npu_row * 32")
+            dst = ptr(refs[2], core=core, extra=f"npu_row * {cols * 4}")
             return (
                 "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
                 f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
                 f"asc_{function}({dst}, {src}, {scalar}, uint8_t({cols // 64}), "
                 "1, 1, 0, 8, 8, 0); }"
             )
-        src = pointer(refs[0], core=core, extra="npu_chunk * 256")
-        dst = pointer(refs[2], core=core, extra="npu_chunk * 256")
+        src = ptr(refs[0], core=core, extra="npu_chunk * 256")
+        dst = ptr(refs[2], core=core, extra="npu_chunk * 256")
         return (
             "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
             f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
@@ -183,7 +194,7 @@ def native_line(task, count, core="0", *, uniform_names=None):
         return f"{function}({p[1]}, {p[0]}, {value}, uint32_t({length(refs[0], 4)}));"
     if task.native in {"mul_rows", "sub_rows", "add_rows", "div_rows"}:
         rows, cols = task.params
-        pp = [pointer(r, core=core, extra=f"npu_row * {r.row_stride}") for r in refs]
+        pp = [ptr(r, core=core, extra=f"npu_row * {r.row_stride}") for r in refs]
         function = task.native.removesuffix("_rows")
         return (
             f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
@@ -196,13 +207,15 @@ def native_line(task, count, core="0", *, uniform_names=None):
             if task.native == "reduce_tile_sum64"
             else "asc_repeat_reduce_max_only_value"
         )
-        src = pointer(refs[0], core=core, extra="npu_chunk * 256")
-        dst = pointer(refs[1], core=core, extra=f"npu_chunk * {rows * 4}")
+        src = ptr(refs[0], core=core, extra="npu_chunk * 256")
+        dst = ptr(refs[1], core=core, extra=f"npu_chunk * {rows * 4}")
         return (
             "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
             f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
             f"{function}({dst}, {src}, uint8_t({rows}), 1, 1, {cols // 8}); }}"
         )
+    if task.native == "reduce_max8":
+        return f"asc_datablock_reduce_max({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
     if task.native in {"reduce_sum64", "reduce_max64"}:
         rows, cols = task.params
         function = (
@@ -212,8 +225,8 @@ def native_line(task, count, core="0", *, uniform_names=None):
         )
         if refs[1].contiguous:
             return f"{function}({p[1]}, {p[0]}, uint32_t({rows * cols}));"
-        src = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4}")
-        dst = pointer(refs[1], core=core, extra=f"npu_row * {refs[1].row_stride}")
+        src = ptr(refs[0], core=core, extra=f"npu_row * {cols * 4}")
+        dst = ptr(refs[1], core=core, extra=f"npu_row * {refs[1].row_stride}")
         return (
             f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
             f"{function}({dst}, {src}, uint32_t({cols})); }}"
@@ -227,8 +240,8 @@ def native_line(task, count, core="0", *, uniform_names=None):
         "stat_sqrt",
     }:
         rows = task.params[0]
-        src = pointer(refs[0], core=core, extra=f"npu_row * {refs[0].row_stride}")
-        dst = pointer(refs[1], core=core, extra=f"npu_row * {refs[1].row_stride}")
+        src = ptr(refs[0], core=core, extra=f"npu_row * {refs[0].row_stride}")
+        dst = ptr(refs[1], core=core, extra=f"npu_row * {refs[1].row_stride}")
         if task.native.startswith("merge"):
             function = (
                 "asc_repeat_reduce_sum"
@@ -244,8 +257,8 @@ def native_line(task, count, core="0", *, uniform_names=None):
         return f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ {call} }}"
     if task.native in {"mul_gamma", "add_bias"}:
         rows, cols = task.params
-        src = pointer(refs[0], core=core, extra=f"npu_row * {cols * 4}")
-        dst = pointer(refs[2], core=core, extra=f"npu_row * {cols * 4}")
+        src = ptr(refs[0], core=core, extra=f"npu_row * {cols * 4}")
+        dst = ptr(refs[2], core=core, extra=f"npu_row * {cols * 4}")
         return (
             f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
             f"asc_{'mul' if task.native == 'mul_gamma' else 'add'}"
@@ -253,7 +266,7 @@ def native_line(task, count, core="0", *, uniform_names=None):
         )
     if task.native in {"stat_fill", "stat_div"}:
         rows = task.params[0]
-        pp = [pointer(r, core=core, extra=f"npu_row * {r.row_stride}") for r in refs]
+        pp = [ptr(r, core=core, extra=f"npu_row * {r.row_stride}") for r in refs]
         if task.native == "stat_fill":
             call = f"asc_duplicate({pp[0]}, float({task.scalar!r}), uint32_t(1));"
         else:
@@ -265,10 +278,19 @@ def native_line(task, count, core="0", *, uniform_names=None):
             f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, {rows}, {cols}, 0, "
             f"{refs[0].row_stride // 2}, {rows}, 1, 0);"
         )
+    if task.native in {"load3d_a", "load3d_b_nn"}:
+        rows, cols = task.params
+        a = task.native == "load3d_a"
+        dst = p[1].replace("bfloat16_t*", "half*")
+        src = p[0].replace("bfloat16_t*", "half*")
+        return (
+            f"asc_copy_l12l0{'a' if a else 'b'}({dst}, {src}, {cols}, {rows}, 0, 0, "
+            f"1, 1, 1, 1, 1, 1, 0, 0, false, {str(not a).lower()}, {cols});"
+        )
     if task.native == "load2d_a":
         rows, cols = task.params
-        src = pointer(refs[0], core=core, extra="npu_chunk * 512")
-        dst = pointer(refs[1], core=core, extra=f"npu_chunk * {cols * 32}")
+        src = ptr(refs[0], core=core, extra="npu_chunk * 512")
+        dst = ptr(refs[1], core=core, extra=f"npu_chunk * {cols * 32}")
         return (
             f"for (int npu_chunk = 0; npu_chunk < {rows // 16}; ++npu_chunk) {{ "
             f"asc_copy_l12l0a({dst}, {src}, 0, {cols // 16}, {rows // 16}, 0); }}"
@@ -278,8 +300,8 @@ def native_line(task, count, core="0", *, uniform_names=None):
         return f"asc_copy_l12l0b({p[1]}, {p[0]}, 0, {rows * cols // 256}, 1, 0);"
     if task.native == "load2d_b_nn":
         rows, cols = task.params  # B[K,N] compact zN -> L0B ZN
-        src = pointer(refs[0], core=core, extra="npu_chunk * 512")
-        dst = pointer(refs[1], core=core, extra=f"npu_chunk * {cols * 32}")
+        src = ptr(refs[0], core=core, extra="npu_chunk * 512")
+        dst = ptr(refs[1], core=core, extra=f"npu_chunk * {cols * 32}")
         # CANN 9.1/2201's public asc_copy_l12l0b has no classic transpose
         # parameter; the similarly named *_transpose is a 3510 API. Use
         # the exact audited dav_c220 LoadData2D intrinsic with transpose=true,
@@ -311,6 +333,22 @@ def native_line(task, count, core="0", *, uniform_names=None):
     if task.native == "fix16":
         return f"asc_copy_l0c2gm({p[1]}, {p[0]}, 16, 16, 16, 16, 0, 0, 0, false, true);"
     raise AssertionError("unvalidated native recipe")
+
+
+def load3d_init(config):
+    if config is None:
+        return []
+    a, b = config
+    return [
+        "  // Invariant dav-2201 Load3D SPRs; width low, height high (raw contract).",
+        f"  asc_l13d_fmatrix_config npu_fa = {{ .config = uint64_t({a}) | (uint64_t(1) << 16) }};",
+        f"  asc_l13d_fmatrix_config npu_fb = {{ .config = uint64_t({b}) | (uint64_t(1) << 16) }};",
+        "  asc_set_l13d_fmatrix(npu_fa); asc_set_l13d_fmatrix_b(npu_fb);",
+        "  asc_load3d_v2_config npu_rpt = { .config = uint64_t(1) << 16 };",
+        "  asc_set_l13d_rpt(npu_rpt); asc_set_l13d_padding(uint64_t(0)); asc_set_l13d_size(uint64_t(0));",
+        "  asc_sync_notify(PIPE_S, PIPE_MTE1, event_t(0));",
+        "  asc_sync_wait(PIPE_S, PIPE_MTE1, event_t(0));",
+    ]
 
 
 def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
@@ -353,6 +391,8 @@ def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
             "  asc_sync_wait(PIPE_S, PIPE_FIX, 0);",
         ]
 
+    lines += load3d_init(p.load3d)
+
     def sync_line(op):
         comment = ""
         if isinstance(op, CrossSyncOp):
@@ -366,16 +406,14 @@ def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
         else:
             ch = ex.channels[op.channel.data]
             a, b = p.tasks[ch.source].pipe, p.tasks[ch.destination].pipe
-            epoch = f"g - {op.distance.data} - {ch.lower}"
-            if ch.stride != 1:
-                epoch = f"({epoch}) / {ch.stride}"
-            event_id = f"{ch.base} + (({epoch}) % {ch.width})"
+            epoch = scalar.div(scalar.sub(scalar.sub("g", op.distance.data), ch.lower), ch.stride)
+            event_id = scalar.add(ch.base, scalar.rem(epoch, ch.width))
             if ch.event_ids is not None:
                 from .events import selection_expression
 
-                event_id = selection_expression(ch.event_ids, epoch)
+                event_id = selection_expression(ch.event_ids, epoch, scalar=scalar)
             function = "asc_sync_notify" if op.action.data == "set" else "asc_sync_wait"
-            code = f"{function}(PIPE_{a}, PIPE_{b}, {event_id});"
+            code = f"{function}(PIPE_{a}, PIPE_{b}, {scalar.use(event_id)});"
             comment = f" // {ch.name}"
         lo, hi = op.lower.data, op.upper.data
         stride = optional_int(op.stride, 1)
@@ -395,6 +433,7 @@ def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
                 lines.append(f"    float npu_value_{task.uid} = 0.0f;")
         for task in tasks.values():
             current_task = task
+            scalar = ScalarScope()
             guard = f"step >= {task.lower + task.stage} && step < {task.upper + task.stage}"
             if task.period != 1:
                 position = f"(step - {task.stage}) % {task.period}"
@@ -407,9 +446,12 @@ def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
                 f"    if ({guard}) {{",
                 f"      const int64_t g = step - {task.stage};",
             ]
-            lines.extend("      " + sync_line(op) for op in before[task.uid])
-            lines.append("      " + native_line(task, p.count, "core_id" if p.blocks > 1 else "0"))
-            lines.extend("      " + sync_line(op) for op in after.get(task.uid, []))
+            body = [sync_line(op) for op in before[task.uid]]
+            body.append(
+                native_line(task, p.count, "core_id" if p.blocks > 1 else "0", scalar=scalar)
+            )
+            body.extend(sync_line(op) for op in after.get(task.uid, []))
+            lines.extend("      " + line for line in scalar.finish(body))
             lines.append("    }")
         lines.append("  }")
     for drain in drains:

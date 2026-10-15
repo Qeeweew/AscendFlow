@@ -18,6 +18,9 @@ def main():
     )
     parser.add_argument("--compile", action="store_true", help="CANN offline compilation")
     parser.add_argument(
+        "--load3d", action="store_true", help="select invariant dav-2201 Load3D matrix loads"
+    )
+    parser.add_argument(
         "--shared", action="store_true", help="also produce the CANN shared launcher"
     )
     parser.add_argument(
@@ -35,6 +38,7 @@ def main():
         diagnostics=args.explain,
         check_interleavings=args.check_interleavings,
         max_check_states=args.max_check_states,
+        load3d=args.load3d,
     )
     print(json.dumps(report, indent=2))
 
@@ -49,10 +53,12 @@ def build_module(
     diagnostics=False,
     check_interleavings=None,
     max_check_states=200_000,
+    load3d=False,
+    timeout_s=60.0,
 ):
     """Compile generic IR once; optional diagnostics do not change its schedule."""
     output = Path(output)
-    result = compile(module, synchronize=synchronize)
+    result = compile(module, synchronize=synchronize, load3d=load3d, timeout_s=timeout_s)
     report = result.report
     report["compilation"] = result.timings
     if check_interleavings:

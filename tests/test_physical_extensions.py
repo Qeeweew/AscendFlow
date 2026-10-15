@@ -7,6 +7,18 @@ from xdsl_npu.ir import ChannelOp, dump, parse
 from xdsl_npu.model import CompileError, dependencies, extract
 
 
+def test_datablock_max_requires_the_complete_packed_output_footprint():
+    k = Kernel("block_max")
+    source = k.buffer("source", "UB", 512)
+    destination = k.buffer("destination", "UB", 32)
+    k.loop(1)
+    a, b = k.view(source, 512), k.view(destination, 32)
+    k.task("initialize", "fill", a)
+    k.task("reduce", "reduce_max8", a, b)
+    with pytest.raises(CompileError, match="datablock max"):
+        extract(k.finish())
+
+
 def scalar_pipeline(count=3, blocks=1):
     k = Kernel("scalar_pipeline", blocks=blocks, disjoint_external=True)
     x = k.buffer("x", "GM", count * blocks * 32, external=True, initialized=True)

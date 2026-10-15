@@ -161,7 +161,7 @@ def pack_event_lifetimes(module):
             )
 
 
-def selection_expression(ids, ordinal):
+def selection_expression(ids, ordinal, *, scalar=None):
     """Encode the exact finite ID map as piecewise short-period selections.
 
     Lifetime packing can change its rotation at a prologue, query boundary or
@@ -174,13 +174,17 @@ def selection_expression(ids, ordinal):
     """
     require(bool(ids), "event selection requires a nonempty ID map")
 
+    def choose_lt(index, bound, left, right):
+        if scalar is not None:
+            return scalar.select_lt(index, bound, left, right)
+        return f"(({index}) < {bound} ? {left} : {right})"
+
     def select(values, index, lo, hi):
         if all(flag == values[lo] for flag in values[lo:hi]):
-            return str(values[lo])
+            return values[lo] if scalar is not None else str(values[lo])
         middle = (lo + hi) // 2
-        return (
-            f"(({index}) < {middle} ? {select(values, index, lo, middle)}"
-            f" : {select(values, index, middle, hi)})"
+        return choose_lt(
+            index, middle, select(values, index, lo, middle), select(values, index, middle, hi)
         )
 
     runs = []
@@ -194,10 +198,16 @@ def selection_expression(ids, ordinal):
             if end > stop:
                 stop, width = end, period
         values = ids[start : start + width]
-        index = f"(({ordinal}) - {start})" if start else f"({ordinal})"
-        index = f"({index} % {width})"
+        if scalar is not None:
+            index = scalar.rem(scalar.sub(ordinal, start), width)
+        else:
+            index = f"(({ordinal}) - {start})" if start else f"({ordinal})"
+            index = f"({index} % {width})"
         if all(flag == values[0] + i for i, flag in enumerate(values)):
-            code = str(values[0]) if width == 1 else f"({values[0]} + {index})"
+            if scalar is not None:
+                code = scalar.value(values[0]) if width == 1 else scalar.add(values[0], index)
+            else:
+                code = str(values[0]) if width == 1 else f"({values[0]} + {index})"
         else:
             code = select(values, index, 0, width)
         runs.append((start, code))
@@ -207,6 +217,6 @@ def selection_expression(ids, ordinal):
         if hi - lo == 1:
             return runs[lo][1]
         middle = (lo + hi) // 2
-        return f"(({ordinal}) < {runs[middle][0]} ? {choose(lo, middle)} : {choose(middle, hi)})"
+        return choose_lt(ordinal, runs[middle][0], choose(lo, middle), choose(middle, hi))
 
     return choose(0, len(runs))

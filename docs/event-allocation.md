@@ -75,6 +75,32 @@ asc_sync_notify(PIPE_V, PIPE_MTE3, ((ordinal % 2) < 1 ? 1 : 0));
 编译含共享库6.54s通过。这不是Python同步分析加速或设备性能提升的证据；
 有限表本身仍随generation数量增长。证据在外层`runs/attention-next/asc-audit/`。
 
+## ASC纯整数表达式接入标准pass
+
+`asc_scalar.py`将地址偏移和本地event编号构造成临时`arith` SSA函数，执行
+`canonicalize → cse → canonicalize`，再打印实际交给CANN的ASC。共享结果输出为
+局部`const int64_t`/`const bool`，例如`g-0-0`变为`g`，重复`g%2`计算合并。
+finite、runtime叶以及使用这些后端的region路径共用此入口。异步操作不进入
+这个临时函数；原生指令、同步位置、buffer和已验证物理IR保持原样。
+
+仅使用xDSL0.73.0已有规则，没有新增范围/同余分析、guard合并或event重新分配。
+原生指令内部row/chunk循环的索引、外层guard和host输入检查仍由原emitter打印。
+该版本没有覆盖的`%1`等恒等式也不额外补齐。所有SSA除数是正整数常量，临时
+结果局限在所属task/command作用域，不跨异步任务共享；此机制不改变浮点运算。
+
+25项定向回归通过，包括runtime前端、prefix、局部/CV编译、Load3D及CPU实际执行
+生成的整数代码。对同一4K FA物理计划逐项执行event Set/Wait编号，共2112次
+比对通过，原生与同步调用顺序保持。ASC输出阶段1.08s，CANN离线编译含共享库
+6.49s；这是单次测量，没有编译加速或设备性能提升结论。提取共享变量后源码
+49032→52429字节，三元选择228→216；文件变短不是本轮验收目标。
+
+最新ASC及审查数据：外层`runs/attention-next/standard-passes/`。从工作区根复现：
+
+```bash
+.venv/bin/python -m pytest -q compiler/tests/test_asc_scalar.py compiler/tests/test_compilation.py compiler/tests/test_load3d.py
+.venv/bin/xdsl-npu --input runs/attention-next/mha4k-load3d/after.xdsl --synchronized --output runs/attention-next/standard-passes-reproduce --compile --shared
+```
+
 ## 真正无法证明八 ID 安全的情况
 
 GDN 的 T5/Dv8/三输入槽计划仍拒绝。根据当前可信完成契约，MTE2→V 有九个

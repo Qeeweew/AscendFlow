@@ -7,7 +7,86 @@
 以[总体设计](design.md)和[重构方案](refactor-plan.md)为准。下文结果保留其原有
 源码、数值配置和测量范围，不作为尚未实现的新路径证据。
 
-## 2026-10-15：最终ASC审查与未通过的性能验收
+## 2026-10-15：CV等待与max归约的设备改进
+
+本轮只改examples中的`tiled_legacy.py`排步，并新增通用原生`reduce_max8`访问
+合同；完整AST FA仍未接通。显式选项为`vector_update="tile", max_reduce="block"`，
+原默认政策保留用于对照。`benchmarks.attention.suite --policy block-max`组合这两个
+选项与跨query overlap；测试同时启用Load3D，所有版本使用相同CANN编译选项。
+
+源码对照依据：ops-transformer HEAD `4bbfb3b2bccceb2a1b80828d04eee915169a2b2e`，
+arch22 `flash_attention_score_s1s2_bn2gs1.h`第941/947行的完整Vec1→旧PV等待，
+第1058/1062行的Vec1八行、D128 Vec2六十四行分块。安装CANN9.1的
+`softmax_flashv2_block_reduce_impl.h:27`使用分层BlockReduce max；安装头文件hash
+与参考源码hash记录在外层`runs/attention-cv/comparison.json`，不假称安装ACLNN
+由这个参考checkout构建。
+
+ASC的关键改变如下，R=每AIV的八个softmax行块：
+
+```text
+旧：step16 softmax(tile1,row0) → 等PV(tile0) → update(tile0,row0)
+新：step23 softmax(tile1,row7) → 等PV(tile0) → update(tile0,全部64行)
+```
+
+新Vec2只在`g % R == R-1`激活，仍位于stage `2*R`；该时刻下一Vec1的最后一组
+已先行派发。score输入仍为两个32KiB槽，scale/softmax在槽内原地计算，取消独立
+score_work，为独立整块PV输入腾出空间。槽的release从scale最后读移至partial_sum
+最后读，删除这个新WAR协议的回归会被最终检查拒绝。跨阶段直接复用score槽给PV
+曾产生等待环，已被拒绝，没有删除验证或添加全局barrier来绕过。
+
+max将连续64个值的归约换为两级八值BlockReduce，使用显式4KiB scratch；所得
+每64列partial仍交给原merge_max。有限scaled scores合同保持；sum仍为原来的
+64列partial及合并，FP32在线更新、PV累加和P/output舍入均未改。MHA每AIV UB
+为191040字节，小于192KiB；没有增加GM搬运，AIC排步和L0C分配本轮未改。
+
+实机910B3，20 AIC/40 AIV，物理1→逻辑0。每进程预检全部八卡，warmup5/repeats30，
+相同输入与allocation重复使用，表中时间均为msprof设备kernel时间，不含host间隙：
+
+| Shape / dtype | 最终生成代码 μs | ACLNN μs | 时间比 |
+|---|---:|---:|---:|
+| B1 H8/Hkv8 Sq=Sk4096 D128 f16，三批中位数 | 698.726 | 512.678 | 1.3629 |
+| B1 H8/Hkv2 Sq=Sk8192 D64 bf16，单批 | 2262.544 | 1687.266 | 1.3410 |
+
+4K三批为698.692/698.726/699.624；ACLNN为515.532/512.678/511.982。
+**仍未达到无明显性能差距的目标**，1.05验收明确失败。单批消融：同版本旧排步
+1310.356μs，仅整块Vec2与UB复用906.048μs，再加block max698.692μs。
+独立手写AscendC为1188.334μs，但它采用20组和不同Update/Softmax排步，只作为
+独立参考，不用于归因某一项生成器变化。
+
+同批Vector活动时间由850.212→831.784→622.480μs，ACLNN325.869μs；活动区间
+可以重叠，不能相加为总耗时或作为纯ALU服务时间。剩余方向是WholeReduce sum
+的指令/存储组织，以及64组对20 AIC的负载分配。CANN的sum树与当前合同不同，
+本轮没有为了追性能直接替换其浮点累加顺序。
+
+4K实际Cube工作68.719GFLOP，条件阵列峰值`20*1.8GHz*8192=294.912TFLOP/s`，
+Cube-only下界233.017μs；当前约98.35TFLOP/s，是该条件峰值的33.35%。这不计
+Vector、搬运和等待，不能作为整个FA的性能预测。4K GM分配136MiB可装入192MiB
+L2；8K为420MiB，超过L2。请求字节率不是实测HBM带宽，未使用未核实的带宽值。
+
+F16小例1/1/1/256/2048/128全输出误差3.0518e-5，block max前后逐字节相同；
+同shape uniform输入误差0。BF16小例1/2/1/256/2048/64全输出误差6.1035e-5。
+两个大例各比较557056个元素，并检查全部4194304输出finite、所有allocation
+guard及Q/K/V不变；大例仍是采样数值验证。FA排步/最后读取/原生footprint回归
+6项、超时与性能验收回归4项通过，未重复长全量测试。
+
+整个隔离构建含Python、同步、ASC和CANN：4K block-max31.22s，8K28.72s；
+本轮最慢构建31.22s，未触发300s硬停止。Python内部仍分别23.48/21.62s，
+同步分析的编译性能问题没有解决。历史AscendC库先因源码hash不匹配被拒绝，
+本轮在新目录重建；另一次测量在设备初始化前因占用预检退出，之后全卡检查空闲
+才在同卡执行。失败记录保留；没有设备错误、reset或换卡。
+
+最终ASC在`runs/attention-cv/block-large/{mha4k,gqa8k}/flash_attention.asc`；三批
+profile、消融、编译和数值记录均在外层`runs/attention-cv/`。复现：
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.suite --cases mha4k gqa8k --policy block-max --load3d --output runs/fa-block-max --compile-timeout 300
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run runs/fa-block-max/mha4k --physical 1 --oracle sampled --warmup 5 --repeats 30 --record-output runs/fa-block-max/mha4k/device
+```
+
+第二条仅给stream interval；kernel时间需使用`benchmarks/profile.sh`配合msprof，
+本轮完整调用参数保留在各profile目录的日志中。
+
+## 此前ASC审查与未通过的性能验收
 
 当前审查对象为`tiled_legacy.py`的BQ128/BK1024/CK128/VR8、每组四个query
 tile、跨query overlap和Load3D候选。它仍走物理构造路径，完整新AST FA未完成。
