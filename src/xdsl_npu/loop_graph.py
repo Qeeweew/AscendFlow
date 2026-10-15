@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from .budget import poll
+from .completion_flow import propagate_ordered
 from .ir import EndOp, InvocationSyncOp, LoopChannelOp, LoopSyncOp, RegionSyncOp, TaskOp, ViewOp
 from .loop_boundary import stream_operations
 from .model import optional_int, require
@@ -102,6 +103,7 @@ class Graph:
         self.domain_states = 0
         self.domain_edges = 0
         self.path_queries = 0
+        self.batch_queries = self.fact_transfers = self.batch_passes = 0
 
     def node(self, command, residue, point, *, guard=None):
         key = command.index, residue, point
@@ -229,7 +231,7 @@ class Graph:
         self.domains[key] = value
         return value
 
-    def path(
+    def _query(
         self,
         source_command,
         source_g,
@@ -238,15 +240,12 @@ class Graph:
         minimum=0,
         prefix=False,
         *,
-        omitted=(),
-        _shorten=True,
         source_point=None,
         destination_point=None,
         remaining=None,
         at_end=False,
     ):
-        self.path_queries += 1
-        poll("completion path", queries=self.path_queries, states=self.domain_states)
+        """Normalize an obligation to its certified translation domain."""
         p = self.period
         first = max(
             minimum, destination_command.lower, source_command.lower - (source_g - destination_g)
@@ -268,17 +267,98 @@ class Graph:
         terminal = bool(terminal_gaps) or at_end
         if terminal_gaps:
             if len(set(terminal_gaps)) != 1 or terminal_gaps[0] < gap:
-                return ()  # The two endpoint activations have empty intersection.
+                return None  # The endpoint activation intersection is empty.
             gap = terminal_gaps[0]
             if self.maximum is not None:
                 actual = self.maximum - gap - 1
                 if actual < first or actual % p != residue:
-                    return ()
+                    return None
                 # Prove the enclosing translation family, not all iterations
                 # from zero to this constant N. `actual` only selects the real
                 # residue; making it the domain's lower bound expands O(N)
                 # history and is unnecessary for this stronger family proof.
         if self.maximum is not None and first + gap >= self.maximum:
+            return None
+        source_point = source_point or (
+            "prefix"
+            if prefix
+            else "end"
+            if source_command.kind in {"task", "set", "cross_set"}
+            else "begin"
+        )
+        source = self.ids[source_command.index, source_g % p, source_point]
+        destination_point = destination_point or (
+            "end" if destination_command.kind in {"set", "cross_set"} else "begin"
+        )
+        destination = self.ids[destination_command.index, destination_g % p, destination_point]
+        return (
+            (residue, first, gap, terminal),
+            (source, source_g // p - destination_g // p),
+            (destination, 0),
+        )
+
+    def covered_many(self, queries):
+        """Propagate all demanded sources once per actual guard domain.
+
+        This consumes the sparse native graph; it does not discover graph
+        edges by asking whether arbitrary pairs happen to be reachable.
+        """
+        queries = tuple(queries)
+        self.batch_queries += len(queries)
+        answers = [True] * len(queries)
+        groups = {}
+        for number, args in enumerate(queries):
+            query = self._query(*args)
+            if query is not None:
+                groups.setdefault(query[0], []).append((number, query[1], query[2]))
+        for guard, group in groups.items():
+            domain = self.domain(*guard)
+            origins, targets = {}, []
+            for number, source, destination in group:
+                source, target = domain.index.get(source), domain.index.get(destination)
+                if source is None or target is None:
+                    answers[number] = False
+                    continue
+                bit = origins.setdefault(source, 1 << len(origins))
+                targets.append((number, target, bit))
+            facts, transfers = propagate_ordered(domain.successors, origins.items())
+            self.batch_passes += 1
+            self.fact_transfers += transfers
+            for number, target, bit in targets:
+                answers[number] = bool(facts[target] & bit)
+        return answers
+
+    def path(
+        self,
+        source_command,
+        source_g,
+        destination_command,
+        destination_g,
+        minimum=0,
+        prefix=False,
+        *,
+        omitted=(),
+        _shorten=True,
+        source_point=None,
+        destination_point=None,
+        remaining=None,
+        at_end=False,
+    ):
+        self.path_queries += 1
+        poll("completion path", queries=self.path_queries, states=self.domain_states)
+        query = self._query(
+            source_command,
+            source_g,
+            destination_command,
+            destination_g,
+            minimum,
+            prefix,
+            source_point=source_point,
+            destination_point=destination_point,
+            remaining=remaining,
+            at_end=at_end,
+        )
+        if query is None:
             return ()
         if (
             _shorten
@@ -322,23 +402,9 @@ class Graph:
                     current = following
                 if current == destination_g:
                     return path + tuple(tail)
-        source_point = source_point or (
-            "prefix"
-            if prefix
-            else "end"
-            if source_command.kind in {"task", "set", "cross_set"}
-            else "begin"
-        )
-        source = self.ids[source_command.index, source_g % p, source_point]
-        destination_point = destination_point or (
-            "end" if destination_command.kind in {"set", "cross_set"} else "begin"
-        )
-        destination = self.ids[destination_command.index, destination_g % p, destination_point]
-        # A Set's observable notification is its asynchronous end; a Wait
-        # consumes at begin. Native dependence endpoints follow the same rule.
-        domain = self.domain(residue, first, gap, terminal)
-        initial = domain.index.get((source, source_g // p - destination_g // p))
-        target = domain.index.get((destination, 0))
+        domain = self.domain(*query[0])
+        source, destination = query[1][0], query[2][0]
+        initial, target = domain.index.get(query[1]), domain.index.get(query[2])
         if initial is None or target is None:
             return None
         reaching = domain.reaching(target)

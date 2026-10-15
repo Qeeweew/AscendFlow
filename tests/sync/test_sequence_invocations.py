@@ -42,7 +42,7 @@ def test_parent_and_child_are_retained_and_zero_child_executes_init_use(grouped_
 
 
 def test_notify_effect_does_not_fence_later_same_pipe_work(grouped_artifact):
-    from xdsl_npu.completion import Site
+    from xdsl_npu.completion import Requirement, Site
     from xdsl_npu.region_completion import RegionCompletion, mark
     from xdsl_npu.region_summary import CountDomain, Position
     from xdsl_npu.sequence_sync import Point, verify_sequence
@@ -52,26 +52,48 @@ def test_notify_effect_does_not_fence_later_same_pipe_work(grouped_artifact):
     channel = next(c for c in checked.analyses["r1"][1].values() if c.distance == 0)
     source = Site(channel.sources[0], Position(False, 0), "end", channel.name, "set", region="r1")
     target = mark(seq, Point("r1", channel.sources[0][1], Position(False, 1)), "prefix")
-    proof = RegionCompletion(seq, checked.analyses, ())
-    assert not proof.direct(source, target, CountDomain(1, 0, exact=3))
+    required = Requirement(source, target, CountDomain(1, 0, exact=3), "Set is not a fence")
+    proof = RegionCompletion(seq, checked.analyses, (required,))
+    assert not proof.covered(required)
 
 
 def test_fifo_begin_composition_matches_the_actual_native_graph(grouped_artifact):
-    from xdsl_npu.completion import CountDomain, Position, Site
+    from xdsl_npu.completion import CountDomain, LeafCompletion, Position, Requirement, Site
     from xdsl_npu.region_completion import RegionCompletion
     from xdsl_npu.sequence_sync import verify_sequence
 
     _, checked = verify_sequence(grouped_artifact.plan, _details=True)
-    proof = RegionCompletion(checked.sequence, checked.analyses, (), calls=(0,))
-    for region, leaf in proof.leaves.inside.items():
-        for a in leaf.native:
-            for b in leaf.native:
-                start = Site(a, Position(False, 0), "begin", region=region)
+    requirements, oracles = [], {}
+    for region, (loop, _, streams, graph, _) in checked.analyses.items():
+        native = {
+            (actor, c.task.uid): c
+            for actor, commands in streams.items()
+            for c in commands
+            if c.kind == "task"
+        }
+        endpoints = {
+            (actor, c.channel, c.kind): c
+            for actor, commands in streams.items()
+            for c in commands
+            if c.kind in {"set", "wait"}
+        }
+        oracles[region] = LeafCompletion(loop, graph, native, endpoints)
+        for a in native:
+            for b in native:
                 for point in ("begin", "end", "prefix"):
-                    target = Site(b, Position(False, 0), point, region=region)
-                    domain = CountDomain(1, 0, exact=3)
-                    if proof.direct(start, target, domain):
-                        assert leaf.prove(start, target, domain)
+                    requirements.append(
+                        Requirement(
+                            Site(a, Position(False, 0), "begin", region=region),
+                            Site(b, Position(False, 0), point, region=region),
+                            CountDomain(1, 0, exact=3),
+                            "native relation",
+                        )
+                    )
+    proof = RegionCompletion(checked.sequence, checked.analyses, requirements, calls=(0,))
+    for r in requirements:
+        # Old per-pair proof is an oracle in this test, never called by planning.
+        if proof.covered(r):
+            assert oracles[r.source.region].prove(r.source, r.destination, r.domain)
 
 
 def test_shared_stationary_frame_writes_compose_inside_the_actual_call():
@@ -128,8 +150,16 @@ def test_parent_scalar_reader_is_retired_without_promoting_wait_to_completion():
         t for d in seq.regions["r2"].actors.values() for t in d.program.tasks if t.pipe == "S"
     )
     p = Point("r2", task.uid, Position(False, 0))
-    proof = RegionCompletion(seq, checked.analyses, ())
-    assert not proof.direct(mark(seq, p, "end"), mark(seq, p, "begin"), CountDomain(1, 0, exact=1))
+    from xdsl_npu.completion import Requirement
+
+    required = Requirement(
+        mark(seq, p, "end"),
+        mark(seq, p, "begin"),
+        CountDomain(1, 0, exact=1),
+        "Scalar end cannot precede its start",
+    )
+    proof = RegionCompletion(seq, checked.analyses, (required,))
+    assert not proof.covered(required)
 
 
 def test_large_fixed_parent_and_child_do_not_expand_proof_windows():

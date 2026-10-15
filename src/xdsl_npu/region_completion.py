@@ -6,24 +6,21 @@ shared with leaf/invocation checks in completion.py.
 """
 
 from collections import defaultdict
-from dataclasses import replace
 
-from .budget import poll
 from .completion import (
-    CompletionPaths,
     CountDomain,
-    LeafCompletion,
     Point,
     Position,
     Requirement,
     Site,
     _first,
-    canonical,
     covers,
+    intersection,
     uncovered,
 )
+from .completion_flow import ALL, CompletionFlow
 from .model import require
-from .region_summary import Access, ReadSpan
+from .region_summary import Access
 
 
 def _data(sequence, name):
@@ -64,23 +61,6 @@ def _valid_point(sequence, point, domain):
     )
 
 
-def _before(sequence, left, right, domain):
-    """Same-region, same-pipe issue order, for the entire parameter domain."""
-    if left.region != right.region:
-        names = list(sequence.regions)
-        return names.index(left.region) < names.index(right.region)
-    tasks = _data(sequence, left.region).program.tasks
-    lt, rt = _task(sequence, left), _task(sequence, right)
-    a, b = _expression(sequence, left)
-    c, d = _expression(sequence, right)
-    delta = (c - a) * _first(domain) + d + rt.stage - b - lt.stage
-    return (
-        delta >= 0
-        and (domain.exact is not None or c - a >= 0)
-        and (delta > 0 or (lt.issue_order, tasks.index(lt)) <= (rt.issue_order, tasks.index(rt)))
-    )
-
-
 def _point(sequence, endpoint, domain, *, source):
     access = endpoint.access
     p = access.position if isinstance(access, Access) else access.last if source else access.first
@@ -114,314 +94,194 @@ def mark(sequence, point, milestone, call=0):
     )
 
 
-class LeafRelations:
-    def __init__(self, sequence, analyses):
-        self.sequence, self.analyses = sequence, analyses
-        self.inside = {}
-        self.cache = {}
-        self.site_cache = {}
-        self.direct_cache, self.active_cache, self.capture_cache = {}, {}, {}
-        for name, analysis in analyses.items():
-            loop, _, commands, graph, _ = analysis
-            native = {
-                (actor, c.task.uid): c
-                for actor, items in commands.items()
-                for c in items
-                if c.kind == "task"
-            }
-            endpoints = {
-                (actor, c.channel, c.kind): c
-                for actor, items in commands.items()
-                for c in items
-                if c.kind in {"set", "wait"}
-            }
-            self.inside[name] = LeafCompletion(loop, graph, native, endpoints)
+def _ge(a, b):
+    """Predicate a*N+b >= 0 for a in {-1,0,1}."""
+    if not a:
+        return ALL if b >= 0 else None
+    if a == 1:
+        return CountDomain(1, 0, minimum=max(0, -b))
+    require(a == -1, "unsupported completion coordinate slope")
+    return CountDomain(1, 0, minimum=0, maximum=b) if b >= 0 else None
 
-    def inherited(self, source, destination, domain):
-        key = source, destination, domain
-        if key not in self.cache:
-            self.cache[key] = self._inherited(source, destination, domain)
-        return self.cache[key]
 
-    def site_path(self, region, left, right, domain):
-        if (left.region, left.call) != (right.region, right.call):
-            return False
-        left, right = left.leaf, right.leaf
-        constant = self.sequence.regions[region].constant_count
-        # A fixed-count leaf's boundary proof is independent of the parent's
-        # dynamic count family; cache before repeatedly normalizing its sites.
-        key = region, left, right, domain if constant is None else None
-        if key not in self.site_cache:
-            self.site_cache[key] = self._site_path(region, left, right, domain)
-        return self.site_cache[key]
+def _equal(left, right):
+    a, b = left[0] - right[0], left[1] - right[1]
+    if not a:
+        return ALL if not b else None
+    return CountDomain(1, 0, exact=-b // a) if -b % a == 0 and -b // a >= 0 else None
 
-    def _site_path(self, region, left, right, domain):
-        inside = self.inside[region]
-        loop, _, commands, _, _ = self.analyses[region]
-        positions = [left.position, right.position]
-        if loop.constant_count is not None:
-            count = loop.constant_count
-            positions = [
-                Position(True, count - 1 - p.evaluate(count))
-                if p.evaluate(count) > count // 2
-                else Position(False, p.evaluate(count))
-                for p in positions
-            ]
-            head = max([0] + [p.offset for p in positions if not p.end])
-            tail = max([0] + [p.offset for p in positions if p.end])
-            window = max(
-                [head + tail + 1, inside.graph.period]
-                + [c.lower + c.upper + 1 for items in commands.values() for c in items]
-                + [
-                    p.offset
-                    + (inside.command(site).lower if p.end else inside.command(site).upper)
-                    + 1
-                    for p, site in zip(positions, (left, right))
-                ]
-            )
-            domain = CountDomain(
-                inside.graph.period, count % inside.graph.period, minimum=min(count, window)
-            )
-        return inside.prove(
-            left if left.position == positions[0] else replace(left, position=positions[0]),
-            right if right.position == positions[1] else replace(right, position=positions[1]),
-            domain,
-        )
 
-    def _inherited(self, source, destination, domain, *, capture_only=False):
-        seq = self.sequence
-        st, dt = _task(seq, source), _task(seq, destination)
-        if not capture_only and (st.pipe == "S" or st.pipe == dt.pipe and st.implicit_completion):
-            return True
-        # Any real Set/barrier in the receiving region on the source pipe also
-        # captures preceding regions' native work. Only use an actual completed
-        # path from that capture to this first consumer; source order is not one.
-        loop, _, commands, _, _ = self.analyses[destination.region]
-        inside = self.inside[destination.region]
-        local_domain = domain
-        target_position = destination.position
-        if loop.constant_count is not None:
-            # A stronger static boundary family contains this fixed count.
-            # Never build an N-step history just to prove an entry gate.
-            if dt.last:
-                target_position = Position(True, 0)
-            window = max(
-                [1, inside.graph.period, 0 if target_position.end else target_position.offset + 1]
-                + [c.lower + c.upper + 1 for items in commands.values() for c in items]
-            )
-            local_domain = CountDomain(
-                inside.graph.period,
-                loop.constant_count % inside.graph.period,
-                minimum=min(loop.constant_count, window),
-            )
-        for actor, items in commands.items():
-            for command in items:
-                if command.kind not in {"set", "barrier"} or command.task.pipe != st.pipe:
-                    continue
-                if command.last_gap is not None:
-                    positions = [Position(True, command.last_gap)]
-                else:
-                    positions = [
-                        Position(False, command.lower + (r - command.lower) % command.period)
-                        for r in command.residues
-                    ]
-                for position in positions:
-                    point = Point(destination.region, command.task.uid, position)
-                    if not _valid_point(seq, point, domain):
-                        continue
-                    ca, cb = _expression(seq, point)
-                    n = _first(domain)
-                    g = ca * n + cb
-                    length = n if loop.constant_count is None else loop.constant_count
-                    if not command.lower <= g < length - command.upper:
-                        continue
-                    if ca and domain.exact is None and domain.period % command.period:
-                        continue
-                    if g % command.period not in command.residues:
-                        continue
-                    # For a nonterminal fixed head, lower bound must also ensure
-                    # the upper activation gap for every N, not just one sample.
-                    if loop.constant_count is None and not _nonnegative(
-                        1 - ca, -cb - command.upper - 1, domain
-                    ):
-                        continue
-                    actor_key = actor, destination.task
-                    if command.kind == "set":
-                        start = Site(
-                            (actor, command.task.uid), position, "end", command.channel, "set"
-                        )
-                        if inside.prove(
-                            start, Site(actor_key, target_position, "begin"), local_domain
-                        ):
-                            return True
-                    else:
-                        start = Site((actor, command.task.uid), position, "begin", direct=command)
-                        if inside.prove(
-                            start, Site(actor_key, target_position, "begin"), local_domain
-                        ):
-                            return True
-        return False
+def _meet(left, right):
+    return None if left is None or right is None else intersection(left, right)
 
 
 class RegionCompletion:
-    """Serial control adapter; overlapping CV must supply its own real issue edges."""
+    """Batch native transfers for the admitted serial region/call structure.
 
-    def __init__(self, sequence, analyses, requirements, *, calls=(0, 1), native=None, bridges=()):
-        self.sequence, self.analyses = sequence, analyses
-        self.calls = calls
-        self.leaves = native if native is not None else LeafRelations(sequence, analyses)
-        require(
-            self.leaves.sequence is sequence and self.leaves.analyses is analyses,
-            "completion caches belong to one immutable analysis snapshot",
-        )
-        self.requirements = tuple(requirements)
-        self.required_marks = {m for r in self.requirements for m in (r.source, r.destination)}
-        self.direct_cache, self.active_cache = self.leaves.direct_cache, self.leaves.active_cache
-        self.capture_cache = self.leaves.capture_cache
-        self.candidate_cache = {}
-        self.neighbors = {}
-        self.queries, self.visits = 0, 0
+    A loop's finite head and tail retain all demanded boundary milestones.
+    Between them, queue, native-retirement, implicit-completion and issue
+    prefixes carry monotonically: each native transfer contains its incoming
+    prefix. This is a structural induction, not sampling N or assuming the
+    omitted native work completed. Event effects NEVER get such a carry edge.
+    Interior paths absent from this summary cannot establish coverage.
+    """
+
+    def __init__(self, sequence, analyses, requirements, *, calls=(0, 1), bridges=()):
+        self.sequence, self.analyses, self.calls = sequence, analyses, calls
         self.order = {name: i for i, name in enumerate(sequence.regions)}
-        self.paths = CompletionPaths(self.successors, self.active)
-        self._index_nodes(bridges)
+        self.requirements = tuple(requirements)
+        self.flow = CompletionFlow()
+        self.flow.node()  # Open entry prefixes; no completion facts originate here.
+        self.queries = 0
+        self.sources = {
+            site: i for i, site in enumerate(dict.fromkeys(r.source for r in self.requirements))
+        }
+        self.bindings = defaultdict(list)
+        marks = {s for r in self.requirements for s in (r.source, r.destination)}
+        for r in self.requirements:
+            marks.add(mark(sequence, r.source.location, "prefix", r.source.call))
+        for bridge in bridges:
+            for call in calls:
+                target = call + int(bridge.carried)
+                if target in calls:
+                    marks.add(mark(sequence, bridge.source, "prefix", call))
+                    marks.add(mark(sequence, bridge.destination, "begin", target))
+        self.marks = defaultdict(list)
+        for m in sorted(marks, key=repr):
+            self.marks[m.call, m.region, m.task, m.channel, m.action].append(m)
+        state = {}
+        for call in calls:
+            for region in sequence.regions:
+                self._region(call, region, state)
+        for site, bit in self.sources.items():
+            for node, guard in self.bindings[site]:
+                self.flow.add_fact(node, guard, 1 << bit)
+        self.flow.propagate()
+        self.native_coverage = {r: self._coverage(r) for r in self.requirements}
         for bridge in bridges:
             self.add_bridge(bridge)
-        for dep in sequence.invocation_dependencies():
-            access = dep.destination.access
-            if isinstance(access, ReadSpan) and access.first != access.last:
-                require(
-                    self.leaves.inside[dep.destination.region].prefix_monotonic(
-                        access.task, "begin"
-                    ),
-                    "invocation reader family lacks FIFO start order",
-                )
 
-    def command(self, m):
-        return self.leaves.inside[m.region].command(m)
+    def _expr(self, region, a, b):
+        count = self.sequence.regions[region].constant_count
+        return (a, b) if count is None else (0, a * count + b)
 
-    def active(self, m, domain):
-        key = m.region, m.leaf, domain
-        if key not in self.active_cache:
-            self.active_cache[key] = covers(domain, self.activation(m, domain))
-        return self.active_cache[key]
-
-    def activation(self, m, domain):
-        return self.leaves.inside[m.region].activation(m, domain)
-
-    def direct(self, left, right, domain):
-        # Direct native/leaf relations depend on relative calls, never absolute
-        # p. Share their immutable query cache between p and p+1; bridge paths
-        # remain explicit and are checked separately for their guards.
-        key = left.region, left.leaf, right.region, right.leaf, right.call - left.call, domain
-        if key not in self.direct_cache:
-            self.direct_cache[key] = self._direct(left, right, domain)
-        return self.direct_cache[key]
-
-    def _direct(self, left, right, domain):
-        if (left.call, self.order[left.region]) > (right.call, self.order[right.region]):
-            return False
-        if not self.active(left, domain) or not self.active(right, domain):
-            return False
-        if left == right:
-            return True
-        a, b = self.command(left), self.command(right)
-        lp, rp = left.point, right.point
-        same_pipe = a.task.pipe == b.task.pipe
-        local = left.call == right.call and left.region == right.region
-        if local:
-            x, y = _expression(self.sequence, left.location)
-            u, v = _expression(self.sequence, right.location)
-            delta = (u - x) * _first(domain) + v + b.task.stage - y - a.task.stage
-            ordered = (
-                delta >= 0
-                and (domain.exact is not None or u >= x)
-                and (delta > 0 or a.index <= b.index)
-            )
-            strict = ordered and (delta > 0 or a.index < b.index)
-        else:
-            ordered = (left.call, self.order[left.region]) < (right.call, self.order[right.region])
-            if not ordered:
-                return False
-            strict = True
-        # FIFO begins followed by a real native begin->end->prefix chain.
-        # This never promotes a source end/Set effect into a pipe fence.
-        if (
-            ordered
-            and same_pipe
-            and lp == "begin"
-            and (rp == "begin" or b.kind == "task" and rp in {"end", "prefix"})
-        ):
-            return True
-        if (
-            strict
-            and a.kind == "task"
-            and lp == "end"
-            and rp == "begin"
-            and (
-                a.task.pipe == "S" or same_pipe and a.task.implicit_completion and b.kind == "task"
-            )
-        ):
-            return True
-        if ordered and a.kind == "task" and lp in {"end", "prefix"}:
-            if same_pipe and (
-                (b.kind == "task" and rp == "prefix")
-                or (b.kind == "set" and rp == "end")
-                or (b.kind == "barrier" and rp == "begin")
-            ):
-                return True  # A real retirement capture includes earlier native work.
-            if not local and b.kind == "task" and rp == "begin":
-                # Do not treat a native prefix as an implicit task completion:
-                # only an actual Set/barrier can capture arbitrary earlier work.
-                key = a.task.pipe, right.location, domain
-                if key not in self.capture_cache:
-                    self.capture_cache[key] = self.leaves._inherited(
-                        left.location, right.location, domain, capture_only=True
-                    )
-                return self.capture_cache[key]
-        if local:
-            return self.leaves.site_path(left.region, left, right, domain)
-        return False
-
-    def _index_nodes(self, bridges):
-        # Candidate endpoints are known before selection. Adding a protocol
-        # changes edges, not the universe or identity of native milestones.
-        values = set(self.required_marks)
-        for bridge in bridges:
-            values.update(
-                (
-                    mark(self.sequence, bridge.source, "prefix"),
-                    mark(self.sequence, bridge.destination, "begin"),
-                )
-            )
-        for value in tuple(values):
-            for point in ("begin", "end", "prefix"):
-                values.add(replace(value, point=point, channel="", action="", direct=None))
-            if self.command(value).kind == "set":
-                values.add(replace(value, point="begin"))
-        values |= {replace(value, call=call) for value in tuple(values) for call in self.calls}
-        require(len(values) <= 2048, "sequence call milestone budget exceeded")
-        self.nodes = frozenset(values)
-        self.scopes, self.begins, self.captures = (
-            defaultdict(list),
-            defaultdict(list),
-            defaultdict(list),
-        )
-        self.native_begins, self.event_begins = [], []
-        for value in sorted(values, key=lambda m: (m.call, self.order[m.region], repr(m))):
-            command = self.command(value)
-            self.scopes[value.call, value.region].append(value)
-            if value.point == "begin":
-                self.begins[command.task.pipe].append(value)
-                (self.native_begins if command.kind == "task" else self.event_begins).append(value)
+    def _activation(self, region, command, generation, guard):
+        a, b = generation
+        ca, cb = self._expr(region, 1, 0)
+        guard = _meet(guard, _ge(a, b - command.lower))
+        guard = _meet(guard, _ge(ca - a, cb - b - command.upper - 1))
+        if command.last_gap is not None:
+            guard = _meet(guard, _equal(generation, (ca, cb - 1 - command.last_gap)))
+        if guard is None:
+            return ()
+        if not a:
+            return (guard,) if b % command.period in command.residues else ()
+        return tuple(
+            overlap
+            for r in command.residues
             if (
-                command.kind == "task"
-                and value.point == "prefix"
-                or command.kind == "set"
-                and value.point == "end"
-                or command.kind == "barrier"
-                and value.point == "begin"
-            ):
-                self.captures[command.task.pipe].append(value)
+                overlap := _meet(
+                    guard, CountDomain(command.period, (r - b) % command.period, minimum=0)
+                )
+            )
+            is not None
+        )
+
+    def _bind(self, call, region, command, generation, guard, points):
+        key = (
+            call,
+            region,
+            (command.actor, command.task.uid),
+            command.channel,
+            ("" if command.kind == "task" else command.kind),
+        )
+        for site in self.marks.get(key, ()):
+            node = points.get(site.point)
+            if node is None:
+                continue
+            p = site.position
+            wanted = self._expr(region, 1, -1 - p.offset) if p.end else (0, p.offset)
+            overlap = _meet(guard, _equal(generation, wanted))
+            if overlap is not None:
+                self.bindings[site].append((node, overlap))
+
+    def _join(self, *inputs):
+        result = self.flow.node()
+        for source, guard in inputs:
+            self.flow.edge(source, result, guard)
+        return result
+
+    def _region(self, call, region, state):
+        _, channels, streams, _, _ = self.analyses[region]
+        require(len(streams) == 1, "serial completion transfers require one local actor")
+        actor, commands = next(iter(streams.items()))
+        maximum = max(c.task.stage for c in commands)
+        points = [
+            m
+            for (p, name, *_), items in self.marks.items()
+            if (p, name) == (call, region)
+            for m in items
+        ]
+        head = max(
+            [1]
+            + [c.task.stage + c.lower + 1 for c in commands]
+            + [m.position.offset + maximum + 1 for m in points if not m.position.end]
+        )
+        tail = max(
+            [1]
+            + [maximum + c.upper + 1 for c in commands]
+            + [maximum + m.position.offset + 1 for m in points if m.position.end]
+        )
+        require(head + tail <= 4096, "completion boundary template budget exceeded")
+        sends, waits = defaultdict(list), defaultdict(list)
+        # Prefix state is monotone through every omitted steady-state step.
+        # No event-publication edge or synthetic child-done crosses that gap.
+        steps = [(0, step, ALL) for step in range(head)]
+        steps += [
+            (1, maximum - tail + j, _ge(*self._expr(region, 1, maximum - tail + j - head)))
+            for j in range(tail)
+        ]
+        for a, step, extent in steps:
+            for command in commands:
+                generation = self._expr(region, a, step - command.task.stage)
+                for guard in self._activation(region, command, generation, extent):
+                    pipe = actor, command.task.pipe
+                    issue = state.get((actor, "issue"), 0)
+                    queue = state.get((*pipe, "queue"), 0)
+                    retire = state.get((*pipe, "retire"), 0)
+                    implicit = state.get((*pipe, "implicit"), 0)
+                    begin = self._join((issue, guard), (queue, guard))
+                    if command.kind == "task":
+                        self.flow.edge(implicit, begin, guard)
+                    end = begin
+                    if command.kind in {"task", "set"}:
+                        end = self._join((begin, guard))
+                    if command.kind in {"set", "barrier"}:
+                        self.flow.edge(retire, end, guard)
+                    state[*pipe, "queue"] = self._join((queue, ALL), (begin, guard))
+                    native_points = {"begin": begin, "end": end}
+                    if command.kind == "task":
+                        prefix = self._join((retire, ALL), (end, guard))
+                        state[*pipe, "retire"] = prefix
+                        native_points["prefix"] = prefix
+                        if command.task.implicit_completion:
+                            state[*pipe, "implicit"] = self._join((implicit, ALL), (end, guard))
+                    if command.task.pipe == "S" and command.kind in {"task", "wait"}:
+                        state[actor, "issue"] = self._join((issue, ALL), (end, guard))
+                    self._bind(call, region, command, generation, guard, native_points)
+                    if command.kind == "set":
+                        sends[command.channel].append((generation, end, guard))
+                    if command.kind == "wait":
+                        waits[command.channel].append((generation, begin, guard))
+        for name, channel in channels.items():
+            require(channel.kind == "local", "serial transfers require local event contracts")
+            for (a, b), target, target_guard in waits[name]:
+                for generation, source, source_guard in sends[name]:
+                    guard = _meet(
+                        _meet(target_guard, source_guard),
+                        _equal(generation, (a, b - channel.distance)),
+                    )
+                    self.flow.edge(source, target, guard)
 
     def add_bridge(self, bridge):
         for call in self.calls:
@@ -431,11 +291,29 @@ class RegionCompletion:
             source = mark(self.sequence, bridge.source, "prefix", call)
             destination = mark(self.sequence, bridge.destination, "begin", target_call)
             require(
-                source in self.nodes and destination in self.nodes,
-                "protocol endpoint absent from immutable completion index",
+                source in self.bindings and destination in self.bindings,
+                "protocol endpoint missing from native completion transfers",
             )
-            for domain in bridge.domains:
-                self.paths.add(source, destination, domain)
+            for left, a in self.bindings[source]:
+                for right, b in self.bindings[destination]:
+                    for domain in bridge.domains:
+                        self.flow.edge(left, right, _meet(_meet(a, b), domain))
+
+    def _coverage(self, requirement):
+        bit = 1 << self.sources[requirement.source]
+        result = []
+        for node, active in self.bindings[requirement.destination]:
+            for guard, bits in self.flow.facts[node].items():
+                if bits & bit:
+                    overlap = _meet(_meet(guard, active), requirement.domain)
+                    if overlap is not None:
+                        result.append(overlap)
+        return tuple(result)
+
+    def coverage(self, requirement):
+        self.queries += 1
+        self.flow.propagate()
+        return self._coverage(requirement)
 
     def covered(self, requirement):
         return covers(requirement.domain, self.coverage(requirement))
@@ -443,68 +321,8 @@ class RegionCompletion:
     def missing(self, requirement):
         return uncovered(requirement.domain, self.coverage(requirement))
 
-    def coverage(self, requirement):
-        self.queries += 1
-        poll("sequence call paths", queries=self.queries, visits=self.visits)
-        require(self.queries <= 20000, "sequence call coverage budget exceeded")
-        source, destination, domain = (
-            requirement.source,
-            requirement.destination,
-            canonical(requirement.domain),
-        )
-        require(
-            source in self.nodes and destination in self.nodes,
-            "completion query absent from immutable endpoint index",
-        )
-        if self.direct(source, destination, domain):
-            return (domain,)
-        return self.paths.coverage(source, destination, domain)
-
-    def successors(self, value, domain):
-        key = value, domain
-        if key not in self.neighbors:
-            successors = []
-            source_domains = self.activation(value, domain)
-            for candidate in self.candidates(value):
-                self.visits += 1
-                if self.visits % 512 == 0:
-                    poll("region completion milestones", visits=self.visits, nodes=len(self.nodes))
-                require(self.visits <= 2_000_000, "region completion path-state budget exceeded")
-                if candidate == value:
-                    continue
-                for source_domain in source_domains:
-                    for guard in self.activation(candidate, source_domain):
-                        if self.direct(value, candidate, guard):
-                            successors.append((candidate, guard))
-            self.neighbors[key] = tuple(successors)
-        return self.neighbors[key]
-
-    def candidates(self, source):
-        """Index admissible relation kinds; _direct still proves every edge.
-
-        Same-leaf relations use the real leaf graph. Cross-scope relations can
-        only use FIFO begins, actual retirement captures, and native incoming
-        captures. Scope identity alone never supplies a completion edge.
-        """
-        command = self.command(source)
-        key = source.call, source.region, command.kind, source.point, command.task.pipe
-        if key not in self.candidate_cache:
-            later = []
-            if source.point == "begin":
-                later.extend(self.begins[command.task.pipe])
-            if command.kind == "task" and source.point in {"end", "prefix"}:
-                later.extend(self.native_begins)
-                later.extend(self.captures[command.task.pipe])
-                if source.point == "end" and command.task.pipe == "S":
-                    later.extend(self.event_begins)
-            rank = source.call, self.order[source.region]
-            local = self.scopes[source.call, source.region]
-            self.candidate_cache[key] = tuple(
-                dict.fromkeys(
-                    [*local, *(m for m in later if rank < (m.call, self.order[m.region]))]
-                )
-            )
-        return self.candidate_cache[key]
+    def inherited(self, requirement):
+        return covers(requirement.domain, self.native_coverage[requirement])
 
 
 def memory_requirement(sequence, source, destination, domain, obligation):

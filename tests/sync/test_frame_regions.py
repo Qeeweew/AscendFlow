@@ -80,10 +80,10 @@ def test_large_constant_calls_and_child_keep_the_same_frame_proof_size():
         "proof_path_queries",
         "invocation_path_visits",
         "sequence_completion_sites",
-        "sequence_completion_expansions",
+        "sequence_completion_transfers",
         "invocation_completion_sites",
-        "invocation_completion_frontiers",
-        "invocation_completion_expansions",
+        "invocation_completion_facts",
+        "invocation_completion_transfers",
     ):
         assert reports[0][key] == reports[1][key]
 

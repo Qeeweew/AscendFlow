@@ -87,9 +87,8 @@ def _plan_boundaries(sequence, analyses, banks):
             destination,
         )
         for source, destination, domain, obligation in ordered
-        if not proof.leaves.inherited(source, destination, domain)
     ]
-    return select_bridges(sequence, proof, candidates, banks), proof.leaves
+    return select_bridges(sequence, proof, candidates, banks)
 
 
 def _install(sequence, bridges):
@@ -296,7 +295,7 @@ def verify_sequence(module, *, _details=False):
     inherited = 0
     for source, destination, domain, obligation in requirements:
         poll("sequence boundary coverage", obligations=len(sequence.summary.obligations))
-        if proof.leaves.inherited(source, destination, domain):
+        if proof.inherited(memory_requirement(sequence, source, destination, domain, obligation)):
             inherited += 1
             continue
         require(
@@ -318,10 +317,11 @@ def verify_sequence(module, *, _details=False):
         "proof_domain_states": sum(a[3].domain_states for a in analyses.values()),
         "proof_path_queries": sum(a[3].path_queries for a in analyses.values()),
         "sequence_boundary_coverage_queries": proof.queries,
-        "sequence_completion_sites": len(proof.nodes),
-        "sequence_completion_frontiers": len(proof.paths.frontiers),
-        "sequence_completion_expansions": proof.paths.expansions,
-        "sequence_native_relation_checks": proof.visits,
+        "sequence_completion_sites": len(proof.flow.edges),
+        "sequence_completion_facts": len(proof.sources),
+        "sequence_completion_transfers": proof.flow.transfers,
+        "sequence_completion_edges": proof.flow.edge_count,
+        "sequence_native_relation_checks": 0,
         "event_ids": banks,
         "runtime_parameters": [
             p.sym_name.data for p in next(iter(sequence.regions.values())).parameters
@@ -331,7 +331,7 @@ def verify_sequence(module, *, _details=False):
     if sequence.invocation is not None:
         from .sequence_calls import verify_calls
 
-        report.update(verify_calls(sequence, analyses, bridges, native=proof.leaves))
+        report.update(verify_calls(sequence, analyses, bridges))
         report["proof_domain_states"] = sum(a[3].domain_states for a in analyses.values())
         report["proof_path_queries"] = sum(a[3].path_queries for a in analyses.values())
     checked = CheckedSequence(sequence, analyses, bridges)
@@ -354,11 +354,11 @@ def autosync_sequence(module, *, _capture=None):
         name: _verify_leaf(loop, live_in=sequence.live_in[name], _details=True)[1]
         for name, loop in sequence.regions.items()
     }
-    forward, native = _plan_boundaries(sequence, analyses, banks)
+    forward = _plan_boundaries(sequence, analyses, banks)
     if sequence.invocation is not None:
         from .sequence_calls import plan_calls
 
-        carried = plan_calls(sequence, analyses, forward, banks, native=native)
+        carried = plan_calls(sequence, analyses, forward, banks)
     else:
         carried = []
     _install(sequence, [*forward, *carried])

@@ -88,12 +88,12 @@ def boundary_requirements(sequence, bridges):
     return tuple(result)
 
 
-def verify_calls(sequence, analyses, bridges, *, native=None):
+def verify_calls(sequence, analyses, bridges):
     if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
         return {}
     memory = memory_requirements(sequence)
     events = event_requirements(sequence) + boundary_requirements(sequence, bridges)
-    proof = RegionCompletion(sequence, analyses, memory + events, native=native, bridges=bridges)
+    proof = RegionCompletion(sequence, analyses, memory + events, bridges=bridges)
     for requirement in memory + events:
         require(
             proof.covered(requirement),
@@ -105,18 +105,19 @@ def verify_calls(sequence, analyses, bridges, *, native=None):
         "invocation_memory_obligations": len(memory),
         "invocation_event_domains": len(events),
         "invocation_proof_queries": proof.queries,
-        "invocation_path_visits": proof.visits,
-        "invocation_completion_sites": len(proof.nodes),
-        "invocation_completion_frontiers": len(proof.paths.frontiers),
-        "invocation_completion_expansions": proof.paths.expansions,
+        "invocation_path_visits": 0,
+        "invocation_completion_sites": len(proof.flow.edges),
+        "invocation_completion_facts": len(proof.sources),
+        "invocation_completion_transfers": proof.flow.transfers,
+        "invocation_completion_edges": proof.flow.edge_count,
     }
 
 
-def plan_calls(sequence, analyses, forward, banks, *, native=None):
+def plan_calls(sequence, analyses, forward, banks):
     if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
         return []
     memory, events = memory_requirements(sequence), event_requirements(sequence)
-    proof = RegionCompletion(sequence, analyses, memory + events, native=native, bridges=forward)
+    proof = RegionCompletion(sequence, analyses, memory + events, bridges=forward)
     # A late reader release often covers an earlier writer and several input
     # rings. Examine real cross-pipe WARs before manufacturing same-pipe fences.
     ordered = sorted(

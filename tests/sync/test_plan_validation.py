@@ -12,6 +12,21 @@ from xdsl_npu.ir import BufferOp, FrameOp, RegionChannelOp, RegionSyncOp, TaskOp
 from xdsl_npu.model import CompileError
 
 
+def test_preceding_vector_barrier_cannot_retire_the_task_that_follows_it(frame_artifact):
+    plan = frame_artifact.plan
+    channel = next(
+        op for op in plan.walk() if isinstance(op, RegionChannelOp) and op.event_id.data == -1
+    )
+    for op in list(plan.walk()):
+        if isinstance(op, RegionSyncOp) and op.channel == channel.sym_name:
+            op.parent.erase_op(op)
+    channel.parent.erase_op(channel)
+    with pytest.raises(CompileError, match="missing sequence (RAW|WAW)"):
+        verify_plan(plan)
+    with pytest.raises(AssertionError):
+        finite_check(plan, 2)
+
+
 @pytest.mark.parametrize("which", [0, 1])
 def test_missing_real_boundary_endpoint_is_rejected(state_artifact, which):
     plan = state_artifact.plan

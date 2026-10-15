@@ -6,14 +6,14 @@
 
 | 范围 | 入口 | 检查什么 |
 |---|---|---|
-| 条件关系算法 | `sync/test_completion.py`、`sync/test_incremental_completion.py` | 条件交集/差集、增量可达、与有限 BFS 对照；不编译算子 |
+| 条件关系算法 | `sync/test_completion.py`、`sync/test_completion_flow.py`、`sync/test_incremental_completion.py` | 条件交集/差集、增量可达、与有限 BFS 对照；不编译算子 |
 | region/call 同步生成 | `sync/test_sequence_sync.py`、`sync/test_sequence_invocations.py` | ready/release、多个 reader、跨调用事件复用、保留循环 |
 | frame 与共享输入 | `sync/test_frame_regions.py`、`sync/test_shared_invocation_inputs.py` | 真实别名、零次执行、slot 最后读取、分组地址 |
 | 最终 IR 验证 | `sync/test_plan_validation.py` | 删除/移动同步、错误时钟、event 冲突、伪造 ownership 后必须拒绝 |
 | 独立有限执行模型 | `models/local_sequence.py` | 解释实际命令、逐字节 RAW/WAR/WAW、二值 event 覆盖和死锁 |
 
 ```bash
-.venv/bin/python -m pytest -q compiler/tests/sync/test_completion.py compiler/tests/sync/test_incremental_completion.py
+.venv/bin/python -m pytest -q compiler/tests/sync/test_completion.py compiler/tests/sync/test_completion_flow.py compiler/tests/sync/test_incremental_completion.py
 .venv/bin/python -m pytest -q compiler/tests/sync --durations=10
 .venv/bin/python -m pytest -q compiler/tests --durations=15
 ```

@@ -45,10 +45,11 @@ def _coverage_queries(obligations, graph, native):
 
 
 def _coverage(loop, obligations, graph, native):
-    queries = _coverage_queries(obligations, graph, native)
-    for o, query in queries:
+    queries = tuple(_coverage_queries(obligations, graph, native))
+    covered = graph.covered_many(query for _, query in queries)
+    for (o, query), valid in zip(queries, covered):
         _, _, _, residue, first, prefix = query
-        if graph.path(*query) is None:
+        if not valid:
             raise CompileError(
                 f"missing loop {o.hazard} {'read_retired_prefix' if prefix else 'read_retired' if o.hazard == 'WAR' else 'write_done'}: "
                 f"{o.source} -> {o.destination}, distance {o.distance}, protocol residue "
@@ -160,7 +161,7 @@ class _ProofSearch:
 
 def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True):
     banks, cross_ids = defaultdict(set), set()
-    local_queries = 0
+    local_checks = []
     for name, channel in channel_map.items():
         if channel.kind == "local" and local:
             source_actor, _ = channel.sources[0]
@@ -189,12 +190,9 @@ def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True)
                 if residue % channel.period not in channel.residues:
                     continue
                 following = _successor(channel, residue, width, graph.period)
-                require(
-                    graph.path(destination, residue + channel.distance, source, following)
-                    is not None,
-                    f"{name}: binary event re-Set can precede its old Wait",
+                local_checks.append(
+                    (name, (destination, residue + channel.distance, source, following))
                 )
-                local_queries += 1
         elif channel.kind == "cross" and counters:
             if channel.ids:
                 require(
@@ -204,13 +202,15 @@ def _lifetime(loop, channel_map, graph, endpoints, *, local=True, counters=True)
                     "cross counter IDs overlap/exceed dav-2201 mode-2 bank",
                 )
                 cross_ids.add(channel.ids[0])
+    for (name, _), valid in zip(local_checks, graph.covered_many(q for _, q in local_checks)):
+        require(valid, f"{name}: binary event re-Set can precede its old Wait")
     if counters:
         for name, query in _counter_queries(graph.period, channel_map, endpoints):
             require(
                 graph.path(*query) is not None,
                 f"{name}: mode-2 notification backlog may exceed 15",
             )
-    return banks, cross_ids, local_queries
+    return banks, cross_ids, len(local_checks)
 
 
 @bounded
@@ -235,18 +235,18 @@ def _verify_leaf(loop, *, live_in=(), _details=False):
     graph, sequence, endpoints, native = completion_graph(loop, channel_map)
     stride, potential = graph.potential()
     queries = _coverage(loop, obligations, graph, native)
-    scalar_queries = 0
+    scalar_queries = []
     for actor, data in loop.actors.items():
         for task in data.program.tasks:
             if task.scalar_source is None:
                 continue
             source, destination = native[actor, task.scalar_source], native[actor, task.uid]
             for residue in range(graph.period):
-                require(
-                    graph.path(source, residue, destination, residue) is not None,
-                    "Scalar value lacks an actual capture-to-dispatch completion path",
-                )
-                scalar_queries += 1
+                scalar_queries.append((source, residue, destination, residue))
+    require(
+        all(graph.covered_many(scalar_queries)),
+        "Scalar value lacks an actual capture-to-dispatch completion path",
+    )
     banks, cross_ids, lifetime_queries = _lifetime(loop, channel_map, graph, endpoints)
     invocation_report = {}
     if loop.invocation is not None and loop.region is None:
@@ -286,8 +286,11 @@ def _verify_leaf(loop, *, live_in=(), _details=False):
         "proof_domain_states": graph.domain_states,
         "proof_domain_edges": graph.domain_edges,
         "proof_path_queries": graph.path_queries,
+        "completion_batch_queries": graph.batch_queries,
+        "completion_transfer_passes": graph.batch_passes,
+        "completion_fact_transfers": graph.fact_transfers,
         "coverage_queries": queries,
-        "scalar_capture_queries": scalar_queries,
+        "scalar_capture_queries": len(scalar_queries),
         "binary_lifetime_queries": lifetime_queries,
         "channels": len(channel_map),
         "event_ids": {":".join(key): sorted(values) for key, values in banks.items()},
@@ -544,15 +547,16 @@ def _plan_leaf(loop, *, live_in=(), banks=None):
         width = 1 if channel.last else None
         for candidate in () if channel.last else range(1, 9):
             if all(
-                graph.path(
-                    destination,
-                    r + channel.distance,
-                    source,
-                    _successor(channel, r, candidate, graph.period),
+                graph.covered_many(
+                    (
+                        destination,
+                        r + channel.distance,
+                        source,
+                        _successor(channel, r, candidate, graph.period),
+                    )
+                    for r in range(graph.period)
+                    if r % channel.period in channel.residues
                 )
-                is not None
-                for r in range(graph.period)
-                if r % channel.period in channel.residues
             ):
                 width = candidate
                 break
