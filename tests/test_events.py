@@ -100,32 +100,55 @@ def test_explicit_ids_are_not_silently_overridden_by_rotating_fields():
         verify_plan(plan)
 
 
+def _evaluate_selection(value, index):
+    # Interpret the emitted C expression without using its run construction.
+    value = value.strip()
+    if "?" not in value:
+        return eval(value, {"__builtins__": {}}, {"index": index})
+    assert value[0] == "(" and value[-1] == ")"
+    value = value[1:-1]
+    depth = 0
+    splits = {}
+    for i, c in enumerate(value):
+        depth += (c == "(") - (c == ")")
+        if depth == 0 and c in "?:":
+            splits[c] = i
+    a, b = splits["?"], splits[":"]
+    condition = eval(value[:a], {"__builtins__": {}}, {"index": index})
+    return _evaluate_selection(value[a + 1 : b] if condition else value[b + 1 :], index)
+
+
 def test_scalar_selection_matches_each_finite_ordinal():
-    for ids in ((3,), (1, 0, 1, 0, 1), (0, 2, 4, 6, 2, 3, 1, 7, 0, 5)):
-        # Check the generated condition tree structurally, including the
-        # periodic shortened form, without reusing its construction logic.
+    import random
+
+    rng = random.Random(0)
+    maps = [(3,), (1, 0, 1, 0, 1), (0, 2, 4, 6, 2, 3, 1, 7, 0, 5)]
+    maps.extend(tuple(rng.randrange(8) for _ in range(n)) for n in range(1, 130))
+    for ids in maps:
         expression = selection_expression(ids, "index")
-        import re
+        assert [_evaluate_selection(expression, i) for i in range(len(ids))] == list(ids)
 
-        def evaluate(value, index):
-            value = value.strip()
-            if re.fullmatch(r"\d+", value):
-                return int(value)
-            # The expression is a fully parenthesized ternary. Scan nesting
-            # to split its condition, true arm and false arm.
-            assert value[0] == "(" and value[-1] == ")"
-            value = value[1:-1]
-            depth = 0
-            splits = {}
-            for i, c in enumerate(value):
-                depth += (c == "(") - (c == ")")
-                if depth == 0 and c in "?:":
-                    splits[c] = i
-            a, b = splits["?"], splits[":"]
-            condition = eval(value[:a], {"__builtins__": {}}, {"index": index})
-            return evaluate(value[a + 1 : b] if condition else value[b + 1 :], index)
 
-        assert [evaluate(expression, i) for i in range(len(ids))] == list(ids)
+def test_event_rotations_across_stage_boundaries_stay_compact():
+    # Query-tail interference changes rotations even though each interval is
+    # regular. Include a nonaligned transition and a partial final period.
+    for scale in (1, 16):
+        ids = (
+            (0, 1) * (20 * scale)
+            + (0, 2, 1, 3) * (6 * scale)
+            + (0, 1) * (3 * scale)
+            + (1, 3, 0, 2) * (14 * scale)
+            + (1,)
+        )
+        expression = selection_expression(ids, "index")
+        assert expression.count("?") <= 20
+        assert len(expression) < 1100
+        assert [_evaluate_selection(expression, i) for i in range(len(ids))] == list(ids)
+
+
+def test_empty_event_selection_has_a_diagnostic():
+    with pytest.raises(CompileError, match="nonempty ID map"):
+        selection_expression((), "index")
 
 
 def test_finite_packing_does_not_invent_paths_to_hide_real_pressure():

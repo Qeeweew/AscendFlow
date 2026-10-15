@@ -7,6 +7,44 @@
 以[总体设计](design.md)和[重构方案](refactor-plan.md)为准。下文结果保留其原有
 源码、数值配置和测量范围，不作为尚未实现的新路径证据。
 
+## 2026-10-15：最终ASC审查与未通过的性能验收
+
+当前审查对象为`tiled_legacy.py`的BQ128/BK1024/CK128/VR8、每组四个query
+tile、跨query overlap和Load3D候选。它仍走物理构造路径，完整新AST FA未完成。
+B1/H8/Hkv8/Sq=Sk4096/D128/f16三批设备kernel中位时间为
+1316.708/1317.258/1318.048μs；ACLNN为512.820/513.220/514.190μs。
+中位数比2.56665，**性能验收失败**。大例为采样数值比对加全输出finite、输入
+与allocation guard检查，不能写成全输出数值比对。对照文件在
+`runs/attention-next/mha-comparison.json`，原始profile在`mha-profiles/`。
+
+直接读`runs/attention-next/mha4k-load3d/flash_attention.asc`，发现：
+
+- **CV派发粒度不等价**：AIV在step16完成下一score tile的第一组8行softmax
+  后，就在第297行等待上一tile的完整PV；下一组softmax要到step17才派发。
+  AIC第一次完整PV到自身step24才发布。910B的`asc_sync_block_wait(pipe,id)`
+  实际展开为`wait_flag_dev(id)`，是controller gate，不能理解为只阻塞MTE2。
+  于是旧PV等待可以挡住下一tile剩余56行的softmax派发。
+- **参照实现的等待位置不同**：ops-transformer arch22的`Process`先执行完整
+  `ProcessVec1`，随后`WaitBmm2Result`、`IterateBmm2`、`ProcessVec2`。
+  `ProcessVec1`内部才是各8行子块的循环；把Vec1/Vec2逐8行交错不等价。
+  同文件1058行在S2=1024时也选8行，所以不能把8行本身判定为性能原因。
+- **L0C限制重叠**：ASC将qk_accum固定在0、pv_accum在65536；每次QK复用
+  同一个64KiB区域，均受上一次FIX完成约束。QK没有L0C双缓冲。增加第二个QK
+  槽会与现有PV同时超过128KiB容量，必须先按整块阶段重新安排复用。
+- **分组与硬件不匹配**：当前launch为64组，设备20 AIC；ACLNN实际launch为
+  20组。各组工作量相等、按波次执行的简化模型下，64组需四波，末波仅4组，
+  有效槽位占用64/80。它是静态排步问题，不是已测出的独立耗时贡献。
+- **event选择源码膨胀**：有限分配表有分段周期，但旧emitter只认整表周期，
+  导致2044个三元选择。已修为精确分段编码，源码92176→49032字节，全部显式
+  ID逐项一致，未改变等待。详见[event分配](event-allocation.md)。该修复尚无
+  新设备性能数据，不能用旧profile代表新二进制。
+
+参照HEAD为`4bbfb3b2bccceb2a1b80828d04eee915169a2b2e`，文件为
+`attention/flash_attention_score/op_kernel/arch22/flash_attention_score_s1s2_bn2gs1.h`。
+该checkout用于源码对照，安装的ACLNN二进制不是本轮从它重建的。
+原ASC的Python规划/最终检查分别25.90/4.60s；源码选择式压缩没有修复这些成本。
+下一项应是完整Vec1/PV/Vec2的阶段派发与L0C复用，不再仅调整Load指令或tile参数。
+
 `flash_attention` 将前向 online attention 展开为真实 xDSL physical IR：
 一个 AIC 执行 QK/PV，两个 AIV 各处理半个 query tile，三个有界 GM 环分别
 交接 scores、operand-dtype P 和 FP32 PV。Q/K/V/O 为连续 BNSD；K/V 保持原布局，

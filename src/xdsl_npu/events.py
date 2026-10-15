@@ -162,17 +162,51 @@ def pack_event_lifetimes(module):
 
 
 def selection_expression(ids, ordinal):
-    """Balanced pure Scalar selection: no constant table memory or extra DMA."""
-    for period in range(1, min(8, len(ids)) + 1):
-        if all(flag == ids[i % period] for i, flag in enumerate(ids)):
-            ids = ids[:period]
-            ordinal = f"(({ordinal}) % {period})"
-            break
+    """Encode the exact finite ID map as piecewise short-period selections.
 
-    def select(lo, hi):
-        if all(flag == ids[lo] for flag in ids[lo:hi]):
-            return str(ids[lo])
+    Lifetime packing can change its rotation at a prologue, query boundary or
+    epilogue. A whole-map period test misses these runs and emits one branch
+    per generation. Greedily find the longest prefix with period <= 8 instead.
+    Each of the eight scans is bounded by the consumed prefix, so discovering
+    runs takes O(8 * len(ids)) time. This does not recolor events or move waits;
+    the original verified map remains the authority for every valid ordinal.
+    No constant table memory, DMA or out-of-range ordinal contract is added.
+    """
+    require(bool(ids), "event selection requires a nonempty ID map")
+
+    def select(values, index, lo, hi):
+        if all(flag == values[lo] for flag in values[lo:hi]):
+            return str(values[lo])
         middle = (lo + hi) // 2
-        return f"(({ordinal}) < {middle} ? {select(lo, middle)} : {select(middle, hi)})"
+        return (
+            f"(({index}) < {middle} ? {select(values, index, lo, middle)}"
+            f" : {select(values, index, middle, hi)})"
+        )
 
-    return select(0, len(ids))
+    runs = []
+    start = 0
+    while start < len(ids):
+        stop, width = start, 1
+        for period in range(1, min(8, len(ids) - start) + 1):
+            end = start + period
+            while end < len(ids) and ids[end] == ids[end - period]:
+                end += 1
+            if end > stop:
+                stop, width = end, period
+        values = ids[start : start + width]
+        index = f"(({ordinal}) - {start})" if start else f"({ordinal})"
+        index = f"({index} % {width})"
+        if all(flag == values[0] + i for i, flag in enumerate(values)):
+            code = str(values[0]) if width == 1 else f"({values[0]} + {index})"
+        else:
+            code = select(values, index, 0, width)
+        runs.append((start, code))
+        start = stop
+
+    def choose(lo, hi):
+        if hi - lo == 1:
+            return runs[lo][1]
+        middle = (lo + hi) // 2
+        return f"(({ordinal}) < {runs[middle][0]} ? {choose(lo, middle)} : {choose(middle, hi)})"
+
+    return choose(0, len(runs))
