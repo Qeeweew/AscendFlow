@@ -4,7 +4,7 @@ from .asc_scalar import ScalarScope
 from .codegen import QUALIFIER, load3d_init, native_line
 from .ir import InvocationChannelOp, MixedOp, OnceOp
 from .model import ITEMSIZE, storage_layout
-from .scalar import bindings, from_ssa
+from .scalar import bindings, facts_from_sizes, from_ssa
 
 
 def _guard(command, channel=None):
@@ -46,6 +46,9 @@ def _event(channel, epoch, scalar):
             1,
         )
     index = scalar.rem(ordinal, len(channel.ids))
+    base, step = channel.ids[0], channel.ids[1] - channel.ids[0]
+    if all(value == base + i * step for i, value in enumerate(channel.ids)):
+        return scalar.add(base, scalar.mul(step, index))
     choices = scalar.value(channel.ids[-1])
     for i in range(len(channel.ids) - 2, -1, -1):
         choices = scalar.select_eq(index, i, channel.ids[i], choices)
@@ -156,13 +159,18 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
     ]
     name = loop.op.sym_name.data
     roots = list(loop.roots)
+    facts = facts_from_sizes(loop.parameters)
     size_args = ["npu_size_" + size.sym_name.data for size in loop.parameters]
     signature = [f"__gm__ uint8_t* {root}" for root in roots]
     signature.extend(f"int64_t {arg}" for arg in size_args)
     expressions = (
-        [loop.bound] if sequence is None else [a[0].bound for a in sequence.analyses.values()]
+        [loop.host_bound]
+        if sequence is None
+        else [a[0].host_bound for a in sequence.analyses.values()]
     ) + [
-        from_ssa(root.extent_count) for root in loop.roots.values() if root.extent_count is not None
+        from_ssa(root.extent_count, facts=facts)
+        for root in loop.roots.values()
+        if root.extent_count is not None
     ]
     expressions += [
         ref.prefix_extent
@@ -190,12 +198,15 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
         "",
         f'extern "C" __global__ {kind} void {name}({", ".join(signature)}) {{',
         *uniform_lines,
-        (
-            f"  const int64_t n = {loop.bound.c(uniform_names) if loop.bound is not None else loop.constant_count};"
-            if sequence is None
-            else f"  const int64_t npu_sequence_count = {sequence.sequence.summary.bound.c(uniform_names) if sequence.sequence.summary.bound is not None else 0};"
-        ),
     ]
+    if sequence is not None:
+        lines.append(
+            f"  const int64_t npu_sequence_count = {sequence.sequence.summary.bound.c(uniform_names) if sequence.sequence.summary.bound is not None else 0};"
+        )
+    elif loop.cyclic is None:
+        lines.append(
+            f"  const int64_t n = {loop.bound.c(uniform_names) if loop.bound is not None else loop.constant_count};"
+        )
     if invocation is not None:
         lines.append(f"  const int64_t npu_invocations = {invocation.bound.c(uniform_names)};")
     tasks = {
@@ -214,6 +225,16 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
             "  asc_set_ctrl(asc_get_ctrl() | (uint64_t(1) << 48));",
             "  const int64_t core_id = asc_get_block_idx();",
         ]
+        if loop.cyclic is not None:
+            # The descriptor is evaluated once per owner. Its SSA division is
+            # known nonnegative after clamping; do not duplicate a nested max
+            # in both quotient and remainder of the ceildiv spelling.
+            total = loop.cyclic.total.c(uniform_names)
+            lines += [
+                f"  const int64_t npu_remaining = {total} - core_id;",
+                "  const int64_t npu_owned = npu_remaining > 0 ? npu_remaining : 0;",
+                f"  const int64_t n = npu_owned / {loop.groups} + (npu_owned % {loop.groups} != 0);",
+            ]
         offsets, _ = storage_layout(data.program.storages)
         for storage in data.program.storages:
             if not storage.external:
@@ -310,10 +331,10 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
             )
         _, checked_uniform_lines = bindings(expressions, checked=True)
         lines += checked_uniform_lines
-        if loop.bound is not None:
+        if loop.host_bound is not None:
             stage_margin = max(task.stage for actor in all_data for task in actor.program.tasks)
             lines.append(
-                f"  if ({loop.bound.c(uniform_names)} > {(1 << 63) - 1 - stage_margin}) return -1; // loop step overflow"
+                f"  if ({loop.host_bound.c(uniform_names)} > {(1 << 63) - 1 - stage_margin}) return -1; // loop step overflow"
             )
         alignments = sorted(
             {
@@ -333,11 +354,11 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
         # input contract check, never a device barrier or a hidden allocation.
         for root, allocation in loop.roots.items():
             if allocation.extent_count is not None:
-                extent = from_ssa(allocation.extent_count).c(uniform_names)
+                extent = from_ssa(allocation.extent_count, facts=facts).c(uniform_names)
                 lines.append(
                     f"  if ({extent} > {((1 << 63) - 1) // allocation.count_scale.data}) return -1; // extent multiplication overflow"
                 )
-                nbytes = f"({from_ssa(allocation.extent_count).c(uniform_names)} * {allocation.count_scale.data})"
+                nbytes = f"({from_ssa(allocation.extent_count, facts=facts).c(uniform_names)} * {allocation.count_scale.data})"
             else:
                 nbytes = str(allocation.nbytes.data)
             lines += [

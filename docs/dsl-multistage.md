@@ -26,11 +26,12 @@ xDSL；不执行设备函数体来 tracing 运行次数，不使用 `cube.task/v
 
 裸 `T.int64` 仍表示非负整数、multiple=1；带合同的参数不变成 constexpr。
 合同进入source/physical IR，launcher在计算地址与设备派发前检查。当前同步分析
-仍保守使用非负域，不假称已经利用minimum证明一般动态商余。allocation须在
+利用minimum/multiple证明正运行时除数与完整tile范围；已接通BNSD局部cyclic
+任务寻址，具体边界见[runtime索引](runtime-indexing.md)。allocation须在
 全部使用者的共同源码scope声明，跨region逃逸会在前端明确拒绝。
 
 语法被前端识别不表示所有组合均可编译。AST 嵌套 pipeline、一般 mixed 层次、
-runtime 商余时钟及宏尚未贯通。显式 unroll 受预算限制；普通常量界不授权展开。
+多层 runtime 商余时钟及宏尚未贯通。显式 unroll 受预算限制；普通常量界不授权展开。
 
 ## 可运行：三阶段双缓冲
 
@@ -133,8 +134,9 @@ if K > 0:
 
 query 状态、task 交接环、child 原生环的 generation 不可混同。新 query QK
 可先于旧 query PV；Q cache 只等其实际最后 QK reader，不扩大到整个 query。
-这类 runtime 参数乘积和商余关系尚未支持，不能靠枚举 K、隐式展开或改成
-constexpr 实现。空 K 的输出由算法显式定义；当前 FA 目标限定正 Sk。
+runtime 参数乘积和商余现已保留为SSA，连续流的多时钟/跨query状态尚未支持，
+不能靠枚举 K、隐式展开或改成constexpr接通。空 K 的输出由算法显式定义；
+当前 FA 目标限定正 Sk。
 
 ## 借用、数值和拒绝边界
 

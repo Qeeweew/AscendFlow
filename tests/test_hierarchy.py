@@ -9,7 +9,6 @@ from examples.vector.independent_rings import independent_rings
 from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.frontend import FrontendError
 from xdsl_npu.ir import dump, parse
 from xdsl_npu.loop_graph import Channel
 from xdsl_npu.loop_model import extract_loop
@@ -30,28 +29,40 @@ def _value(value, bindings):
     op = value.owner
     if isinstance(op, arith.ConstantOp):
         return op.value.value.data
-    assert isinstance(op, arith.MuliOp)
-    return _value(op.lhs, bindings) * _value(op.rhs, bindings)
+    lhs, rhs = (_value(operand, bindings) for operand in op.operands)
+    if isinstance(op, arith.AddiOp):
+        return lhs + rhs
+    if isinstance(op, arith.SubiOp):
+        return lhs - rhs
+    if isinstance(op, arith.MuliOp):
+        return lhs * rhs
+    if isinstance(op, (arith.DivUIOp, arith.RemUIOp, arith.CeilDivUIOp)):
+        assert lhs >= 0 and rhs > 0
+        if isinstance(op, arith.RemUIOp):
+            return lhs % rhs
+        return (lhs + rhs - 1) // rhs if isinstance(op, arith.CeilDivUIOp) else lhs // rhs
+    if isinstance(op, arith.MinSIOp):
+        return min(lhs, rhs)
+    if isinstance(op, arith.MaxSIOp):
+        return max(lhs, rhs)
+    raise AssertionError(op.name)
 
 
 def _address(view, bindings):
-    result = view.offset.data
-    for term in view.terms:
-        index, coefficient, divisor, modulus = (v.data for v in term)
-        value = _value(view.indices[index], bindings) // divisor
-        result += coefficient * (value % modulus if modulus else value)
-    for term in view.dynamic_terms or ():
-        index, size, coefficient, divisor, modulus = (v.data for v in term)
-        value = _value(view.indices[index], bindings) // divisor
-        result += (
-            coefficient
-            * _value(view.indices[size], bindings)
-            * (value % modulus if modulus else value)
-        )
-    return result
+    # Independently derive row-major byte pitches from the allocation's axes.
+    # No production normalization, address, or ownership proof is called.
+    allocation = view.source.owner
+    assert isinstance(allocation, AllocationOp)
+    extents = [dimension.data for dimension in view.source.type.shape]
+    for axis, dimension in zip(allocation.dynamic_axes, allocation.dimensions):
+        extents[axis.data] = _value(dimension, bindings)
+    linear = 0
+    for origin, extent in zip(view.origins, extents):
+        linear = linear * extent + _value(origin, bindings)
+    return linear * {"f16": 2, "bf16": 2, "f32": 4}[view.source.type.dtype.data]
 
 
-def test_parent_and_child_coordinates_and_products_are_retained_in_ir():
+def test_parent_and_child_coordinates_and_axis_extents_are_retained_in_ir():
     module = parse(dump(hierarchical_gemm.to_ir()))
     program = module.body.block.first_op
     assert isinstance(program, ProgramOp)
@@ -62,14 +73,20 @@ def test_parent_and_child_coordinates_and_products_are_retained_in_ir():
     assert child.parent_op() is parent
     sizes = {op.sym_name.data: op.value for op in module.walk() if isinstance(op, SizeOp)}
     assert parent.ub is sizes["outputs"] and child.limit is sizes["panels"]
-    products = [op for op in program.body.block.ops if isinstance(op, arith.MuliOp)]
-    assert len(products) == 1  # A/B share their group pitch expression.
     views = [op for op in module.walk() if isinstance(op, ViewOp)]
     external = {
         op.source.owner.sym_name.data: op
         for op in views
         if isinstance(op.source.owner, AllocationOp) and op.source.type.memory.data == "GM"
     }
+    coordinates = (program.body.block.args[0], parent.body.block.args[0], child.body.block.args[0])
+    for name in ("A", "B"):
+        view = external[name]
+        assert tuple(view.origins[:3]) == coordinates
+        assert tuple(axis.data for axis in view.axes) == (3, 4)
+        assert tuple(view.source.owner.dimensions) == (sizes["outputs"], sizes["panels"])
+    assert tuple(external["C"].origins[:2]) == coordinates[:2]
+    assert tuple(axis.data for axis in external["C"].axes) == (2, 3)
     for outputs, panels in ((1, 1), (2, 7), (17, 1024), (1 << 20, (1 << 20) + 1)):
         for group, output, k in ((0, 0, 0), (19, outputs - 1, panels - 1)):
             bindings = {
@@ -99,8 +116,8 @@ def test_parent_axis_cannot_use_the_wrong_extent_or_traversal(bounds):
                     for k in N.Pipelined(panels, stages=1):
                         N.copy(A[output, k, :], x)
     """)
-    with pytest.raises(FrontendError, match="bounded by its tensor extent|zero-based unit-step"):
-        definition.to_ir()
+    with pytest.raises(CompileError, match="bounded by its tensor extent|zero-based unit-step"):
+        lower_source(definition.to_ir())
 
 
 def _members(access, count):
@@ -377,14 +394,21 @@ def test_summary_budget_is_on_static_structure(reduction_boundary, monkeypatch):
 
 
 def test_dynamic_stride_cannot_hide_a_nonuniform_factor():
-    from xdsl.utils.exceptions import VerifyException
-
     module = hierarchical_gemm.to_ir()
     program = module.body.block.first_op
-    product = next(op for op in program.body.block.ops if isinstance(op, arith.MuliOp))
-    product.operands = [program.body.block.args[0], product.rhs]
-    with pytest.raises(VerifyException, match="invalid runtime view"):
-        module.verify()
+    allocation = next(
+        op
+        for op in program.body.block.ops
+        if isinstance(op, AllocationOp) and op.sym_name.data == "A"
+    )
+    # A forged allocation axis would turn every earlier row-major pitch into
+    # owner-dependent arithmetic. A block coordinate is not a uniform extent.
+    product = arith.MuliOp(program.body.block.args[0], allocation.dimensions[1])
+    program.body.block.insert_op_before(product, allocation)
+    allocation.operands = (allocation.dimensions[0], product.result)
+    module.verify()
+    with pytest.raises(CompileError, match="GM extent requires a declared uniform scalar"):
+        lower_source(module)
 
 
 def test_constant_child_summary_cannot_be_rebound_to_another_length():

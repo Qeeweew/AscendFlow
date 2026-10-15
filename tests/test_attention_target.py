@@ -46,10 +46,11 @@ def test_both_organizations_share_actual_algorithm_and_explicit_operations():
 
 
 def test_source_is_explicitly_refused_without_falling_back_to_legacy():
-    with pytest.raises(FrontendError, match="unsupported index product"):
-        compile(attention_target())
-    with pytest.raises(FrontendError, match="positive static divisor"):
-        compile(attention_target(continuous=True))
+    # Runtime index SSA now admits both descriptors. The next unsupported
+    # numerical contract must remain explicit; this is not an executable FA.
+    for continuous in (False, True):
+        with pytest.raises(FrontendError, match="Vector scalar must be finite"):
+            compile(attention_target(continuous=continuous))
 
 
 def static(expr, parameters):

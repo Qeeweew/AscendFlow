@@ -7,7 +7,6 @@ below are used by the AST parser; they do not provide an executable tracer.
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from math import prod
 
 from xdsl.dialects.builtin import (
     ArrayAttr,
@@ -21,7 +20,7 @@ from xdsl.dialects.builtin import (
 from xdsl.dialects.builtin import f32 as ir_f32
 from xdsl.ir import Block, OpResult, Region, SSAValue, SSAValues
 
-from .model import ITEMSIZE, require, round_f32
+from .model import require, round_f32
 from .source_ir import (
     AllocationOp,
     CopyOp,
@@ -173,59 +172,96 @@ class _Predicate:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class _Index:
-    # Each term is coefficient * ((coordinate // divisor) % modulus).
-    terms: tuple[tuple[SSAValue, int, int, int], ...] = ()
+    """An index SSA expression with a separate static slice displacement."""
+
+    value: SSAValue | None = None
     constant: int = 0
 
     def __add__(self, other):
         other = _index(other)
-        return _Index(self.terms + other.terms, self.constant + other.constant)
+        value = self.value if other.value is None else other.value
+        if self.value is not None and other.value is not None:
+            from xdsl.dialects import arith
+
+            value = _trace().index_op(arith.AddiOp, self.value, other.value)
+        return _Index(value, self.constant + other.constant)
 
     __radd__ = __add__
 
     def __mul__(self, factor):
+        from xdsl.dialects import arith
+
+        other = _index(factor)
+        if self.value is None:
+            if other.value is None:
+                return _Index(constant=self.constant * other.constant)
+            return other * self.constant
+        if other.value is None:
+            if other.constant == 0:
+                return _Index()
+            if other.constant == 1:
+                return self
+            return _Index(
+                _trace().index_op(arith.MuliOp, self.value, other.constant),
+                self.constant * other.constant,
+            )
         require(
-            type(factor) is int or isinstance(factor, (_Dimension, _ExtentProduct)),
-            "unsupported index product",
+            _trace().uniform(self.value) or _trace().uniform(other.value),
+            "index multiplication requires a uniform parameter factor",
         )
-        if isinstance(factor, (_Dimension, _ExtentProduct)):
-            constant = _index(self.constant * factor) if self.constant else _Index()
-            return constant + _Index(tuple((v, factor * c, d, m) for v, c, d, m in self.terms))
-        return _Index(
-            tuple((v, c * factor, d, m) for v, c, d, m in self.terms), self.constant * factor
-        )
+        return _Index(_trace().index_op(arith.MuliOp, self, other))
 
     __rmul__ = __mul__
 
     def __sub__(self, other):
-        return self + _index(other) * -1
+        from xdsl.dialects import arith
+
+        other = _index(other)
+        if self.value is other.value:
+            return _Index(constant=self.constant - other.constant)
+        if other.value is None:
+            return _Index(self.value, self.constant - other.constant)
+        if self.value is None:
+            value = _trace().index_op(arith.SubiOp, 0, other.value)
+        else:
+            value = _trace().index_op(arith.SubiOp, self.value, other.value)
+        return _Index(value, self.constant - other.constant)
 
     def __rsub__(self, other):
         return _index(other) - self
 
     def __floordiv__(self, divisor):
-        require(
-            type(divisor) is int and divisor > 0 and not self.constant and len(self.terms) == 1,
-            "division requires one unshifted coordinate and a positive static divisor",
-        )
-        value, coefficient, old_divisor, modulus = self.terms[0]
-        require(
-            coefficient == 1 and modulus == 0, "composed nonlinear index division is unsupported"
-        )
-        return _Index(((value, 1, old_divisor * divisor, 0),))
+        from xdsl.dialects import arith
+
+        return self._divide(divisor, arith.DivUIOp)
 
     def __mod__(self, modulus):
-        require(
-            type(modulus) is int and modulus > 0 and not self.constant and len(self.terms) == 1,
-            "modulo requires one unshifted coordinate and a positive static modulus",
-        )
-        value, coefficient, divisor, old_modulus = self.terms[0]
-        require(
-            coefficient == 1 and old_modulus == 0, "composed nonlinear index modulo is unsupported"
-        )
-        return _Index(((value, 1, divisor, modulus),))
+        from xdsl.dialects import arith
+
+        return self._divide(modulus, arith.RemUIOp)
+
+    def _divide(self, divisor, operation):
+        from xdsl.dialects import arith
+
+        divisor = _index(divisor)
+        if divisor.value is None:
+            require(divisor.constant > 0, "index divisor must be positive")
+            if self.value is None:
+                require(self.constant >= 0, "unsigned index division needs a nonnegative numerator")
+                return _Index(
+                    constant=(
+                        self.constant // divisor.constant
+                        if operation is arith.DivUIOp
+                        else self.constant % divisor.constant
+                    )
+                )
+        else:
+            require(_trace().uniform(divisor.value), "index divisor must be a uniform parameter")
+        # Positive runtime divisors and nonnegative numerators require lowering
+        # proofs over the actual active coordinate domain.
+        return _Index(_trace().index_op(operation, self, divisor))
 
     def __bool__(self):
         raise TypeError("device coordinates cannot control Python branches")
@@ -244,13 +280,35 @@ def _index(value):
     if isinstance(value, _Index):
         return value
     if isinstance(value, (_Dimension, _ExtentProduct)):
-        return _Index(((_trace().size(value), value.scale, 1, 0),))
-    require(type(value) is int, "tensor indices must be static integers or pipeline coordinates")
+        return _Index(_trace().size(value)) * value.scale
+    if isinstance(value, SSAValue):
+        require(isinstance(value.type, IndexType), "expected an index scalar")
+        return _Index(value)
+    require(
+        type(value) is int, "tensor indices must be static integers or device index expressions"
+    )
     return _Index(constant=value)
 
 
 def _coordinate(value):
-    return _Index(((value, 1, 1, 0),))
+    return _Index(value)
+
+
+def _index_arithmetic():
+    from xdsl.dialects import arith
+
+    return (
+        arith.ConstantOp,
+        arith.AddiOp,
+        arith.SubiOp,
+        arith.MuliOp,
+        arith.DivUIOp,
+        arith.RemUIOp,
+        arith.MinSIOp,
+        arith.MaxSIOp,
+        arith.CeilDivUIOp,
+        arith.CmpiOp,
+    )
 
 
 _current = ContextVar("xdsl_npu_source", default=None)
@@ -276,6 +334,7 @@ class _Trace:
         self.counter = 0
         self.sizes = {}
         self.products = {}
+        self.index_ops = {}
         self.location = None
 
     def size(self, dimension):
@@ -288,16 +347,9 @@ class _Trace:
                 for end in range(2, len(factors) + 1):
                     key = factors[:end]
                     if key not in self.products:
-                        op = arith.MuliOp(lhs, self.size(factors[end - 1]))
-                        if self.location is not None:
-                            op.location = self.location
-                        previous = (
-                            list(self.products.values())[-1].owner
-                            if self.products
-                            else list(self.sizes.values())[-1]
+                        self.products[key] = self.index_op(
+                            arith.MuliOp, lhs, self.size(factors[end - 1])
                         )
-                        self.op.body.block.insert_op_after(op, previous)
-                        self.products[key] = op.result
                     lhs = self.products[key]
             return self.products[factors]
         if dimension.name not in self.sizes:
@@ -333,6 +385,70 @@ class _Trace:
         self.blocks[-1].add_op(op)
         return op
 
+    def scalar(self, value):
+        from xdsl.dialects import arith
+
+        index = self.resolve_index(_index(value))
+        if index.value is None:
+            return self._pure(arith.ConstantOp.from_int_and_width(index.constant, IndexType()))
+        if index.constant == 0:
+            return index.value
+        return self.index_op(arith.AddiOp, index.value, index.constant)
+
+    def index_op(self, operation, *operands, comparison=None):
+        values = tuple(self.scalar(value) for value in operands)
+        op = operation(*values) if comparison is None else operation(*values, comparison)
+        return self._pure(op)
+
+    def _pure(self, op):
+        """Place pure arithmetic where all its operands first become available."""
+        scopes = []
+        for value in op.operands:
+            block = value.owner if isinstance(value.owner, Block) else value.owner.parent
+            require(block in self.blocks, "index expression escaped its source scope")
+            scopes.append(self.blocks.index(block))
+        depth = max(scopes, default=0)
+        block = self.blocks[depth]
+        key = (
+            block,
+            type(op),
+            tuple(op.operands),
+            frozenset(op.attributes.items()),
+            frozenset(op.properties.items()),
+        )
+        if key in self.index_ops:
+            op.drop_all_references()
+            return self.index_ops[key]
+        if self.location is not None:
+            op.location = self.location
+        if depth + 1 < len(self.blocks):
+            anchor = self.blocks[depth + 1].parent_op()
+            require(anchor is not None, "index scope is detached")
+            block.insert_op_before(op, anchor)
+        else:
+            block.add_op(op)
+        self.index_ops[key] = op.results[0]
+        return op.results[0]
+
+    def uniform(self, value):
+        """Whether a value depends only on declared uniform scalar parameters."""
+        seen = set()
+
+        def visit(current, depth):
+            if current in seen:
+                return True
+            if depth > 128 or len(seen) >= 4096:
+                return False
+            seen.add(current)
+            owner = current.owner
+            if isinstance(owner, SizeOp):
+                return True
+            if not isinstance(owner, _index_arithmetic()):
+                return False
+            return all(visit(operand, depth + 1) for operand in owner.operands)
+
+        return visit(value, 0)
+
     def name(self, prefix):
         self.counter += 1
         return f"{prefix}_{self.counter}"
@@ -347,23 +463,47 @@ class _Trace:
 
     def resolve_index(self, index):
         """An exported tile keeps its producer's descriptor and storage version."""
-        result = _Index(constant=index.constant)
-        for value, coefficient, divisor, modulus in index.terms:
-            if isinstance(value.owner, SizeOp) or value in self.products.values():
-                result += _Index(((value, coefficient, divisor, modulus),))
-                continue
-            if value.owner in self.blocks:
-                result += _Index(((value, coefficient, divisor, modulus),))
-                continue
-            region = value.owner.parent_op()
-            require(
-                isinstance(region, PipelineOp),
-                "execution-owner coordinate escaped its source scope",
-            )
-            require(region.count.data > 0, "a zero-trip pipeline has no exported tile")
-            literal = (region.count.data - 1) // divisor
-            result += coefficient * (literal % modulus if modulus else literal)
-        return result
+        resolved = {}
+
+        def visit(value, depth=0):
+            require(depth <= 128 and len(resolved) < 4096, "index expression exceeds SSA budget")
+            if value in resolved:
+                return resolved[value]
+            owner = value.owner
+            block = owner if isinstance(owner, Block) else owner.parent
+            if block in self.blocks:
+                resolved[value] = value
+                return value
+            if isinstance(owner, Block):
+                region = owner.parent_op()
+                require(
+                    isinstance(region, PipelineOp),
+                    "execution-owner coordinate escaped its source scope",
+                )
+                require(
+                    region.count is not None,
+                    "dynamic child coordinate cannot escape without a last-iteration proof",
+                )
+                require(region.count.data > 0, "a zero-trip pipeline has no exported tile")
+                result = self.scalar(region.count.data - 1)
+            else:
+                require(
+                    isinstance(owner, _index_arithmetic()),
+                    "index expression escaped its source scope",
+                )
+                operands = tuple(visit(operand, depth + 1) for operand in owner.operands)
+                result = self._pure(
+                    type(owner).create(
+                        operands=operands,
+                        result_types=owner.result_types,
+                        attributes=owner.attributes.copy(),
+                        properties=owner.properties.copy(),
+                    )
+                )
+            resolved[value] = result
+            return result
+
+        return _Index(None if index.value is None else visit(index.value), index.constant)
 
     def enter(self, op):
         self.add(op)
@@ -395,26 +535,24 @@ class _Buffer:
     layout: str
 
     def __getitem__(self, indices):
-        indices = indices if isinstance(indices, tuple) else (indices,)
-        strides = tuple(
-            prod(self.shape[i + 1 :]) * ITEMSIZE[self.dtype.value] for i in range(len(self.shape))
-        )
-        view = _View(self, self.shape, strides, _Index())
-        return view[indices] if indices else view
+        return self._full()[indices]
 
     def _full(self):
-        strides = tuple(
-            prod(self.shape[i + 1 :]) * ITEMSIZE[self.dtype.value] for i in range(len(self.shape))
+        return _View(
+            self, tuple(_Index() for _ in self.shape), self.shape, tuple(range(len(self.shape)))
         )
-        return _View(self, self.shape, strides, _Index())
 
 
 @dataclass(frozen=True)
 class _View:
     buffer: _Buffer
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    offset: _Index
+    origins: tuple[_Index, ...]
+    widths: tuple[int | _Dimension, ...]
+    axes: tuple[int, ...]
+
+    @property
+    def shape(self):
+        return tuple(self.widths[axis] for axis in self.axes)
 
     def __getitem__(self, indices):
         indices = indices if isinstance(indices, tuple) else (indices,)
@@ -426,35 +564,54 @@ class _View:
             source = self[indices[:-1]]
             require(len(source.shape) == 1, "row broadcast requires one packed vector")
             return _RowBroadcast(source)
-        require(len(indices) <= len(self.shape), "too many tensor axes")
-        indices += (slice(None),) * (len(self.shape) - len(indices))
-        shape, strides, offset = [], [], self.offset
-        for size, stride, index in zip(self.shape, self.strides, indices):
+        require(len(indices) <= len(self.axes), "too many tensor axes")
+        indices += (slice(None),) * (len(self.axes) - len(indices))
+        origins, widths, axes = list(self.origins), list(self.widths), []
+        for axis, index in zip(self.axes, indices):
+            size = self.widths[axis]
+            restricted = not (
+                self.origins[axis].value is None
+                and self.origins[axis].constant == 0
+                and size == self.buffer.shape[axis]
+            )
             if isinstance(index, slice):
                 require(index.step in {None, 1}, "strided source slices are not implemented")
+                if index.start is None and index.stop is None:
+                    axes.append(axis)
+                    continue
                 start = _index(0 if index.start is None else index.start)
                 stop = _index(size if index.stop is None else index.stop)
-                require(start.terms == stop.terms, "slice width must be a static integer")
-                width = stop.constant - start.constant
+                difference = stop - start
+                require(difference.value is None, "slice width must be a static integer")
+                width = difference.constant
                 require(width > 0, "empty or negative source slice")
-                if isinstance(size, _Dimension):
-                    _runtime_axis(start, size, width)
-                else:
-                    lo, hi = _index_bounds(start)
-                    require(0 <= lo and hi + width <= size, "source slice exceeds its logical axis")
-                offset += start * stride
-                shape.append(width)
-                strides.append(stride)
+                axes.append(axis)
             else:
-                index = _index(index)
-                if isinstance(size, _Dimension):
-                    _runtime_axis(index, size, 1)
-                else:
-                    lo, hi = _index_bounds(index)
-                    require(0 <= lo and hi < size, "source index exceeds its logical axis")
-                offset += index * stride
-        require(shape, "Scalar accesses need an explicit Scalar operation")
-        return _View(self.buffer, tuple(shape), tuple(strides), offset)
+                start, width = _index(index), 1
+            if start.value is None:
+                require(start.constant >= 0, "source index must be nonnegative")
+                if type(size) is int:
+                    require(
+                        start.constant + width <= size,
+                        "source slice exceeds its logical axis",
+                    )
+            else:
+                require(
+                    not restricted,
+                    "dynamic relative indexing of a restricted view needs a range proof",
+                )
+            require(
+                not restricted
+                or self.origins[axis].value is None
+                or start.value is None
+                and start.constant == 0
+                and width == size,
+                "narrowing a view with a dynamic origin needs a parent range proof",
+            )
+            origins[axis] += start
+            widths[axis] = width
+        require(axes, "Scalar accesses need an explicit Scalar operation")
+        return _View(self.buffer, tuple(origins), tuple(widths), tuple(axes))
 
     def bound(self):
         trace = _trace()
@@ -463,58 +620,23 @@ class _View:
             f"allocation {self.buffer.op.sym_name.data} escaped its source region; "
             "declare shared storage in an enclosing scope",
         )
-        return replace(self, offset=trace.resolve_index(self.offset))
+        return replace(self, origins=tuple(trace.resolve_index(origin) for origin in self.origins))
 
     def emit(self, valid=None):
         trace, buffer = _trace(), self.buffer
         bound = self.bound()
-        offset = bound.offset
-        variables = list(dict.fromkeys(v for v, _, _, _ in offset.terms))
-        dynamic_terms, static_terms = [], []
-        for variable, coefficient, divisor, modulus in offset.terms:
-            if isinstance(coefficient, (_Dimension, _ExtentProduct)):
-                count = trace.size(coefficient)
-                if count not in variables:
-                    variables.append(count)
-                dynamic_terms.append(
-                    _ints(
-                        (
-                            variables.index(variable),
-                            variables.index(count),
-                            coefficient.scale,
-                            divisor,
-                            modulus,
-                        )
-                    )
-                )
-            else:
-                static_terms.append(
-                    _ints((variables.index(variable), coefficient, divisor, modulus))
-                )
-        terms = ArrayAttr(static_terms)
         require(
-            all(type(stride) is int for stride in self.strides),
-            "a native tile needs static inner strides; select runtime axes before the tile",
+            all(type(width) is int and width > 0 for width in bound.widths),
+            "a native tile needs static widths; select runtime axes before the tile",
         )
-        valid_attrs = {}
-        if valid is not None:
-            require(
-                isinstance(valid, SSAValue) and isinstance(valid.type, IndexType),
-                "valid requires an explicit device index expression",
-            )
-            if valid not in variables:
-                variables.append(valid)
-            valid_attrs["valid_index"] = IntAttr(variables.index(valid))
         op = ViewOp.build(
-            operands=[buffer.op.ref, variables],
-            result_types=[_type(self.shape, buffer.dtype, buffer.memory, buffer.layout)],
-            attributes={
-                "offset": IntAttr(offset.constant),
-                "terms": terms,
-                "strides": _ints(self.strides),
-                "dynamic_terms": ArrayAttr(dynamic_terms),
-                **valid_attrs,
-            },
+            operands=[
+                buffer.op.ref,
+                [trace.scalar(origin) for origin in bound.origins],
+                None if valid is None else trace.scalar(valid),
+            ],
+            result_types=[_type(bound.shape, buffer.dtype, buffer.memory, buffer.layout)],
+            attributes={"widths": _ints(bound.widths), "axes": _ints(bound.axes)},
         )
         trace.add(op)
         return op.ref
@@ -556,128 +678,29 @@ def _view(value):
     return value
 
 
-def _index_bounds(index):
-    from xdsl.dialects import arith, scf
-
-    index, trace = _trace().resolve_index(index), _trace()
-    lo = hi = index.constant
-    for value, coefficient, divisor, modulus in index.terms:
-        region = value.owner.parent_op()
-        if isinstance(region, ProgramOp):
-            count = region.groups.data
-        elif isinstance(region, PipelineOp):
-            if region.limit is not None:
-                require(modulus > 0, "runtime index on a static axis needs a bounded mapping")
-                count = divisor * modulus
-            else:
-                count = max(1, region.count.data)
-        elif isinstance(region, scf.ForOp):
-            lower = region.lb.owner
-            require(
-                isinstance(lower, arith.ConstantOp) and lower.value.value.data == 0,
-                "serial view bounds currently require a zero lower bound",
-            )
-            upper = region.ub.owner
-            if isinstance(upper, arith.ConstantOp):
-                count = max(1, upper.value.value.data)
-            else:
-                require(modulus > 0, "runtime serial index on a static axis needs modulo")
-                count = divisor * modulus
-        else:
-            require(isinstance(region, DomainOp), "unknown source index scope")
-            count = 2 if region.kind.data == "vector" and trace.op.kind.data == "mixed" else 1
-        maximum = (count - 1) // divisor
-        if modulus:
-            maximum = min(modulus - 1, maximum)
-        endpoints = 0, coefficient * maximum
-        lo += min(endpoints)
-        hi += max(endpoints)
-    return lo, hi
-
-
-def _runtime_axis(index, dimension, width):
-    trace = _trace()
-    if trace.op.attributes.get("frontend") == StringAttr("ast") and index.terms:
-        from .scalar import bounded_by, from_ssa, literal
-
-        require(
-            len(index.terms) == 1 and index.constant == 0,
-            "runtime tile view needs one unshifted logical coordinate",
-        )
-        variable, coefficient, divisor, modulus = index.terms[0]
-        pipeline = variable.owner.parent_op()
-        from xdsl.dialects import arith, scf
-
-        if isinstance(pipeline, scf.ForOp):
-            require(
-                isinstance(pipeline.lb.owner, arith.ConstantOp)
-                and pipeline.lb.owner.value.value.data == 0
-                and isinstance(pipeline.step.owner, arith.ConstantOp)
-                and pipeline.step.owner.value.value.data == 1,
-                "runtime tensor axis requires a zero-based unit-step serial coordinate",
-            )
-            limit = pipeline.ub
-        else:
-            require(
-                isinstance(pipeline, PipelineOp) and pipeline.limit is not None,
-                "runtime tile view requires its pipeline bound",
-            )
-            limit = pipeline.limit
-        bound = from_ssa(limit)
-        extent = from_ssa(trace.size(dimension))
-        if (coefficient, divisor, modulus) == (width, 1, 0) and (
-            bound == extent
-            and width == 1
-            or bound.kind == "ceildiv"
-            and bound.args[1] == literal(width)
-            and bounded_by(bound.args[0], extent)
-        ):
-            return
-        require(False, "runtime tile view is not bounded by its tensor extent")
-    require(
-        dimension.scale == 1 and width == 1, "runtime axis currently requires one task per index"
-    )
-    if not index.terms and index.constant == 0:
-        return
-    require(
-        len(index.terms) == 1 and index.constant == 0,
-        "runtime axis requires its logical task coordinate",
-    )
-    variable, coefficient, divisor, modulus = index.terms[0]
-    pipeline = variable.owner.parent_op()
-    require(
-        isinstance(pipeline, PipelineOp)
-        and pipeline.limit is trace.size(dimension)
-        and (coefficient, divisor, modulus) == (1, 1, 0),
-        "runtime axis must use the corresponding pipeline limit and coordinate",
-    )
-
-
 def _predicate(value):
+    from xdsl.dialects import arith
+
     if isinstance(value, SSAValue) and value.type == i1:
         return value
+    trace = _trace()
     if type(value) is bool:
-        value = _Predicate(int(value), "eq", 1)
+        op = PredicateOp.build(
+            operands=[[]],
+            result_types=[i1],
+            attributes={
+                "lhs_terms": ArrayAttr([]),
+                "rhs_terms": ArrayAttr([]),
+                "lhs_offset": IntAttr(int(value)),
+                "rhs_offset": IntAttr(1),
+                "comparison": StringAttr("eq"),
+            },
+        )
+        trace.add(op)
+        return op.value
     require(isinstance(value, _Predicate), "initialization requires a boolean or task comparison")
-    lhs, rhs = (_trace().resolve_index(_index(v)) for v in (value.lhs, value.rhs))
-    variables = list(dict.fromkeys(v for expr in (lhs, rhs) for v, _, _, _ in expr.terms))
-    op = PredicateOp.build(
-        operands=[variables],
-        result_types=[i1],
-        attributes={
-            "lhs_terms": ArrayAttr(
-                _ints((variables.index(v), c, d, m)) for v, c, d, m in lhs.terms
-            ),
-            "rhs_terms": ArrayAttr(
-                _ints((variables.index(v), c, d, m)) for v, c, d, m in rhs.terms
-            ),
-            "lhs_offset": IntAttr(lhs.constant),
-            "rhs_offset": IntAttr(rhs.constant),
-            "comparison": StringAttr(value.comparison),
-        },
-    )
-    _trace().add(op)
-    return op.value
+    comparison = {"eq": "eq", "lt": "slt", "le": "sle"}[value.comparison]
+    return trace.index_op(arith.CmpiOp, value.lhs, value.rhs, comparison=comparison)
 
 
 def _tile(view):

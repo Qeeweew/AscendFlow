@@ -298,6 +298,19 @@ class RuntimeSizeOp(IRDLOperation):
         _verify_runtime_contract(self.sym_name.data, self.minimum.data, self.multiple.data)
 
 
+@irdl_op_definition
+class CyclicCountOp(IRDLOperation):
+    """Owner-local count derived from a uniform total and actual Kernel.blocks.
+
+    For owner c in [0, groups), count = ceildiv(max(0, total-c), groups).
+    The containing physical loop validates the scope and ownership relation.
+    """
+
+    name = "npu.cyclic_count"
+    total = operand_def(IndexType)
+    count = result_def(IndexType)
+
+
 def _verify_runtime_contract(name, minimum, multiple):
     if not name.isidentifier():
         raise VerifyException("runtime size requires a parameter name")
@@ -469,6 +482,7 @@ NPU = Dialect(
         RegionSyncOp,
         BoundaryOp,
         RuntimeSizeOp,
+        CyclicCountOp,
         LoopChannelOp,
         InvocationChannelOp,
         InvocationSyncOp,

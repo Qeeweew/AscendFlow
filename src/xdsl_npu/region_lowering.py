@@ -116,6 +116,9 @@ def lower_regions(program, *, symbolic):
     from .sequence_model import extract_sequence
 
     body = source_body(program, symbolic=symbolic)
+    from .indexing import validate_source_arithmetic
+
+    validate_source_arithmetic(program)
     multiple = len(body.regions) > 1
     domains = (
         (("aic", "cube", 0), ("aiv0", "vector", 0), ("aiv1", "vector", 1))

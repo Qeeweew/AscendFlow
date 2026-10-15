@@ -18,7 +18,7 @@ from .ir import BoundaryOp, EndOp
 from .lowering_context import ActorBindings
 from .mixed import extract_mixed, global_dependencies
 from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
-from .scalar import ARITHMETIC, expression, from_ssa, literal, prefix
+from .scalar import ARITHMETIC, Expr, expression, from_ssa, literal, prefix
 from .source_ir import (
     AllocationOp,
     CopyOp,
@@ -315,10 +315,7 @@ class _Actor:
         self.scalar_cache = ChainMap({}, self.bindings.scalar_cache)
         self.runtime = None
         if pipeline.limit is not None:
-            require(
-                pipeline.limit in self.uniform, "pipeline bound must be uniform at region entry"
-            )
-            self.runtime = self.uniform[pipeline.limit]
+            self.runtime = self.bindings.runtime_bound(pipeline)
         if self.kernel.stream is not None:
             require(region_name is not None, "another region needs a lexical identity")
             self.kernel.region(
@@ -344,10 +341,16 @@ class _Actor:
 
     def view(self, value, record, *, matrix=False):
         view, allocation = value.owner, _root(value)
-        require(
-            not self.once or self.pipeline.body.block.args[0] not in view.indices,
-            "ordinary work cannot use a child generation outside its region",
+        from .indexing import (
+            arguments,
+            check_axis,
+            constant_ratio,
+            equivalent,
+            normalize,
+            physical_terms,
         )
+
+        facts = self.bindings.facts
         typ = value.type
         require(
             (typ.memory, typ.dtype, typ.layout)
@@ -355,107 +358,123 @@ class _Actor:
             "a source view cannot silently change memory, dtype, or physical layout",
         )
         dimensions = shape(value)
-        strides = tuple(v.data for v in view.strides)
+        require(len(dimensions) in {1, 2}, "native tile rank must be one or two")
+        coordinate = self.pipeline.body.block.args[0]
+        owner = self.program.body.block.args[0]
+        coordinates = {coordinate: "$g", owner: "$core"}
+        if self.invocation is not None:
+            coordinates[self.invocation.body.block.args[0]] = "$call"
+        # Each statically selected execution lane has its own physical actor.
+        memo = {variable: literal(number) for variable, number in record.constants}
+
+        def scalar(ssa):
+            return from_ssa(ssa, coordinates=coordinates, memo=memo, facts=facts)
+
+        origins = [scalar(origin) for origin in view.origins]
         require(
-            len(dimensions) in {1, 2} and len(strides) == len(dimensions),
-            "native tile rank must be one or two",
+            not self.once or all("$g" not in arguments(origin) for origin in origins),
+            "ordinary work cannot use a child generation outside its region",
         )
+        dynamic = dict(zip((v.data for v in allocation.dynamic_axes), allocation.dimensions))
+        extents = [
+            scalar(dynamic[axis]) if axis in dynamic else literal(size)
+            for axis, size in enumerate(shape(allocation.ref))
+        ]
+        byte_strides, stride = [], literal(ITEMSIZE[typ.dtype.data])
+        for extent in reversed(extents):
+            byte_strides.insert(0, stride)
+            stride = expression("mul", extent, stride)
+        strides = tuple(normalize(byte_strides[axis.data], facts).constant for axis in view.axes)
+        require(all(stride is not None for stride in strides), "native row pitch must be static")
         require(strides[-1] == ITEMSIZE[typ.dtype.data], "native tile columns must be contiguous")
-        bindings = dict(record.constants)
-        offset = view.offset.data
-        generation, core = [], []
-        count_offset, count_core_stride = 0, 0
-        translations = {}
-
-        def frame_translation(variable, coefficient, divisor, modulus):
-            if allocation not in self.frame_specs:
-                return False
-            if variable not in {
-                self.program.body.block.args[0],
-                self.invocation.body.block.args[0],
-            }:
-                return False
-            require(
-                divisor == 1 and modulus == 0 and variable not in translations,
-                "GM frame coordinate must be one affine owner/invocation term",
-            )
-            translations[variable] = coefficient
-            return True
-
-        for term in view.terms:
-            require(len(term) == 4, "source index term must have index/coefficient/divisor/modulus")
-            index, coefficient, divisor, modulus = (v.data for v in term)
-            require(
-                0 <= index < len(view.indices) and divisor > 0 and modulus >= 0,
-                "invalid source coordinate",
-            )
-            variable = view.indices[index]
-            if frame_translation(variable, literal(coefficient), divisor, modulus):
-                pass
-            elif variable in bindings:
-                value = bindings[variable] // divisor
-                offset += coefficient * (value % modulus if modulus else value)
-            elif variable is self.pipeline.body.block.args[0]:
-                require(
-                    not self.once, "ordinary work cannot use a child generation outside its region"
+        bound = (
+            scalar(self.pipeline.limit)
+            if self.pipeline.limit is not None
+            else literal(self.pipeline.count.data)
+        )
+        g, core = Expr("argument", ("$g",)), Expr("argument", ("$core",))
+        domains = [
+            (g, literal(0), expression("sub", bound, literal(1))),
+            (core, literal(0), literal(self.program.groups.data - 1)),
+        ]
+        total = getattr(self.bindings, "cyclic_total", None)
+        if total is not None:
+            flat = expression("add", core, expression("mul", g, literal(self.program.groups.data)))
+            domains.insert(0, (flat, literal(0), expression("sub", total, literal(1))))
+        if self.invocation is not None:
+            domains.append(
+                (
+                    Expr("argument", ("$call",)),
+                    literal(0),
+                    expression("sub", scalar(self.invocation.ub), literal(1)),
                 )
-                generation.append((coefficient, divisor, modulus))
-            elif variable is self.program.body.block.args[0]:
-                core.append((coefficient, divisor, modulus))
-            else:
-                raise ValueError("coordinate escaped its task or execution-domain scope")
-        for term in () if view.dynamic_terms is None else view.dynamic_terms:
-            require(
-                len(term) == 5,
-                "dynamic coordinate needs variable/count/coefficient/divisor/modulus",
             )
-            variable_index, count_index, coefficient, divisor, modulus = (v.data for v in term)
-            require(
-                0 <= variable_index < len(view.indices)
-                and 0 <= count_index < len(view.indices)
-                and divisor > 0
-                and modulus >= 0,
-                "invalid dynamic view term",
-            )
-            variable, count = view.indices[variable_index], view.indices[count_index]
-            if frame_translation(
-                variable, expression("mul", literal(coefficient), from_ssa(count)), divisor, modulus
+        for origin, width, extent in zip(origins, view.widths, extents):
+            if bound == literal(0) and not self.once:
+                continue  # No active generation can access this axis.
+            if (
+                view.valid is not None
+                and allocation.ref.type.memory.data == "GM"
+                and len(extents) == 1
             ):
+                # Exact aligned prefix geometry is proved below and independently
+                # revalidated on the physical native footprints.
                 continue
-            require(
-                count is self.pipeline.limit and self.runtime is not None,
-                "address uses a different runtime count",
-            )
-            if variable is self.program.body.block.args[0]:
+            check_axis(origin, width.data, extent, domains, facts)
+        address = literal(0)
+        for origin, stride in zip(origins, byte_strides):
+            address = expression("add", address, expression("mul", origin, stride))
+        terms = physical_terms(address, facts)
+        if allocation in self.frame_specs:
+            extent, scale = self.frame_specs[allocation]
+            frame_stride = expression("mul", extent, literal(scale))
+            expected = {
+                Expr("argument", ("$call",)): frame_stride,
+                core: expression("mul", scalar(self.invocation.ub), frame_stride),
+            }
+            for variable, translation in expected.items():
                 require(
-                    divisor == 1 and modulus == 0, "runtime group translation needs an affine owner"
+                    equivalent(terms.pop(variable, literal(0)), translation, facts),
+                    "GM view must select its actual owner/invocation frame",
                 )
-                count_core_stride += coefficient
-            elif variable in bindings:
-                coordinate_value = bindings[variable] // divisor
-                count_offset += coefficient * (
-                    coordinate_value % modulus if modulus else coordinate_value
+        offset, count_offset, count_core_stride = 0, 0, 0
+        generation, core_terms = [], []
+        for variable, coefficient in terms.items():
+            if variable is None:
+                if coefficient.constant is not None:
+                    offset += coefficient.constant
+                else:
+                    ratio = constant_ratio(coefficient, bound, facts)
+                    require(
+                        ratio is not None, "uniform address offset needs its loop count contract"
+                    )
+                    count_offset += ratio
+                continue
+            divisor, modulus = 1, 0
+            if variable.kind == "rem":
+                variable, radix = variable.args
+                require(radix.constant is not None, "runtime radix cannot become a storage period")
+                modulus = radix.constant
+            if variable.kind == "floordiv":
+                variable, radix = variable.args
+                require(
+                    radix.constant is not None,
+                    "runtime task quotient needs a segmented access contract",
+                )
+                divisor = radix.constant
+            require(variable in {g, core}, "coordinate escaped its task or execution-domain scope")
+            if coefficient.constant is not None:
+                (generation if variable == g else core_terms).append(
+                    (coefficient.constant, divisor, modulus)
                 )
             else:
-                require(False, "runtime task stride needs a segmented ownership contract")
-        if allocation in self.frame_specs:
-            from .invocation import factors
-
-            extent, scale = self.frame_specs[allocation]
-            stride = expression("mul", extent, literal(scale))
-            expected = {
-                self.invocation.body.block.args[0]: stride,
-                self.program.body.block.args[0]: expression(
-                    "mul", from_ssa(self.invocation.ub), stride
-                ),
-            }
-            require(
-                all(
-                    factors(translations.get(var, literal(0))) == factors(value)
-                    for var, value in expected.items()
-                ),
-                "GM view must select its actual owner/invocation frame",
-            )
+                ratio = constant_ratio(coefficient, bound, facts)
+                require(
+                    variable == core and divisor == 1 and modulus == 0 and ratio is not None,
+                    "runtime task stride needs a segmented ownership contract",
+                )
+                count_core_stride += ratio
+        core = core_terms
         contiguous = len(dimensions) == 1 or strides[0] == dimensions[1] * strides[-1]
         if typ.layout.data != "linear":
             # Leading axes select complete packed planes. Row-major byte
@@ -478,21 +497,22 @@ class _Actor:
         else:
             rows, width, pitch = 1, prod(dimensions) * ITEMSIZE[typ.dtype.data], 0
         prefix_elements, prefix_extent = 0, None
-        if view.valid_index is not None:
+        if view.valid is not None:
             require(
                 self.pipeline.limit is not None and rows == 1 and len(dimensions) == 1,
                 "valid prefix currently requires a one-dimensional runtime pipeline tile",
             )
-            bound = from_ssa(self.pipeline.limit, memo=self.scalar_cache)
+            bound = from_ssa(self.pipeline.limit, memo=self.scalar_cache, facts=facts)
             prefix_elements = dimensions[0]
             require(
                 bound.kind == "ceildiv" and bound.args[1].constant == prefix_elements,
                 "valid prefix tile must match the pipeline ceildiv divisor",
             )
             valid = from_ssa(
-                view.indices[view.valid_index.data],
+                view.valid,
                 coordinates={self.pipeline.body.block.args[0]: "$g"},
                 memo=self.scalar_cache,
+                facts=facts,
             )
             require(
                 valid == prefix(bound.args[0], prefix_elements),

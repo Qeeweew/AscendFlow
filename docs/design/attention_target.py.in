@@ -45,7 +45,7 @@ def attention_target(
         out_broadcast = N.alloc_ub((VR, 8), N.f32)
         query_tiles = Sq // BQ
         kv_tiles = Sk // BK
-        local_queries = N.max(0, N.ceildiv(B * HQ * query_tiles - group, GROUPS))
+        local_queries = N.ceildiv(N.max(0, B * HQ * query_tiles - group), GROUPS)
         # Sq/Sk contracts are checked before launch; constexpr head/tile checks remain required.
         # Empty owners do no work. No implicit padding or global Q/K/V packing.
         @TASK_LOOP@

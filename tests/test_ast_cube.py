@@ -3,7 +3,8 @@
 from dataclasses import replace
 
 import pytest
-from xdsl.dialects.builtin import IntAttr
+from xdsl.dialects import arith
+from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr
 
 from examples.gemm.batched import batched_matmul
 from tests.test_loop_sync import finite_hardware_dag
@@ -15,7 +16,7 @@ from xdsl_npu.loop_model import extract_loop, loop_dependencies
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import CopyOp, MatmulOp, PipelineOp
+from xdsl_npu.source_ir import CopyOp, MatmulOp, PipelineOp, TensorType
 from xdsl_npu.source_ir import ViewOp as SourceViewOp
 
 
@@ -148,7 +149,21 @@ def test_partial_fractal_view_is_not_mistaken_for_a_contiguous_row_slice():
         for op in source.walk()
         if isinstance(op, SourceViewOp) and op.source.owner.sym_name.data == "a1"
     )
-    view.attributes["offset"] = IntAttr(512)
+    # Keep the forged submatrix inside its logical allocation, so rejection
+    # must come from the fractal complete-plane contract rather than bounds.
+    allocation = view.source.owner
+    typ = allocation.ref.type
+    shape = [dimension.data for dimension in typ.shape]
+    shape[-2] *= 2
+    allocation.ref._type = TensorType(
+        ArrayAttr(IntAttr(dimension) for dimension in shape), typ.dtype, typ.memory, typ.layout
+    )
+    row = arith.ConstantOp.from_int_and_width(4, IndexType())
+    view.parent.insert_op_before(row, view)
+    origins = list(view.origins)
+    origins[-2] = row.result
+    view.operands = (view.source, *origins)
+    source.verify()
     with pytest.raises(CompileError, match="complete matrix plane"):
         lower_source(source)
 

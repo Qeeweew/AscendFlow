@@ -8,6 +8,7 @@
 | 目录/源码 | 展示能力 | 设备验证入口（模块名） |
 |---|---|---|
 | [vector/scale.py](vector/scale.py) | GM→UB→Vector→GM 双缓冲 | `benchmarks.vector.run` |
+| [vector/grouped.py](vector/grouped.py) | runtime BNSD 商余寻址、cyclic 分组、空 owner | 同上，加 `--example grouped` |
 | [vector/prefix.py](vector/prefix.py) | 两长度、对齐有效前缀 | `benchmarks.vector.run_prefix` |
 | [vector/independent_rings.py](vector/independent_rings.py) | 独立输入/输出槽位周期 | `benchmarks.vector.run_rings` |
 | [normalization/rms_norm.py](normalization/rms_norm.py) | 归约、Scalar 最后读取 | `benchmarks.normalization.run` |

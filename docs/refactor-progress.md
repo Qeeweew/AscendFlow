@@ -1,14 +1,29 @@
 # 当前状态与问题清单
 
-2026-10-15，基于 `041996f4da1f` 推进第一批实现。之前文档与停止的block-sum
+2026-10-15，当前基于 `2d94314e7c80` 推进 runtime 索引。之前文档与停止的block-sum
 实验diff已保存到外层 `runs/refactor/dsl-implementation/starting.patch`。
 本页区分本轮实现、历史性能和仍未接通的能力。
 
 **新 DSL 的完整 Flash Attention 仍不能编译。** 旧FA、公开physical builder与
-tracer入口已删除；没有绕行内部构造器的兼容example。下一主线是runtime索引/
-descriptor和一般nested CV，[计划](refactor-plan.md)规定其退出条件。
+tracer入口已删除；没有绕行内部构造器的兼容example。runtime BNSD局部流水已
+接通，下一主线是一般nested CV，[计划](refactor-plan.md)规定其退出条件。
 
-本轮已实施：
+本轮已实施的索引闭环：
+
+- source view改为原始轴SSA origin/width/axes，保留shape与动态radix来源，
+  Stage间的纯算术有合法支配关系。先逐轴证明范围，再化简字节地址。
+- minimum/multiple进入独立事实环境；运行时商余和整除恒等式不按长度展开。
+  多项式有单式项数与累计工作预算，runtime radix不进入存储周期LCM。
+- `examples/vector/grouped.py`通过公共DSL/同步路径。cyclic组数不要求整除
+  total；空owner正确保留。物理verifier从实际total/blocks/所有GM读写重验ownership。
+- 原始source division先于化简校验，避免`bad-bad`或精确除法消元掩盖负dividend。
+  动态父view进一步缩窄明确拒绝，不能只保留最后范围后丢弃父约束。
+- 数值运算仍在examples；完整FA两版前端已越过索引失败点，首个诊断现为
+  `fill(-inf)`的finite标量限制，之后一般nested mixed与控制合同仍未完成。
+
+详细合同、同步前后和命令见 [runtime索引](runtime-indexing.md)。
+
+上一保存点已实施：
 
 - 删除 `xdsl_npu.Kernel`、`xdsl_npu.builder`、`trace_func`、隐式`versions=`/
   L0 `gemm`、旧examples/runners。`_physical_builder`只供lowering和内部测试。
@@ -28,13 +43,13 @@ descriptor和一般nested CV，[计划](refactor-plan.md)规定其退出条件�
 
 | 路径 | 已有能力 | 明确边界 |
 |---|---|---|
-| AST DSL → source IR → physical IR → AutoSync → ASC | runtime 局部流水、Vector/归约、显式 Cube、受限 serial parent/child、部分局部 CV | 一般 nested mixed/CV、runtime BNSD/商余 descriptor、完整 FA 未接通 |
+| AST DSL → source IR → physical IR → AutoSync → ASC | runtime 局部流水、Vector/归约、显式 Cube、受限 serial parent/child、部分局部 CV、BNSD cyclic局部寻址 | 一般 nested mixed/CV、跨query多时钟与完整 FA 未接通 |
 | 内部physical IR测试 | 保留机器访问、事件、ownership与退休反例 | 没有旧用户DSL；有限fixture不证明runtime FA支持 |
 | FA 设计 fixture | 真实数学主体、静态容量与有限派发表检查 | 测试目前要求编译失败，不是 executable example |
 | 独立 AscendC / 安装 ACLNN | 数值、排步与性能参照 | 不证明编译器或新 DSL 支持同一算子 |
 
 AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是全部从零开始。
-同样不能由这些子集推断一般 BNSD、多时钟 CV 或间接访问已支持。
+同样不能由BNSD局部搬运推断一般多时钟 CV 或间接访问已支持。
 公共入口在 [compilation.py](../src/xdsl_npu/compilation.py)，
 目标失败回归在 [test_attention_target.py](../tests/test_attention_target.py)，
 旧FA suite已删除，新FA设备runner尚未实现。
@@ -45,9 +60,9 @@ AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是
 |---|---|---|
 | API | 旧公开task/tracer及FA入口已删除，AST接口保留 | 不再维护兼容层；内部物理fixture不成为用户入口 |
 | INPUT | minimum/multiple合同已贯通IR/launcher；多参数关系与head映射仍未完成 | 继续完善可验证地址/owner前提，保留溢出和空工作语义 |
-| INDEX | `language.py` 的乘积、div/mod 与 `lowering_context.py` 的动态维度仅支持特定模式 | 结构化 shape/stride/descriptor 与范围证明，合法长度不进编译键，不靠放宽字符串生成 |
+| INDEX | 原始轴SSA与受限runtime商余已贯通局部流水；runtime row pitch/多时钟动态stride仍拒绝 | 延伸同一范围/ownership合同，不把合法长度放入编译键 |
 | CV | `region_lowering.py` 拒绝一般 mixed sequence 和 AST nested pipeline；条件 lowering 仅有受限末代后缀 | 保留父子 actor/clock/generation、first/last/零次路径；完整 QK/softmax/PV/update 纵向闭环 |
-| MEMORY | 已有精确 view/root/局部 ownership；不等长 group、共享 Q/K/V、间接地址及跨 child 复用仍不足 | 真实范围、有效域、最后读取和 owner 分区；buffer 分配/布局/可见性与同步一同验证 |
+| MEMORY | cyclic局部不等长/空group已证明；共享 Q/K/V、间接地址及跨 child 复用仍不足 | 真实范围、有效域、最后读取和 owner 分区；buffer 分配/布局/可见性与同步一同验证 |
 | SYNC | runtime 叶已直接生成，局部mixed已有双AIV quorum；legacy仍有候选试删。一般nested CV中的贡献组合和事件共享未完成 | 共用硬件完成语义，分开物理访问与事件寿命；最终从实际 IR 检查，不能旁路或加任意 barrier |
 | EFFECT | 细粒度 native 已能在最后 reader 后早 release，但主要使用 task end；SPR/入口协议另有特殊处理 | 明确每个 native 的读退休、写完成与配置资源合同；不能让高层 recipe 隐藏多个里程碑 |
 | EVENT | 已有有限表分段周期压缩和标准整数 pass；有限 ID 表仍随 generation 增长，runtime 跨 channel/region 共享不足 | 从符号寿命直接分配/表达 ID；化简不得改变配对、代次或等待位置 |
@@ -95,7 +110,41 @@ AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是
 FP32 求和归约顺序按用户要求允许调整，不再设位级相同门槛；精度、数值误差、
 概率舍入和递推状态仍有明确合同。不能用更宽容差掩盖地址或同步错误。
 
-## 本轮验证与复现
+## Runtime 索引闭环的验证
+
+源码/IR迁移后完整回归 **999 passed / 209.04s**。随后审查发现并修复负unsigned
+dividend被消元和动态父view缩窄丢约束两处漏洞；对应source/索引/轴合同最终
+定向 **63 passed / 2.53s**，事件ID的实际C++/UBSan定向 **4 passed / 1.15s**。
+没有为每个补丁重跑完整套件。Ruff与diff检查通过。
+
+最终grouped构建全链 **5.776s**，CANN `-O2 -std=c++20 --npu-arch=dav-2201`。
+五个独立冷进程，从读取DSL到ASC，不含import/CANN：
+
+| 示例 | p50 | max |
+|---|---:|---:|
+| grouped BNSD | 0.2737s | 0.2751s |
+| hierarchical GEMM | 0.6145s | 0.6203s |
+
+GEMM比上一保存点的0.5617s增加约9.4%；本轮增加了source轴和division验证，
+但未做同场旧版A/B，不能把差值全部归因于某个pass，也不宣称全面编译提速。
+两者都不按runtime长度展开；grouped为3个native模板、局部存储周期2，动态radix
+不增加周期。等差event ID直接用`base+step*(ordinal%width)`，默认例为`g%2`；
+非等差表保持选择，分配/配对/guard不变。ASC更短不代表机器指令或延迟必然减少：
+本次等差化简前后aibin为2840/2920字节，未据此宣称性能提升。
+
+检查全部8卡后选健康空闲physical6→logical0。同一个库运行S=16/48/64/4096/
+131072，全部输出精确正确，输入与guard完好；覆盖14个空owner和不等长分组。
+最大shape **[2,3,131072,64] f32**，50331648元素、每张量192MiB。
+5次warmup、30次重复的stream interval为 **508.205μs/launch**，包含host提交
+间隙，尚无本例的kernel-only/AscendC/ACLNN对比，不能用它验收FA性能目标。
+
+证据在外层 `runs/refactor/runtime-index/`：`grouped-final/`保存source/before/
+after IR与ASC、CANN命令/库hash；`device/device.json`保存全卡快照与所有输入；
+`cold-grouped/`、`cold-gemm/`记录源码和编译器树hash、分阶段耗时。
+完整测试日志在 `runs/refactor/dsl-implementation/runtime-index-tests.log`。
+可复现命令见 [runtime索引文档](runtime-indexing.md)。
+
+## 上一保存点的验证与复现
 
 集成回归 **894 passed / 196.95s**，只运行一次完整套件；Ruff与diff检查通过。
 Vector与层次GEMM分别完成CANN离线/shared构建，总耗时5.46/5.94秒，均在300秒
@@ -126,8 +175,8 @@ PYTHONPATH=compiler .venv/bin/xdsl-npu --input compiler/examples/gemm/hierarchic
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/gemm/hierarchical.py --entry hierarchical_gemm --trials 5 --output runs/reproduce/cold-gemm
 ```
 
-下一项是runtime uniform索引因子与task/query descriptor，随后一般nested CV；
-完整FA及其变体、跨region事件共享、设备性能对齐仍未完成。
+该保存点之后已实现本页开头的runtime索引闭环；完整FA及其变体、一般nested CV、
+跨region事件共享、设备性能对齐仍未完成。
 
 ## 工作区和本次交付边界
 

@@ -16,6 +16,7 @@ from xdsl.dialects.builtin import IndexType
 from .budget import poll
 from .ir import (
     BufferOp,
+    CyclicCountOp,
     EndOp,
     FixConfigOp,
     InvocationChannelOp,
@@ -49,7 +50,16 @@ from .model import (
     storage_layout,
 )
 from .periodic import MAX_ACCESS_SEGMENTS, MAX_PERIOD_TEMPLATES, bounded_period
-from .scalar import ARITHMETIC, Expr, bounded_by, expression, from_ssa, literal, uniform
+from .scalar import (
+    ARITHMETIC,
+    Expr,
+    bounded_by,
+    expression,
+    facts_from_sizes,
+    from_ssa,
+    literal,
+    uniform,
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +97,12 @@ class Loop:
     bound: Expr | None
     invocation: object = None
     region: object = None
+    cyclic: object = None
+
+    @property
+    def host_bound(self):
+        """Uniform upper bound on every owner's actual local task count."""
+        return self.bound if self.cyclic is None else self.cyclic.host_bound
 
     @property
     def protocol_scope(self):
@@ -231,7 +247,9 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
             )
         else:
             require(
-                isinstance(op, (RuntimeSizeOp, LoopChannelOp, InvocationChannelOp, EndOp))
+                isinstance(
+                    op, (RuntimeSizeOp, CyclicCountOp, LoopChannelOp, InvocationChannelOp, EndOp)
+                )
                 or region is not None
                 and isinstance(op, RegionChannelOp)
                 or (isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC)
@@ -548,18 +566,18 @@ def _extract_loop_after_verify(module, *, region=None):
             and 0 < size.multiple.data <= (1 << 63) - 1,
             "runtime size needs a valid name, nonnegative minimum and positive multiple",
         )
-    names = {s.sym_name.data for s in sizes}
+    facts = facts_from_sizes(sizes)
     uniform_values = {}
     for child in op.body.block.ops:
         if isinstance(child, RuntimeSizeOp):
-            uniform_values[child.value] = from_ssa(child.value)
+            uniform_values[child.value] = from_ssa(child.value, facts=facts)
         elif isinstance(child, arith.ConstantOp) or type(child) in ARITHMETIC:
             require(
                 all(v in uniform_values for v in child.operands),
                 "uniform scalar expression has undeclared or nonuniform inputs",
             )
-            value = from_ssa(child.results[0])
-            require(uniform(value, names), "unsupported nonnegative uniform bound expression")
+            value = from_ssa(child.results[0], facts=facts)
+            require(uniform(value, facts), "unsupported nonnegative uniform bound expression")
             uniform_values[child.results[0]] = value
     if region is not None:
         require(
@@ -579,8 +597,30 @@ def _extract_loop_after_verify(module, *, region=None):
     )
     require(streams, "loop program has no stream")
     limit = streams[0].limit
+    cyclic_ops = [child for child in op.walk() if isinstance(child, CyclicCountOp)]
+    cyclic = None
+    if cyclic_ops:
+        from .cyclic import CyclicDomain
+
+        require(
+            len(cyclic_ops) == 1
+            and isinstance(op, KernelOp)
+            and region is None
+            and len(streams) == 1
+            and streams[0].parent_op() is op
+            and not any(isinstance(child, (scf.ForOp, OnceOp)) for child in op.walk()),
+            "cyclic task domains require one local actor without sequence/invocation/mixed composition",
+        )
+        count = cyclic_ops[0]
+        require(
+            count.parent_op() is op and count.total in uniform_values and limit is count.count,
+            "cyclic count must bind this stream and a declared nonnegative uniform total",
+        )
+        total = uniform_values[count.total]
+        require(uniform(total, facts), "cyclic total must be nonnegative and uniform")
+        cyclic = CyclicDomain(total, groups)
     require(
-        limit is None or limit in uniform_values,
+        limit is None or limit in uniform_values or cyclic is not None,
         "stream bound must be a declared uniform expression",
     )
     size = limit.owner if limit is not None and isinstance(limit.owner, RuntimeSizeOp) else None
@@ -673,9 +713,14 @@ def _extract_loop_after_verify(module, *, region=None):
         storage_periods,
         {},
         tuple(sizes),
-        None if limit is None else uniform_values[limit],
+        cyclic.local_bound
+        if cyclic is not None
+        else None
+        if limit is None
+        else uniform_values[limit],
         invocation,
         region,
+        cyclic,
     )
     _check_prefixes(loop, all_views)
     _check_accesses(loop, all_views)
@@ -789,7 +834,13 @@ def _check_accesses(loop, all_views):
         storage = refs[0].storage
         groups = loop.access_groups(storage)
         drift = {slope(ref) for ref in refs}
-        if root in writes and storage.external and any(drift):
+        if loop.cyclic is not None and storage.external:
+            from .cyclic import check_stream
+
+            frame = check_stream(loop.cyclic, storage, refs, facts_from_sizes(loop.parameters))
+            if root in writes:
+                loop.frames[root] = frame
+        elif root in writes and storage.external and any(drift):
             require(
                 len(drift) == 1 and next(iter(drift)) > 0,
                 f"{root}: stream/state aliases need an explicit ownership contract",
@@ -861,7 +912,9 @@ def _check_accesses(loop, all_views):
                 coefficient = ref.count_offset + ref.count_core_stride * core
                 for r in range(period):
                     parts = ref.segments(r, core)
-                    if ref.prefix_extent is not None and storage.external:
+                    if loop.cyclic is not None and storage.external:
+                        pass  # Exact cyclic tile/owner/allocation bounds were checked above.
+                    elif ref.prefix_extent is not None and storage.external:
                         pass  # The upper address is min((g+1)*tile, raw_extent), not padded.
                     elif storage.count_scale:
                         require(

@@ -14,7 +14,7 @@ from xdsl.dialects.builtin import (
     f32,
     i1,
 )
-from xdsl.ir import Dialect, ParametrizedAttribute, TypeAttribute
+from xdsl.ir import Block, Dialect, ParametrizedAttribute, TypeAttribute
 from xdsl.irdl import (
     AttrSizedOperandSegments,
     IRDLOperation,
@@ -265,63 +265,183 @@ class DomainOp(IRDLOperation):
             parent = parent.parent_op()
 
 
+def _dominates(value, use, positions, ancestors):
+    """Require a definition before its use along the enclosing source regions."""
+    if use not in ancestors:
+        anchors = {}
+        anchor, block = use, use.parent
+        while block is not None:
+            anchors[block] = anchor
+            anchor = block.parent_op()
+            block = None if anchor is None else anchor.parent
+        ancestors[use] = anchors
+    anchors = ancestors[use]
+    owner = value.owner
+    if isinstance(owner, Block):
+        if owner not in anchors:
+            raise VerifyException("view index block argument does not dominate its use")
+        return
+    block = owner.parent
+    if block not in anchors:
+        raise VerifyException("view operand definition does not dominate its use")
+    if block not in positions:
+        positions[block] = {operation: position for position, operation in enumerate(block.ops)}
+    if positions[block][owner] < positions[block][anchors[block]]:
+        return
+    raise VerifyException("view operand definition must precede its use")
+
+
+def _verify_index_provenance(value, use, seen, active, positions, ancestors, depth=0):
+    from xdsl.dialects import arith, scf
+
+    _dominates(value, use, positions, ancestors)
+    if value in active:
+        raise VerifyException("view index SSA contains a cycle")
+    if value in seen:
+        return
+    if depth > 128 or len(seen) + len(active) >= 4096:
+        raise VerifyException("view index SSA exceeds expression budget")
+    owner = value.owner
+    if isinstance(owner, Block):
+        region = owner.parent_op()
+        if (
+            not isinstance(region, (ProgramOp, PipelineOp, DomainOp, scf.ForOp))
+            or value is not owner.args[0]
+        ):
+            raise VerifyException("view index needs a declared source coordinate")
+        seen.add(value)
+        return
+    if isinstance(owner, SizeOp):
+        if not isinstance(owner.parent_op(), ProgramOp):
+            raise VerifyException("view runtime size must be a uniform program parameter")
+        seen.add(value)
+        return
+    if not isinstance(
+        owner,
+        (
+            arith.ConstantOp,
+            arith.AddiOp,
+            arith.SubiOp,
+            arith.MuliOp,
+            arith.DivUIOp,
+            arith.RemUIOp,
+            arith.MinSIOp,
+            arith.MaxSIOp,
+            arith.CeilDivUIOp,
+        ),
+    ):
+        raise VerifyException("view index has unsupported SSA provenance")
+    active.add(value)
+    for operand in owner.operands:
+        if not isinstance(operand.type, IndexType):
+            raise VerifyException("view index arithmetic requires index operands")
+        _verify_index_provenance(operand, owner, seen, active, positions, ancestors, depth + 1)
+    active.remove(value)
+    seen.add(value)
+
+
+def _constant_index(value):
+    from xdsl.dialects import arith
+
+    memo = {}
+
+    def visit(current):
+        if current in memo:
+            return memo[current]
+        owner = current.owner
+        result = None
+        if isinstance(owner, arith.ConstantOp):
+            result = owner.value.value.data
+        elif hasattr(owner, "operands") and len(owner.operands) == 2:
+            lhs, rhs = (visit(operand) for operand in owner.operands)
+            if lhs is not None and rhs is not None:
+                if isinstance(owner, arith.AddiOp):
+                    result = lhs + rhs
+                elif isinstance(owner, arith.SubiOp):
+                    result = lhs - rhs
+                elif isinstance(owner, arith.MuliOp):
+                    result = lhs * rhs
+                elif isinstance(owner, (arith.DivUIOp, arith.RemUIOp, arith.CeilDivUIOp)):
+                    if lhs < 0 or rhs <= 0:
+                        raise VerifyException(
+                            "unsigned index division requires nonnegative numerator and positive divisor"
+                        )
+                    if isinstance(owner, arith.RemUIOp):
+                        result = lhs % rhs
+                    else:
+                        result = (
+                            (lhs + rhs - 1) // rhs
+                            if isinstance(owner, arith.CeilDivUIOp)
+                            else lhs // rhs
+                        )
+                elif isinstance(owner, arith.MinSIOp):
+                    result = min(lhs, rhs)
+                elif isinstance(owner, arith.MaxSIOp):
+                    result = max(lhs, rhs)
+        if result is not None and not -(1 << 63) <= result <= (1 << 63) - 1:
+            raise VerifyException("constant view index arithmetic exceeds int64")
+        memo[current] = result
+        return result
+
+    # Provenance and DAG budgets have already been checked by the caller.
+    return visit(value)
+
+
 @irdl_op_definition
 class ViewOp(IRDLOperation):
+    """A native tile with an origin and static width on every allocation axis."""
+
     name = "npu_source.view"
     source = operand_def(TensorType)
-    indices = var_operand_def(IndexType)
-    offset = attr_def(IntAttr)
-    terms = attr_def(ArrayAttr[ArrayAttr[IntAttr]])
-    dynamic_terms = opt_attr_def(ArrayAttr[ArrayAttr[IntAttr]])
-    strides = attr_def(ArrayAttr[IntAttr])
-    valid_index = opt_attr_def(IntAttr)
+    origins = var_operand_def(IndexType)
+    widths = attr_def(ArrayAttr[IntAttr])
+    axes = attr_def(ArrayAttr[IntAttr])
+    valid = opt_operand_def(IndexType)
     ref = result_def(TensorType)
+    irdl_options = (AttrSizedOperandSegments(as_property=False),)
 
     def verify_(self):
-        from xdsl.dialects import arith
-
-        def extent_factors(value, depth=0):
-            owner = value.owner
-            if isinstance(owner, SizeOp):
-                return (owner.parent_op(),)
-            if isinstance(owner, arith.MuliOp) and depth < 8:
-                left, right = (extent_factors(v, depth + 1) for v in owner.operands)
-                if left and right and all(root is owner.parent_op() for root in left + right):
-                    return left + right if len(left) + len(right) <= 8 else ()
-            return ()
-
-        if self.valid_index is not None and not 0 <= self.valid_index.data < len(self.indices):
-            raise VerifyException("valid prefix must bind an actual index SSA operand")
-        if (
-            self.ref.type.memory != self.source.type.memory
-            or self.ref.type.dtype != self.source.type.dtype
-            or self.ref.type.layout != self.source.type.layout
+        if not isinstance(self.source.owner, AllocationOp):
+            raise VerifyException("view source must be the original allocation")
+        positions, ancestors = {}, {}
+        _dominates(self.source, self, positions, ancestors)
+        source, result = self.source.type, self.ref.type
+        if (result.memory, result.dtype, result.layout) != (
+            source.memory,
+            source.dtype,
+            source.layout,
         ):
             raise VerifyException("view cannot change memory, dtype, or layout")
-        if not self.ref.type.shape or any(n.data <= 0 for n in self.ref.type.shape):
-            raise VerifyException("view dimensions must be positive")
-        if len(self.strides) != len(self.ref.type.shape) or any(s.data <= 0 for s in self.strides):
-            raise VerifyException("view needs a positive byte stride per axis")
-        for term in self.terms:
-            if len(term) != 4:
-                raise VerifyException("view term requires index/coefficient/divisor/modulus")
-            index, _, divisor, modulus = (v.data for v in term)
-            if not 0 <= index < len(self.indices) or divisor <= 0 or modulus < 0:
-                raise VerifyException("invalid view coordinate term")
-        for term in self.dynamic_terms or ():
-            if len(term) != 5:
-                raise VerifyException(
-                    "runtime view term requires coordinate/size/coefficient/divisor/modulus"
-                )
-            index, size, _, divisor, modulus = (v.data for v in term)
-            if (
-                not 0 <= index < len(self.indices)
-                or not 0 <= size < len(self.indices)
-                or not extent_factors(self.indices[size])
-                or divisor <= 0
-                or modulus < 0
+        rank = len(source.shape)
+        if len(self.origins) != rank or len(self.widths) != rank:
+            raise VerifyException("view needs one origin and width per original axis")
+        widths, axes = (
+            tuple(width.data for width in self.widths),
+            tuple(axis.data for axis in self.axes),
+        )
+        if any(width <= 0 for width in widths):
+            raise VerifyException("view widths must be positive static integers")
+        if (
+            not axes
+            or tuple(sorted(set(axes))) != axes
+            or any(not 0 <= axis < rank for axis in axes)
+        ):
+            raise VerifyException("view axes must retain ordered distinct original axes")
+        if any(width != 1 for axis, width in enumerate(widths) if axis not in axes):
+            raise VerifyException("integer-indexed view axes must have width one")
+        if tuple(dimension.data for dimension in result.shape) != tuple(
+            widths[axis] for axis in axes
+        ):
+            raise VerifyException("view result shape must match its retained original axes")
+        seen = set()
+        for origin in (*self.origins, *((self.valid,) if self.valid is not None else ())):
+            _verify_index_provenance(origin, self, seen, set(), positions, ancestors)
+        for origin, width, extent in zip(self.origins, widths, source.shape):
+            constant = _constant_index(origin)
+            if constant is not None and (
+                constant < 0 or extent.data > 0 and constant + width > extent.data
             ):
-                raise VerifyException("invalid runtime view coordinate/size term")
+                raise VerifyException("view origin and width exceed the original axis")
 
 
 @irdl_op_definition

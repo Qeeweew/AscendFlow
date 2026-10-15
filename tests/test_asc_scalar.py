@@ -12,7 +12,7 @@ from xdsl_npu import autosync, emit_asc
 from xdsl_npu.asc_scalar import ScalarScope
 from xdsl_npu.events import selection_expression
 from xdsl_npu.ir import dump
-from xdsl_npu.loop_codegen import _event
+from xdsl_npu.loop_codegen import _event, _guard
 
 
 def test_standard_passes_fold_identities_and_share_real_ssa_nodes():
@@ -100,6 +100,95 @@ def test_emitted_event_and_address_expressions_execute_exactly(tmp_path):
     executable = tmp_path / "scalars"
     subprocess.run(
         [compiler, "-std=c++17", "-O0", str(source), "-o", str(executable)],
+        check=True,
+        capture_output=True,
+        timeout=20,
+    )
+    subprocess.run([str(executable)], check=True, capture_output=True, timeout=5)
+
+
+def test_runtime_event_id_progressions_execute_under_source_and_wait_guards(tmp_path):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("host C++ compiler required to execute generated expressions")
+    # Tuple fields are assigned IDs, protocol period/residues, and wait distance.
+    # The ID assignments are inputs to _event, never reallocated by emission.
+    cases = [
+        ((7,), 1, (0,), 0, True),
+        ((0, 1), 1, (0,), 0, True),
+        ((1, 3, 5, 7), 1, (0,), 3, True),
+        ((7, 5, 3, 1), 1, (0,), 4, True),
+        ((-5, -2, 1, 4), 1, (0,), 2, True),
+        ((4, 4, 4), 1, (0,), 1, True),
+        ((0, 4, 1, 7), 1, (0,), 5, False),
+        ((2, 4, 6), 5, (0, 2, 4), 0, True),
+        ((7, 4, 1), 3, (0, 2), 5, True),
+        ((7, 0, 5, 1), 5, (1, 4), 3, False),
+        ((3,), 7, (2, 6), 9, True),
+    ]
+    functions, checks = [], []
+    limit, inactive = 97, -1000000
+    for number, (ids, period, residues, distance, affine) in enumerate(cases):
+        channel = SimpleNamespace(period=period, residues=residues, ids=ids, carry=False)
+        scope = ScalarScope()
+        epoch = scope.sub("g", distance) if distance else scope.value("g")
+        event = scope.use(_event(channel, epoch, scope))
+        body = "\n".join(scope.finish([f"return {event};"]))
+        if affine:
+            # A periodic ordinal may still contain its original rank selects.
+            # The arithmetic ID mapping contributes no equality/ternary chain.
+            assert " == " not in body
+            if period == 1 or len(ids) == 1:
+                assert "?" not in body
+            else:
+                assert body.count("?") <= len(residues)
+        elif period == 1:
+            assert "?" in body
+        functions.append(f"int64_t event_{number}(int64_t g) {{\n{body}\n}}\n")
+        command = SimpleNamespace(
+            last_gap=None,
+            lower=distance,
+            upper=0,
+            period=period,
+            residues=tuple(sorted((residue + distance) % period for residue in residues)),
+        )
+        guard = _guard(command, channel) or "true"
+        expected = [inactive] * limit
+        # Independent occurrence oracle: list only legal source epochs, then
+        # cycle the already assigned IDs. No quotient/rank formula is reused.
+        active_epochs = (epoch for epoch in range(limit) if epoch % period in residues)
+        for occurrence, epoch in enumerate(active_epochs):
+            wait_generation = epoch + distance
+            if wait_generation < limit:
+                expected[wait_generation] = ids[occurrence % len(ids)]
+        checks.append(
+            "{\n"
+            f"  const int64_t expected[] = {{{', '.join(map(str, expected))}}};\n"
+            f"  for (int64_t g = 0; g < {limit}; ++g) {{\n"
+            f"    const bool active = {guard};\n"
+            f"    assert(active == (expected[g] != {inactive}));\n"
+            f"    if (active) assert(event_{number}(g) == expected[g]);\n"
+            "  }\n}\n"
+        )
+    source, executable = tmp_path / "runtime_events.cpp", tmp_path / "runtime_events"
+    source.write_text(
+        "#include <cstdint>\n#include <cassert>\n"
+        + "".join(functions)
+        + "int main() {\n"
+        + "".join(checks)
+        + "}\n"
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-fsanitize=undefined",
+            "-fno-sanitize-recover=undefined",
+            str(source),
+            "-o",
+            str(executable),
+        ],
         check=True,
         capture_output=True,
         timeout=20,

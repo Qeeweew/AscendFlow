@@ -51,8 +51,14 @@ def test_ast_cv_regions_share_stage_one_without_merging_their_semantics():
         "cube",
         "vector",
     ]
+
+    def uses_coordinate(value):
+        return value is pipeline.body.block.args[0] or any(
+            uses_coordinate(operand) for operand in getattr(value.owner, "operands", ())
+        )
+
     assert all(
-        pipeline.body.block.args[0] in op.indices
+        any(uses_coordinate(origin) for origin in op.origins)
         for op in source.walk()
         if isinstance(op, ViewOp)
         and op.source.owner.sym_name.data in {"scores", "probabilities", "pv"}

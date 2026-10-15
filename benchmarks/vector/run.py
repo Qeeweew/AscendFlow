@@ -17,11 +17,11 @@ from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.model import require
 
 
-def run(result, library, output, physical, counts, repeats):
+def run(result, library, output, physical, counts, repeats, *, grouped=False, warmup=5):
     import numpy as np
 
     require(
-        all(count >= 0 for count in counts) and repeats > 0,
+        all(count >= 0 for count in counts) and repeats > 0 and warmup > 0,
         "nonnegative lengths and positive repeats required",
     )
     manifest = json.loads(library.with_suffix(".compile.json").read_text())
@@ -37,6 +37,11 @@ def run(result, library, output, physical, counts, repeats):
     runtime = ACL()
     records = []
     groups = result.report["groups"]
+    if grouped:
+        require(
+            result.name == "grouped_scale" and groups == 20,
+            "runner requires the declared grouped example policy",
+        )
     try:
         module = ct.CDLL(str(library.resolve()))
         launch = getattr(module, f"launch_{result.name}")
@@ -44,9 +49,9 @@ def run(result, library, output, physical, counts, repeats):
         launch.restype = ct.c_int
         guard = b"\x5a" * 128
         for count in counts:
-            values = ((np.arange(groups * count * 64, dtype=np.int32) % 127 - 63) / 16).astype(
-                np.float32
-            )
+            shape = (2, 3, count, 64) if grouped else (groups, count, 64)
+            elements = 6 * count * 64 if grouped else groups * count * 64
+            values = ((np.arange(elements, dtype=np.int32) % 127 - 63) / 16).astype(np.float32)
             raw_input = values.tobytes() + guard
             raw_output = b"\xcd" * values.nbytes + guard
             x, y = runtime.allocate(raw_input), runtime.allocate(raw_output)
@@ -62,6 +67,11 @@ def run(result, library, output, physical, counts, repeats):
                 raw[values.nbytes :] == guard, "output guard changed, including empty-loop case"
             )
             require(runtime.read(x, len(raw_input)) == raw_input, "read-only input changed")
+            for _ in range(warmup - 1):
+                require(
+                    launch(runtime.stream, x, y, count) == 0, "runtime length contract rejected"
+                )
+            runtime.synchronize()
             start, stop = runtime.event(), runtime.event()
             runtime.record(start)
             for _ in range(repeats):
@@ -87,13 +97,13 @@ def run(result, library, output, physical, counts, repeats):
                 stop,
             )
             record = {
-                "tiles_per_group": count,
-                "shape": [groups, count, 64],
+                "sequence_length" if grouped else "tiles_per_group": count,
+                "shape": list(shape),
                 "dtype": "f32",
                 "elements": values.size,
                 "max_abs_error": 0.0,
                 "empty_loop_and_bounds_guards": "checked",
-                "warmup": 1,
+                "warmup": warmup,
                 "repeats": repeats,
                 "stream_interval_us_per_launch": elapsed.value * 1000 / repeats,
                 "timing_scope": "ACL event stream interval, including submission gaps; not kernel-only",
@@ -123,23 +133,26 @@ def run(result, library, output, physical, counts, repeats):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--example", choices=("scale", "grouped"), default="scale")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--physical", type=int)
     parser.add_argument(
         "--library", type=Path, help="reuse an exactly matching compiled shared library"
     )
-    parser.add_argument("--counts", type=int, nargs="+", default=[0, 1, 2, 4, 4096, 65536])
+    parser.add_argument("--counts", type=int, nargs="+")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=300)
     args = parser.parse_args()
+    grouped = args.example == "grouped"
+    counts = args.counts or ([16, 48, 64, 4096, 131072] if grouped else [0, 1, 2, 4, 4096, 65536])
     # A source check for --library must not invalidate that library's existing
     # manifest. Every build directory still belongs to one operator build.
     build_output = args.output if args.library is None else args.output / "source-check"
     build_file(
-        Path(__file__).resolve().parents[2] / "examples/vector/scale.py",
+        Path(__file__).resolve().parents[2] / f"examples/vector/{args.example}.py",
         build_output,
-        entry="scale",
+        entry="grouped_scale" if grouped else "scale",
         compile_asc=args.library is None and args.offline,
         shared=args.library is None and args.physical is not None,
         timeout_s=args.timeout,
@@ -151,7 +164,7 @@ def main():
     if args.physical is not None and library is None:
         library = args.output / f"{result.name}.so"
     if args.physical is not None:
-        run(result, library, args.output, args.physical, args.counts, args.repeats)
+        run(result, library, args.output, args.physical, counts, args.repeats, grouped=grouped)
     else:
         print(json.dumps({"verification": result.report, "compilation": result.timings}, indent=2))
 

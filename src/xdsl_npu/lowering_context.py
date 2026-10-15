@@ -6,14 +6,14 @@ allocation for the same source identity or joins separately constructed kernels.
 
 from math import prod
 
-from xdsl.dialects import arith
+from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType, IntAttr
 
 from ._physical_builder import Kernel
 from .ir import FrameOp
 from .model import ITEMSIZE, require
-from .scalar import ARITHMETIC, expression, from_ssa, literal
-from .source_ir import MatmulOp, SizeOp
+from .scalar import ARITHMETIC, expression, facts_from_sizes, from_ssa, literal, uniform
+from .source_ir import AllocationOp, MatmulOp, PipelineOp, SizeOp
 
 
 class ActorBindings:
@@ -26,18 +26,48 @@ class ActorBindings:
             disjoint_external=bool(program.disjoint_external.data),
         )
         self.uniform = {}
+        self.facts = facts_from_sizes(program.body.block.ops)
+        needed = set()
+
+        def need(value):
+            if value in needed:
+                return
+            needed.add(value)
+            if isinstance(value.owner, arith.ConstantOp) or type(value.owner) in ARITHMETIC:
+                for operand in value.owner.operands:
+                    need(operand)
+
+        for child in program.walk():
+            if isinstance(child, AllocationOp):
+                for dimension in child.dimensions:
+                    need(dimension)
+            elif isinstance(child, PipelineOp) and child.limit is not None:
+                need(child.limit)
+            elif isinstance(child, scf.ForOp):
+                need(child.ub)
         for op in program.body.block.ops:
             if isinstance(op, SizeOp):
                 self.uniform[op.value] = self.kernel.runtime_size(
                     op.sym_name.data, minimum=op.minimum.data, multiple=op.multiple.data
                 )
             elif isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC:
+                if op.results[0] not in needed:
+                    continue
+                if not all(value in self.uniform for value in op.operands):
+                    # Owner-dependent descriptors remain source SSA until an
+                    # admitted iteration domain gives them physical meaning.
+                    continue
+                if not uniform(from_ssa(op.results[0], facts=self.facts), self.facts):
+                    # Signed predicate intermediates (e.g. n-1) are not loop
+                    # bounds or extents. Their source SSA remains available to
+                    # the predicate lowering; do not emit unused declarations.
+                    continue
                 cloned = op.clone(self.uniform)
                 self.kernel.block.add_op(cloned)
                 self.uniform.update(zip(op.results, cloned.results))
         self.scalar_cache = {}
         self.uniform_by_expression = {
-            from_ssa(source, memo=self.scalar_cache): target
+            from_ssa(source, memo=self.scalar_cache, facts=self.facts): target
             for source, target in self.uniform.items()
         }
         self.allocation_order = {op: i for i, op in enumerate(allocations)}
@@ -45,6 +75,43 @@ class ActorBindings:
         self.roots, self.frame_specs, self.operand_buffers = {}, {}, {}
         self.configured = False
         self.execution_anchor = None
+
+    def runtime_bound(self, pipeline):
+        """Admit a cyclic owner domain from actual SSA, without a trusted flag."""
+        from .indexing import equivalent
+        from .ir import CyclicCountOp
+
+        if pipeline.limit in self.uniform:
+            return self.uniform[pipeline.limit]
+        owner = self.program.body.block.args[0]
+        bound = from_ssa(pipeline.limit, coordinates={owner: "$core"}, facts=self.facts)
+        require(
+            self.invocation is None
+            and self.program.kind.data != "mixed"
+            and bound.kind == "ceildiv"
+            and bound.args[1] == literal(self.program.groups.data)
+            and bound.args[0].kind == "max"
+            and literal(0) in bound.args[0].args,
+            "pipeline bound requires a uniform count or a proved cyclic owner domain",
+        )
+        remaining = next(arg for arg in bound.args[0].args if arg != literal(0))
+        from .scalar import Expr
+
+        total = expression("add", remaining, Expr("argument", ("$core",)))
+        candidates = [
+            (expr, value)
+            for expr, value in self.uniform_by_expression.items()
+            if uniform(expr, self.facts) and equivalent(expr, total, self.facts)
+        ]
+        require(candidates, "cyclic count must retain its declared uniform total")
+        # Prefer the original total SSA, including its parameter contracts.
+        total_expr, total_value = candidates[0]
+        count = CyclicCountOp.create(operands=[total_value], result_types=[IndexType()])
+        self.kernel.block.add_op(count)
+        self._place_declaration(count)
+        self.uniform[pipeline.limit] = count.count
+        self.cyclic_total = total_expr
+        return count.count
 
     def mark_region(self, region):
         if self.execution_anchor is None:
@@ -93,11 +160,7 @@ class ActorBindings:
             )
             dynamic = bool(allocation.dimensions)
             require(
-                not dynamic
-                or (
-                    all(d in self.uniform for d in allocation.dimensions)
-                    and (len(allocation.dimensions) == 1 or invocation is not None)
-                ),
+                not dynamic or (all(d in self.uniform for d in allocation.dimensions)),
                 "GM extent requires a declared uniform scalar expression",
             )
             if allocation.ring.data:
@@ -113,7 +176,9 @@ class ActorBindings:
                 layout=typ.layout.data,
                 external=external,
                 initialized=allocation.access.data in {"read", "read_write"},
-                extent_count=self.uniform_product(tuple(from_ssa(d) for d in allocation.dimensions))
+                extent_count=self.uniform_product(
+                    tuple(from_ssa(d, facts=self.facts) for d in allocation.dimensions)
+                )
                 if dynamic
                 else None,
                 count_scale=size if dynamic else 0,
@@ -121,7 +186,7 @@ class ActorBindings:
             if invocation is not None and external:
                 values = dict(zip((d.data for d in allocation.dynamic_axes), allocation.dimensions))
                 parent_extent = (
-                    from_ssa(values[1])
+                    from_ssa(values[1], facts=self.facts)
                     if 1 in values
                     else literal(dimensions[1])
                     if len(dimensions) > 1
@@ -130,18 +195,18 @@ class ActorBindings:
                 if not (
                     len(dimensions) >= 3
                     and dimensions[0] == program.groups.data
-                    and parent_extent == from_ssa(invocation.ub)
+                    and parent_extent == from_ssa(invocation.ub, facts=self.facts)
                     and all(i in {1, 2} for i in values)
                 ):
                     # Unpartitioned inputs keep their real group coordinates.
                     # Physical extraction checks EVERY native effect is a read;
                     # initialized/access annotations alone do not prove that.
                     continue
-                extent = from_ssa(values[2]) if 2 in values else literal(1)
+                extent = from_ssa(values[2], facts=self.facts) if 2 in values else literal(1)
                 require(
                     2 not in values
                     or pipeline.limit is not None
-                    and extent == from_ssa(pipeline.limit),
+                    and extent == from_ssa(pipeline.limit, facts=self.facts),
                     "dynamic frame axis must match the child pipeline bound",
                 )
                 scale = prod(n for n in dimensions[2:] if n != -1) * ITEMSIZE[typ.dtype.data]

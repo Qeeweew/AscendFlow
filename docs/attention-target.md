@@ -21,7 +21,7 @@ continuous: Pipelined task → query=task//kv_tiles, kv=task%kv_tiles
 
 所有输入长度都是runtime参数，目标工厂不接受它们，也不按长度生成Python任务。
 `Sq/Sk` 已使用 `N.int64(minimum=1, multiple_of=BQ/BK)` 声明，通用输入合同
-已接入IR和launcher；完整FA仍被索引与nested CV阻塞。buffer声明移到共同Kernel
+已接入IR和launcher；索引SSA已能表达两版FA，完整FA仍被native数值合同与nested CV阻塞。buffer声明移到共同Kernel
 scope，避免从Cube/Vector region逸出未导出的SSA。
 有限激活表工具只用于审查，限制64个逻辑task；它不是生产编译器或硬件模拟器。
 
@@ -83,16 +83,17 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 | 当前合同/缺口 | 下一部分位置 |
 |---|---|
 | local ordinary work/init/child/use | 已有受限子集与符号完成关系；一般mixed组合仍缺失 |
-| Q/K/V共享、runtime BNSD地址、group任务数 | 输入/索引/ownership合同；已有readonly子集不足以承载完整FA |
+| Q/K/V共享、runtime BNSD地址、group任务数 | 局部cyclic BNSD搬运已接通；共享KV和mixed分组组合仍待证明 |
 | AST嵌套pipeline、内外generation、共享L0C | 一般nested CV与父子完成关系 |
 | first/last、初始化与空路径 | 控制/激活域合同；不能只支持最后一代后缀 |
 | maximum/reduce/broadcast | 已有AST基元；完整FA集成仍待完成 |
-| runtime商余、跨query延迟descriptor | continuous的任务时钟；不能按K枚举 |
+| runtime商余、跨query延迟descriptor | 前端SSA已支持商余；跨query完成/状态时钟仍未接通，不能按K枚举 |
 | 双AIV贡献、MTE2最后读取、通知/可见性/资源 | 公共同步、event分配与最终实际IR检查 |
 | 大规模AscendC/ACLNN/profile | 完整DSL链验收；已有参考不等于编译器FA结果 |
 
-当前nested的首个诊断是`unsupported index product`，continuous是动态除数
-不在受支持索引子集中。测试要求明确失败，不把fixture解析成功当作FA编译通过。
+两版当前首个诊断均为`Vector scalar must be finite`，来自初始化历史max的
+`fill(-inf)`。解决该数值合同之后仍有一般nested mixed、first/last与多时钟
+ownership等缺口；不能只把第一个报错移走就声称FA可用。测试仍要求明确拒绝。
 解决一个诊断后还要检查整个表，不应通过缩小任务域或隐藏调用跳过其他缺口。
 
 **独立参考已有记录**：[AscendC参考及证据](attention-reference.md)覆盖手排控制、

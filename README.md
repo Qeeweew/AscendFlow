@@ -5,7 +5,8 @@
 用户表达计算、物理存储和多阶段排步，编译器负责异步访问及缓冲复用的同步。
 
 **新 AST 的完整 Flash Attention 尚不能编译。** 当前可运行局部流水、受限串行
-层次和单层 CV；runtime BNSD/商余 descriptor、一般 nested CV 仍待实现。
+层次和单层 CV；runtime BNSD 商余寻址与不等长 cyclic 局部任务已接通，
+一般 nested CV 仍待实现。
 
 旧 `cube.task/vector.task`、公开 physical builder、Python tracer 与旧 FA 入口
 已删除，不保留兼容层。内部 Task IR 和硬件反例继续用于编译器验证。
@@ -58,7 +59,7 @@ PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/exam
 | 目录 | 职责 |
 |---|---|
 | `src/xdsl_npu/` | DSL、xDSL IR、同步、代码生成及通用运行工具 |
-| `examples/` | 算子源码和少量使用入口；旧实现显式标记 legacy |
+| `examples/` | 当前可编译的 AST 算子源码和少量使用入口 |
 | `tests/` | 回归、同步反例、有限执行模型与设计目标的拒绝测试 |
 | `benchmarks/` | 设备验证、独立数值参考、AscendC/ACLNN 对照、编译计时和 profiling |
 | `docs/` | 设计、当前状态、下一步计划和带边界的验证记录 |

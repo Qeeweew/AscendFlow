@@ -485,26 +485,7 @@ class _Parser:
             )
 
     def scalar(self, value):
-        if isinstance(value, SSAValue):
-            require(isinstance(value.type, IndexType), "expected an index scalar")
-            return value
-        if isinstance(value, N._Dimension):
-            return self.trace.size(value)
-        if type(value) is int:
-            return self.trace.add(arith.ConstantOp.from_int_and_width(value, IndexType())).result
-        if isinstance(value, N._Index):
-            result = self.scalar(value.constant)
-            for variable, coefficient, divisor, modulus in value.terms:
-                term = variable
-                if divisor != 1:
-                    term = self.trace.add(arith.FloorDivSIOp(term, self.scalar(divisor))).result
-                if modulus:
-                    term = self.trace.add(arith.RemSIOp(term, self.scalar(modulus))).result
-                if coefficient != 1:
-                    term = self.trace.add(arith.MuliOp(term, self.scalar(coefficient))).result
-                result = self.trace.add(arith.AddiOp(result, term)).result
-            return result
-        raise CompileError("expected a device integer expression")
+        return self.trace.scalar(value)
 
     def arguments(self, node):
         if any(isinstance(arg, ast.Starred) for arg in node.args) or any(
@@ -572,26 +553,15 @@ class _Parser:
                 if type(lhs) not in {int, float} or type(rhs) not in {int, float}:
                     self.fail(node, "device integer division requires // or N.ceildiv")
                 return lhs / rhs
-            if isinstance(lhs, SSAValue) or isinstance(rhs, SSAValue):
-                ops = {
-                    ast.Add: arith.AddiOp,
-                    ast.Sub: arith.SubiOp,
-                    ast.Mult: arith.MuliOp,
-                    ast.FloorDiv: arith.FloorDivSIOp,
-                    ast.Mod: arith.RemSIOp,
-                }
-                return self.trace.add(ops[type(node.op)](self.scalar(lhs), self.scalar(rhs))).result
-            if isinstance(lhs, N._Dimension):
-                lhs = N._index(lhs)
-            if isinstance(rhs, N._Dimension):
-                rhs = N._index(rhs)
+            if type(lhs) not in {int, float} or type(rhs) not in {int, float}:
+                lhs, rhs = N._index(lhs), N._index(rhs)
             return _BINARY[type(node.op)](lhs, rhs)
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in _COMPARE:
             lhs, rhs = self.expr(node.left), self.expr(node.comparators[0])
             name, compare = _COMPARE[type(node.ops[0])]
             if type(lhs) in {int, float, bool} and type(rhs) in {int, float, bool}:
                 return compare(lhs, rhs)
-            return self.trace.add(arith.CmpiOp(self.scalar(lhs), self.scalar(rhs), name)).result
+            return self.trace.index_op(arith.CmpiOp, lhs, rhs, comparison=name)
         if isinstance(node, ast.Call):
             symbol = self.expr(node.func)
             if not isinstance(symbol, _Symbol):
@@ -615,7 +585,7 @@ class _Parser:
                 cls = {"ceildiv": arith.CeilDivUIOp, "min": arith.MinSIOp, "max": arith.MaxSIOp}[
                     name
                 ]
-                return self.trace.add(cls(self.scalar(a), self.scalar(b))).result
+                return self.trace.index_op(cls, a, b)
             if name not in _CALLS:
                 self.fail(node, f"{name} is only valid in its declaration/control position")
             return getattr(N, name)(*args, **kwargs)
