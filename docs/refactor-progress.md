@@ -1,7 +1,7 @@
 # 当前实现与验证状态
 
-更新：2026-10-15。算法基线为 `3f95139`，保存了之前未提交的 frame 同步和证明
-开销修正。本轮整理目录/工具/文档，**没有实现新的同步算法或新版 FA**。
+更新：2026-10-15。目录整理保存点为 `1d5c092`。当前开始迁移公共完成关系，
+**整个重构仍未完成，新 AST FA 仍未接通**。
 下一部分的唯一实施顺序见[重构计划](refactor-plan.md)。
 
 ## 已实现与未实现
@@ -16,7 +16,7 @@
 | fresh frame 跨调用 | 只有已验证不相交的 frame 可省跨调用存储冲突，事件寿命仍检查 |
 | 多 region 漂移范围 | 只读的已有子集保留；可写的 translated/drifting frame 仍拒绝 |
 | 源码结构入口 | `region_lowering` 已统一准入和 actor 构造 |
-| 公共物理完成关系/覆盖查询 | 未统一；loop/invocation/sequence 仍有不同证明适配器 |
+| 公共完成端点/条件覆盖查询 | Site 与条件路径已共用；串行 region/call 和单 child 调用走共同查询，层次 CV 未接通 |
 | 一般 AST 嵌套 pipeline/mixed 层次 | 明确拒绝，常量界也不隐式展开 |
 | 多参数 BNSD、runtime task/query 商余关系 | FA 所需完整子集未接通 |
 | 跨 region event ID 共享 | 未完成通用组合；不能套用 legacy 支持声明 |
@@ -28,15 +28,40 @@ persistent 等仍需专门合同。无法证明时明确拒绝，不加任意 ba
 
 ## 当前明确问题
 
-1. 完成关系分散在 `BoundaryProof`、`CallProof` 等处。调用词法顺序只适用于串行
-   域，连续 CV 不能照用。下一步要替换公共语义和查询，不能再叠专用证明器。
-2. frame snapshot 示例在正 child 长度时仍保留一条可被跨 region 传递路径覆盖
-   的 MTE3→MTE2 通知；child=0 需要直接 ready。条件覆盖尚不完整，不能宣称最少同步。
+1. 已删除原 `BoundaryProof.covered` 和 `CallProof` 的独立路径搜索，叶及调用
+   使用共同 Site/CountDomain/条件路径。`RegionCompletion` 仍是串行控制适配器，
+   不能用于重叠 CV；单 count 域尚不能表达完整 query/task/child 时钟。
+2. frame snapshot 的跨 region 传递路径已能组合，直接 MTE3→MTE2 通知缩为 N=0。
+   目前生成器仍通过候选试删得到结果，下一步改为直接合成未覆盖的关系。
 3. 同一示例的 slot0 最后读取已按奇偶选择：偶数 N 释放在 N−2，奇数在 N−1；
    generated 使用互斥 id2/id3，参考使用一个 id2，不能声称 event packing 完全相同。
 4. 核心入口统一不等于同步算法统一；局部设备对照接近也不等于 FA 性能达标。
 5. benchmark 仍有重复设备执行流程。本轮只收敛公共启动、产物校验和数值参考，
    没有用大型 benchmark 框架替代同步重构。
+
+## 公共完成关系迁移：当前检查点
+
+`completion.py` 统一条件集合、完成端点和带条件路径；`region_completion.py`
+集中现有串行域的真实 native 关系，域/调用编号本身不提供顺序。Native 关系
+缓存只在同一个分析快照内共用，最终 verifier 从实际 IR 建立新快照。
+
+新增条件交集/路径并集的有限图差分，及新 query QK→旧 query PV 的关系级反例；
+后者仅检查公共关系查询不强加 query 串行，不能作为 AST CV 编译证据。
+实际 frame 的直接通知只保留在零次 child；正长度由初始 MTE3→V 和相应最后
+Vector reader→MTE2 的现有路径覆盖。偶数 N 仍释放 N−2 的 slot0，不等待最后
+slot1；没有增加搬运、buffer、barrier 或 per-call drain。
+
+- 完整回归801 passed，397.82s；其中182项相关回归先行通过，Ruff通过。
+- 11份 AST 中10份 ASC hash不变；frame 只改变该通知条件及互斥等待排列。
+- CANN generated/AscendC offline/shared通过；全卡检查后physical1→logical0，
+  18条小例（含舍入）和两条1GiB大例精确正确，输入/guard完好。
+- 新大例的非profile ACL stream间隔为755.547/765.463μs；包含host空隙，
+  不能替代三批kernel profiling或作为性能改善结论。新版本profile尚待验证。
+- 初次统一后冷编译p50为1.608s；按profile共享查询和规范化后一次五进程记录为
+  1.373s/max1.393s、RSS39168KiB，**仍超过1s门槛**。各次源码/package hash见原始记录。
+
+证据位于外层 `runs/refactor/unified-sync/`。本检查点没有达到重构第1步的全部
+退出条件：试删生成器、编译预算、一般 region 组合及多级 CV 都还需继续处理。
 
 ## 保存点 3f95139 的 frame 验证
 

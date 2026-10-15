@@ -6,102 +6,13 @@ only depend on an earlier call. Actual native prefixes discharge memory, and
 separate Wait-to-Set obligations discharge finite event resources.
 """
 
-from collections import defaultdict, deque
-from dataclasses import dataclass, field, replace
-from math import gcd, lcm
+from dataclasses import replace
 
-from .budget import poll
-from .invocation_sync import Site, _first
+from .completion import CountDomain, Requirement, Site
 from .model import require
-from .periodic import bounded_period
-from .region_summary import Access, CountDomain, Position, ReadSpan, summarize_local_events
-from .sequence_sync import (
-    BoundaryProof,
-    Bridge,
-    Point,
-    _covers,
-    _data,
-    _domain_row,
-    _expression,
-    _nonnegative,
-    _point,
-    _task,
-    _valid_point,
-)
-
-
-@dataclass(frozen=True)
-class Mark:
-    region: str
-    site: Site
-    call: int = 0
-    _hash: int = field(init=False, repr=False, compare=False)
-    point: Point = field(init=False, repr=False, compare=False)
-    local: tuple = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self):
-        object.__setattr__(self, "_hash", hash((self.region, self.site, self.call)))
-        object.__setattr__(self, "point", Point(self.region, self.site.task[1], self.site.position))
-        object.__setattr__(self, "local", (self.region, self.site))
-
-    def __hash__(self):
-        return self._hash
-
-
-@dataclass(frozen=True)
-class Requirement:
-    source: Mark
-    destination: Mark
-    domain: CountDomain
-    reason: str
-
-
-def canonical(domain):
-    return (
-        CountDomain(1, 0, exact=domain.exact)
-        if domain.exact is not None
-        else CountDomain(domain.period, domain.residue, minimum=_first(domain))
-    )
-
-
-def position(sequence, region, point):
-    count = sequence.regions[region].constant_count
-    if count is None:
-        return point
-    index = point.evaluate(count)
-    return Position(False, index) if index <= count // 2 else Position(True, count - 1 - index)
-
-
-def intersection(left, right):
-    if left.exact is not None:
-        return left if right.contains(left.exact) else None
-    if right.exact is not None:
-        return right if left.contains(right.exact) else None
-    divisor = gcd(left.period, right.period)
-    if (right.residue - left.residue) % divisor:
-        return None
-    period = bounded_period(lcm(left.period, right.period), "coupled region path predicate")
-    other = right.period // divisor
-    shift = (
-        0
-        if other == 1
-        else ((right.residue - left.residue) // divisor * pow(left.period // divisor, -1, other))
-        % other
-    )
-    return CountDomain(
-        period,
-        (left.residue + left.period * shift) % period,
-        minimum=max(_first(left), _first(right)),
-    )
-
-
-def mark(sequence, point, milestone, call=0):
-    actor = next(iter(sequence.regions[point.region].actors))
-    return Mark(
-        point.region,
-        Site((actor, point.task), position(sequence, point.region, point.position), milestone),
-        call,
-    )
+from .region_completion import RegionCompletion, _data, _point, _task, mark, position
+from .region_summary import Access, summarize_local_events
+from .sequence_sync import Bridge, _domain_row
 
 
 def memory_requirements(sequence):
@@ -146,8 +57,8 @@ def event_requirements(sequence):
             )
             result.append(
                 Requirement(
-                    Mark(name, left),
-                    Mark(name, right, 1),
+                    replace(left, region=name),
+                    replace(right, region=name, call=1),
                     domain,
                     f"event {name}/{event.channel}:{event.event_id} Wait-before-Set",
                 )
@@ -177,272 +88,12 @@ def boundary_requirements(sequence, bridges):
     return tuple(result)
 
 
-class CallProof:
-    def __init__(self, sequence, analyses, requirements):
-        self.sequence, self.analyses = sequence, analyses
-        self.leaves = BoundaryProof(sequence, analyses)
-        self.requirements = tuple(requirements)
-        self.required_marks = {m for r in self.requirements for m in (r.source, r.destination)}
-        self.direct_cache, self.active_cache = {}, {}
-        self.capture_cache, self.node_cache = {}, {}
-        self.candidate_cache = {}
-        self.neighbors = {}
-        self.queries, self.visits = 0, 0
-        self.order = {name: i for i, name in enumerate(sequence.regions)}
-        for dep in sequence.invocation_dependencies():
-            access = dep.destination.access
-            if isinstance(access, ReadSpan) and access.first != access.last:
-                require(
-                    self.leaves.inside[dep.destination.region].prefix_monotonic(
-                        access.task, "begin"
-                    ),
-                    "invocation reader family lacks FIFO start order",
-                )
-
-    def command(self, m):
-        return self.leaves.inside[m.region].command(m.site)
-
-    def active(self, m, domain):
-        # Adjacent symbolic calls have identical leaf activation. Actual
-        # inter-call guards live on bridges, not these leaf milestones.
-        key = m.local, domain
-        if key in self.active_cache:
-            return self.active_cache[key]
-        seq = self.sequence
-        value = _valid_point(seq, m.point, domain)
-        command = self.command(m)
-        a, b = _expression(seq, m.point)
-        count = seq.regions[m.region].constant_count
-        ca, cb = (1, 0) if count is None else (0, count)
-        value = value and _nonnegative(a, b - command.lower, domain)
-        value = value and _nonnegative(ca - a, cb - b - command.upper - 1, domain)
-        if command.last_gap is not None:
-            da, db = a - ca, b - cb + 1 + command.last_gap
-            value = value and (
-                da * domain.exact + db == 0 if domain.exact is not None else da == db == 0
-            )
-        if value:
-            start = a * _first(domain) + b
-            step = a * domain.period
-            residues = (
-                1 if domain.exact is not None else command.period // gcd(command.period, step)
-            )
-            value = all(
-                (start + i * step) % command.period in command.residues for i in range(residues)
-            )
-        self.active_cache[key] = value
-        return value
-
-    def direct(self, left, right, domain):
-        # Direct native/leaf relations depend on relative calls, never absolute
-        # p. Share their immutable query cache between p and p+1; bridge paths
-        # remain explicit and are checked separately for their guards.
-        key = left.local, right.local, right.call - left.call, domain
-        if key not in self.direct_cache:
-            self.direct_cache[key] = self._direct(left, right, domain)
-        return self.direct_cache[key]
-
-    def _direct(self, left, right, domain):
-        if (left.call, self.order[left.region]) > (right.call, self.order[right.region]):
-            return False
-        if not self.active(left, domain) or not self.active(right, domain):
-            return False
-        if left == right:
-            return True
-        a, b = self.command(left), self.command(right)
-        lp, rp = left.site.point, right.site.point
-        same_pipe = a.task.pipe == b.task.pipe
-        local = left.call == right.call and left.region == right.region
-        if local:
-            x, y = _expression(self.sequence, left.point)
-            u, v = _expression(self.sequence, right.point)
-            delta = (u - x) * _first(domain) + v + b.task.stage - y - a.task.stage
-            ordered = (
-                delta >= 0
-                and (domain.exact is not None or u >= x)
-                and (delta > 0 or a.index <= b.index)
-            )
-            strict = ordered and (delta > 0 or a.index < b.index)
-        else:
-            ordered = (left.call, self.order[left.region]) < (right.call, self.order[right.region])
-            if not ordered:
-                return False
-            strict = True
-        # FIFO starts/Wait consumption are not FIFO asynchronous completion.
-        if ordered and same_pipe and lp == rp == "begin":
-            return True
-        if (
-            strict
-            and a.kind == "task"
-            and lp == "end"
-            and rp == "begin"
-            and (
-                a.task.pipe == "S" or same_pipe and a.task.implicit_completion and b.kind == "task"
-            )
-        ):
-            return True
-        if ordered and a.kind == "task" and lp in {"end", "prefix"}:
-            if same_pipe and (
-                (b.kind == "task" and rp == "prefix")
-                or (b.kind == "set" and rp == "end")
-                or (b.kind == "barrier" and rp == "begin")
-            ):
-                return True  # A real retirement capture includes earlier native work.
-            if not local and b.kind == "task" and rp == "begin":
-                # Do not treat a native prefix as an implicit task completion:
-                # only an actual Set/barrier can capture arbitrary earlier work.
-                key = a.task.pipe, right.point, domain
-                if key not in self.capture_cache:
-                    self.capture_cache[key] = self.leaves._inherited(
-                        left.point, right.point, domain, capture_only=True
-                    )
-                return self.capture_cache[key]
-        if local:
-            return self.leaves.site_path(left.region, left.site, right.site, domain)
-        return False
-
-    def nodes(self, bridges, source, destination):
-        key = (
-            tuple((b.source, b.destination, b.carried) for b in bridges),
-            None if source in self.required_marks else source,
-            None if destination in self.required_marks else destination,
-        )
-        if key in self.node_cache:
-            return self.node_cache[key]
-        values = {source, destination}
-        for requirement in self.requirements:
-            values.update((requirement.source, requirement.destination))
-        for bridge in bridges:
-            for call in (0, 1):
-                if call + int(bridge.carried) <= 1:
-                    values.add(mark(self.sequence, bridge.source, "prefix", call))
-                    values.add(
-                        mark(self.sequence, bridge.destination, "begin", call + int(bridge.carried))
-                    )
-        # Expose native milestones behind real event endpoints; no done token.
-        for value in tuple(values):
-            for point in ("begin", "end", "prefix"):
-                values.add(replace(value, site=Site(value.site.task, value.site.position, point)))
-            if self.command(value).kind == "set":
-                values.add(replace(value, site=replace(value.site, point="begin")))
-        # The same boundary shape is available in both symbolic calls.
-        values |= {replace(value, call=1 - value.call) for value in tuple(values)}
-        require(len(values) <= 2048, "sequence call milestone budget exceeded")
-        result = (
-            len(self.node_cache),
-            tuple(sorted(values, key=lambda m: (m.call, self.order[m.region], repr(m.site)))),
-        )
-        self.node_cache[key] = result
-        return result
-
-    def covered(self, requirement, bridges):
-        self.queries += 1
-        poll("sequence call paths", queries=self.queries, visits=self.visits)
-        require(self.queries <= 20000, "sequence call coverage budget exceeded")
-        source, destination, domain = (
-            requirement.source,
-            requirement.destination,
-            canonical(requirement.domain),
-        )
-        pool, nodes = self.nodes(bridges, source, destination)
-        edges = defaultdict(list)
-        for bridge in bridges:
-            for call in (0, 1):
-                target_call = call + int(bridge.carried)
-                if target_call > 1:
-                    continue
-                a = mark(self.sequence, bridge.source, "prefix", call)
-                b = mark(self.sequence, bridge.destination, "begin", target_call)
-                edges[a].extend((b, canonical(guard)) for guard in bridge.domains)
-        reached = defaultdict(list)
-        pending = deque([(source, domain)])
-        while pending:
-            value, active = pending.popleft()
-            if _covers(active, reached[value]):
-                continue
-            reached[value].append(active)
-            if value == destination:
-                if _covers(domain, reached[value]):
-                    return True
-                continue
-            key = pool, value, active
-            if key not in self.neighbors:
-                successors = []
-                for candidate in self.candidates(pool, nodes, value):
-                    self.visits += 1
-                    if self.visits % 512 == 0:
-                        poll("sequence call milestones", visits=self.visits, nodes=len(nodes))
-                    require(self.visits <= 2_000_000, "sequence call path-state budget exceeded")
-                    if candidate != value and self.direct(value, candidate, active):
-                        successors.append(candidate)
-                self.neighbors[key] = tuple(successors)
-            for candidate in self.neighbors[key]:
-                if not _covers(active, reached[candidate]):
-                    pending.append((candidate, active))
-            for candidate, guard in edges[value]:
-                overlap = intersection(active, guard)
-                if (
-                    overlap is not None
-                    and self.active(value, overlap)
-                    and self.active(candidate, overlap)
-                ):
-                    pending.append((candidate, overlap))
-        return _covers(domain, reached[destination])
-
-    def candidates(self, pool, nodes, source):
-        """Exclude impossible cross-region relation kinds before graph queries.
-
-        Same-leaf pairs still use the complete guarded leaf proof. Across
-        regions/calls, _direct can only use FIFO begins, native retirement
-        captures, or a later native's real incoming capture. This is an
-        overapproximation of those cases, never a new completion edge.
-        """
-        a, lp = self.command(source), source.site.point
-        key = pool, source.call, source.region, a.kind, lp, a.task.pipe
-        if key in self.candidate_cache:
-            return self.candidate_cache[key]
-        self.visits += len(nodes)
-        require(self.visits <= 2_000_000, "sequence call path-state budget exceeded")
-        poll("sequence call candidate indexing", visits=self.visits, nodes=len(nodes))
-        result = []
-        for target in nodes:
-            if source.call == target.call and source.region == target.region:
-                result.append(target)
-                continue
-            if (source.call, self.order[source.region]) >= (target.call, self.order[target.region]):
-                continue
-            b, rp = self.command(target), target.site.point
-            same_pipe = a.task.pipe == b.task.pipe
-            if (
-                same_pipe
-                and lp == rp == "begin"
-                or a.kind == "task"
-                and lp in {"end", "prefix"}
-                and (
-                    rp == "begin"
-                    and (b.kind == "task" or lp == "end" and a.task.pipe == "S")
-                    or same_pipe
-                    and (
-                        b.kind == "task"
-                        and rp == "prefix"
-                        or b.kind == "set"
-                        and rp == "end"
-                        or b.kind == "barrier"
-                        and rp == "begin"
-                    )
-                )
-            ):
-                result.append(target)
-        self.candidate_cache[key] = tuple(result)
-        return self.candidate_cache[key]
-
-
-def verify_calls(sequence, analyses, bridges):
+def verify_calls(sequence, analyses, bridges, *, native=None):
     if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
         return {}
     memory = memory_requirements(sequence)
     events = event_requirements(sequence) + boundary_requirements(sequence, bridges)
-    proof = CallProof(sequence, analyses, memory + events)
+    proof = RegionCompletion(sequence, analyses, memory + events, native=native)
     for requirement in memory + events:
         require(
             proof.covered(requirement, bridges),
@@ -458,11 +109,11 @@ def verify_calls(sequence, analyses, bridges):
     }
 
 
-def plan_calls(sequence, analyses, forward, banks):
+def plan_calls(sequence, analyses, forward, banks, *, native=None):
     if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
         return []
     memory, events = memory_requirements(sequence), event_requirements(sequence)
-    proof = CallProof(sequence, analyses, memory + events)
+    proof = RegionCompletion(sequence, analyses, memory + events, native=native)
     proposals = []
     # A late reader release often covers an earlier writer and several input
     # rings. Examine real cross-pipe WARs before manufacturing same-pipe fences.
@@ -470,7 +121,7 @@ def plan_calls(sequence, analyses, forward, banks):
         memory,
         key=lambda r: (
             not r.reason.startswith("WAR"),
-            _task(sequence, r.source.point).pipe == _task(sequence, r.destination.point).pipe,
+            _task(sequence, r.source.location).pipe == _task(sequence, r.destination.location).pipe,
             -proof.order[r.source.region],
             proof.order[r.destination.region],
             repr(r),
@@ -479,7 +130,7 @@ def plan_calls(sequence, analyses, forward, banks):
     for requirement in ordered:
         if proof.covered(requirement, [*forward, *proposals]):
             continue
-        source, destination = requirement.source.point, requirement.destination.point
+        source, destination = requirement.source.location, requirement.destination.location
         sp, dp = _task(sequence, source).pipe, _task(sequence, destination).pipe
         proposals.append(
             Bridge(

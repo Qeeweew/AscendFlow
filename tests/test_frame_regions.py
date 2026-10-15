@@ -66,6 +66,22 @@ def test_missing_gm_publish_path_is_rejected_even_when_child_is_empty(artifact):
         finite_check(plan, 0, invocations=2)
 
 
+def test_snapshot_ready_is_required_only_for_the_empty_child(artifact):
+    channel = next(
+        op
+        for op in artifact.plan.walk()
+        if isinstance(op, RegionChannelOp)
+        and op.source_region.data == "r0"
+        and op.destination_region.data == "r2"
+        and op.destination_task.data.endswith("_0_copy")
+    )
+    assert [[v.data for v in row] for row in channel.domains] == [[1, 0, 0, 0]]
+    # The independent byte/event oracle checks the actual emitted commands,
+    # including both last-reader parities and repeated invocations.
+    for count in (0, 1, 2, 3, 7, 8):
+        finite_check(artifact.plan, count, invocations=3)
+
+
 def test_missing_ub_input_retirement_does_not_get_hidden_by_a_frame_ready(artifact):
     plan = artifact.plan
     channel = next(
@@ -80,7 +96,8 @@ def test_missing_ub_input_retirement_does_not_get_hidden_by_a_frame_ready(artifa
         if isinstance(op, RegionSyncOp) and op.channel == channel.sym_name:
             op.parent.erase_op(op)
     channel.parent.erase_op(channel)
-    with pytest.raises(CompileError, match="missing sequence W(AW|AR).*inputs"):
+    # The removed release also breaks the positive-count snapshot-ready path.
+    with pytest.raises(CompileError, match="missing sequence (RAW.*Output|W(AW|AR).*inputs)"):
         verify_plan(plan)
     with pytest.raises(AssertionError):
         finite_check(plan, 2, invocations=2)

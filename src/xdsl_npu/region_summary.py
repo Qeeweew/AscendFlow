@@ -16,6 +16,7 @@ from math import gcd
 
 from xdsl.ir import SSAValue
 
+from .completion import CountDomain, Position
 from .ir import BufferOp, FrameOp
 from .loop_model import access_cells, slope
 from .model import require
@@ -31,35 +32,6 @@ def allocation(storage):
         op = op.source.owner
     require(isinstance(op, BufferOp), "region summary lost allocation provenance")
     return op
-
-
-@dataclass(frozen=True)
-class CountDomain:
-    period: int
-    residue: int
-    exact: int | None = None
-    minimum: int | None = None
-
-    def contains(self, count):
-        return (
-            count == self.exact
-            if self.exact is not None
-            else (
-                count >= (self.period if self.minimum is None else self.minimum)
-                and count % self.period == self.residue
-            )
-        )
-
-
-@dataclass(frozen=True)
-class Position:
-    """A generation relative to this child invocation, never to its parent."""
-
-    end: bool
-    offset: int
-
-    def evaluate(self, count):
-        return count - 1 - self.offset if self.end else self.offset
 
 
 @dataclass(frozen=True)

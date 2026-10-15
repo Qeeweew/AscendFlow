@@ -6,16 +6,16 @@ invocations supplies progress, while the checks below separately cover memory
 and event reuse. No finite parent/child expansion participates in this proof.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from math import lcm
 
 from xdsl.dialects.builtin import IntAttr, StringAttr
 
-from .budget import poll
+from .completion import LeafCompletion, Site, _first, canonical, covered_path
 from .ir import InvocationChannelOp, InvocationSyncOp, LoopChannelOp, TaskOp
 from .loop_boundary import stream_operations
 from .model import require
-from .periodic import MAX_PERIOD_TEMPLATES, project
+from .periodic import MAX_PERIOD_TEMPLATES
 from .region_summary import (
     Access,
     CountDomain,
@@ -26,34 +26,6 @@ from .region_summary import (
 )
 
 
-def _first(domain):
-    if domain.exact is not None:
-        return domain.exact
-    minimum = domain.period if domain.minimum is None else domain.minimum
-    return minimum + (domain.residue - minimum) % domain.period
-
-
-@dataclass(frozen=True)
-class Site:
-    task: tuple[str, str]
-    position: Position
-    point: str
-    channel: str = ""
-    action: str = ""
-    direct: object = None
-    _hash: int = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self):
-        object.__setattr__(
-            self,
-            "_hash",
-            hash((self.task, self.position, self.point, self.channel, self.action, self.direct)),
-        )
-
-    def __hash__(self):
-        return self._hash
-
-
 @dataclass(frozen=True)
 class Bridge:
     name: str
@@ -62,135 +34,6 @@ class Bridge:
     destination: Site
     domain: CountDomain
     carried: bool
-
-
-class Inside:
-    def __init__(self, loop, graph, native, endpoints):
-        self.loop, self.graph, self.native, self.endpoints = loop, graph, native, endpoints
-        self.cache, self.monotonic = {}, {}
-        self.queries = 0
-
-    def command(self, site):
-        if site.direct is not None:
-            return site.direct
-        return (
-            self.endpoints[site.task[0], site.channel, site.action]
-            if site.channel
-            else self.native[site.task]
-        )
-
-    def prove(self, left, right, domain):
-        key = left, right, domain
-        if key not in self.cache:
-            self.queries += 1
-            poll("invocation completion", queries=self.queries, states=self.graph.domain_states)
-            require(self.queries <= 20000, "invocation boundary proof query budget exceeded")
-            self.cache[key] = self._prove(left, right, domain)
-        return self.cache[key]
-
-    def _prove(self, left, right, domain):
-        a, b = self.command(left), self.command(right)
-        first = _first(domain)
-        if domain.exact is not None:
-            ag, bg = left.position.evaluate(first), right.position.evaluate(first)
-            return (
-                self.graph.path(
-                    a,
-                    ag,
-                    b,
-                    bg,
-                    bg,
-                    source_point=left.point,
-                    destination_point=right.point,
-                    remaining=first - 1 - bg,
-                    at_end=True,
-                    _shorten=False,
-                )
-                is not None
-            )
-        if left.position.end == right.position.end:
-            if not left.position.end:
-                ag, bg = left.position.offset, right.position.offset
-                if max(ag, bg) >= first:
-                    return False
-                return (
-                    self.graph.path(
-                        a,
-                        ag,
-                        b,
-                        bg,
-                        bg,
-                        source_point=left.point,
-                        destination_point=right.point,
-                        remaining=first - 1 - bg,
-                        _shorten=False,
-                    )
-                    is not None
-                )
-            for residue, count in project(
-                domain.period, (domain.residue,), self.graph.period, first
-            ):
-                if (
-                    self.loop.constant_count is not None
-                    and self.loop.constant_count % self.graph.period != residue
-                ):
-                    continue
-                ag, bg = left.position.evaluate(count), right.position.evaluate(count)
-                if (
-                    min(ag, bg) < 0
-                    or self.graph.path(
-                        a,
-                        ag,
-                        b,
-                        bg,
-                        bg,
-                        source_point=left.point,
-                        destination_point=right.point,
-                        remaining=right.position.offset,
-                        at_end=True,
-                        _shorten=False,
-                    )
-                    is None
-                ):
-                    return False
-            return True
-        if left.position.end or left.position.offset > right.position.evaluate(first):
-            return False
-        # A constant head can precede an arbitrary tail through a native
-        # retirement prefix. Prove both boundary legs and the one-generation
-        # prefix recurrence; induction then spans N without enumerating it.
-        for key, command in self.native.items():
-            if command.task.last:
-                continue
-            head = Site(key, left.position, "prefix")
-            tail = Site(key, right.position, "prefix")
-            if (
-                self.prove(left, head, domain)
-                and self.prove(tail, right, domain)
-                and self.prefix_monotonic(key)
-            ):
-                return True
-        return False
-
-    def prefix_monotonic(self, key, point="prefix"):
-        cache_key = key, point
-        if cache_key not in self.monotonic:
-            command = self.native[key]
-            self.monotonic[cache_key] = not command.task.last and all(
-                self.graph.path(
-                    command,
-                    r,
-                    command,
-                    r + 1,
-                    r + 1,
-                    source_point=point,
-                    destination_point=point,
-                    _shorten=False,
-                )
-                is not None
-                for r in range(self.graph.period)
-            )
-        return self.monotonic[cache_key]
 
 
 def _protocols(loop, channel_map):
@@ -329,19 +172,28 @@ def _domains(domain, period, maximum):
 def _covered(left, right, domain, groups, inside):
     if inside.loop.constant_count is not None and not domain.contains(inside.loop.constant_count):
         return True
+    # Adjacent calls remain distinct identities. Only actual carried protocols
+    # connect them; lexical position does not supply completion.
+    right = replace(right, call=1)
+    edges, nodes = {}, {left, right}
     for group in groups.values():
-        cases = _domains(domain, group[0].domain.period, inside.loop.constant_count)
-        if all(
-            any(
-                bridge.domain.contains(_first(case))
-                and inside.prove(left, bridge.source, case)
-                and inside.prove(bridge.destination, right, case)
-                for bridge in group
-            )
-            for case in cases
-        ):
-            return True
-    return False
+        for bridge in group:
+            source, destination = bridge.source, replace(bridge.destination, call=1)
+            edges.setdefault(source, []).append((destination, canonical(bridge.domain)))
+            nodes.update((source, destination))
+    nodes = tuple(sorted(nodes, key=repr))
+
+    def successors(site, guard):
+        for candidate in nodes:
+            if candidate != site and candidate.call == site.call:
+                for source_guard in inside.activation(site, guard):
+                    for predicate in inside.activation(candidate, source_guard):
+                        if inside.prove(site, candidate, predicate):
+                            yield candidate, predicate
+
+    return covered_path(
+        left, right, domain, edges, successors, lambda site, guard: inside.prove(site, site, guard)
+    )
 
 
 def verify_invocation(loop, channel_map, graph, endpoints, native):
@@ -361,7 +213,7 @@ def verify_invocation(loop, channel_map, graph, endpoints, native):
         if not r.storage.external
     }
     summary = summarize_reused_storage(loop, roots)
-    inside = Inside(loop, graph, native, endpoints)
+    inside = LeafCompletion(loop, graph, native, endpoints)
     obligations = summary.invocation_dependencies()
     resources = summarize_local_events(loop)
     repeated = loop.invocation.bound.constant is None or loop.invocation.bound.constant > 1
@@ -482,7 +334,7 @@ def plan_invocation(loop):
         for r in t.refs
         if not r.storage.external
     }
-    inside = Inside(loop, graph, native, endpoints)
+    inside = LeafCompletion(loop, graph, native, endpoints)
     summary = summarize_reused_storage(loop, roots)
     candidates = {}
     for dep in summary.invocation_dependencies():

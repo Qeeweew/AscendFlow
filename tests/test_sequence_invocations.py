@@ -76,17 +76,17 @@ def test_real_parent_frame_coordinate_is_required(artifact):
 
 
 def test_notify_effect_does_not_fence_later_same_pipe_work(artifact):
-    from xdsl_npu.invocation_sync import Site
+    from xdsl_npu.completion import Site
+    from xdsl_npu.region_completion import RegionCompletion, mark
     from xdsl_npu.region_summary import CountDomain, Position
-    from xdsl_npu.sequence_calls import CallProof, Mark, mark
     from xdsl_npu.sequence_sync import Point, verify_sequence
 
     _, checked = verify_sequence(artifact.plan, _details=True)
     seq = checked.sequence
     channel = next(c for c in checked.analyses["r1"][1].values() if c.distance == 0)
-    source = Mark("r1", Site(channel.sources[0], Position(False, 0), "end", channel.name, "set"))
+    source = Site(channel.sources[0], Position(False, 0), "end", channel.name, "set", region="r1")
     target = mark(seq, Point("r1", channel.sources[0][1], Position(False, 1)), "prefix")
-    proof = CallProof(seq, checked.analyses, ())
+    proof = RegionCompletion(seq, checked.analyses, ())
     assert not proof.direct(source, target, CountDomain(1, 0, exact=3))
 
 
@@ -165,8 +165,8 @@ def test_parent_scalar_reader_is_retired_without_promoting_wait_to_completion():
     for calls, count in [(2, 0), (2, 1), (3, 3)]:
         finite_check(artifact.plan, count, invocations=calls)
     # An implicit Scalar completion must never reverse its own begin/end.
+    from xdsl_npu.region_completion import RegionCompletion, mark
     from xdsl_npu.region_summary import CountDomain, Position
-    from xdsl_npu.sequence_calls import CallProof, mark
     from xdsl_npu.sequence_sync import Point, verify_sequence
 
     _, checked = verify_sequence(artifact.plan, _details=True)
@@ -175,15 +175,15 @@ def test_parent_scalar_reader_is_retired_without_promoting_wait_to_completion():
         t for d in seq.regions["r2"].actors.values() for t in d.program.tasks if t.pipe == "S"
     )
     p = Point("r2", task.uid, Position(False, 0))
-    proof = CallProof(seq, checked.analyses, ())
+    proof = RegionCompletion(seq, checked.analyses, ())
     assert not proof.direct(mark(seq, p, "end"), mark(seq, p, "begin"), CountDomain(1, 0, exact=1))
 
 
 def test_canonical_predicate_intersection_matches_independent_finite_membership():
     from itertools import product
 
+    from xdsl_npu.completion import canonical, intersection
     from xdsl_npu.region_summary import CountDomain
-    from xdsl_npu.sequence_calls import canonical, intersection
 
     domains = [
         CountDomain(p, r, minimum=m) for p in (1, 2, 3, 5) for r in range(p) for m in (0, 1, 4)
