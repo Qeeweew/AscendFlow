@@ -1,8 +1,10 @@
 # 父循环体的初始化、子流水和异步导出
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 实现保存点 `ed87249`，G0验证于2026-10-15收尾。源码是
-[grouped_state_sum](../examples/ast_grouped_state_sum.py)，独立参考是
-[AscendC模板](../examples/ascendc_grouped_state.asc.in)。输入按
+[grouped_state_sum](../examples/state/grouped.py)，独立参考是
+[AscendC模板](../benchmarks/references/ascendc/ascendc_grouped_state.asc.in)。输入按
 `[group, output, tile, B]`组织，不包含隐式packing。
 
 ## 语义和实际同步
@@ -125,17 +127,17 @@ CSV hash、硬件平台及频率记录；`profiles/trial-*`保留全部样本、
 
 ```bash
 .venv/bin/python -m pytest -q compiler/tests/test_sequence_invocations.py compiler/tests/test_sequence_sync.py
-.venv/bin/python compiler/examples/run_grouped_state.py --output runs/refactor/parent-sequence --build
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python compiler/examples/run_grouped_state.py --output runs/refactor/parent-sequence --physical 1 --cases 16:128 --warmup 5 --repeats 30 --skip-rounding-case --record runs/refactor/parent-sequence/device-large.json
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run_grouped --output runs/refactor/parent-sequence --build
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.state.run_grouped --output runs/refactor/parent-sequence --physical 1 --cases 16:128 --warmup 5 --repeats 30 --skip-rounding-case --record runs/refactor/parent-sequence/device-large.json
 ```
 
 一个profile的命令如下。generated/ascendc各三批，按上述顺序替换variant和trial，
 不要并行运行；profile目录使用新目录，防止混入旧CSV。
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/parent-sequence/profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/examples/profile_grouped_state.sh --output /workspace/xdsl-910b/runs/refactor/parent-sequence --physical 1 --cases 16:128 --variant generated --warmup 5 --repeats 30 --skip-rounding-case --record /workspace/xdsl-910b/runs/refactor/parent-sequence/profiles/trial-0/generated/device.json' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/refactor/parent-sequence/profiles/trial-0/generated
-.venv/bin/python compiler/examples/analyze_state_sum.py runs/refactor/parent-sequence/profiles --output runs/refactor/parent-sequence/performance.json
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/parent-sequence/profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.state.run_grouped --output /workspace/xdsl-910b/runs/refactor/parent-sequence --physical 1 --cases 16:128 --variant generated --warmup 5 --repeats 30 --skip-rounding-case --record /workspace/xdsl-910b/runs/refactor/parent-sequence/profiles/trial-0/generated/device.json' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/refactor/parent-sequence/profiles/trial-0/generated
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.analyze runs/refactor/parent-sequence/profiles --output runs/refactor/parent-sequence/performance.json
 ```
 
 wrapper显式使用venv，避免msprof解析Python软链接后丢失环境。最后的分析命令

@@ -1,11 +1,11 @@
 """Hierarchical source addresses and parameterized region boundary summaries."""
 
 import pytest
-from ast_hierarchical_gemm import hierarchical_gemm
-from ast_reduction_gemm import reduction_gemm
-from independent_rings import independent_rings
 from xdsl.dialects import arith, scf
 
+from examples.gemm.hierarchical import hierarchical_gemm
+from examples.gemm.reduction import reduction_gemm
+from examples.vector.independent_rings import independent_rings
 from xdsl_npu import Kernel, compile
 from xdsl_npu import language as N
 from xdsl_npu.frontend import FrontendError

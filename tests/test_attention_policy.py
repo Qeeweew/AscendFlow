@@ -12,8 +12,10 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 import pytest
-from attention_target import target_source
-from run_attention_policy import inputs_and_oracle, reference_source
+
+from benchmarks.references.attention import reference_source
+from benchmarks.validation.attention import inputs_and_oracle
+from tests.fixtures.attention_target import target_source
 
 
 @pytest.fixture(scope="module")
@@ -188,7 +190,8 @@ def test_target_one_slot_requires_explicit_inner_issue_order(producer, reader):
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 def test_uniform_attention_oracle_and_declared_workspace(dtype):
     import numpy as np
-    from attention_oracle import decode, rounded
+
+    from benchmarks.validation.attention import decode, rounded
 
     policy = {"batch": 1, "heads": 2, "kv_heads": 1, "groups": 2, "dtype": dtype}
     raw, expected, selected, _ = inputs_and_oracle(policy, 128, 2048, data_case="uniform")

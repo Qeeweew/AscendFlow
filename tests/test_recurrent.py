@@ -1,8 +1,8 @@
 import pytest
-from recurrent import recurrent_gdn
-from recurrent_oracle import gdn_reference, recurrent_inputs
 from xdsl.transforms.dead_code_elimination import dce
 
+from benchmarks.validation.recurrent import gdn_reference, recurrent_inputs
+from examples.legacy.gdn import recurrent_gdn
 from xdsl_npu import Kernel, autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import SyncOp, TaskOp, dump, parse

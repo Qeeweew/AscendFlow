@@ -1,5 +1,7 @@
 # 复杂算子所需的物理执行扩展
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 当前新增内容均进入同一 AutoSync 和最终 verifier，不绕过产品同步契约。
 
 `ViewOp` 可描述逐行 footprint：每行有效字节数、行数和 row stride。依赖和状态机
@@ -35,8 +37,8 @@ Scalar→Vector 双缓冲、count=5、四核 grid 已通过 CANN 编译和物理
 normalization/RoPE/GEMM 等复杂算子已经交付。
 
 ```bash
-.venv/bin/python compiler/examples/build_legacy.py scalar --count 5 --blocks 4 --output runs/stage2/scalar-grid --compile --shared
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/stage2/scalar-grid --physical 1
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build scalar --count 5 --blocks 4 --output runs/stage2/scalar-grid --compile --shared
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.legacy.run runs/stage2/scalar-grid --physical 1
 ```
 
 产物、健康快照、编译选项和数值结果保存在外层 runs/stage2，未提交产品 Git。

@@ -1,10 +1,10 @@
 import pytest
-from kernels import gemm_bias_silu
-from oracles import mixed_inputs
-from pipeline_fixtures import mixed_pipeline
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 from xdsl.transforms.dead_code_elimination import dce
 
+from benchmarks.validation.operators import mixed_inputs
+from examples.legacy.operators import gemm_bias_silu
+from tests.fixtures.pipelines import mixed_pipeline
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import (

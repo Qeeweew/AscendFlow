@@ -1,8 +1,10 @@
 # P0独立AscendC FA参考
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 这是[目标源码](attention-target.md)的独立手排参考，文件为
-[ascendc_attention.asc.in](../examples/ascendc_attention.asc.in)，构建/运行入口为
-[run_attention_policy.py](../examples/run_attention_policy.py)。不调用编译器FA
+[ascendc_attention.asc.in](../benchmarks/references/ascendc/ascendc_attention.asc.in)，构建/运行入口为
+[run_attention_policy.py](../benchmarks/attention/run_policy.py)。不调用编译器FA
 builder、AutoSync或codegen，不把生成ASC改名作为参考。新AST FA仍未接通。
 
 ## 固定政策与本次发现
@@ -90,7 +92,7 @@ BF16 8K GQA在20 AIC/40 AIV的910B3上，warmup5/repeats30，**一批profile**�
 时长p50=18.641612 ms，范围18.592592…18.684216 ms。是热重复分配的固定参考
 基线；没有三批独立比较、buffer轮换或与ACLNN/新生成代码对照，不作为性能验收。
 
-[分析脚本](../examples/analyze_attention_policy.py)绑定实际CSV、source/library
+[分析脚本](../benchmarks/attention/analyze_policy.py)绑定实际CSV、source/library
 hash与运行合同后计算：262144次128³ MAD，共1,099,511,627,776 FLOPs；GM请求
 36,641,439,744字节，其中Score往返16 GiB、P往返8 GiB、PV往返2 GiB。请求速率
 约1965.6 GB/s，**不是HBM实测带宽**。IO+workspace为192.5 MiB，仅略大于实机
@@ -109,28 +111,28 @@ hash与运行合同后计算：262144次128³ MAD，共1,099,511,627,776 FLOPs�
 
 ```bash
 .venv/bin/python -m pytest -q compiler/tests/test_attention_policy.py compiler/tests/test_attention_target.py
-.venv/bin/python compiler/examples/run_attention_policy.py --output runs/refactor/attention-reference/f16-g1 --heads 1 --kv-heads 1 --groups 1 --build
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run_policy --output runs/refactor/attention-reference/f16-g1 --heads 1 --kv-heads 1 --groups 1 --build
 ```
 
 选择健康空闲物理卡后（已有记录为1），执行：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python compiler/examples/run_attention_policy.py --output runs/refactor/attention-reference/f16-g1 --heads 1 --kv-heads 1 --groups 1 --physical 1 --cases 128:1024 256:1024 384:3072
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.attention.run_policy --output runs/refactor/attention-reference/f16-g1 --heads 1 --kv-heads 1 --groups 1 --physical 1 --cases 128:1024 256:1024 384:3072
 ```
 
 大例需按B1/H32/Hkv8/G20/bf16单独`--build`，Sq/Sk仍是同binary的runtime参数。
-使用`profile_attention_policy.sh`给msprof提供venv入口，避免profiler解析Python
+使用`benchmarks/profile.sh benchmarks.attention.run_policy`给msprof提供venv入口，避免profiler解析Python
 符号链接后丢失venv。例如对已经构建的大例运行：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/attention-reference/bf16-large/profile --application='/workspace/xdsl-910b/compiler/examples/profile_attention_policy.sh --output /workspace/xdsl-910b/runs/refactor/attention-reference/bf16-large --heads 32 --kv-heads 8 --groups 20 --dtype bf16 --physical 1 --cases 8192:8192 --scope sampled --warmup 5 --repeats 30 --record /workspace/xdsl-910b/runs/refactor/attention-reference/bf16-large/device-large.json' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/attention-reference/bf16-large/profile --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.attention.run_policy --output /workspace/xdsl-910b/runs/refactor/attention-reference/bf16-large --heads 32 --kv-heads 8 --groups 20 --dtype bf16 --physical 1 --cases 8192:8192 --scope sampled --warmup 5 --repeats 30 --record /workspace/xdsl-910b/runs/refactor/attention-reference/bf16-large/device-large.json' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
 ```
 
 分析已完成profile：
 
 ```bash
-.venv/bin/python compiler/examples/profile_summary.py runs/refactor/attention-reference/bf16-large/profile
-.venv/bin/python compiler/examples/analyze_attention_policy.py runs/refactor/attention-reference/bf16-large/device-large.json runs/refactor/attention-reference/bf16-large/profile --output runs/refactor/attention-reference/bf16-large/analysis.json
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/refactor/attention-reference/bf16-large/profile
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.analyze_policy runs/refactor/attention-reference/bf16-large/device-large.json runs/refactor/attention-reference/bf16-large/profile --output runs/refactor/attention-reference/bf16-large/analysis.json
 ```
 
 P0的参考及政策差异已落地；下一步按P1a收敛actor绑定/region入口，接通父体

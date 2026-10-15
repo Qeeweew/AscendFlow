@@ -1,5 +1,7 @@
 # 910B 静态混合核 GM ownership
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 本阶段实现真实 `__mix__(1,2)`：每组一个 AIC 和两个参与的 AIV，AIC 的 Fixpipe
 把结果发布到显式有界 GM scratch，两个 AIV 各导入半个 tile，然后继续 Vector
 后处理及输出。普通 `autosync`、`verify_plan`、`emit_asc` 入口接受混合核 IR。
@@ -165,26 +167,26 @@ ACL event stream 间隔含宿主派发空隙，不能当作上述内核时间。
 
 ```bash
 .venv/bin/pytest -q compiler/tests
-.venv/bin/python compiler/examples/build_legacy.py mixed --count 17 --slots 2 --check-interleavings shared --output runs/mixed/17-epochs --shared
-.venv/bin/python compiler/examples/build_legacy.py mixed --count 0 --slots 2 --check-interleavings all --output runs/mixed/zero-epoch --shared
-.venv/bin/python compiler/examples/build_legacy.py mixed --count 5 --slots 2 --aiv1-delay 32 --check-interleavings shared --output runs/mixed/uneven-participants --shared
-.venv/bin/python compiler/examples/build_legacy.py gemm-bias-silu --m 16 --n 16 --k 16 --tile-m 16 --tile-n 16 --l1-k 16 --l0-k 16 --gm-slots 1 --ub-slots 1 --check-interleavings all --output runs/mixed/one-epoch --shared
-.venv/bin/python compiler/examples/build_legacy.py gemm-bias-silu --m 768 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/mixed/768-1024-768 --shared
-.venv/bin/python compiler/examples/build_legacy.py gemm-bias-silu --m 80 --n 32 --k 64 --tile-m 16 --tile-n 16 --l1-k 32 --l0-k 16 --l1-slots 3 --l0-slots 2 --grid-m 1 --c-slots 2 --gm-slots 1 --ub-slots 1 --check-interleavings shared --output runs/mixed/asymmetric-rings --compile --shared
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/mixed/768-1024-768 --physical 1 --repeats 30
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reference.py runs/mixed/768-1024-768 --physical 1 --repeats 30
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build mixed --count 17 --slots 2 --check-interleavings shared --output runs/mixed/17-epochs --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build mixed --count 0 --slots 2 --check-interleavings all --output runs/mixed/zero-epoch --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build mixed --count 5 --slots 2 --aiv1-delay 32 --check-interleavings shared --output runs/mixed/uneven-participants --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build gemm-bias-silu --m 16 --n 16 --k 16 --tile-m 16 --tile-n 16 --l1-k 16 --l0-k 16 --gm-slots 1 --ub-slots 1 --check-interleavings all --output runs/mixed/one-epoch --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build gemm-bias-silu --m 768 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/mixed/768-1024-768 --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build gemm-bias-silu --m 80 --n 32 --k 64 --tile-m 16 --tile-n 16 --l1-k 32 --l0-k 16 --l1-slots 3 --l0-slots 2 --grid-m 1 --c-slots 2 --gm-slots 1 --ub-slots 1 --check-interleavings shared --output runs/mixed/asymmetric-rings --compile --shared
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.legacy.run runs/mixed/768-1024-768 --physical 1 --repeats 30
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.legacy.run_reference runs/mixed/768-1024-768 --physical 1 --repeats 30
 ```
 
 profiler 采用两个不同输出目录，避免覆盖原始数据；第二次换
-`profile_reference.sh` 和 `profile-reference`，其余口径相同：
+`benchmarks/profile.sh benchmarks.legacy.run_reference` 和 `profile-reference`，其余口径相同：
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof \
   --output=/workspace/xdsl-910b/runs/mixed/profile-generated \
-  --application='/workspace/xdsl-910b/compiler/examples/profile_device.sh /workspace/xdsl-910b/runs/mixed/768-1024-768 --physical 1 --repeats 30 --record-output /workspace/xdsl-910b/runs/mixed/profile-generated/device' \
+  --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.legacy.run /workspace/xdsl-910b/runs/mixed/768-1024-768 --physical 1 --repeats 30 --record-output /workspace/xdsl-910b/runs/mixed/profile-generated/device' \
   --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/mixed/profile-generated
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/mixed/profile-generated
 ```
 
 Bisheng 固定 `-O2 -fPIC -std=c++20 --npu-arch=dav-2201` 与

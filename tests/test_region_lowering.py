@@ -3,8 +3,8 @@
 from dataclasses import replace
 
 import pytest
-from ast_grouped_state_sum import grouped_state_sum
 
+from examples.state.grouped import grouped_state_sum
 from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.ir import dump

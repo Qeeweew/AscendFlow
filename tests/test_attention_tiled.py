@@ -1,7 +1,7 @@
 import pytest
-from flash_attention_tiled import flash_attention_tiled
 from xdsl.dialects.builtin import IntAttr
 
+from examples.flash_attention.tiled_legacy import flash_attention_tiled
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.ir import CrossSyncOp, dump, parse
 from xdsl_npu.mixed import extract_mixed, global_dependencies
@@ -72,7 +72,7 @@ def test_multiple_epochs_do_not_reorder_the_flattened_physical_frontier():
 
 def test_tiled_oracle_retains_the_declared_logical_probability_rounding():
     pytest.importorskip("numpy")
-    from attention_oracle import attention_inputs
+    from benchmarks.validation.attention import attention_inputs
 
     plan = autosync(flash_attention_tiled(1, 1, 1, 64, 2048, 64, block_q=64))
     _, expected, _, report = attention_inputs(plan)

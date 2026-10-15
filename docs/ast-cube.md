@@ -1,6 +1,8 @@
 # R2：显式 Cube 操作数和分层缓冲生命周期
 
-[ast_cube.py](../examples/ast_cube.py) 接通 AST 的 L1/L0A/L0B/L0C 分配、显式搬运、
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
+[ast_cube.py](../examples/gemm/batched.py) 接通 AST 的 L1/L0A/L0B/L0C 分配、显式搬运、
 原生 matmul 和 Fixpipe。运行时参数是每组任务数；每个任务执行一个完整矩阵
 乘法。这是嵌套 K 流水的前置闭环，不代表动态内层 GEMM 或 Flash Attention 已迁移。
 
@@ -77,7 +79,7 @@ oracle 和有限硬件 DAG 覆盖两种 B 方向、零次、一次及各槽复�
 
 ## AscendC 对照中的真实事件资源
 
-[ascendc_cube.asc.in](../examples/ascendc_cube.asc.in) 使用公开 AscendC
+[ascendc_cube.asc.in](../benchmarks/references/ascendc/ascendc_cube.asc.in) 使用公开 AscendC
 DataCopy/LoadData/Mmad/Fixpipe 和手写事件，未从 PlanIR 自动转换。
 固定循环排步、容量和数值契约相同。CANN9.1没有公开 `HardEvent::S_FIX` 枚举，
 一次性 Fixpipe 配置交接使用同目标的原生 `set_flag/wait_flag`。
@@ -134,10 +136,10 @@ max为0.2400秒，peak RSS最高36832 KiB；import/CANN单列。
 
 ```bash
 .venv/bin/pytest -q compiler/tests/test_ast_cube.py compiler/tests/test_source_language.py
-.venv/bin/python compiler/examples/run_cube.py --output runs/refactor/ast-cube/nt-f16 --build
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.gemm.run --output runs/refactor/ast-cube/nt-f16 --build
 npu-smi info
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python compiler/examples/run_cube.py --output runs/refactor/ast-cube/nt-f16 --physical 1
-.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_cube.py --entry batched_matmul --trials 5 --output runs/refactor/ast-cube/cold-final
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.gemm.run --output runs/refactor/ast-cube/nt-f16 --physical 1
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/gemm/batched.py --entry batched_matmul --trials 5 --output runs/refactor/ast-cube/cold-final
 ```
 
 NN/f16另设 `--nn --m 32 --n 48 --k 64`；NT/bf16另设
@@ -147,9 +149,9 @@ NN/f16另设 `--nn --m 32 --n 48 --k 64`；NT/bf16另设
 3轮各2个版本的 profiling 使用独立 `trial-*/generated|ascendc` 目录：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/ast-cube/profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/examples/profile_cube.sh --output /workspace/xdsl-910b/runs/refactor/ast-cube/nt-f16 --record /workspace/xdsl-910b/runs/refactor/ast-cube/profiles/trial-0/generated/device.json --physical 1 --variant generated --tiles 1024 --warmup 5 --repeats 30' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/refactor/ast-cube/profiles/trial-0/generated --warmup 5 --repeats 30
-.venv/bin/python compiler/examples/analyze_cube.py runs/refactor/ast-cube/profiles --output runs/refactor/ast-cube/profiles/comparison.json
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/ast-cube/profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.gemm.run --output /workspace/xdsl-910b/runs/refactor/ast-cube/nt-f16 --record /workspace/xdsl-910b/runs/refactor/ast-cube/profiles/trial-0/generated/device.json --physical 1 --variant generated --tiles 1024 --warmup 5 --repeats 30' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/refactor/ast-cube/profiles/trial-0/generated --warmup 5 --repeats 30
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.gemm.analyze runs/refactor/ast-cube/profiles --output runs/refactor/ast-cube/profiles/comparison.json
 ```
 
 证据全部在外层 `runs/refactor/ast-cube/`。分析器绑定源码/库/CSV hash、编译

@@ -1,0 +1,158 @@
+"""Build once, run an AST dynamic-length three-stage Vector pipeline.
+
+Set ASCEND_RT_VISIBLE_DEVICES=<physical> and ASCEND_DEVICE_ID=0 before Python.
+The length counts complete 64-element tiles per group; native tile sizes are
+static. Device timings are diagnostic stream intervals, not tuned throughput.
+"""
+
+import argparse
+import ctypes as ct
+import hashlib
+import json
+from pathlib import Path
+
+from examples.legacy.multistage import vector_source
+from xdsl_npu import compile
+from xdsl_npu import language as N
+from xdsl_npu.device import ACL, health_snapshot
+from xdsl_npu.model import require
+from xdsl_npu.toolchain import offline_compile
+
+
+def run(result, library, output, physical, counts, repeats):
+    import numpy as np
+
+    require(
+        all(count >= 0 for count in counts) and repeats > 0,
+        "nonnegative lengths and positive repeats required",
+    )
+    manifest = json.loads(library.with_suffix(".compile.json").read_text())
+    require(
+        hashlib.sha256(result.asc.encode()).hexdigest() == manifest["source_sha256"],
+        "compiled library source does not match this compilation",
+    )
+    require(
+        hashlib.sha256(library.read_bytes()).hexdigest() == manifest["shared_sha256"],
+        "compiled library does not match its manifest",
+    )
+    health = health_snapshot(physical, output)
+    runtime = ACL()
+    records = []
+    groups = result.report["groups"]
+    try:
+        module = ct.CDLL(str(library.resolve()))
+        launch = getattr(module, f"launch_{result.name}")
+        launch.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_int64]
+        launch.restype = ct.c_int
+        guard = b"\x5a" * 128
+        for count in counts:
+            values = ((np.arange(groups * count * 64, dtype=np.int32) % 127 - 63) / 16).astype(
+                np.float32
+            )
+            raw_input = values.tobytes() + guard
+            raw_output = b"\xcd" * values.nbytes + guard
+            x, y = runtime.allocate(raw_input), runtime.allocate(raw_output)
+            require(launch(runtime.stream, x, y, count) == 0, "runtime length contract rejected")
+            runtime.synchronize()
+            raw = runtime.read(y, len(raw_output))
+            actual = np.frombuffer(raw[: values.nbytes], dtype=np.float32)
+            require(
+                np.array_equal(actual, values * np.float32(2)),
+                "device result differs from FP32 scale oracle",
+            )
+            require(
+                raw[values.nbytes :] == guard, "output guard changed, including empty-loop case"
+            )
+            require(runtime.read(x, len(raw_input)) == raw_input, "read-only input changed")
+            start, stop = runtime.event(), runtime.event()
+            runtime.record(start)
+            for _ in range(repeats):
+                require(
+                    launch(runtime.stream, x, y, count) == 0, "runtime length contract rejected"
+                )
+            runtime.record(stop)
+            runtime.synchronize()
+            raw = runtime.read(y, len(raw_output))
+            require(
+                np.array_equal(
+                    np.frombuffer(raw[: values.nbytes], dtype=np.float32), values * np.float32(2)
+                )
+                and raw[values.nbytes :] == guard,
+                "repeated launches changed numerical output or bounds guard",
+            )
+            elapsed = ct.c_float()
+            runtime.call(
+                "aclrtEventElapsedTime",
+                [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
+                ct.byref(elapsed),
+                start,
+                stop,
+            )
+            record = {
+                "tiles_per_group": count,
+                "shape": [groups, count, 64],
+                "dtype": "f32",
+                "elements": values.size,
+                "max_abs_error": 0.0,
+                "empty_loop_and_bounds_guards": "checked",
+                "warmup": 1,
+                "repeats": repeats,
+                "stream_interval_us_per_launch": elapsed.value * 1000 / repeats,
+                "timing_scope": "ACL event stream interval, including submission gaps; not kernel-only",
+                "input_sha256": hashlib.sha256(raw_input).hexdigest(),
+            }
+            records.append(record)
+            print(json.dumps(record), flush=True)
+        require(
+            launch(runtime.stream, x, y, -1) == -1, "negative length must be rejected before launch"
+        )
+    finally:
+        runtime.close()
+    report = {
+        "health": health,
+        "kernel": result.name,
+        "library": str(library.resolve()),
+        "source_sha256": manifest["source_sha256"],
+        "shared_sha256": manifest["shared_sha256"],
+        "verification": result.report,
+        "compilation": result.timings,
+        "same_binary_for_all_lengths": True,
+        "cases": records,
+    }
+    (output / "device.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--physical", type=int)
+    parser.add_argument(
+        "--library", type=Path, help="reuse an exactly matching compiled shared library"
+    )
+    parser.add_argument("--counts", type=int, nargs="+", default=[0, 1, 2, 4, 4096, 65536])
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--frontend", choices=["ast", "legacy"], default="ast")
+    args = parser.parse_args()
+    if args.frontend == "ast":
+        from examples.vector.scale import scale
+
+        result = compile(scale)
+    else:
+        result = compile(vector_source(N.dynamic("tasks")))
+    result.write(args.output)
+    library = args.library
+    if (args.offline or args.physical is not None) and library is None:
+        offline_compile(
+            result.asc, args.output.resolve(), result.name, shared=args.physical is not None
+        )
+        library = args.output / f"{result.name}.so"
+    if args.physical is not None:
+        run(result, library, args.output, args.physical, args.counts, args.repeats)
+    else:
+        print(json.dumps({"verification": result.report, "compilation": result.timings}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

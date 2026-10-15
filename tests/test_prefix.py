@@ -1,11 +1,11 @@
 """Runtime prefix proofs tested against independently enumerated byte accesses."""
 
 import pytest
-from ast_prefix import scale_prefix
-from test_loop_sync import finite_hardware_dag
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import IntAttr
 
+from examples.vector.prefix import scale_prefix
+from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile, verify_plan
 from xdsl_npu.frontend import from_source
 from xdsl_npu.ir import BufferOp, LoopChannelOp, LoopSyncOp, RuntimeSizeOp, StreamOp, TaskOp, ViewOp
@@ -210,7 +210,7 @@ def test_equivalent_scalar_bound_does_not_change_tail_or_generated_code(artifact
 
 
 def test_prefix_does_not_add_waits_or_change_release_scope(artifact):
-    from ast_vector import scale
+    from examples.vector.scale import scale
 
     regular = compile(scale)
 

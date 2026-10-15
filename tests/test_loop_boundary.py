@@ -3,11 +3,11 @@
 from dataclasses import replace
 
 import pytest
-from ast_reduction_gemm import reduction_gemm
-from test_loop_sync import finite_hardware_dag
 from xdsl.dialects.builtin import StringAttr
 from xdsl.ir import Block, Region
 
+from examples.gemm.reduction import reduction_gemm
+from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import Kernel, compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.ir import (

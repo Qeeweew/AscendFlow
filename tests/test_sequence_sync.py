@@ -4,11 +4,11 @@ from collections import defaultdict, deque
 from itertools import product
 
 import pytest
-from ast_state_sum import state_sum
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IntAttr, StringAttr
 from xdsl.utils.exceptions import VerifyException
 
+from examples.state.recurrence import state_sum
 from xdsl_npu import Kernel, autosync, compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.ir import (

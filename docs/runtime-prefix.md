@@ -1,7 +1,9 @@
 # AST 运行时长度与精确尾部前缀
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 这是已接通的 R1 子集，不是通用分支/嵌套同步。源码在
-[ast_prefix.py](../examples/ast_prefix.py)，独立字节访问与负例在
+[ast_prefix.py](../examples/vector/prefix.py)，独立字节访问与负例在
 [test_prefix.py](../tests/test_prefix.py)。
 
 ## 输入及执行语义
@@ -86,14 +88,14 @@ native 模板使用独立 `Templates` 表示，已移除假定 `Program(count=0)
 工作区根目录执行：
 
 ```bash
-.venv/bin/python compiler/examples/run_prefix.py --shared --output runs/refactor/ast-prefix-final
-.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_prefix.py --entry scale_prefix --trials 5 --output runs/refactor/ast-prefix-cold
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.vector.run_prefix --shared --output runs/refactor/ast-prefix-final
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/vector/prefix.py --entry scale_prefix --trials 5 --output runs/refactor/ast-prefix-cold
 ```
 
 检查全部卡后，显式选择健康空闲物理卡；此次为卡1映射逻辑0：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_prefix.py --output runs/refactor/r1-prefix-exact-gates --library runs/refactor/ast-prefix-final/scale_prefix.so --physical 1
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.vector.run_prefix --output runs/refactor/r1-prefix-exact-gates --library runs/refactor/ast-prefix-final/scale_prefix.so --physical 1
 ```
 
 同一 binary 的最新17组测试，包含精确0/1/2/4/4096/65536 tiles，最大16,777,224个处理元素，每组5次，误差0，输出

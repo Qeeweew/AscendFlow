@@ -1,10 +1,10 @@
 import itertools
 
 import pytest
-from pipeline_fixtures import phased_pipeline, vector_pipeline
-from recurrent import recurrent_gdn
 from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
+from examples.legacy.gdn import recurrent_gdn
+from tests.fixtures.pipelines import phased_pipeline, vector_pipeline
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.events import minimum_chains, pack_event_lifetimes, selection_expression

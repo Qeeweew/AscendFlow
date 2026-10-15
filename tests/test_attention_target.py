@@ -5,8 +5,8 @@ import operator
 from collections import Counter
 
 import pytest
-from attention_target import activation_trace, attention_target, target_source
 
+from tests.fixtures.attention_target import activation_trace, attention_target, target_source
 from xdsl_npu import compile
 from xdsl_npu.frontend import FrontendError
 

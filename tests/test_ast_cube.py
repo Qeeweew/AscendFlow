@@ -3,10 +3,10 @@
 from dataclasses import replace
 
 import pytest
-from ast_cube import batched_matmul
-from test_loop_sync import finite_hardware_dag
 from xdsl.dialects.builtin import IntAttr
 
+from examples.gemm.batched import batched_matmul
+from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.frontend import FrontendError

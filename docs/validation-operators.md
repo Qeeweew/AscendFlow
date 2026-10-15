@@ -1,5 +1,7 @@
 # 算子闭环验证记录
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 2026-10-13，独立产品仓库，xDSL 0.73.0、CANN 9.1.0、dav-2201、物理卡1
 910B3、每进程映射逻辑0。外层原始产物位于 `runs/operators/`，不提交产品 Git。
 此阶段新增实际算子编译与执行；完整复杂算子编译器目标仍未完成。
@@ -123,7 +125,7 @@ generation，不能从此配置宣称跨 generation 的流水重叠。原8核政
 32核配置可显式重现：
 
 ```bash
-.venv/bin/python compiler/examples/build_legacy.py softmax --rows 256 --columns 1024 --blocks 32 --output runs/operators/softmax-256-1024-32cores --compile --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build softmax --rows 256 --columns 1024 --blocks 32 --output runs/operators/softmax-256-1024-32cores --compile --shared
 ```
 
 ## 复现
@@ -131,20 +133,20 @@ generation，不能从此配置宣称跨 generation 的流水重叠。原8核政
 从工作区根目录执行 README 的编译命令。RMSNorm 数值边界可对已编译目录运行：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/operators/rms-small-sqrt-div --physical 1 --data-case numerical-edges --record-output runs/operators/rms-numerical-edges
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.legacy.run runs/operators/rms-small-sqrt-div --physical 1 --data-case numerical-edges --record-output runs/operators/rms-numerical-edges
 ```
 
 msprof 通过真实 shell 脚本保持 venv解释器路径。固定采集命令如下，采集前
-runner仍检查全部卡；参考侧把 `profile_device.sh` 换成 `profile_reference.sh`：
+runner仍检查全部卡；参考侧把 `benchmarks/profile.sh benchmarks.legacy.run` 换成 `benchmarks/profile.sh benchmarks.legacy.run_reference`：
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 \
 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof \
   --output=/workspace/xdsl-910b/runs/operators/profile-rms-256-1024-generated \
-  --application='/workspace/xdsl-910b/compiler/examples/profile_device.sh /workspace/xdsl-910b/runs/operators/rms-256-1024-f32 --physical 1 --repeats 30' \
+  --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.legacy.run /workspace/xdsl-910b/runs/operators/rms-256-1024-f32 --physical 1 --repeats 30' \
   --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/operators/profile-rms-256-1024-generated
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/operators/profile-rms-256-1024-generated
 ```
 
 进一步扩展的主要缺口：动态 task/间接 alias与 ownership，跨 AIC/AIV交接，

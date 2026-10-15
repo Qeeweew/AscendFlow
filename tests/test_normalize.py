@@ -1,9 +1,9 @@
 """Typed reduction, Scalar retirement and expert issue-order regressions."""
 
 import pytest
-from ast_normalize import rms_normalize
 from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
 
+from examples.normalization.rms_norm import rms_normalize
 from xdsl_npu import compile, verify_plan
 from xdsl_npu.frontend import from_source
 from xdsl_npu.ir import LoopChannelOp, LoopSyncOp, TaskOp
@@ -144,8 +144,7 @@ def test_runtime_work_counts_real_invocation_without_expanding_rows(artifact):
 
 
 def test_cv_actor_issue_policies_keep_the_shared_multistage_model():
-    from multistage import cv_source
-
+    from examples.legacy.multistage import cv_source
     from xdsl_npu import language as N
 
     source = cv_source(N.dynamic("tasks"))

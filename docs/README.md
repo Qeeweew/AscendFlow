@@ -1,0 +1,34 @@
+# 产品文档索引
+
+当前入口只有四份，避免历史进度与目标互相覆盖：
+
+| 文档 | 负责回答 |
+|---|---|
+| [design.md](design.md) | 为什么采用公共符号访问/完成关系，统一同步算法如何组织 |
+| [dsl-multistage.md](dsl-multistage.md) | 如何表达 runtime、局部/CV 多阶段和嵌套流水 |
+| [refactor-progress.md](refactor-progress.md) | 实际支持、明确缺陷及已验证证据 |
+| [refactor-plan.md](refactor-plan.md) | 下一部分具体修改、替换职责及退出门槛 |
+
+[算子示例](../examples/README.md)与[验证工具](../benchmarks/README.md)分别给源码和
+复现入口。设计模板不作为可运行示例；历史证据不自动适用于新 AST 路径。
+
+## FA 目标与对照
+
+- [目标数学、存储与政策](attention-target.md)，[未实现源码规格](design/attention_target.py.in)。
+- [独立 AscendC 的合同和测量](attention-reference.md)。
+- [legacy FA 的变体与性能](flash-attention.md)。
+
+## 已有能力的详细合同和证据
+
+以下是相应保存点的详细验证记录。若其“仍不支持”或“下一步”与当前状态不同，
+以状态页和当前计划为准；保留原始测量，复现路径已随目录清理更新。
+
+| 范围 | 记录 |
+|---|---|
+| 同步、effects、事件、ownership | [同步反例](synchronization.md)、[事件分配](event-allocation.md)、[混合核](mixed-ownership.md)、[物理扩展](physical-extensions.md) |
+| runtime 与局部流水 | [prefix](runtime-prefix.md)、[周期分解](factored-periods.md)、[归一化](ast-normalization.md)、[Cube](ast-cube.md) |
+| 归约和 region 组合 | [K归约](runtime-reduction.md)、[层次边界](hierarchy-boundaries.md)、[父子调用](runtime-hierarchy.md)、[sequence](region-sequence.md)、[父体](runtime-sequence-calls.md)、[共享输入](shared-invocation-inputs.md) |
+| legacy 算子 | [算子合同](operators.md)、[GEMM](hierarchical-gemm.md)、[GDN](recurrent-gdn.md) |
+| 来源与历史 | [源码依据](source-notes.md)、[首轮验证](validation-stage1.md)、[旧算子验证](validation-operators.md)、[旧保存点](checkpoint-before-refactor.md)、[历史进度](history/refactor-progress-20261015.md) |
+
+参考源码和外层报告只作为研究材料，不成为 wheel 或构建依赖。

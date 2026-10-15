@@ -1,5 +1,7 @@
 # 阶段 1 验证记录
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 2026-10-13，xDSL 0.73.0、CANN 9.1.0、dav-2201、910B3。
 此记录只覆盖局部同步闭环；高完成度的复杂算子编译/运行仍是后续目标。
 
@@ -49,7 +51,7 @@ preflight 拒绝占用卡上的运行。没有 reset 或设备错误后的换卡
 ## 固定专家计划与性能
 
 比较 shape=32×128，f32，Input/Output 各两槽，stage=0/1/1/2，单 AIV，物理卡1。
-`examples/manual_vector.asc.in` 是独立手排参考，和生成源码分别编译。
+`benchmarks/references/ascendc/manual_vector.asc.in` 是独立手排参考，和生成源码分别编译。
 最终**整个设备 ELF 字节相同**：
 
 ```text
@@ -97,7 +99,7 @@ ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 \
 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof \
   --output=/workspace/xdsl-910b/runs/stage1/comparison/generated-profile-valid \
-  --application='/workspace/xdsl-910b/compiler/examples/profile_device.sh /workspace/xdsl-910b/runs/stage1/comparison/generated --physical 1 --repeats 30' \
+  --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.legacy.run /workspace/xdsl-910b/runs/stage1/comparison/generated --physical 1 --repeats 30' \
   --task-time=on --ai-core=on --aic-metrics=PipeUtilization
 ```
 

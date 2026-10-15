@@ -1,5 +1,7 @@
 # P1：顺序区域的精确访问组合
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 本切片已从[精确访问组合](../src/xdsl_npu/region_sequence.py)接通根部单actor的
 普通工作→流水→普通工作，以及共享存储的多个兄弟流水。实现见
 [公共区域lowering](../src/xdsl_npu/region_lowering.py)、
@@ -83,7 +85,7 @@ reader、物理孔洞、同名不同分配、两个child、末代writer，以及
 
 ## 实际同步前后与设备闭环
 
-[state_sum](../examples/ast_state_sum.py)有真实Initial加载、双槽输入和FP32
+[state_sum](../examples/state/recurrence.py)有真实Initial加载、双槽输入和FP32
 逐代累加，最后导出；N=0输出Initial。插入前的物理IR投影为：
 
 ```text
@@ -123,14 +125,14 @@ input槽释放取Vector读取退休，不等输出搬运；state递推的V等待
 工作区根目录运行：
 
 ```bash
-.venv/bin/python compiler/examples/run_state_sum.py --output runs/refactor/state-sum --build
-.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_state_sum.py --entry state_sum --trials 5 --output runs/refactor/state-sum/cold-review
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run --output runs/refactor/state-sum --build
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/state/recurrence.py --entry state_sum --trials 5 --output runs/refactor/state-sum/cold-review
 ```
 
 设备命令在全部卡健康/空闲检查后选择物理卡；已有证据使用物理1→逻辑0：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_state_sum.py --output runs/refactor/state-sum --physical 1
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.state.run --output runs/refactor/state-sum --physical 1
 ```
 
 仍缺父serial体内前后工作、跨调用共享只读GM的统一组合、一般frame转换、

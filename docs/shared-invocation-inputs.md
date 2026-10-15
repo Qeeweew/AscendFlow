@@ -1,7 +1,9 @@
 # 跨父调用共享只读 GM
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 G1在统一源码入口之后增加的受限ownership能力。源码
-[shared_state_sum](../examples/ast_shared_state_sum.py)让Initial/group和X/group/tile
+[shared_state_sum](../examples/state/shared_inputs.py)让Initial/group和X/group/tile
 在所有output调用中重读，只有Output按group/output分frame。也有所有group读取
 同一份GM输入的回归；未增加copy、buffer或同步。
 
@@ -90,9 +92,9 @@ requested GM速率约1523.88GB/s，不是HBM实测流量/带宽。输入跨调�
 
 ```bash
 .venv/bin/python -m pytest -q compiler/tests/test_shared_invocation_inputs.py
-.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_shared_state_sum.py --entry shared_state_sum --trials 5 --output runs/refactor/shared-inputs/cold-recheck
-.venv/bin/python compiler/examples/run_grouped_state.py --shared-inputs --output runs/refactor/shared-inputs/device --build
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python compiler/examples/run_grouped_state.py --shared-inputs --output runs/refactor/shared-inputs/device --physical 1 --cases 16:2048 --warmup 5 --repeats 30 --skip-rounding-case --record runs/refactor/shared-inputs/device-large.json
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/state/shared_inputs.py --entry shared_state_sum --trials 5 --output runs/refactor/shared-inputs/cold-recheck
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run_grouped --shared-inputs --output runs/refactor/shared-inputs/device --build
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.state.run_grouped --shared-inputs --output runs/refactor/shared-inputs/device --physical 1 --cases 16:2048 --warmup 5 --repeats 30 --skip-rounding-case --record runs/refactor/shared-inputs/device-large.json
 ```
 
 profiling使用[同一wrapper和流程](runtime-sequence-calls.md#复现)，application增加
@@ -101,7 +103,7 @@ profiling使用[同一wrapper和流程](runtime-sequence-calls.md#复现)，appl
 generated、generated/ascendc。每批生成summary，再运行：
 
 ```bash
-.venv/bin/python compiler/examples/analyze_state_sum.py runs/refactor/shared-inputs/profiles --output runs/refactor/shared-inputs/performance.json
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.analyze runs/refactor/shared-inputs/profiles --output runs/refactor/shared-inputs/performance.json
 ```
 
 分析校验政策/输入输出、调用数、源码/库、flags、CSV、设备和Vector工作量。

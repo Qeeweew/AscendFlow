@@ -3,8 +3,8 @@ from collections import defaultdict
 from itertools import pairwise
 
 import pytest
-from pipeline_fixtures import cube_pipeline, vector_pipeline
 
+from tests.fixtures.pipelines import cube_pipeline, vector_pipeline
 from xdsl_npu import autosync
 from xdsl_npu.reachability import ProofSearch
 from xdsl_npu.sync import CompletionPrefixes, Graph, completion_graph, execution

@@ -1,6 +1,6 @@
 import pytest
-from kernels import batched_matmul_nt, rms_norm, rope, softmax, swiglu
 
+from examples.legacy.operators import batched_matmul_nt, rms_norm, rope, softmax, swiglu
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import ChannelOp, SyncOp, dump, parse

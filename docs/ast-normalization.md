@@ -1,8 +1,10 @@
 # AST 归约、Scalar 捕获与固定排步验证
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 本例是 FP32 RMS normalization 原语，不含 gamma/bias；不替代已有完整 RMSNorm。
-算法在 [ast_normalize.py](../examples/ast_normalize.py)，独立 AscendC 对照在
-[ascendc_normalize.asc.in](../examples/ascendc_normalize.asc.in)，均位于 examples。
+算法在 [ast_normalize.py](../examples/normalization/rms_norm.py)，独立 AscendC 对照在
+[ascendc_normalize.asc.in](../benchmarks/references/ascendc/ascendc_normalize.asc.in)，均位于 examples。
 编译器只增加 reduce、Scalar read、带标量参数的乘法及排步机制，没有识别算子名。
 
 ## 数值与存储契约
@@ -126,17 +128,17 @@ import/CANN 分开。native模板数12，周期2；不会按 rows 产生 Python 
 工作区根目录执行；运行前检查全部卡，以下选择物理卡1：
 
 ```bash
-.venv/bin/python compiler/examples/run_normalize.py --output runs/refactor/ast-normalize-comparison --build
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_normalize.py --output runs/refactor/ast-normalize-comparison --physical 1
-.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_normalize.py --entry rms_normalize --trials 5 --output runs/refactor/ast-normalize-cold
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.normalization.run --output runs/refactor/ast-normalize-comparison --build
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.normalization.run --output runs/refactor/ast-normalize-comparison --physical 1
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/normalization/rms_norm.py --entry rms_normalize --trials 5 --output runs/refactor/ast-normalize-cold
 ```
 
 对 generated / ascendc 各采3轮，分别使用独立输出目录及 `--record`：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/ast-normalize-profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/examples/profile_normalize.sh --output /workspace/xdsl-910b/runs/refactor/ast-normalize-comparison --record /workspace/xdsl-910b/runs/refactor/ast-normalize-profiles/trial-0/generated/device.json --physical 1 --variant generated --rows 256 --warmup 5 --repeats 30' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/refactor/ast-normalize-profiles/trial-0/generated --warmup 5 --repeats 30
-.venv/bin/python compiler/examples/analyze_normalize.py runs/refactor/ast-normalize-profiles --output runs/refactor/ast-normalize-profiles/comparison.json
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/ast-normalize-profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.normalization.run --output /workspace/xdsl-910b/runs/refactor/ast-normalize-comparison --record /workspace/xdsl-910b/runs/refactor/ast-normalize-profiles/trial-0/generated/device.json --physical 1 --variant generated --rows 256 --warmup 5 --repeats 30' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/refactor/ast-normalize-profiles/trial-0/generated --warmup 5 --repeats 30
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.normalization.analyze runs/refactor/ast-normalize-profiles --output runs/refactor/ast-normalize-profiles/comparison.json
 ```
 
 IR、ASC、共享库、CANN选项/版本、输入输出 hash、硬件快照、CSV和频率记录均

@@ -1,5 +1,7 @@
 # Flash Attention：三环自动同步与大规模设备验证
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 本页记录 **legacy物理构造路径** 的功能与实验，不是新AST DSL的支持列表。
 截至 `b98d541`，真实FA尚未完成结构化前端迁移；新的语言/连续流水/性能验收
 以[总体设计](design.md)和[重构方案](refactor-plan.md)为准。下文结果保留其原有
@@ -14,7 +16,7 @@ NN 的 V 在原生 L1→L0B Load2D 中转置，没有全形状 GM 转置或额�
 ## 实际接口和数值契约
 
 ```python
-from flash_attention import flash_attention  # compiler/examples 在 Python 路径中
+from examples.flash_attention.legacy import flash_attention  # PYTHONPATH=compiler
 from xdsl_npu import autosync, verify_plan, emit_asc
 
 source = flash_attention(
@@ -209,17 +211,17 @@ GM请求可命中L2，全部分配小于名义L2容量不保证全部驻留。3.
 ```bash
 .venv/bin/pip install --no-build-isolation -e 'compiler[validation]'
 .venv/bin/pytest -q compiler/tests/test_attention.py compiler/tests/test_performance.py
-.venv/bin/python compiler/examples/flash_attention.py --batch 1 --query-heads 2 --kv-heads 1 --query-length 128 --kv-length 192 --head-dim 64 --block-q 32 --block-kv 64 --causal --query-start 17 --shared --output runs/attention/causal-example
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python compiler/examples/run_attention.py runs/attention/causal-example --physical 1
-.venv/bin/python compiler/examples/flash_attention.py --batch 1 --query-heads 8 --kv-heads 8 --query-length 4096 --kv-length 4096 --head-dim 128 --block-q 128 --q-cache l1 --reuse-ub --pipeline --packed-reductions --shared --output runs/attention/mha-4k-reproduce
+PYTHONPATH=compiler .venv/bin/python -m examples.flash_attention.legacy --batch 1 --query-heads 2 --kv-heads 1 --query-length 128 --kv-length 192 --head-dim 64 --block-q 32 --block-kv 64 --causal --query-start 17 --shared --output runs/attention/causal-example
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.attention.run runs/attention/causal-example --physical 1
+PYTHONPATH=compiler .venv/bin/python -m examples.flash_attention.legacy --batch 1 --query-heads 8 --kv-heads 8 --query-length 4096 --kv-length 4096 --head-dim 128 --block-q 128 --q-cache l1 --reuse-ub --pipeline --packed-reductions --shared --output runs/attention/mha-4k-reproduce
 
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof \
   --output=/workspace/xdsl-910b/runs/attention/profile-reproduce \
-  --application='/workspace/xdsl-910b/compiler/examples/profile_attention.sh /workspace/xdsl-910b/runs/attention/mha-4k-reproduce --physical 1 --oracle sampled --repeats 30 --record-output /workspace/xdsl-910b/runs/attention/profile-reproduce/device' \
+  --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.attention.run /workspace/xdsl-910b/runs/attention/mha-4k-reproduce --physical 1 --oracle sampled --repeats 30 --record-output /workspace/xdsl-910b/runs/attention/profile-reproduce/device' \
   --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/attention/profile-reproduce
-.venv/bin/python compiler/examples/attention_performance.py runs/attention/mha-4k-reproduce runs/attention/profile-reproduce --physical 1
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/attention/profile-reproduce
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.performance runs/attention/mha-4k-reproduce runs/attention/profile-reproduce --physical 1
 ```
 
 CANN对照另选输出目录，在相同 application 中加 `--backend aclnn`；8K GQA改为

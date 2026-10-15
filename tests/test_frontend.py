@@ -1,9 +1,9 @@
 """Source semantics, refusal boundaries and real AST-to-synchronized-ASC tests."""
 
 import pytest
-from ast_vector import scale
 from xdsl.dialects import arith, scf
 
+from examples.vector.scale import scale
 from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.frontend import FrontendError, PrimFunction

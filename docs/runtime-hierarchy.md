@@ -1,8 +1,10 @@
 # R2a：父输出循环与子K流水的真实闭环
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 在 `83d7d09` 的边界摘要上接通物理父子区域、GM frame、跨调用完成/事件检查及
-ASC。[源码](../examples/ast_hierarchical_gemm.py)、[独立AscendC](../examples/ascendc_hierarchical_gemm.asc.in)、
-[运行入口](../examples/run_hierarchical_gemm.py)均在examples。算子调参没有恢复。
+ASC。[源码](../examples/gemm/hierarchical.py)、[独立AscendC](../benchmarks/references/ascendc/ascendc_hierarchical_gemm.asc.in)、
+[运行入口](../benchmarks/gemm/run_hierarchical.py)分别位于 examples 和 benchmarks。算子调参没有恢复。
 
 ## 支持的结构与地址契约
 
@@ -138,23 +140,23 @@ HBM带宽。每AIC L1/L0A/L0B/L0C分别36864/8192/16384/8192 bytes。
 工作区根目录执行，产物只写外层runs：
 
 ```bash
-.venv/bin/python compiler/examples/run_hierarchical_gemm.py --output runs/refactor/invocations-reproduce --build
-.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_hierarchical_gemm.py --entry hierarchical_gemm --trials 5 --output runs/refactor/invocations-reproduce-cold
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.gemm.run_hierarchical --output runs/refactor/invocations-reproduce --build
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/gemm/hierarchical.py --entry hierarchical_gemm --trials 5 --output runs/refactor/invocations-reproduce-cold
 .venv/bin/pytest -q compiler/tests/test_invocations.py compiler/tests/test_budget.py
 ```
 
 设备检查后选择健康空闲卡；下例为本次物理1，runner再次检查所有卡：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_hierarchical_gemm.py --output runs/refactor/invocations-reproduce --physical 1
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.gemm.run_hierarchical --output runs/refactor/invocations-reproduce --physical 1
 ```
 
 profiling每个variant/批次独立进程，下面替换trial编号和variant运行共6次：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/invocations-reproduce/profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/examples/profile_hierarchical_gemm.sh --output /workspace/xdsl-910b/runs/refactor/invocations-reproduce --record /workspace/xdsl-910b/runs/refactor/invocations-reproduce/profiles/trial-0/generated/device.json --physical 1 --variant generated --cases 16:256 --warmup 5 --repeats 30' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/refactor/invocations-reproduce/profiles/trial-0/generated
-.venv/bin/python compiler/examples/analyze_cube.py runs/refactor/invocations-reproduce/profiles --hierarchical --output runs/refactor/invocations-reproduce/profiles/comparison.json
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/refactor/invocations-reproduce/profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.gemm.run_hierarchical --output /workspace/xdsl-910b/runs/refactor/invocations-reproduce --record /workspace/xdsl-910b/runs/refactor/invocations-reproduce/profiles/trial-0/generated/device.json --physical 1 --variant generated --cases 16:256 --warmup 5 --repeats 30' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/refactor/invocations-reproduce/profiles/trial-0/generated
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.gemm.analyze runs/refactor/invocations-reproduce/profiles --hierarchical --output runs/refactor/invocations-reproduce/profiles/comparison.json
 ```
 
 父output×K主闭环已完成；R2a剩余的通用循环外工作，以及R2b状态/guard/布局

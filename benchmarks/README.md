@@ -1,0 +1,67 @@
+# 编译、正确性与性能验证
+
+从 `/workspace/xdsl-910b` 执行，模块入口使用 `PYTHONPATH=compiler`。这些工具
+不进入 compiler wheel；生成 ASC、库、输入、日志和 profiling 数据写入外层 runs。
+算子源码在 examples；数值参考共用 `benchmarks.validation`，无 ACL 初始化副作用。
+
+## 目录与入口
+
+| 路径 | 用途 |
+|---|---|
+| `compile.py`、`regions.py` | 冷进程源码→ASC 计时与静态结构压力输入 |
+| `vector/`、`gemm/`、`normalization/`、`state/` | 对应 AST 示例的固定政策验证与分析 |
+| `attention/` | legacy FA 执行、独立固定政策参考及硬件工作量分析 |
+| `references/ascendc/` | 独立手写 ASC 模板，不能由生成 PlanIR 反向生成 |
+| `references/` | ASC 模板读取、固定 FA 参考参数与 ACLNN 适配器 |
+| `validation/` | 确定性输入和 CPU 数值参考，供测试与 benchmark 共用 |
+| `legacy/` | 旧 physical/tracing 路径的构建和执行；不作为新 AST 能力证据 |
+| `profile.sh`、`profile_summary.py` | 通用 msprof 启动及数据汇总 |
+| `artifacts.py` | 统一校验 profile 对应的源码/库 hash 和旧相对路径 |
+
+每个算子的参数、工作量和误差合同保留在其 runner。当前只合并重复启动、产物
+校验和共享输入/oracle，不引入通用算子注册框架；仍有重复设备执行代码待收敛。
+
+## 无设备验证
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/state/frame_snapshot.py --entry frame_state_sum --trials 5 --output runs/cleanup/cold
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run_grouped --frame-snapshot --output runs/cleanup/frame --build
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run_policy --heads 1 --kv-heads 1 --groups 1 --output runs/cleanup/attention-reference --build
+```
+
+第二条编译生成代码与手写参考；第三条只编译独立 AscendC FA，不能计为编译器
+FA 成功。冷编译计时从读源码到最终检查/ASC，import、CANN 及属性访问另计。
+
+## 设备与大规模性能
+
+先检查所有卡健康、进程、显存和利用率，选择空闲健康卡。下例物理卡1仅作
+映射示例，运行当时须重新选择；runner 在 ACL 使用前再次检查。
+
+```bash
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.state.run_grouped --frame-snapshot --output runs/cleanup/frame --physical 1 --cases 16:128 --warmup 5 --repeats 30 --skip-rounding-case
+```
+
+B4096/G32/16:128 的 X 为1GiB。FA 计划固定4K/8K主例，矩阵与比较规则见
+[计划](../docs/refactor-plan.md)。设备错误立即停止，不 reset、不换卡规避错误。
+
+统一 profiling 包装器的第一个参数为模块名，保持原进程 cwd，自动加入产品根
+导入路径。它保留 venv Python 路径，避免 msprof 将符号链接解析到系统解释器。
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/cleanup/profiles/trial-0/generated --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.state.run_grouped --frame-snapshot --output /workspace/xdsl-910b/runs/cleanup/frame --physical 1 --variant generated --cases 16:128 --warmup 5 --repeats 30 --skip-rounding-case --record /workspace/xdsl-910b/runs/cleanup/profiles/trial-0/generated/device.json' --task-time=on --ai-core=on --aic-metrics=PipeUtilization
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/cleanup/profiles/trial-0/generated --warmup 5 --repeats 30
+```
+
+generated/ascendc 交替做三批；完成后：
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.analyze runs/cleanup/profiles --output runs/cleanup/performance.json
+```
+
+旧 manifest 若记录相对编译路径，显式指定当时编译 cwd：`--build-cwd compiler`
+或 `--build-cwd /workspace/xdsl-910b`，不能猜测路径。新编译 manifest 为绝对路径。
+旧记录的 hash/测量不因文件迁移而重写；新复现产物有新的源码/runner 身份。
+
+先审查最终 ASC 的搬运、缓冲、累计顺序和 wait/release，再看 timeline/内核时间。
+固定政策 AscendC、开源专家实现/ACLNN、硬件条件下界分别报告。记录完整源码/
+库/编译选项/shape/dtype/设备/计时口径；GM 请求速率不是测得 HBM 带宽。

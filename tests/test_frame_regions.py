@@ -3,9 +3,9 @@
 from dataclasses import replace
 
 import pytest
-from ast_frame_state_sum import frame_state_sum
-from test_sequence_sync import finite_check
 
+from examples.state.frame_snapshot import frame_state_sum
+from tests.test_sequence_sync import finite_check
 from xdsl_npu import compile, verify_plan
 from xdsl_npu.ir import FrameOp, RegionChannelOp, RegionSyncOp
 from xdsl_npu.model import CompileError

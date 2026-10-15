@@ -1,5 +1,7 @@
 # 首轮源码依据
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 R2 AST Cube 新增依据：CATLASS HEAD仍为 `698379e0d4b1b94d12728e7181df2cf83a958e8f`，
 工作区干净，未更新。`block_mmad_preload_async_with_callback.hpp:278–375` 明确
 在最后一次L1→L0读取后释放L1；L0和L0C另有M/FIX交接。安装CANN9.1的

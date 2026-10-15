@@ -1,7 +1,7 @@
 import pytest
-from multistage import cv_source, vector_source
 from xdsl.utils.exceptions import VerifyException
 
+from examples.legacy.multistage import cv_source, vector_source
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check
@@ -215,7 +215,7 @@ def test_region_yield_types_are_verified_after_source_roundtrip():
 
 @pytest.mark.parametrize("count,segments", [(0, 3), (1, 1), (2, 3), (4, 3)])
 def test_segmented_cv_uses_inner_prefetch_and_complete_outer_handoffs(count, segments):
-    from multistage import segmented_cv_source
+    from examples.legacy.multistage import segmented_cv_source
 
     physical = finite_lower_source(parse(dump(segmented_cv_source(count, segments))))
     plan = autosync(physical)
@@ -258,8 +258,7 @@ def test_unimplemented_runtime_initialization_is_rejected_explicitly():
 
 
 def test_all_segment_contributions_precede_ready_and_an_early_ready_is_rejected():
-    from multistage import segmented_cv_source
-
+    from examples.legacy.multistage import segmented_cv_source
     from xdsl_npu.ir import TaskOp
     from xdsl_npu.mixed import mixed_execution, mixed_graph
     from xdsl_npu.model import Instance

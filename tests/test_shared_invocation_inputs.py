@@ -3,10 +3,10 @@
 from dataclasses import replace
 
 import pytest
-from ast_shared_state_sum import shared_state_sum
-from test_sequence_sync import finite_check
 from xdsl.dialects.builtin import IntAttr
 
+from examples.state.shared_inputs import shared_state_sum
+from tests.test_sequence_sync import finite_check
 from xdsl_npu import compile, verify_plan
 from xdsl_npu.ir import BufferOp, FrameOp, TaskOp, ViewOp
 from xdsl_npu.model import CompileError

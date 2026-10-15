@@ -1,8 +1,8 @@
 """Cancellation at real proof work, bounded diagnostics and context cleanup."""
 
 import pytest
-from ast_vector import scale
 
+from examples.vector.scale import scale
 from xdsl_npu import budget, compile
 from xdsl_npu.loop_graph import Graph
 from xdsl_npu.model import CompileError

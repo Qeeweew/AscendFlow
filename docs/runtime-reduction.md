@@ -1,8 +1,10 @@
 # 运行时 K 归约：首代清零、末代导出与同步
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 本切片在 `f951390` 基础上实现一个保留的 K-panel 流水，不是嵌套父子流水。
-[DSL 示例](../examples/ast_reduction_gemm.py)、[独立 AscendC](../examples/ascendc_reduction_gemm.asc.in)
-与[验证入口](../examples/run_reduction_gemm.py)均在 examples。输入明确为 panel-major，
+[DSL 示例](../examples/gemm/reduction.py)、[独立 AscendC](../benchmarks/references/ascendc/ascendc_reduction_gemm.asc.in)
+与[验证入口](../benchmarks/gemm/run_reduction.py)分别位于 examples 和 benchmarks。输入明确为 panel-major，
 编译器不增加 GM packing。`panels=0` 保持输出不变；这不是空 GEMM 输出零的契约。
 
 ## 实现与同步
@@ -101,8 +103,8 @@ MAC活动0.151须结合实际搬运和 timeline 解读，比例不是互斥时�
 在工作区根目录执行，产物仅写外层 runs：
 
 ```bash
-.venv/bin/python compiler/examples/run_reduction_gemm.py --output runs/refactor/dynamic-k/reproduce --build
-.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_reduction_gemm.py --entry reduction_gemm --trials 5 --output runs/refactor/dynamic-k/reproduce-cold
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.gemm.run_reduction --output runs/refactor/dynamic-k/reproduce --build
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/gemm/reduction.py --entry reduction_gemm --trials 5 --output runs/refactor/dynamic-k/reproduce-cold
 .venv/bin/pytest -q compiler/tests/test_loop_boundary.py compiler/tests/test_loop_sync.py
 ```
 
@@ -110,12 +112,12 @@ MAC活动0.151须结合实际搬运和 timeline 解读，比例不是互斥时�
 记录的选择，runner 会再次检查，设备错误不 reset 或换卡绕过：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reduction_gemm.py --output runs/refactor/dynamic-k/reproduce --physical 1 --panels 0 1 2 4 7 1024 4096
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.gemm.run_reduction --output runs/refactor/dynamic-k/reproduce --physical 1 --panels 0 1 2 4 7 1024 4096
 ```
 
 AscendC 的 TPipe 占用 M_MTE1 IDs0/1/2，手排 L0 credits 使用3/4。
-profiling 使用 `profile_reduction_gemm.sh` 包装同一入口；保存3轮生成/参考目录后：
+profiling 使用 `benchmarks/profile.sh benchmarks.gemm.run_reduction` 包装同一入口；保存3轮生成/参考目录后：
 
 ```bash
-.venv/bin/python compiler/examples/analyze_cube.py runs/refactor/dynamic-k/profiles --reduction --output runs/refactor/dynamic-k/profiles/comparison.json
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.gemm.analyze runs/refactor/dynamic-k/profiles --reduction --output runs/refactor/dynamic-k/profiles/comparison.json
 ```

@@ -1,5 +1,7 @@
 # 分层与连续 NT GEMM
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 `gemm_nt(M,N,K)` 编译 `C=A@Bt.T`，输入 f16 ND、输出 f32 ND。每个 AIC 固定
 负责一个 N 列 tile，并由显式 `grid_m` 决定连续处理多少 M 行 tile。所有搬运、
 MAD、Fixpipe、缓冲和执行 stage 均进入同一个物理 IR/AutoSync/verifier；没有
@@ -143,9 +145,9 @@ ACL stream interval包含提交间隙，另存于`device.json/reference.json`，
 扩展物理/native/ownership契约后进入同一最终验证，不能在 ASC层藏入实现。
 
 ```bash
-.venv/bin/python compiler/examples/build_legacy.py gemm --m 512 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/gemm/persistent-512-1024-768 --compile --shared
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/gemm/persistent-512-1024-768 --physical 1
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_reference.py runs/gemm/persistent-512-1024-768 --physical 1
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build gemm --m 512 --n 1024 --k 768 --tile-m 128 --tile-n 128 --l1-k 256 --l0-k 64 --grid-m 2 --c-slots 2 --cache-b --output runs/gemm/persistent-512-1024-768 --compile --shared
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.legacy.run runs/gemm/persistent-512-1024-768 --physical 1
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.legacy.run_reference runs/gemm/persistent-512-1024-768 --physical 1
 ```
 
 采集脚本保持venv解释器，并在每次进程加载ACL前检查全部卡：
@@ -154,9 +156,9 @@ ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof \
   --output=/workspace/xdsl-910b/runs/gemm/profile-persistent-generated \
-  --application='/workspace/xdsl-910b/compiler/examples/profile_device.sh /workspace/xdsl-910b/runs/gemm/persistent-512-1024-768 --physical 1 --repeats 30' \
+  --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.legacy.run /workspace/xdsl-910b/runs/gemm/persistent-512-1024-768 --physical 1 --repeats 30' \
   --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/gemm/profile-persistent-generated
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/gemm/profile-persistent-generated
 ```
 
-基线采集换用`profile_reference.sh`和新的外层输出目录，其余计时口径一致。
+基线采集换用`benchmarks/profile.sh benchmarks.legacy.run_reference`和新的外层输出目录，其余计时口径一致。

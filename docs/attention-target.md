@@ -1,8 +1,8 @@
-# P0：真实 FA 的结构化源码合同
+# 待实现目标：真实 FA 的结构化源码合同
 
-代码基线 `fafeea3` 后新增。入口为
-[attention_target.py](../examples/attention_target.py)，数学主体为
-[源模板](../examples/design/attention_target.py.in)。这是**待接通的设计fixture**，
+源码规格最初在 `fafeea3` 后建立；目录整理不改变其数学主体。测试入口为
+[attention_target.py](../tests/fixtures/attention_target.py)，数学主体为
+[源模板](../docs/design/attention_target.py.in)。这是**待接通的设计fixture**，
 没有新增可运行FA支持，不调用legacy builder或绕过同步验证。
 
 ## 固定输入和执行政策
@@ -74,32 +74,29 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 
 ## 缺口映射与实际拒绝
 
-| 缺口 | 依赖/工作包 |
+| 当前合同/缺口 | 下一部分位置 |
 |---|---|
-| 普通region前后copy/fill/FIX、真实初始化及异步出口 | P1顺序区域组合 |
-| K/V跨query/head/group只读共享；交接scratch未初始化读检查 | P1真实effects/provenance，P2参与者 |
-| 每group任务数、runtime extent/stride、非连续2D片段 | P1/P2地址/owner证明；不能强制panel-major |
-| Pipelined内嵌Pipelined及内外两个generation | P2层次CV |
-| first/last合流、NEG_INF fill、UB bitwise copy | P1边界/P2原语 |
-| maximum、packed reduce、带显式scratch的row broadcast | P2通用typed lowering |
-| runtime商余和延迟query/head/kv descriptor | P3a先验证关系/规模，P3b接完整FA |
-| GM完整贡献、双AIV quorum、各MTE2最后读与event寿命 | P2/P3同步/资源及最终检查 |
-| 大规模独立AscendC/ACLNN/profiling对照 | P0固定reference、P2/P3设备验收 |
+| local ordinary work/init/child/use | 已有受限子集，统一其完成关系查询 |
+| Q/K/V共享、runtime BNSD地址、group任务数 | 计划第2步；已有readonly子集不足以承载完整FA |
+| AST嵌套pipeline、内外generation、共享L0C | 计划第1步关系模型，第2步真实nested CV |
+| first/last、NEG_INF、maximum/reduce/broadcast | 第2步，通用原语效果全部可见 |
+| runtime商余、跨query延迟descriptor | 第3步continuous；不能按K枚举 |
+| 双AIV贡献、MTE2最后读取、通知/可见性/资源 | 第2/3步公共同步与最终检查 |
+| 大规模AscendC/ACLNN/profile | 第2/3步；已有参考不等于编译器FA结果 |
 
 当前nested的首个诊断是`unsupported index product`，continuous是动态除数
 不在受支持索引子集中。测试要求明确失败，不把fixture解析成功当作FA编译通过。
 解决一个诊断后还要检查整个表，不应通过缩小任务域或隐藏调用跳过其他缺口。
 
-**P0独立参考已落地**：[AscendC参考及证据](attention-reference.md)覆盖手排控制、
+**独立参考已有记录**：[AscendC参考及证据](attention-reference.md)覆盖手排控制、
 小例完整数值、8K大例采样/profile及条件硬件下界；没有新AST FA的CANN或设备
-结果，参考性能也未达到最终目标。局部顺序区域已接通；`ed87249`又接通严格
-frame下的父体init/多个child/use，但本fixture需要的共享GM、mixed层次和连续
-task关系仍缺，见
-[区域组合](region-sequence.md)。最新实施次序以[重构方案](refactor-plan.md)为准。
+结果，参考性能也未达到最终目标。局部顺序区域、共享只读GM和stationary可写frame已有子集；
+FA所需的完整BNSD地址、mixed层次与连续task关系仍未接通。当前边界见
+[状态页](refactor-progress.md)，本源码不是可运行example。
 
 复现源码和有限派发表（不启动设备，也不宣称编译FA）：
 
 ```bash
-.venv/bin/python compiler/examples/attention_target.py --output runs/refactor/attention-target
+PYTHONPATH=compiler .venv/bin/python -m tests.fixtures.attention_target --output runs/refactor/attention-target
 .venv/bin/python -m pytest -q compiler/tests/test_attention_target.py
 ```

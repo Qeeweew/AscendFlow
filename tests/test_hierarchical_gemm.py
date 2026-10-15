@@ -1,7 +1,7 @@
 import pytest
-from kernels import gemm_nt
 from xdsl.dialects.builtin import IntAttr
 
+from examples.legacy.operators import gemm_nt
 from xdsl_npu import Kernel, autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import ChannelOp, SyncOp, TaskOp, ViewOp, dump, parse

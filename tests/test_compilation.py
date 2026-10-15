@@ -1,9 +1,9 @@
 from dataclasses import FrozenInstanceError
 
 import pytest
-from multistage import cv_source, segmented_cv_source, vector_source
 from xdsl.dialects.builtin import FloatAttr, f32
 
+from examples.legacy.multistage import cv_source, segmented_cv_source, vector_source
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.compilation import Compilation, compile
 from xdsl_npu.ir import LoopChannelOp, LoopSyncOp, TaskOp

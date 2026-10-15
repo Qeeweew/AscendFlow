@@ -1,8 +1,8 @@
 import pytest
-from pipeline_fixtures import cube_pipeline, vector_pipeline
 from xdsl.dialects.builtin import IntAttr, StringAttr
 from xdsl.transforms.dead_code_elimination import dce
 
+from tests.fixtures.pipelines import cube_pipeline, vector_pipeline
 from xdsl_npu import Kernel, autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import ChannelOp, SyncOp, ViewOp, dump, parse

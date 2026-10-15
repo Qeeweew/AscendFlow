@@ -1,5 +1,7 @@
 # 二值 event 生命周期分配
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 逻辑 channel 的数量不等于物理 flag 的数量。局部 AutoSync 保留原本可验证的
 连续 rotating ring；该方案不能放入每个有向 bank 的八 ID 时，改用同一组
 真实命令的有限生命周期分配。不改变 task、issue order、stage、buffer、同步
@@ -98,7 +100,7 @@ rotating width 不合适就提前拒绝。
 
 ```bash
 .venv/bin/pytest -q compiler/tests/test_events.py
-.venv/bin/python compiler/examples/build_legacy.py phased --phases 9 --phase-length 1 --columns 16 --check-interleavings all --output runs/events/nine-phases --compile --shared
-.venv/bin/python compiler/examples/build_legacy.py phased --phases 5 --phase-length 3 --columns 16 --check-interleavings all --output runs/events/epoch-selection --compile --shared
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/events/epoch-selection --physical 1 --repeats 10
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build phased --phases 9 --phase-length 1 --columns 16 --check-interleavings all --output runs/events/nine-phases --compile --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build phased --phases 5 --phase-length 3 --columns 16 --check-interleavings all --output runs/events/epoch-selection --compile --shared
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.legacy.run runs/events/epoch-selection --physical 1 --repeats 10
 ```

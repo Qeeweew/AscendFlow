@@ -20,7 +20,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["examples"]
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py311"

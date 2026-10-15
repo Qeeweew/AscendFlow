@@ -1,11 +1,11 @@
 """Actual parent/child finite byte histories and event lifetimes, not planner witnesses."""
 
 import pytest
-from ast_grouped_state_sum import grouped_state_sum
-from test_sequence_sync import finite_check
 from xdsl.dialects import scf
 from xdsl.dialects.builtin import IntAttr
 
+from examples.state.grouped import grouped_state_sum
+from tests.test_sequence_sync import finite_check
 from xdsl_npu import compile, verify_plan
 from xdsl_npu.ir import FrameOp, RegionChannelOp, RegionSyncOp, parse
 from xdsl_npu.model import CompileError

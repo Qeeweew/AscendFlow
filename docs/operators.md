@@ -1,5 +1,7 @@
 # 固定 shape 算子入口
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 这些 Python 工厂生成真实的 `npu.buffer/view/task/stream`，并通过产品的共享
 AutoSync、最终 verifier 和 ASC 后端。工厂中没有 event ID；ASC 后端也不增加
 未进入效果分析的搬运或 scratch。`from xdsl_npu import rms_norm, rope, softmax,
@@ -102,7 +104,7 @@ barrier。后续 `sin_low` 是 X 的最后 reader，其 release 放在 `rotate_h
 witness 可复现为：
 
 ```bash
-.venv/bin/python compiler/examples/build_legacy.py rope --rows 3 --columns 64 --row-block 1 --output runs/operators/rope-war
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build rope --rows 3 --columns 64 --row-block 1 --output runs/operators/rope-war
 ```
 
 `before.xdsl`、`after.xdsl`、`witnesses.json` 和生成 ASC 保存在该外层目录。

@@ -1,7 +1,9 @@
 # R2a：父子源码与调用边界分析
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 本页记录 `83d7d09` 的R2a边界分析基础。当时新增
-[hierarchical_gemm](../examples/ast_hierarchical_gemm.py)保留runtime `outputs`父serial
+[hierarchical_gemm](../examples/gemm/hierarchical.py)保留runtime `outputs`父serial
 和runtime `panels`子Pipelined，使用真实的首清末导计算主体。该提交能生成结构化
 源IR；当时physical lowering拒绝父scf.for。后续已接通限定local结构的真实闭环，
 当前能力、设备/profiling证据见[运行时层次流水](runtime-hierarchy.md)。
@@ -106,10 +108,8 @@ holes、末代写及两次调用的RAW/WAR/WAW。event轮换另与N=0..79的直�
 
 ```bash
 .venv/bin/pytest -q compiler/tests/test_hierarchy.py
-.venv/bin/python - <<'PY'
-import sys
-sys.path.insert(0, 'compiler/examples')
-from ast_hierarchical_gemm import hierarchical_gemm
+PYTHONPATH=compiler .venv/bin/python - <<'PY'
+from examples.gemm.hierarchical import hierarchical_gemm
 from xdsl_npu.ir import dump
 print(dump(hierarchical_gemm.to_ir()))
 PY

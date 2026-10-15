@@ -1,7 +1,9 @@
 # R2：分离存储周期和同步协议周期
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 本切片修改现有单层符号流水的分析，不改变 DSL 排步、存储分配或原生指令。
-[示例](../examples/independent_rings.py) 使用显式5槽输入、7槽输出，计算
+[示例](../examples/vector/independent_rings.py) 使用显式5槽输入、7槽输出，计算
 `Y[t,:] = 2 * X[t,:]`；这组互素容量用于验证编译复杂度，不是算子调优建议。
 
 ## 原来的问题与新的边界
@@ -90,10 +92,10 @@ reader frontier、路径域大小仍另有成本，不能据此宣称整个编�
 
 ```bash
 .venv/bin/pytest -q compiler/tests/test_periodic.py compiler/tests/test_loop_sync.py
-.venv/bin/python compiler/examples/independent_rings.py --output runs/refactor/factored-periods/device-build --shared
-.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/independent_rings.py --entry independent_rings --trials 5 --output runs/refactor/factored-periods/cold-after
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.vector.run_rings --output runs/refactor/factored-periods/device-build --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/vector/independent_rings.py --entry independent_rings --trials 5 --output runs/refactor/factored-periods/cold-after
 npu-smi info
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/independent_rings.py --output runs/refactor/factored-periods/device --library runs/refactor/factored-periods/device-build/independent_rings.so --physical 1
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.vector.run_rings --output runs/refactor/factored-periods/device --library runs/refactor/factored-periods/device-build/independent_rings.so --physical 1
 ```
 
 设备 runner 使用同一 binary 测试0/1/2/4/5/6/7/8/14/35/65536/262144个

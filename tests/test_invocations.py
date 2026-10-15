@@ -8,10 +8,10 @@ import re
 from collections import defaultdict, deque
 
 import pytest
-from ast_hierarchical_gemm import hierarchical_gemm
 from xdsl.dialects import scf
 from xdsl.dialects.builtin import IntAttr, StringAttr
 
+from examples.gemm.hierarchical import hierarchical_gemm
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.ir import (

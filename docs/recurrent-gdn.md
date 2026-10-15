@@ -1,5 +1,7 @@
 # 静态 GDN 与递推状态生命周期
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 `recurrent_gdn(sequences, steps, key_dim=64, value_dim=64, slots=2,
 snapshot_slots=2, scale=None)` 已使用同一个 physical IR、AutoSync、最终 verifier
 和 ASC 后端实现。每个独立 AIV block 拥有一个序列的私有 FP32 state；输入预取环、
@@ -137,15 +139,15 @@ AI_VECTOR_CORE task；设备 task 时间中位数为26.842微秒，min/max为
 
 ```bash
 .venv/bin/pytest -q compiler/tests/test_recurrent.py
-.venv/bin/python compiler/examples/build_legacy.py gdn --sequences 1 --steps 1 --value-dim 8 --slots 1 --snapshot-slots 1 --check-interleavings all --output runs/gdn/one-token --compile --shared
-.venv/bin/python compiler/examples/build_legacy.py gdn --sequences 2 --steps 5 --value-dim 8 --slots 2 --snapshot-slots 1 --check-interleavings all --output runs/gdn/five-token-single-snapshot --compile --shared
-.venv/bin/python compiler/examples/build_legacy.py gdn --sequences 32 --steps 16 --value-dim 64 --slots 2 --snapshot-slots 2 --output runs/gdn/32-16-64 --compile --shared
-ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/examples/run_device.py runs/gdn/32-16-64 --physical 1 --repeats 30
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build gdn --sequences 1 --steps 1 --value-dim 8 --slots 1 --snapshot-slots 1 --check-interleavings all --output runs/gdn/one-token --compile --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build gdn --sequences 2 --steps 5 --value-dim 8 --slots 2 --snapshot-slots 1 --check-interleavings all --output runs/gdn/five-token-single-snapshot --compile --shared
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.legacy.build gdn --sequences 32 --steps 16 --value-dim 64 --slots 2 --snapshot-slots 2 --output runs/gdn/32-16-64 --compile --shared
+PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 .venv/bin/python -m benchmarks.legacy.run runs/gdn/32-16-64 --physical 1 --repeats 30
 ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 XDSL_NPU_PYTHON=/workspace/xdsl-910b/.venv/bin/python \
 /usr/local/Ascend/cann-9.1.0/tools/profiler/bin/msprof --output=/workspace/xdsl-910b/runs/gdn/profile-generated \
-  --application='/workspace/xdsl-910b/compiler/examples/profile_device.sh /workspace/xdsl-910b/runs/gdn/32-16-64 --physical 1 --repeats 30 --record-output /workspace/xdsl-910b/runs/gdn/profile-generated/device' \
+  --application='/workspace/xdsl-910b/compiler/benchmarks/profile.sh benchmarks.legacy.run /workspace/xdsl-910b/runs/gdn/32-16-64 --physical 1 --repeats 30 --record-output /workspace/xdsl-910b/runs/gdn/profile-generated/device' \
   --task-time=on --ai-core=on --aic-metrics=PipeUtilization
-.venv/bin/python compiler/examples/profile_summary.py runs/gdn/profile-generated
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.profile_summary runs/gdn/profile-generated
 ```
 
 完整源码、编译参数、Bisheng 版本、源码/ELF/库 hash、输入 hash、两份输出与

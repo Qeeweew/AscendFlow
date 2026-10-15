@@ -7,9 +7,9 @@ The normal compiler must never invoke finite task instantiation.
 from collections import deque
 
 import pytest
-from multistage import cv_source, segmented_cv_source, vector_source
 from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
+from examples.legacy.multistage import cv_source, segmented_cv_source, vector_source
 from xdsl_npu import compile, emit_asc, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check

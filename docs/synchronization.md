@@ -1,5 +1,7 @@
 # 局部流水线的同步契约
 
+> 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
+
 `Ref` 保存 storage root、以字节为单位的 offset/stride、常量整数 divisor/modulus、
 独立核坐标、dtype/layout 和末块
 范围。Subview/recast 不产生新 allocation；布局转换只允许在具有明确效果的 recipe

@@ -1,6 +1,6 @@
 import pytest
-from flash_attention import flash_attention
 
+from examples.flash_attention.legacy import flash_attention
 from xdsl_npu import autosync
 from xdsl_npu.model import CompileError
 from xdsl_npu.performance import physical_work, profile_evidence, theoretical_metrics
