@@ -105,19 +105,17 @@ class Kernel:
         return self.invocation
 
     def once(self, uid):
-        if self.stream is not None or self.invocation is not None:
+        if self.stream is not None:
             raise ValueError("ordinary block needs its own lexical region")
         self.task_block = Block(arg_types=[IndexType()])
         self.stream = OnceOp.create(
             attributes={"uid": StringAttr(uid)}, regions=[Region(self.task_block)]
         )
-        self.block.add_op(self.stream)
+        (self.block if self.invocation is None else self.invocation.body.block).add_op(self.stream)
         return self
 
     def region(self, uid, count=None):
         """Append an ordinary block or retained stream, sharing real allocations."""
-        if self.invocation is not None:
-            raise ValueError("sequential regions inside an invocation are not yet supported")
         if self.task_block is not None:
             self.finish_region()
         self.stream, self.task_block = None, None

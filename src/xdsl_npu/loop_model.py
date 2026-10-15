@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from itertools import pairwise
 from math import lcm
 
-from xdsl.dialects import arith
+from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType
 
 from .budget import poll
@@ -199,7 +199,11 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
             from .invocation import frame_storage
 
             declarations.update({frame.op.ref: frame_storage(frame) for frame in invocation.frames})
-            streams.extend(child for child in op.body.block.ops if isinstance(child, StreamOp))
+            streams.extend(
+                child
+                for child in op.body.block.ops
+                if isinstance(child, StreamOp) or region is not None and isinstance(child, OnceOp)
+            )
         elif isinstance(op, FixConfigOp):
             require(
                 not config and kernel.core.data == "aic" and not streams,
@@ -216,7 +220,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 f"unsupported loop kernel effect {op.name}",
             )
     require(
-        len(streams) == 1 if region is None else region in streams and invocation is None,
+        len(streams) == 1 if region is None else region in streams,
         "one symbolic task stream per actor required outside sequence analysis",
     )
     stream = streams[0] if region is None else region
@@ -525,7 +529,11 @@ def _extract_loop_after_verify(module, *, region=None):
         require(
             isinstance(op, KernelOp)
             and isinstance(region, (OnceOp, StreamOp))
-            and region.parent_op() is op,
+            and (
+                region.parent_op() is op
+                or isinstance(region.parent_op(), scf.ForOp)
+                and region.parent_op().parent_op() is op
+            ),
             "leaf extraction requires its actual local root region",
         )
     streams = (
@@ -572,7 +580,11 @@ def _extract_loop_after_verify(module, *, region=None):
         kernels = [("aic" if op.core.data == "aic" else "aiv0", op)]
     from .invocation import extract_invocation
 
-    invocation = None if isinstance(op, MixedOp) else extract_invocation(op, uniform_values)
+    invocation = (
+        None
+        if isinstance(op, MixedOp)
+        else extract_invocation(op, uniform_values, sequence=region is not None)
+    )
     actors, all_views = {}, {}
     constants = set()
     storage_periods, view_counts = {}, {}

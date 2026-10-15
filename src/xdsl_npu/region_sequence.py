@@ -74,6 +74,34 @@ class SequenceSummary:
         require(type(count) is int and count >= 0, "negative/invalid sequence length")
         return tuple(cell for cell in self.cells if cell.domain.contains(count))
 
+    def invocation_dependencies(self):
+        """Exit accesses of call p against first accesses of p+1, same bound."""
+        result = []
+        for cell in self.cells:
+
+            def add(hazard, source, destination, *, cell=cell):
+                result.append(
+                    Obligation(
+                        cell.storage,
+                        cell.start,
+                        cell.stop,
+                        cell.domain,
+                        hazard,
+                        source,
+                        destination,
+                    )
+                )
+
+            if cell.last_write is not None:
+                for reader in cell.reads_before_write:
+                    add("RAW", cell.last_write, reader)
+                if cell.first_write is not None:
+                    add("WAW", cell.last_write, cell.first_write)
+            if cell.first_write is not None:
+                for reader in cell.pending_reads:
+                    add("WAR", reader, cell.first_write)
+        return tuple(result)
+
 
 def _domains(entries):
     """Partition N only where a participating *dynamic* region changes transfer.

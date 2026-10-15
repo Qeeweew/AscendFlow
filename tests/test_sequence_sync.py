@@ -1,9 +1,11 @@
 """Independent finite actual-command DAG and byte oracle for local sequences."""
 
 from collections import defaultdict, deque
+from itertools import product
 
 import pytest
 from ast_state_sum import state_sum
+from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IntAttr, StringAttr
 from xdsl.utils.exceptions import VerifyException
 
@@ -12,11 +14,13 @@ from xdsl_npu import language as N
 from xdsl_npu.ir import (
     BoundaryOp,
     BufferOp,
+    FrameOp,
     LoopChannelOp,
     LoopSyncOp,
     OnceOp,
     RegionChannelOp,
     RegionSyncOp,
+    RuntimeSizeOp,
     StreamOp,
     TaskOp,
     ViewOp,
@@ -32,9 +36,9 @@ def artifact():
 
 
 def physical_regions(plan):
-    return [
-        op for op in plan.body.block.first_op.body.block.ops if isinstance(op, (OnceOp, StreamOp))
-    ]
+    kernel = plan.body.block.first_op
+    parent = next((op for op in kernel.body.block.ops if isinstance(op, scf.ForOp)), kernel)
+    return [op for op in parent.body.block.ops if isinstance(op, (OnceOp, StreamOp))]
 
 
 def operations(region):
@@ -51,10 +55,24 @@ def pipe(task):
     return "S" if task.native.data == "scalar_load" else "V"
 
 
-def cells(value, g, n):
+def scalar(value, n, calls):
+    op = value.owner
+    if isinstance(op, RuntimeSizeOp):
+        return calls if op.sym_name.data == "outputs" else n
+    if isinstance(op, arith.ConstantOp):
+        return op.value.value.data
+    assert isinstance(op, arith.MuliOp)
+    return scalar(op.lhs, n, calls) * scalar(op.rhs, n, calls)
+
+
+def cells(value, g, n, *, call=0, calls=1):
     view = value.owner
     assert isinstance(view, ViewOp)
-    assert isinstance(view.source.owner, BufferOp)
+    root = view.source.owner
+    frame = root if isinstance(root, FrameOp) else None
+    if frame is not None:
+        root = frame.source.owner
+    assert isinstance(root, BufferOp)
     address = view.offset.data + view.stride.data * (
         g % view.modulus.data if view.modulus.data else g
     )
@@ -62,13 +80,15 @@ def cells(value, g, n):
         coefficient, divisor, modulus = [v.data for v in term]
         address += coefficient * ((g // divisor) % modulus if modulus else g // divisor)
     address += (0 if view.count_offset is None else view.count_offset.data) * n
+    if frame is not None:
+        address += call * scalar(frame.extent, n, calls) * frame.scale.data
     for row in range(1 if view.rows is None else view.rows.data):
         start = address + row * (0 if view.row_stride is None else view.row_stride.data)
         for byte in range(start, start + view.nbytes.data):
-            yield view.source.owner, byte
+            yield root, byte
 
 
-def finite_check(plan, n):
+def finite_check(plan, n, *, invocations=1):
     regions = physical_regions(plan)
     boundary = {o.sym_name.data: o for o in plan.walk() if isinstance(o, RegionChannelOp)}
     ids, edges = {}, []
@@ -89,7 +109,7 @@ def finite_check(plan, n):
             edges[a].add(b)
 
     counts, native = {}, {}
-    for region in regions:
+    for call, region in product(range(invocations), regions):
         count = (
             1
             if isinstance(region, OnceOp)
@@ -149,6 +169,12 @@ def finite_check(plan, n):
                             resource = pipe(src), pipe(dst), event_id
                     elif isinstance(op, RegionSyncOp):
                         c = boundary[op.channel.data]
+                        carried = c.carried is not None and c.carried.data == 1
+                        if carried and (
+                            (kind == "set" and call + 1 == invocations)
+                            or (kind != "set" and call == 0)
+                        ):
+                            continue
                         active = False
                         for row in c.domains:
                             p, r, exact, minimum = [v.data for v in row]
@@ -191,8 +217,8 @@ def finite_check(plan, n):
                         edge(prefixes.get(p), prefix)
                         edge(end, prefix)
                         prefixes[p] = prefix
-                        begins[region, g, task] = begin
-                        ends[region, g, task] = end
+                        begins[call, region, g, task] = begin
+                        ends[call, region, g, task] = end
                     elif kind in {"set", "barrier"}:
                         edge(prefixes.get(p), end)
                     if p == "S" and kind in {"task", "wait"}:
@@ -229,7 +255,7 @@ def finite_check(plan, n):
         for wait, send in zip(waits[key], sets[key][1:]):
             assert reach[wait] & (1 << send), "binary event overwrite"
     writers, readers = {}, defaultdict(set)
-    for region in regions:
+    for call, region in product(range(invocations), regions):
         for g in range(counts[region]):
             for task in native[region]:
                 if isinstance(task.parent_op(), BoundaryOp) and g != counts[region] - 1:
@@ -243,9 +269,9 @@ def finite_check(plan, n):
                 }[task.native.data]
                 touched = {}
                 for value, mode in zip(task.refs, modes):
-                    for byte in cells(value, g, counts[region]):
+                    for byte in cells(value, g, counts[region], call=call, calls=invocations):
                         touched.setdefault(byte, set()).update(mode)
-                key = region, g, task
+                key = call, region, g, task
                 for byte, mode in touched.items():
                     hazards = set()
                     if "R" in mode:

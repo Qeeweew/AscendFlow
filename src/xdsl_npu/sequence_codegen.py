@@ -37,6 +37,12 @@ def region_boundary(checked, region):
             f"n - {point.position.offset + 1}" if point.position.end else str(point.position.offset)
         )
         guard = "(" + " || ".join(f"({c})" for c in conditions) + f") && g == {position}"
+        if bridge.carried:
+            guard += (
+                " && npu_invocation + 1 < npu_invocations"
+                if action == "set"
+                else " && npu_invocation > 0"
+            )
         a, b = _task(checked.sequence, source).pipe, _task(checked.sequence, destination).pipe
         if bridge.event_id == -1:
             sync = f"asc_sync_pipe(PIPE_{b});"

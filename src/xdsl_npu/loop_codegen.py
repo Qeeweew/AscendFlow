@@ -232,6 +232,16 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
         else:
             from .sequence_codegen import region_boundary
 
+            if sequence.sequence.invocation is not None:
+                lines.append(
+                    "  for (int64_t npu_invocation = 0; npu_invocation < npu_invocations; ++npu_invocation) {"
+                )
+                for frame in invocation.frames:
+                    lines.append(
+                        f"    __gm__ uint8_t* {frame.name} = {frame.root.sym_name.data} + "
+                        f"(core_id * npu_invocations + npu_invocation) * "
+                        f"{frame.extent.c(uniform_names)} * {frame.scale};"
+                    )
             for region_name, leaf in sequence.analyses.items():
                 region_loop, region_channels, region_commands, _, _ = leaf
                 region_data = region_loop.actors[actor]
@@ -254,6 +264,8 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
                     boundary=region_boundary(sequence, region_name),
                 )
                 lines.append("  } // asynchronous region exit")
+            if sequence.sequence.invocation is not None:
+                lines.append("  } // serial sequence: no per-call drain")
         lines += [
             "  // Final lifetime boundary; no PIPE_ALL in the loop.",
             "  asc_sync_pipe(PIPE_ALL);",

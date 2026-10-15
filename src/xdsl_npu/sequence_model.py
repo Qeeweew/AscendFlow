@@ -2,7 +2,18 @@
 
 from dataclasses import dataclass
 
-from .ir import BufferOp, KernelOp, LoopChannelOp, OnceOp, RegionChannelOp, StreamOp
+from xdsl.dialects import scf
+
+from .ir import (
+    BufferOp,
+    InvocationChannelOp,
+    InvocationSyncOp,
+    KernelOp,
+    LoopChannelOp,
+    OnceOp,
+    RegionChannelOp,
+    StreamOp,
+)
 from .loop_model import _extract_loop_after_verify, slope
 from .model import require, verify_translated_owners
 from .region_sequence import Part, summarize_sequence
@@ -15,13 +26,20 @@ class Sequence:
     regions: dict
     live_in: dict
     summary: object
+    invocation: object = None
+
+
+def sequence_regions(kernel):
+    parents = [op for op in kernel.body.block.ops if isinstance(op, scf.ForOp)]
+    scope = parents[0] if len(parents) == 1 else kernel
+    return [op for op in scope.body.block.ops if isinstance(op, (StreamOp, OnceOp))]
 
 
 def is_sequence(module):
     root = module.body.block.first_op
     if not isinstance(root, KernelOp):
         return False
-    regions = [op for op in root.body.block.ops if isinstance(op, (StreamOp, OnceOp))]
+    regions = sequence_regions(root)
     return any(isinstance(op, OnceOp) for op in regions) or len(regions) > 1
 
 
@@ -29,8 +47,12 @@ def extract_sequence(module):
     module.verify()
     kernel = module.body.block.first_op
     require(isinstance(kernel, KernelOp), "sequential regions currently need one local actor")
-    regions = [op for op in kernel.body.block.ops if isinstance(op, (OnceOp, StreamOp))]
+    regions = sequence_regions(kernel)
     require(regions, "sequence has no executable regions")
+    require(
+        not any(isinstance(op, (InvocationChannelOp, InvocationSyncOp)) for op in kernel.walk()),
+        "sequence calls require their region protocols, not single-child invocation endpoints",
+    )
     require(
         all(op.uid is not None and op.uid.data.isidentifier() for op in regions)
         and len({op.uid.data for op in regions}) == len(regions),
@@ -41,6 +63,14 @@ def extract_sequence(module):
         "leaf event channels must belong to their actual region",
     )
     loops = {op.uid.data: _extract_loop_after_verify(module, region=op) for op in regions}
+    invocation = next(iter(loops.values())).invocation
+    if invocation is not None:
+        require(
+            all(op.parent_op() is invocation.op for op in regions)
+            and not any(isinstance(op, (OnceOp, StreamOp)) for op in kernel.body.block.ops),
+            "invocation sequence cannot hide execution outside its parent",
+        )
+    frame_roots = set() if invocation is None else {f.name for f in invocation.frames}
     refs, writes, users = {}, set(), {}
     for name, loop in loops.items():
         for actor, data in loop.actors.items():
@@ -53,6 +83,12 @@ def extract_sequence(module):
                         writes.add(root)
     stationary = set()
     for root, accesses in refs.items():
+        if root in frame_roots:
+            require(
+                root not in writes or len(users[root]) == 1,
+                f"{root}: cross-region GM frame writes need a shared frame frontier",
+            )
+            continue
         fixed = all(
             not slope(ref)
             and not ref.count_offset
@@ -106,4 +142,4 @@ def extract_sequence(module):
         all(op.parent_op() is kernel for op in kernel.walk() if isinstance(op, RegionChannelOp)),
         "boundary channels must belong to the enclosing kernel",
     )
-    return Sequence(module, loops, live_in, summary)
+    return Sequence(module, loops, live_in, summary, invocation)

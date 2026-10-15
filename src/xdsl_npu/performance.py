@@ -52,6 +52,11 @@ def runtime_work(module, arguments):
             if checked.sequence.summary.bound is None
             else checked.sequence.summary.bound.evaluate(arguments)
         )
+        invocations = (
+            1
+            if checked.sequence.invocation is None
+            else checked.sequence.invocation.bound.evaluate(arguments)
+        )
         for bridge in checked.bridges:
             if not any(d.contains(count) for d in bridge.domains):
                 continue
@@ -61,9 +66,9 @@ def runtime_work(module, arguments):
                 else (("barrier", bridge.destination),)
             ):
                 key = f"{action}:{_task(checked.sequence, point).pipe}"
-                result["sync_invocations"][key] = (
-                    result["sync_invocations"].get(key, 0) + result["groups"]
-                )
+                result["sync_invocations"][key] = result["sync_invocations"].get(key, 0) + result[
+                    "groups"
+                ] * (max(0, invocations - 1) if bridge.carried else invocations)
         result.pop("tasks_per_group")
         result["region_tasks_per_group"] = {
             name: part["tasks_per_group"] for name, part in zip(checked.analyses, parts)

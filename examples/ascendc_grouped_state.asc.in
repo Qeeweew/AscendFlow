@@ -1,0 +1,55 @@
+// Independent AscendC repeated init/recur/export with one carried output credit.
+// Same storage and issue policy as the example; no generated PlanIR input.
+#include "kernel_operator.h"
+#include <cstdint>
+using namespace AscendC;
+constexpr int B = @B@, GROUPS = @GROUPS@;
+
+extern "C" __global__ __vector__ void grouped_state_reference(
+    __gm__ uint8_t* initial, __gm__ uint8_t* input, __gm__ uint8_t* output, int64_t outputs, int64_t tiles) {
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> stateBuf, inputBuf;
+  pipe.InitBuffer(stateBuf, B * sizeof(float));
+  pipe.InitBuffer(inputBuf, 2 * B * sizeof(float));
+  auto state = stateBuf.Get<float>(), x = inputBuf.Get<float>();
+  for (int64_t call = 0; call < outputs; ++call) {
+  GlobalTensor<float> gi, gx, go;
+  gi.SetGlobalBuffer((__gm__ float*)initial + (int64_t(GetBlockIdx()) * outputs + call) * B);
+  gx.SetGlobalBuffer((__gm__ float*)input + (int64_t(GetBlockIdx()) * outputs + call) * tiles * B);
+  go.SetGlobalBuffer((__gm__ float*)output + (int64_t(GetBlockIdx()) * outputs + call) * B);
+  if (call > 0) WaitFlag<HardEvent::MTE3_MTE2>(event_t(0));
+  DataCopy(state, gi, B);
+  // For positive tiles the first input-ready captures the preceding state DMA.
+  if (tiles == 0) SetFlag<HardEvent::MTE2_MTE3>(event_t(0));
+  for (int64_t step = 0; step < tiles + 1; ++step) {
+    if (step < tiles) {
+      const auto id = event_t(step % 2);
+      if (step >= 2) WaitFlag<HardEvent::V_MTE2>(id);
+      DataCopy(x[(step % 2) * B], gx[step * B], B);
+      SetFlag<HardEvent::MTE2_V>(id);
+    }
+    if (step >= 1 && step - 1 < tiles) {
+      const int64_t g = step - 1;
+      const auto id = event_t(g % 2);
+      if (g >= 1) PipeBarrier<PIPE_V>();
+      WaitFlag<HardEvent::MTE2_V>(id);
+      Add(state, state, x[(g % 2) * B], B);
+      if (g == tiles - 1) SetFlag<HardEvent::V_MTE3>(event_t(0));
+      if (g + 2 < tiles) SetFlag<HardEvent::V_MTE2>(id);
+    }
+  }
+  if (tiles == 0) WaitFlag<HardEvent::MTE2_MTE3>(event_t(0));
+  else WaitFlag<HardEvent::V_MTE3>(event_t(0));
+  DataCopy(go, state, B);
+  if (call + 1 < outputs) SetFlag<HardEvent::MTE3_MTE2>(event_t(0));
+  } // output read retirement, not a whole-child drain
+  PipeBarrier<PIPE_ALL>();
+}
+
+extern "C" int launch_grouped_state_reference(void* stream, void* initial, void* input, void* output, int64_t outputs, int64_t tiles) {
+  const int64_t limit = (INT64_MAX - 64) / (int64_t(GROUPS) * B * sizeof(float));
+  if (outputs < 0 || tiles < 0 || outputs > limit || tiles > limit) return -1;
+  if (outputs && tiles > limit / outputs) return -1;
+  grouped_state_reference<<<GROUPS, nullptr, stream>>>((uint8_t*)initial, (uint8_t*)input, (uint8_t*)output, outputs, tiles);
+  return 0;
+}

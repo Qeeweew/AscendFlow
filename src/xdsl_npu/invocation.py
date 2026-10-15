@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from xdsl.dialects import scf
 
-from .ir import BufferOp, FrameOp, StreamOp
+from .ir import BufferOp, FrameOp, OnceOp, StreamOp
 from .model import Storage, optional_int, require
 from .scalar import Expr, expression, literal
 
@@ -35,7 +35,7 @@ class Invocation:
     frames: tuple[Frame, ...]
 
 
-def extract_invocation(kernel, uniform_values):
+def extract_invocation(kernel, uniform_values, *, sequence=False):
     parents = [op for op in kernel.body.block.ops if isinstance(op, scf.ForOp)]
     if not parents:
         return None
@@ -90,14 +90,17 @@ def extract_invocation(kernel, uniform_values):
             )
             frames.append(Frame(op, root, "npu_frame_" + root.sym_name.data, extent, op.scale.data))
             used.add(root)
-        elif isinstance(op, StreamOp):
+        elif isinstance(op, StreamOp) or sequence and isinstance(op, OnceOp):
             streams.append(op)
         else:
             require(
                 isinstance(op, scf.YieldOp) and not op.arguments,
                 f"unsupported invocation effect {op.name}",
             )
-    require(len(streams) == 1, "each invocation currently contains one retained child stream")
+    require(
+        bool(streams) if sequence else len(streams) == 1,
+        "each invocation requires its actual retained execution regions",
+    )
     roots = {op for op in kernel.body.block.ops if isinstance(op, BufferOp) and op.external.data}
     require(used == roots, "every invocation GM root requires an explicit frame")
     return Invocation(parent, bound, tuple(frames))

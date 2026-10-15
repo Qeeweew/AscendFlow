@@ -18,7 +18,7 @@ from .invocation_sync import Inside, Site, _first
 from .ir import LoopSyncOp, RegionChannelOp, RegionSyncOp, TaskOp
 from .loop_boundary import stream_operations
 from .loop_sync import _plan_leaf, _verify_leaf
-from .model import require
+from .model import optional_int, require
 from .periodic import bounded_period
 from .region_summary import Access, CountDomain, Position
 from .sequence_model import extract_sequence
@@ -38,6 +38,7 @@ class Bridge:
     domains: tuple[CountDomain, ...]
     event_id: int
     name: str = ""
+    carried: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,11 @@ def _domain_row(d):
 
 
 def _covers(required, guards):
+    guards = tuple(guards)
+    if not guards:
+        return False
+    if required in guards:
+        return True
     if required.exact is not None:
         return any(g.contains(required.exact) for g in guards)
     # Membership is constant per residue between threshold/exact boundaries.
@@ -186,8 +192,17 @@ class BoundaryProof:
             self.sequence, right, domain
         ):
             return False
-        inside = self.inside[left.region]
-        loop, _, commands, _, _ = self.analyses[left.region]
+        actor = next(iter(self.sequence.regions[left.region].actors))
+        return self.site_path(
+            left.region,
+            Site((actor, left.task), left.position, source_point),
+            Site((actor, right.task), right.position, destination_point),
+            domain,
+        )
+
+    def site_path(self, region, left, right, domain):
+        inside = self.inside[region]
+        loop, _, commands, _, _ = self.analyses[region]
         positions = [left.position, right.position]
         if loop.constant_count is not None:
             count = loop.constant_count
@@ -202,14 +217,19 @@ class BoundaryProof:
             window = max(
                 [head + tail + 1, inside.graph.period]
                 + [c.lower + c.upper + 1 for items in commands.values() for c in items]
+                + [
+                    p.offset
+                    + (inside.command(site).lower if p.end else inside.command(site).upper)
+                    + 1
+                    for p, site in zip(positions, (left, right))
+                ]
             )
             domain = CountDomain(
                 inside.graph.period, count % inside.graph.period, minimum=min(count, window)
             )
-        actor = next(iter(loop.actors))
         return inside.prove(
-            Site((actor, left.task), positions[0], source_point),
-            Site((actor, right.task), positions[1], destination_point),
+            replace(left, position=positions[0]),
+            replace(right, position=positions[1]),
             domain,
         )
 
@@ -242,10 +262,10 @@ class BoundaryProof:
                 covered.extend(bridge.domains)
         return _covers(domain, covered)
 
-    def _inherited(self, source, destination, domain):
+    def _inherited(self, source, destination, domain, *, capture_only=False):
         seq = self.sequence
         st, dt = _task(seq, source), _task(seq, destination)
-        if st.pipe == "S" or st.pipe == dt.pipe and st.implicit_completion:
+        if not capture_only and (st.pipe == "S" or st.pipe == dt.pipe and st.implicit_completion):
             return True
         # Any real Set/barrier in the receiving region on the source pipe also
         # captures preceding regions' native work. Only use an actual completed
@@ -403,7 +423,11 @@ def _plan_boundaries(sequence, analyses, banks):
 
 def _install(sequence, bridges):
     kernel = sequence.module.body.block.first_op
-    first = next(iter(sequence.regions.values())).region
+    first = (
+        sequence.invocation.op
+        if sequence.invocation is not None
+        else next(iter(sequence.regions.values())).region
+    )
     for bridge in bridges:
         s, d = bridge.source, bridge.destination
         declaration = RegionChannelOp.create(
@@ -421,6 +445,7 @@ def _install(sequence, bridges):
                     ArrayAttr(IntAttr(n) for n in _domain_row(g)) for g in bridge.domains
                 ),
                 "event_id": IntAttr(bridge.event_id),
+                **({"carried": IntAttr(1)} if bridge.carried else {}),
             }
         )
         kernel.body.block.insert_op_before(declaration, first)
@@ -451,7 +476,10 @@ def _read_bridges(sequence, analyses):
         data = next(iter(loop.actors.values()))
         tasks = {t.uid: t for t in data.program.tasks}
         for channel in channel_map.values():
-            require(channel.kind == "local", "sequence needs local leaf event resources")
+            require(
+                channel.kind == "local" and not channel.carry,
+                "sequence needs local non-carried leaf event resources",
+            )
             key = tasks[channel.sources[0][1]].pipe, tasks[channel.destinations[0][1]].pipe
             require(
                 not usage[key].intersection(channel.ids),
@@ -477,8 +505,14 @@ def _read_bridges(sequence, analyses):
             )
             points.append(Point(region.data, task.data, Position(bool(end.data), offset.data)))
         source, destination = points
+        carried = optional_int(op.carried, 0)
         require(
-            list(sequence.regions).index(source.region)
+            carried in {0, 1} and (not carried or sequence.invocation is not None),
+            "carried region channel requires its actual serial parent",
+        )
+        require(
+            carried
+            or list(sequence.regions).index(source.region)
             < list(sequence.regions).index(destination.region),
             "region protocols must follow actual lexical dispatch order",
         )
@@ -510,7 +544,9 @@ def _read_bridges(sequence, analyses):
                 "region event IDs overlap/exceed their bank",
             )
             usage[sp, dp].add(event_id)
-        bridges.append(Bridge(source, destination, tuple(domains), event_id, op.sym_name.data))
+        bridges.append(
+            Bridge(source, destination, tuple(domains), event_id, op.sym_name.data, bool(carried))
+        )
     actual = {}
     for name, loop in sequence.regions.items():
         data = next(iter(loop.actors.values()))
@@ -575,6 +611,7 @@ def verify_sequence(module, *, _details=False):
             loop, live_in=sequence.live_in[name], _details=True
         )
     bridges, banks = _read_bridges(sequence, analyses)
+    forward = tuple(b for b in bridges if not b.carried)
     proof = BoundaryProof(sequence, analyses)
     inherited = 0
     for source, destination, domain, obligation in _requirements(sequence):
@@ -583,7 +620,7 @@ def verify_sequence(module, *, _details=False):
             inherited += 1
             continue
         require(
-            proof.covered(source, destination, domain, obligation, bridges),
+            proof.covered(source, destination, domain, obligation, forward),
             f"missing sequence {obligation.hazard}: {source} -> {destination}, "
             f"{obligation.storage.owner.sym_name.data}[{obligation.start}:{obligation.stop}]",
         )
@@ -607,6 +644,12 @@ def verify_sequence(module, *, _details=False):
         ],
         "terminal_drain": "one kernel drain; region exits preserve actual outstanding native work",
     }
+    if sequence.invocation is not None:
+        from .sequence_calls import verify_calls
+
+        report.update(verify_calls(sequence, analyses, bridges))
+        report["proof_domain_states"] = sum(a[3].domain_states for a in analyses.values())
+        report["proof_path_queries"] = sum(a[3].path_queries for a in analyses.values())
     checked = CheckedSequence(sequence, analyses, bridges)
     return (report, checked) if _details else report
 
@@ -627,5 +670,12 @@ def autosync_sequence(module, *, _capture=None):
         name: _verify_leaf(loop, live_in=sequence.live_in[name], _details=True)[1]
         for name, loop in sequence.regions.items()
     }
-    _install(sequence, _plan_boundaries(sequence, analyses, banks))
+    forward = _plan_boundaries(sequence, analyses, banks)
+    if sequence.invocation is not None:
+        from .sequence_calls import plan_calls
+
+        carried = plan_calls(sequence, analyses, forward, banks)
+    else:
+        carried = []
+    _install(sequence, [*forward, *carried])
     return _finish(result, _capture=_capture)

@@ -255,6 +255,7 @@ class RegionChannelOp(IRDLOperation):
     # (period, residue, exact or -1, minimum); guards refer to the shared N.
     domains = attr_def(ArrayAttr[ArrayAttr[IntAttr]])
     event_id = attr_def(IntAttr)  # -1 denotes a same-pipe fence.
+    carried = opt_attr_def(IntAttr)  # Set in invocation p, Wait in p+1; no seed.
     traits = traits_def(AsyncEffects())
 
 

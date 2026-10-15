@@ -249,7 +249,7 @@ def _verify_leaf(loop, *, live_in=(), _details=False):
                 scalar_queries += 1
     banks, cross_ids, lifetime_queries = _lifetime(loop, channel_map, graph, endpoints)
     invocation_report = {}
-    if loop.invocation is not None:
+    if loop.invocation is not None and loop.region is None:
         from .invocation_sync import verify_invocation
 
         invocation_report = verify_invocation(loop, channel_map, graph, endpoints, native)
@@ -314,7 +314,7 @@ def _verify_leaf(loop, *, live_in=(), _details=False):
             bank = f"{source.actor}:{source.task.pipe}:{destination.task.pipe}"
             report["event_ids"].setdefault(bank, []).append(protocol.event_id.data)
             report["event_ids"][bank].sort()
-    if loop.invocation is not None:
+    if loop.invocation is not None and loop.region is None:
         report["invocation_channels"] = sum(
             isinstance(op, InvocationChannelOp) for op in loop.op.walk()
         )
@@ -565,7 +565,7 @@ def _plan_leaf(loop, *, live_in=(), banks=None):
         )
         op.attributes["event_ids"] = _ints(range(base, base + width))
         banks[key] = base + width
-    if loop.invocation is not None:
+    if loop.invocation is not None and loop.region is None:
         from .invocation_sync import plan_invocation
 
         plan_invocation(loop)
