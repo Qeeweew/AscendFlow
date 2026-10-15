@@ -8,7 +8,7 @@
 
 | 工作包 | 现有资产 | 尚缺 |
 |---|---|---|
-| P0目标合同 | examples中完整FA目标源码、数值与派发表、容量检查 | 独立同政策AscendC；fixture不能运行 |
+| P0目标合同 | FA目标源码、数值/派发表、独立AscendC的小例及8K记录 | 新AST fixture仍不能运行；参考不代表专家性能 |
 | P1局部组合 | 根部once/stream、共享ref、真实init/use、只读GM；1 GiB闭环 | 父serial体组合、统一绑定环境、跨region资源复用、snapshot切片 |
 | P2多级CV/FA | 旧CV/分段反例、native与cross-core基础 | 新AST嵌套、完整softmax/FA、同政策对照 |
 | P3连续任务 | 目标query/KV解码源码与有限派发表 | runtime商余的分析合同及完整编译/设备路径 |
@@ -248,8 +248,8 @@ layout变换。偏差超过5%触发归因；噪声覆盖差异则标未决，不
 
 ## 11. 下一次开发从哪里开始
 
-先按P0补齐FA参考和政策差异表，直接用现有fixture而非再写宏观报告；随后
-P1a抽取actor绑定环境，接通父体`init; child; use`。紧接P3a验证双runtime轴
+P0的[独立参考和政策差异](attention-reference.md)已补齐，并修正单槽L0的内层
+issue_order。下一步P1a抽取actor绑定环境，接通父体`init; child; use`，紧接P3a验证双runtime轴
 及query/task/child代次关系，再推进资源复用与层次CV。每步完成具体退出条件
 才登记，不以测试总数或文档完成代替功能交付。
 

@@ -1,0 +1,351 @@
+// Independent fixed-policy AscendC FA. Not emitted from compiler IR.
+// BNSD, BQ128/BK1024/D128, native CK128, private Vector rows8.
+// One continuous task stream: AIC QK[t],PV[t-1]; AIV Update[t-2],Softmax[t-1].
+#include "kernel_operator.h"
+#include <cstdint>
+using namespace AscendC;
+using Element = @TYPE@;
+constexpr int B = @B@, HQ = @HQ@, HKV = @HKV@, GROUPS = @GROUPS@;
+constexpr int Q = 128, K = 1024, D = 128, C = 128, R = 8, ROWS = Q/2, CHUNKS = K/C;
+constexpr float SCALE = 0.08838834764831845f;
+// Six mode-2 counter channels, FIFO epochs, at most two outstanding sends.
+constexpr int SCORE_READY=0, SCORE_FREE=1, P_READY=2, P_FREE=3, PV_READY=4, PV_FREE=5;
+// TPipe reserves/seeds M_MTE1 0,1,2. Native operands use only 3,4,5.
+constexpr int Q_CREDIT=3, K_CREDIT=4, PV_CREDIT=5;
+
+template<HardEvent E> __aicore__ inline void Take(bool &pending, int id) {
+  if (pending) WaitFlag<E>(event_t(id));
+  pending = false;
+}
+template<HardEvent E> __aicore__ inline void Give(bool &pending, int id) {
+  SetFlag<E>(event_t(id)); pending = true;
+}
+__aicore__ inline void FenceV() { PipeBarrier<PIPE_V>(); }
+
+template<int M, int N>
+__aicore__ inline void GmToL1(LocalTensor<Element> dst, GlobalTensor<Element> src, int pitch) {
+  Nd2NzParams p;
+  p.ndNum=1; p.nValue=M; p.dValue=N; p.srcNdMatrixStride=0; p.srcDValue=pitch;
+  p.dstNzC0Stride=M; p.dstNzNStride=1; p.dstNzMatrixStride=0;
+  DataCopy(dst,src,p);
+}
+__aicore__ inline void ToA(LocalTensor<Element> dst, LocalTensor<Element> src) {
+  LoadData2DParams p;
+  p.startIndex=0; p.repeatTimes=C/16; p.srcStride=Q/16; p.dstGap=0; p.sid=0; p.ifTranspose=false;
+  for(int m=0;m<Q/16;++m) LoadData(dst[m*C*16],src[m*256],p);
+}
+__aicore__ inline void ToB(LocalTensor<Element> dst, LocalTensor<Element> src, bool transpose) {
+  LoadData2DParams p;
+  p.startIndex=0; p.dstGap=0; p.sid=0; p.ifTranspose=!transpose;
+  if(transpose) { p.repeatTimes=C*D/256; p.srcStride=1; LoadData(dst,src,p); }
+  else { p.repeatTimes=D/16; p.srcStride=C/16;
+    for(int k=0;k<C/16;++k) LoadData(dst[k*D*16],src[k*256],p);
+  }
+}
+__aicore__ inline void Mad(LocalTensor<float> dst, LocalTensor<Element> a,
+                          LocalTensor<Element> b, bool initialize) {
+  MmadParams p; p.m=Q; p.n=C; p.k=D; p.cmatrixInitVal=initialize; p.unitFlag=0;
+  Mmad(dst,a,b,p);
+}
+__aicore__ inline void Export(GlobalTensor<float> dst, LocalTensor<float> src, int pitch) {
+  FixpipeParamsV220 p;
+  p.mSize=Q; p.nSize=C; p.srcStride=Q; p.dstStride=pitch;
+  p.quantPre=QuantMode_t::NoQuant; p.reluEn=false; p.unitFlag=0;
+  Fixpipe<float,float,CFG_ROW_MAJOR>(dst,src,p);
+}
+
+class CubeAttention {
+  TPipe pipe;
+  TBuf<TPosition::A1> qBuf,kBuf,pBuf,vBuf;
+  TBuf<TPosition::A2> qaBuf,paBuf;
+  TBuf<TPosition::B2> kbBuf,vbBuf;
+  TBuf<TPosition::CO1> cBuf;
+  LocalTensor<Element> q1,k1,p1,v1,qa,pa,kb,vb;
+  LocalTensor<float> c0;
+  GlobalTensor<Element> gq,gk,gv,gp;
+  GlobalTensor<float> gs,gpv;
+  bool q1Free=false, qaFree=false, kbFree=false, pvOperandFree=false;
+  bool kFree[2]={false,false},pFree[2]={false,false},vFree[2]={false,false},cFree[2]={false,false};
+  int64_t sq,sk,group,kvCount,total;
+public:
+  __aicore__ inline void Init(__gm__ uint8_t* q,__gm__ uint8_t* k,__gm__ uint8_t* v,
+      __gm__ uint8_t* score,__gm__ uint8_t* prob,__gm__ uint8_t* pv,int64_t qs,int64_t ks) {
+    sq=qs; sk=ks; group=get_block_idx(); kvCount=sk/K;
+    int64_t queries=B*HQ*(sq/Q);
+    total=(queries>group ? (queries-1-group)/GROUPS+1 : 0)*kvCount;
+    pipe.InitBuffer(qBuf,Q*D*2); pipe.InitBuffer(kBuf,2*C*D*2);
+    pipe.InitBuffer(pBuf,2*Q*C*2); pipe.InitBuffer(vBuf,2*C*D*2);
+    pipe.InitBuffer(qaBuf,Q*D*2); pipe.InitBuffer(paBuf,Q*C*2);
+    pipe.InitBuffer(kbBuf,D*C*2); pipe.InitBuffer(vbBuf,C*D*2);
+    pipe.InitBuffer(cBuf,2*Q*C*4);
+    q1=qBuf.Get<Element>(); k1=kBuf.Get<Element>(); p1=pBuf.Get<Element>(); v1=vBuf.Get<Element>();
+    qa=qaBuf.Get<Element>(); pa=paBuf.Get<Element>(); kb=kbBuf.Get<Element>(); vb=vbBuf.Get<Element>();
+    c0=cBuf.Get<float>();
+    gq.SetGlobalBuffer((__gm__ Element*)q); gk.SetGlobalBuffer((__gm__ Element*)k);
+    gv.SetGlobalBuffer((__gm__ Element*)v); gp.SetGlobalBuffer((__gm__ Element*)prob+group*2*Q*K);
+    gs.SetGlobalBuffer((__gm__ float*)score+group*2*Q*K);
+    gpv.SetGlobalBuffer((__gm__ float*)pv+group*2*Q*D);
+    SetFixpipeNz2ndFlag(1,0,0);
+    set_flag(PIPE_S,PIPE_FIX,event_t(0)); wait_flag(PIPE_S,PIPE_FIX,event_t(0));
+  }
+  __aicore__ inline int64_t KVBase(int64_t t) {
+    int64_t query=group+(t/kvCount)*GROUPS, head=query/(sq/Q), batch=head/HQ;
+    return (batch*HKV+(head%HQ)/(HQ/HKV))*sk*D+(t%kvCount)*K*D;
+  }
+  __aicore__ inline void QK(int64_t t) {
+    if(t%kvCount==0) {
+      Take<HardEvent::MTE1_MTE2>(q1Free,6);
+      GmToL1<Q,D>(q1,gq[(group+(t/kvCount)*GROUPS)*Q*D],D);
+      SetFlag<HardEvent::MTE2_MTE1>(event_t(6));
+      Take<HardEvent::M_MTE1>(qaFree,Q_CREDIT);
+      WaitFlag<HardEvent::MTE2_MTE1>(event_t(6)); ToA(qa,q1);
+      Give<HardEvent::MTE1_MTE2>(q1Free,6);
+    }
+    const int64_t base=KVBase(t);
+    for(int step=0;step<CHUNKS+3;++step) {
+      if(step<CHUNKS) {
+        int slot=step%2;
+        Take<HardEvent::MTE1_MTE2>(kFree[slot],slot);
+        GmToL1<C,D>(k1[slot*C*D],gk[base+step*C*D],D);
+        SetFlag<HardEvent::MTE2_MTE1>(event_t(slot));
+      }
+      if(step>=2 && step-2<CHUNKS) {
+        int chunk=step-2,slot=chunk%2;
+        WaitFlag<HardEvent::MTE1_M>(event_t(0));
+        Take<HardEvent::FIX_M>(cFree[slot],slot);
+        Mad(c0[slot*Q*C],qa,kb,true);
+        Give<HardEvent::M_MTE1>(kbFree,K_CREDIT);
+        if(chunk==CHUNKS-1 && t%kvCount==kvCount-1) Give<HardEvent::M_MTE1>(qaFree,Q_CREDIT);
+        SetFlag<HardEvent::M_FIX>(event_t(slot));
+      }
+      if(step>=1 && step-1<CHUNKS) {
+        int chunk=step-1, slot=chunk%2;
+        Take<HardEvent::M_MTE1>(kbFree,K_CREDIT);
+        WaitFlag<HardEvent::MTE2_MTE1>(event_t(slot));
+        ToB(kb,k1[slot*C*D],true);
+        Give<HardEvent::MTE1_MTE2>(kFree[slot],slot);
+        SetFlag<HardEvent::MTE1_M>(event_t(0));
+      }
+      if(step>=3 && step-3<CHUNKS) {
+        int chunk=step-3,slot=chunk%2;
+        if(chunk==0 && t>=2) CrossCoreWaitFlag<2>(SCORE_FREE);
+        WaitFlag<HardEvent::M_FIX>(event_t(slot));
+        Export(gs[(t%2)*Q*K+chunk*C],c0[slot*Q*C],K);
+        Give<HardEvent::FIX_M>(cFree[slot],slot);
+      }
+    }
+    CrossCoreSetFlag<2,PIPE_FIX>(SCORE_READY);
+  }
+  __aicore__ inline void PV(int64_t t) {
+    // This gate follows the complete next-QK dispatch, as required by the policy.
+    CrossCoreWaitFlag<2>(P_READY);
+    int64_t base=KVBase(t);
+    for(int step=0;step<CHUNKS+2;++step) {
+      if(step<CHUNKS) {
+        int slot=step%2;
+        Take<HardEvent::MTE1_MTE2>(pFree[slot],2+slot);
+        GmToL1<Q,C>(p1[slot*Q*C],gp[(t%2)*Q*K+step*C],K);
+        if(step==CHUNKS-1 && t+2<total) CrossCoreSetFlag<2,PIPE_MTE2>(P_FREE);
+        SetFlag<HardEvent::MTE2_MTE1>(event_t(2+slot));
+        Take<HardEvent::MTE1_MTE2>(vFree[slot],4+slot);
+        GmToL1<C,D>(v1[slot*C*D],gv[base+step*C*D],D);
+        SetFlag<HardEvent::MTE2_MTE1>(event_t(4+slot));
+      }
+      if(step>=2 && step-2<CHUNKS) {
+        int chunk=step-2;
+        WaitFlag<HardEvent::MTE1_M>(event_t(1));
+        if(chunk==0) Take<HardEvent::FIX_M>(cFree[0],0);
+        Mad(c0,pa,vb,chunk==0);
+        Give<HardEvent::M_MTE1>(pvOperandFree,PV_CREDIT);
+      }
+      if(step>=1 && step-1<CHUNKS) {
+        int chunk=step-1,slot=chunk%2;
+        Take<HardEvent::M_MTE1>(pvOperandFree,PV_CREDIT);
+        WaitFlag<HardEvent::MTE2_MTE1>(event_t(2+slot)); ToA(pa,p1[slot*Q*C]);
+        Give<HardEvent::MTE1_MTE2>(pFree[slot],2+slot);
+        WaitFlag<HardEvent::MTE2_MTE1>(event_t(4+slot)); ToB(vb,v1[slot*C*D],false);
+        Give<HardEvent::MTE1_MTE2>(vFree[slot],4+slot);
+        SetFlag<HardEvent::MTE1_M>(event_t(1));
+      }
+    }
+    SetFlag<HardEvent::M_FIX>(event_t(0));
+    if(t>=2) CrossCoreWaitFlag<2>(PV_FREE);
+    WaitFlag<HardEvent::M_FIX>(event_t(0));
+    Export(gpv[(t%2)*Q*D],c0,D);
+    Give<HardEvent::FIX_M>(cFree[0],0);
+    CrossCoreSetFlag<2,PIPE_FIX>(PV_READY);
+  }
+  __aicore__ inline void Run() {
+    for(int64_t step=0;step<total+1;++step) {
+      if(step<total) QK(step);
+      if(step>=1 && step-1<total) PV(step-1);
+    }
+    // Consume only actual outstanding local credits; no per-query/child drain.
+    Take<HardEvent::MTE1_MTE2>(q1Free,6);
+    Take<HardEvent::M_MTE1>(qaFree,Q_CREDIT);
+    Take<HardEvent::M_MTE1>(kbFree,K_CREDIT);
+    Take<HardEvent::M_MTE1>(pvOperandFree,PV_CREDIT);
+    for(int s=0;s<2;++s) {
+      Take<HardEvent::MTE1_MTE2>(kFree[s],s);
+      Take<HardEvent::MTE1_MTE2>(pFree[s],2+s);
+      Take<HardEvent::MTE1_MTE2>(vFree[s],4+s);
+      Take<HardEvent::FIX_M>(cFree[s],s);
+    }
+    PipeBarrier<PIPE_ALL>();
+  }
+};
+
+template<int WIDTH, bool SUBTRACT>
+__aicore__ inline void RowBinary(LocalTensor<float> dst,LocalTensor<float> src,LocalTensor<float> br) {
+  BinaryRepeatParams p(1,1,0,8,8,0);
+  for(int r=0;r<R;++r) {
+    if constexpr(SUBTRACT) Sub(dst[r*WIDTH],src[r*WIDTH],br[r*8],64,WIDTH/64,p);
+    else Mul(dst[r*WIDTH],src[r*WIDTH],br[r*8],64,WIDTH/64,p);
+  }
+}
+template<ReduceType KIND>
+__aicore__ inline void RowReduce(LocalTensor<float> dst,LocalTensor<float> src,LocalTensor<float> tmp) {
+  ReduceRepeat<KIND>(tmp,src,64,R*K/64,1,1,8,ReduceOrder::ORDER_ONLY_VALUE);
+  FenceV();
+  ReduceRepeat<KIND>(dst,tmp,K/64,R,1,1,K/64/8,ReduceOrder::ORDER_ONLY_VALUE);
+}
+class VectorAttention {
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> storage;
+  LocalTensor<float> sin,work,pvin,m,l,o,alpha,partial,nextm,sum,ones,inverse,sbr,obr;
+  LocalTensor<Element> pout,oout;
+  GlobalTensor<float> gs,gpv;
+  GlobalTensor<Element> gp,go;
+  bool sinFree[2]={false,false},pinFree[2]={false,false},poutFree[2]={false,false},outFree[2]={false,false};
+  int64_t sq,group,lane,kvCount,total;
+public:
+  __aicore__ inline void Init(__gm__ uint8_t* score,__gm__ uint8_t* prob,__gm__ uint8_t* pv,
+      __gm__ uint8_t* output,int64_t qs,int64_t ks) {
+    sq=qs; group=get_block_idx(); lane=GetSubBlockIdx(); kvCount=ks/K;
+    int64_t queries=B*HQ*(sq/Q);
+    total=(queries>group ? (queries-1-group)/GROUPS+1 : 0)*kvCount;
+    constexpr int floats=2*R*K+R*K+2*R*D+ROWS+ROWS+ROWS*D+2*ROWS+R*K/64+4*R+2*R*8;
+    constexpr int halves=2*R*K+2*R*D;
+    static_assert(floats*4+halves*2<=192*1024);
+    pipe.InitBuffer(storage,floats*4+halves*2);
+    auto f=storage.Get<float>(); int i=0;
+    sin=f[i];i+=2*R*K; work=f[i];i+=R*K; pvin=f[i];i+=2*R*D;
+    m=f[i];i+=ROWS; l=f[i];i+=ROWS; o=f[i];i+=ROWS*D; alpha=f[i];i+=2*ROWS;
+    partial=f[i];i+=R*K/64; nextm=f[i];i+=R; sum=f[i];i+=R; ones=f[i];i+=R;
+    inverse=f[i];i+=R; sbr=f[i];i+=R*8; obr=f[i];
+    auto h=storage.Get<Element>(); pout=h[floats*2]; oout=h[floats*2+2*R*K];
+    gs.SetGlobalBuffer((__gm__ float*)score+group*2*Q*K+lane*ROWS*K);
+    gpv.SetGlobalBuffer((__gm__ float*)pv+group*2*Q*D+lane*ROWS*D);
+    gp.SetGlobalBuffer((__gm__ Element*)prob+group*2*Q*K+lane*ROWS*K);
+    go.SetGlobalBuffer((__gm__ Element*)output);
+  }
+  __aicore__ inline void Softmax(int64_t t) {
+    CrossCoreWaitFlag<2>(SCORE_READY);
+    if(t%kvCount==0) { FenceV(); Duplicate(m,-__builtin_inff(),ROWS); Duplicate(l,0.0f,ROWS); }
+    for(int step=0;step<ROWS/R+2;++step) {
+      if(step<ROWS/R) {
+        int s=step%2;
+        Take<HardEvent::V_MTE2>(sinFree[s],s);
+        DataCopy(sin[s*R*K],gs[(t%2)*Q*K+step*R*K],R*K);
+        if(step==ROWS/R-1 && t+2<total) CrossCoreSetFlag<2,PIPE_MTE2>(SCORE_FREE);
+        SetFlag<HardEvent::MTE2_V>(event_t(s));
+      }
+      if(step>=1 && step-1<ROWS/R) {
+        int row=step-1,s=row%2,r=row*R;
+        WaitFlag<HardEvent::MTE2_V>(event_t(s));
+        FenceV(); Muls(work,sin[s*R*K],SCALE,R*K);
+        Give<HardEvent::V_MTE2>(sinFree[s],s);
+        FenceV(); RowReduce<ReduceType::MAX>(nextm,work,partial);
+        FenceV(); Max(nextm,m[r],nextm,R);
+        FenceV(); Sub(alpha[(t%2)*ROWS+r],m[r],nextm,R);
+        Brcb(sbr,nextm,1,BrcbRepeatParams(1,8));
+        FenceV(); Exp(alpha[(t%2)*ROWS+r],alpha[(t%2)*ROWS+r],R);
+        RowBinary<K,true>(work,work,sbr);
+        // Bit-preserving copy of the current maximum, via int32 vector Adds(0).
+        Adds(m[r].ReinterpretCast<int32_t>(),nextm.ReinterpretCast<int32_t>(),int32_t(0),R);
+        FenceV(); Exp(work,work,R*K);
+        Mul(l[r],l[r],alpha[(t%2)*ROWS+r],R);
+        FenceV(); RowReduce<ReduceType::SUM>(sum,work,partial);
+        FenceV(); Add(l[r],l[r],sum,R);
+        Take<HardEvent::MTE3_V>(poutFree[s],s);
+        Cast(pout[s*R*K],work,RoundMode::CAST_RINT,R*K);
+        SetFlag<HardEvent::V_MTE3>(event_t(s));
+      }
+      if(step>=2 && step-2<ROWS/R) {
+        int row=step-2,s=row%2;
+        if(row==0 && t>=2) CrossCoreWaitFlag<2>(P_FREE);
+        WaitFlag<HardEvent::V_MTE3>(event_t(s));
+        DataCopy(gp[(t%2)*Q*K+row*R*K],pout[s*R*K],R*K);
+        Give<HardEvent::MTE3_V>(poutFree[s],s);
+      }
+    }
+    CrossCoreSetFlag<2,PIPE_MTE3>(P_READY);
+  }
+  __aicore__ inline void Update(int64_t t) {
+    CrossCoreWaitFlag<2>(PV_READY);
+    bool last=t%kvCount==kvCount-1;
+    if(t%kvCount==0) { FenceV(); Duplicate(o,0.0f,ROWS*D); }
+    for(int step=0;step<ROWS/R+2;++step) {
+      if(step<ROWS/R) {
+        int s=step%2;
+        Take<HardEvent::V_MTE2>(pinFree[s],2+s);
+        DataCopy(pvin[s*R*D],gpv[(t%2)*Q*D+step*R*D],R*D);
+        if(step==ROWS/R-1 && t+2<total) CrossCoreSetFlag<2,PIPE_MTE2>(PV_FREE);
+        SetFlag<HardEvent::MTE2_V>(event_t(2+s));
+      }
+      if(step>=1 && step-1<ROWS/R) {
+        int row=step-1,s=row%2,r=row*R;
+        WaitFlag<HardEvent::MTE2_V>(event_t(2+s));
+        FenceV(); Brcb(obr,alpha[(t%2)*ROWS+r],1,BrcbRepeatParams(1,8));
+        FenceV(); RowBinary<D,false>(o[r*D],o[r*D],obr);
+        FenceV(); Add(o[r*D],o[r*D],pvin[s*R*D],R*D);
+        if(last) {
+          Duplicate(ones,1.0f,R); FenceV(); Div(inverse,ones,l[r],R);
+          FenceV(); Brcb(obr,inverse,1,BrcbRepeatParams(1,8));
+          FenceV(); RowBinary<D,false>(pvin[s*R*D],o[r*D],obr);
+          Take<HardEvent::MTE3_V>(outFree[s],2+s);
+          FenceV(); Cast(oout[s*R*D],pvin[s*R*D],RoundMode::CAST_RINT,R*D);
+          SetFlag<HardEvent::V_MTE3>(event_t(2+s));
+        }
+        Give<HardEvent::V_MTE2>(pinFree[s],2+s);
+      }
+      if(last && step>=2 && step-2<ROWS/R) {
+        int row=step-2,s=row%2;
+        WaitFlag<HardEvent::V_MTE3>(event_t(2+s));
+        int64_t global=group+(t/kvCount)*GROUPS;
+        DataCopy(go[global*Q*D+lane*ROWS*D+row*R*D],oout[s*R*D],R*D);
+        Give<HardEvent::MTE3_V>(outFree[s],2+s);
+      }
+    }
+  }
+  __aicore__ inline void Run() {
+    for(int64_t step=0;step<total+2;++step) {
+      if(step>=2 && step-2<total) Update(step-2);
+      if(step>=1 && step-1<total) Softmax(step-1);
+    }
+    for(int s=0;s<2;++s) {
+      Take<HardEvent::V_MTE2>(sinFree[s],s);
+      Take<HardEvent::V_MTE2>(pinFree[s],2+s);
+      Take<HardEvent::MTE3_V>(poutFree[s],s);
+      Take<HardEvent::MTE3_V>(outFree[s],2+s);
+    }
+    PipeBarrier<PIPE_ALL>();
+  }
+};
+
+extern "C" __global__ __mix__(1,2) void attention_reference(__gm__ uint8_t* q,
+    __gm__ uint8_t* k,__gm__ uint8_t* v,__gm__ uint8_t* o,__gm__ uint8_t* score,
+    __gm__ uint8_t* p,__gm__ uint8_t* pv,int64_t sq,int64_t sk) {
+  set_ctrl(get_ctrl() | (uint64_t(1)<<48));
+  if ASCEND_IS_AIC { CubeAttention kernel; kernel.Init(q,k,v,score,p,pv,sq,sk); kernel.Run(); }
+  if ASCEND_IS_AIV { VectorAttention kernel; kernel.Init(score,p,pv,o,sq,sk); kernel.Run(); }
+}
+extern "C" int launch_attention_reference(void* stream,void* q,void* k,void* v,void* o,
+    void* score,void* p,void* pv,int64_t sq,int64_t sk) {
+  constexpr int64_t limit=(INT64_MAX-64)/(B*HQ*D*4);
+  if(sq<0 || sk<=0 || sq%Q || sk%K || sq>limit || sk>limit) return -1;
+  if(sq/Q && sk/K > (INT64_MAX-2)/(B*HQ*(sq/Q))) return -1;
+  attention_reference<<<GROUPS,nullptr,stream>>>((uint8_t*)q,(uint8_t*)k,(uint8_t*)v,(uint8_t*)o,
+      (uint8_t*)score,(uint8_t*)p,(uint8_t*)pv,sq,sk);
+  return 0;
+}

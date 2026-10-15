@@ -151,7 +151,10 @@ with T.Stage(0, name="qk"), T.Cube():
     if kv == 0:
         T.copy(Q[query, :, :], q1)
         T.copy(q1, qa)
-    for chunk in T.Pipelined(BK // CK, stages=4):
+    for chunk in T.Pipelined(
+        BK // CK, stages=4,
+        issue_order={"cube": ("load_k", "native_qk", "operand_k", "export")},
+    ):
         with T.Stage(0, name="load_k"):
             T.copy(K[kv, chunk, :, :], k1[chunk % 2, :, :])
         with T.Stage(1, name="operand_k"):
@@ -165,6 +168,11 @@ with T.Stage(0, name="qk"), T.Cube():
 此处地址为分块示意，真实BNSD例必须使用保持原layout的views，不能靠隐式输入
 packing成立。child退出不drain，不自动把父PV插入child循环。若需要这样的
 穿插，要明确改变执行政策；不得为追求重叠暗中改变固定源码组织。
+
+这里的L0B只有一槽，所以每step必须先派发旧块MAD，再装下一块operand；
+否则Stage1的新写先于Stage2的旧读，同步会形成等待环。原目标fixture遗漏了
+这项内层policy，现已显式修正。增加第二份L0B会超过该配置的分配预算，不能
+用扩buffer隐瞒问题。PV的单槽L0A/L0B有相同约束。
 
 边界必须保留真实首读/末写/未退休reader和未消费event。`init; child; use`在
 child=0时让use读取init；多reader的cache覆写等全部reader而非最后派发者。

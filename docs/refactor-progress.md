@@ -1,5 +1,33 @@
 # 重构的验证记录
 
+## P0独立AscendC参考与真实政策反例
+
+在`e954087`后补齐[独立FA参考](attention-reference.md)：完整BK1024 online
+softmax、CK128 Cube、VR8 Vector、连续跨query流、明确的local/cross ready和
+release。它只在examples，不调用编译器FA构造或同步器。新AST FA仍未接通。
+
+实现参考时发现fixture内层单槽L0的实际issue顺序不可行：下一operand覆盖在旧
+MAD之前。目标源码现显式将旧MAD放到下一operand前，原默认顺序保留为负例；
+没有扩buffer或自动改序。这说明源码fixture的容量/语法检查不足以验证政策。
+
+相关75项CPU/IR/实际C++控制trace回归通过（11.03秒），Ruff通过。trace使用
+测试头执行实际C++控制，有限case各16个随机FIFO退休次序；不模拟数值或完整
+byte effects，不冒充最终同步证明。离线/shared CANN编译成功。
+
+物理1→逻辑0完成FP16单组、BF16多组GQA的完整小例，包括空query/空owner、
+跨query、K=1及7个KV块；标准输入误差分别≤3.05176e-5、≤2.44141e-4。
+BF16 sharp输入最大绝对误差0.00390625，在预先固定rtol0.01/atol0.001内。
+输入和所有GM guards保持完整，没有设备错误/reset/换卡。
+
+B1/Hq32/Hkv8/Sq=Sk8192/D128 bf16大例全部33,554,432输出finite，每head每query
+块采样6行最大误差1.22070e-4。首批warmup5/repeats30的profile p50=18.641612 ms；
+条件Cube下界3.72827 ms（20核/1.8GHz/8192 ops假设），有效吞吐约58.98 TFLOP/s。
+这是独立参考的单批基线，未比较新生成代码或ACLNN，不表示性能目标已完成；
+没有恢复调参。GM请求36.64 GB不是HBM流量，AIV activity0.672也不是瓶颈证明。
+
+证据在外层`runs/refactor/attention-reference/`，详细配置、限制和复现命令见
+参考文档。P0参考已落地；下一步P1a继续actor绑定/区域入口收敛与父体init/use。
+
 ## 方案再审：以be957e8保存点为实现基线
 
 按当前请求重写[设计](design.md)、[DSL规格](dsl-multistage.md)和

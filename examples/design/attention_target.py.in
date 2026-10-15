@@ -59,7 +59,10 @@ def attention_target(
                 if kv == 0:
                     N.copy(Q[batch, head, query_row:query_row + BQ, :], q1)
                     N.copy(q1, qa)
-                for chunk in N.Pipelined(BK // CK, stages=4):
+                for chunk in N.Pipelined(
+                    BK // CK, stages=4,
+                    issue_order={"cube": ("load_k", "qk_native", "operand_k", "export_score")},
+                ):
                     j = kv * BK + chunk * CK
                     with N.Stage(0, name="load_k"):
                         N.copy(K[batch, kv_head, j:j + CK, :], k1[chunk % 2, :, :])
@@ -98,7 +101,10 @@ def attention_target(
                     with N.Stage(2, name="export_p"):
                         N.copy(p_out[row % 2, :, :], P[group, s, g:g + VR, :])
             with N.Stage(1, name="pv"), N.Cube():
-                for chunk in N.Pipelined(BK // CK, stages=3):
+                for chunk in N.Pipelined(
+                    BK // CK, stages=3,
+                    issue_order={"cube": ("load_pv", "pv_native", "operand_pv")},
+                ):
                     j = kv * BK + chunk * CK
                     with N.Stage(0, name="load_pv"):
                         N.copy(P[group, s, :, chunk * CK:(chunk + 1) * CK], p1[chunk % 2, :, :])

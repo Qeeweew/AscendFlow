@@ -66,8 +66,10 @@ UB静态总量由测试直接读取源码分配表达式计算，必须≤192KiB
 AIV容量相加。这个检查仅证明声明容量，不证明布局、异步复用或代码性能。
 三个GM工作区声明为未初始化的可写分配；后续读必须来自实际writer，不预授权入口值。
 
-QK内层保留4stage load/operand/MAD/FIX；PV保留3stage累加子流水，循环外只做
-一次FIX。Vector按8行保留load/compute/store子流水。原生K/V按BNSD直接读，
+QK内层保留4stage load/operand/MAD/FIX，实际issue_order为load/MAD/operand/FIX；
+PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做一次FIX。
+旧fixture遗漏内层order，单槽L0 operand会在旧MAD派发前被下一代覆盖；已修正并
+增加负例，没有扩大buffer。Vector按8行保留load/compute/store子流水。K/V按BNSD直接读，
 没有预转置、GM packing或全形状Score/P矩阵。
 
 ## 缺口映射与实际拒绝
@@ -88,8 +90,9 @@ QK内层保留4stage load/operand/MAD/FIX；PV保留3stage累加子流水，循�
 不在受支持索引子集中。测试要求明确失败，不把fixture解析成功当作FA编译通过。
 解决一个诊断后还要检查整个表，不应通过缩小任务域或隐藏调用跳过其他缺口。
 
-**P0尚未全部完成**：目标源码/激活/声明资源已固定，独立同policy AscendC源码及
-数值对照仍需落地；没有新AST FA的CANN或设备结果。P1已接通根部local顺序区域
+**P0独立参考已落地**：[AscendC参考及证据](attention-reference.md)覆盖手排控制、
+小例完整数值、8K大例采样/profile及条件硬件下界；没有新AST FA的CANN或设备
+结果，参考性能也未达到最终目标。P1已接通根部local顺序区域
 的同步、代码生成和设备例，但父体组合及本fixture所需mixed层次仍缺，见
 [区域组合](region-sequence.md)。最新实施次序以[重构方案](refactor-plan.md)为准。
 

@@ -6,7 +6,7 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 2026-10-14对照保存点 `be957e8` 重写了[总体设计](docs/design.md)、
 [DSL 前端与 CV 多阶段规格](docs/dsl-multistage.md)和[重构计划](docs/refactor-plan.md)。
 新计划分别验收语言表达、编译成本和最终机器执行；规则跨query连续CV流水
-进入本轮范围，动态任务队列另行扩展。下一步补齐独立FA参考，收敛区域lowering
+进入本轮范围，动态任务队列另行扩展。独立FA参考已补齐；下一步收敛区域lowering
 入口，并提前检验连续流的query/task代次与编译规模，再接通层次CV和真实FA。
 受限 AST 已接通单循环 Vector、运行时原始
 长度与精确对齐尾部；
@@ -15,6 +15,9 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 
 新的[FA目标源码](docs/attention-target.md)已将嵌套/连续两种组织、真实online
 数学及声明存储固定在examples，仍是明确拒绝编译的设计fixture。
+[独立AscendC参考](docs/attention-reference.md)已完成小例数值、8K大例采样/profile
+及硬件下界分析；同时发现并修正fixture的单槽L0派发顺序。参考不代表新AST FA
+已经可运行，首批性能也不是最终竞争目标。
 [顺序区域组合](docs/region-sequence.md)已接通根部单actor的普通工作、多个流水、
 真实初始化与异步出口协议。[state_sum](examples/ast_state_sum.py)有1 GiB设备例
 及独立AscendC/profile证据，冷源码→ASC p50约0.185秒。父serial体一般组合、
