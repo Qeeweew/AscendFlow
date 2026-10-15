@@ -73,6 +73,7 @@ def native_line(task, count, core="0", *, uniform_names=None, scalar=None):
             ("GM", "UB"): "asc_copy_gm2ub",
             ("UB", "GM"): "asc_copy_ub2gm",
             ("GM", "L1"): "asc_copy_gm2l1",
+            ("UB", "UB"): "asc_copy_ub2ub",
         }.get(route)
         if function:
             return f"{function}({p[1]}, {p[0]}, uint32_t({length(refs[0])}));"

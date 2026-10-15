@@ -289,6 +289,40 @@ class Program:
         )
 
 
+def _disjoint_ub_copy(source: Ref, destination: Ref):
+    """Prove disjoint contiguous operands without a memmove assumption.
+
+    Different physical UB allocations are separate. For two views of one
+    allocation, equal translations leave a constant relative displacement;
+    this remains valid for every generation, owner and runtime count. Other
+    aliases require a stronger native overlap contract and are rejected.
+    """
+    if source.storage != destination.storage:
+        return True
+
+    def translation(ref):
+        generation, core = {}, {}
+        for _, stride, modulus, divisor in ref.terms:
+            key = modulus, divisor
+            generation[key] = generation.get(key, 0) + stride
+        for stride, divisor, modulus in ref.core_terms:
+            key = modulus, divisor
+            core[key] = core.get(key, 0) + stride
+        return (
+            {key: stride for key, stride in generation.items() if stride},
+            {key: stride for key, stride in core.items() if stride},
+            ref.count_offset,
+            ref.count_core_stride,
+        )
+
+    displacement = sum(term[0] for term in destination.terms) - sum(
+        term[0] for term in source.terms
+    )
+    return (
+        translation(source) == translation(destination) and abs(displacement) >= source.total_nbytes
+    )
+
+
 def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...]):
     if native in {"load3d_a", "load3d_b_nn"}:
         # Complete b16 matrix, unit filters/strides, zero padding. Layout and
@@ -308,6 +342,7 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             ("GM", "L1"): "MTE2",
             ("L1", "L0A"): "MTE1",
             ("L1", "L0B"): "MTE1",
+            ("UB", "UB"): "V",
         }
         require(banks in routes, f"unsupported dav-2201 DMA route {banks}; no hidden GM staging")
         require(not params, "copy has no unchecked native parameters")
@@ -324,6 +359,18 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             require(
                 lengths[0] % 32 == 0 and 0 < lengths[0] <= 65535 * 32,
                 "raw DMA footprint must be positive, 32-byte aligned and fit burst length",
+            )
+        if banks == ("UB", "UB"):
+            # CANN 9.1/2201 asc_copy_ub2ub uses copy_ubuf_to_ubuf on PIPE_V.
+            # Its size is bytes, divided by 32 into a uint16_t burst length.
+            require(
+                all(ref.prefix_extent is None and not ref.tail_nbytes for ref in refs),
+                "UB-to-UB copy requires fixed complete 32-byte blocks",
+            )
+            require(
+                _disjoint_ub_copy(*refs),
+                "UB-to-UB copy requires provably disjoint source and destination ranges; "
+                "overlapping or changing aliases are unsupported",
             )
         return routes[banks], ("R", "W")
     if native == "copy_rows":
