@@ -9,7 +9,8 @@
 专家排步与未来自动排步进入同一个物理访问和完成关系模型。自动同步优先，
 性能通过最终 ASC、CANN 产物及设备 profiling 验证。
 
-现有源码入口已经统一，但 loop、invocation、sequence 仍各自组织完成关系查询。
+现有源码入口已经统一，region/call 共用增量关系查询与同步选择；叶流水的规划
+和层次控制适配尚未统一。
 继续按程序形状增加证明器，会把组合问题变成不断增加特例。下一次重构要替换
 重复的语义和查询职责，而不是增加第四个形状分支或只把文件搬进同一个目录。
 
@@ -73,6 +74,18 @@ ready、read-retired、release/credit、notification-consumed、最终 drain 具
 分支保留条件，空循环是恒等路径；循环携带访问不能被局部出口吞掉。摘要不能
 把所有 reader 压成一个 child-done，也不能把“父调用串行”当作 CV 的全局事实。
 
+当前 serial region/call 的具体实现：`RegionCompletion` 一次建立真实端点索引，
+按 scope、pipe 和 milestone 限定 native 候选；`CompletionPaths` 按源端点和
+条件域保存可恢复的可达前沿。`sequence_plan.select_bridges` 查询已有覆盖，只为
+差集生成协议，并把确定的边加入前沿。新增边只唤醒已经到达它源端点的查询；
+未选择的候选不能给其他候选提供证明。合并同端点的等价条件后再分配 event ID。
+最终 verifier 从实际 IR 重新建分析，不继承规划阶段的前沿。
+
+这借鉴了 TileLang `AnalyzeNodeList` 的层次组织，以及 `OptimizeSyncPoints`
+先查覆盖、保留必要边后增量加入 `DepClosure` 的顺序。没有移植其有界距离全闭包、
+特殊协议重试或跨层时钟投影；当前单 count/serial adapter 也不因此具备一般 CV
+能力。候选的消费端/最后 reader 优先次序是一种选择政策，不保证同步全局最少。
+
 例：双缓冲输入 `x[i%2]` 需要
 
 ```text
@@ -119,6 +132,13 @@ serial 调用的词法顺序优化只有在域确实串行时可用，不能推�
 密集别名可能产生 O(A²) 个冲突；条件投影、关系组合和 event 分配也可能昂贵。
 不宣称整个算法线性。独立周期按实际耦合分量分析，不取所有 ring 的全局 LCM。
 缓存按不可变关系与分析 revision 建立，失效规则明确；不能靠热缓存掩盖冷路径。
+
+当前增量查询不再因每次加入 bridge 重建端点池和整条搜索。新增边的传播只访问
+已经到达源端点的前沿；不同目标可以复用同源、同条件域的搜索。它仍可能为多个
+源维护不同前沿，同一 scope 内仍有端点两两 native 证明，条件差集也会产生片段。
+因此不能宣称整体线性，或仅凭重构断言冷编译变快。报告中的 completion sites、
+frontiers、expansions、native relation checks 是最终验证阶段计数，耗时测量另行
+包含规划与最终验证两者。
 
 验收同时测模板/关系 pieces/节点/边/查询/重建/访问数、RSS 和五个冷进程时间。
 保留循环的常量界 1024 与 1048576 不应导致结构计数按次数增长；整数位数成本

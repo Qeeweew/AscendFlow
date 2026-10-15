@@ -7,7 +7,15 @@ from math import lcm
 
 import pytest
 
-from xdsl_npu.completion import CountDomain, Position, Site, covered_path
+from xdsl_npu.completion import (
+    CountDomain,
+    Position,
+    Site,
+    covered_path,
+    covers,
+    intersection,
+    uncovered,
+)
 
 
 def site(name, *, call=0, point="end"):
@@ -36,6 +44,41 @@ def test_steady_path_does_not_cover_zero_or_large_exact_boundary():
         assert not prove(
             a, b, {a: [(b, CountDomain(1, 0, minimum=n + 1))]}, CountDomain(1, 0, exact=n)
         )
+
+
+def test_uncovered_interval_size_is_independent_of_its_numeric_width():
+    required = CountDomain(1, 0, minimum=0)
+    for n in (1024, 1048576, 10**12):
+        missing = uncovered(required, (CountDomain(1, 0, minimum=n),))
+        assert missing == (CountDomain(1, 0, minimum=0, maximum=n - 1),)
+        assert not covers(required, missing)
+        assert intersection(missing[0], CountDomain(1, 0, minimum=n)) is None
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_bounded_differences_match_independent_membership(seed):
+    rng = random.Random(seed)
+    for _ in range(30):
+        domains = []
+        for _ in range(5):
+            p = rng.choice((1, 2, 3, 4))
+            minimum = rng.randrange(8)
+            domains.append(
+                CountDomain(
+                    p,
+                    rng.randrange(p),
+                    minimum=minimum,
+                    maximum=rng.choice((None, minimum + 2 * p)),
+                )
+            )
+        required, *guards = domains
+        missing = uncovered(required, guards)
+        outcomes = []
+        for n in range(48):
+            expected = required.contains(n) and not any(g.contains(n) for g in guards)
+            outcomes.append(expected)
+            assert any(d.contains(n) for d in missing) == expected
+        assert covers(required, guards) == (not any(outcomes))
 
 
 def test_continuous_cv_issue_relation_does_not_impose_serial_query_order():
@@ -80,3 +123,22 @@ def test_guarded_cycles_and_path_unions_match_finite_graph(seed):
         outcomes.append(expected)
         assert prove(nodes[0], nodes[-1], edges, CountDomain(1, 0, exact=count)) == expected
     assert prove(nodes[0], nodes[-1], edges) == all(outcomes)
+
+
+def test_canonical_predicate_intersection_matches_independent_finite_membership():
+    from itertools import product
+
+    from xdsl_npu.completion import canonical, intersection
+    from xdsl_npu.region_summary import CountDomain
+
+    domains = [
+        CountDomain(p, r, minimum=m) for p in (1, 2, 3, 5) for r in range(p) for m in (0, 1, 4)
+    ]
+    domains += [CountDomain(1, 0, exact=n) for n in (0, 1, 7)]
+    for a, b in product(domains, repeat=2):
+        result = intersection(canonical(a), canonical(b))
+        for n in range(32):
+            assert canonical(a).contains(n) == a.contains(n)
+            assert bool(result is not None and result.contains(n)) == (
+                a.contains(n) and b.contains(n)
+            )

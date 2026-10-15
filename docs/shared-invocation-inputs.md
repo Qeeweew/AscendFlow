@@ -91,7 +91,7 @@ requested GM速率约1523.88GB/s，不是HBM实测流量/带宽。输入跨调�
 在工作区根目录执行。设备前按全卡健康与占用选卡，以下物理1映射逻辑0：
 
 ```bash
-.venv/bin/python -m pytest -q compiler/tests/test_shared_invocation_inputs.py
+.venv/bin/python -m pytest -q compiler/tests/sync/test_shared_invocation_inputs.py
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/state/shared_inputs.py --entry shared_state_sum --trials 5 --output runs/refactor/shared-inputs/cold-recheck
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run_grouped --shared-inputs --output runs/refactor/shared-inputs/device --build
 PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.state.run_grouped --shared-inputs --output runs/refactor/shared-inputs/device --physical 1 --cases 16:2048 --warmup 5 --repeats 30 --skip-rounding-case --record runs/refactor/shared-inputs/device-large.json

@@ -164,7 +164,7 @@ def _domains(domain, period, maximum):
     return tuple(
         d
         for r in range(domain.residue, joint, domain.period)
-        if (d := CountDomain(joint, r, minimum=_first(domain)))
+        if (d := CountDomain(joint, r, minimum=_first(domain), maximum=domain.maximum))
         and (maximum is None or d.contains(maximum))
     )
 

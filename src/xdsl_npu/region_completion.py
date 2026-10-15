@@ -10,6 +10,7 @@ from dataclasses import replace
 
 from .budget import poll
 from .completion import (
+    CompletionPaths,
     CountDomain,
     LeafCompletion,
     Point,
@@ -18,8 +19,8 @@ from .completion import (
     Site,
     _first,
     canonical,
-    covered_path,
     covers,
+    uncovered,
 )
 from .model import require
 from .region_summary import Access, ReadSpan
@@ -265,7 +266,7 @@ class LeafRelations:
 class RegionCompletion:
     """Serial control adapter; overlapping CV must supply its own real issue edges."""
 
-    def __init__(self, sequence, analyses, requirements, *, calls=(0, 1), native=None):
+    def __init__(self, sequence, analyses, requirements, *, calls=(0, 1), native=None, bridges=()):
         self.sequence, self.analyses = sequence, analyses
         self.calls = calls
         self.leaves = native if native is not None else LeafRelations(sequence, analyses)
@@ -277,11 +278,14 @@ class RegionCompletion:
         self.required_marks = {m for r in self.requirements for m in (r.source, r.destination)}
         self.direct_cache, self.active_cache = self.leaves.direct_cache, self.leaves.active_cache
         self.capture_cache = self.leaves.capture_cache
-        self.node_cache, self.coverage_cache = {}, {}
         self.candidate_cache = {}
         self.neighbors = {}
         self.queries, self.visits = 0, 0
         self.order = {name: i for i, name in enumerate(sequence.regions)}
+        self.paths = CompletionPaths(self.successors, self.active)
+        self._index_nodes(bridges)
+        for bridge in bridges:
+            self.add_bridge(bridge)
         for dep in sequence.invocation_dependencies():
             access = dep.destination.access
             if isinstance(access, ReadSpan) and access.first != access.last:
@@ -339,8 +343,14 @@ class RegionCompletion:
             if not ordered:
                 return False
             strict = True
-        # FIFO starts/Wait consumption are not FIFO asynchronous completion.
-        if ordered and same_pipe and lp == rp == "begin":
+        # FIFO begins followed by a real native begin->end->prefix chain.
+        # This never promotes a source end/Set effect into a pipe fence.
+        if (
+            ordered
+            and same_pipe
+            and lp == "begin"
+            and (rp == "begin" or b.kind == "task" and rp in {"end", "prefix"})
+        ):
             return True
         if (
             strict
@@ -372,49 +382,68 @@ class RegionCompletion:
             return self.leaves.site_path(left.region, left, right, domain)
         return False
 
-    def nodes(self, bridges, source, destination):
-        lower = source.call, self.order[source.region]
-        upper = destination.call, self.order[destination.region]
-        key = (
-            tuple((b.source, b.destination, b.carried) for b in bridges),
-            lower,
-            upper,
-            None if source in self.required_marks else source,
-            None if destination in self.required_marks else destination,
-        )
-        if key in self.node_cache:
-            return self.node_cache[key]
-        values = {source, destination}
-        for requirement in self.requirements:
-            values.update((requirement.source, requirement.destination))
+    def _index_nodes(self, bridges):
+        # Candidate endpoints are known before selection. Adding a protocol
+        # changes edges, not the universe or identity of native milestones.
+        values = set(self.required_marks)
         for bridge in bridges:
-            for call in self.calls:
-                if call + int(bridge.carried) in self.calls:
-                    values.add(mark(self.sequence, bridge.source, "prefix", call))
-                    values.add(
-                        mark(self.sequence, bridge.destination, "begin", call + int(bridge.carried))
-                    )
-        # Expose native milestones behind real event endpoints; no done token.
+            values.update(
+                (
+                    mark(self.sequence, bridge.source, "prefix"),
+                    mark(self.sequence, bridge.destination, "begin"),
+                )
+            )
         for value in tuple(values):
             for point in ("begin", "end", "prefix"):
                 values.add(replace(value, point=point, channel="", action="", direct=None))
             if self.command(value).kind == "set":
                 values.add(replace(value, point="begin"))
-        # The same boundary shape is available in both symbolic calls.
         values |= {replace(value, call=call) for value in tuple(values) for call in self.calls}
-        # Every edge admitted by this *serial* adapter is monotone in
-        # (call, region). A path between these endpoints cannot visit scopes
-        # outside that interval. No iteration/generation bound is imposed.
-        values = {m for m in values if lower <= (m.call, self.order[m.region]) <= upper}
         require(len(values) <= 2048, "sequence call milestone budget exceeded")
-        result = (
-            len(self.node_cache),
-            tuple(sorted(values, key=lambda m: (m.call, self.order[m.region], repr(m)))),
+        self.nodes = frozenset(values)
+        self.scopes, self.begins, self.captures = (
+            defaultdict(list),
+            defaultdict(list),
+            defaultdict(list),
         )
-        self.node_cache[key] = result
-        return result
+        self.native_begins, self.event_begins = [], []
+        for value in sorted(values, key=lambda m: (m.call, self.order[m.region], repr(m))):
+            command = self.command(value)
+            self.scopes[value.call, value.region].append(value)
+            if value.point == "begin":
+                self.begins[command.task.pipe].append(value)
+                (self.native_begins if command.kind == "task" else self.event_begins).append(value)
+            if (
+                command.kind == "task"
+                and value.point == "prefix"
+                or command.kind == "set"
+                and value.point == "end"
+                or command.kind == "barrier"
+                and value.point == "begin"
+            ):
+                self.captures[command.task.pipe].append(value)
 
-    def covered(self, requirement, bridges):
+    def add_bridge(self, bridge):
+        for call in self.calls:
+            target_call = call + int(bridge.carried)
+            if target_call not in self.calls:
+                continue
+            source = mark(self.sequence, bridge.source, "prefix", call)
+            destination = mark(self.sequence, bridge.destination, "begin", target_call)
+            require(
+                source in self.nodes and destination in self.nodes,
+                "protocol endpoint absent from immutable completion index",
+            )
+            for domain in bridge.domains:
+                self.paths.add(source, destination, domain)
+
+    def covered(self, requirement):
+        return covers(requirement.domain, self.coverage(requirement))
+
+    def missing(self, requirement):
+        return uncovered(requirement.domain, self.coverage(requirement))
+
+    def coverage(self, requirement):
         self.queries += 1
         poll("sequence call paths", queries=self.queries, visits=self.visits)
         require(self.queries <= 20000, "sequence call coverage budget exceeded")
@@ -423,95 +452,58 @@ class RegionCompletion:
             requirement.destination,
             canonical(requirement.domain),
         )
-        key = source, destination, domain, tuple(bridges)
-        if key not in self.coverage_cache:
-            self.coverage_cache[key] = self._covered(source, destination, domain, bridges)
-        return self.coverage_cache[key]
+        require(
+            source in self.nodes and destination in self.nodes,
+            "completion query absent from immutable endpoint index",
+        )
+        if self.direct(source, destination, domain):
+            return (domain,)
+        return self.paths.coverage(source, destination, domain)
 
-    def _covered(self, source, destination, domain, bridges):
-        pool, nodes = self.nodes(bridges, source, destination)
-        edges = defaultdict(list)
-        for bridge in bridges:
-            for call in self.calls:
-                target_call = call + int(bridge.carried)
-                if target_call not in self.calls:
+    def successors(self, value, domain):
+        key = value, domain
+        if key not in self.neighbors:
+            successors = []
+            source_domains = self.activation(value, domain)
+            for candidate in self.candidates(value):
+                self.visits += 1
+                if self.visits % 512 == 0:
+                    poll("region completion milestones", visits=self.visits, nodes=len(self.nodes))
+                require(self.visits <= 2_000_000, "region completion path-state budget exceeded")
+                if candidate == value:
                     continue
-                a = mark(self.sequence, bridge.source, "prefix", call)
-                b = mark(self.sequence, bridge.destination, "begin", target_call)
-                edges[a].extend((b, canonical(guard)) for guard in bridge.domains)
+                for source_domain in source_domains:
+                    for guard in self.activation(candidate, source_domain):
+                        if self.direct(value, candidate, guard):
+                            successors.append((candidate, guard))
+            self.neighbors[key] = tuple(successors)
+        return self.neighbors[key]
 
-        def successors(value, active):
-            # A native path covering this whole predicate finishes this branch;
-            # do not materialize all sibling pairs before trying the target.
-            if self.direct(value, destination, active):
-                return ((destination, active),)
-            key = pool, value, active
-            if key not in self.neighbors:
-                successors = []
-                source_domains = self.activation(value, active)
-                for candidate in self.candidates(pool, nodes, value):
-                    self.visits += 1
-                    if self.visits % 512 == 0:
-                        poll("region completion milestones", visits=self.visits, nodes=len(nodes))
-                    require(
-                        self.visits <= 2_000_000, "region completion path-state budget exceeded"
-                    )
-                    if candidate == value:
-                        continue
-                    for source_domain in source_domains:
-                        for guard in self.activation(candidate, source_domain):
-                            if self.direct(value, candidate, guard):
-                                successors.append((candidate, guard))
-                self.neighbors[key] = tuple(successors)
-            return self.neighbors[key]
+    def candidates(self, source):
+        """Index admissible relation kinds; _direct still proves every edge.
 
-        return covered_path(source, destination, domain, edges, successors, self.active)
-
-    def candidates(self, pool, nodes, source):
-        """Exclude impossible cross-region relation kinds before graph queries.
-
-        Same-leaf pairs still use the complete guarded leaf proof. Across
-        regions/calls, _direct can only use FIFO begins, native retirement
-        captures, or a later native's real incoming capture. This is an
-        overapproximation of those cases, never a new completion edge.
+        Same-leaf relations use the real leaf graph. Cross-scope relations can
+        only use FIFO begins, actual retirement captures, and native incoming
+        captures. Scope identity alone never supplies a completion edge.
         """
-        a, lp = self.command(source), source.point
-        key = pool, source.call, source.region, a.kind, lp, a.task.pipe
-        if key in self.candidate_cache:
-            return self.candidate_cache[key]
-        self.visits += len(nodes)
-        require(self.visits <= 2_000_000, "sequence call path-state budget exceeded")
-        poll("sequence call candidate indexing", visits=self.visits, nodes=len(nodes))
-        result = []
-        for target in nodes:
-            if source.call == target.call and source.region == target.region:
-                result.append(target)
-                continue
-            if (source.call, self.order[source.region]) >= (target.call, self.order[target.region]):
-                continue
-            b, rp = self.command(target), target.point
-            same_pipe = a.task.pipe == b.task.pipe
-            if (
-                same_pipe
-                and lp == rp == "begin"
-                or a.kind == "task"
-                and lp in {"end", "prefix"}
-                and (
-                    rp == "begin"
-                    and (b.kind == "task" or lp == "end" and a.task.pipe == "S")
-                    or same_pipe
-                    and (
-                        b.kind == "task"
-                        and rp == "prefix"
-                        or b.kind == "set"
-                        and rp == "end"
-                        or b.kind == "barrier"
-                        and rp == "begin"
-                    )
+        command = self.command(source)
+        key = source.call, source.region, command.kind, source.point, command.task.pipe
+        if key not in self.candidate_cache:
+            later = []
+            if source.point == "begin":
+                later.extend(self.begins[command.task.pipe])
+            if command.kind == "task" and source.point in {"end", "prefix"}:
+                later.extend(self.native_begins)
+                later.extend(self.captures[command.task.pipe])
+                if source.point == "end" and command.task.pipe == "S":
+                    later.extend(self.event_begins)
+            rank = source.call, self.order[source.region]
+            local = self.scopes[source.call, source.region]
+            self.candidate_cache[key] = tuple(
+                dict.fromkeys(
+                    [*local, *(m for m in later if rank < (m.call, self.order[m.region]))]
                 )
-            ):
-                result.append(target)
-        self.candidate_cache[key] = tuple(result)
+            )
         return self.candidate_cache[key]
 
 

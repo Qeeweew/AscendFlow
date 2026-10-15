@@ -118,6 +118,7 @@ def _domains(entries):
             continue
         for cell in cells:
             d = cell.domain
+            require(d.maximum is None, "bounded child transfer summaries are not yet supported")
             require(d.period > 0 and 0 <= d.residue < d.period, "invalid child count domain")
             if d.exact is not None:
                 require(d.exact >= 0, "negative exact child domain")

@@ -30,6 +30,8 @@ def region_boundary(checked, region):
                 conditions.append(f"npu_sequence_count == {domain.exact}")
             else:
                 terms = [f"npu_sequence_count >= {domain.minimum}"]
+                if domain.maximum is not None:
+                    terms.append(f"npu_sequence_count <= {domain.maximum}")
                 if domain.period != 1:
                     terms.append(f"npu_sequence_count % {domain.period} == {domain.residue}")
                 conditions.append(" && ".join(terms))

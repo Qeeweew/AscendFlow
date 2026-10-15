@@ -8,12 +8,12 @@ activation and has a distinct bank/ID lifetime in this initial allocator.
 """
 
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from .budget import poll
-from .completion import Point, intersection
+from .completion import Point
 from .ir import LoopSyncOp, RegionChannelOp, RegionSyncOp, TaskOp
 from .loop_boundary import stream_operations
 from .loop_sync import _plan_leaf, _verify_leaf
@@ -21,7 +21,6 @@ from .model import optional_int, require
 from .periodic import bounded_period
 from .region_completion import (
     RegionCompletion,
-    _before,
     _data,
     _point,
     _task,
@@ -30,16 +29,7 @@ from .region_completion import (
 )
 from .region_summary import CountDomain, Position, allocation
 from .sequence_model import extract_sequence
-
-
-@dataclass(frozen=True)
-class Bridge:
-    source: Point
-    destination: Point
-    domains: tuple[CountDomain, ...]
-    event_id: int
-    name: str = ""
-    carried: bool = False
+from .sequence_plan import Bridge, Candidate, domain_row, select_bridges
 
 
 @dataclass(frozen=True)
@@ -47,14 +37,6 @@ class CheckedSequence:
     sequence: object
     analyses: dict
     bridges: tuple[Bridge, ...]
-
-
-def _domain_row(d):
-    return (
-        (1, 0, d.exact, 0)
-        if d.exact is not None
-        else (d.period, d.residue, -1, d.period if d.minimum is None else d.minimum)
-    )
 
 
 def _requirements(sequence):
@@ -75,106 +57,39 @@ def _plan_boundaries(sequence, analyses, banks):
     requirements = _requirements(sequence)
     queries = tuple(memory_requirement(sequence, *r) for r in requirements)
     proof = RegionCompletion(sequence, analyses, queries, calls=(0,))
-    proposals = []
-    for source, destination, domain, _ in _requirements(sequence):
-        poll("sequence boundary proposals", proposals=len(proposals))
-        if proof.leaves.inherited(source, destination, domain):
-            continue
-        sp, dp = _task(sequence, source).pipe, _task(sequence, destination).pipe
-        found = False
-        for i, (old_source, old_dest, old_domain) in enumerate(proposals):
-            if (
-                old_domain != domain
-                or old_dest.region != destination.region
-                or _task(sequence, old_dest).pipe != dp
-            ):
-                continue
-            if old_source != source and not (sp == dp == _task(sequence, old_source).pipe):
-                continue
-            if _before(sequence, old_dest, destination, domain):
-                found = True
-                break
-            if _before(sequence, destination, old_dest, domain):
-                proposals[i] = (source, destination, domain)
-                found = True
-                break
-        if not found:
-            proposals.append((source, destination, domain))
-    grouped = {}
-    for source, destination, domain in proposals:
-        grouped.setdefault((source, destination), set()).add(domain)
-    result = []
-    for (source, destination), domains in grouped.items():
-        sp, dp = _task(sequence, source).pipe, _task(sequence, destination).pipe
-        result.append(
-            Bridge(
-                source,
-                destination,
-                tuple(sorted(domains, key=_domain_row)),
-                -1 if sp == dp else 0,
-                f"region_c{len(result)}",
-            )
+    # Select actual releases before ready edges targeting the same region.
+    # Earlier destination regions establish the context for later transfers.
+    # Only already selected protocols may justify coverage: no circular
+    # reliance on other candidates that might themselves be omitted.
+    order = proof.order
+
+    def consumer_issue(point):
+        task = _task(sequence, point)
+        generation = -1 - point.position.offset if point.position.end else point.position.offset
+        tasks = _data(sequence, point.region).program.tasks
+        return point.position.end, generation + task.stage, task.issue_order, tasks.index(task)
+
+    ordered = sorted(
+        requirements,
+        key=lambda r: (
+            order[r[1].region],
+            consumer_issue(r[1]),
+            r[3].hazard != "WAR",
+            -order[r[0].region],
+            _task(sequence, r[0]).pipe == _task(sequence, r[1]).pipe,
+            repr(r[:3]),
+        ),
+    )
+    candidates = [
+        Candidate(
+            memory_requirement(sequence, source, destination, domain, obligation),
+            source,
+            destination,
         )
-    requirements = _requirements(sequence)
-    for candidate in reversed(tuple(result)):
-        remaining = [b for b in result if b is not candidate]
-        if all(
-            proof.leaves.inherited(s, d, domain)
-            or proof.covered(memory_requirement(sequence, s, d, domain, obligation), remaining)
-            for s, d, domain, obligation in requirements
-        ):
-            result = remaining
-    # Zero iterations are a structural path, not one sample of the steady
-    # state. A notification needed only on that path must not gate nonempty
-    # work. Split this one boundary symbolically; never enumerate N or widen a
-    # buffer. Every removal is checked against all original memory obligations.
-    positive = CountDomain(1, 0, minimum=1)
-    for candidate in tuple(result):
-        pieces = []
-        for domain in candidate.domains:
-            if domain.exact is None and domain.contains(0):
-                pieces.append(CountDomain(1, 0, exact=0))
-                rest = intersection(domain, positive)
-                if rest is not None:
-                    pieces.append(rest)
-            else:
-                pieces.append(domain)
-        if tuple(pieces) == candidate.domains:
-            continue
-        changed = False
-        for piece in reversed(tuple(pieces)):
-            trimmed = tuple(p for p in pieces if p != piece)
-            replacement = [replace(candidate, domains=trimmed)] if trimmed else []
-            remaining = [b for b in result if b is not candidate] + replacement
-            if all(
-                proof.leaves.inherited(s, d, domain)
-                or proof.covered(memory_requirement(sequence, s, d, domain, obligation), remaining)
-                for s, d, domain, obligation in requirements
-            ):
-                pieces = list(trimmed)
-                changed = True
-        if changed:
-            result = [b for b in result if b is not candidate]
-            if pieces:
-                result.append(replace(candidate, domains=tuple(sorted(pieces, key=_domain_row))))
-    actor = next(iter(next(iter(sequence.regions.values())).actors))
-    assigned = []
-    for bridge in result:
-        if bridge.event_id >= 0:
-            sp, dp = _task(sequence, bridge.source).pipe, _task(sequence, bridge.destination).pipe
-            key = actor, sp, dp
-            reserved = int(
-                (sp, dp) == ("S", "FIX") and _data(sequence, bridge.source.region).program.config
-            )
-            event_id = max(banks[key], reserved)
-            require(
-                event_id < 8,
-                f"{key}: sequential event bank exhausted; no whole-region fence fallback",
-            )
-            banks[key] = event_id + 1
-            bridge = replace(bridge, event_id=event_id)
-        assigned.append(bridge)
-    return assigned, proof.leaves
+        for source, destination, domain, obligation in ordered
+        if not proof.leaves.inherited(source, destination, domain)
+    ]
+    return select_bridges(sequence, proof, candidates, banks), proof.leaves
 
 
 def _install(sequence, bridges):
@@ -198,7 +113,7 @@ def _install(sequence, bridges):
                 "destination_end": IntAttr(int(d.position.end)),
                 "destination_offset": IntAttr(d.position.offset),
                 "domains": ArrayAttr(
-                    ArrayAttr(IntAttr(n) for n in _domain_row(g)) for g in bridge.domains
+                    ArrayAttr(IntAttr(n) for n in domain_row(g)) for g in bridge.domains
                 ),
                 "event_id": IntAttr(bridge.event_id),
                 **({"carried": IntAttr(1)} if bridge.carried else {}),
@@ -274,17 +189,24 @@ def _read_bridges(sequence, analyses):
         )
         domains = []
         for row in op.domains:
-            require(len(row) == 4, "region count predicate needs four integers")
-            p, r, exact, minimum = (v.data for v in row)
+            require(len(row) in (4, 5), "region count predicate needs four or five integers")
+            p, r, exact, minimum = (v.data for v in row.data[:4])
+            maximum = row.data[4].data if len(row) == 5 else None
             bounded_period(p, "region count predicate")
             require(
                 0 <= r < p
                 and exact >= -1
                 and minimum >= 0
-                and (exact == -1 or (p, r, minimum) == (1, 0, 0)),
+                and (exact == -1 or (p, r, minimum) == (1, 0, 0))
+                and (maximum is None or exact == -1 and maximum >= minimum),
                 "invalid region count predicate",
             )
-            domains.append(CountDomain(p, r, exact if exact >= 0 else None, minimum))
+            domain = CountDomain(p, r, exact if exact >= 0 else None, minimum, maximum)
+            require(
+                maximum is None or minimum + (r - minimum) % p <= maximum,
+                "empty bounded region predicate",
+            )
+            domains.append(domain)
         require(domains and len(set(domains)) == len(domains), "empty/duplicate region activation")
         require(
             all(_valid_point(sequence, point, domain) for point in points for domain in domains),
@@ -370,17 +292,15 @@ def verify_sequence(module, *, _details=False):
     forward = tuple(b for b in bridges if not b.carried)
     requirements = _requirements(sequence)
     queries = tuple(memory_requirement(sequence, *r) for r in requirements)
-    proof = RegionCompletion(sequence, analyses, queries, calls=(0,))
+    proof = RegionCompletion(sequence, analyses, queries, calls=(0,), bridges=forward)
     inherited = 0
-    for source, destination, domain, obligation in _requirements(sequence):
+    for source, destination, domain, obligation in requirements:
         poll("sequence boundary coverage", obligations=len(sequence.summary.obligations))
         if proof.leaves.inherited(source, destination, domain):
             inherited += 1
             continue
         require(
-            proof.covered(
-                memory_requirement(sequence, source, destination, domain, obligation), forward
-            ),
+            proof.covered(memory_requirement(sequence, source, destination, domain, obligation)),
             f"missing sequence {obligation.hazard}: {source} -> {destination}, "
             f"{allocation(obligation.storage).sym_name.data}[{obligation.start}:{obligation.stop}]",
         )
@@ -398,6 +318,10 @@ def verify_sequence(module, *, _details=False):
         "proof_domain_states": sum(a[3].domain_states for a in analyses.values()),
         "proof_path_queries": sum(a[3].path_queries for a in analyses.values()),
         "sequence_boundary_coverage_queries": proof.queries,
+        "sequence_completion_sites": len(proof.nodes),
+        "sequence_completion_frontiers": len(proof.paths.frontiers),
+        "sequence_completion_expansions": proof.paths.expansions,
+        "sequence_native_relation_checks": proof.visits,
         "event_ids": banks,
         "runtime_parameters": [
             p.sym_name.data for p in next(iter(sequence.regions.values())).parameters

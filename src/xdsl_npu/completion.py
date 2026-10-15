@@ -23,6 +23,7 @@ class CountDomain:
     residue: int
     exact: int | None = None
     minimum: int | None = None
+    maximum: int | None = None
 
     def contains(self, count):
         return (
@@ -31,6 +32,7 @@ class CountDomain:
             else (
                 count >= (self.period if self.minimum is None else self.minimum)
                 and count % self.period == self.residue
+                and (self.maximum is None or count <= self.maximum)
             )
         )
 
@@ -117,7 +119,9 @@ def canonical(domain):
     return (
         CountDomain(1, 0, exact=domain.exact)
         if domain.exact is not None
-        else CountDomain(domain.period, domain.residue, minimum=_first(domain))
+        else CountDomain(
+            domain.period, domain.residue, minimum=_first(domain), maximum=domain.maximum
+        )
     )
 
 
@@ -137,11 +141,14 @@ def intersection(left, right):
         else ((right.residue - left.residue) // divisor * pow(left.period // divisor, -1, other))
         % other
     )
-    return CountDomain(
+    maxima = [d.maximum for d in (left, right) if d.maximum is not None]
+    result = CountDomain(
         period,
         (left.residue + left.period * shift) % period,
         minimum=max(_first(left), _first(right)),
+        maximum=min(maxima) if maxima else None,
     )
+    return result if result.maximum is None or _first(result) <= result.maximum else None
 
 
 def covers(required, guards):
@@ -152,14 +159,75 @@ def covers(required, guards):
         return True
     if required.exact is not None:
         return any(g.contains(required.exact) for g in guards)
+    return next(_uncovered(required, guards), None) is None
+
+
+def uncovered(required, guards):
+    """Exact symbolic difference; interval width never controls enumeration."""
+    guards = tuple(guards)
+    if required in guards:
+        return ()
+    if required.exact is not None:
+        return () if any(g.contains(required.exact) for g in guards) else (required,)
+    return tuple(_uncovered(required, guards))
+
+
+def coalesce(domains):
+    """Join adjacent pieces of the same residue class without filling holes."""
+    items = list(dict.fromkeys(canonical(d) for d in domains))
+    changed = True
+    while changed:
+        changed = False
+        for i, a in enumerate(items):
+            for j in range(i + 1, len(items)):
+                b = items[j]
+                merged = None
+                if a.exact is not None or b.exact is not None:
+                    single, family = (a, b) if a.exact is not None else (b, a)
+                    n = single.exact
+                    if family.contains(n):
+                        merged = family
+                    elif family.exact is None and n % family.period == family.residue:
+                        if n + family.period == _first(family):
+                            merged = replace(family, minimum=n)
+                        elif family.maximum is not None:
+                            last = (
+                                family.maximum - (family.maximum - family.residue) % family.period
+                            )
+                            if last + family.period == n:
+                                merged = replace(family, maximum=n)
+                elif (a.period, a.residue) == (b.period, b.residue):
+                    first, second = (a, b) if _first(a) <= _first(b) else (b, a)
+                    if first.maximum is None or first.maximum + first.period >= _first(second):
+                        maximum = (
+                            None
+                            if a.maximum is None or b.maximum is None
+                            else max(a.maximum, b.maximum)
+                        )
+                        merged = replace(first, maximum=maximum)
+                if merged is not None:
+                    items[i] = merged
+                    items.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+    return tuple(items)
+
+
+def _uncovered(required, guards):
     # Membership is constant per residue between threshold/exact boundaries.
     # Never enumerate up to a large integer boundary such as one million.
     period = required.period
     cuts = {_first(required)}
+    if required.maximum is not None:
+        cuts.add(required.maximum + 1)
     for guard in guards:
         if guard.exact is None:
             period = bounded_period(lcm(period, guard.period), "region activation coverage")
             cuts.add(guard.period if guard.minimum is None else guard.minimum)
+            if guard.maximum is not None:
+                cuts.add(guard.maximum + 1)
         else:
             cuts.update((guard.exact, guard.exact + 1))
     cuts = sorted(c for c in cuts if c >= _first(required))
@@ -172,8 +240,13 @@ def covers(required, guards):
                 and required.contains(n)
                 and not any(g.contains(n) for g in guards)
             ):
-                return False
-    return True
+                last = None if upper is None else upper - 1
+                if required.maximum is not None:
+                    last = required.maximum if last is None else min(last, required.maximum)
+                if last is not None and n + period > last:
+                    yield CountDomain(1, 0, exact=n)
+                else:
+                    yield CountDomain(period, r, minimum=n, maximum=last)
 
 
 class LeafCompletion:
@@ -374,40 +447,79 @@ class LeafCompletion:
         return self.monotonic[cache_key]
 
 
-def covered_path(source, destination, domain, edges, successors, active):
-    """Prove a whole predicate by composing native and guarded edges.
+class CompletionPaths:
+    """Demand-driven, monotone conditional reachability in one analysis snapshot.
 
-    A path carries the intersection of *all* its guards. Distinct paths may
-    cover different parts of the requested domain; neither an existential
-    path nor an endpoint's matching residue suffices. Successors are native
-    relations paired with the predicate on which the adapter proves them.
+    Native successors are immutable. Only accepted protocol edges may be added;
+    deleting or replacing a protocol requires a new snapshot. Each (source,
+    predicate) has a resumable frontier shared by all destination queries.
+    Adding an edge wakes only frontiers that have reached its source, including
+    ones whose earlier query returned no path. No speculative edge participates
+    in another candidate's coverage proof.
     """
-    domain = canonical(domain)
-    if source == destination:
-        return active(source, domain)
-    reached = defaultdict(list)
-    pending = deque([(source, domain)])
-    visits = 0
-    while pending:
-        value, guard = pending.popleft()
-        visits += 1
-        if visits % 256 == 0:
-            poll("conditional completion paths", visits=visits)
-        require(visits <= 2_000_000, "conditional completion path-state budget exceeded")
-        if covers(guard, reached[value]):
-            continue
-        reached[value].append(guard)
-        if value == destination:
-            if covers(domain, reached[value]):
-                return True
-            continue
-        for candidate, predicate in chain(successors(value, guard), edges.get(value, ())):
-            overlap = intersection(guard, predicate)
-            if overlap is not None and active(value, overlap) and active(candidate, overlap):
-                if candidate == destination:
-                    reached[destination].append(overlap)
-                    if covers(domain, reached[destination]):
-                        return True
-                    continue
-                pending.append((candidate, overlap))
-    return covers(domain, reached[destination])
+
+    def __init__(self, successors, active):
+        self.successors, self.active = successors, active
+        self.edges = defaultdict(list)
+        self.frontiers = {}
+        self.users = defaultdict(set)
+        self.expansions = 0
+        self.updates = 0
+
+    def _reach(self, key, target, domain):
+        reached, pending = self.frontiers[key]
+        for missing in uncovered(domain, reached[target]):
+            reached[target].append(missing)
+            pending.append((target, missing))
+            self.users[target].add(key)
+
+    def _step(self, key, source, target, domain, predicate):
+        overlap = intersection(domain, predicate)
+        if overlap is not None and self.active(source, overlap) and self.active(target, overlap):
+            self._reach(key, target, overlap)
+
+    def add(self, source, target, domain):
+        domain = canonical(domain)
+        if (target, domain) in self.edges[source]:
+            return
+        self.edges[source].append((target, domain))
+        for key in tuple(self.users[source]):
+            self.updates += 1
+            for guard in tuple(self.frontiers[key][0][source]):
+                self._step(key, source, target, guard, domain)
+
+    def coverage(self, source, destination, domain):
+        domain = canonical(domain)
+        if source == destination:
+            return (domain,) if self.active(source, domain) else ()
+        key = source, domain
+        if key not in self.frontiers:
+            self.frontiers[key] = defaultdict(list), deque()
+            self._reach(key, source, domain)
+        reached, pending = self.frontiers[key]
+        while pending and not covers(domain, reached[destination]):
+            value, guard = pending.popleft()
+            self.expansions += 1
+            if self.expansions % 256 == 0:
+                poll("conditional completion paths", expansions=self.expansions)
+            require(
+                self.expansions <= 2_000_000, "conditional completion path-state budget exceeded"
+            )
+            for target, predicate in chain(
+                self.successors(value, guard), self.edges.get(value, ())
+            ):
+                self._step(key, value, target, guard, predicate)
+        return tuple(reached[destination])
+
+
+def covered_domains(source, destination, domain, edges, successors, active):
+    """One-shot query using the same guarded composition as incremental planning."""
+    paths = CompletionPaths(successors, active)
+    for value, items in edges.items():
+        for target, predicate in items:
+            paths.add(value, target, predicate)
+    return paths.coverage(source, destination, domain)
+
+
+def covered_path(source, destination, domain, edges, successors, active):
+    return covers(domain, covered_domains(source, destination, domain, edges, successors, active))

@@ -10,9 +10,9 @@ from dataclasses import replace
 
 from .completion import CountDomain, Requirement, Site
 from .model import require
-from .region_completion import RegionCompletion, _data, _point, _task, mark, position
+from .region_completion import RegionCompletion, _point, _task, mark, position
 from .region_summary import Access, summarize_local_events
-from .sequence_sync import Bridge, _domain_row
+from .sequence_plan import Candidate, select_bridges
 
 
 def memory_requirements(sequence):
@@ -93,10 +93,10 @@ def verify_calls(sequence, analyses, bridges, *, native=None):
         return {}
     memory = memory_requirements(sequence)
     events = event_requirements(sequence) + boundary_requirements(sequence, bridges)
-    proof = RegionCompletion(sequence, analyses, memory + events, native=native)
+    proof = RegionCompletion(sequence, analyses, memory + events, native=native, bridges=bridges)
     for requirement in memory + events:
         require(
-            proof.covered(requirement, bridges),
+            proof.covered(requirement),
             f"missing sequence invocation {requirement.reason}: {requirement.source} -> {requirement.destination}, {requirement.domain}",
         )
     return {
@@ -106,6 +106,9 @@ def verify_calls(sequence, analyses, bridges, *, native=None):
         "invocation_event_domains": len(events),
         "invocation_proof_queries": proof.queries,
         "invocation_path_visits": proof.visits,
+        "invocation_completion_sites": len(proof.nodes),
+        "invocation_completion_frontiers": len(proof.paths.frontiers),
+        "invocation_completion_expansions": proof.paths.expansions,
     }
 
 
@@ -113,8 +116,7 @@ def plan_calls(sequence, analyses, forward, banks, *, native=None):
     if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
         return []
     memory, events = memory_requirements(sequence), event_requirements(sequence)
-    proof = RegionCompletion(sequence, analyses, memory + events, native=native)
-    proposals = []
+    proof = RegionCompletion(sequence, analyses, memory + events, native=native, bridges=forward)
     # A late reader release often covers an earlier writer and several input
     # rings. Examine real cross-pipe WARs before manufacturing same-pipe fences.
     ordered = sorted(
@@ -127,45 +129,5 @@ def plan_calls(sequence, analyses, forward, banks, *, native=None):
             repr(r),
         ),
     )
-    for requirement in ordered:
-        if proof.covered(requirement, [*forward, *proposals]):
-            continue
-        source, destination = requirement.source.location, requirement.destination.location
-        sp, dp = _task(sequence, source).pipe, _task(sequence, destination).pipe
-        proposals.append(
-            Bridge(
-                source,
-                destination,
-                (requirement.domain,),
-                -1 if sp == dp else 0,
-                f"call_c{len(proposals)}",
-                True,
-            )
-        )
-    grouped = {}
-    for bridge in proposals:
-        key = bridge.source, bridge.destination, bridge.event_id
-        grouped.setdefault(key, set()).update(bridge.domains)
-    proposals = [
-        Bridge(s, d, tuple(sorted(domains, key=_domain_row)), event_id, f"call_c{i}", True)
-        for i, ((s, d, event_id), domains) in enumerate(grouped.items())
-    ]
-    for candidate in reversed(tuple(proposals)):
-        remaining = [b for b in proposals if b is not candidate]
-        if all(proof.covered(r, [*forward, *remaining]) for r in memory + events):
-            proposals = remaining
-    actor = next(iter(next(iter(sequence.regions.values())).actors))
-    assigned = []
-    for bridge in proposals:
-        if bridge.event_id >= 0:
-            sp, dp = _task(sequence, bridge.source).pipe, _task(sequence, bridge.destination).pipe
-            key = actor, sp, dp
-            reserved = int(
-                (sp, dp) == ("S", "FIX") and _data(sequence, bridge.source.region).program.config
-            )
-            event_id = max(banks[key], reserved)
-            require(event_id < 8, f"{key}: invocation event bank exhausted; no drain fallback")
-            banks[key] = event_id + 1
-            bridge = replace(bridge, event_id=event_id)
-        assigned.append(bridge)
-    return assigned
+    candidates = [Candidate(r, r.source.location, r.destination.location) for r in ordered]
+    return select_bridges(sequence, proof, candidates, banks, carried=True)

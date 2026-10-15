@@ -126,7 +126,7 @@ CSV hash、硬件平台及频率记录；`profiles/trial-*`保留全部样本、
 工作区根目录执行，设备前重新选择健康空闲卡，下例为physical1：
 
 ```bash
-.venv/bin/python -m pytest -q compiler/tests/test_sequence_invocations.py compiler/tests/test_sequence_sync.py
+.venv/bin/python -m pytest -q compiler/tests/sync/test_sequence_invocations.py compiler/tests/sync/test_sequence_sync.py
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run_grouped --output runs/refactor/parent-sequence --build
 PYTHONPATH=compiler ASCEND_RT_VISIBLE_DEVICES=1 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 .venv/bin/python -m benchmarks.state.run_grouped --output runs/refactor/parent-sequence --physical 1 --cases 16:128 --warmup 5 --repeats 30 --skip-rounding-case --record runs/refactor/parent-sequence/device-large.json
 ```

@@ -16,6 +16,7 @@
 - [当前状态](docs/refactor-progress.md)：实际支持、已知问题和验证结果。
 - [下一部分重构计划](docs/refactor-plan.md)：统一同步核心，接通真实 FA 的嵌套和连续 CV。
 - [性能工具](benchmarks/README.md)：AscendC/ACLNN、profiling、硬件指标和编译耗时。
+- [测试分层](tests/README.md)：关系算法、同步生成、最终 IR 破坏检查与有限执行模型。
 - [文档索引](docs/README.md)：详细合同与历史证据。
 
 ## 安装与一个可运行例子

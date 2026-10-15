@@ -1,40 +1,34 @@
 """Actual parent/child finite byte histories and event lifetimes, not planner witnesses."""
 
 import pytest
-from xdsl.dialects import scf
-from xdsl.dialects.builtin import IntAttr
 
 from examples.state.grouped import grouped_state_sum
-from tests.test_sequence_sync import finite_check
+from tests.models.local_sequence import finite_check
 from xdsl_npu import compile, verify_plan
-from xdsl_npu.ir import FrameOp, RegionChannelOp, RegionSyncOp, parse
-from xdsl_npu.model import CompileError
+from xdsl_npu.ir import RegionChannelOp, parse
 from xdsl_npu.performance import runtime_work
-
-
-@pytest.fixture(scope="module")
-def artifact():
-    return compile(grouped_state_sum.specialize(B=16, GROUPS=1))
 
 
 @pytest.mark.parametrize(
     "calls,count", [(0, 0), (0, 7), (1, 0), (3, 0), (1, 1), (3, 1), (2, 2), (3, 3), (2, 7), (3, 17)]
 )
-def test_actual_parent_sequence_bytes_and_binary_events(artifact, calls, count):
-    finite_check(artifact.plan, count, invocations=calls)
+def test_actual_parent_sequence_bytes_and_binary_events(grouped_artifact, calls, count):
+    finite_check(grouped_artifact.plan, count, invocations=calls)
 
 
-def test_parent_and_child_are_retained_and_zero_child_executes_init_use(artifact):
-    assert artifact.report["native_templates"] == 4
-    assert artifact.asc.count("for (int64_t") == 2
-    assert artifact.asc.count("asc_sync_pipe(PIPE_ALL)") == 1
-    assert "npu_invocation = 0; npu_invocation <" in artifact.asc
-    assert verify_plan(parse(artifact.plan_ir)) == artifact.report
-    carried = [o for o in artifact.plan.walk() if isinstance(o, RegionChannelOp) and o.carried]
+def test_parent_and_child_are_retained_and_zero_child_executes_init_use(grouped_artifact):
+    assert grouped_artifact.report["native_templates"] == 4
+    assert grouped_artifact.asc.count("for (int64_t") == 2
+    assert grouped_artifact.asc.count("asc_sync_pipe(PIPE_ALL)") == 1
+    assert "npu_invocation = 0; npu_invocation <" in grouped_artifact.asc
+    assert verify_plan(parse(grouped_artifact.plan_ir)) == grouped_artifact.report
+    carried = [
+        o for o in grouped_artifact.plan.walk() if isinstance(o, RegionChannelOp) and o.carried
+    ]
     assert len(carried) == 1
-    assert "PIPE_MTE3, PIPE_MTE2" in artifact.asc
+    assert "PIPE_MTE3, PIPE_MTE2" in grouped_artifact.asc
     for calls, count in [(0, 7), (3, 0), (2, 7), (1048576, 1048576)]:
-        work = runtime_work(artifact.plan, {"outputs": calls, "tiles": count})
+        work = runtime_work(grouped_artifact.plan, {"outputs": calls, "tiles": count})
         assert work["native_invocations"]["copy"] == calls * (count + 2)
         assert work["native_invocations"]["add"] == calls * count
         assert "tasks_per_invocation" not in work
@@ -47,47 +41,37 @@ def test_parent_and_child_are_retained_and_zero_child_executes_init_use(artifact
         )
 
 
-def test_missing_call_return_is_not_hidden_by_leaf_verification(artifact):
-    plan = artifact.plan
-    channel = next(o for o in plan.walk() if isinstance(o, RegionChannelOp) and o.carried)
-    for op in list(plan.walk()):
-        if isinstance(op, RegionSyncOp) and op.channel == channel.sym_name:
-            op.parent.erase_op(op)
-    channel.parent.erase_op(channel)
-    with pytest.raises(CompileError, match="missing sequence invocation"):
-        verify_plan(plan)
-
-
-def test_carried_guard_cannot_be_reinterpreted_as_forward_same_call(artifact):
-    plan = artifact.plan
-    channel = next(o for o in plan.walk() if isinstance(o, RegionChannelOp) and o.carried)
-    channel.attributes["carried"] = IntAttr(0)
-    with pytest.raises(CompileError, match="lexical dispatch order"):
-        verify_plan(plan)
-
-
-def test_real_parent_frame_coordinate_is_required(artifact):
-    plan = artifact.plan
-    parent = next(o for o in plan.walk() if isinstance(o, scf.ForOp))
-    frame = next(o for o in plan.walk() if isinstance(o, FrameOp))
-    frame.operands = (frame.source, parent.lb, frame.extent)
-    with pytest.raises(CompileError, match="actual root, invocation coordinate"):
-        verify_plan(plan)
-
-
-def test_notify_effect_does_not_fence_later_same_pipe_work(artifact):
+def test_notify_effect_does_not_fence_later_same_pipe_work(grouped_artifact):
     from xdsl_npu.completion import Site
     from xdsl_npu.region_completion import RegionCompletion, mark
     from xdsl_npu.region_summary import CountDomain, Position
     from xdsl_npu.sequence_sync import Point, verify_sequence
 
-    _, checked = verify_sequence(artifact.plan, _details=True)
+    _, checked = verify_sequence(grouped_artifact.plan, _details=True)
     seq = checked.sequence
     channel = next(c for c in checked.analyses["r1"][1].values() if c.distance == 0)
     source = Site(channel.sources[0], Position(False, 0), "end", channel.name, "set", region="r1")
     target = mark(seq, Point("r1", channel.sources[0][1], Position(False, 1)), "prefix")
     proof = RegionCompletion(seq, checked.analyses, ())
     assert not proof.direct(source, target, CountDomain(1, 0, exact=3))
+
+
+def test_fifo_begin_composition_matches_the_actual_native_graph(grouped_artifact):
+    from xdsl_npu.completion import CountDomain, Position, Site
+    from xdsl_npu.region_completion import RegionCompletion
+    from xdsl_npu.sequence_sync import verify_sequence
+
+    _, checked = verify_sequence(grouped_artifact.plan, _details=True)
+    proof = RegionCompletion(checked.sequence, checked.analyses, (), calls=(0,))
+    for region, leaf in proof.leaves.inside.items():
+        for a in leaf.native:
+            for b in leaf.native:
+                start = Site(a, Position(False, 0), "begin", region=region)
+                for point in ("begin", "end", "prefix"):
+                    target = Site(b, Position(False, 0), point, region=region)
+                    domain = CountDomain(1, 0, exact=3)
+                    if proof.direct(start, target, domain):
+                        assert leaf.prove(start, target, domain)
 
 
 def test_shared_stationary_frame_writes_compose_inside_the_actual_call():
@@ -123,37 +107,6 @@ def test_two_children_in_one_parent_share_real_storage_and_event_lifetimes():
         finite_check(result.plan, count, invocations=calls)
 
 
-def test_whole_last_reader_not_compute_completion_protects_state_reuse():
-    from dataclasses import replace
-
-    from xdsl_npu.ir import TaskOp
-
-    source = grouped_state_sum.source.replace(
-        "(GROUPS, outputs, tiles, B)", "(GROUPS, outputs, 1, B)"
-    )
-    source = source.replace("T.Pipelined(tiles,", "T.Pipelined(1,")
-    result = compile(replace(grouped_state_sum, source=source).specialize(B=16, GROUPS=1))
-    plan = result.plan
-    channel = next(o for o in plan.walk() if isinstance(o, RegionChannelOp) and o.carried)
-    add = next(o for o in plan.walk() if isinstance(o, TaskOp) and o.native.data == "add")
-    region = add.parent_op()
-    send = next(
-        o
-        for o in plan.walk()
-        if isinstance(o, RegionSyncOp) and o.channel == channel.sym_name and o.action.data == "set"
-    )
-    send.parent.detach_op(send)
-    add.parent.insert_op_after(send, add)
-    send.operands = (region.body.block.args[0],)
-    channel.attributes.update(
-        source_region=region.uid, source_task=add.uid, source_end=IntAttr(1), event_id=IntAttr(2)
-    )
-    with pytest.raises(CompileError, match="missing sequence invocation WAR"):
-        verify_plan(plan)
-    with pytest.raises(AssertionError):
-        finite_check(plan, 0, invocations=2)
-
-
 def test_parent_scalar_reader_is_retired_without_promoting_wait_to_completion():
     from dataclasses import replace
 
@@ -161,15 +114,15 @@ def test_parent_scalar_reader_is_retired_without_promoting_wait_to_completion():
         "T.copy(state, Output[group, output, :])",
         "T.copy(state, Output[group, output, :])\n            sample = T.load_scalar(state[0:1])",
     )
-    artifact = compile(replace(grouped_state_sum, source=source).specialize(B=16, GROUPS=1))
+    grouped_artifact = compile(replace(grouped_state_sum, source=source).specialize(B=16, GROUPS=1))
     for calls, count in [(2, 0), (2, 1), (3, 3)]:
-        finite_check(artifact.plan, count, invocations=calls)
+        finite_check(grouped_artifact.plan, count, invocations=calls)
     # An implicit Scalar completion must never reverse its own begin/end.
     from xdsl_npu.region_completion import RegionCompletion, mark
     from xdsl_npu.region_summary import CountDomain, Position
     from xdsl_npu.sequence_sync import Point, verify_sequence
 
-    _, checked = verify_sequence(artifact.plan, _details=True)
+    _, checked = verify_sequence(grouped_artifact.plan, _details=True)
     seq = checked.sequence
     task = next(
         t for d in seq.regions["r2"].actors.values() for t in d.program.tasks if t.pipe == "S"
@@ -177,25 +130,6 @@ def test_parent_scalar_reader_is_retired_without_promoting_wait_to_completion():
     p = Point("r2", task.uid, Position(False, 0))
     proof = RegionCompletion(seq, checked.analyses, ())
     assert not proof.direct(mark(seq, p, "end"), mark(seq, p, "begin"), CountDomain(1, 0, exact=1))
-
-
-def test_canonical_predicate_intersection_matches_independent_finite_membership():
-    from itertools import product
-
-    from xdsl_npu.completion import canonical, intersection
-    from xdsl_npu.region_summary import CountDomain
-
-    domains = [
-        CountDomain(p, r, minimum=m) for p in (1, 2, 3, 5) for r in range(p) for m in (0, 1, 4)
-    ]
-    domains += [CountDomain(1, 0, exact=n) for n in (0, 1, 7)]
-    for a, b in product(domains, repeat=2):
-        result = intersection(canonical(a), canonical(b))
-        for n in range(32):
-            assert canonical(a).contains(n) == a.contains(n)
-            assert bool(result is not None and result.contains(n)) == (
-                a.contains(n) and b.contains(n)
-            )
 
 
 def test_large_fixed_parent_and_child_do_not_expand_proof_windows():
