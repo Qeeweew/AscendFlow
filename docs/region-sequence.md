@@ -2,7 +2,7 @@
 
 本切片已从[精确访问组合](../src/xdsl_npu/region_sequence.py)接通根部单actor的
 普通工作→流水→普通工作，以及共享存储的多个兄弟流水。实现见
-[sequence_lowering](../src/xdsl_npu/sequence_lowering.py)、
+[公共区域lowering](../src/xdsl_npu/region_lowering.py)、
 [sequence_sync](../src/xdsl_npu/sequence_sync.py)与
 [sequence_codegen](../src/xdsl_npu/sequence_codegen.py)。这是受限的根部组合，
 不是任意层次region闭包。后续已接通严格frame下的serial父体init/多个child/use，

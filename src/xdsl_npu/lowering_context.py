@@ -7,7 +7,7 @@ allocation for the same source identity or joins separately constructed kernels.
 from math import prod
 
 from xdsl.dialects import arith
-from xdsl.dialects.builtin import IndexType, IntAttr, StringAttr
+from xdsl.dialects.builtin import IndexType, IntAttr
 
 from .builder import Kernel
 from .ir import FrameOp
@@ -143,10 +143,6 @@ class ActorBindings:
             op = record.op
             if not isinstance(op, MatmulOp) or op.a.type.memory.data != "L1":
                 continue
-            require(
-                program.attributes.get("frontend") != StringAttr("ast"),
-                "AST matmul requires explicit L0 operands; implicit L1 recipes are legacy",
-            )
             require(self.family == "cube", "matmul requires a Cube execution domain")
             if op not in self.operand_buffers:
                 dtype = op.a.type.dtype.data

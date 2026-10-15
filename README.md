@@ -27,6 +27,10 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 generated/独立AscendC批p50中位数为753.352/756.924μs，未观察到明显退化。
 一般GM ownership、跨region事件ID复用和mixed层次仍缺，不能由此推断FA达标。
 
+G1已将单流、父体、顺序组合和mixed单流的源码准入/actor构造统一到
+[region_lowering](src/xdsl_npu/region_lowering.py)，四个代表例ASC保持一致。
+物理边界和ownership继续收敛中，完整层次CV尚未接通。
+
 P1a已共享actor分配/标量绑定，并移除逐叶重复验证全IR的开销。同一32流静态
 压力样本的完整冷源码→ASC p50从2.188秒降到0.773秒，最终ASC和验证报告保持
 一致；普通state_sum为0.164秒。口径、复现及父体组合的新证据见

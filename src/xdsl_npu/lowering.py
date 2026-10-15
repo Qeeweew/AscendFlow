@@ -11,12 +11,12 @@ from dataclasses import dataclass
 from math import prod
 
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
+from xdsl.dialects.builtin import DictionaryAttr, IntAttr, StringAttr
 from xdsl.ir import Block, Region
 
 from .ir import BoundaryOp, EndOp
 from .lowering_context import ActorBindings
-from .mixed import compose, extract_mixed, global_dependencies
+from .mixed import extract_mixed, global_dependencies
 from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
 from .scalar import ARITHMETIC, expression, from_ssa, literal, prefix
 from .source_ir import (
@@ -31,7 +31,6 @@ from .source_ir import (
     ReduceOp,
     ScalarReadOp,
     ScaleOp,
-    SizeOp,
     StageOp,
     ViewOp,
     YieldOp,
@@ -518,7 +517,7 @@ class _Actor:
             prefix_elements=prefix_elements,
         )
 
-    def emit(self, *, finalize=True):
+    def emit(self):
         ranks = {
             id(record): rank
             for rank, record in enumerate(sorted(self.records, key=lambda r: r.order))
@@ -777,12 +776,7 @@ class _Actor:
         for block in boundaries.values():
             block.add_op(EndOp())
         self.kernel.task_block = stream_block
-        if finalize:
-            module = self.kernel.finish()
-            module.body.block.first_op.attributes["source_schedule"] = ArrayAttr(self.schedule)
-            return module
         self.kernel.finish_region()
-        return self.kernel.module
 
 
 def _tile_producer(value, outer):
@@ -968,86 +962,6 @@ def lower_source(module, *, symbolic=True):
         isinstance(program, ProgramOp) and len(list(module.body.block.ops)) == 1,
         "expected one typed source program",
     )
-    from .sequence_lowering import lower_sequence, needs_sequence
+    from .region_lowering import lower_regions
 
-    if needs_sequence(program):
-        require(symbolic, "sequential source regions require retained control")
-        return lower_sequence(program)
-    parents = [op for op in program.body.block.ops if isinstance(op, scf.ForOp)]
-    invocation = parents[0] if len(parents) == 1 else None
-    if parents:
-        require(
-            symbolic and invocation is not None and program.kind.data != "mixed",
-            "structured invocation lowering currently requires one local actor and parent",
-        )
-        require(
-            not invocation.iter_args
-            and not invocation.results
-            and all(isinstance(op, (PipelineOp, scf.YieldOp)) for op in invocation.body.block.ops),
-            "structured scf.for synchronization requires one child pipeline and no other effects/carry",
-        )
-    if program.attributes.get("frontend") == StringAttr("ast"):
-        for operation in program.walk():
-            if isinstance(operation, MatmulOp):
-                require(
-                    operation.a.type.memory.data == "L0A",
-                    "AST matmul requires explicit L0 operands; implicit L1 recipes are legacy",
-                )
-            require(
-                not isinstance(operation, scf.ForOp) or operation is invocation,
-                f"{operation.location}: structured {operation.name} synchronization is not "
-                "implemented; AST control flow is never silently expanded or discarded",
-            )
-            if isinstance(operation, PipelineOp):
-                require(
-                    operation.parent_op() is (program if invocation is None else invocation),
-                    "nested AST pipelines require hierarchical synchronization; "
-                    "constant bounds do not authorize implicit unrolling",
-                )
-    scope = program if invocation is None else invocation
-    pipelines = [op for op in scope.body.block.ops if isinstance(op, PipelineOp)]
-    require(len(pipelines) == 1, "source requires one continuous outer task stream")
-    require(
-        all(
-            isinstance(op, (AllocationOp, SizeOp, PipelineOp, YieldOp, arith.ConstantOp))
-            or op is invocation
-            or type(op) in ARITHMETIC
-            for op in program.body.block.ops
-        ),
-        "executable source work must belong to a task pipeline",
-    )
-    allocations = [op for op in program.walk() if isinstance(op, AllocationOp)]
-    pipeline = pipelines[0]
-    require(
-        symbolic or not any(isinstance(op, scf.IfOp) for op in pipeline.walk()),
-        "boundary regions require the symbolic compiler; no finite fallback",
-    )
-    if program.kind.data == "mixed":
-        actors = {
-            actor: _Actor(program, pipeline, actor, family, owner, allocations, symbolic)
-            for actor, family, owner in [
-                ("aic", "cube", 0),
-                ("aiv0", "vector", 0),
-                ("aiv1", "vector", 1),
-            ]
-        }
-        modules = [actor.emit() for actor in actors.values()]
-        physical = compose(
-            program.sym_name.data, *modules, disjoint_external=bool(program.disjoint_external.data)
-        )
-    else:
-        actors = {
-            program.kind.data: _Actor(
-                program,
-                pipeline,
-                program.kind.data,
-                program.kind.data,
-                0,
-                allocations,
-                symbolic,
-                invocation=invocation,
-            )
-        }
-        physical = next(iter(actors.values())).emit()
-    _check_values(physical, actors, pipeline)
-    return physical
+    return lower_regions(program, symbolic=symbolic)

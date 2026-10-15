@@ -1,5 +1,27 @@
 # 重构的验证记录
 
+## G1第一步：统一源码区域入口
+
+删除`needs_sequence/lower_sequence`及`lower_source`中的独立父体/单流actor构造，
+统一为[region_lowering](../src/xdsl_npu/region_lowering.py)。`SourceBody/SourceRegion`
+只引用原xDSL节点，不复制程序或按次数展开；一次结构准入后，共享actor绑定，
+遍历原语叶，再统一结束kernel和写source_schedule。原语emitter只结束本region。
+AST显式L0合同也在共同入口检查，删除绑定层的重复检查。
+
+现有local单流、serial父体、顺序组合与mixed单流共用源码入口。底层物理单流/
+sequence证明适配器暂保留；这不是G1全部完成，更不是一般层次CV已支持。
+跨调用共享只读GM及统一边界/ownership仍是下一项。
+
+第一组164项回归通过（49.99s），补充178项通过（44.25s），两组文件范围不同；
+包括legacy有限嵌套、AST禁止隐式展开、父体和两child、Cube、Scalar、prefix、
+预算与FA目标拒绝。新增负例确认有/无普通前置工作时都在native构造前拒绝AST
+嵌套展开，失败不改变输入IR；父体之外的真实工作不能被丢掉。Ruff通过。
+
+四例ASC保持原hash：state_sum、hierarchical_gemm、reduction_gemm和
+grouped_state_sum，复用相同CANN/设备证据。五次完整冷源码→ASC父体p50=0.87317s、
+max=0.87652s、RSS=38336KiB，与此前0.88045/0.88241s基本持平，不声称显著提速。
+原始计时和hash在`runs/refactor/parent-sequence/g1-cold`及`g1-hashes.json`。
+
 ## G0收尾：父体1GiB设备与三批profile
 
 修复父体工作量继承首个once的错误聚合字段，按region报告每次调用/每group任务数。
