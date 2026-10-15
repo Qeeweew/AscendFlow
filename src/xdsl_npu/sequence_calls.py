@@ -37,10 +37,12 @@ class Mark:
     call: int = 0
     _hash: int = field(init=False, repr=False, compare=False)
     point: Point = field(init=False, repr=False, compare=False)
+    local: tuple = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         object.__setattr__(self, "_hash", hash((self.region, self.site, self.call)))
         object.__setattr__(self, "point", Point(self.region, self.site.task[1], self.site.position))
+        object.__setattr__(self, "local", (self.region, self.site))
 
     def __hash__(self):
         return self._hash
@@ -104,7 +106,7 @@ def mark(sequence, point, milestone, call=0):
 
 def memory_requirements(sequence):
     result = []
-    for dep in sequence.summary.invocation_dependencies():
+    for dep in sequence.invocation_dependencies():
         # Invocation GM frames are distinct; these are actual reused local bytes.
         require(not dep.storage.owner.external.data, "call transfer includes unpartitioned GM")
         source = _point(sequence, dep.source, dep.domain, source=True)
@@ -183,10 +185,11 @@ class CallProof:
         self.required_marks = {m for r in self.requirements for m in (r.source, r.destination)}
         self.direct_cache, self.active_cache = {}, {}
         self.capture_cache, self.node_cache = {}, {}
+        self.candidate_cache = {}
         self.neighbors = {}
         self.queries, self.visits = 0, 0
         self.order = {name: i for i, name in enumerate(sequence.regions)}
-        for dep in sequence.summary.invocation_dependencies():
+        for dep in sequence.invocation_dependencies():
             access = dep.destination.access
             if isinstance(access, ReadSpan) and access.first != access.last:
                 require(
@@ -200,7 +203,9 @@ class CallProof:
         return self.leaves.inside[m.region].command(m.site)
 
     def active(self, m, domain):
-        key = m, domain
+        # Adjacent symbolic calls have identical leaf activation. Actual
+        # inter-call guards live on bridges, not these leaf milestones.
+        key = m.local, domain
         if key in self.active_cache:
             return self.active_cache[key]
         seq = self.sequence
@@ -229,12 +234,17 @@ class CallProof:
         return value
 
     def direct(self, left, right, domain):
-        key = left, right, domain
+        # Direct native/leaf relations depend on relative calls, never absolute
+        # p. Share their immutable query cache between p and p+1; bridge paths
+        # remain explicit and are checked separately for their guards.
+        key = left.local, right.local, right.call - left.call, domain
         if key not in self.direct_cache:
             self.direct_cache[key] = self._direct(left, right, domain)
         return self.direct_cache[key]
 
     def _direct(self, left, right, domain):
+        if (left.call, self.order[left.region]) > (right.call, self.order[right.region]):
+            return False
         if not self.active(left, domain) or not self.active(right, domain):
             return False
         if left == right:
@@ -358,7 +368,7 @@ class CallProof:
             key = pool, value, active
             if key not in self.neighbors:
                 successors = []
-                for candidate in nodes:
+                for candidate in self.candidates(pool, nodes, value):
                     self.visits += 1
                     if self.visits % 512 == 0:
                         poll("sequence call milestones", visits=self.visits, nodes=len(nodes))
@@ -378,6 +388,53 @@ class CallProof:
                 ):
                     pending.append((candidate, overlap))
         return _covers(domain, reached[destination])
+
+    def candidates(self, pool, nodes, source):
+        """Exclude impossible cross-region relation kinds before graph queries.
+
+        Same-leaf pairs still use the complete guarded leaf proof. Across
+        regions/calls, _direct can only use FIFO begins, native retirement
+        captures, or a later native's real incoming capture. This is an
+        overapproximation of those cases, never a new completion edge.
+        """
+        a, lp = self.command(source), source.site.point
+        key = pool, source.call, source.region, a.kind, lp, a.task.pipe
+        if key in self.candidate_cache:
+            return self.candidate_cache[key]
+        self.visits += len(nodes)
+        require(self.visits <= 2_000_000, "sequence call path-state budget exceeded")
+        poll("sequence call candidate indexing", visits=self.visits, nodes=len(nodes))
+        result = []
+        for target in nodes:
+            if source.call == target.call and source.region == target.region:
+                result.append(target)
+                continue
+            if (source.call, self.order[source.region]) >= (target.call, self.order[target.region]):
+                continue
+            b, rp = self.command(target), target.site.point
+            same_pipe = a.task.pipe == b.task.pipe
+            if (
+                same_pipe
+                and lp == rp == "begin"
+                or a.kind == "task"
+                and lp in {"end", "prefix"}
+                and (
+                    rp == "begin"
+                    and (b.kind == "task" or lp == "end" and a.task.pipe == "S")
+                    or same_pipe
+                    and (
+                        b.kind == "task"
+                        and rp == "prefix"
+                        or b.kind == "set"
+                        and rp == "end"
+                        or b.kind == "barrier"
+                        and rp == "begin"
+                    )
+                )
+            ):
+                result.append(target)
+        self.candidate_cache[key] = tuple(result)
+        return self.candidate_cache[key]
 
 
 def verify_calls(sequence, analyses, bridges):

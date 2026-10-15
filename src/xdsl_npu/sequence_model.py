@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from xdsl.dialects import scf
 
 from .ir import (
-    BufferOp,
     InvocationChannelOp,
     InvocationSyncOp,
     KernelOp,
@@ -17,7 +16,7 @@ from .ir import (
 from .loop_model import _extract_loop_after_verify, slope
 from .model import require, verify_translated_owners
 from .region_sequence import Part, summarize_sequence
-from .region_summary import summarize_reused_storage
+from .region_summary import allocation, summarize_reused_storage
 
 
 @dataclass(frozen=True)
@@ -27,6 +26,11 @@ class Sequence:
     live_in: dict
     summary: object
     invocation: object = None
+
+    def invocation_dependencies(self):
+        # These FrameOps came from extract_invocation's actual partition check.
+        fresh = () if self.invocation is None else tuple(f.op.ref for f in self.invocation.frames)
+        return self.summary.invocation_dependencies(fresh=fresh)
 
 
 def sequence_regions(kernel):
@@ -83,12 +87,6 @@ def extract_sequence(module):
                         writes.add(root)
     stationary = set()
     for root, accesses in refs.items():
-        if root in frame_roots:
-            require(
-                root not in writes or len(users[root]) == 1,
-                f"{root}: cross-region GM frame writes need a shared frame frontier",
-            )
-            continue
         fixed = all(
             not slope(ref)
             and not ref.count_offset
@@ -97,6 +95,17 @@ def extract_sequence(module):
             and root not in loop.frames
             for loop, ref, _ in accesses
         )
+        if root in frame_roots:
+            if root in writes and len(users[root]) > 1:
+                require(
+                    fixed,
+                    f"{root}: cross-region drifting GM frame access needs a translated frontier",
+                )
+                stationary.add(root)
+            # Native frame bounds plus the checked invocation partition prove
+            # different groups/calls disjoint. Same-call readers/writers still
+            # need the ordinary shared frontier; no implicit frame exit fence.
+            continue
         if fixed:
             stationary.add(root)
         elif len(users[root]) > 1:
@@ -130,11 +139,10 @@ def extract_sequence(module):
         parts.append(Part(name, summarize_reused_storage(loop, roots)))
     summary = summarize_sequence(parts)
     for cell in summary.cells:
-        allocation = cell.storage.owner
-        require(isinstance(allocation, BufferOp), "sequence summary lost allocation provenance")
+        root = allocation(cell.storage)
         require(
-            not cell.reads_before_write or allocation.external.data and allocation.initialized.data,
-            f"undefined sequence entry read on {allocation.sym_name.data}[{cell.start}:{cell.stop}] "
+            not cell.reads_before_write or root.external.data and root.initialized.data,
+            f"undefined sequence entry read on {root.sym_name.data}[{cell.start}:{cell.stop}] "
             f"in {tuple(r.region for r in cell.reads_before_write)}; empty child is identity",
         )
     # Do not accept a hidden declaration in an unrelated nested scope.

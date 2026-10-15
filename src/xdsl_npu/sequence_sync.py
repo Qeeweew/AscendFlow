@@ -20,7 +20,7 @@ from .loop_boundary import stream_operations
 from .loop_sync import _plan_leaf, _verify_leaf
 from .model import optional_int, require
 from .periodic import bounded_period
-from .region_summary import Access, CountDomain, Position
+from .region_summary import Access, CountDomain, Position, allocation
 from .sequence_model import extract_sequence
 
 
@@ -162,6 +162,7 @@ class BoundaryProof:
         self.sequence, self.analyses = sequence, analyses
         self.inside = {}
         self.cache = {}
+        self.site_cache = {}
         self.coverage_queries = 0
         for name, analysis in analyses.items():
             loop, _, commands, graph, _ = analysis
@@ -201,6 +202,15 @@ class BoundaryProof:
         )
 
     def site_path(self, region, left, right, domain):
+        constant = self.sequence.regions[region].constant_count
+        # A fixed-count leaf's boundary proof is independent of the parent's
+        # dynamic count family; cache before repeatedly normalizing its sites.
+        key = region, left, right, domain if constant is None else None
+        if key not in self.site_cache:
+            self.site_cache[key] = self._site_path(region, left, right, domain)
+        return self.site_cache[key]
+
+    def _site_path(self, region, left, right, domain):
         inside = self.inside[region]
         loop, _, commands, _, _ = self.analyses[region]
         positions = [left.position, right.position]
@@ -622,7 +632,7 @@ def verify_sequence(module, *, _details=False):
         require(
             proof.covered(source, destination, domain, obligation, forward),
             f"missing sequence {obligation.hazard}: {source} -> {destination}, "
-            f"{obligation.storage.owner.sym_name.data}[{obligation.start}:{obligation.stop}]",
+            f"{allocation(obligation.storage).sym_name.data}[{obligation.start}:{obligation.stop}]",
         )
     report = {
         "kernel": module.body.block.first_op.sym_name.data,

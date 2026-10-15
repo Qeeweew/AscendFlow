@@ -1,8 +1,8 @@
 """Exact access frontiers at the boundary of a repeated leaf pipeline.
 
 These are memory obligations, not completion certificates or event plans. The
-caller selects stationary storage roots that survive a child invocation. GM
-frames require a parent ownership proof and are deliberately not accepted here.
+caller selects stationary storage roots. Checked invocation frames retain their
+actual FrameOp identity, rather than losing the owning call in a root name.
 
 For period P, enumerate N=1..P-1 and P long domains N>=P, N%P=r. A periodic
 writer leaves a suffix of at most P generations. With no periodic writer, a
@@ -16,12 +16,21 @@ from math import gcd
 
 from xdsl.ir import SSAValue
 
-from .ir import BufferOp
+from .ir import BufferOp, FrameOp
 from .loop_model import access_cells, slope
 from .model import require
 from .scalar import Expr
 
 MAX_SUMMARY_VISITS = 1_000_000
+
+
+def allocation(storage):
+    """Physical allocation behind a stationary root or checked call-local frame."""
+    op = storage.owner
+    if isinstance(op, FrameOp):
+        op = op.source.owner
+    require(isinstance(op, BufferOp), "region summary lost allocation provenance")
+    return op
 
 
 @dataclass(frozen=True)
@@ -367,6 +376,10 @@ def summarize_reused_storage(loop, roots):
                 root = op.sym_name.data if op.external.data else actor + "/" + op.sym_name.data
                 if root in roots:
                     origins[root] = op.ref
+    if loop.invocation is not None:
+        for frame in loop.invocation.frames:
+            if frame.name in roots:
+                origins[frame.name] = frame.op.ref
     require(set(origins) == set(roots), "region summary needs actual stationary allocation roots")
     return RegionSummary(
         roots,

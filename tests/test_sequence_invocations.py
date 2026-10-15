@@ -90,15 +90,16 @@ def test_notify_effect_does_not_fence_later_same_pipe_work(artifact):
     assert not proof.direct(source, target, CountDomain(1, 0, exact=3))
 
 
-def test_shared_frame_writes_are_explicitly_refused_until_joint_frontiers_exist():
+def test_shared_stationary_frame_writes_compose_inside_the_actual_call():
     from dataclasses import replace
 
     source = grouped_state_sum.source.replace(
         "T.copy(Initial[group, output, :], state)",
         "T.copy(Initial[group, output, :], state)\n            T.copy(state, Output[group, output, :])",
     )
-    with pytest.raises(CompileError, match="cross-region GM frame writes"):
-        compile(replace(grouped_state_sum, source=source).specialize(B=16, GROUPS=1))
+    result = compile(replace(grouped_state_sum, source=source).specialize(B=16, GROUPS=1))
+    for calls, count in [(0, 7), (1, 0), (3, 0), (2, 7)]:
+        finite_check(result.plan, count, invocations=calls)
 
 
 def test_two_children_in_one_parent_share_real_storage_and_event_lifetimes():

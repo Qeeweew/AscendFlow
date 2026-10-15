@@ -14,6 +14,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profiles", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--build-cwd", type=Path, help="Explicit base for legacy relative compile paths"
+    )
     args = parser.parse_args()
     trials = {"generated": [], "ascendc": []}
     identity = None
@@ -28,6 +31,9 @@ def main():
         manifest = device["variants"][variant]
         command = manifest["commands"][0]
         source = Path(command[command.index("-o") - 1])
+        if not source.is_absolute():
+            require(args.build_cwd is not None, "relative compile paths require --build-cwd")
+            source = (args.build_cwd / source).resolve()
         require(
             hashlib.sha256(source.read_bytes()).hexdigest() == manifest["source_sha256"]
             and hashlib.sha256(source.with_suffix(".so").read_bytes()).hexdigest()
@@ -73,6 +79,7 @@ def main():
                 "min_us": min(samples),
                 "max_us": max(samples),
                 "compiler": manifest,
+                "source_path": str(source),
                 "evidence": evidence,
             }
         )
@@ -89,13 +96,15 @@ def main():
     )
     ops = work["vector_requested_elements"]["add"]
     outputs = case.get("outputs", 1)
-    expected = device["policy"]["GROUPS"] * outputs * case["tiles"] * device["policy"]["B"]
+    adds_per_call = case["tiles"] + int(device["policy"].get("frame_snapshot", False))
+    expected = device["policy"]["GROUPS"] * outputs * adds_per_call * device["policy"]["B"]
     require(ops == expected, "physical add work disagrees with the ordered recurrence")
     result = {
         "policy": device["policy"],
         "outputs": outputs,
         "tiles": case["tiles"],
         "hardware": device["hardware"],
+        "legacy_build_cwd": None if args.build_cwd is None else str(args.build_cwd.resolve()),
         "trials": trials,
         "median_of_run_medians_us": times,
         "generated_over_reference": times["generated"] / times["ascendc"],

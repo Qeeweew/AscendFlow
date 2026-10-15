@@ -17,6 +17,7 @@ FLAGS = [
 
 
 def offline_compile(source: str, directory: Path, name: str, *, shared=False) -> dict:
+    directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     src = directory / f"{name}.asc"
     src.write_text(source)

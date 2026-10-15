@@ -1,0 +1,70 @@
+// Independent AscendC: publish a call-local snapshot, read it, then replace it.
+#include "kernel_operator.h"
+#include <cstdint>
+using namespace AscendC;
+constexpr int B = @B@, GROUPS = @GROUPS@;
+
+extern "C" __global__ __vector__ void frame_state_reference(
+    __gm__ uint8_t* initial, __gm__ uint8_t* input, __gm__ uint8_t* output,
+    int64_t outputs, int64_t tiles) {
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> stateBuf, inputBuf;
+  pipe.InitBuffer(stateBuf, B * sizeof(float));
+  pipe.InitBuffer(inputBuf, 2 * B * sizeof(float));
+  auto state = stateBuf.Get<float>(), x = inputBuf.Get<float>();
+  for (int64_t call = 0; call < outputs; ++call) {
+    GlobalTensor<float> gi, gx, go;
+    const int64_t owner = int64_t(GetBlockIdx()) * outputs + call;
+    gi.SetGlobalBuffer((__gm__ float*)initial + owner * B);
+    gx.SetGlobalBuffer((__gm__ float*)input + owner * tiles * B);
+    go.SetGlobalBuffer((__gm__ float*)output + owner * B);
+    if (call > 0) WaitFlag<HardEvent::MTE3_MTE2>(event_t(1));
+    DataCopy(state, gi, B);
+    SetFlag<HardEvent::MTE2_MTE3>(event_t(0));
+    WaitFlag<HardEvent::MTE2_MTE3>(event_t(0));
+    DataCopy(go, state, B);
+    SetFlag<HardEvent::MTE3_MTE2>(event_t(0)); // snapshot write done
+    if (tiles > 0) SetFlag<HardEvent::MTE3_V>(event_t(0)); // state read retired
+    for (int64_t step = 0; step < tiles + 1; ++step) {
+      if (step < tiles) {
+        const auto id = event_t(step % 2);
+        if (step >= 2) WaitFlag<HardEvent::V_MTE2>(id);
+        DataCopy(x[(step % 2) * B], gx[step * B], B);
+        SetFlag<HardEvent::MTE2_V>(id);
+      }
+      if (step >= 1 && step - 1 < tiles) {
+        const int64_t g = step - 1;
+        const auto id = event_t(g % 2);
+        if (g >= 1) PipeBarrier<PIPE_V>();
+        WaitFlag<HardEvent::MTE2_V>(id);
+        if (g == 0) WaitFlag<HardEvent::MTE3_V>(event_t(0));
+        Add(state, state, x[(g % 2) * B], B);
+        // Retire precisely the last reader of x[0], including an even tile count.
+        if (g % 2 == 0 && g + 2 >= tiles) SetFlag<HardEvent::V_MTE2>(event_t(2));
+        if (g + 2 < tiles) SetFlag<HardEvent::V_MTE2>(id);
+      }
+    }
+    WaitFlag<HardEvent::MTE3_MTE2>(event_t(0));
+    if (tiles > 0) WaitFlag<HardEvent::V_MTE2>(event_t(2));
+    DataCopy(x, go, B);
+    SetFlag<HardEvent::MTE2_V>(event_t(2));
+    WaitFlag<HardEvent::MTE2_V>(event_t(2));
+    if (tiles > 0) PipeBarrier<PIPE_V>();
+    Add(state, state, x, B); // Consume snapshot after the ordered recurrence.
+    SetFlag<HardEvent::V_MTE3>(event_t(0));
+    WaitFlag<HardEvent::V_MTE3>(event_t(0));
+    DataCopy(go, state, B);
+    if (call + 1 < outputs) SetFlag<HardEvent::MTE3_MTE2>(event_t(1));
+  }
+  PipeBarrier<PIPE_ALL>();
+}
+
+extern "C" int launch_frame_state_reference(void* stream, void* initial, void* input,
+    void* output, int64_t outputs, int64_t tiles) {
+  const int64_t limit = (INT64_MAX - 64) / (int64_t(GROUPS) * B * sizeof(float));
+  if (outputs < 0 || tiles < 0 || outputs > limit || tiles > limit) return -1;
+  if (outputs && tiles > limit / outputs) return -1;
+  frame_state_reference<<<GROUPS, nullptr, stream>>>((uint8_t*)initial, (uint8_t*)input,
+      (uint8_t*)output, outputs, tiles);
+  return 0;
+}

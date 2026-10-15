@@ -74,10 +74,13 @@ class SequenceSummary:
         require(type(count) is int and count >= 0, "negative/invalid sequence length")
         return tuple(cell for cell in self.cells if cell.domain.contains(count))
 
-    def invocation_dependencies(self):
+    def invocation_dependencies(self, *, fresh=()):
         """Exit accesses of call p against first accesses of p+1, same bound."""
+        fresh = frozenset(fresh)
         result = []
         for cell in self.cells:
+            if cell.storage in fresh:
+                continue  # Disjoint call coordinates were checked by the caller.
 
             def add(hazard, source, destination, *, cell=cell):
                 result.append(

@@ -6,7 +6,7 @@ invocations supplies progress, while the checks below separately cover memory
 and event reuse. No finite parent/child expansion participates in this proof.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import lcm
 
 from xdsl.dialects.builtin import IntAttr, StringAttr
@@ -41,6 +41,17 @@ class Site:
     channel: str = ""
     action: str = ""
     direct: object = None
+    _hash: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "_hash",
+            hash((self.task, self.position, self.point, self.channel, self.action, self.direct)),
+        )
+
+    def __hash__(self):
+        return self._hash
 
 
 @dataclass(frozen=True)

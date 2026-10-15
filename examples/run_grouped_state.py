@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from ast_frame_state_sum import frame_state_sum
 from ast_grouped_state_sum import grouped_state_sum
 from ast_shared_state_sum import shared_state_sum
 from run_state_sum import inputs_and_oracle
@@ -17,10 +18,12 @@ from xdsl_npu.performance import hardware_snapshot, runtime_work
 from xdsl_npu.toolchain import offline_compile
 
 
-def reference_source(tile, groups, *, shared_inputs=False):
+def reference_source(tile, groups, *, shared_inputs=False, frame_snapshot=False):
     source = (
         Path(__file__)
-        .with_name("ascendc_grouped_state.asc.in")
+        .with_name(
+            "ascendc_frame_state.asc.in" if frame_snapshot else "ascendc_grouped_state.asc.in"
+        )
         .read_text()
         .replace("@B@", str(tile))
         .replace("@GROUPS@", str(groups))
@@ -48,7 +51,9 @@ def main():
     )
     parser.add_argument("--variant", choices=["generated", "ascendc", "both"], default="both")
     parser.add_argument("--build", action="store_true")
-    parser.add_argument("--shared-inputs", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--shared-inputs", action="store_true")
+    mode.add_argument("--frame-snapshot", action="store_true")
     parser.add_argument("--physical", type=int)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
@@ -75,13 +80,28 @@ def main():
         ),
         "validation cases require nonnegative bounded counts and at most 4 GiB input each",
     )
-    definition = shared_state_sum if args.shared_inputs else grouped_state_sum
+    definition = (
+        frame_state_sum
+        if args.frame_snapshot
+        else shared_state_sum
+        if args.shared_inputs
+        else grouped_state_sum
+    )
     artifact = compile(definition.specialize(B=args.tile, GROUPS=args.groups))
     sources = {
         "generated": (artifact.name, artifact.asc),
         "ascendc": (
-            "shared_state_reference" if args.shared_inputs else "grouped_state_reference",
-            reference_source(args.tile, args.groups, shared_inputs=args.shared_inputs),
+            "frame_state_reference"
+            if args.frame_snapshot
+            else "shared_state_reference"
+            if args.shared_inputs
+            else "grouped_state_reference",
+            reference_source(
+                args.tile,
+                args.groups,
+                shared_inputs=args.shared_inputs,
+                frame_snapshot=args.frame_snapshot,
+            ),
         ),
     }
     variants = list(sources) if args.variant == "both" else [args.variant]
@@ -132,6 +152,10 @@ def main():
                     if args.shared_inputs
                     else expected.reshape(args.groups, calls, args.tile)
                 )
+                if args.frame_snapshot:
+                    expected = np.add(
+                        expected, np.frombuffer(initial, dtype=np.float32).reshape(expected.shape)
+                    )
                 guard = b"\x5a" * 512
                 original = b"\xcd" * expected.nbytes + guard
                 initial, x = initial + guard, x + guard
@@ -214,13 +238,18 @@ def main():
                     "B": args.tile,
                     "GROUPS": args.groups,
                     **({"shared_inputs": True} if args.shared_inputs else {}),
+                    **({"frame_snapshot": True} if args.frame_snapshot else {}),
                 },
                 "health": health,
                 "hardware": hardware,
                 "variants": manifests,
                 "cases": records,
                 "compilation": artifact.timings,
-                "contract": "ordered FP32 recurrence per call; zero child copies Initial; zero parent writes nothing",
+                "contract": (
+                    "ordered FP32 recurrence per call, then add the original GM snapshot; zero parent writes nothing"
+                    if args.frame_snapshot
+                    else "ordered FP32 recurrence per call; zero child copies Initial; zero parent writes nothing"
+                ),
             },
             indent=2,
         )
