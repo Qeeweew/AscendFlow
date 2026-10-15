@@ -461,6 +461,12 @@ def _emit_checked(module, analysis, *, host_launcher=True):
     External/mutable modules enter through emit_asc and are always checked.
     No verified flag, historical witness, or user analysis is accepted there.
     """
+    from .scope_model import is_scoped
+
+    if is_scoped(module):
+        from .scope_codegen import emit_scopes
+
+        return emit_scopes(analysis, host_launcher=host_launcher)
     from .ir import MixedOp, StaticDispatchOp
     from .loop_model import is_symbolic
     from .sequence_model import is_sequence

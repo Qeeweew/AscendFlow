@@ -75,9 +75,19 @@ query tile 分给20组已经产生12/13差异，不能追加长度整除组数�
 不为每个源、查询域复制整张图，不把所有 actor 强行排成一条串行时钟。
 现已接入AST词法scope和fixed child完成投影，local sequence实际使用同一投影，
 固定行步长列切片及其跨child访问frontier也已进入最终检查。以下下一步必须
-在已有实现上扩展，不能再写一套脱离lowering的summary原型：先保留父Pipelined
-中的真实child callsite及祖先地址绑定，再按父Stage/issue policy组合实际端点；
-用共享L0C的FIX→下一MAD和两AIV最后reader贡献作为首个CV验收。
+在已有实现上扩展，不能再写一套脱离lowering的summary原型。直接固定child的
+真实callsite、祖先地址别名、父Stage/issue policy及双AIV端点组合已经接线。
+这一真实路径已完成最终IR破坏检查、CANN与多长度设备闭环，下一步解决两个反例：
+
+- 子event寿命必须跨父调用计算；按完整通知ordinal选择ID，而不是在每个child
+  中无条件重启同一组ID。先从当前拒绝的`nested_copy`验证Wait消费，再扩大共享。
+- 共享L0C须先建立逻辑定义/read配对与RW recurrence，再选择独立定义的物理
+  占用次序，生成相邻定义的WAW与全部最后reader的WAR。不能将所有访问按issue
+  重排。`QK(t+1)→PV(t)`有负逻辑代次差；同步epoch与实际访问generation必须
+  分开表示。用公共parent step可以表示它，但仍需保留端点的启动/排空激活域。
+  `n=1`和最终PV连续占用必须通过独立trace，外部最终可观察值不得改变。
+
+这两项通过后再接first/last与独立query/kv时钟；保留原FA source主体做验收。
 双 AIV 的完整贡献、MTE2 import 的早 release、FIX 与共享 L0C 冲突都要表达。
 源码控制退出不插入 child drain；不以增加 buffer、搬运或 barrier 接通。
 先核实每个 native 的读退休、写完成和配置资源合同；当前主要使用 task end，

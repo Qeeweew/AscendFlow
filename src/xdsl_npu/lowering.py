@@ -97,7 +97,9 @@ def _check_work_order(records, program, pipeline, family, pinned, ranks):
     return records
 
 
-def _work(program, pipeline, family, owner, *, operations=None, scoped=None, scope=None):
+def _work(
+    program, pipeline, family, owner, *, operations=None, scoped=None, scope=None, nested=False
+):
     if program.attributes.get("frontend") != StringAttr("ast"):
         return _legacy_work(program, pipeline, family, owner, operations=operations)
     require(
@@ -130,7 +132,7 @@ def _work(program, pipeline, family, owner, *, operations=None, scoped=None, sco
             stage = clock.stage
         else:
             require(
-                clock is None or isinstance(clock.op, scf.ForOp),
+                clock is None or isinstance(clock.op, scf.ForOp) or nested and clock.op is pipeline,
                 "ordinary source work cannot borrow a child clock",
             )
             stage = None
@@ -359,9 +361,12 @@ class _Actor:
         once=False,
         region_name=None,
         bindings=None,
+        ambient_frames=(),
+        capture=None,
     ):
         self.program, self.pipeline = program, pipeline
         self.invocation = invocation
+        self.ambient_frames, self.capture = tuple(ambient_frames), capture
         self.records = _work(program, pipeline, family, owner) if records is None else records
         self.once, self.region_name = once, region_name
         require(
@@ -437,6 +442,9 @@ class _Actor:
         coordinate = self.pipeline.body.block.args[0]
         owner = self.program.body.block.args[0]
         coordinates = {coordinate: "$g", owner: "$core"}
+        coordinates.update(
+            (frame.coordinate, f"$parent{i}") for i, frame in enumerate(self.ambient_frames)
+        )
         if self.invocation is not None:
             coordinates[self.invocation.body.block.args[0]] = "$call"
         # Each statically selected execution lane has its own physical actor.
@@ -472,6 +480,15 @@ class _Actor:
             (g, literal(0), expression("sub", bound, literal(1))),
             (core, literal(0), literal(self.program.groups.data - 1)),
         ]
+        for i, frame in enumerate(self.ambient_frames):
+            extent = literal(frame.bound) if isinstance(frame.bound, int) else scalar(frame.bound)
+            domains.append(
+                (
+                    Expr("argument", (f"$parent{i}",)),
+                    literal(0),
+                    expression("sub", extent, literal(1)),
+                )
+            )
         total = getattr(self.bindings, "cyclic_total", None)
         if total is not None:
             flat = expression("add", core, expression("mul", g, literal(self.program.groups.data)))
@@ -499,6 +516,20 @@ class _Actor:
         address = literal(0)
         for origin, stride in zip(origins, byte_strides):
             address = expression("add", address, expression("mul", origin, stride))
+        root = self.roots[allocation]
+        if self.capture is not None:
+            from .scope_address import split_offset
+
+            parent, address = split_offset(
+                address,
+                child_clock=None if self.once else "$g",
+                captured_variables={
+                    "$core",
+                    *(f"$parent{i}" for i in range(len(self.ambient_frames))),
+                },
+                facts=facts,
+            )
+            root = self.capture(allocation, parent)
         terms = physical_terms(address, facts)
         if allocation in self.frame_specs:
             extent, scale = self.frame_specs[allocation]
@@ -603,7 +634,7 @@ class _Actor:
             )
             prefix_extent = self.uniform_by_expression[bound.args[0]]
         return self.kernel.view(
-            self.roots[allocation],
+            root,
             width,
             offset=offset,
             rows=rows,
@@ -1078,5 +1109,13 @@ def lower_source(module, *, symbolic=True):
         "expected one typed source program",
     )
     from .region_lowering import lower_regions
+
+    if symbolic and program.attributes.get("frontend") == StringAttr("ast"):
+        from .scope_lowering import has_nested_pipelines, lower_scopes
+
+        if has_nested_pipelines(program) and any(
+            isinstance(op, PipelineOp) for op in program.body.block.ops
+        ):
+            return lower_scopes(program)
 
     return lower_regions(program, symbolic=symbolic)

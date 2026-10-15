@@ -5,7 +5,7 @@ from itertools import groupby
 from .asc_scalar import ScalarScope
 from .codegen import QUALIFIER, load3d_init, native_line
 from .ir import InvocationChannelOp, MixedOp, OnceOp
-from .model import ITEMSIZE, storage_layout
+from .model import ITEMSIZE, require, storage_layout
 from .scalar import bindings, facts_from_sizes, from_ssa
 
 
@@ -68,8 +68,10 @@ def _region_lines(
     uniform_names,
     *,
     boundary=None,
+    display_actor=None,
 ):
     lines = []
+    label = actor if display_actor is None else display_actor
     maximum = max(task.stage for task in data.program.tasks)
     for task in data.program.tasks:
         if task.native == "scalar_load":
@@ -98,7 +100,7 @@ def _region_lines(
         scalar, inner = ScalarScope(), []
         generation = "step" if stage == 0 else f"step - {stage}"
         lines += [
-            f"    {{ // {actor}: stage {stage}",
+            f"    {{ // {label}: stage {stage}",
             f"      const int64_t g = {generation};",
             "      if (g >= 0 && g < n) {",
         ]
@@ -149,8 +151,12 @@ def _region_lines(
             if guard:
                 body, marker, comment = code.partition("//")
                 code = f"if ({guard}) {{ {body.strip()} }}" + (f" //{comment}" if marker else "")
-            inner += [f"// {actor}/{task.uid}: {command.kind}, stage {stage}", code]
-        lines.extend(f"        {line}" for line in scalar.finish(inner))
+            inner += [f"// {label}/{task.uid}: {command.kind}, stage {stage}", code]
+        lines.extend(
+            f"        {line}"
+            for statement in scalar.finish(inner)
+            for line in statement.splitlines()
+        )
         lines += ["      }", "    }"]
     lines.append("  }")
     if invocation is not None:
@@ -158,13 +164,19 @@ def _region_lines(
     return lines
 
 
-def emit_loop(analysis, *, host_launcher=True, sequence=None):
+def emit_loop(analysis, *, host_launcher=True, sequence=None, scopes=None):
     loop, channel_map, sequences, _, _ = analysis
-    all_data = [
-        d
-        for item in ([analysis] if sequence is None else sequence.analyses.values())
-        for d in item[0].actors.values()
-    ]
+    require(
+        sequence is None or scopes is None, "ASC emission needs one retained region organization"
+    )
+    if scopes is not None:
+        require(loop is scopes.access.loop, "scope emission requires its actual parent access loop")
+    analyses = (
+        scopes.analyses.values()
+        if scopes is not None
+        else ([analysis] if sequence is None else sequence.analyses.values())
+    )
+    all_data = [d for item in analyses for d in item[0].actors.values()]
     name = loop.op.sym_name.data
     roots = list(loop.roots)
     facts = facts_from_sizes(loop.parameters)
@@ -257,7 +269,11 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
                 "  asc_sync_wait(PIPE_S, PIPE_FIX, event_t(0));",
             ]
         lines += load3d_init(data.program.load3d)
-        if sequence is None:
+        if scopes is not None:
+            from .scope_codegen import emit_scope_actor
+
+            lines += emit_scope_actor(scopes, actor, uniform_names)
+        elif sequence is None:
             lines += _region_lines(
                 actor,
                 data,
@@ -341,6 +357,11 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
         lines += checked_uniform_lines
         if loop.host_bound is not None:
             stage_margin = max(task.stage for actor in all_data for task in actor.program.tasks)
+            if scopes is not None:
+                stage_margin = max(
+                    stage_margin,
+                    max(leaf.call.stage.data for leaf in scopes.program.leaves.values()),
+                )
             lines.append(
                 f"  if ({loop.host_bound.c(uniform_names)} > {(1 << 63) - 1 - stage_margin}) return -1; // loop step overflow"
             )

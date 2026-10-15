@@ -23,6 +23,8 @@ minimum/multiple从AST贯通launcher（CPU测试仅替换设备派发行）；
 | region/call 同步生成 | `sync/test_sequence_sync.py`、`sync/test_sequence_invocations.py` | ready/release、多个 reader、跨调用事件复用、保留循环 |
 | frame 与共享输入 | `sync/test_frame_regions.py`、`sync/test_shared_invocation_inputs.py` | 真实别名、零次执行、slot 最后读取、分组地址 |
 | 最终 IR 验证 | `sync/test_plan_validation.py` | 删除/移动同步、错误时钟、event 冲突、伪造 ownership 后必须拒绝 |
+| 嵌套固定child | `test_scope_address.py`、`test_scope_access.py`、`test_scope_completion.py`、`test_scope_codegen.py` | 祖先地址别名、独立byte oracle、父子时钟、投影可达性与实际ASC |
+| 父同步负例 | `test_scope_protocol_review.py`、`test_scope_lifetimes.py` | 实际Wait顺序、event消费与FIFO、尚未支持的共享L0C独立生命周期 |
 | 独立有限执行模型 | `models/local_sequence.py` | 解释实际命令、逐字节 RAW/WAR/WAW、二值 event 覆盖和死锁 |
 
 ```bash
@@ -49,3 +51,12 @@ minimum/multiple从AST贯通launcher（CPU测试仅替换设备派发行）；
 
 编译耗时用 `benchmarks.compile` 的五个独立进程测量，import 和 CANN 单列。
 ASC、离线编译和设备性能的入口见 [benchmarks](../benchmarks/README.md)。
+
+嵌套CV的小规模设备回归用一份binary覆盖多个runtime长度，检查所有输出、两个
+workspace槽、输入和guard。它没有FA或吞吐量性能结论。先检查全卡状态，选择健康
+空闲物理卡；示例中的6须按实际状态选择，不得通过换卡绕过设备错误。
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --output runs/refactor/nested-cv/build --build
+ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --output runs/refactor/nested-cv/build --physical 6
+```

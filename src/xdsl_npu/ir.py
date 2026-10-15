@@ -182,6 +182,78 @@ class FrameOp(IRDLOperation):
 
 
 @irdl_op_definition
+class CoreIdOp(IRDLOperation):
+    """Logical launch group coordinate, shared by its AIC and participating AIVs."""
+
+    name = "npu.core_id"
+    value = result_def(IndexType)
+
+
+@irdl_op_definition
+class CaptureOp(IRDLOperation):
+    """An address frozen at a parent callsite; alias only, with no completion.
+
+    The byte offset is pure index SSA in the actual parent clock. The child
+    accesses a bounded static span relative to it. Parent extraction proves
+    bounds and ownership against source; captures never create fresh storage.
+    """
+
+    name = "npu.capture"
+    source = operand_def(RefType)
+    offset = operand_def(IndexType)
+    nbytes = attr_def(IntAttr)
+    sym_name = attr_def(StringAttr)
+    ref = result_def(RefType)
+
+
+@irdl_op_definition
+class CallOp(IRDLOperation):
+    """One retained child invocation at an actual parent software-pipeline slot.
+
+    Its body contains address captures and one fixed Stream/Once region. Stage
+    shifts the parent generation only; exiting this call retires no child work.
+    """
+
+    name = "npu.call"
+    generation = operand_def(IndexType)
+    uid = attr_def(StringAttr)
+    stage = attr_def(IntAttr)
+    logical_phase = attr_def(IntAttr)
+    issue_order = attr_def(IntAttr)
+    body = region_def("single_block")
+    traits = traits_def(RecursiveMemoryEffect())
+
+
+@irdl_op_definition
+class ScopeChannelOp(IRDLOperation):
+    """Parent-generation protocol between actual fixed child native endpoints."""
+
+    name = "npu.scope_channel"
+    sym_name = attr_def(StringAttr)
+    kind = attr_def(StringAttr)
+    sources = attr_def(ArrayAttr[StringAttr])
+    destinations = attr_def(ArrayAttr[StringAttr])
+    distance = attr_def(IntAttr)
+    period = attr_def(IntAttr)
+    residues = attr_def(ArrayAttr[IntAttr])
+    event_ids = attr_def(ArrayAttr[IntAttr])
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
+class ScopeSyncOp(IRDLOperation):
+    """A real native insertion at inner position, activated on its parent clock."""
+
+    name = "npu.scope_sync"
+    parent_generation = operand_def(IndexType)
+    child_generation = operand_def(IndexType)
+    action = attr_def(StringAttr)
+    channel = attr_def(StringAttr)
+    position = attr_def(IntAttr)
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
 class ViewOp(IRDLOperation):
     name = "npu.view"
     source = operand_def(RefType)
@@ -475,6 +547,11 @@ NPU = Dialect(
         StaticCaseOp,
         BufferOp,
         FrameOp,
+        CoreIdOp,
+        CaptureOp,
+        CallOp,
+        ScopeChannelOp,
+        ScopeSyncOp,
         ViewOp,
         StreamOp,
         OnceOp,

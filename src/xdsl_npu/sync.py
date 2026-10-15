@@ -376,6 +376,13 @@ def completion_graph(ex: Execution, *, controls=None):
 
 @bounded
 def verify_plan(module: ModuleOp, *, _imports=(), _details=False):
+    from .scope_model import is_scoped
+
+    if is_scoped(module):
+        from .scope_sync import verify_scopes
+
+        require(not _imports, "nested verification must discharge its actual parent entry reads")
+        return verify_scopes(module, _details=_details)
     from .loop_model import is_symbolic
     from .sequence_model import is_sequence
 
@@ -631,6 +638,13 @@ def autosync(module: ModuleOp, *, _imports=(), _capture=None) -> ModuleOp:
     assumption that the buffer ring equals the event ring. Capacity failure is
     a diagnostic, not permission to serialize or enlarge buffers.
     """
+    from .scope_model import is_scoped
+
+    if is_scoped(module):
+        from .scope_sync import autosync_scopes
+
+        require(not _imports, "nested planning must discharge its actual parent entry reads")
+        return autosync_scopes(module, _capture=_capture)
     from .ir import MixedOp, StaticDispatchOp
     from .loop_model import is_symbolic
     from .sequence_model import is_sequence

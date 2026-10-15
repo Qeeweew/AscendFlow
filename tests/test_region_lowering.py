@@ -11,25 +11,24 @@ from xdsl_npu.ir import dump
 from xdsl_npu.model import CompileError
 
 
-@pytest.mark.parametrize("prefix", ["", "N.fill(x[0, :], 1.0)"])
-def test_ast_nested_constant_loop_is_refused_before_native_construction(monkeypatch, prefix):
+def test_work_outside_nested_parent_is_refused_before_native_construction(monkeypatch):
     from xdsl_npu.lowering import _Actor
 
     def no_partial_lowering(*args, **kwargs):
         raise AssertionError("unsupported control reached native construction")
 
     monkeypatch.setattr(_Actor, "emit", no_partial_lowering)
-    source = N.from_source(f"""
+    source = N.from_source("""
         def nested(n: N.int64):
             with N.Kernel(kind="vector"):
                 x = N.alloc_ub((2, 64), N.f32)
-                {prefix}
+                N.fill(x[0, :], 1.0)
                 for i in N.Pipelined(n, stages=1):
                     for j in N.Pipelined(3, stages=1):
                         N.fill(x[j % 2, :], 0.0)
     """).to_ir()
     before = dump(source)
-    with pytest.raises(CompileError, match="do not authorize implicit unrolling"):
+    with pytest.raises(CompileError, match="one parent Pipelined is required"):
         compile(source)
     assert dump(source) == before
 

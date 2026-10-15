@@ -10,11 +10,12 @@ from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.child_completion import ChildPort, project_fixed_child
 from xdsl_npu.completion import Position, Site
-from xdsl_npu.ir import TaskOp, dump
-from xdsl_npu.loop_graph import Graph
+from xdsl_npu.ir import LoopSyncOp, TaskOp, dump
+from xdsl_npu.loop_graph import Command, Graph
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.mixed import compose
 from xdsl_npu.model import CompileError
+from xdsl_npu.native_order import instruction_points
 from xdsl_npu.sequence_sync import verify_sequence
 
 
@@ -154,7 +155,8 @@ def fill_child(count):
     return k.finish()
 
 
-def test_projection_does_not_expand_count_or_mutate_the_native_graph(monkeypatch):
+@pytest.mark.parametrize("insertion_cuts", [False, True])
+def test_projection_does_not_expand_count_or_mutate_the_native_graph(monkeypatch, insertion_cuts):
     children = [checked(fill_child(count)) for count in (8, (1 << 40) + 3)]
 
     def no_instance_graph(*args, **kwargs):
@@ -168,12 +170,19 @@ def test_projection_does_not_expand_count_or_mutate_the_native_graph(monkeypatch
         actor = next(iter(analysis[0].actors))
         head = Site((actor, "same"), Position(False, 0), "end", region="child")
         tail = replace(head, position=Position(True, 0), point="prefix")
-        projection = project_fixed_child(analysis, (head, tail))
+        projection = project_fixed_child(analysis, (head, tail), insertion_cuts=insertion_cuts)
         stats = projection.statistics()
         assert stats["native_templates"] == 1
-        assert stats["native_nodes"] == nodes
-        assert stats["native_edges"] == len(edges)
-        assert stats["projection_nodes"] == nodes + len(projection.inputs) * 2
+        if insertion_cuts:
+            commands = sum(len(sequence) for sequence in analysis[2].values())
+            assert stats["native_nodes"] == nodes + analysis[3].period * (
+                2 * commands + stats["native_templates"]
+            )
+            assert stats["native_edges"] > len(edges)
+        else:
+            assert stats["native_nodes"] == nodes
+            assert stats["native_edges"] == len(edges)
+        assert stats["projection_nodes"] == stats["native_nodes"] + len(projection.inputs) * 2
         assert projection.reaches(head, tail)
         assert len(analysis[3].nodes) == nodes and tuple(analysis[3].edges) == edges
         assert dump(plan) == before
@@ -200,15 +209,24 @@ def test_runtime_child_count_is_rejected():
         project_fixed_child(analysis, ())
 
 
-def test_relation_budget_precedes_proof_graph_materialization(one_copy, monkeypatch):
+@pytest.mark.parametrize("insertion_cuts", [False, True])
+def test_relation_budget_precedes_proof_graph_materialization(
+    one_copy, monkeypatch, insertion_cuts
+):
     import xdsl_npu.child_completion as child
+    import xdsl_npu.loop_planning as planning
 
     monkeypatch.setattr(child, "MAX_PROJECTION_RELATIONS", 1)
     monkeypatch.setattr(
         child, "SymbolicCompletion", lambda: pytest.fail("materialized before relation budget")
     )
+    monkeypatch.setattr(
+        planning,
+        "DirectCompletion",
+        lambda *args: pytest.fail("rebuilt cuts before relation budget"),
+    )
     with pytest.raises(CompileError, match="endpoint relation budget"):
-        child.project_fixed_child(one_copy[1], ())
+        child.project_fixed_child(one_copy[1], (), insertion_cuts=insertion_cuts)
 
 
 def test_sequence_leaf_keeps_its_parent_invocation_metadata():
@@ -335,3 +353,297 @@ def test_mixed_actors_with_identical_uids_have_separate_endpoints_and_ports():
         for source, target in projection.relations
         if isinstance(source, Site) and isinstance(target, ChildPort)
     )
+
+
+def command_site(command, generation, point):
+    return Site(
+        (command.actor, command.task.uid),
+        Position(False, generation),
+        point,
+        command.channel,
+        "" if command.kind == "task" else command.kind,
+        region="outer/child",
+    )
+
+
+def test_admission_cuts_are_forward_only_and_retain_existing_wait_semantics(one_copy):
+    plan, analysis = one_copy
+    before = dump(plan)
+    actor = next(iter(analysis[0].actors))
+    wait = next(command for command in analysis[2][actor] if command.kind == "wait")
+    task = next(
+        command
+        for command in analysis[2][actor]
+        if command.task.uid == "scale" and command.kind == "task"
+    )
+    wait_before = command_site(wait, 0, "queue")
+    wait_admit = replace(wait_before, point="admit_queue")
+    wait_issue = replace(wait_before, point="issue")
+    wait_admit_issue = replace(wait_before, point="admit_issue")
+    wait_begin = replace(wait_before, point="begin")
+    task_queue = command_site(task, 0, "queue")
+    task_issue = replace(task_queue, point="issue")
+    task_begin = replace(task_queue, point="begin")
+    endpoints = (
+        wait_before,
+        wait_admit,
+        wait_issue,
+        wait_admit_issue,
+        wait_begin,
+        task_queue,
+        task_issue,
+        task_begin,
+    )
+    projection = project_fixed_child(analysis, endpoints, insertion_cuts=True)
+    assert projection.reaches(wait_before, wait_admit)
+    assert not projection.reaches(wait_admit, wait_before)
+    assert projection.reaches(wait_issue, wait_admit_issue)
+    assert not projection.reaches(wait_admit_issue, wait_issue)
+    assert projection.reaches(wait_admit, wait_begin)
+    assert projection.reaches(wait_admit, task_queue)
+    assert projection.reaches(wait_admit, task_begin)
+    assert projection.reaches(wait_admit, ChildPort(actor, "V", "queue", "output"))
+    assert projection.reaches(wait_admit_issue, task_issue)
+    assert projection.reaches(wait_admit_issue, ChildPort(actor, None, "issue", "output"))
+    # A real V Wait gates its consumer queue, not Scalar dispatch. An outer
+    # Scalar acquisition belongs to the separate admission-issue cut.
+    assert projection.reaches(wait_begin, task_begin)
+    assert not projection.reaches(wait_begin, task_issue)
+    assert not projection.reaches(wait_admit, task_issue)
+    assert dump(plan) == before
+
+
+def test_final_command_admission_is_preserved_at_the_exit(one_copy):
+    _, analysis = one_copy
+    actor = next(iter(analysis[0].actors))
+    last = analysis[2][actor][-1]
+    before = command_site(last, 0, "issue")
+    admit = replace(before, point="admit_issue")
+    projection = project_fixed_child(analysis, (before, admit), insertion_cuts=True)
+    assert projection.reaches(admit, ChildPort(actor, None, "issue", "output"))
+    assert not projection.reaches(admit, before)
+
+
+def test_native_fifo_exit_forwards_inserted_set_begin_to_the_actual_next_command():
+    k = Kernel("fifo_exit", disjoint_external=True)
+    x = k.buffer("X", "GM", 64, external=True, initialized=True)
+    a, b = (k.buffer(name, "UB", 64) for name in ("a", "b"))
+    k.loop(1, symbolic=True)
+    k.copy("first", k.view(x, 64), k.view(a, 64))
+    k.copy("later", k.view(x, 64), k.view(b, 64))
+    _, analysis = checked(k.finish())
+    actor = next(iter(analysis[0].actors))
+    first, later = [command for command in analysis[2][actor] if command.kind == "task"]
+    before = {
+        point: command_site(first, 0, point)
+        for point in ("admit_issue", "begin", "end", "prefix", "after_queue")
+    }
+    target = command_site(later, 0, "begin")
+    projection = project_fixed_child(analysis, (*before.values(), target), insertion_cuts=True)
+    after = before["after_queue"]
+    assert projection.reaches(before["begin"], after)
+    assert projection.reaches(after, target)
+    assert not projection.reaches(after, before["begin"])
+    assert not projection.reaches(before["end"], after)
+    edges = defaultdict(set)
+    for source, destination in projection.relations:
+        edges[source].add(destination)
+    actual = instruction_points(
+        Command(999, actor, first.task, "set"),
+        {"issue": before["admit_issue"], "queue": before["begin"], "retire": before["prefix"]},
+        lambda point: ("inserted_set", point),
+        lambda source, destination: edges[source].add(destination),
+    )
+    edges[actual["begin"]].add(after)
+
+    def reaches(source, destination):
+        seen, pending = {source}, [source]
+        while pending:
+            for point in edges[pending.pop()]:
+                if point not in seen:
+                    seen.add(point)
+                    pending.append(point)
+        return destination in seen
+
+    assert reaches(actual["begin"], target)
+    assert not reaches(actual["begin"], before["begin"])
+    assert not reaches(actual["end"], target)
+    assert not reaches(actual["end"], ChildPort(actor, "MTE2", "queue", "output"))
+
+
+def test_fifo_exit_reaches_real_child_sync_and_crosses_skipped_tail_to_next_call(one_copy):
+    _, analysis = one_copy
+    actor = next(iter(analysis[0].actors))
+    source = next(
+        command
+        for command in analysis[2][actor]
+        if command.kind == "task" and command.task.uid == "load"
+    )
+    following = next(command for command in analysis[2][actor] if command.kind == "set")
+    after = command_site(source, 0, "after_queue")
+    begin = command_site(source, 0, "begin")
+    end = command_site(source, 0, "end")
+    sent = command_site(following, 0, "begin")
+    projection = project_fixed_child(analysis, (after, begin, end, sent), insertion_cuts=True)
+    output = ChildPort(actor, "MTE2", "queue", "output")
+    assert projection.reaches(after, sent)
+    assert projection.reaches(after, output)
+    assert not projection.reaches(end, output)
+    assert parent_path(projection, after, begin)
+    assert not parent_path(projection, end, begin)
+
+
+@pytest.mark.parametrize("count", [1, 8, (1 << 40) + 3])
+def test_final_active_fifo_exit_crosses_to_the_next_call_without_clock_expansion(count):
+    _, analysis = checked(fill_child(count))
+    actor = next(iter(analysis[0].actors))
+    source = next(command for command in analysis[2][actor] if command.kind == "task")
+    tail = command_site(source, count - 1, "after_queue")
+    head = command_site(source, 0, "begin")
+    end = command_site(source, count - 1, "end")
+    projection = project_fixed_child(analysis, (tail, head, end), insertion_cuts=True)
+    assert projection.native_templates == 1
+    assert projection.reaches(tail, ChildPort(actor, "V", "queue", "output"))
+    assert not projection.reaches(end, ChildPort(actor, "V", "queue", "output"))
+    assert parent_path(projection, tail, head)
+    assert not parent_path(projection, end, head)
+
+
+def test_terminal_native_fifo_exit_reaches_the_next_call(cube):
+    _, analysis = cube
+    after = task_site(analysis, "FIX", 7, "after_queue")
+    begin = replace(after, point="begin")
+    end = replace(after, point="end")
+    projection = project_fixed_child(analysis, (after, begin, end), insertion_cuts=True)
+    assert projection.reaches(after, ChildPort(after.task[0], "FIX", "queue", "output"))
+    assert parent_path(projection, after, begin)
+    assert not parent_path(projection, end, begin)
+
+
+def test_fifo_exit_requires_opt_in_and_an_active_native_task(one_copy):
+    _, analysis = one_copy
+    actor = next(iter(analysis[0].actors))
+    source = next(command for command in analysis[2][actor] if command.kind == "task")
+    wait = next(command for command in analysis[2][actor] if command.kind == "wait")
+    with pytest.raises(CompileError, match="milestone"):
+        project_fixed_child(analysis, (command_site(source, 0, "after_queue"),))
+    with pytest.raises(CompileError, match="native task"):
+        project_fixed_child(analysis, (command_site(wait, 0, "after_queue"),), insertion_cuts=True)
+    with pytest.raises(CompileError, match="inactive"):
+        project_fixed_child(
+            analysis, (command_site(source, 1, "after_queue"),), insertion_cuts=True
+        )
+
+
+def test_multiple_same_pipe_commands_keep_their_admission_order():
+    k = Kernel("multiple_commands")
+    buffers = [k.buffer(name, "UB", 64) for name in ("first", "second", "third")]
+    k.loop(3, symbolic=True)
+    for rank, root in enumerate(buffers):
+        k.task("fill_" + str(rank), "fill", k.view(root, 64), scalar=float(rank))
+    _, analysis = checked(k.finish())
+    actor = next(iter(analysis[0].actors))
+    commands = [c for c in analysis[2][actor] if c.kind == "task"]
+    endpoints = tuple(
+        command_site(command, 1, point)
+        for command in commands
+        for point in ("queue", "admit_queue", "issue", "admit_issue", "begin", "end", "prefix")
+    )
+    projection = project_fixed_child(analysis, endpoints, insertion_cuts=True)
+    for rank, command in enumerate(commands):
+        for point in ("queue", "issue"):
+            before = command_site(command, 1, point)
+            admit = replace(before, point="admit_" + point)
+            assert projection.reaches(before, admit)
+            assert not projection.reaches(admit, before)
+            for later in commands[rank + 1 :]:
+                assert projection.reaches(admit, command_site(later, 1, point))
+            for earlier in commands[:rank]:
+                assert not projection.reaches(admit, command_site(earlier, 1, point))
+
+
+@pytest.fixture(scope="module")
+def mixed_child():
+    from tests.fixtures.cv import cv_source
+
+    return checked(cv_source(2))
+
+
+@pytest.fixture(scope="module")
+def barrier_child():
+    return checked(fill_child(3))
+
+
+@pytest.mark.parametrize("fixture", ["one_copy", "cube", "barrier_child", "mixed_child"])
+def test_cut_projection_preserves_all_real_native_and_sync_relations(request, fixture):
+    _, analysis = request.getfixturevalue(fixture)
+    count = analysis[0].constant_count
+    endpoints = []
+    kinds = set()
+    for sequence in analysis[2].values():
+        for command in sequence:
+            g = count - 1 - command.upper
+            if g < command.lower or g % command.period not in command.residues:
+                continue
+            if command.last_gap is not None and g != count - 1 - command.last_gap:
+                continue
+            kinds.add(command.kind)
+            for point in ("begin", "end", "prefix") if command.kind == "task" else ("begin", "end"):
+                endpoints.append(command_site(command, g, point))
+    ordinary = project_fixed_child(analysis, endpoints)
+    cuts = project_fixed_child(analysis, endpoints, insertion_cuts=True)
+    assert cuts.relations == ordinary.relations
+    assert cuts.native_templates == ordinary.native_templates
+    assert cuts.native_node_count > ordinary.native_node_count
+    if fixture == "one_copy":
+        assert {"task", "set", "wait"} <= kinds
+    elif fixture == "barrier_child":
+        assert "barrier" in kinds
+    elif fixture == "mixed_child":
+        assert {"cross_set", "cross_wait"} <= kinds
+
+
+def test_zero_trip_cut_projection_is_only_prefix_identity():
+    _, analysis = checked(fill_child(0))
+    projection = project_fixed_child(analysis, (), insertion_cuts=True)
+    assert projection.relations == frozenset(
+        (port, replace(port, side="output")) for port in projection.inputs
+    )
+    actor = next(iter(analysis[0].actors))
+    for point in ("begin", "end", "prefix", "issue", "queue", "admit_issue", "admit_queue"):
+        with pytest.raises(CompileError, match="inactive"):
+            project_fixed_child(
+                analysis, (Site((actor, "same"), Position(False, 0), point),), insertion_cuts=True
+            )
+
+
+def test_cut_points_are_opt_in_and_syncs_do_not_gain_native_retirement_prefixes(one_copy):
+    _, analysis = one_copy
+    actor = next(iter(analysis[0].actors))
+    wait = next(command for command in analysis[2][actor] if command.kind == "wait")
+    for point in ("issue", "queue", "retire", "implicit", "admit_issue", "admit_queue"):
+        site = command_site(wait, 0, point)
+        with pytest.raises(CompileError, match="milestone"):
+            project_fixed_child(analysis, (site,))
+        assert project_fixed_child(analysis, (site,), insertion_cuts=True).endpoints == (site,)
+    for point in ("prefix", "admit_retire", "admit_implicit"):
+        with pytest.raises(CompileError, match="milestone"):
+            project_fixed_child(analysis, (command_site(wait, 0, point),), insertion_cuts=True)
+
+
+def test_ambiguous_barrier_command_cuts_are_rejected(barrier_child):
+    plan = barrier_child[0].clone()
+    barrier = next(
+        op for op in plan.walk() if isinstance(op, LoopSyncOp) and op.action.data == "barrier"
+    )
+    barrier.parent.insert_op_before(barrier.clone(), barrier)
+    _, analysis = verify_loop(plan, _details=True)
+    actor = next(iter(analysis[0].actors))
+    command = next(c for c in analysis[2][actor] if c.kind == "barrier")
+    with pytest.raises(CompileError, match="ambiguous native commands"):
+        project_fixed_child(
+            analysis, (command_site(command, 1, "admit_queue"),), insertion_cuts=True
+        )
+    native = next(c for c in analysis[2][actor] if c.kind == "task")
+    endpoint = command_site(native, 1, "prefix")
+    assert project_fixed_child(analysis, (endpoint,), insertion_cuts=True).endpoints == (endpoint,)

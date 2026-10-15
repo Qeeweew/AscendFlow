@@ -166,7 +166,7 @@ def test_a_logical_value_is_not_a_snapshot_of_overwritten_storage():
         lower_source(definition.to_ir())
 
 
-def test_nested_pipeline_is_refused_instead_of_rebinding_a_borrowed_tile():
+def test_nested_pipeline_keeps_child_clock_for_borrowed_tile():
     definition = N.from_source(
         """
         def nested(X:N.Tensor((2,3,64),N.f32),Y:N.Tensor((2,64),N.f32,access="write")):
@@ -185,8 +185,18 @@ def test_nested_pipeline_is_refused_instead_of_rebinding_a_borrowed_tile():
         """,
         disjoint_external=True,
     )
-    with pytest.raises(CompileError, match="do not authorize implicit unrolling"):
-        lower_source(definition.to_ir())
+    from xdsl_npu.ir import CallOp, StreamOp
+    from xdsl_npu.ir import ViewOp as PhysicalViewOp
+
+    physical = lower_source(definition.to_ir())
+    calls = [op for op in physical.walk() if isinstance(op, CallOp)]
+    assert len(calls) == 2
+    child = next(op for op in calls[0].body.block.ops if isinstance(op, StreamOp))
+    assert child.count.data == 3
+    views = [op for op in child.walk() if isinstance(op, PhysicalViewOp)]
+    assert views
+    assert all(op.generation is child.body.block.args[0] for op in views)
+    assert all(op.generation is not calls[0].generation for op in views)
 
 
 def test_two_logical_values_may_share_one_root_with_disjoint_input_views():

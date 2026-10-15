@@ -36,8 +36,16 @@ class DirectCompletion(Graph):
         self.command_count = 0
 
     def admit(self, command, residue, milestones):
-        """Fixed native insertion cuts, independent of any possible protocol."""
-        require(command.kind == "task", "direct synthesis expects unsynchronized native work")
+        """Forward-only insertion cuts before an actual native command.
+
+        Synthesis starts from tasks; a child projection also rebuilds the real
+        synchronized stream. Existing syncs still pass through the ordinary
+        instruction/prefix rules in completion_graph, including Wait gates.
+        """
+        require(
+            command.kind in {"task", "set", "wait", "barrier", "cross_set", "cross_wait"},
+            "insertion cuts require an actual native command",
+        )
         self.command_count = max(self.command_count, command.index + 1)
         before = dict(milestones)
         for point in ("issue", "queue"):

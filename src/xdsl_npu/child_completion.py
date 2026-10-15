@@ -71,7 +71,7 @@ class FixedChildProjection:
         }
 
 
-def project_fixed_child(analysis, endpoints):
+def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
     """Project one verified leaf invocation with an actual constant count.
 
     ``analysis`` is the result of the existing leaf verifier. All requested
@@ -84,8 +84,16 @@ def project_fixed_child(analysis, endpoints):
     identities at the same physical milestone retain their proved relations.
     Ports preserve incoming prefix facts even for a zero-trip child; they never
     create a child completion milestone.
+
+    ``insertion_cuts`` rebuilds the actual synchronized command stream with
+    forward-only issue/queue admission cuts. Sites may additionally name its
+    physical issue/queue/retire/implicit prefixes or admit_issue/admit_queue.
+    A fact acquired at admission reaches following commands, never the prefix
+    before that admission. A native after_queue exit forwards inserted Set
+    begins to the actual FIFO successor without entering the source begin.
+    These cuts do not create asynchronous completion.
     """
-    loop, _, streams, graph, _ = analysis
+    loop, channel_map, streams, graph, _ = analysis
     count = loop.constant_count
     require(
         type(count) is int and count >= 0 and loop.cyclic is None,
@@ -110,6 +118,29 @@ def project_fixed_child(analysis, endpoints):
         "fixed child endpoint relation budget exceeded",
     )
     poll("fixed child completion projection", endpoints=len(endpoints), ports=ports)
+    if insertion_cuts:
+        from .loop_graph import completion_graph
+        from .loop_planning import DirectCompletion
+
+        graph, streams, _, _ = completion_graph(
+            loop,
+            channel_map,
+            period=graph.period,
+            _planning=DirectCompletion(graph.period, count),
+        )
+        for sequence in streams.values():
+            for command in sequence:
+                if command.kind != "task":
+                    continue
+                poll("fixed child FIFO exits", command=command.index)
+                for residue in range(graph.period):
+                    begin = graph.ids.get((command.index, residue, "begin"))
+                    if begin is None:
+                        continue
+                    after = graph.node(command, residue, "after_queue")
+                    following, shift = graph.next_queue[command.index, residue]
+                    graph.edge((begin, 0), (after, 0))
+                    graph.edge((after, 0), (following, shift))
     flow = SymbolicCompletion()
     mapping = tuple(
         flow.node(native_family(meta, graph.period, (0, count))) for meta in graph.nodes
@@ -132,28 +163,50 @@ def project_fixed_child(analysis, endpoints):
             return None
         return mapping[node], (0, generation)
 
-    commands = {
-        (
-            (actor, command.task.uid),
-            command.channel,
-            "" if command.kind == "task" else command.kind,
-        ): command
-        for actor, sequence in streams.items()
-        for command in sequence
-    }
+    commands, ambiguous = {}, set()
+    for actor, sequence in streams.items():
+        for command in sequence:
+            key = (
+                (actor, command.task.uid),
+                command.channel,
+                "" if command.kind == "task" else command.kind,
+            )
+            if key in commands:
+                ambiguous.add(key)
+            commands[key] = command
     bindings = {}
+    milestones = {"begin", "end", "prefix"}
+    if insertion_cuts:
+        milestones |= {
+            "issue",
+            "queue",
+            "retire",
+            "implicit",
+            "admit_issue",
+            "admit_queue",
+            "after_queue",
+        }
     for site in endpoints:
         require(
-            site.point in {"begin", "end", "prefix"}
+            site.point in milestones
             and isinstance(site.position, Position)
             and type(site.position.end) is bool
             and type(site.position.offset) is int
             and site.position.offset >= 0,
             "invalid child completion endpoint milestone or inner position",
         )
-        command = commands.get((site.task, site.channel, site.action))
+        key = site.task, site.channel, site.action
+        require(
+            not insertion_cuts or key not in ambiguous,
+            "child completion endpoint names ambiguous native commands",
+        )
+        command = commands.get(key)
         require(
             command is not None, "child completion endpoint has no matching actor/native command"
+        )
+        require(
+            site.point != "after_queue" or command.kind == "task",
+            "child FIFO exit requires a native task",
         )
         generation = site.position.evaluate(count)
         require(0 <= generation < count, "inactive child completion endpoint")
@@ -187,6 +240,23 @@ def project_fixed_child(analysis, endpoints):
                 flow.edge(entry, point[0], source_point=(0, 0), target_point=point[1])
             generation = count + maximum - 1 - last.task.stage
             if point := binding(last, kind, generation):
+                flow.edge(point[0], exit, source_point=point[1], target_point=(0, 0))
+            # An acquisition at the final command's cut remains in the
+            # outgoing prefix, even if that command itself is skipped.
+            # Never feed admission back into the pre-insertion prefix.
+            if (
+                insertion_cuts
+                and kind in {"issue", "queue"}
+                and (point := binding(last, "admit_" + kind, generation))
+            ):
+                flow.edge(point[0], exit, source_point=point[1], target_point=(0, 0))
+            if (
+                insertion_cuts
+                and kind == "queue"
+                and (point := binding(last, "after_queue", generation))
+            ):
+                # The final native's successor lies outside this invocation.
+                # An inserted Set begin still belongs to the outgoing FIFO.
                 flow.edge(point[0], exit, source_point=point[1], target_point=(0, 0))
             points = {
                 point: bound[0]

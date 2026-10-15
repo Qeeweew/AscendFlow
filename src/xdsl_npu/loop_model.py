@@ -814,7 +814,7 @@ def _check_prefixes(loop, all_views):
                 )
 
 
-def _check_accesses(loop, all_views):
+def _check_accesses(loop, all_views, *, native=True):
     from .model import ranges_cover
 
     writes = {
@@ -964,6 +964,8 @@ def _check_accesses(loop, all_views):
                             ),
                             f"{root}: access crosses its task frame",
                         )
+    if not native:
+        return
     for actor, data in loop.actors.items():
         views = all_views[actor]
         for value, ref in views.items():
@@ -1019,6 +1021,34 @@ def _check_accesses(loop, all_views):
                         ),
                         f"{task.uid}: shifted in-place Vector alias",
                     )
+
+
+def verify_access_ownership(loop):
+    """Check derived boundary byte fragments, whose natives were checked below.
+
+    Fragments preserve real allocation identities and capture offsets. A cut
+    inside a DMA row need not have DMA-origin alignment; the original native
+    view, not the cut, carries that separate contract.
+    """
+    views = {
+        actor: dict(
+            enumerate(dict.fromkeys(ref for task in data.program.tasks for ref in task.refs))
+        )
+        for actor, data in loop.actors.items()
+    }
+    visits = sum(
+        loop.storage_periods[loop.root(actor, ref)]
+        * ref.rows
+        * (loop.access_groups(ref.storage) if ref.storage.external else 1)
+        for actor, refs in views.items()
+        for ref in refs.values()
+    )
+    require(visits <= MAX_ACCESS_SEGMENTS, "scope ownership fragment/group budget exceeded")
+    require(
+        all(ref.prefix_extent is None for refs in views.values() for ref in refs.values()),
+        "scope boundary ownership cannot assume clipped native fragments",
+    )
+    _check_accesses(loop, views, native=False)
 
 
 def access_cells(loop, *, roots=None, include_readonly=False):

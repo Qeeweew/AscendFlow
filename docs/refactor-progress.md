@@ -7,10 +7,83 @@
 本页区分本轮实现、历史性能和仍未接通的能力。
 
 **新 DSL 的完整 Flash Attention 仍不能编译。** 旧FA、公开physical builder与
-tracer入口已删除；没有绕行内部构造器的兼容example。runtime BNSD局部流水已
-接通，下一主线是一般nested CV，[计划](refactor-plan.md)规定其退出条件。
+tracer入口已删除；没有绕行内部构造器的兼容example。runtime BNSD局部流水与
+一层固定child的嵌套CV已通过CANN与设备正确性；完整FA还受共享存储生命周期、
+first/last和多运行时钟限制，[计划](refactor-plan.md)规定其退出条件。
 
-## 本次推进：真实作用域与固定 child 边界
+## 当前推进：保留实际父子流水与跨核协议
+
+公开`compile(prim_func)`已接入实际`CallOp`与`CaptureOp`，外层`Pipelined(n)`
+保持runtime参数，固定child保留独立时钟与native模板。capture只是原allocation
+的地址别名，不分配新buffer、不搬运数据，也不提供完成语义。
+当前接纳一个根Pipelined及其直接固定child；同层普通工作作为Once call保留。
+跨层动态child、first/last分支和多个runtime轴仍明确拒绝。
+
+`tests/fixtures/nested.py:nested_cv`是两组AIC/双AIV的编译器回归：Cube child
+分两列块计算Gram矩阵并FIX导出；Vector child分行读取、乘二并写出。
+11个native模板和3个call保留，父GM环为双缓冲。父同步直接定位到真实inner
+native与child generation；不在child退出插入drain。同步前后的主要区别为：
+
+```text
+before: FIX Score[t%2]    / 两个AIV各自MTE2读取Score[t%2]
+after:  最后FIX → ready Set(0) → 两个AIV各自第一次MTE2前Wait(0)
+        两个AIV各自最后MTE2 → release Set(1) → FIX(t+2)前Wait(1)
+```
+
+ready覆盖全部已写列块，release等待两个真实reader的MTE2退休；无需等待其后
+Vector计算或输出搬运。L1/L0A/L0B/L0C/UB的跨父调用复用另外从实际最后reader
+生成本地event。最终verifier从实际IR重建地址、端点、quorum及event消费。
+同一native侧的多个父同步必须符合声明顺序并紧邻该native，不能跨越child同步。
+已有反例证明交换local Wait与cross Wait会破坏旧Wait→下一Set，不能只核对配对。
+
+父图只压缩已证明的child内部关系；不压缩父协议环。SCC后的局部DAG用拓扑序
+与bitset直接约简，未对真实同步做“试删再验证”。初始CV父图的7,551条边约简至
+554条（补全FIFO出口前的结构测量）；补齐FIFO与跳过同步的透明前缀后为415节点、
+663边，仍为11个native模板、12个父channel和2个跨核counter。实际指令未因关系
+约简删除，不使用带cProfile的耗时代替冷计时。
+
+初始化检查另发现并修正实际IR漏洞：child内部残留`core_stride/core_terms`会在
+blocks=1的分析视图中丢失，父摘要可能把另一核读到的未写区域误认成已写。
+现在明确要求祖先核坐标/count平移全部进入Capture；真实child残留分量会拒绝。
+错误根、span、对齐、双clock、隐藏effect及count+stage溢出均有mutation回归。
+
+复杂度边界：runtime父长度N不枚举。固定child长度C仍参与访问footprint扫描，
+readonly family可保留C个端点；交叉访问切片的最坏成本可为二次，不能宣称与C
+无关。`parent_access_visits`记录child片段、child摘要、父周期片段与cut成本，
+累计上限100万；父存储周期来自Capture的modulo，不把child长度当作周期。
+完成投影的端点两两关系也单独计数并限预算，约简没有取消其提取成本。
+
+| 当前证据 | 结果 |
+|---|---|
+| 受影响的Python/IR、符号关系、独立有限图及代码生成回归 | 477项通过，91.97秒；不是单算子编译时间 |
+| 五个独立冷进程，源码读取/构造→最终检查→ASC | p50 1.6563秒 / max 1.6663秒；import另计，RSS峰值40 MiB |
+| Python→ASC→CANN/shared，总期限300秒 | 6.476秒；其中CANN 4.774秒；`-O2`、`dav-2201` |
+| 同一binary设备正确性 | 物理6→逻辑0；全卡状态检查后，n=0/1/2/3/7/31/257，各10次；全部输出、最终两个槽精确一致，input/guard不变 |
+
+证据位于外层`runs/refactor/nested-cv/`：`regression.log`、`cold-release/benchmark.json`、
+`build/source.xdsl`、`before.xdsl`、`after.xdsl`、`nested_cv.asc`及CANN manifest；
+`build/device/result.json`记录设备、shape、重复数、源码与库hash及结果。
+ASC SHA256为`fa18b42dd67aa464e090a3e4fe0665dfb2f79da458cf026d5ee76df0e3192bea`。
+该小回归没有吞吐量、ACLNN或profiling结论，也未达到常用内核p50≤1秒的目标。
+复现命令从工作区根目录执行，设备命令仅在物理6仍健康空闲时使用：
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --output runs/refactor/nested-cv/build --build
+ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --output runs/refactor/nested-cv/build --physical 6
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/tests/fixtures/nested.py --entry nested_cv --output runs/refactor/nested-cv/cold-release
+```
+
+**尚未解决的两个具体反例：**
+
+- `nested_copy`的child本地event只按inner generation轮转；跨parent调用仍可能
+  在上次Wait前re-Set，当前拒绝。不能用新增buffer或child drain掩盖。
+- `shared_l0c_qk_pv`保留共享L0C，QK/PV操作数独立。现有logical frontier要求
+  `PV(t).FIX → QK(t+1).MAD`，与显式`QK(t+1) → PV(t)`派发相冲突，当前报cycle。
+  后续先固定逻辑RAW及RW recurrence，再对独立结果的物理生命周期推导复用；
+  不按physical issue重绑所有read。协议需要独立的端点代次与激活域，处理负逻辑
+  代次差和启动/排空。这个反例不是FA已接通的证据。
+
+## 已保存阶段 a788cbc：真实作用域与固定 child 边界
 
 - AST lowering已实际使用一次收集的`Scope/Context`，保留原始clock SSA、
   祖先Stage、guard和actor；每个源效果只收集一次。现有Vector、Cube、serial、
@@ -74,7 +147,7 @@ for name, source in (("pitched_children", pitched_children), ("cube_columns", cu
 PY
 ```
 
-**未完成：**父级Pipelined中重叠的child调用、父代次地址捕获、跨child的双AIV
+**该阶段未完成：**父级Pipelined中重叠的child调用、父代次地址捕获、跨child的双AIV
 贡献与资源寿命、独立query/kv运行时钟及first/last路径。当前nested FA仍明确
 拒绝，不能将本次local sequence接线称为nested CV或FA接入完成。
 
@@ -124,7 +197,7 @@ PY
 
 | 路径 | 已有能力 | 明确边界 |
 |---|---|---|
-| AST DSL → source IR → physical IR → AutoSync → ASC | runtime 局部流水、Vector/归约、显式 Cube、受限 serial parent/child、部分局部 CV、BNSD cyclic局部寻址 | 一般 nested mixed/CV、跨query多时钟与完整 FA 未接通 |
+| AST DSL → source IR → physical IR → AutoSync → ASC | runtime 局部流水、Vector/归约、显式 Cube、受限 serial parent/child、固定直接child的nested CV、BNSD cyclic局部寻址 | 分支/多层或动态child、独立生命周期重排、跨query多时钟与完整 FA 未接通 |
 | 内部physical IR测试 | 保留机器访问、事件、ownership与退休反例 | 没有旧用户DSL；有限fixture不证明runtime FA支持 |
 | FA 设计 fixture | 原始完整数学主体可生成source IR，包含负无穷初始化；静态容量与有限派发表检查 | 物理编译仍拒绝，不是 executable example |
 | 独立 AscendC / 安装 ACLNN | 数值、排步与性能参照 | 不证明编译器或新 DSL 支持同一算子 |
@@ -142,9 +215,9 @@ AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是
 | API | 旧公开task/tracer及FA入口已删除，AST接口保留 | 不再维护兼容层；内部物理fixture不成为用户入口 |
 | INPUT | minimum/multiple合同已贯通IR/launcher；多参数关系与head映射仍未完成 | 继续完善可验证地址/owner前提，保留溢出和空工作语义 |
 | INDEX | 原始轴SSA与受限runtime商余已贯通局部流水；runtime row pitch/多时钟动态stride仍拒绝 | 延伸同一范围/ownership合同，不把合法长度放入编译键 |
-| CV | `region_lowering.py` 拒绝一般 mixed sequence 和 AST nested pipeline；条件 lowering 仅有受限末代后缀 | 保留父子 actor/clock/generation、first/last/零次路径；完整 QK/softmax/PV/update 纵向闭环 |
+| CV | `scope_lowering`已保留直接固定child与父代次capture；更深层、first/last和多时钟仍拒绝 | 从当前真实call继续扩展；完整 QK/softmax/PV/update 纵向闭环 |
 | MEMORY | cyclic局部不等长/空group已证明；共享 Q/K/V、间接地址及跨 child 复用仍不足 | 真实范围、有效域、最后读取和 owner 分区；buffer 分配/布局/可见性与同步一同验证 |
-| SYNC | runtime 叶已直接生成，局部mixed已有双AIV quorum；legacy仍有候选试删。一般nested CV中的贡献组合和事件共享未完成 | 共用硬件完成语义，分开物理访问与事件寿命；最终从实际 IR 检查，不能旁路或加任意 barrier |
+| SYNC | runtime叶与直接固定child已有双AIV quorum；跨parent的leaf event轮转、独立定义复用和legacy候选试删仍待处理 | 共用硬件完成语义，分开物理访问与事件寿命；最终从实际 IR 检查，不能旁路或加任意 barrier |
 | EFFECT | 细粒度 native 已能在最后 reader 后早 release，但主要使用 task end；SPR/入口协议另有特殊处理 | 明确每个 native 的读退休、写完成与配置资源合同；不能让高层 recipe 隐藏多个里程碑 |
 | EVENT | 已有有限表分段周期压缩和标准整数 pass；有限 ID 表仍随 generation 增长，runtime 跨 channel/region 共享不足 | 从符号寿命直接分配/表达 ID；化简不得改变配对、代次或等待位置 |
 | COMPILE | 查询域拓扑已共享；条件记录扫描、激活绑定、父层重复工作仍需测量 | 拒绝用结构改善代替真实耗时；事实成本和父层计数继续跟踪 |

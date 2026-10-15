@@ -7,7 +7,7 @@ from examples.vector.scale import scale
 from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.frontend import FrontendError, PrimFunction
-from xdsl_npu.ir import dump, parse
+from xdsl_npu.ir import CallOp, StreamOp, TaskOp, dump, parse
 from xdsl_npu.model import CompileError, Program
 from xdsl_npu.source_ir import AllocationOp, CopyOp, PipelineOp, SizeOp
 
@@ -133,8 +133,12 @@ def test_ast_constant_nested_pipeline_is_not_sent_to_legacy_unrolling():
                         N.fill(x[j % 2, :], 0.0)
     """)
     assert len([op for op in definition.to_ir().walk() if isinstance(op, PipelineOp)]) == 2
-    with pytest.raises(CompileError, match="do not authorize implicit unrolling"):
-        compile(definition)
+    result = compile(definition)
+    physical = parse(result.before_ir)
+    assert len([op for op in physical.walk() if isinstance(op, CallOp)]) == 1
+    assert [op.count.data for op in physical.walk() if isinstance(op, StreamOp)] == [4, 3]
+    assert len([op for op in physical.walk() if isinstance(op, TaskOp)]) == 1
+    assert result.report["native_templates"] == 1
 
 
 @pytest.mark.parametrize(
