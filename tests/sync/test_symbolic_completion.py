@@ -99,6 +99,21 @@ def test_an_individual_set_effect_is_not_a_monotone_native_prefix():
     assert not flow.coverage(consumer, (0, 1), 1, ALL)
 
 
+def test_fixed_source_shift_to_tail_keeps_each_affine_choice_branch_independent():
+    flow = SymbolicCompletion()
+    source = flow.node(Family(0, (1, -1)))
+    tail = flow.node(Family(0, (1, -1), last=(1, -1)))
+    flow.edge(source, tail, 1)
+    flow.seed(source, (0, 0), ALL, 1)
+    flow.propagate()
+    coverage = flow.coverage(tail, (1, -1), 1, ALL)
+    # The actual edge reaches generation 1, which is the tail only at N=2.
+    # A singleton binding in the N>=2 branch must not rewrite the lower
+    # endpoint used by the sibling N<=1 horizon branch.
+    for count in range(8):
+        assert any(domain.contains(count) for domain in coverage) == (count == 2)
+
+
 def test_boundary_link_changes_clock_only_at_its_exact_source_milestone():
     flow = SymbolicCompletion()
     prefix = flow.node(Family(0, (1, -1), monotone=True))

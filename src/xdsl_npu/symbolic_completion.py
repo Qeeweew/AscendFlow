@@ -264,20 +264,21 @@ class SymbolicCompletion:
             return
         for left, lower_domain in choice(lo, (0, lower), guard, maximum=True):
             for right, domain in choice(hi, horizon, lower_domain, maximum=False):
-                domain = meet(domain, le(left, right))
+                active_left, active_right = left, right
+                domain = meet(domain, le(active_left, active_right))
                 if domain is None:
                     continue
                 if last is not None:
-                    domain = meet(domain, meet(le(left, last), le(last, right)))
+                    domain = meet(domain, meet(le(active_left, last), le(last, active_right)))
                     domain = meet(domain, family.residue_guard(last))
                     if domain is None:
                         continue
-                    left = right = last
+                    active_left = active_right = last
                 if family.monotone:
                     # Reach the real prefix once, then use its transparent
                     # carry cycle. Never extend a native end or Set effect.
-                    right = horizon
-                self._remember(node, left, right, domain, bits)
+                    active_right = horizon
+                self._remember(node, active_left, active_right, domain, bits)
 
     def seed(self, node, point, guard, bits):
         self.add_fact(
