@@ -229,6 +229,52 @@ def nonnegative(expr, facts):
     return lower >= 0
 
 
+def _joint_affine_interval(expr, domains, facts):
+    """Recover a proved joint coordinate after ordinary polynomial expansion.
+
+    A captured address may spell ``tile*core + tile*groups*query`` rather
+    than ``tile*(core + groups*query)``. Independent intervals lose the
+    owner/query correlation. Use an exact polynomial identity with a positive
+    constant scale and a uniform bias; never infer a new iteration domain.
+    """
+    candidates = [
+        (coordinate, lower, upper)
+        for coordinate, lower, upper in domains
+        if len({name for name in arguments(coordinate) if name.startswith("$")}) > 1
+    ]
+    if not candidates or expr.kind not in {"add", "mul"}:
+        return None
+
+    def varying(poly):
+        return {
+            term: coefficient
+            for term, coefficient in poly.items()
+            if any(name.startswith("$") for atom in term for name in arguments(atom))
+        }
+
+    top = polynomial(expr, facts)
+    left = varying(top)
+    if not left:
+        return None
+    for coordinate, lower, upper in candidates:
+        bottom = polynomial(coordinate, facts)
+        right = varying(bottom)
+        if not right or left.keys() != right.keys():
+            continue
+        ratios = {left[term] / coefficient for term, coefficient in right.items()}
+        if len(ratios) != 1:
+            continue
+        (ratio,) = ratios
+        if ratio <= 0 or ratio.denominator != 1:
+            continue
+        bias = _to_expr(_sum(top, _scale(bottom, -ratio)))
+        scale = literal(int(ratio))
+        return tuple(
+            expression("add", expression("mul", scale, bound), bias) for bound in (lower, upper)
+        )
+    return None
+
+
 def interval(expr, domains, facts):
     """Inclusive symbolic range on an active loop iteration.
 
@@ -239,6 +285,9 @@ def interval(expr, domains, facts):
     for coordinate, lower, upper in domains:
         if equivalent(expr, coordinate, facts):
             return lower, upper
+    correlated = _joint_affine_interval(expr, domains, facts)
+    if correlated is not None:
+        return correlated
     if expr.kind in {"constant", "argument"}:
         return expr, expr
     a, b = expr.args

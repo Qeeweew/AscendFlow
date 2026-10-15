@@ -31,6 +31,23 @@ def _replace_argument(expr: Expr, name: str, value: Expr) -> Expr:
     return visit(expr)
 
 
+def _subtract_static_bias(expr: Expr, bias: int) -> Expr:
+    """Fold additive constants without expanding quotient/remainder atoms."""
+    terms, pending, constant = [], [expr], -bias
+    while pending:
+        current = pending.pop()
+        if current.kind == "add":
+            pending.extend(reversed(current.args))
+        elif current.constant is not None:
+            constant += current.constant
+        else:
+            terms.append(current)
+    result = literal(constant)
+    for term in terms:
+        result = expression("add", result, term)
+    return result
+
+
 def _check_relative(relative: Expr, child_clock: str | None) -> None:
     names = arguments(relative)
     require(
@@ -131,19 +148,22 @@ def split_offset(
     _check_relative(relative, child_clock)
     if not parent_terms:
         parent = literal(0)
-    elif all(coefficient.denominator == 1 for coefficient in parent_terms.values()):
+    elif all(coefficient.denominator == 1 for coefficient in parent_terms.values()) and not any(
+        atom.kind == "floordiv" for term in parent_terms for atom in term
+    ):
         parent = _to_expr(parent_terms)
     else:
-        # Exact parameter divisibility can give proof fractions (Sq/128).
-        # Preserve the original runtime quotient instead of emitting fractions
-        # or specializing the parameter. At child=0, subtract the entire static
-        # relative value; periodic child atoms may themselves have nonzero bias.
+        # Proof fractions (Sq/128) and expanded divmod correlations must not
+        # become the emitted address. Retain the original quotient/remainder
+        # tree, whose range is known, rather than x - d*(x/d). At child=0,
+        # subtract the entire static relative value; periodic child atoms may
+        # themselves have nonzero bias. The polynomial still proves the split.
         parent = address
         zero_relative = relative
         if child_clock is not None:
             parent = _replace_argument(parent, child_clock, literal(0))
             zero_relative = _replace_argument(relative, child_clock, literal(0))
-        parent = expression("sub", parent, literal(zero_relative.evaluate({})))
+        parent = _subtract_static_bias(parent, zero_relative.evaluate({}))
         require(
             polynomial(parent, facts, periodic=True) == parent_terms,
             "ancestor capture does not match the canonical parent address",

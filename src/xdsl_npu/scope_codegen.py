@@ -510,6 +510,10 @@ def emit_scope_actor(checked, actor, uniform_names):
 def emit_scopes(checked, *, host_launcher=True):
     from .loop_codegen import emit_loop
 
+    require(
+        not checked.program.invocations,
+        "nested serial invocations need verified cross-query protocols before ASC emission",
+    )
     return emit_loop(
         (checked.access.loop, {}, {}, None, None),
         host_launcher=host_launcher,

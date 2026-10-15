@@ -521,6 +521,12 @@ class _Actor:
         if total is not None:
             flat = expression("add", core, expression("mul", g, literal(self.program.groups.data)))
             domains.insert(0, (flat, literal(0), expression("sub", total, literal(1))))
+        for source_coordinate, owner_domain in self.bindings.owner_domains.items():
+            if source_coordinate not in coordinates:
+                continue
+            actual = Expr("argument", (coordinates[source_coordinate],))
+            flat = expression("add", core, expression("mul", actual, literal(owner_domain.groups)))
+            domains.insert(0, (flat, literal(0), expression("sub", owner_domain.total, literal(1))))
         if self.invocation is not None:
             domains.append(
                 (
@@ -1086,6 +1092,10 @@ def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=()):
     from .loop_model import extract_loop, loop_dependencies
 
     loop = extract_loop(physical) if extracted is None else extracted
+    if not any(
+        record.op.dependencies for lowering in actors.values() for record in lowering.records
+    ):
+        return
     raw = [o for o in loop_dependencies(loop, live_in=live_in) if o.hazard == "RAW"]
     for actor, lowering in actors.items():
         owner = actor if len(actors) == 3 else ("aic" if actor == "cube" else "aiv0")
@@ -1155,7 +1165,7 @@ def lower_source(module, *, symbolic=True):
         from .scope_lowering import has_nested_pipelines, lower_scopes
 
         if has_nested_pipelines(program) and any(
-            isinstance(op, PipelineOp) for op in program.body.block.ops
+            isinstance(op, (PipelineOp, scf.ForOp)) for op in program.body.block.ops
         ):
             return lower_scopes(program)
 

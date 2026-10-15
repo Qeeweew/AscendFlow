@@ -73,6 +73,10 @@ class ActorBindings:
         self.allocation_order = {op: i for i, op in enumerate(allocations)}
         self.externals = {op for op in allocations if op.ref.type.memory.data == "GM"}
         self.roots, self.frame_specs, self.operand_buffers = {}, {}, {}
+        # These domains belong to actual source block arguments. A retained
+        # serial owner's bound is not a uniform value or a leaf's generation.
+        self.owner_domains = {}
+        self.scoped_serial_bounds = {}
         self.configured = False
         self.execution_anchor = None
 
@@ -112,6 +116,58 @@ class ActorBindings:
         self.uniform[pipeline.limit] = count.count
         self.cyclic_total = total_expr
         return count.count
+
+    def scoped_serial_bound(self, serial):
+        """Bind one actual serial owner without the legacy invocation frames.
+
+        Only a declared uniform bound or the existing cyclic owner formula is
+        admitted. Keep owner-dependent counts out of ``uniform``: the query
+        clock and the inner KV clock have independent bounds and identities.
+        """
+        from .cyclic import CyclicDomain
+        from .indexing import equivalent
+        from .ir import CyclicCountOp
+        from .scalar import Expr
+
+        require(
+            isinstance(serial, scf.ForOp)
+            and serial.parent_op() is self.program
+            and self.invocation is None,
+            "scoped serial bound needs its actual root query loop",
+        )
+        if serial in self.scoped_serial_bounds:
+            return self.scoped_serial_bounds[serial]
+        if serial.ub in self.uniform:
+            value = self.uniform[serial.ub]
+        else:
+            owner = self.program.body.block.args[0]
+            core = Expr("argument", ("$core",))
+            bound = from_ssa(serial.ub, coordinates={owner: "$core"}, facts=self.facts)
+            require(
+                bound.kind == "ceildiv"
+                and bound.args[1] == literal(self.program.groups.data)
+                and bound.args[0].kind == "max"
+                and literal(0) in bound.args[0].args,
+                "scoped serial bound requires a uniform count or a proved cyclic owner domain",
+            )
+            remaining = next(arg for arg in bound.args[0].args if arg != literal(0))
+            total = expression("add", remaining, core)
+            candidates = [
+                (expr, value)
+                for expr, value in self.uniform_by_expression.items()
+                if uniform(expr, self.facts) and equivalent(expr, total, self.facts)
+            ]
+            require(candidates, "scoped cyclic count must retain its declared uniform total")
+            total_expr, total_value = candidates[0]
+            count = CyclicCountOp.create(operands=[total_value], result_types=[IndexType()])
+            self.kernel.block.add_op(count)
+            self._place_declaration(count)
+            value = count.count
+            self.owner_domains[serial.body.block.args[0]] = CyclicDomain(
+                total_expr, self.program.groups.data
+            )
+        self.scoped_serial_bounds[serial] = value
+        return value
 
     def mark_region(self, region):
         if self.execution_anchor is None:

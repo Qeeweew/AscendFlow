@@ -9,11 +9,75 @@
 **新 DSL 的完整 Flash Attention 仍不能编译。** 旧FA、公开physical builder与
 tracer入口已删除；没有绕行内部构造器的兼容example。runtime BNSD局部流水与
 一层固定child的嵌套CV已通过CANN与设备正确性；stationary私有L0C的跨调用复用
-现也完成设备闭环。本轮接通一个实际parent时钟上的native first/last执行；
-完整FA仍受外层mixed serial query、独立query/kv时钟及其ownership限制，
-[计划](refactor-plan.md)规定其退出条件。
+现也完成设备闭环。parent native首末执行已接通；本轮将原nested FA完整降到
+保留query/KV/child时钟的物理IR。**跨query内存与event寿命尚未证明，完整FA
+仍不能生成可执行ASC**，[计划](refactor-plan.md)规定其退出条件。
 
-## 本轮：保留子流水中的原生首末条件
+## 本轮：真实 FA 的三个时钟与 UB 原样复制
+
+原[FA主体](design/attention_target.py.in)未改。现在source→physical路径保留
+20组AIC/双AIV、12个call、72个native模板及原始buffer、数学运算和排步。
+query为实际`scf.For`，KV仍为runtime Stream，四类固定child保持自己的时钟。
+各actor的query域必须一致，支持cyclic不等长和空owner；`(query*kv_tiles+kv)%2`
+保留真实跨query槽相位。没有使用旧Frame假设、展开query或插入query drain。
+物理IR提取检查clock、原root、地址范围和alignment；这不替代同步/ownership证明。
+
+地址修复均按通用语义处理：展开的`tile*core+tile*groups*query`从已验证joint
+domain恢复相关区间；捕获分离继续用多项式证明等价，但保留原始商余表达式，
+避免把`x%2`展开成`x-2*(x/2)`后丢失范围和可读性。若源程序没有显式SSA tile
+依赖，跳过该专用检查的冗余RAW构造；物理抽取与最终内存/同步验证仍保留。
+
+真实FA还暴露了`N.copy(next_m,m[row])`未接UB→UB的问题，现已增加通用原生
+路径。CANN 9.1的dav_c220接口明确标记`begin_pipe(V)`，2201实现直接调用
+`copy_ubuf_to_ubuf`，size单位是byte。编译器建模为V的R/W异步访问，使用
+`asc_copy_ub2ub`；拒绝重叠/不可证明别名、非32字节块、prefix/tail及错误owner。
+没有用浮点运算模拟复制，也没有额外GM staging。
+
+独立fixture [ub_copy](../tests/fixtures/ub_copy.py)的同步前是GM→UB→UB→GM三段；
+同步后保留3个native模板、原来两份64字节UB，生成以下4组协议：
+
+```text
+MTE2 load(g) → V copy(g)       ready
+V copy(g)   → MTE3 store(g)   ready
+V copy(g)   → MTE2 load(g+2)  source-slot release
+MTE3 store(g) → V copy(g+2)   destination-slot release
+```
+
+删除每个实际ready/release，最终verifier和独立byte/DAG模型均拒绝。新route
+24项回归通过；query/地址/既有pipeline等集成回归406项通过，52.49秒。query
+fixture另以真实source SSA解释检查顺序数值和byte footprint，未将其冒充同步模型。
+UB copy整链构建5.450秒（统一300秒期限，CANN 9.1/dav-2201/-O2）；全卡状态
+检查后物理6→逻辑0，同一binary对N=0/1/2/3/7/4096各运行10次，输出、输入和
+保护区逐字节一致，包括±0、inf及qNaN/sNaN payload。没有FA吞吐量结论。
+
+五个独立冷进程，源码读取/构造→最终检查→ASC（import/CANN另计）：
+
+| 输入 | p50 / max，秒 |
+|---|---|
+| ub_copy | 0.2107 / 0.2166 |
+| native_guarded_recurrence | 1.9829 / 2.0053 |
+| nested_copy | 1.3523 / 1.3862 |
+| nested_cv | 1.6733 / 1.6772 |
+| shared_l0c_qk_pv | 3.2898 / 3.2978 |
+
+不能由局部省掉分析宣称整体提速；四个既有输入仍未达到常用kernel p50≤1秒
+目标，其ASC与上一阶段设备版本逐字节相同。UB copy的ASC/设备来源hash一致。
+全部证据在`runs/refactor/scoped-queries/`：`physical/attention/`保存原source和
+物理IR，明确记录同步拒绝、无ASC；`ub-copy/`保存同步前后IR、ASC、CANN和设备
+结果；`cold-final/`与`validation.json`记录冷测、代码身份和hash核对。
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m tests.support.run_ub_copy --output runs/refactor/scoped-queries/ub-copy --build
+ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_ub_copy --output runs/refactor/scoped-queries/ub-copy --physical 6
+.venv/bin/python -m pytest -q compiler/tests/test_scope_serial_integration.py compiler/tests/test_ub_copy.py
+```
+
+设备命令执行前须确认物理6仍健康空闲。下一步在真实capture上处理query tile、
+共享只读head映射与全局epoch环，再证明query尾全部reader/退休/Wait消费到
+下query初始化和Set的关系。当前autosync、专家physical验证及emitter均保留门禁，
+不会漏掉外层循环而返回成功。continuous仍拒绝runtime-cycle首末谓词。
+
+## 已保存阶段 4070d31：保留子流水中的原生首末条件
 
 公开DSL fixture [native_guarded_recurrence](../tests/fixtures/guarded.py)现在贯通
 源码→同步前后IR→ASC→CANN→设备。它在首次parent初始化state/factor，固定的
@@ -430,7 +494,7 @@ AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是
 | API | 旧公开task/tracer及FA入口已删除，AST接口保留 | 不再维护兼容层；内部物理fixture不成为用户入口 |
 | INPUT | minimum/multiple合同已贯通IR/launcher；多参数关系与head映射仍未完成 | 继续完善可验证地址/owner前提，保留溢出和空工作语义 |
 | INDEX | 原始轴SSA与受限runtime商余已贯通局部流水；runtime row pitch/多时钟动态stride仍拒绝 | 延伸同一范围/ownership合同，不把合法长度放入编译键 |
-| CV | `scope_lowering`已保留直接固定child、父代次capture及实际parent first/last；mixed query外壳与多时钟仍拒绝 | 从当前真实call继续扩展；完整 QK/softmax/PV/update 纵向闭环 |
+| CV | 原nested FA的query/KV/fixed-child已到物理IR，parent first/last保留；跨query同步仍拒绝 | 从真实capture和最后reader/event消费继续扩展；完整 QK/softmax/PV/update 纵向闭环 |
 | MEMORY | cyclic局部不等长/空group已证明；共享 Q/K/V、间接地址及跨 child 复用仍不足 | 真实范围、有效域、最后读取和 owner 分区；buffer 分配/布局/可见性与同步一同验证 |
 | SYNC | runtime叶与直接固定child已有双AIV quorum；跨parent事件宽度/池共享、stationary私有独立定义复用及首末访问域已接通；跨query消费与条件ring仍不足 | 共用硬件完成语义，分开物理访问与事件寿命；最终从实际 IR 检查，不能旁路或加任意 barrier |
 | EFFECT | 细粒度 native 已能在最后 reader 后早 release，但主要使用 task end；SPR/入口协议另有特殊处理 | 明确每个 native 的读退休、写完成与配置资源合同；不能让高层 recipe 隐藏多个里程碑 |

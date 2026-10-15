@@ -4,8 +4,9 @@
 “继续优化 legacy FA”与“先取消首尾窗口”的安排。当前已完成旧公开API删除、输入minimum/multiple合同、局部查询域拓扑共享
 和通用构建期限；随后接通runtime轴SSA、商余寻址和cyclic局部ownership。
 实际测试与编译结果见状态页。以下保留整个重构的目标和退出
-条件；当前已接通直接固定child的nested CV、stationary私有L0C复用和一个实际
-parent时钟上的native first/last条件。完整FA仍未完成。
+条件；直接固定child的nested CV、stationary私有L0C复用和parent native首末
+条件已有设备闭环。原nested FA的query/KV/child物理lowering现已接通，跨query
+同步仍明确拒绝，完整FA仍未完成。
 
 ## 目标、边界与次序
 
@@ -97,19 +98,24 @@ query tile 分给20组已经产生12/13差异，不能追加长度整除组数�
   frame支持以固定次数、统一正stride、frame内访问与allocation边界为前提。
   这一能力不接纳runtime余数周期、parent条件ring或缺少复用证明的event宽度调整。
 
-下一主线是**原nested FA的serial query → runtime KV → fixed child**，不改
-target主体、不把query扁平化成展开任务，也不把首尾条件改成child末次。源码审查
-确认根serial当前落入`region_lowering`的单actor限制；只删除该检查不能接通：
-`scope_lowering`与`scope_model`目前也只接一个根Stream。按以下顺序扩展同一路径：
+主线是**原nested FA的serial query → runtime KV → fixed child**，不改target
+主体、不展开query，也不把parent首尾条件改成child末次。实际source/物理抽取已
+接通，保留72个native模板、12个call和20组AIC/双AIV的三个独立时钟。当前公共
+编译明确拒绝跨query同步，不能把结构/地址检查当作完整同步验证。
 
-1. 保留query、KV、child三个真实SSA时钟，Stage只位移KV；把query坐标和原BNSD
-   轴来源传入Capture/地址检查与ASC，不能用字符串或旧连续Frame假设重绑地址。
-2. query使用既有cyclic ownership合同，证明同group的AIC和两个AIV有相同
+1. **已接物理IR：**query、KV、child三个真实SSA时钟，Stage只位移KV；query与
+   原BNSD地址进入Capture。没有套用旧连续Frame，也尚未启用该结构的ASC。
+2. **已接域和地址边界：**query使用既有cyclic count，检查同group的AIC/双AIV有相同
    `ceildiv(max(0,total_queries-group),groups)`域；覆盖12/13次与零工作owner。
    KV保持uniform runtime bound，三块GM双槽和local状态跨query复用同一root。
-3. 将query尾的真实最后读取、退休和旧Wait消费接到下query的重写/初始化及
-   新Set；serial控制退出不提供异步完成，不添加query drain或额外buffer。
-4. 先用同结构mixed递推做公开DSL→实际IR破坏/独立有限模型→ASC/CANN→设备
+   这些域不自动证明GM写入不别名；最终ownership仍须进入同步分析。
+3. **下一步：**按实际capture区分Q/O的query tile、K/V的共享只读head映射、
+   stationary私有状态与Score/P/PV/alpha的全局epoch环。环相位是
+   `(query*kv_tiles)%2`，不得改成每query重置槽位。先在冻结query的KV域内
+   证明真实访问，再将query尾的全部最后读取、退休和旧Wait消费投影到下query
+   的重写/初始化与新Set；复用现有符号完成关系与原生端点，不插query drain。
+4. 同结构mixed递推已经通过source顺序数值/地址及实际物理IR时钟负测；下一步
+   补跨query的独立有限同步模型→ASC/CANN→设备
    闭环，覆盖query=0/1/2/3和KV=1/2/3、漏一方AIV及错clock/root；随后用原FA
    source验证下一具体阻塞。小反例不代替FA数值或性能验收。
 

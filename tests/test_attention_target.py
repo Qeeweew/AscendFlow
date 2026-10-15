@@ -46,10 +46,10 @@ def test_both_organizations_share_actual_algorithm_and_explicit_operations():
 
 
 def test_source_is_explicitly_refused_without_falling_back_to_legacy():
-    # The actual infinities and all mathematical operations now reach source
-    # IR. Hierarchical physical synchronization still needs implementation.
+    # The nested source now reaches physical IR with its real query/KV/child
+    # clocks. Cross-query memory and event lifetimes still need proof.
     for continuous, error in (
-        (False, "one local actor and parent"),
+        (False, "cross-query memory and event lifetime synchronization"),
         (True, "runtime-cycle predicates are unsupported"),
     ):
         with pytest.raises(CompileError, match=error):

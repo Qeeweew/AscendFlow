@@ -547,6 +547,10 @@ def _analyses(program):
 def _scope_access(program):
     from .scope_access import analyze_scope_access
 
+    require(
+        not program.invocations,
+        "nested serial invocations need cross-query memory and event lifetime synchronization",
+    )
     access = analyze_scope_access(program, definitions=True)
     if any(leaf.cases for leaf in program.leaves.values()):
         from .scope_guarded_access import analyze_guarded_access
@@ -792,6 +796,10 @@ def autosync_scopes(module, *, _capture=None):
         "nested AutoSync requires unsynchronized physical calls",
     )
     program = extract_scopes(result)
+    require(
+        not program.invocations,
+        "nested serial invocations need cross-query memory and event lifetime synchronization",
+    )
     banks = defaultdict(lambda: defaultdict(int))
     for leaf in program.leaves.values():
         poll("child synchronization planning")

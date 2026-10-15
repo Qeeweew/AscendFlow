@@ -18,6 +18,7 @@ from .ir import (
     CallOp,
     CaptureOp,
     CoreIdOp,
+    CyclicCountOp,
     EndOp,
     FixConfigOp,
     KernelOp,
@@ -48,6 +49,12 @@ from .scalar import (
     infer,
     literal,
     uniform,
+)
+from .scope_invocation import (
+    ScopeInvocation,
+    extract_scope_invocation,
+    query_domains,
+    verify_query_domains,
 )
 
 
@@ -91,6 +98,7 @@ class ScopedProgram:
     bound: Expr | None
     count: int | None
     groups: int
+    invocations: dict[str, ScopeInvocation] = field(default_factory=dict)
 
 
 def is_scoped(module):
@@ -141,15 +149,15 @@ def _index_operation(op, coordinates, domains, facts):
     return from_ssa(op.results[0], coordinates=coordinates, facts=facts)
 
 
-def _uniforms(operations, facts):
+def _uniforms(operations, facts, *, allow_local=False):
     values = {}
     for op in operations:
         if isinstance(op, RuntimeSizeOp):
             values[op.value] = from_ssa(op.value, facts=facts)
         elif isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC:
-            require(
-                all(value in values for value in op.operands), "scope uniform has nonuniform inputs"
-            )
+            if not all(value in values for value in op.operands):
+                require(allow_local, "scope uniform has nonuniform inputs")
+                continue
             expr = from_ssa(op.results[0], facts=facts)
             require(uniform(expr, facts), "scope bound must be a nonnegative uniform expression")
             values[op.results[0]] = expr
@@ -322,7 +330,7 @@ def extract_scopes(module):
         "duplicate nested runtime scalar name",
     )
     facts = facts_from_sizes(parameters)
-    uniforms = _uniforms(declarations, facts)
+    uniforms = _uniforms(declarations, facts, allow_local=not mixed)
     shared = {op.ref: op for op in declarations if isinstance(op, BufferOp) and op.external.data}
     require(
         len({op.sym_name.data for op in shared.values()}) == len(shared),
@@ -333,7 +341,7 @@ def extract_scopes(module):
         "nested GM roots need a disjoint alias contract",
     )
     channels = {op.sym_name.data for op in declarations if isinstance(op, ScopeChannelOp)}
-    parents, leaves, bounds = {}, {}, set()
+    parents, leaves, bounds, invocations = {}, {}, set(), {}
     for actor, kernel in kernels.items():
         require(
             kernel.core.data == ("aic" if actor == "aic" else "aiv"),
@@ -351,9 +359,14 @@ def extract_scopes(module):
             (1 if kernel.blocks is None else kernel.blocks.data) == groups,
             "nested actors disagree on groups",
         )
-        parent_loops = [op for op in kernel.body.block.ops if isinstance(op, StreamOp)]
-        require(len(parent_loops) == 1, "nested actor requires one actual parent stream")
-        parent = parents[actor] = parent_loops[0]
+        invocation, parent = extract_scope_invocation(kernel, uniforms, facts, groups)
+        parents[actor] = parent
+        if invocation is not None:
+            invocations[actor] = invocation
+    verify_query_domains(invocations, kernels)
+    for actor, kernel in kernels.items():
+        parent = parents[actor]
+        invocation = invocations.get(actor)
         _clock(parent, "parent pipeline")
         if parent.limit is not None:
             require(
@@ -396,9 +409,26 @@ def extract_scopes(module):
                 expression("sub", bound if bound is not None else literal(count), literal(1)),
             ),
         ]
+        if invocation is not None:
+            coordinates[invocation.op.body.block.args[0]] = "$parent1"
+            domains = query_domains(invocation) + domains
+        execution = parent if invocation is None else invocation.op
+        actor_values = set(uniforms) if mixed else set()
         entered = False
         for op in kernel.body.block.ops:
-            if op is parent:
+            if op is execution:
+                if invocation is not None:
+                    query = invocation.op
+                    require(
+                        query.lb in actor_values
+                        and query.step in actor_values
+                        and (
+                            query.ub in actor_values
+                            or invocation.cyclic is not None
+                            and query.ub.owner.total in actor_values
+                        ),
+                        "serial query header uses a non-dominating bound",
+                    )
                 entered = True
                 continue
             require(
@@ -411,6 +441,7 @@ def extract_scopes(module):
                     (
                         BufferOp,
                         CoreIdOp,
+                        CyclicCountOp,
                         RuntimeSizeOp,
                         StreamOp,
                         FixConfigOp,
@@ -428,11 +459,23 @@ def extract_scopes(module):
                     not isinstance(op, (RuntimeSizeOp, ScopeChannelOp)),
                     "nested actor parameters/channels must be actual shared root declarations",
                 )
-                if isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC:
-                    require(
-                        all(value in uniforms for value in op.results),
-                        "nested actor arithmetic must use actual shared uniform declarations",
-                    )
+            if isinstance(op, (RuntimeSizeOp, CoreIdOp)):
+                actor_values.update(op.results)
+            elif isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC:
+                require(
+                    all(value in actor_values for value in op.operands),
+                    "nested actor arithmetic uses a non-dominating/inner clock input",
+                )
+                _index_operation(op, coordinates, domains, facts)
+                actor_values.update(op.results)
+            elif isinstance(op, CyclicCountOp):
+                require(
+                    invocation is not None
+                    and invocation.cyclic is not None
+                    and invocation.op.ub is op.count
+                    and op.total in actor_values,
+                    "cyclic query count must retain its actual dominating total",
+                )
         calls = [op for op in parent.body.block.ops if isinstance(op, CallOp)]
         require(calls, "nested actor needs an actual child call")
         require(
@@ -462,7 +505,7 @@ def extract_scopes(module):
             require(len(children) == 1, "call needs exactly one retained child region")
             stream = children[0]
             _child_clock(call, stream, channels)
-            captures, seen, available = [], set(), set(uniforms) | set(coordinates)
+            captures, seen, available = [], set(), actor_values | set(coordinates)
             entered = False
             for op in call.body.block.ops:
                 if op is stream:
@@ -541,6 +584,8 @@ def extract_scopes(module):
                             alignments.get(ref.storage.name, 1), alignment
                         )
             address_facts = facts | {"$parent0": Fact(), "$core": Fact(0, 1, groups - 1)}
+            if invocation is not None:
+                address_facts["$parent1"] = Fact()
             for captured in captures:
                 alignment = alignments.get(captured.op.sym_name.data, 1)
                 offset_fact = infer(captured.offset, address_facts)
@@ -557,12 +602,15 @@ def extract_scopes(module):
         len(bounds) == 1 and leaves, "nested actors need one shared parent domain and real work"
     )
     bound, count = next(iter(bounds))
-    return ScopedProgram(module, root, kernels, parents, leaves, parameters, bound, count, groups)
+    return ScopedProgram(
+        module, root, kernels, parents, leaves, parameters, bound, count, groups, invocations
+    )
 
 
 def compose_scope_actors(program, modules):
     """Share actual GM/uniform SSA while retaining each actor's nested regions."""
     block, sizes, expressions, roots, kernels = Block(), {}, {}, {}, []
+    uniform_values = set()
     for actor, module in zip(("aic", "aiv0", "aiv1"), modules):
         kernel = module.body.block.first_op
         for op in list(kernel.body.block.ops):
@@ -579,7 +627,10 @@ def compose_scope_actors(program, modules):
                 )
                 op.value.replace_all_uses_with(shared.value)
                 kernel.body.block.erase_op(op)
+                uniform_values.add(shared.value)
             elif isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC:
+                if not all(value in uniform_values for value in op.operands):
+                    continue  # Core/query-local expressions stay with their actual actor.
                 expr = from_ssa(op.results[0], facts=facts_from_sizes(sizes.values()))
                 if expr not in expressions:
                     shared = op.clone()
@@ -587,7 +638,12 @@ def compose_scope_actors(program, modules):
                     block.add_op(shared)
                 op.results[0].replace_all_uses_with(expressions[expr])
                 kernel.body.block.erase_op(op)
+                uniform_values.add(expressions[expr])
             elif isinstance(op, BufferOp) and op.external.data:
+                require(
+                    op.extent_count is None or op.extent_count in uniform_values,
+                    "shared nested allocation extent must retain a real uniform SSA",
+                )
                 key = op.sym_name.data
                 if key not in roots:
                     shared = op.clone()

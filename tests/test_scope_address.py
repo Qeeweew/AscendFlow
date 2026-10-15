@@ -10,13 +10,45 @@ from xdsl.ir import SSAValue
 
 from tests.fixtures.attention_target import attention_target
 from tests.test_index_frontend import evaluate as evaluate_ssa
-from xdsl_npu.indexing import arguments, equivalent
+from xdsl_npu.indexing import arguments, check_axis, equivalent
 from xdsl_npu.lowering import _refs
 from xdsl_npu.model import ITEMSIZE, CompileError
-from xdsl_npu.scalar import Fact, expression, facts_from_sizes, from_ssa, literal
+from xdsl_npu.scalar import Expr, Fact, expression, facts_from_sizes, from_ssa, literal
 from xdsl_npu.scope_address import split_offset
 from xdsl_npu.source_ir import AllocationOp, DomainOp, PipelineOp, ProgramOp, SizeOp, ViewOp
 from xdsl_npu.source_scopes import Scope, Work, collect_source_scopes
+
+
+def test_captured_multiclock_remainder_keeps_its_proved_slot_range():
+    core, query, kv, child, count = (
+        Expr("argument", (name,)) for name in ("$core", "$query", "$kv", "$child", "n")
+    )
+    epoch = expression("add", expression("mul", query, count), kv)
+    slot = expression("rem", epoch, literal(2))
+    base = expression(
+        "add", expression("mul", core, literal(4096)), expression("mul", slot, literal(2048))
+    )
+    address = expression(
+        "add", base, expression("add", expression("mul", child, literal(128)), literal(32))
+    )
+    facts = {"n": Fact(1)}
+    parent, relative = split_offset(address, "$child", {"$core", "$query", "$kv"}, facts)
+    domains = [
+        (core, literal(0), literal(1)),
+        (query, literal(0), literal(1 << 40)),
+        (kv, literal(0), expression("sub", count, literal(1))),
+    ]
+    check_axis(parent, 2048, literal(8192), domains, facts)
+    with pytest.raises(CompileError, match="bounded"):
+        check_axis(parent, 2049, literal(8192), domains, facts)
+    for n in (1, 2, 3, 1024):
+        for q in (0, 1, 7, 1 << 40):
+            for k in (0, n - 1):
+                values = {"n": n, "$core": 1, "$query": q, "$kv": k, "$child": 3}
+                assert parent.evaluate(values) == 4096 + ((q * n + k) % 2) * 2048
+                assert parent.evaluate(values) + relative.evaluate(values) == address.evaluate(
+                    values
+                )
 
 
 @dataclass

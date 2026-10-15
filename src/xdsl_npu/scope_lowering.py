@@ -15,7 +15,7 @@ from .indexing import equivalent, validate_source_arithmetic
 from .ir import CallOp, CaptureOp, CoreIdOp, EndOp, StreamOp, ViewOp
 from .lowering_context import ActorBindings
 from .model import require
-from .scalar import ARITHMETIC, from_ssa
+from .scalar import ARITHMETIC, from_ssa, literal
 from .scope_predicates import classify_guard
 from .source_ir import AllocationOp, MatmulOp, PipelineOp
 from .source_scopes import ClockFrame, Scope, Work, collect_source_scopes
@@ -107,10 +107,30 @@ def lower_scopes(program):
     require(
         len(tree.items) == 1
         and isinstance(tree.items[0], Scope)
-        and isinstance(tree.items[0].op, PipelineOp),
-        "nested AST pipelines require hierarchical synchronization: one parent Pipelined is required",
+        and isinstance(tree.items[0].op, (PipelineOp, scf.ForOp)),
+        "nested AST pipelines require one parent Pipelined or a retained serial query loop",
     )
-    parent = tree.items[0]
+    serial, parent = None, tree.items[0]
+    if isinstance(parent.op, scf.ForOp):
+        serial = parent
+        require(
+            not serial.op.iter_args
+            and not serial.op.results
+            and from_ssa(serial.op.lb) == literal(0)
+            and from_ssa(serial.op.step) == literal(1)
+            and len(serial.op.body.block.args) == 1
+            and isinstance(serial.op.body.block.last_op, scf.YieldOp)
+            and not serial.op.body.block.last_op.arguments,
+            "scoped serial queries require zero-based unit-step control without scalar carry",
+        )
+        require(
+            len(serial.items) == 1
+            and isinstance(serial.items[0], Scope)
+            and isinstance(serial.items[0].op, PipelineOp)
+            and serial.items[0].op.parent_op() is serial.op,
+            "scoped serial query must contain one actual KV pipeline and no other work",
+        )
+        parent = serial.items[0]
     parent_guards = {
         op: kind
         for op in program.walk()
@@ -119,6 +139,11 @@ def lower_scopes(program):
     }
     allocations = tuple(op for op in program.walk() if isinstance(op, AllocationOp))
     for op in program.walk():
+        if isinstance(op, scf.ForOp):
+            require(
+                serial is not None and op is serial.op,
+                "scoped pipelines require one actual serial query clock",
+            )
         if isinstance(op, MatmulOp):
             require(op.a.type.memory.data == "L0A", "nested AST matmul needs explicit L0 operands")
         if isinstance(op, PipelineOp) and op is not parent.op:
@@ -140,6 +165,15 @@ def lower_scopes(program):
         kernel = bindings.kernel
         core = CoreIdOp.create(result_types=[IndexType()])
         kernel.block.add_op(core)
+        query = None
+        if serial is not None:
+            query = scf.ForOp(
+                bindings.uniform_product((literal(0),)),
+                bindings.scoped_serial_bound(serial.op),
+                bindings.uniform_product((literal(1),)),
+                [],
+                Block(arg_types=[IndexType()]),
+            )
         limit = bindings.runtime_bound(parent.op) if parent.op.limit is not None else None
         outer = StreamOp.create(
             operands=[] if limit is None else [limit],
@@ -148,6 +182,8 @@ def lower_scopes(program):
             regions=[Region(Block(arg_types=[IndexType()]))],
         )
         names = {"$parent0": outer.body.block.args[0], "$core": core.value}
+        if query is not None:
+            names["$parent1"] = query.body.block.args[0]
         for source, target in bindings.uniform.items():
             expr = from_ssa(source, facts=bindings.facts)
             if expr.kind == "argument":
@@ -233,7 +269,8 @@ def lower_scopes(program):
                 once=once,
                 region_name=uid,
                 bindings=bindings,
-                ambient_frames=(ClockFrame(parent.op),),
+                ambient_frames=(ClockFrame(parent.op),)
+                + (() if serial is None else (ClockFrame(serial.op),)),
                 capture=capture,
                 parent_generation=call.generation,
             )
@@ -254,7 +291,12 @@ def lower_scopes(program):
             call.body.block.add_ops([leaf.region, EndOp()])
             outer.body.block.add_op(call)
         outer.body.block.add_op(EndOp())
-        kernel.block.add_ops([outer, EndOp()])
+        if query is None:
+            kernel.block.add_op(outer)
+        else:
+            query.body.block.add_ops([outer, scf.YieldOp()])
+            kernel.block.add_op(query)
+        kernel.block.add_op(EndOp())
         kernel.op.attributes["source_schedule"] = ArrayAttr(
             item for leaf in leaves for item in leaf.schedule
         )

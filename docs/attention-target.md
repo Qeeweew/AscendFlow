@@ -85,7 +85,7 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 |---|---|
 | local ordinary work/init/child/use | 已有受限子集与符号完成关系；一般mixed组合仍缺失 |
 | Q/K/V共享、runtime BNSD地址、group任务数 | 局部cyclic BNSD搬运已接通；共享KV和mixed分组组合仍待证明 |
-| AST嵌套pipeline、内外generation、共享L0C | 直接固定child的nested CV与stationary私有L0C复用已接通；外层mixed serial query仍缺失 |
+| AST嵌套pipeline、内外generation、共享L0C | 原nested主体现已保留query/KV/child三个真实时钟到物理IR；跨query完成与别名仍缺失 |
 | first/last、初始化与空路径 | 一个实际parent时钟中的native首末条件已贯通；runtime周期首末与更深时钟仍缺失 |
 | maximum/reduce/broadcast | 已有AST基元；完整FA集成仍待完成 |
 | runtime商余、跨query延迟descriptor | 前端SSA已支持商余；跨query完成/状态时钟仍未接通，不能按K枚举 |
@@ -94,11 +94,13 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 
 普通f32 `fill(±inf)`已贯通源/物理合同和ASC，CANN与设备位模式回归通过。
 原始两版源码现在可完整通过source IR验证，未使用有限常量替换负无穷。
-物理lowering仍明确拒绝：nested因mixed父serial，continuous因`task % kv_tiles`
-首末谓词不是实际parent的first/last。不能把这一周期谓词误当作整个task stream
-的初始化/收尾条件。
+原nested主体现在完整通过物理lowering/地址抽取，保留72个native模板、12个call；
+UB内`next_m→m`使用通用PIPE_V原样copy，未改数学主体。公共编译明确拒绝
+`cross-query memory and event lifetime synchronization`，没有生成FA ASC或设备
+结果。continuous仍因`task % kv_tiles`首末谓词不是实际parent first/last而拒绝；
+不能把这一周期谓词误当作整个task stream的初始化/收尾条件。
 
-下一步需要将现有祖先clock/Stage/guard上下文扩展到外层query。例如Score导出
+下一步需要在已保留的外层query上接通访问与event寿命证明。例如Score导出
 的child Stage3仅移动chunk，不能改变父task；O的地址不含kv，仍受父kv的
 last guard约束；PV读取常量地址`c0[0]`仍须等待子循环最后MAD。不能从地址
 变量集合或region yield推断这些完成关系。固定child循环也必须保留，不以
@@ -108,7 +110,7 @@ last guard约束；PV读取常量地址`c0[0]`仍须等待子循环最后MAD。�
 **独立参考已有记录**：[AscendC参考及证据](attention-reference.md)覆盖手排控制、
 小例完整数值、8K大例采样/profile及条件硬件下界；没有新AST FA的CANN或设备
 结果，参考性能也未达到最终目标。局部顺序区域、共享只读GM和stationary可写frame已有子集；
-FA所需的完整BNSD地址、mixed层次与连续task关系仍未接通。当前边界见
+FA所需的跨query BNSD别名/ownership、mixed同步与连续task关系仍未接通。当前边界见
 [状态页](refactor-progress.md)，本源码不是可运行example。
 
 复现源码和有限派发表（不启动设备，也不宣称编译FA）：
