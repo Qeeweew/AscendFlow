@@ -32,6 +32,7 @@ def _locals(protocols, proof):
         require(p.kind in {"local", "cross", "barrier"}, "unknown parent pool channel kind")
         if p.kind != "local":
             continue
+        require(p.activation is None, "ordinary event pools cannot discard conditional activation")
         require(
             not p.last and not p.carry, "parent pools require nonterminal, non-carried channels"
         )
@@ -132,7 +133,11 @@ class _Proofs:
             spans[key] = first, len(queries)
         if not spans:
             return
-        answers = self.proof.graph.covered_many(queries)
+        answers = (
+            self.proof.covered_many(queries)
+            if hasattr(self.proof, "covered_many")
+            else self.proof.graph.covered_many(queries)
+        )
         self.queries += len(queries)
         self.statistics[kind + "_queries"] += len(queries)
         self.statistics[kind + "_batches"] += 1
@@ -244,6 +249,17 @@ def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
     Nonlocal protocols and the input resource map remain unchanged.
     """
     protocols = tuple(protocols)
+    if any(p.activation is not None for p in protocols):
+        from .scope_guarded_events import allocate
+
+        conditional = tuple(p for p in protocols if p.activation is not None)
+        ordinary = tuple(p for p in protocols if p.activation is None)
+        checked, reserved = allocate(conditional, proof, used_banks, statistics=statistics)
+        checked_ordinary, used = allocate_parent_pools(
+            ordinary, proof, reserved, statistics=statistics
+        )
+        assigned = {p.name: p for p in (*checked, *checked_ordinary)}
+        return tuple(assigned[p.name] for p in protocols), used
     locals_ = _locals(protocols, proof)
     used, checks, assigned = _reserved(used_banks), _Proofs(proof, statistics), {}
     merge_work = _MergeWork(checks.statistics)
@@ -317,6 +333,13 @@ def verify_parent_pools(protocols, proof, used_banks, *, statistics=None):
     of activations and cannot replace these individual self-reuse checks.
     """
     protocols = tuple(protocols)
+    if any(p.activation is not None for p in protocols):
+        from .scope_guarded_events import allocate
+
+        conditional = tuple(p for p in protocols if p.activation is not None)
+        ordinary = tuple(p for p in protocols if p.activation is None)
+        _, reserved = allocate(conditional, proof, used_banks, verify=True, statistics=statistics)
+        return verify_parent_pools(ordinary, proof, reserved, statistics=statistics)
     locals_ = _locals(protocols, proof)
     used, checks, pools = _reserved(used_banks), _Proofs(proof, statistics), defaultdict(list)
     for local in locals_:

@@ -19,13 +19,17 @@ from xdsl_npu.model import require
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--entry", choices=["nested_cv", "nested_copy"], default="nested_cv")
+    parser.add_argument(
+        "--entry", choices=["nested_cv", "nested_copy", "shared_l0c_qk_pv"], default="nested_cv"
+    )
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--physical", type=int)
     parser.add_argument("--cases", type=int, nargs="+", default=[0, 1, 2, 3, 7, 31, 257])
     parser.add_argument("--repeats", type=int, default=10)
     args = parser.parse_args()
     require(args.repeats > 0 and all(0 <= n <= 65536 for n in args.cases), "invalid cases")
+    if args.entry == "shared_l0c_qk_pv":
+        require(max(args.cases) <= 7, "shared-L0C exact oracle requires --cases 0 1 2 3 7")
     output = args.output.resolve()
     name = args.entry
     fixture = Path(__file__).resolve().parents[1] / "fixtures" / "nested.py"
@@ -73,10 +77,22 @@ def main():
                 slots = np.frombuffer(slot_bytes, dtype=np.float32).reshape(2, 2, 16, 32)
                 for t in range(n):
                     slots[:, t % 2] = raw_score[:, t]
-            else:
+            elif name == "nested_copy":
                 x = ((np.arange(n * 4 * 8) % 257) - 128).astype(np.float32).reshape(n, 4, 8)
                 expected = x
                 slot_bytes = x.tobytes()
+            else:
+                from tests.test_definition_lifetimes import (
+                    shared_l0c_device_input,
+                    shared_l0c_device_oracle,
+                )
+
+                x = shared_l0c_device_input(n)
+                before = np.frombuffer(b"\xcd" * (1 * 2 * 16 * 128 * 4), dtype=np.float32)
+                slots, expected, _ = shared_l0c_device_oracle(
+                    x, score_before=before.reshape(1, 2, 16, 128)
+                )
+                slot_bytes = slots.tobytes()
             initial_score = b"\xcd" * len(slot_bytes) + guard
             original = x.tobytes() + guard
             xp = runtime.allocate(original)

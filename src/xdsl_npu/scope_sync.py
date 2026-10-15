@@ -16,6 +16,15 @@ from .native_order import instruction_points, prefix_inputs
 from .periodic import bounded_period, project
 from .region_summary import summarize_local_events
 from .scope_completion import compose_calls
+from .scope_domains import (
+    Activation,
+    ScopedDependence,
+    decode_activation,
+    encode_activation,
+    legacy_activation,
+    shifted,
+    validate_activation,
+)
 from .scope_events import event_choices, resource_inputs, resource_sites
 from .scope_model import extract_scopes
 
@@ -32,6 +41,7 @@ class ScopeProtocol:
     ids: tuple[int, ...] = ()
     last: bool = False
     carry: bool = False
+    activation: Activation | None = None
 
 
 @dataclass(frozen=True)
@@ -51,26 +61,56 @@ def _point(site, point):
 
 
 class ParentCompletion:
-    def __init__(self, program, analyses, access, period, *, resource_inputs=None):
+    def __init__(
+        self, program, analyses, access, period, *, resource_inputs=None, extra_protocols=()
+    ):
         self.program, self.access = program, access
         self.events, self.protocols = {}, []
+        self.node_activations, self._guarded = {}, None
         marks = defaultdict(set)
-        for uid, site in access.endpoints.values():
-            marks[uid].update(
-                _point(site, point)
-                for point in (
-                    "begin",
-                    "end",
-                    "prefix",
-                    "issue",
-                    "queue",
-                    "retire",
-                    "implicit",
-                    "admit_issue",
-                    "admit_queue",
-                    "after_queue",
+        if any(isinstance(o, ScopedDependence) for o in access.obligations):
+            # Definition extraction retains interior versions for logical RAW
+            # binding, but those records need no parent completion projection.
+            # Project only actual obligations and native insertion milestones.
+            directions = defaultdict(set)
+            for obligation in access.obligations:
+                directions[obligation.source].update(
+                    ("end", "prefix", "begin", "admit_issue", "after_queue")
                 )
+                directions[obligation.destination].update(
+                    ("begin", "issue", "queue", "retire", "admit_issue", "admit_queue")
+                )
+            for protocol in extra_protocols:
+                for source in protocol.sources:
+                    directions[source].update(
+                        ("end", "prefix", "begin", "admit_issue", "after_queue")
+                    )
+                for destination in protocol.destinations:
+                    directions[destination].update(
+                        ("begin", "issue", "queue", "retire", "admit_issue", "admit_queue")
+                    )
+            selected = ((access.endpoints[key], points) for key, points in directions.items())
+        else:
+            selected = (
+                (
+                    endpoint,
+                    (
+                        "begin",
+                        "end",
+                        "prefix",
+                        "issue",
+                        "queue",
+                        "retire",
+                        "implicit",
+                        "admit_issue",
+                        "admit_queue",
+                        "after_queue",
+                    ),
+                )
+                for endpoint in access.endpoints.values()
             )
+        for (uid, site), points in selected:
+            marks[uid].update(_point(site, point) for point in points)
         self.resource_pairs = []
         for uid, analysis in analyses.items():
             poll("child event resource projection")
@@ -127,6 +167,10 @@ class ParentCompletion:
         uid, site = self.access.endpoints[endpoint]
         return self.completion.at(uid, _point(site, point), generation)
 
+    @property
+    def period(self):
+        return self.graph.period
+
     def queries(self, obligation):
         source_uid, source = self.access.endpoints[obligation.source]
         target_uid, target = self.access.endpoints[obligation.destination]
@@ -144,7 +188,81 @@ class ParentCompletion:
             )
 
     def covered(self, obligation):
-        return all(self.graph.covered_many(tuple(self.queries(obligation))))
+        return self.covered_obligations((obligation,))[0]
+
+    def _guarded_obligation(self, obligation):
+        from .completion import Position
+
+        source_uid, source = self.access.endpoints[obligation.source]
+        target_uid, target = self.access.endpoints[obligation.destination]
+        endpoints = (
+            self.completion.commands[
+                source_uid, _point(source, "prefix" if obligation.prefix else "end")
+            ],
+            self.completion.commands[target_uid, _point(target, "begin")],
+            obligation.distance,
+        )
+        if isinstance(obligation, ScopedDependence):
+            return ((*endpoints, obligation.activation),)
+        # Prove the stronger translation family from the first real alias
+        # intersection, as in ordinary Graph queries. The guarded solver still
+        # checks every epoch, including all first/last paths; no conditional
+        # path is assumed translation invariant by this projection.
+        return tuple(
+            (
+                *endpoints,
+                Activation(
+                    first=Position(False, first - obligation.distance),
+                    last=Position(True, obligation.distance),
+                    period=self.graph.period,
+                    residues=((residue - obligation.distance) % self.graph.period,),
+                ),
+            )
+            for residue, first in project(
+                obligation.period, obligation.residues, self.graph.period, obligation.distance
+            )
+        )
+
+    def covered_obligations(self, obligations):
+        obligations = tuple(obligations)
+        if self.node_activations or any(isinstance(o, ScopedDependence) for o in obligations):
+            groups = [self._guarded_obligation(o) for o in obligations]
+            answers = self.guarded().covered_many(q for group in groups for q in group)
+            results, offset = [], 0
+            for group in groups:
+                end = offset + len(group)
+                results.append(all(answers[offset:end]))
+                offset = end
+            return results
+        return [all(self.graph.covered_many(tuple(self.queries(o)))) for o in obligations]
+
+    def guarded(self):
+        if self._guarded is None:
+            from .scope_guarded_completion import GuardedCompletion
+
+            self._guarded = GuardedCompletion(self.graph, self.node_activations)
+        return self._guarded
+
+    def covered_many(self, queries):
+        """Resource queries must see every actual conditional protocol too."""
+        if not self.node_activations:
+            return self.graph.covered_many(queries)
+        converted = []
+        for source, sg, destination, dg, *rest in queries:
+            require(not rest, "guarded resource query needs explicit endpoint activation")
+            distance = dg - sg
+            from .completion import Position
+
+            first = max(source.lower, destination.lower - distance, 0, -distance)
+            gap = max(source.upper, destination.upper + distance, 0, distance)
+            activation = Activation(
+                first=Position(False, first),
+                last=Position(True, gap),
+                period=self.graph.period,
+                residues=(sg % self.graph.period,),
+            )
+            converted.append((source, destination, distance, activation))
+        return self.guarded().covered_many(converted)
 
     def _forward(self, command, residue, kind, before, added):
         # A synchronization may be absent in fill/drain even while its native
@@ -157,6 +275,13 @@ class ParentCompletion:
     def insert(self, protocol):
         """Real Set/Wait transitions at child native admission cuts, not child exits."""
         require(protocol.name not in {p.name for p in self.protocols}, "duplicate scope protocol")
+        if protocol.activation is not None:
+            validate_activation(protocol.activation, distance=protocol.distance)
+            require(
+                (protocol.period, protocol.residues)
+                == (protocol.activation.period, protocol.activation.residues),
+                "scope channel has inconsistent activation residues",
+            )
         self.protocols.append(protocol)
         tasks = {
             (actor, t.uid): t
@@ -181,14 +306,32 @@ class ParentCompletion:
                     sorted((r + protocol.distance) % protocol.period for r in protocol.residues)
                 )
             )
+            activation = (
+                None
+                if protocol.activation is None
+                else shifted(protocol.activation, 0 if action == "set" else protocol.distance)
+            )
+            if activation is not None:
+                residues = activation.residues
+            lower, upper = (
+                (
+                    protocol.distance if action != "set" else 0,
+                    protocol.distance if action == "set" else 0,
+                )
+                if activation is None
+                else (
+                    0 if activation.first.end else activation.first.offset,
+                    activation.last.offset if activation.last.end else 0,
+                )
+            )
             command = Command(
                 self.number,
                 owner[0],
                 task,
                 kind,
                 protocol.name,
-                protocol.distance if action != "set" else 0,
-                protocol.distance if action == "set" else 0,
+                lower,
+                upper,
                 protocol.period,
                 residues,
             )
@@ -197,10 +340,7 @@ class ParentCompletion:
             for residue in range(self.graph.period):
                 if residue % command.period not in command.residues:
                     continue
-                before = {
-                    point: self.site(owner, point, residue)
-                    for point in ("issue", "queue", "retire", "implicit")
-                }
+                before = {}
                 key = owner, residue
                 if action == "set":
                     before["issue"] = self.site(
@@ -209,11 +349,26 @@ class ParentCompletion:
                     before["queue"] = self.sends.get(key, self.site(owner, "begin", residue))
                     before["retire"] = self.site(owner, "prefix", residue)
                 else:
+                    before = {
+                        point: self.site(owner, point, residue)
+                        for point in (
+                            ("issue", "queue", "retire")
+                            if action == "barrier"
+                            else ("issue", "queue")
+                        )
+                    }
                     before.update(self.waits.get(key, {}))
+
+                def node(point, c=command, r=residue, active=activation):
+                    index = self.graph.node(c, r, point)
+                    if active is not None:
+                        self.node_activations[index] = active
+                    return index, 0
+
                 actual = instruction_points(
                     command,
                     before,
-                    lambda point, c=command, r=residue: (self.graph.node(c, r, point), 0),
+                    node,
                     self.completion.edge,
                 )
                 points[owner[0], action, residue] = actual
@@ -244,6 +399,22 @@ class ParentCompletion:
                     self.completion.edge(source, (target[0], generation // self.graph.period))
 
     def check_child_resources(self):
+        if self.node_activations:
+            answers = self.guarded().covered_many(
+                (
+                    self.completion.commands[uid, consumed],
+                    self.completion.commands[uid, republished],
+                    1,
+                    legacy_activation(1),
+                )
+                for uid, consumed, republished, _ in self.resource_pairs
+            )
+            for (uid, _, _, resource), valid in zip(self.resource_pairs, answers, strict=True):
+                require(
+                    valid,
+                    f"{uid}/{resource.channel}: child event {resource.event_id} may be re-Set before its previous parent call Wait",
+                )
+            return len(self.resource_pairs) * self.graph.period
         queries = 0
         for uid, consumed, republished, resource in self.resource_pairs:
             poll("child event reuse verification")
@@ -256,6 +427,13 @@ class ParentCompletion:
 
     def resource_covered(self, uid, consumed, republished):
         """A selected ID's final Wait is consumed before this call republishes it."""
+        if self.node_activations:
+            return self.guarded().covered(
+                self.completion.commands[uid, consumed],
+                self.completion.commands[uid, republished],
+                1,
+                legacy_activation(1),
+            )
         return all(
             self.graph.covered_many(
                 self.completion.query(uid, consumed, r, uid, republished, r + 1, minimum=1)
@@ -275,6 +453,72 @@ def _analyses(program):
         }
         reports[uid], analyses[uid] = _verify_leaf(leaf.loop, live_in=roots, _details=True)
     return reports, analyses
+
+
+def _scope_access(program):
+    from .scope_access import analyze_scope_access
+
+    access = analyze_scope_access(program, definitions=True)
+    if access.definition_roots:
+        from .scope_lifetimes import plan_lifetimes
+
+        plan = plan_lifetimes(program, access)
+        access = replace(
+            access,
+            obligations=plan.dependencies,
+            lifetime_report={
+                "reordered_roots": list(plan.reordered_roots),
+                "retained_logical_roots": dict(plan.fallbacks),
+                "visits": plan.visits,
+            },
+        )
+    return access
+
+
+def _scope_requirements(access):
+    """Keep conditional retirement clauses separate from ordinary protocols."""
+    ordinary, guarded = [], {}
+    tasks = {(a, t.uid): t for a, data in access.loop.actors.items() for t in data.program.tasks}
+    for obligation in access.obligations:
+        if not isinstance(obligation, ScopedDependence):
+            ordinary.append(obligation)
+            continue
+        require(
+            obligation.source[0] == obligation.destination[0],
+            "conditional ownership currently requires actor-private storage",
+        )
+        guarded.setdefault(
+            (obligation.source, obligation.destination, obligation.distance, obligation.activation),
+            [],
+        ).append(obligation)
+    result = _requirements(access.loop, ordinary)
+    for (source, destination, distance, activation), obligations in guarded.items():
+        validate_activation(activation, distance=distance)
+        kind = "barrier" if tasks[source].pipe == tasks[destination].pipe else "local"
+        result.append(
+            (
+                ScopeProtocol(
+                    "",
+                    kind,
+                    () if kind == "barrier" else (source,),
+                    (destination,),
+                    distance,
+                    activation.period,
+                    activation.residues,
+                    activation=activation,
+                ),
+                tuple(obligations),
+            )
+        )
+    return result
+
+
+def _scope_period(access, protocols):
+    periods = [p.period for p in protocols]
+    periods.extend(
+        o.activation.period for o in access.obligations if isinstance(o, ScopedDependence)
+    )
+    return bounded_period(lcm(*periods), "parent protocols") if periods else 1
 
 
 def _encode(access, owner):
@@ -304,6 +548,8 @@ def _install(program, access, protocols):
                 "event_ids": _ints(p.ids),
             }
         )
+        if p.activation is not None:
+            declaration.attributes["activation"] = encode_activation(p.activation)
         root.insert_op_before(declaration, first)
         placements = (
             [(owner, "barrier") for owner in p.destinations]
@@ -389,7 +635,12 @@ def _allocate_child_resources(program, analyses, access, proof, selected):
         return proof, _leaf_banks(program, analyses)
     choices = event_choices(program, analyses)
     proof = ParentCompletion(
-        program, analyses, access, proof.graph.period, resource_inputs=resource_inputs(choices)
+        program,
+        analyses,
+        access,
+        proof.graph.period,
+        resource_inputs=resource_inputs(choices),
+        extra_protocols=selected,
     )
     for protocol in selected:
         proof.insert(protocol)
@@ -432,7 +683,6 @@ def _allocate_child_resources(program, analyses, access, proof, selected):
 
 @bounded
 def autosync_scopes(module, *, _capture=None):
-    from .scope_access import analyze_scope_access
     from .sync import _finish
 
     result = module.clone()
@@ -463,14 +713,10 @@ def autosync_scopes(module, *, _capture=None):
         leaf.call.body.block.insert_op_before(replacement, leaf.stream)
         leaf.call.body.block.erase_op(leaf.stream)
     program = extract_scopes(result)
-    access = analyze_scope_access(program)
+    access = _scope_access(program)
     _, analyses = _analyses(program)
-    candidates = _requirements(access.loop, access.obligations)
-    period = (
-        bounded_period(lcm(*(p.period for p, _ in candidates)), "parent protocols")
-        if candidates
-        else 1
-    )
+    candidates = _scope_requirements(access)
+    period = _scope_period(access, (p for p, _ in candidates))
     proof = ParentCompletion(program, analyses, access, period)
     # For one acquire, try the required latest producer capture before earlier
     # ones; only the already selected actual protocols establish coverage.
@@ -487,7 +733,7 @@ def autosync_scopes(module, *, _capture=None):
     selected = []
     for candidate, obligations in ordered:
         poll("parent synchronization selection")
-        if all(proof.covered(o) for o in obligations):
+        if all(proof.covered_obligations(obligations)):
             continue
         p = ScopeProtocol(
             f"scope_c{len(selected)}",
@@ -497,10 +743,11 @@ def autosync_scopes(module, *, _capture=None):
             candidate.distance,
             candidate.period,
             candidate.residues,
+            activation=getattr(candidate, "activation", None),
         )
         proof.insert(p)
         require(
-            all(proof.covered(o) for o in obligations),
+            all(proof.covered_obligations(obligations)),
             "parent protocol cannot cover its actual child access obligation",
         )
         selected.append(p)
@@ -553,7 +800,7 @@ def _read_protocols(program, access, analyses):
         residues, ids = tuple(v.data for v in op.residues), tuple(v.data for v in op.event_ids)
         bounded_period(period, "parent protocol")
         require(
-            distance >= 0
+            (distance >= 0 or op.activation is not None)
             and residues
             and residues == tuple(sorted(set(residues)))
             and all(0 <= r < period for r in residues),
@@ -596,7 +843,19 @@ def _read_protocols(program, access, analyses):
             require(len(ids) == 1 and ids[0] not in cross_ids, "parent CV counter IDs overlap")
             cross_ids.update(ids)
         channels[name] = ScopeProtocol(
-            name, kind, sources, destinations, distance, period, residues, ids
+            name,
+            kind,
+            sources,
+            destinations,
+            distance,
+            period,
+            residues,
+            ids,
+            activation=None
+            if op.activation is None
+            else decode_activation(
+                op.activation, distance=distance, period=period, residues=residues
+            ),
         )
         placements = (
             [(key, "barrier") for key in destinations]
@@ -679,24 +938,20 @@ def _read_protocols(program, access, analyses):
 
 @bounded
 def verify_scopes(module, *, _details=False):
-    from .scope_access import analyze_scope_access
-
     program = extract_scopes(module)
-    access = analyze_scope_access(program)
+    access = _scope_access(program)
     reports, analyses = _analyses(program)
     channels, banks = _read_protocols(program, access, analyses)
-    period = (
-        bounded_period(lcm(*(p.period for p in channels.values())), "parent protocols")
-        if channels
-        else 1
-    )
-    proof = ParentCompletion(program, analyses, access, period)
+    period = _scope_period(access, channels.values())
+    proof = ParentCompletion(program, analyses, access, period, extra_protocols=channels.values())
     for channel in channels.values():
         proof.insert(channel)
     potential = proof.graph.potential()
-    for obligation in access.obligations:
+    for obligation, valid in zip(
+        access.obligations, proof.covered_obligations(access.obligations), strict=True
+    ):
         require(
-            proof.covered(obligation),
+            valid,
             f"missing scoped {obligation.hazard}: {obligation.source} -> {obligation.destination}, "
             f"distance {obligation.distance} on {obligation.storage}[{obligation.start}:{obligation.stop}]",
         )
@@ -707,7 +962,13 @@ def verify_scopes(module, *, _details=False):
     banks = verify_parent_pools(
         channels.values(), proof, _leaf_banks(program, analyses), statistics=pool_statistics
     )
-    _, counters, _ = _lifetime(access.loop, channels, proof.graph, proof.events, local=False)
+    _, counters, _ = _lifetime(
+        access.loop,
+        channels,
+        proof if proof.node_activations else proof.graph,
+        proof.events,
+        local=False,
+    )
     report = {
         "kernel": program.root.sym_name.data,
         "verification": "actual retained child proofs, parent physical frontiers, guarded completion, and event lifetimes",
@@ -719,9 +980,14 @@ def verify_scopes(module, *, _details=False):
         "scope_projection_statistics": {
             uid: p.statistics() for uid, p in proof.completion.projections.items()
         },
-        "scope_completion_facts": proof.graph.completion_statistics(),
+        "scope_completion_facts": (
+            proof.guarded().statistics()
+            if proof.node_activations
+            else proof.graph.completion_statistics()
+        ),
         "parent_memory_obligations": len(access.obligations),
         "parent_access_visits": access.visits,
+        "definition_lifetimes": access.lifetime_report,
         "parent_channels": len(channels),
         "parent_binary_lifetime_queries": pool_statistics["self_queries"],
         "child_parent_lifetime_queries": child_lifetimes,

@@ -5,7 +5,120 @@ from .codegen import QUALIFIER
 from .ir import CallOp, ScopeSyncOp, TaskOp
 from .loop_boundary import stream_operations
 from .model import require
-from .scalar import Expr
+from .scalar import INT64_MAX, Expr
+
+
+def _source_epoch(action, distance, scalar):
+    """Source epoch for a real instruction at this actor's parent generation."""
+    if action == "set" or not distance:
+        return scalar.value("npu_parent_g")
+    return (
+        scalar.sub("npu_parent_g", distance)
+        if distance > 0
+        else scalar.add("npu_parent_g", -distance)
+    )
+
+
+def _integer_expression(build):
+    """Simplify one guard operand without hoisting it before short-circuit guards."""
+    scalar = ScalarScope()
+    lines = scalar.finish([scalar.use(build(scalar))])
+    require(len(lines) == 1, "scope guard unexpectedly requires an unguarded scalar temporary")
+    return lines[0]
+
+
+def _activation_guard(channel, action):
+    """Conditions for one explicit source-epoch activation at an actual call.
+
+    Calls already enforce 0 <= parent_g < N. Translate source bounds to this
+    call's coordinate before forming a source-epoch remainder: for a negative
+    distance, computing parent_g-distance in an inactive tail can overflow.
+    Event arithmetic remains inside the resulting guard, as in legacy code.
+    """
+    from .scope_domains import validate_activation
+
+    activation = channel.activation
+    validate_activation(activation, distance=channel.distance)
+    require(action in {"set", "wait", "barrier"}, "unsupported scope synchronization action")
+    require(
+        (channel.period, channel.residues) == (activation.period, activation.residues),
+        "scope activation period/residues disagree with the channel",
+    )
+    count = activation.count
+    require(
+        all(
+            type(value) is int and -INT64_MAX <= value <= INT64_MAX
+            for value in (
+                channel.distance,
+                activation.period,
+                *activation.residues,
+                activation.first.offset,
+                activation.last.offset,
+                count.period,
+                count.residue,
+                *(
+                    value
+                    for value in (count.exact, count.minimum, count.maximum)
+                    if value is not None
+                ),
+            )
+        ),
+        "scope activation has an invalid ASC int64 literal",
+    )
+    terms = []
+    if count.exact is not None:
+        terms.append(f"npu_parent_n == {count.exact}")
+    else:
+        minimum = count.period if count.minimum is None else count.minimum
+        if minimum:
+            terms.append(f"npu_parent_n >= {minimum}")
+        if count.maximum is not None:
+            terms.append(f"npu_parent_n <= {count.maximum}")
+        if count.period != 1:
+            remainder = _integer_expression(lambda scalar: scalar.rem("npu_parent_n", count.period))
+            terms.append(f"{remainder} == {count.residue}")
+
+    shift = 0 if action == "set" else channel.distance
+
+    def affine(position):
+        if count.exact is not None:
+            return 0, position.evaluate(count.exact) + shift
+        return (1, shift - 1 - position.offset) if position.end else (0, position.offset + shift)
+
+    def expression(boundary):
+        coefficient, offset = boundary
+        require(
+            -INT64_MAX <= offset <= INT64_MAX,
+            "scope activation boundary has an invalid ASC int64 literal",
+        )
+
+        def build(scalar):
+            if not coefficient:
+                return scalar.value(offset)
+            if offset < 0:
+                return scalar.sub("npu_parent_n", -offset)
+            if offset:
+                return scalar.add("npu_parent_n", offset)
+            return scalar.value("npu_parent_n")
+
+        return _integer_expression(build)
+
+    first, last = affine(activation.first), affine(activation.last)
+    if first == last:
+        terms.append(f"npu_parent_g == {expression(first)}")
+    else:
+        if first[0] or first[1] > 0:
+            terms.append(f"npu_parent_g >= {expression(first)}")
+        if not last[0] or last[1] < -1:
+            terms.append(f"npu_parent_g <= {expression(last)}")
+    if activation.period != 1:
+        remainder = _integer_expression(
+            lambda scalar: scalar.rem(
+                _source_epoch(action, channel.distance, scalar), activation.period
+            )
+        )
+        terms.append("(" + " || ".join(f"{remainder} == {r}" for r in activation.residues) + ")")
+    return terms
 
 
 def _parent_tasks(checked):
@@ -76,25 +189,32 @@ def scope_boundary(checked, leaf):
             "scope synchronization is not beside its checked native endpoint",
         )
         conditions = [f"g == {op.position.data}"]
-        if channel.distance:
-            conditions.append(
-                f"npu_parent_g < npu_parent_n - {channel.distance}"
-                if action == "set"
-                else f"npu_parent_g >= {channel.distance}"
+        if getattr(channel, "activation", None) is not None:
+            conditions.extend(_activation_guard(channel, action))
+        else:
+            require(
+                type(channel.distance) is int and channel.distance >= 0,
+                "signed scope distance requires an explicit activation",
             )
-        epoch = (
-            "npu_parent_g"
-            if action != "wait" or not channel.distance
-            else f"(npu_parent_g - {channel.distance})"
-        )
-        if channel.period != 1:
-            conditions.append(
-                "("
-                + " || ".join(
-                    f"{epoch} % {channel.period} == {residue}" for residue in channel.residues
+            if channel.distance:
+                conditions.append(
+                    f"npu_parent_g < npu_parent_n - {channel.distance}"
+                    if action == "set"
+                    else f"npu_parent_g >= {channel.distance}"
                 )
-                + ")"
+            epoch = (
+                "npu_parent_g"
+                if action != "wait" or not channel.distance
+                else f"(npu_parent_g - {channel.distance})"
             )
+            if channel.period != 1:
+                conditions.append(
+                    "("
+                    + " || ".join(
+                        f"{epoch} % {channel.period} == {residue}" for residue in channel.residues
+                    )
+                    + ")"
+                )
         if channel.kind == "barrier":
             sync = f"asc_sync_pipe(PIPE_{task.pipe});"
         elif channel.kind == "cross":
@@ -114,11 +234,14 @@ def scope_boundary(checked, leaf):
                 "scope local channel needs one source and destination pipe",
             )
             scalar = ScalarScope()
-            generation = (
-                scalar.value("npu_parent_g")
-                if action == "set"
-                else scalar.sub("npu_parent_g", channel.distance)
-            )
+            if getattr(channel, "activation", None) is not None:
+                generation = _source_epoch(action, channel.distance, scalar)
+            else:
+                generation = (
+                    scalar.value("npu_parent_g")
+                    if action == "set"
+                    else scalar.sub("npu_parent_g", channel.distance)
+                )
             event = scalar.use(_event(channel, generation, scalar))
             function = "asc_sync_notify" if action == "set" else "asc_sync_wait"
             sync = " ".join(

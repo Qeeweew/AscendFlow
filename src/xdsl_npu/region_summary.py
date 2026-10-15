@@ -28,6 +28,7 @@ from .scalar import Expr
 MAX_SUMMARY_VISITS = 1_000_000
 MAX_FIXED_ACCESS_SEGMENTS = 65_536
 MAX_FIXED_SUMMARY_VISITS = 262_144
+MAX_FIXED_DEFINITION_VISITS = 262_144
 
 
 def allocation(storage):
@@ -58,6 +59,34 @@ class ReadSpan:
 
 
 @dataclass(frozen=True)
+class ReadBinding:
+    """The exact logical version read by one cell access.
+
+    None defers the producer to this invocation's incoming value. It neither
+    initializes storage nor permits rebinding the read to a later overwrite.
+    """
+
+    reader: Access
+    writer: Access | None
+
+
+@dataclass(frozen=True)
+class DefinitionRun:
+    """One independent W-only definition and its R/W continuation versions.
+
+    An incoming run has entry=None, including a run beginning with RW. Every
+    read keeps its writer binding even when a later RW retires its frontier.
+    pending_reads is only the frontier after last_write, not all run readers.
+    These are memory facts; they authorize neither retirement nor GM reordering.
+    """
+
+    entry: Access | None
+    last_write: Access | None
+    pending_reads: tuple[ReadSpan, ...]
+    read_bindings: tuple[ReadBinding, ...] = ()
+
+
+@dataclass(frozen=True)
 class CellSummary:
     storage: str
     start: int
@@ -67,6 +96,7 @@ class CellSummary:
     first_write: Access | None
     last_write: Access | None
     pending_reads: tuple[ReadSpan, ...]
+    definitions: tuple[DefinitionRun, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -270,6 +300,9 @@ class RegionSummary:
     # must not merge two private buffers just because their printed names match.
     origins: tuple[tuple[str, SSAValue], ...] = ()
     bound_value: SSAValue | None = None
+    # Separately budgeted fixed-scan/record work; the established frontier
+    # visits retain their original definition for existing callers.
+    definition_visits: int = 0
 
     def for_count(self, count):
         require(count >= 0, "negative invocation length")
@@ -308,10 +341,22 @@ class RegionSummary:
         return tuple(result)
 
 
-def _scan(events):
+def _scan(events, *, definitions: list[DefinitionRun] | None = None):
     first, last = None, None
     live_in, pending = [], []
+    entry, bindings, active, count = None, [], False, 0
     for access, read, write in events:
+        if definitions is not None:
+            if write and not read:
+                if active:
+                    definitions.append(DefinitionRun(entry, last, tuple(pending), tuple(bindings)))
+                entry, bindings = access, []
+            active = True
+            if read:
+                bindings.append(ReadBinding(access, last))
+            count += 1
+            if count % 256 == 0:
+                poll("fixed child definitions", accesses=count, runs=len(definitions))
         if read:
             span = ReadSpan.one(access)
             pending.append(span)
@@ -320,6 +365,8 @@ def _scan(events):
         if write:
             first = first or access
             last, pending = access, []
+    if definitions is not None and active:
+        definitions.append(DefinitionRun(entry, last, tuple(pending), tuple(bindings)))
     return tuple(live_in), first, last, tuple(pending)
 
 
@@ -434,6 +481,7 @@ def summarize_fixed_storage(loop, roots):
         )
     # Charge cuts AND frontier visits before the shared sweep allocates its
     # per-cell event lists. Interval count alone does not bound intersecting cuts.
+    definition_visits = 0
     for root, accesses in cells.items():
         accesses.sort(key=lambda access: (access[0], order[access[1], access[2]]))
         points = sorted(
@@ -445,14 +493,28 @@ def summarize_fixed_storage(loop, roots):
         )
         visits += len(points) + 2 * cut_visits
         require(visits <= MAX_FIXED_SUMMARY_VISITS, "fixed summary cut/scan visit budget exceeded")
+        # Each interval/cell incidence bounds one extra scan action, plus
+        # a run and a read binding (the first incoming RW/R may need both).
+        # Estimate before allocating cell-event lists or definition records.
+        definition_visits += 3 * cut_visits
+        require(
+            definition_visits <= MAX_FIXED_DEFINITION_VISITS,
+            "fixed definition summary visit budget exceeded",
+        )
         poll("fixed child cuts", root=root, points=len(points), visits=visits)
     summaries = []
     for root, lo, hi, accesses in cut_access_cells(cells):
+        definitions = []
         frontier = _scan(
-            (Access((actor, uid), Position(False, g)), read, write)
-            for (g, actor, uid), read, write, _ in accesses
+            (
+                (Access((actor, uid), Position(False, g)), read, write)
+                for (g, actor, uid), read, write, _ in accesses
+            ),
+            definitions=definitions,
         )
-        summaries.append(CellSummary(root, lo, hi, CountDomain(1, 0, exact=count), *frontier))
+        summaries.append(
+            CellSummary(root, lo, hi, CountDomain(1, 0, exact=count), *frontier, tuple(definitions))
+        )
         if len(summaries) % 256 == 0:
             poll("fixed child frontiers", cells=len(summaries), visits=visits)
     origins = {root: op.ref for root, op in loop.roots.items() if root in selected}
@@ -463,7 +525,15 @@ def summarize_fixed_storage(loop, roots):
                 if root in selected:
                     origins[root] = op.ref
     require(set(origins) == selected, "fixed summary needs actual allocation roots")
-    return RegionSummary(roots, tuple(summaries), visits, loop.bound, count, tuple(origins.items()))
+    return RegionSummary(
+        roots,
+        tuple(summaries),
+        visits,
+        loop.bound,
+        count,
+        tuple(origins.items()),
+        definition_visits=definition_visits,
+    )
 
 
 def summarize_reused_storage(loop, roots):

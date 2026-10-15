@@ -42,6 +42,10 @@ class ScopeAccess:
     origins: dict[str, SSAValue]
     summaries: dict[str, RegionSummary]
     visits: int
+    capture_offsets: dict
+    capture_roots: dict
+    definition_roots: frozenset[str]
+    lifetime_report: dict | None = None
 
 
 def _coordinate(atom):
@@ -132,7 +136,7 @@ def _cut_cost(loop):
     return cost
 
 
-def analyze_scope_access(program: ScopedProgram) -> ScopeAccess:
+def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeAccess:
     """Build parent byte obligations; the caller separately verifies each leaf.
 
     Inner native positions are constants in the boundary view. The only
@@ -201,18 +205,37 @@ def analyze_scope_access(program: ScopedProgram) -> ScopeAccess:
         fragments <= MAX_SCOPE_ACCESS_SEGMENTS, "scope fixed-child fragment/group budget exceeded"
     )
     poll("scope child boundaries", fragments=fragments, calls=len(program.leaves))
+    # Definition occupancy is needed only when independent local writers can
+    # cross logical generations. Keep ordinary boundary projections unchanged.
+    writers = {}
+    if definitions:
+        for uid, leaf in program.leaves.items():
+            for actor, data in leaf.loop.actors.items():
+                for task in data.program.tasks:
+                    for ref, mode in zip(task.refs, task.modes, strict=True):
+                        alias = leaf.loop.root(actor, ref)
+                        name, storage, offset = captures[uid, alias]
+                        if not storage.external and "W" in mode:
+                            writers.setdefault(name, {})[uid] = leaf.call.stage.data
+    definition_roots = frozenset(
+        name
+        for name, calls in writers.items()
+        if len(set(calls.values())) > 1
+        and all(not any(offset[1:]) for (uid, root), offset in by_root.items() if root == name)
+    )
     summaries, groups = {}, {}
     visits = fragments
     for uid, leaf in program.leaves.items():
         normalized, data = next(iter(leaf.loop.actors.items()))
         summary = summaries[uid] = summarize_fixed_storage(leaf.loop, aliases[uid])
-        visits += summary.visits
+        visits += summary.visits + summary.definition_visits
         require(
             visits <= MAX_SCOPE_ACCESS_VISITS, "scope fixed-child summary visit budget exceeded"
         )
         native = {task.uid: (index, task) for index, task in enumerate(data.program.tasks)}
         for cell in summary.cells:
             effects = {}
+            name = captures[uid, cell.storage][0]
             for access in (cell.first_write, cell.last_write):
                 if access is not None:
                     effects.setdefault(access, set()).add("W")
@@ -222,7 +245,18 @@ def analyze_scope_access(program: ScopedProgram) -> ScopeAccess:
                     "fixed scope boundary needs exact inner reader positions",
                 )
                 effects.setdefault(Access(span.task, span.first), set()).add("R")
-            name = captures[uid, cell.storage][0]
+            if name in definition_roots:
+                for run in cell.definitions:
+                    for access in (run.entry, run.last_write):
+                        if access is not None:
+                            effects.setdefault(access, set()).add("W")
+                    for binding in run.read_bindings:
+                        effects.setdefault(binding.reader, set()).add("R")
+                        if binding.writer is not None:
+                            effects.setdefault(binding.writer, set()).add("W")
+                    for span in run.pending_reads:
+                        require(span.first == span.last, "scope definition needs exact readers")
+                        effects.setdefault(Access(span.task, span.first), set()).add("R")
             for access, modes in effects.items():
                 generation = access.position.evaluate(summary.constant_count)
                 index, task = native[access.task[1]]
@@ -392,4 +426,14 @@ def analyze_scope_access(program: ScopedProgram) -> ScopeAccess:
                 continue
             dependency = replace(dependency, residues=residues)
         obligations.append(dependency)
-    return ScopeAccess(loop, endpoints, tuple(obligations), origins, summaries, visits)
+    return ScopeAccess(
+        loop,
+        endpoints,
+        tuple(obligations),
+        origins,
+        summaries,
+        visits,
+        by_root,
+        {key: item[0] for key, item in captures.items()},
+        definition_roots,
+    )

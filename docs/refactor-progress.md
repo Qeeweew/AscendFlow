@@ -8,10 +8,82 @@
 
 **新 DSL 的完整 Flash Attention 仍不能编译。** 旧FA、公开physical builder与
 tracer入口已删除；没有绕行内部构造器的兼容example。runtime BNSD局部流水与
-一层固定child的嵌套CV已通过CANN与设备正确性；完整FA还受共享存储生命周期、
-first/last和多运行时钟限制，[计划](refactor-plan.md)规定其退出条件。
+一层固定child的嵌套CV已通过CANN与设备正确性；stationary私有L0C的跨调用复用
+现也完成设备闭环。完整FA仍受native first/last、独立query/kv运行时钟与更一般
+ownership限制，[计划](refactor-plan.md)规定其退出条件。
 
-## 当前推进：跨父调用的事件宽度与安全池共享
+## 当前推进：保留逻辑结果的共享 L0C 生命周期
+
+`tests/fixtures/nested.py:shared_l0c_qk_pv`现已走通公开DSL→实际IR验证→ASC→CANN→
+设备。它是编译器反例，不是完整FA或性能基准：QK、PV使用独立L1/L0A/L0B，
+复用原来的两个16×16 FP32 L0C槽（2048字节），10个native模板、3个call。
+没有增加buffer、搬运或child drain，运行长度`n`仍是参数。
+
+修复前，逻辑frontier要求`PV(t).FIX → QK(t+1).MAD`，与显式排步中先发
+`QK(t+1)`再发`PV(t)`形成假环。现在先保存每个读的逻辑writer与RW累加链，再
+按真实Call stage/issue次序安排独立定义的存储占用。GM仍保持逻辑顺序和最终值。
+父层只投影实际跨调用义务的完成端点，不把所有内部定义都投影成父层状态。
+
+自动生成的c0复用关系如下；箭头均为真实FIX退休到MAD开始，不是child退出：
+
+| 激活条件 | 同步前后对应关系 |
+|---|---|
+| N=1 | QK(0).FIX6 → PV(0).MAD0 |
+| N≥2，启动 | QK(0).FIX6 → QK(1).MAD0 |
+| 0≤k≤N−2 | QK(k+1).FIX6 → PV(k).MAD0 |
+| 0≤k≤N−3 | PV导出(k).FIX → QK(k+2).MAD0 |
+| N≥2，排空 | PV导出(N−2).FIX → PV(N−1).MAD0 |
+
+`PV(k).MAD7 → PV导出(k).FIX`的RAW保留；c1另外在FIX7退休后复用。
+ASC使用实际parent generation和count条件，负代次差也由同一个来源epoch配对
+Set/Wait；该例最终event ID均为常量。15个父channel中6个带条件，FIX→M bank
+恰好使用8个ID。条件channel暂独占pool，不套用普通prefix channel的共享规则。
+检查器从实际`ScopeChannelOp.activation`重建条件；缩窄启动条件、错位排空条件、
+改错signed distance均被拒绝。event消费和内存依赖共用带count条件的完成查询。
+
+独立有限模型直接解释实际IR的地址、native顺序及物理event ID，固定逻辑RAW/RW
+版本后检查存储占用；覆盖N=0/1/2/3/7与漏启动/排空、漏Wait、错ID及错误producer。
+它不是任意N的证明。设备使用物理6→逻辑0，同一二进制在这些N上各运行10次，
+Y、最终Score槽、输入及保护区精确一致。运行前全卡健康/进程/显存/利用率快照
+随结果保存。没有FA、ACLNN吞吐量或理论峰值达成结论。
+
+编译成本来自固定child的byte切分、静态stage跨度内的占用族，以及完成图上的
+条件查询；不枚举runtime N。裁剪无关端点、批量传播后，再将存储alias周期投影
+到实际协议周期；不为双槽GM把整张完成图加倍。该投影证明更强的完整epoch区间，
+仍检查首末条件，不能借用仅启动时成立的路径。父图由初次集成的1532节点/2498边
+降至447节点/757边，89个去重查询、153个静态case、无runtime实例图。
+
+相关回归457项通过；最后周期投影改动另通过55项针对性检查，固定child/event
+summary及依赖frontier的131项回归也通过。最终编译器源码的
+五个独立冷进程结果如下（含源码读取、前端、最终验证、快照与ASC，不含import/CANN）：
+
+| 输入 | p50 / max | RSS峰值 |
+|---|---|---|
+| shared_l0c_qk_pv | 3.2273 / 3.2364秒 | 48520 KiB |
+| nested_copy | 1.3640 / 1.3683秒 | 39772 KiB |
+| nested_cv | 1.6559 / 1.6841秒 | 41164 KiB |
+
+初次共享L0C集成单次观察约14秒；上述正式冷测仍未达到p50≤1秒目标。原copy/CV
+ASC与上一设备验证版本逐字节相同；共享L0C最终ASC与本次设备binary来源相同，
+SHA256为`f1452ba445d24c05c91afa19cbff39c3b9a19257dff1912d3deba0def0e65068`。
+完整阶段、源码tree hash与冷测在`runs/refactor/shared-l0c/cold-final/`；设备及
+CANN证据在同级`build/`。该次完整构建12.920秒，使用CANN 9.1.0、dav-2201、
+`-O2 -std=c++20`，准确命令见compile manifest。没有把缓存取结果时间计为编译时间。
+
+复现（工作区根目录）：
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --entry shared_l0c_qk_pv --cases 0 1 2 3 7 --output runs/refactor/shared-l0c/build --build
+ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --entry shared_l0c_qk_pv --cases 0 1 2 3 7 --output runs/refactor/shared-l0c/build --physical 6
+```
+
+`build/source.xdsl`、`before.xdsl`、`after.xdsl`及`shared_l0c_qk_pv.asc`分别保留
+源码IR、同步前后IR和设备所用代码。构建使用一个覆盖Python与CANN的300秒期限。
+本次定义重排仅支持stationary、actor-private、明确初始化的独立定义与只读导出；
+incoming RW保留逻辑recurrence，不能当作fresh定义。周期capture、更深子循环、
+native条件执行和跨独立runtime时钟尚未由本次能力接通；不存在静默重排。
+
+## 已保存阶段 f91ac07：跨父调用的事件宽度与安全池共享
 
 此前明确拒绝的`tests/fixtures/nested.py:nested_copy`现已通过公开DSL、CANN及
 设备正确性。它保留两个固定child、4个native模板、4个父channel、原来的128字节

@@ -4,7 +4,7 @@
 “继续优化 legacy FA”与“先取消首尾窗口”的安排。当前已完成旧公开API删除、输入minimum/multiple合同、局部查询域拓扑共享
 和通用构建期限；随后接通runtime轴SSA、商余寻址和cyclic局部ownership。
 实际测试与编译结果见状态页。以下保留整个重构的目标和退出
-条件，一般nested CV与完整FA仍未完成。
+条件；当前已接通直接固定child的nested CV和stationary私有L0C复用，完整FA仍未完成。
 
 ## 目标、边界与次序
 
@@ -82,15 +82,18 @@ query tile 分给20组已经产生12/13差异，不能追加长度整除组数�
 - `nested_copy`已按实际跨父调用寿命选择child宽度，并通过parent ready/release
   池共享满足8个ID的硬件容量；保持原buffer与排步，设备闭环通过。更一般的
   parent epoch轮转仍未支持，单通知child缺消费路径时明确拒绝。
-- 共享L0C须先建立逻辑定义/read配对与RW recurrence，再选择独立定义的物理
+- 共享L0C已建立逻辑定义/read配对与RW recurrence，再选择独立定义的物理
   占用次序，生成相邻定义的WAW与全部最后reader的WAR。不能将所有访问按issue
   重排。`QK(t+1)→PV(t)`有负逻辑代次差；同步epoch与实际访问generation必须
-  分开表示。用公共parent step可以表示它，但仍需保留端点的启动/排空激活域。
-  `n=1`和最终PV连续占用必须通过独立trace，外部最终可观察值不得改变。
+  分开表示。同步IR现在保存来源epoch的count与首末激活域，最终检查按实际IR
+  重建；`n=1`、启动及最终PV连续占用已通过独立实际IR模型与设备。该支持
+  限定stationary私有root，不包含native first/last执行或独立runtime时钟。
 
-下一主线是共享L0C的独立定义生命周期，再接first/last与独立query/kv时钟；
-保留原FA source主体做验收。`test_definition_lifetimes.py`仅固定逻辑producer、
-RW链与启动/稳态/排空的独立参考合同，不是已实现的重排能力。
+下一主线是native first/last与独立query/kv时钟；同步条件支持不能冒充native
+条件执行支持。先用初始化、稳态更新、末次导出三段的小型递推接通源条件到真实
+访问域，再接多运行时钟与原FA source主体。保留共享L0C的原容量和source政策。
+`test_definition_lifetimes.py`固定独立逻辑合同，`test_scope_shared_l0c_model.py`
+检查当前编译结果；二者不替代完整FA数值与性能验收。
 双 AIV 的完整贡献、MTE2 import 的早 release、FIX 与共享 L0C 冲突都要表达。
 源码控制退出不插入 child drain；不以增加 buffer、搬运或 barrier 接通。
 先核实每个 native 的读退休、写完成和配置资源合同；当前主要使用 task end，

@@ -11,6 +11,7 @@ from xdsl.context import Context
 from xdsl.dialects.builtin import (
     ArrayAttr,
     Builtin,
+    DictionaryAttr,
     FloatAttr,
     IndexType,
     IntAttr,
@@ -237,6 +238,7 @@ class ScopeChannelOp(IRDLOperation):
     period = attr_def(IntAttr)
     residues = attr_def(ArrayAttr[IntAttr])
     event_ids = attr_def(ArrayAttr[IntAttr])
+    activation = opt_attr_def(DictionaryAttr)
     traits = traits_def(AsyncEffects())
 
 

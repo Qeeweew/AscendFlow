@@ -1,4 +1,4 @@
-"""Finite single-AIV oracle for actual retained parent/child instructions.
+"""Finite single-actor oracle for actual retained parent/child instructions.
 
 Only physical IR and elementary scalar arithmetic are interpreted here. No
 production completion graph, memory summary, event allocator, or proof is an
@@ -8,6 +8,7 @@ compiler proof. A child return creates no asynchronous completion edge.
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from itertools import pairwise
 
 from xdsl.dialects import arith
 
@@ -42,6 +43,12 @@ MODES = {
     "div": ("R", "R", "W"),
     "max": ("R", "R", "W"),
     "scalar_load": ("R",),
+    "nd2nz": ("R", "W"),
+    "load2d_a": ("R", "W"),
+    "load2d_b_nt": ("R", "W"),
+    "mad": ("R", "R", "W"),
+    "mad_first": ("R", "R", "W"),
+    "fix": ("R", "W"),
 }
 
 
@@ -104,7 +111,32 @@ def pipe(task):
         banks = tuple(ref.type.bank.data for ref in task.refs)
         assert banks in {("GM", "UB"), ("UB", "GM")}, banks
         return "MTE2" if banks[0] == "GM" else "MTE3"
+    cube = {
+        "nd2nz": ("MTE2", ("GM", "L1")),
+        "load2d_a": ("MTE1", ("L1", "L0A")),
+        "load2d_b_nt": ("MTE1", ("L1", "L0B")),
+        "mad": ("M", ("L0A", "L0B", "L0C")),
+        "mad_first": ("M", ("L0A", "L0B", "L0C")),
+        "fix": ("FIX", ("L0C", "GM")),
+    }
+    if native in cube:
+        native_pipe, banks = cube[native]
+        assert tuple(ref.type.bank.data for ref in task.refs) == banks
+        dimensions = tuple(value.data for value in task.params)
+        assert dimensions[:2] == (16, 16), "Cube oracle supports whole 16x16 fractals"
+        if native in {"mad", "mad_first"}:
+            assert dimensions[:3] == (16, 16, 16), "Cube oracle supports short 16x16 MAD"
+        return native_pipe
     return "S" if native == "scalar_load" else "V"
+
+
+def _modes(task, generation):
+    if task.native.data == "mad_first":
+        return "R", "R", "W" if generation == 0 else "RW"
+    if task.native.data == "mad":
+        assert len(task.params) == 4 and task.params.data[3].data in (0, 1)
+        return "R", "R", "W" if task.params.data[3].data else "RW"
+    return MODES[task.native.data]
 
 
 def _extent(root, environment, parameters, group):
@@ -130,7 +162,7 @@ def _captures(call, environment, parameters, group):
     return result
 
 
-def _cells(value, environment, captures, count, parameters, group):
+def _spans(value, environment, captures, count, parameters, group):
     view = value.owner
     assert isinstance(view, ViewOp), "native access must be an actual ViewOp"
     assert not _integer(view.prefix_elements, 0), "prefix clipping is outside this oracle"
@@ -176,10 +208,152 @@ def _cells(value, environment, captures, count, parameters, group):
     extent = _extent(root, environment, parameters, group)
     for row in range(_integer(view.rows, 1)):
         start = offset + row * _integer(view.row_stride, 0)
+        assert 0 <= start < start + width <= span, "actual native byte outside capture"
+        assert 0 <= base + start < base + start + width <= extent, (
+            "actual native byte out of bounds"
+        )
+        yield root, base + start, width
+
+
+def _cells(value, environment, captures, count, parameters, group):
+    for root, start, width in _spans(value, environment, captures, count, parameters, group):
         for byte in range(start, start + width):
-            assert 0 <= byte < span, "actual native byte outside capture"
-            assert 0 <= base + byte < extent, "actual native byte out of bounds"
-            yield root, base + byte
+            yield root, byte
+
+
+def _atomize(accesses):
+    """Exact finite row partition: bytes in an atom have identical access histories."""
+    boundaries = defaultdict(set)
+    for spans in accesses.values():
+        for root, start, width, _ in spans:
+            boundaries[root].update((start, start + width))
+    atoms = {root: tuple(pairwise(sorted(points))) for root, points in boundaries.items()}
+    result = {}
+    for key, spans in accesses.items():
+        touched = defaultdict(set)
+        for root, start, width, mode in spans:
+            for first, last in atoms[root]:
+                if start <= first and last <= start + width:
+                    touched[root, first, last].update(mode)
+        result[key] = touched
+    return result
+
+
+def _scope_epoch(channel, action, generation, count):
+    distance = channel.distance.data
+    activation = channel.activation
+    if activation is None:
+        assert distance >= 0, "signed distance needs an actual activation"
+        if (action == "set" and generation >= count - distance) or (
+            action != "set" and generation < distance
+        ):
+            return None
+        epoch = generation - distance if action == "wait" else generation
+    else:
+        fields = {name: value.data for name, value in activation.data.items()}
+        required = {
+            "count_period",
+            "count_residue",
+            "first_end",
+            "first_offset",
+            "last_end",
+            "last_offset",
+        }
+        assert (
+            required
+            <= fields.keys()
+            <= required | {"count_exact", "count_minimum", "count_maximum"}
+        )
+        period, residue = fields["count_period"], fields["count_residue"]
+        assert period > 0 and 0 <= residue < period
+        if "count_exact" in fields:
+            if count != fields["count_exact"]:
+                return None
+        elif (
+            count < fields.get("count_minimum", period)
+            or count % period != residue
+            or "count_maximum" in fields
+            and count > fields["count_maximum"]
+        ):
+            return None
+        epoch = generation if action == "set" else generation - distance
+        first = (
+            count - 1 - fields["first_offset"] if fields["first_end"] else fields["first_offset"]
+        )
+        last = count - 1 - fields["last_offset"] if fields["last_end"] else fields["last_offset"]
+        if not first <= epoch <= last:
+            return None
+        assert 0 <= epoch < count and 0 <= epoch + distance < count, "scope epoch out of bounds"
+    if epoch % channel.period.data not in tuple(value.data for value in channel.residues):
+        return None
+    return epoch
+
+
+def _physical_versions(logical, physical, accesses, begins, ends, reach):
+    """Keep source RAW/RW versions; order independent definitions physically.
+
+    Every adjacent version needs WAW retirement, every read needs its exact
+    source writer, and all that version's readers must retire before the next
+    version can overwrite it. RW updates remain in their original definition.
+    This proves a unique writer at each read without imposing source WAR/WAW
+    between independent clears whose physical occupation order was changed.
+    """
+    writers, owners = {}, {}
+    versions = defaultdict(list)
+    read_bindings = []
+    bytes_read = bytes_written = 0
+    for key in logical:
+        for cell, modes in accesses[key].items():
+            previous = writers.get(cell)
+            if "R" in modes:
+                bytes_read += cell[2] - cell[1]
+                assert previous is not None or cell[0].initialized.data, "undefined actual read"
+                read_bindings.append((cell, key, previous))
+            if "W" in modes:
+                bytes_written += cell[2] - cell[1]
+                owner = owners[previous, cell] if "R" in modes and previous is not None else key
+                owners[key, cell] = owner
+                versions[cell, owner].append(key)
+                writers[cell] = key
+    definitions = defaultdict(list)
+    for key in physical:
+        for cell, modes in accesses[key].items():
+            if "W" in modes and owners[key, cell] == key:
+                definitions[cell].append(key)
+    following = {}
+    for cell, definitions_ in definitions.items():
+        ordered = [key for owner in definitions_ for key in versions[cell, owner]]
+        if cell[0].external.data:
+            assert ordered[-1] == writers[cell], "final external writer changed"
+        following[cell, None] = ordered[0]
+        for old, new in pairwise(ordered):
+            following[cell, old] = new
+            assert reach[ends[old]] & (1 << begins[new]), (
+                "unordered physical WAW",
+                cell[0].sym_name.data,
+                cell[1],
+                old,
+                new,
+            )
+    for cell, reader, writer in read_bindings:
+        if writer is not None:
+            assert reach[ends[writer]] & (1 << begins[reader]), (
+                "logical RAW producer unavailable",
+                cell[0].sym_name.data,
+                cell[1],
+                writer,
+                reader,
+            )
+        next_writer = following.get((cell, writer))
+        if next_writer is not None and next_writer != reader:
+            assert reach[ends[reader]] & (1 << begins[next_writer]), (
+                "unordered physical WAR",
+                cell[0].sym_name.data,
+                cell[1],
+                reader,
+                next_writer,
+            )
+    return bytes_read, bytes_written
 
 
 def _active(task, generation, count):
@@ -227,8 +401,10 @@ def finite_check(plan, n, *, group=0, parameters=None):
     """Check actual issue, binary-event consumption, and every byte dependency."""
     parameters = {"n": n} | ({} if parameters is None else parameters)
     kernels = [op for op in plan.walk() if isinstance(op, KernelOp)]
-    assert len(kernels) == 1 and kernels[0].core.data == "aiv", "single-AIV oracle only"
+    assert len(kernels) == 1 and kernels[0].core.data in {"aiv", "aic"}, "single-actor oracle only"
     kernel = kernels[0]
+    cube = kernel.core.data == "aic"
+    actor_name = "aic" if cube else "aiv0"
     assert 0 <= group < _integer(kernel.blocks, 1)
     parents = [op for op in kernel.body.block.ops if isinstance(op, StreamOp)]
     assert len(parents) == 1, "one retained parent stream is required"
@@ -258,7 +434,7 @@ def finite_check(plan, n, *, group=0, parameters=None):
 
     def scope_endpoint(encoded):
         actor, uid, task, position = encoded.data.split("/")
-        assert actor == "aiv0", "single-AIV endpoint required"
+        assert actor == actor_name, "endpoint belongs to a different actual actor"
         return uid, tables[uid][task], int(position)
 
     def sync_info(op, call, task, pg, g, child_count, environment):
@@ -293,11 +469,8 @@ def finite_check(plan, n, *, group=0, parameters=None):
             if g != op.position.data:
                 return None
             channel = scope_channels[op.channel.data]
-            distance = channel.distance.data
-            if (action == "set" and pg >= count - distance) or (action != "set" and pg < distance):
-                return None
-            epoch = pg - distance if action == "wait" else pg
-            if epoch % channel.period.data not in tuple(v.data for v in channel.residues):
+            epoch = _scope_epoch(channel, action, pg, count)
+            if epoch is None:
                 return None
             endpoints = channel.sources if action == "set" else channel.destinations
             assert any(
@@ -380,13 +553,26 @@ def finite_check(plan, n, *, group=0, parameters=None):
                             edge(end, prefix)
                             prefixes[native_pipe] = prefix
                             begins[key], ends[key] = begin, end
-                            modes = MODES[task.native.data]
-                            touched = defaultdict(set)
+                            modes = _modes(task, g)
+                            touched = [] if cube else defaultdict(set)
                             for value, mode in zip(task.refs, modes, strict=True):
-                                for byte in _cells(
-                                    value, environment, captures, child_count, parameters, group
-                                ):
-                                    touched[byte].update(mode)
+                                if cube:
+                                    touched.extend(
+                                        (root, start, width, mode)
+                                        for root, start, width in _spans(
+                                            value,
+                                            environment,
+                                            captures,
+                                            child_count,
+                                            parameters,
+                                            group,
+                                        )
+                                    )
+                                else:
+                                    for byte in _cells(
+                                        value, environment, captures, child_count, parameters, group
+                                    ):
+                                        touched[byte].update(mode)
                             accesses[key] = touched
                             instances.append(
                                 (
@@ -443,9 +629,18 @@ def finite_check(plan, n, *, group=0, parameters=None):
         for (_, wait), (_, send) in zip(waits[resource], sent[1:]):
             assert reach[wait] & (1 << send), ("binary event overwrite", resource)
 
+    logical = [instance[-1] for instance in sorted(instances, key=lambda instance: instance[:-1])]
+    if cube:
+        accesses = _atomize(accesses)
+        bytes_read, bytes_written = _physical_versions(
+            logical, list(begins), accesses, begins, ends, reach
+        )
+        return FiniteResult(
+            tuple(issued), tuple(event_trace), command_count, bytes_read, bytes_written
+        )
     writers, readers = {}, defaultdict(set)
     bytes_read = bytes_written = 0
-    for *_, key in sorted(instances, key=lambda instance: instance[:-1]):
+    for key in logical:
         for byte, modes in accesses[key].items():
             hazards = []
             if "R" in modes:

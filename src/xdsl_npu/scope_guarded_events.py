@@ -1,0 +1,97 @@
+"""Dedicated binary pools for count/first/last-conditional parent protocols.
+
+Only ID assignment changes. Every reuse query uses the actual source predicate
+and the same guarded completion proof as memory. These pools are deliberately
+disjoint; the ordinary prefix-pool sharing theorem does not apply to them.
+"""
+
+from collections import defaultdict
+from dataclasses import replace
+
+from .budget import poll
+from .model import require
+from .scope_domains import Activation, affine, position, validate_activation
+from .symbolic_completion import add, le, meet
+
+
+def _bank(protocol, proof):
+    require(protocol.kind == "local", "conditional event allocation requires a local channel")
+    require(
+        len(protocol.sources) == len(protocol.destinations) == 1
+        and protocol.sources[0][0] == protocol.destinations[0][0],
+        "conditional local pool needs one actual actor",
+    )
+    actor = protocol.sources[0][0]
+    send = proof.events[actor, protocol.name, "set"]
+    wait = proof.events[actor, protocol.name, "wait"]
+    return (actor, send.task.pipe, wait.task.pipe), send, wait
+
+
+def self_reuse(protocol, proof, width):
+    """Last Wait precedes the following Set using that exact ordinal ID."""
+    value = validate_activation(protocol.activation, distance=protocol.distance)
+    _, send, wait = _bank(protocol, proof)
+    active = tuple(r for r in range(proof.graph.period) if r % value.period in value.residues)
+    for rank, residue in enumerate(active):
+        poll("conditional parent event reuse", channel=protocol.name, width=width)
+        cycles, index = divmod(rank + width, len(active))
+        step = active[index] + cycles * proof.graph.period - residue
+        first, last = affine(value.first), add(affine(value.last), -step)
+        domain = meet(value.count, le(first, last))
+        if domain is None:
+            continue  # This invocation cannot publish the same ID twice.
+        distance = protocol.distance
+        required = Activation(
+            domain,
+            position(add(first, distance)),
+            position(add(last, distance)),
+            proof.graph.period,
+            ((residue + distance) % proof.graph.period,),
+        )
+        if not proof.guarded().covered(wait, send, step - distance, required):
+            return False
+    return True
+
+
+def allocate(protocols, proof, used_banks, *, verify=False, statistics=None):
+    """Reserve complete private pools; never infer ordering from ID equality."""
+    used = defaultdict(set, {key: set(ids) for key, ids in used_banks.items()})
+    result, queries, allocated = [], 0, 0
+    for protocol in protocols:
+        if protocol.activation is None or protocol.kind == "barrier":
+            result.append(protocol)
+            continue
+        bank, _, _ = _bank(protocol, proof)
+        if verify:
+            ids = protocol.ids
+            require(
+                1 <= len(ids) <= 8
+                and len(set(ids)) == len(ids)
+                and all(type(i) is int and 0 <= i < 8 for i in ids)
+                and not used[bank].intersection(ids),
+                "conditional parent event pool overlaps another resource or has invalid IDs",
+            )
+            queries += proof.graph.period
+            require(
+                self_reuse(protocol, proof, len(ids)),
+                f"{protocol.name}: conditional parent event re-Set can precede its old Wait",
+            )
+        else:
+            width = None
+            for candidate in range(1, 9):
+                queries += proof.graph.period
+                if self_reuse(protocol, proof, candidate):
+                    width = candidate
+                    break
+            require(
+                width is not None, f"{bank}: no conditional parent event width <=8 proves reuse"
+            )
+            free = [i for i in range(8) if i not in used[bank]]
+            require(len(free) >= width, f"{bank}: conditional parent event bank exhausted")
+            ids = tuple(free[:width])
+        used[bank].update(ids)
+        result.append(replace(protocol, ids=ids))
+        allocated += len(ids)
+    if statistics is not None:
+        statistics.update(conditional_self_queries=queries, conditional_allocated_ids=allocated)
+    return tuple(result), used
