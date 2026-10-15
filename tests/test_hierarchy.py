@@ -6,8 +6,9 @@ from xdsl.dialects import arith, scf
 from examples.gemm.hierarchical import hierarchical_gemm
 from examples.gemm.reduction import reduction_gemm
 from examples.vector.independent_rings import independent_rings
-from xdsl_npu import Kernel, compile
+from xdsl_npu import compile
 from xdsl_npu import language as N
+from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.frontend import FrontendError
 from xdsl_npu.ir import dump, parse
 from xdsl_npu.loop_graph import Channel

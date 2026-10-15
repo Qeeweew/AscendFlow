@@ -30,11 +30,12 @@ PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run_grouped --frame-sna
 第二条生成同步前后 IR 和 ASC，未指定 `--physical` 不运行设备；加 `--build`
 可编译生成代码与独立参考。当前支持与限制见[状态页](../docs/refactor-progress.md)。
 
-## Flash Attention 与旧实现
+## Flash Attention 接入状态
 
-[flash_attention/](flash_attention/README.md) 保留 legacy FA 及通信分块变体。
-`legacy/` 保留旧 operator recipes、GDN 和 tracing multistage，用于差分回归。
-它们没有迁移成新 AST；旧有限路径不能用于宣称 runtime 长度无关的编译性能。
+旧 task/tracer examples 与旧 FA 已删除，未保留兼容入口。完整新 DSL FA 尚未
+接通，当前没有可运行 FA example；[目标源码与缺口](../docs/attention-target.md)
+单独放在设计文档中，不能作为已支持算子。
 
-新 FA 的完整数学主体目前在 [设计源码](../docs/design/attention_target.py.in)，
-仍被编译器明确拒绝。接通后才成为这里的正式 AST 示例，不以目标文件冒充支持。
+原有关键机器反例保留在 `tests/fixtures/physical_operators.py`、
+`physical_state.py` 和 `cv.py`，只作内部测试输入，不作为用户编程模型或性能入口。
+其他目录只展示当前实际可编译的 AST 程序。

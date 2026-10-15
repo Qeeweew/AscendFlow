@@ -9,18 +9,17 @@ from collections import deque
 import pytest
 from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
-from examples.legacy.multistage import cv_source, segmented_cv_source, vector_source
+from tests.fixtures.cv import cv_source, segmented_cv_program, vector_source
 from xdsl_npu import compile, emit_asc, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import LoopChannelOp, LoopSyncOp, parse
 from xdsl_npu.loop_model import loop_dependencies
 from xdsl_npu.loop_sync import verify_loop
-from xdsl_npu.lowering import lower_source
 from xdsl_npu.model import CompileError, Program
 
 
-@pytest.fixture(scope="module", params=[vector_source, cv_source, segmented_cv_source])
+@pytest.fixture(scope="module", params=[vector_source, cv_source, segmented_cv_program])
 def artifact(request):
     return compile(request.param(N.dynamic("tasks")))
 
@@ -217,21 +216,25 @@ def test_selection_builds_three_graphs_without_a_path_oracle(monkeypatch):
 
 @pytest.mark.parametrize("width", [1, 8, 24])
 def test_guarded_prefix_graph_has_linear_edges_in_template_count(width):
-    count = N.dynamic("tasks")
-
-    @N.trace_func(disjoint_external=True)
-    def chain(X: N.Tensor((count, 64), N.f32), Y: N.Tensor((count, 64), N.f32, access="write")):
-        with N.Kernel():
-            inputs, outputs = N.alloc_ub((64,), versions=2), N.alloc_ub((64,), versions=2)
-            for task in N.Pipelined(count, stages=3):
-                with N.Stage(0):
-                    value = N.copy(X[task, :], inputs)
-                with N.Stage(1), N.Vector():
-                    # Static arithmetic policy changes T, not runtime N.
-                    for _ in range(width):
-                        value = N.mul(value, 2.0, out=outputs)
-                with N.Stage(2):
-                    N.copy(value, Y[task, :])
+    chain = N.from_source(
+        """
+        def chain(X:N.Tensor((tasks,64),N.f32),
+                  Y:N.Tensor((tasks,64),N.f32,access="write"),tasks:N.int64):
+            with N.Kernel():
+                inputs=N.alloc_ub((2,64))
+                outputs=N.alloc_ub((2,64))
+                for task in N.Pipelined(tasks,stages=3):
+                    with N.Stage(0):
+                        value=N.copy(X[task,:],inputs[task%2,:])
+                    with N.Stage(1),N.Vector():
+                        for repeat in N.unroll(WIDTH):
+                            value=N.mul(value,2.0,out=outputs[task%2,:])
+                    with N.Stage(2):
+                        N.copy(value,Y[task,:])
+    """,
+        constants={"WIDTH": width},
+        disjoint_external=True,
+    )
 
     report = compile(chain).report
     assert report["native_templates"] == width + 2
@@ -279,17 +282,18 @@ def test_war_records_last_reader_not_logical_result_completion():
 
 
 def test_nested_runtime_loop_is_diagnosed_instead_of_expanded():
-    tasks = N.dynamic("tasks")
-
-    @N.trace_func(disjoint_external=True)
-    def nested(X: N.Tensor((tasks, 64), N.f32)):
-        with N.Kernel():
-            ub = N.alloc_ub((64,))
-            for task in N.Pipelined(tasks, stages=1):
-                with N.Stage(0):
-                    for inner in N.Pipelined(tasks, stages=1):
-                        with N.Stage(0):
-                            N.copy(X[inner, :], ub)
-
-    with pytest.raises(CompileError, match="nested runtime pipelines"):
-        lower_source(nested)
+    nested = N.from_source(
+        """
+        def nested(X:N.Tensor((tasks,64),N.f32),tasks:N.int64):
+            with N.Kernel():
+                ub=N.alloc_ub((64,))
+                for task in N.Pipelined(tasks,stages=1):
+                    with N.Stage(0):
+                        for inner in N.Pipelined(tasks,stages=1):
+                            with N.Stage(0):
+                                N.copy(X[inner,:],ub)
+    """,
+        disjoint_external=True,
+    )
+    with pytest.raises(CompileError, match="nested AST pipelines"):
+        compile(nested)

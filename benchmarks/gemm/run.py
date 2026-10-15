@@ -11,14 +11,14 @@ import hashlib
 import json
 from pathlib import Path
 
+from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from examples.gemm.batched import batched_matmul
-from xdsl_npu import compile
 from xdsl_npu import language as N
+from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.model import require
 from xdsl_npu.performance import hardware_snapshot, runtime_work
-from xdsl_npu.toolchain import offline_compile
 
 
 def reference_source(policy):
@@ -81,6 +81,7 @@ def main():
     parser.add_argument("--nn", action="store_true")
     parser.add_argument("--accumulate", action="store_true")
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--physical", type=int)
     parser.add_argument("--record", type=Path)
     parser.add_argument("--tiles", type=int, nargs="+", default=[0, 1, 2, 4, 1024])
@@ -106,20 +107,33 @@ def main():
         "C_SLOTS": 2,
         "ACCUMULATE": args.accumulate,
     }
-    result = compile(batched_matmul.specialize(**policy))
-    sources = {
-        "generated": (result.name, result.asc),
-        "ascendc": ("cube_reference", reference_source(policy)),
-    }
-    variants = list(sources) if args.variant == "both" else [args.variant]
-    if args.build or args.physical is None:
-        result.write(args.output / "generated")
+    variants = ["generated", "ascendc"] if args.variant == "both" else [args.variant]
+    build_generated = args.build and "generated" in variants
+    generated = args.output / "generated"
+    generated_check = generated if build_generated else generated / "source-check"
+    build_module(
+        lambda: batched_matmul.specialize(**policy),
+        generated_check,
+        shared=build_generated,
+        timeout_s=args.timeout,
+    )
+    result = read_artifact(generated_check)
+    sources = {"generated": (result.name, result.asc)}
     manifests = {}
     for variant in variants:
-        name, source = sources[variant]
         directory = (args.output / variant).resolve()
-        if args.build:
-            offline_compile(source, directory, name, shared=True)
+        if variant == "ascendc":
+            check = directory if args.build else directory / "source-check"
+            build_module(
+                lambda: reference_source(policy),
+                check,
+                name="cube_reference",
+                shared=args.build,
+                timeout_s=args.timeout,
+            )
+            reference = read_artifact(check)
+            sources[variant] = reference.name, reference.asc
+        name, source = sources[variant]
         if args.physical is not None:
             manifest = json.loads((directory / f"{name}.compile.json").read_text())
             require(

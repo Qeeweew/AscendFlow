@@ -166,7 +166,7 @@ def test_explicit_b_operand_tracks_its_own_numerical_writer():
 
 def test_ast_rejects_hidden_l0_recipe_and_runtime_conditional_expressions():
     source = batched_matmul.source.replace("T.matmul(aa, bb, accum=", "T.gemm(aa, bb, ")
-    with pytest.raises(FrontendError, match="explicit L0 buffers"):
+    with pytest.raises(FrontendError, match="unknown DSL operation gemm"):
         replace(batched_matmul, source=source).to_ir()
     source = batched_matmul.source.replace("N if TRANSPOSE_B else K", "N if tiles > 0 else K")
     with pytest.raises(FrontendError, match="constexpr boolean"):

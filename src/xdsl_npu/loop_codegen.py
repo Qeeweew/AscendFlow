@@ -306,7 +306,7 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None):
         limit = ((1 << 63) - 1 - margin) // coefficient
         for size_arg, size in zip(size_args, loop.parameters):
             lines.append(
-                f"  if ({size_arg} < 0 || {size_arg} > {limit} || {size_arg} % {size.multiple.data} != 0) return -1;"
+                f"  if ({size_arg} < {size.minimum.data} || {size_arg} > {limit} || {size_arg} % {size.multiple.data} != 0) return -1;"
             )
         _, checked_uniform_lines = bindings(expressions, checked=True)
         lines += checked_uniform_lines

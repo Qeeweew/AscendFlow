@@ -4,17 +4,22 @@
 不进入 compiler wheel；生成 ASC、库、输入、日志和 profiling 数据写入外层 runs。
 算子源码在 examples；数值参考共用 `benchmarks.validation`，无 ACL 初始化副作用。
 
+2026-10-15：旧 task DSL、legacy runner 和旧 FA suite 已删除。当前AST与独立
+参考构建入口使用 `xdsl_npu.build`，输入构造、分析、ASC和CANN共用≤300秒总期限。
+每个variant是单个算子构建；超时失败立即抛出，不能继续下一候选。构建结果先写
+临时目录，通过后发布；失败使成功manifest和二进制失效。复用已有库时，当前源码
+检查写入独立 `source-check/`，不覆盖待测库。新DSL完整FA仍未接通。
+
 ## 目录与入口
 
 | 路径 | 用途 |
 |---|---|
 | `compile.py`、`regions.py` | 冷进程源码→ASC 计时与静态结构压力输入 |
 | `vector/`、`gemm/`、`normalization/`、`state/` | 对应 AST 示例的固定政策验证与分析 |
-| `attention/` | legacy FA 执行、独立固定政策参考及硬件工作量分析 |
+| `attention/` | 独立固定政策AscendC参考、分析与历史批次资格检查；尚无新DSL FA runner |
 | `references/ascendc/` | 独立手写 ASC 模板，不能由生成 PlanIR 反向生成 |
 | `references/` | ASC 模板读取、固定 FA 参考参数与 ACLNN 适配器 |
 | `validation/` | 确定性输入和 CPU 数值参考，供测试与 benchmark 共用 |
-| `legacy/` | 旧 physical/tracing 路径的构建和执行；不作为新 AST 能力证据 |
 | `profile.sh`、`profile_summary.py` | 通用 msprof 启动及数据汇总 |
 | `artifacts.py` | 统一校验 profile 对应的源码/库 hash 和旧相对路径 |
 

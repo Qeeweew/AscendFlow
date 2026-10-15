@@ -11,12 +11,10 @@ import hashlib
 import json
 from pathlib import Path
 
-from examples.legacy.multistage import vector_source
-from xdsl_npu import compile
-from xdsl_npu import language as N
+from benchmarks.artifacts import read_artifact
+from xdsl_npu.build import build_file
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.model import require
-from xdsl_npu.toolchain import offline_compile
 
 
 def run(result, library, output, physical, counts, repeats):
@@ -133,20 +131,24 @@ def main():
     )
     parser.add_argument("--counts", type=int, nargs="+", default=[0, 1, 2, 4, 4096, 65536])
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--frontend", choices=["ast", "legacy"], default="ast")
+    parser.add_argument("--timeout", type=float, default=300)
     args = parser.parse_args()
-    if args.frontend == "ast":
-        from examples.vector.scale import scale
-
-        result = compile(scale)
-    else:
-        result = compile(vector_source(N.dynamic("tasks")))
-    result.write(args.output)
+    # A source check for --library must not invalidate that library's existing
+    # manifest. Every build directory still belongs to one operator build.
+    build_output = args.output if args.library is None else args.output / "source-check"
+    build_file(
+        Path(__file__).resolve().parents[2] / "examples/vector/scale.py",
+        build_output,
+        entry="scale",
+        compile_asc=args.library is None and args.offline,
+        shared=args.library is None and args.physical is not None,
+        timeout_s=args.timeout,
+    )
+    # Device execution only consumes published ASC/metadata; it does not need
+    # to compile the same source again or manufacture a verified mutable IR.
+    result = read_artifact(build_output)
     library = args.library
-    if (args.offline or args.physical is not None) and library is None:
-        offline_compile(
-            result.asc, args.output.resolve(), result.name, shared=args.physical is not None
-        )
+    if args.physical is not None and library is None:
         library = args.output / f"{result.name}.so"
     if args.physical is not None:
         run(result, library, args.output, args.physical, args.counts, args.repeats)

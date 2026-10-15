@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import pytest
 
-from xdsl_npu import Kernel
+from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.model import CompileError
 from xdsl_npu.region_sequence import Part, summarize_sequence

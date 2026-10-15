@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from time import monotonic
 
+from .build import deadline, in_build_group, remaining
+
 CANN = Path("/usr/local/Ascend/cann-9.1.0")
 FLAGS = [
     "-O2",
@@ -20,16 +22,22 @@ FLAGS = [
 
 
 def offline_compile(
-    source: str, directory: Path, name: str, *, shared=False, timeout_s=300.0
+    source: str, directory: Path, name: str, *, shared=False, timeout_s=300.0, _deadline=None
 ) -> dict:
     """Compile within one wall-clock budget, killing the compiler process group on expiry."""
-    if type(timeout_s) not in {int, float} or not 0 < timeout_s <= 300:
-        raise ValueError("CANN compilation timeout must be in (0,300] seconds")
-    deadline = monotonic() + timeout_s
+    started = monotonic()
+    end = deadline(timeout_s, inherited=_deadline)
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / f"{name}.compile.json").unlink(missing_ok=True)
-    (directory / f"{name}.timeout.json").unlink(missing_ok=True)
+    if not name.isidentifier():
+        raise ValueError("CANN build name must be an identifier")
+    artifacts = [
+        directory / f"{name}{suffix}" for suffix in (".o", ".aibin", ".so", ".compile.json")
+    ]
+    for path in artifacts:
+        path.unlink(missing_ok=True)
+    timeout_record = directory / f"{name}.timeout.json"
+    timeout_record.unlink(missing_ok=True)
     src = directory / f"{name}.asc"
     src.write_text(source)
     binary = CANN / "tools/bisheng_compiler/bin/bisheng"
@@ -61,60 +69,94 @@ def offline_compile(
                 str(directory / f"{name}.so"),
             ]
         )
-    logs = []
-    for command in commands:
+    logs, timings = [], []
+    own_group = not in_build_group()
+
+    def stop(proc):
+        try:
+            if own_group:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                # The outer watchdog owns the whole worker group and always
+                # reaps it, including compiler descendants, when work ends.
+                proc.kill()
+        except ProcessLookupError:
+            pass
+
+    def run(command):
+        remaining(end, "CANN command launch")
+        command_started = monotonic()
         proc = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            start_new_session=True,
+            start_new_session=own_group,
         )
         try:
-            stdout, _ = proc.communicate(timeout=max(0.001, deadline - monotonic()))
+            stdout, _ = proc.communicate(timeout=remaining(end, "CANN command"))
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            stop(proc)
             stdout, _ = proc.communicate()
             logs.append(stdout)
-            (directory / f"{name}.compile.log").write_text("\n".join(logs))
-            (directory / f"{name}.timeout.json").write_text(
+            raise TimeoutError(
+                f"CANN compilation exceeded the shared deadline; process group killed: {command}"
+            ) from None
+        except BaseException:
+            stop(proc)
+            proc.communicate()
+            raise
+        finally:
+            # A compiler may exit successfully or with an error while a
+            # background child has redirected its output and is still alive.
+            # Always retire the process group this command actually owns.
+            if own_group:
+                stop(proc)
+        logs.append(stdout)
+        timings.append(monotonic() - command_started)
+        (directory / f"{name}.compile.log").write_text("\n".join(logs))
+        if proc.returncode:
+            raise RuntimeError(f"CANN failed (exit {proc.returncode}): {command}\n{stdout}")
+        return stdout
+
+    try:
+        for command in commands:
+            run(command)
+        version = run([str(binary), "--version"])
+        sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        record = {
+            "target": "dav-2201",
+            "cann": str(CANN),
+            "commands": commands,
+            "compiler_version": version,
+            "source_sha256": sha(src),
+            "binary_sha256": sha(output),
+            "binary_bytes": output.stat().st_size,
+            "command_seconds": timings[: len(commands)],
+            "compiler_version_seconds": timings[-1],
+            "seconds": monotonic() - started,
+        }
+        if shared:
+            record["shared_sha256"] = sha(directory / f"{name}.so")
+        remaining(end, "CANN artifact validation")
+        (directory / f"{name}.compile.json").write_text(json.dumps(record, indent=2) + "\n")
+        return record
+    except BaseException as error:
+        for path in artifacts:
+            path.unlink(missing_ok=True)
+        (directory / f"{name}.compile.log").write_text("\n".join(logs))
+        if isinstance(error, TimeoutError):
+            timeout_record.write_text(
                 json.dumps(
                     {
                         "status": "timeout",
                         "timeout_s": timeout_s,
-                        "command": command,
+                        "seconds": monotonic() - started,
+                        "error": str(error),
                         "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
                     },
                     indent=2,
                 )
                 + "\n"
             )
-            raise TimeoutError(
-                f"CANN compilation exceeded {timeout_s}s; process group killed"
-            ) from None
-        except BaseException:
-            # The outer per-operator watchdog interrupts Python at its total
-            # deadline; do not leave a detached CANN compiler/linker running.
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
-            raise
-        logs.append(stdout)
-        (directory / f"{name}.compile.log").write_text("\n".join(logs))
-        if proc.returncode:
-            raise RuntimeError(f"CANN failed (exit {proc.returncode}): {command}\n{stdout}")
-    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-    record = {
-        "target": "dav-2201",
-        "cann": str(CANN),
-        "commands": commands,
-        "compiler_version": subprocess.check_output(
-            [str(binary), "--version"], text=True, timeout=max(0.001, deadline - monotonic())
-        ),
-        "source_sha256": sha(src),
-        "binary_sha256": sha(output),
-        "binary_bytes": output.stat().st_size,
-    }
-    if shared:
-        record["shared_sha256"] = sha(directory / f"{name}.so")
-    (directory / f"{name}.compile.json").write_text(json.dumps(record, indent=2) + "\n")
-    return record
+        raise

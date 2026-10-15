@@ -315,6 +315,19 @@ class Graph:
             self._completion = NativeCompletion(self)
         return self._completion
 
+    def completion_statistics(self):
+        """Costs of this analysis, separating symbolic facts from path expansion.
+
+        The final verifier owns a new graph. These are its local-analysis
+        counts, not totals for discarded planning graphs or parent proofs.
+        """
+        proof = self.completion()
+        return {
+            **proof.statistics(),
+            "translated_domain_states": self.domain_states,
+            "translated_domain_edges": self.domain_edges,
+        }
+
     def covered_many(self, queries):
         """Batch obligations on native families; no translated instance graph."""
         queries = tuple(queries)

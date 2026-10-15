@@ -1,17 +1,21 @@
+"""Physical carry/snapshot and event contracts, not a public GDN DSL API."""
+
 import pytest
 from xdsl.transforms.dead_code_elimination import dce
 
 from benchmarks.validation.recurrent import gdn_reference, recurrent_inputs
-from examples.legacy.gdn import recurrent_gdn
-from xdsl_npu import Kernel, autosync, emit_asc, verify_plan
+from tests.fixtures.physical_state import recurrent_gdn
+from xdsl_npu import autosync, emit_asc, verify_plan
+from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import SyncOp, TaskOp, dump, parse
 from xdsl_npu.model import CompileError, Instance, dependencies, extract
 from xdsl_npu.sync import completion_graph, execution
 
 
-@pytest.mark.parametrize("steps", [0, 1, 3, 5])
-@pytest.mark.parametrize("slots,snapshot_slots", [(1, 1), (2, 1), (2, 3)])
+@pytest.mark.parametrize(
+    "steps,slots,snapshot_slots", [(0, 2, 3), (1, 1, 1), (1, 2, 3), (3, 1, 1), (3, 2, 1), (5, 2, 3)]
+)
 def test_static_state_streams_use_the_shared_physical_plan(steps, slots, snapshot_slots):
     source = recurrent_gdn(2, steps, value_dim=8, slots=slots, snapshot_slots=snapshot_slots)
     original = dump(source)
@@ -113,7 +117,7 @@ def test_state_update_requires_the_actual_initial_writer():
         {"snapshot_slots": 0},
     ],
 )
-def test_unimplemented_state_contracts_are_explicit(options):
+def test_fixture_rejects_unsupported_physical_state_contracts(options):
     kwargs = {"sequences": 1, "steps": 3, **options}
     with pytest.raises(CompileError):
         recurrent_gdn(**kwargs)

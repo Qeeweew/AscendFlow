@@ -33,7 +33,7 @@ from xdsl.irdl import (
 from xdsl.traits import IsTerminator, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
-from .ir import AsyncEffects
+from .ir import AsyncEffects, _verify_runtime_contract
 
 
 def _verify_yield(op):
@@ -161,14 +161,12 @@ class AllocationOp(IRDLOperation):
 class SizeOp(IRDLOperation):
     name = "npu_source.size"
     sym_name = attr_def(StringAttr)
+    minimum = attr_def(IntAttr)
     multiple = attr_def(IntAttr)
     value = result_def(IndexType)
 
     def verify_(self):
-        if not self.sym_name.data.isidentifier() or self.multiple.data <= 0:
-            raise VerifyException(
-                "runtime size requires a name and a positive divisibility contract"
-            )
+        _verify_runtime_contract(self.sym_name.data, self.minimum.data, self.multiple.data)
         if not isinstance(self.parent_op(), ProgramOp):
             raise VerifyException("runtime size is a uniform program parameter")
 

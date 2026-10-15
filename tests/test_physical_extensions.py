@@ -1,21 +1,23 @@
 import pytest
 from xdsl.dialects.builtin import IntAttr
 
-from xdsl_npu import Kernel, autosync, emit_asc, verify_plan
+from xdsl_npu import autosync, emit_asc, verify_plan
+from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import ChannelOp, dump, parse
 from xdsl_npu.model import CompileError, dependencies, extract
 
 
-def test_datablock_max_requires_the_complete_packed_output_footprint():
+@pytest.mark.parametrize("native", ["reduce_max8", "reduce_sum8"])
+def test_datablock_reduction_requires_the_complete_packed_output_footprint(native):
     k = Kernel("block_max")
     source = k.buffer("source", "UB", 512)
     destination = k.buffer("destination", "UB", 32)
     k.loop(1)
     a, b = k.view(source, 512), k.view(destination, 32)
     k.task("initialize", "fill", a)
-    k.task("reduce", "reduce_max8", a, b)
-    with pytest.raises(CompileError, match="datablock max"):
+    k.task("reduce", native, a, b)
+    with pytest.raises(CompileError, match="datablock"):
         extract(k.finish())
 
 

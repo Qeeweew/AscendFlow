@@ -6,16 +6,16 @@ import hashlib
 import json
 from pathlib import Path
 
+from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from benchmarks.validation.state import inputs_and_oracle
 from examples.state.frame_snapshot import frame_state_sum
 from examples.state.grouped import grouped_state_sum
 from examples.state.shared_inputs import shared_state_sum
-from xdsl_npu import compile
+from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.model import require
 from xdsl_npu.performance import hardware_snapshot, runtime_work
-from xdsl_npu.toolchain import offline_compile
 
 
 def reference_source(tile, groups, *, shared_inputs=False, frame_snapshot=False):
@@ -49,6 +49,7 @@ def main():
     )
     parser.add_argument("--variant", choices=["generated", "ascendc", "both"], default="both")
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--timeout", type=float, default=300)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--shared-inputs", action="store_true")
     mode.add_argument("--frame-snapshot", action="store_true")
@@ -85,32 +86,45 @@ def main():
         if args.shared_inputs
         else grouped_state_sum
     )
-    artifact = compile(definition.specialize(B=args.tile, GROUPS=args.groups))
-    sources = {
-        "generated": (artifact.name, artifact.asc),
-        "ascendc": (
-            "frame_state_reference"
-            if args.frame_snapshot
-            else "shared_state_reference"
-            if args.shared_inputs
-            else "grouped_state_reference",
-            reference_source(
-                args.tile,
-                args.groups,
-                shared_inputs=args.shared_inputs,
-                frame_snapshot=args.frame_snapshot,
-            ),
-        ),
-    }
-    variants = list(sources) if args.variant == "both" else [args.variant]
-    if args.build or args.physical is None:
-        artifact.write(args.output / "generated")
+    variants = ["generated", "ascendc"] if args.variant == "both" else [args.variant]
+    build_generated = args.build and "generated" in variants
+    generated = args.output / "generated"
+    generated_check = generated if build_generated else generated / "source-check"
+    build_module(
+        lambda: definition.specialize(B=args.tile, GROUPS=args.groups),
+        generated_check,
+        shared=build_generated,
+        timeout_s=args.timeout,
+    )
+    artifact = read_artifact(generated_check)
+    sources = {"generated": (artifact.name, artifact.asc)}
     manifests = {}
     for variant in variants:
-        name, source = sources[variant]
         directory = args.output / variant
-        if args.build:
-            offline_compile(source, directory, name, shared=True)
+        if variant == "ascendc":
+            name = (
+                "frame_state_reference"
+                if args.frame_snapshot
+                else "shared_state_reference"
+                if args.shared_inputs
+                else "grouped_state_reference"
+            )
+            check = directory if args.build else directory / "source-check"
+            build_module(
+                lambda: reference_source(
+                    args.tile,
+                    args.groups,
+                    shared_inputs=args.shared_inputs,
+                    frame_snapshot=args.frame_snapshot,
+                ),
+                check,
+                name=name,
+                shared=args.build,
+                timeout_s=args.timeout,
+            )
+            reference = read_artifact(check)
+            sources[variant] = reference.name, reference.asc
+        name, source = sources[variant]
         if args.physical is not None:
             manifest = json.loads((directory / f"{name}.compile.json").read_text())
             require(

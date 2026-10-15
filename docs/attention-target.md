@@ -7,7 +7,7 @@
 
 ## 固定输入和执行政策
 
-初始合同：BNSD、f16/bf16、正Sq/Sk、Sq整除BQ、Sk整除BK、HQ整除HKV，
+初始合同：BNSD、f16/bf16、正Sq/Sk、Sq整除BQ、Sk整除BK、HQ为HKV的整数倍，
 D=CK=128、BQ128、BK1024、VR8。scale固定为FP32的1/sqrt(128)。首先实现
 无mask的forward；尾部/causal/空序列另立合同。工作组默认20，每组round-robin
 处理扁平query tile；组内1AIC/2AIV共享task域，不要求各组任务数相同。
@@ -20,6 +20,9 @@ continuous: Pipelined task → query=task//kv_tiles, kv=task%kv_tiles
 ```
 
 所有输入长度都是runtime参数，目标工厂不接受它们，也不按长度生成Python任务。
+`Sq/Sk` 已使用 `N.int64(minimum=1, multiple_of=BQ/BK)` 声明，通用输入合同
+已接入IR和launcher；完整FA仍被索引与nested CV阻塞。buffer声明移到共同Kernel
+scope，避免从Cube/Vector region逸出未导出的SSA。
 有限激活表工具只用于审查，限制64个逻辑task；它不是生产编译器或硬件模拟器。
 
 固定policy：AIC qk0→pv1；AIV update2→softmax1。同一actor本地step中先派发
@@ -47,10 +50,11 @@ ops-transformer HEAD `4bbfb3b` 的 arch22
 rescale/add。末块先FP32 `1/l`，再乘O，最后RN输出。不替换成rsqrt、融合FMA
 或逐native块softmax；P舍入不越过逻辑BK。
 
-行归约固定R64 partial后packed merge；广播使用显式8列BRCB scratch。
-这几项generic typed语法还需实现，并映射到已有受审查native操作；不能让宏
-隐藏临时分配或引入整行broadcast搬运。CPU oracle可复用现有online recurrence，
-但native累计/exp误差需要独立容差，不能当位级仿真。
+当前设计模板使用R64 partial后packed merge；广播使用显式8列BRCB scratch。
+这些 generic typed 基元已接入 AST softmax，完整 FA 仍被地址与 nested CV 合同
+阻塞。按用户最新要求，FP32 sum 归约次序允许改变，不要求位级相同；这里的
+固定树只是现有 fixture 配方，不是新 DSL 的限制。scratch/effects 仍须可见，
+CPU oracle 使用明确误差限，不能当作 native 指令位级仿真。
 
 默认源码分配（每个AIC/每个AIV分别计费）：
 
@@ -74,15 +78,18 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 
 ## 缺口映射与实际拒绝
 
+以下按合同分类，执行顺序以[重整计划](refactor-plan.md)为准。
+
 | 当前合同/缺口 | 下一部分位置 |
 |---|---|
-| local ordinary work/init/child/use | 已有受限子集，统一其完成关系查询 |
-| Q/K/V共享、runtime BNSD地址、group任务数 | 计划第2步；已有readonly子集不足以承载完整FA |
-| AST嵌套pipeline、内外generation、共享L0C | 计划第1步关系模型，第2步真实nested CV |
-| first/last、NEG_INF、maximum/reduce/broadcast | 第2步，通用原语效果全部可见 |
-| runtime商余、跨query延迟descriptor | 第3步continuous；不能按K枚举 |
-| 双AIV贡献、MTE2最后读取、通知/可见性/资源 | 第2/3步公共同步与最终检查 |
-| 大规模AscendC/ACLNN/profile | 第2/3步；已有参考不等于编译器FA结果 |
+| local ordinary work/init/child/use | 已有受限子集与符号完成关系；一般mixed组合仍缺失 |
+| Q/K/V共享、runtime BNSD地址、group任务数 | 输入/索引/ownership合同；已有readonly子集不足以承载完整FA |
+| AST嵌套pipeline、内外generation、共享L0C | 一般nested CV与父子完成关系 |
+| first/last、初始化与空路径 | 控制/激活域合同；不能只支持最后一代后缀 |
+| maximum/reduce/broadcast | 已有AST基元；完整FA集成仍待完成 |
+| runtime商余、跨query延迟descriptor | continuous的任务时钟；不能按K枚举 |
+| 双AIV贡献、MTE2最后读取、通知/可见性/资源 | 公共同步、event分配与最终实际IR检查 |
+| 大规模AscendC/ACLNN/profile | 完整DSL链验收；已有参考不等于编译器FA结果 |
 
 当前nested的首个诊断是`unsupported index product`，continuous是动态除数
 不在受支持索引子集中。测试要求明确失败，不把fixture解析成功当作FA编译通过。

@@ -120,29 +120,6 @@ def native_line(task, count, core="0", *, uniform_names=None, scalar=None):
     if task.native in {"fill", "fill_neg_inf"}:
         value = "-__builtin_inff()" if task.native == "fill_neg_inf" else f"float({task.scalar!r})"
         return f"asc_duplicate({p[0]}, {value}, uint32_t({length(refs[0], 4)}));"
-    if task.native == "mask_causal":
-        rows, cols, block_q, qt, first, owner_row, start = task.params
-        dst = ptr(refs[0], core=core, extra=f"npu_row * {cols * 4} + npu_chunk * 256")
-        return (
-            "asc_set_mask_norm(); "
-            f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
-            f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
-            f"int64_t npu_visible = {start + first + owner_row + 1} + ({core} % {qt}) * {block_q} + npu_row - g * {cols} - npu_chunk * 64; "
-            "uint64_t npu_mask = npu_visible >= 64 ? 0 : (npu_visible <= 0 ? UINT64_MAX : UINT64_MAX << npu_visible); "
-            "if (npu_mask) { asc_set_vector_mask(0, npu_mask); "
-            f"asc_duplicate({dst}, -__builtin_inff(), uint8_t(1), 1, 8); }} }} }}"
-        )
-    if task.native == "mask_prefix":
-        rows, cols, prefix = task.params
-        dst = ptr(refs[0], core=core, extra="npu_chunk * 256")
-        return (
-            "asc_set_mask_norm(); "
-            f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
-            f"int64_t npu_visible = {prefix} - g * {cols} - npu_chunk * 64; "
-            "uint64_t npu_mask = npu_visible >= 64 ? 0 : (npu_visible <= 0 ? UINT64_MAX : UINT64_MAX << npu_visible); "
-            "if (npu_mask) { asc_set_vector_mask(0, npu_mask); "
-            f"asc_duplicate({dst}, -__builtin_inff(), uint8_t({rows}), 1, {cols // 8}); }} }}"
-        )
     if task.native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
         rows, cols = task.params
         function = task.native.removesuffix("_row_broadcast")
@@ -214,8 +191,9 @@ def native_line(task, count, core="0", *, uniform_names=None, scalar=None):
             f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
             f"{function}({dst}, {src}, uint8_t({rows}), 1, 1, {cols // 8}); }}"
         )
-    if task.native == "reduce_max8":
-        return f"asc_datablock_reduce_max({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
+    if task.native in {"reduce_max8", "reduce_sum8"}:
+        function = "max" if task.native == "reduce_max8" else "sum"
+        return f"asc_datablock_reduce_{function}({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
     if task.native in {"reduce_sum64", "reduce_max64"}:
         rows, cols = task.params
         function = (

@@ -76,7 +76,7 @@ def test_large_constant_calls_and_child_keep_the_same_frame_proof_size():
     ]
     for key in (
         "native_templates",
-        "proof_domain_states",
+        "completion_statistics",
         "proof_path_queries",
         "invocation_path_visits",
         "sequence_completion_sites",
@@ -86,6 +86,7 @@ def test_large_constant_calls_and_child_keep_the_same_frame_proof_size():
         "invocation_completion_transfers",
     ):
         assert reports[0][key] == reports[1][key]
+    assert reports[0]["completion_statistics"]["condition_facts"] > 0
 
 
 def test_partial_frame_write_cannot_initialize_unwritten_bytes():

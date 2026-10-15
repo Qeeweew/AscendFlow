@@ -69,25 +69,6 @@ def test_runtime_parameter_cannot_be_silently_specialized():
     )
 
 
-def test_ast_explicit_slots_preserve_the_existing_physical_pipeline():
-    count = N.dynamic("tiles")
-
-    @N.trace_func(disjoint_external=True)
-    def reference(X: N.Tensor((count, 64), N.f32), Y: N.Tensor((count, 64), N.f32, access="write")):
-        with N.Kernel(1, kind="vector"):
-            x = N.alloc_ub((64,), versions=2, name="inputs")
-            y = N.alloc_ub((64,), versions=2, name="outputs")
-            for t in N.Pipelined(count, stages=3):
-                with N.Stage(0, name="load"):
-                    N.copy(X[t, :], x)
-                with N.Stage(1, name="compute"), N.Vector():
-                    N.mul(x, 2.0, out=y)
-                with N.Stage(2, name="store"):
-                    N.copy(y, Y[t, :])
-
-    assert compile(scale).asc == compile(reference).asc.replace("reference", "scale")
-
-
 def test_ast_constant_loop_keeps_one_body_even_for_millions_of_iterations():
     sizes = []
     for count in (0, 4, 1 << 26):
@@ -161,7 +142,7 @@ def test_ast_constant_nested_pipeline_is_not_sent_to_legacy_unrolling():
     [
         ("for i in range(4):\n    pass", "undefined DSL name range"),
         ("while True:\n    pass", "unsupported device statement While"),
-        ("x = N.alloc_ub((64,), versions=2)", "explicit slot axes"),
+        ("x = N.alloc_ub((64,), versions=2)", "unexpected keyword argument.*versions"),
         ("for i in N.unroll(1000000):\n    pass", "64-iteration budget"),
     ],
 )

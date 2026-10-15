@@ -38,35 +38,6 @@ def rounded(values, dtype):
     return decode(encode(values, dtype), dtype, values.shape)
 
 
-def attention_description(plan):
-    from xdsl_npu.ir import StaticDispatchOp
-    from xdsl_npu.mixed import extract_mixed
-
-    if isinstance(plan.body.block.first_op, StaticDispatchOp):
-        from xdsl_npu.dispatch import extract_dispatch
-
-        dispatch = extract_dispatch(plan)
-        mixed = dispatch.cases[0][1]
-        for _, other in dispatch.cases:
-            require(
-                all(
-                    other.op.attributes.get(key) == mixed.op.attributes.get(key)
-                    for key in (
-                        "attention_shape",
-                        "attention_tile",
-                        "attention_scale",
-                        "attention_causal",
-                        "attention_start",
-                        "attention_packed_decode",
-                    )
-                ),
-                "attention cases disagree on their numerical contract",
-            )
-        return dispatch.roots, mixed.op.attributes, dispatch.op.sym_name.data
-    mixed = extract_mixed(plan)
-    return mixed.roots, mixed.op.attributes, mixed.op.sym_name.data
-
-
 def online_attention(
     q, k, v, *, block_kv, dtype, scale, query_positions=None, causal=False, query_start=0
 ):
@@ -91,8 +62,7 @@ def online_attention(
             )
             scores = np.where(visible, scores, np.float32(-np.inf))
         next_maximum = np.maximum(maximum, np.max(scores, axis=1))
-        # Rows with no visible key in this tile retain their prior state. The
-        # factory omits tiles masked for the whole physical query group.
+        # Fully masked later tiles contribute zero and retain the prior state.
         alpha = np.exp(np.float32(maximum - next_maximum))
         probabilities = np.exp(np.float32(scores - next_maximum[:, None]))
         partials = probabilities.reshape(rows, -1, 64).sum(axis=2, dtype=np.float32)
@@ -102,100 +72,6 @@ def online_attention(
         output = np.float32(np.float32(output * alpha[:, None]) + pv)
         maximum = next_maximum
     return rounded(np.float32(output * np.float32(1 / denominator[:, None])), dtype)
-
-
-def attention_inputs(plan, *, scope="full", data_case="standard"):
-    import numpy as np
-
-    roots, attrs, name = attention_description(plan)
-    require(name == "flash_attention", "expected the forward attention recipe")
-    shape = tuple(n.data for n in attrs["attention_shape"])
-    block_q, block_kv, _, _ = (n.data for n in attrs["attention_tile"])
-    batch, heads, kv_heads, sq, sk, dim = shape
-    dtype = roots["q"].ref.type.dtype.data
-    scale = attrs["attention_scale"].value.data
-    causal, query_start = bool(attrs["attention_causal"].data), attrs["attention_start"].data
-    require(scope in {"full", "sampled"}, "attention oracle scope must be full or sampled")
-    require(data_case in {"standard", "sharp", "uniform"}, "unknown attention input case")
-    rng = np.random.default_rng(9102201)
-    raw = {}
-    arrays = {}
-    for name, size in (
-        ("q", (batch, heads, sq, dim)),
-        ("k", (batch, kv_heads, sk, dim)),
-        ("v", (batch, kv_heads, sk, dim)),
-    ):
-        values = rng.standard_normal(size, dtype=np.float32) * np.float32(0.5)
-        if data_case == "sharp" and name in {"q", "k"}:
-            values *= np.float32(3)
-        if data_case == "uniform" and name == "k":
-            values.fill(0)
-        raw[name] = encode(values, dtype)
-        arrays[name] = decode(raw[name], dtype, size)
-        require(
-            len(raw[name]) == roots[name].nbytes.data,
-            "attention input metadata/footprint mismatch",
-        )
-    if scope == "full" or sq == 1:
-        selected = np.arange(sq)
-    else:
-        # Both AIV owners and every query tile, plus sequence endpoints.
-        native_tile = attrs.get("attention_native_tile")
-        sample_step = native_tile.data[1].data if native_tile is not None else block_q // 2
-        selected = np.array(
-            sorted(
-                {
-                    row
-                    for tile in range(sq // block_q)
-                    for row in (
-                        *(tile * block_q + offset for offset in range(0, block_q, sample_step)),
-                        tile * block_q + block_q - 1,
-                    )
-                }
-            )
-        )
-    expected = np.empty((batch, heads, len(selected), dim), dtype=np.float32)
-    start = perf_counter()
-    for b in range(batch):
-        for h in range(heads):
-            kh = h // (heads // kv_heads)
-            # Bounded query blocks bound host temporary scores independently
-            # of Sq; all KV blocks/rounding boundaries are still visited.
-            for first in range(0, len(selected), block_q):
-                indices = selected[first : first + block_q]
-                expected[b, h, first : first + len(indices)] = online_attention(
-                    arrays["q"][b, h, indices],
-                    arrays["k"][b, kh],
-                    arrays["v"][b, kh],
-                    block_kv=block_kv,
-                    dtype=dtype,
-                    scale=scale,
-                    causal=causal,
-                    query_start=query_start,
-                    query_positions=indices,
-                )
-    for name, root in roots.items():
-        if name not in raw:
-            raw[name] = (b"\xff\x7f" if name == "output" else b"\xcd\xcd") * (root.nbytes.data // 2)
-    report = {
-        "shape_b_hq_hkv_sq_sk_d": list(shape),
-        "dtype": dtype,
-        "block_q": block_q,
-        "logical_block_kv": block_kv,
-        "softmax_scale_f32": scale,
-        "oracle_scope": scope,
-        "query_rows_per_head": selected.tolist(),
-        "numerical_elements": int(expected.size),
-        "oracle_seconds": perf_counter() - start,
-        "seed": 9102201,
-        "data_case": data_case,
-        "causal": causal,
-        "query_start": query_start,
-        "oracle": "NumPy FP32 online recurrence, FP32 denominator, RN operand P and output",
-        "recipe_policies": [n.data for n in attrs.get("attention_policies", ())],
-        "native_cube_kv_vector_rows": [n.data for n in attrs.get("attention_native_tile", ())],
-    }
-    return raw, expected, selected, report
 
 
 def inputs_and_oracle(policy, sq, sk, *, scope="full", data_case="standard"):

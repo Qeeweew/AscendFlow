@@ -144,7 +144,7 @@ def test_runtime_work_counts_real_invocation_without_expanding_rows(artifact):
 
 
 def test_cv_actor_issue_policies_keep_the_shared_multistage_model():
-    from examples.legacy.multistage import cv_source
+    from tests.fixtures.cv import cv_source
     from xdsl_npu import language as N
 
     source = cv_source(N.dynamic("tasks"))

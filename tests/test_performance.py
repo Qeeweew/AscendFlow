@@ -1,6 +1,6 @@
 import pytest
 
-from examples.flash_attention.legacy import flash_attention
+from tests.fixtures.cv import cv_program
 from xdsl_npu import autosync
 from xdsl_npu.model import CompileError
 from xdsl_npu.performance import physical_work, profile_evidence, theoretical_metrics
@@ -8,27 +8,23 @@ from xdsl_npu.performance import physical_work, profile_evidence, theoretical_me
 
 def test_exact_typed_dma_and_cube_work_distinguish_cache_footprint_from_requests():
     baseline = physical_work(
-        autosync(flash_attention(1, 2, 1, 64, 256, 64)), useful_cube_flops=4 * 2 * 64 * 256 * 64
+        autosync(cv_program(2, segments=2)), useful_cube_flops=4 * 2 * 2 * 16**3
     )
-    assert baseline["native_cube_flops"] == 4 * 2 * 64 * 256 * 64
+    # Two 16x16x16 MAD families, two segments and two task generations.
+    assert baseline["native_cube_flops"] == 4 * 2 * 2 * 16**3
     assert baseline["native_cube_flops"] == baseline["useful_cube_flops"]
-    assert baseline["gm_instruction_requests_by_root"]["k:R"] == 2 * 256 * 64 * 2
-    assert baseline["gm_instruction_request_bytes"] == 688128
-    assert baseline["unique_gm_io_allocation_bytes"] == 98304
-    fast = physical_work(autosync(flash_attention(1, 2, 1, 64, 256, 64, packed_reductions=True)))
-    assert baseline["native_cube_flops"] == fast["native_cube_flops"]
-    assert baseline["dma_source_bytes_by_route"] == fast["dma_source_bytes_by_route"]
-    assert baseline["vector_intrinsic_call_upper_bounds"]["reduce_sum64"] == 256
-    assert fast["vector_intrinsic_call_upper_bounds"]["reduce_tile_sum64"] == 16
+    assert baseline["gm_instruction_requests_by_root"]["K:R"] == 2 * 2 * 512
+    assert baseline["gm_instruction_requests_by_root"]["scores:W"] == 2 * 2 * 1024
+    assert baseline["gm_instruction_requests_by_root"]["scores:R"] == 2 * 2 * 1024
+    assert baseline["gm_instruction_request_bytes"] == 2 * (3584 + 2 * 4096)
+    assert baseline["unique_gm_io_allocation_bytes"] == 2 * (1536 + 2 * 1024)
+    assert baseline["vector_intrinsic_call_upper_bounds"]["convert_rn"] == 2 * 2 * 2
 
 
-def test_causal_physical_work_counts_visited_tile_padding_separately_from_useful_cells():
-    work = physical_work(
-        autosync(flash_attention(1, 32, 1, 1, 128, 64, causal=True, query_start=17)),
-        useful_cube_flops=4 * 32 * 18 * 64,
-    )
-    assert work["native_cube_flops"] == 4 * 32 * 128 * 64
-    assert work["useful_cube_flops"] == 4 * 32 * 18 * 64
+def test_physical_work_keeps_declared_useful_cells_separate_from_full_native_tiles():
+    work = physical_work(autosync(cv_program(1)), useful_cube_flops=4 * 5 * 7 * 16)
+    assert work["native_cube_flops"] == 4 * 16**3
+    assert work["useful_cube_flops"] == 4 * 5 * 7 * 16
 
 
 def test_roofline_uses_explicit_array_and_bandwidth_assumptions():

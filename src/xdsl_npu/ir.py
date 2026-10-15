@@ -42,6 +42,7 @@ from xdsl.traits import (
     MemoryEffectKind,
     RecursiveMemoryEffect,
 )
+from xdsl.utils.exceptions import VerifyException
 
 
 @irdl_attr_definition
@@ -289,8 +290,23 @@ class RuntimeSizeOp(IRDLOperation):
 
     name = "npu.runtime_size"
     sym_name = attr_def(StringAttr)
+    minimum = attr_def(IntAttr)
     multiple = attr_def(IntAttr)
     value = result_def(IndexType)
+
+    def verify_(self):
+        _verify_runtime_contract(self.sym_name.data, self.minimum.data, self.multiple.data)
+
+
+def _verify_runtime_contract(name, minimum, multiple):
+    if not name.isidentifier():
+        raise VerifyException("runtime size requires a parameter name")
+    if type(minimum) is not int or not 0 <= minimum <= (1 << 63) - 1:
+        raise VerifyException("runtime minimum must be a nonnegative int64 integer")
+    if type(multiple) is not int or not 0 < multiple <= (1 << 63) - 1:
+        raise VerifyException("runtime multiple must be a positive int64 integer")
+    if ((minimum + multiple - 1) // multiple) * multiple > (1 << 63) - 1:
+        raise VerifyException("runtime input contract has no representable int64 value")
 
 
 @irdl_op_definition

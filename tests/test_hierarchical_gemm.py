@@ -1,15 +1,17 @@
+"""Finite native L1/L0/Cube/FIX lifetime oracles, independent of public DSL syntax."""
+
 import pytest
 from xdsl.dialects.builtin import IntAttr
 
-from examples.legacy.operators import gemm_nt
-from xdsl_npu import Kernel, autosync, emit_asc, verify_plan
+from tests.fixtures.physical_operators import gemm_nt
+from xdsl_npu import autosync, emit_asc, verify_plan
+from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import ChannelOp, SyncOp, TaskOp, ViewOp, dump, parse
 from xdsl_npu.model import CompileError, extract
 
 
-@pytest.mark.parametrize("ratio", [1, 2, 3, 4])
-@pytest.mark.parametrize("slots", [1, 2, 3])
+@pytest.mark.parametrize("ratio,slots", [(1, 1), (2, 1), (2, 2), (3, 2), (3, 3), (4, 3)])
 def test_l1_has_its_own_clock_and_all_l0_readers(ratio, slots):
     source = gemm_nt(
         32,

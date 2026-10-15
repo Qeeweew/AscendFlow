@@ -7,11 +7,14 @@
 
 采用 TileLang 风格的 tensor、显式存储、循环和作用域，受限 Python AST 进入
 xDSL；不执行设备函数体来 tracing 运行次数，不使用 `cube.task/vector.task`。
+用户已明确不要求兼容旧 DSL；这些旧入口已直接删除，不保留兼容层。内部
+物理 task IR 与公开语言分开，实现状态见[状态页](refactor-progress.md)。
 
 | 语法 | 意义 |
 |---|---|
 | `@T.prim_func` | 捕获设备源码及位置，不执行函数体 |
 | `T.Tensor(...), n: T.int64` | 外部引用及运行时参数；长度不是 constexpr |
+| `n: T.int64(minimum=1, multiple_of=B)` | 可检查的 runtime 输入合同，B 可引用后置 constexpr |
 | `B: T.constexpr` | tile 容量、layout/dtype、固定政策等显式特化值 |
 | `T.Kernel(groups, kind=...)` | launch 域；mixed 每组一个 AIC 和两个 AIV |
 | `T.Cube()`、`T.Vector() as lane` | actor 作用域；engine 由原生操作决定 |
@@ -20,6 +23,11 @@ xDSL；不执行设备函数体来 tracing 运行次数，不使用 `cube.task/v
 | `T.Stage(s, name=...)` | 最近 pipeline 的逻辑任务偏移，不是完成边界 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理空间、容量、layout、slot、别名 |
 | `copy/matmul/reduce/...` | typed 操作；实际读写和 scratch 必须可见 |
+
+裸 `T.int64` 仍表示非负整数、multiple=1；带合同的参数不变成 constexpr。
+合同进入source/physical IR，launcher在计算地址与设备派发前检查。当前同步分析
+仍保守使用非负域，不假称已经利用minimum证明一般动态商余。allocation须在
+全部使用者的共同源码scope声明，跨region逃逸会在前端明确拒绝。
 
 语法被前端识别不表示所有组合均可编译。AST 嵌套 pipeline、一般 mixed 层次、
 runtime 商余时钟及宏尚未贯通。显式 unroll 受预算限制；普通常量界不授权展开。
@@ -139,7 +147,9 @@ initialized 只说明初值，不能授权永远只读或跨 owner 覆写。
 未知动态别名/ownership 要有可验证合同或明确拒绝，不以 barrier 掩盖。
 
 FA 保持 FP32 m/l/O、p32 denominator、P RN、CK 累计、rescale/add 和最终归一化
-边界。改变逻辑 BK、reduce 树或融合运算属于算法/数值变化，不能当同步优化。
+边界。按最新要求，FA 的 FP32 sum 允许重排归约树，按误差合同验收；现有
+`order=` 配方不是长期语言约束。改变 BK、融合运算或递推状态仍需说明数值
+合同，归约选择不属于同步 pass 的职责。
 宏未来仅做透明 AST 内联，scratch/effects 可见，内部普通循环仍保留。
 
 ## 已接通的 FA Vector 基元

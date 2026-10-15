@@ -19,7 +19,7 @@ def _identity(command):
 def test_incremental_native_facts_match_materialized_instruction_stream(monkeypatch, case):
     import xdsl_npu.loop_sync as sync
     from examples.gemm.reduction import reduction_gemm
-    from examples.legacy.multistage import cv_source, vector_source
+    from tests.fixtures.cv import cv_source, vector_source
 
     graphs, checked = [], []
     original_init, original_insert = DirectCompletion.__init__, DirectCompletion.insert
@@ -159,6 +159,7 @@ def test_direct_domains_propagate_new_edges_and_nodes_without_rebuilding():
     from types import SimpleNamespace
 
     from xdsl_npu.loop_graph import Command
+
     task = SimpleNamespace(stage=0)
     graph = DirectCompletion(1, None)
     source, target = (Command(i, "aiv0", task, "task") for i in range(2))

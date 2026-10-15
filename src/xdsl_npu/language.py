@@ -1,10 +1,9 @@
-"""Tile-style DSL declarations and shared typed operation builders.
+"""Tile-style AST declarations and internal typed operation builders.
 
-prim_func captures restricted Python AST. trace_func is the explicit legacy
-constructor, retained for migration/reference tests, never a parser fallback.
+prim_func captures source without executing the device function. The builders
+below are used by the AST parser; they do not provide an executable tracer.
 """
 
-import inspect
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -16,7 +15,6 @@ from xdsl.dialects.builtin import (
     FloatAttr,
     IndexType,
     IntAttr,
-    ModuleOp,
     StringAttr,
     i1,
 )
@@ -58,6 +56,28 @@ class _ParameterType(StrEnum):
     INT64 = "int64"
     CONSTEXPR = "constexpr"
 
+    def __call__(self, *, minimum=0, multiple_of=1):
+        require(self is _ParameterType.INT64, "only int64 accepts runtime input contracts")
+        return _IntegerParameter(minimum, multiple_of)
+
+
+@dataclass(frozen=True)
+class _IntegerParameter:
+    minimum: int = 0
+    multiple_of: int = 1
+
+    def __post_init__(self):
+        require(
+            type(self.minimum) is int and 0 <= self.minimum <= (1 << 63) - 1,
+            "int64 minimum must be a nonnegative int64 integer",
+        )
+        require(
+            type(self.multiple_of) is int and 0 < self.multiple_of <= (1 << 63) - 1,
+            "int64 multiple_of must be a positive int64 integer",
+        )
+        first = ((self.minimum + self.multiple_of - 1) // self.multiple_of) * self.multiple_of
+        require(first <= (1 << 63) - 1, "int64 input contract has no representable value")
+
 
 int64, constexpr = _ParameterType.INT64, _ParameterType.CONSTEXPR
 
@@ -80,6 +100,7 @@ class _Dimension:
     name: str
     multiple: int = 1
     scale: int = 1
+    minimum: int = 0
 
     def __mul__(self, factor):
         if isinstance(factor, (_Dimension, _ExtentProduct)):
@@ -126,11 +147,11 @@ def _extent_product(left, right):
     return _ExtentProduct(tuple(sorted(factors, key=lambda d: d.name)), left.scale * right.scale)
 
 
-def dynamic(name, *, multiple_of=1):
+def dynamic(name, *, minimum=0, multiple_of=1):
     """Uniform runtime length. Local/native tile dimensions remain static."""
     require(type(name) is str and name.isidentifier(), "runtime size needs an identifier")
-    require(type(multiple_of) is int and multiple_of > 0, "size multiple must be positive")
-    return _Dimension(name, multiple_of)
+    contract = _IntegerParameter(minimum, multiple_of)
+    return _Dimension(name, contract.multiple_of, minimum=contract.minimum)
 
 
 @dataclass(frozen=True)
@@ -284,6 +305,7 @@ class _Trace:
                 result_types=[IndexType()],
                 attributes={
                     "sym_name": StringAttr(dimension.name),
+                    "minimum": IntAttr(dimension.minimum),
                     "multiple": IntAttr(dimension.multiple),
                 },
             )
@@ -299,7 +321,10 @@ class _Trace:
                 block.insert_op_before(op, block.first_op)
             self.sizes[dimension.name] = op
         op = self.sizes[dimension.name]
-        require(op.multiple.data == dimension.multiple, "inconsistent contracts for runtime size")
+        require(
+            (op.minimum.data, op.multiple.data) == (dimension.minimum, dimension.multiple),
+            "inconsistent contracts for runtime size",
+        )
         return op.value
 
     def add(self, op):
@@ -368,22 +393,13 @@ class _Buffer:
     dtype: DType
     memory: str
     layout: str
-    versions: int
-    ring: bool
 
     def __getitem__(self, indices):
         indices = indices if isinstance(indices, tuple) else (indices,)
-        generation = None
-        if self.ring:
-            require(
-                indices and isinstance(indices[0], _Index),
-                "task ring indexing starts with a task coordinate",
-            )
-            generation, indices = indices[0], indices[1:]
         strides = tuple(
             prod(self.shape[i + 1 :]) * ITEMSIZE[self.dtype.value] for i in range(len(self.shape))
         )
-        view = _View(self, self.shape, strides, _Index(), generation)
+        view = _View(self, self.shape, strides, _Index())
         return view[indices] if indices else view
 
     def _full(self):
@@ -399,7 +415,6 @@ class _View:
     shape: tuple[int, ...]
     strides: tuple[int, ...]
     offset: _Index
-    generation: _Index | None = None
 
     def __getitem__(self, indices):
         indices = indices if isinstance(indices, tuple) else (indices,)
@@ -439,33 +454,21 @@ class _View:
                     require(0 <= lo and hi < size, "source index exceeds its logical axis")
                 offset += index * stride
         require(shape, "Scalar accesses need an explicit Scalar operation")
-        return _View(self.buffer, tuple(shape), tuple(strides), offset, self.generation)
+        return _View(self.buffer, tuple(shape), tuple(strides), offset)
 
     def bound(self):
         trace = _trace()
-        generation = self.generation
-        if generation is None and self.buffer.versions > 1:
-            require(trace.pipelines, "versioned views require a Pipelined task region")
-            generation = _coordinate(trace.pipelines[-1].body.block.args[0])
-        return replace(
-            self,
-            offset=trace.resolve_index(self.offset),
-            generation=None if generation is None else trace.resolve_index(generation),
+        require(
+            self.buffer.op.parent in trace.blocks,
+            f"allocation {self.buffer.op.sym_name.data} escaped its source region; "
+            "declare shared storage in an enclosing scope",
         )
+        return replace(self, offset=trace.resolve_index(self.offset))
 
     def emit(self, valid=None):
         trace, buffer = _trace(), self.buffer
         bound = self.bound()
         offset = bound.offset
-        if buffer.versions > 1:
-            offset += _version_index(bound.generation, buffer.versions) * (
-                prod(buffer.shape) * ITEMSIZE[buffer.dtype.value]
-            )
-        if buffer.ring:
-            require(buffer.memory == "GM", "task workspace rings reside in GM")
-            offset += _coordinate(trace.op.body.block.args[0]) * (
-                buffer.versions * prod(buffer.shape) * ITEMSIZE[buffer.dtype.value]
-            )
         variables = list(dict.fromkeys(v for v, _, _, _ in offset.terms))
         dynamic_terms, static_terms = [], []
         for variable, coefficient, divisor, modulus in offset.terms:
@@ -650,12 +653,6 @@ def _runtime_axis(index, dimension, width):
     )
 
 
-def _version_index(index, versions):
-    if not index.terms:
-        return _Index(constant=index.constant % versions)
-    return index % versions
-
-
 def _predicate(value):
     if isinstance(value, SSAValue) and value.type == i1:
         return value
@@ -695,9 +692,7 @@ def _dependency_inputs(values):
     return _ints(i for i, value in enumerate(values) if isinstance(value, _Value))
 
 
-def _allocate(
-    shape, dtype, memory, *, versions=1, layout="linear", name=None, access="local", ring=False
-):
+def _allocate(shape, dtype, memory, *, layout="linear", name=None, access="local"):
     trace = _trace()
     shape = tuple(shape)
     require(
@@ -717,39 +712,35 @@ def _allocate(
         result_types=[_type(shape, dtype, memory, layout)],
         attributes={
             "sym_name": StringAttr(name),
-            "versions": IntAttr(versions),
+            "versions": IntAttr(1),
             "access": StringAttr(access),
-            "ring": IntAttr(int(ring)),
+            "ring": IntAttr(0),
             "dynamic_axes": _ints(axes),
         },
     )
     trace.add(op)
     op.ref.name_hint = name
-    return _Buffer(op, shape, dtype, memory, layout, versions, ring)
+    return _Buffer(op, shape, dtype, memory, layout)
 
 
-def alloc_ub(shape, dtype=f32, *, versions=1, name=None):
-    return _allocate(shape, dtype, "UB", versions=versions, name=name)
+def alloc_ub(shape, dtype=f32, *, name=None):
+    return _allocate(shape, dtype, "UB", name=name)
 
 
-def alloc_l1(shape, dtype=f16, *, versions=1, name=None):
-    return _allocate(shape, dtype, "L1", versions=versions, layout="NZ", name=name)
+def alloc_l1(shape, dtype=f16, *, name=None):
+    return _allocate(shape, dtype, "L1", layout="NZ", name=name)
 
 
-def alloc_l0a(shape, dtype=f16, *, versions=1, name=None):
-    return _allocate(shape, dtype, "L0A", versions=versions, layout="ZZ", name=name)
+def alloc_l0a(shape, dtype=f16, *, name=None):
+    return _allocate(shape, dtype, "L0A", layout="ZZ", name=name)
 
 
-def alloc_l0b(shape, dtype=f16, *, versions=1, name=None):
-    return _allocate(shape, dtype, "L0B", versions=versions, layout="ZN", name=name)
+def alloc_l0b(shape, dtype=f16, *, name=None):
+    return _allocate(shape, dtype, "L0B", layout="ZN", name=name)
 
 
-def alloc_l0c(shape, dtype=f32, *, versions=1, name=None):
-    return _allocate(shape, dtype, "L0C", versions=versions, layout="NZ", name=name)
-
-
-def alloc_workspace(shape, dtype=f32, *, versions, name=None):
-    return _allocate(shape, dtype, "GM", versions=versions, name=name, ring=True)
+def alloc_l0c(shape, dtype=f32, *, name=None):
+    return _allocate(shape, dtype, "L0C", layout="NZ", name=name)
 
 
 class Kernel:
@@ -838,16 +829,6 @@ class Pipelined:
             regions=[Region(Block(arg_types=[IndexType()]))],
         )
 
-    def __iter__(self):
-        trace = _trace()
-        trace.enter(self.op)
-        trace.pipelines.append(self.op)
-        try:
-            yield _coordinate(self.op.body.block.args[0])
-        finally:
-            trace.pipelines.pop()
-            trace.leave(self.op)
-
 
 def _issue_order(order):
     if order is None:
@@ -885,35 +866,6 @@ def from_source(source, *, constants=None, filename="<dsl>", disjoint_external=F
     return parse_source(
         source, constants=constants, filename=filename, disjoint_external=disjoint_external
     )
-
-
-def trace_func(function=None, *, disjoint_external=False):
-    """Explicit legacy tracing API; new programs should use prim_func."""
-
-    def decorate(func):
-        trace = _Trace(func.__name__, disjoint_external)
-        token = _current.set(trace)
-        try:
-            arguments = []
-            for name, parameter in inspect.signature(func).parameters.items():
-                typ = parameter.annotation
-                require(
-                    isinstance(typ, Tensor),
-                    f"{name}: expected a Tensor shape/dtype/access annotation",
-                )
-                arguments.append(
-                    _allocate(typ.shape, typ.dtype, "GM", name=name, access=typ.access)
-                )
-            func(*arguments)
-            require(trace.kernel_entered, "source function must contain Kernel")
-            trace.add(YieldOp.build(operands=[[]]))
-            module = ModuleOp([trace.op])
-            module.verify()
-            return module
-        finally:
-            _current.reset(token)
-
-    return decorate if function is None else decorate(function)
 
 
 def copy(source, destination, *, valid=None, transpose=False):
@@ -1115,38 +1067,28 @@ def matmul(a, b, *, accum, initialize=True):
         == ("L0A", "L0B", "L0C"),
         "matmul requires explicit L0A, L0B and L0C tiles; copy L1 operands first",
     )
-    return _matmul(a, b, accum, transpose_b=False, initialize=initialize)
+    return _matmul(a, b, accum, initialize=initialize)
 
 
-def gemm(a, b, accumulator, *, transpose_b=False, initialize=True):
-    """Legacy L1 recipe; AST programs use explicit L0 storage and matmul."""
-    require(
-        _view(a).buffer.memory == _view(b).buffer.memory == "L1",
-        "legacy gemm requires L1 operands; use matmul for explicit L0 tiles",
-    )
-    return _matmul(a, b, accumulator, transpose_b=transpose_b, initialize=initialize)
-
-
-def _matmul(a, b, accumulator, *, transpose_b, initialize):
+def _matmul(a, b, accumulator, *, initialize):
     av, bv, cv = _view(a), _view(b), _view(accumulator).bound()
-    require(all(len(v.shape) == 2 for v in (av, bv, cv)), "gemm requires matrix tiles")
+    require(all(len(v.shape) == 2 for v in (av, bv, cv)), "matmul requires matrix tiles")
     m, k = av.shape
-    n, bk = bv.shape if transpose_b else (bv.shape[1], bv.shape[0])
-    require(k == bk and cv.shape == (m, n), "gemm matrix extents do not agree")
+    bk, n = bv.shape
+    require(k == bk and cv.shape == (m, n), "matmul matrix extents do not agree")
     require(
         av.buffer.dtype == bv.buffer.dtype
         and av.buffer.dtype in {f16, bf16}
         and cv.buffer.dtype == f32,
-        "gemm requires b16 operands and f32 accumulator",
+        "matmul requires b16 operands and f32 accumulator",
     )
-    require(type(transpose_b) is bool, "explicit boolean transpose policy required")
     initialization = _predicate(initialize)
     inputs = [a, b] if initialize is True else [a, b, accumulator]
     op = MatmulOp.build(
         operands=[av.emit(), bv.emit(), cv.emit(), initialization, _deps(inputs)],
         result_types=[_tile(cv)],
         attributes={
-            "transpose_b": IntAttr(int(transpose_b)),
+            "transpose_b": IntAttr(0),
             "dependency_inputs": _dependency_inputs(inputs),
         },
     )

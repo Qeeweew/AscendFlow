@@ -9,7 +9,8 @@
 | [refactor-progress.md](refactor-progress.md) | 实际支持、明确缺陷及已验证证据 |
 | [refactor-plan.md](refactor-plan.md) | 下一部分具体修改、替换职责及退出门槛 |
 
-当前专项：[暂停优化的同步问题](sync-known-issues.md)、[新DSL Vector算子及设备性能](vector-row-performance.md)。
+当前专项：[同步与事件已知问题](sync-known-issues.md)、[新DSL Vector算子及设备性能](vector-row-performance.md)。
+旧 task DSL 和旧FA入口已删除；硬件反例迁入内部测试，不继续增加旧算子优化。
 
 [算子示例](../examples/README.md)与[验证工具](../benchmarks/README.md)分别给源码和
 复现入口。设计模板不作为可运行示例；历史证据不自动适用于新 AST 路径。

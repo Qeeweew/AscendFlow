@@ -1,4 +1,8 @@
-"""Explicit fixed-issue builder; there are no user event IDs or barriers."""
+"""Internal physical-IR construction for lowering and compiler tests.
+
+This is not a public programming language. User programs use language.prim_func;
+TaskOp retains the physical accesses required by synchronization and codegen.
+"""
 
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp, StringAttr, f32
@@ -70,10 +74,14 @@ class Kernel:
     def init_fixpipe(self):
         self.block.add_op(FixConfigOp())
 
-    def runtime_size(self, name, *, multiple=1):
+    def runtime_size(self, name, *, minimum=0, multiple=1):
         op = RuntimeSizeOp.create(
             result_types=[IndexType()],
-            attributes={"sym_name": StringAttr(name), "multiple": IntAttr(multiple)},
+            attributes={
+                "sym_name": StringAttr(name),
+                "minimum": IntAttr(minimum),
+                "multiple": IntAttr(multiple),
+            },
         )
         self.block.add_op(op)
         return op.value

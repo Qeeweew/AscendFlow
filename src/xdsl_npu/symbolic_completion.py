@@ -6,6 +6,7 @@ prefixes may extend an interval to their physical-loop horizon: the transparent
 prefix cycle supplies that induction. Ordinary task/Set completion does not.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 from heapq import heappop, heappush
 
@@ -13,6 +14,16 @@ from .budget import poll
 from .completion import CountDomain, _first, canonical, intersection
 from .completion_flow import ALL, _includes
 from .model import require
+
+FACT_STATISTICS = (
+    "fact_nodes",
+    "condition_facts",
+    "peak_condition_facts",
+    "fact_attempts",
+    "fact_comparisons",
+    "fact_updates",
+    "fact_transfers",
+)
 
 
 def add(value, delta):
@@ -104,30 +115,75 @@ def native_family(meta, period, count=(1, 0)):
     )
 
 
-class SymbolicCompletion:
+class CompletionTopology:
+    """One owner appends immutable family/arc records; domains only read them."""
+
     def __init__(self):
-        self.families, self.edges, self.facts = [], [], []
-        self.pending, self.delta = [], {}
-        self.edge_count = self.transfers = 0
+        self.families, self.edges = [], []
+        self.edge_count = 0
 
     def node(self, family):
         require(len(self.edges) < 100_000, "symbolic completion node budget exceeded")
         index = len(self.edges)
         self.families.append(family)
-        self.edges.append([])
-        self.facts.append({})
+        self.edges.append(())
         return index
 
+    def edge(self, source, target, shift=0, *, source_point=None, target_point=None, guard=ALL):
+        if guard is None:
+            return None
+        require((source_point is None) == (target_point is None), "partial boundary binding")
+        if source_point is not None:
+            guard = meet(guard, self.families[source].residue_guard(source_point))
+        if guard is None:
+            return None
+        edge = target, shift, source_point, target_point, canonical(guard)
+        if edge in self.edges[source]:
+            return None
+        self.edges[source] += (edge,)
+        self.edge_count += 1
+        return edge
+
+
+class SymbolicCompletion:
+    def __init__(self, *, topology=None, count=None, terminal=True):
+        self._owns_topology = topology is None
+        self.topology = CompletionTopology() if topology is None else topology
+        self.families, self.edges = self.topology.families, self.topology.edges
+        # A domain allocates facts only at reached nodes, not V empty maps.
+        self.facts = defaultdict(dict)
+        self.count, self.terminal = count, terminal
+        # Bind immutable family bounds once, only when a fact touches a node.
+        # This is domain-local activation, not another copy of the topology.
+        self.activation = {}
+        self.pending, self.delta = [], {}
+        self.transfers = 0
+        self.fact_attempts = self.fact_comparisons = self.fact_updates = 0
+        self.fact_records = self.peak_fact_records = 0
+
+    @property
+    def edge_count(self):
+        return self.topology.edge_count
+
+    def node(self, family):
+        require(self._owns_topology, "a query domain cannot mutate its shared topology")
+        return self.topology.node(family)
+
     def _remember(self, node, lo, hi, guard, bits):
+        self.fact_attempts += 1
         guard = ALL if guard == ALL else canonical(guard)
         if guard.exact is not None:
             lo = 0, lo[0] * guard.exact + lo[1]
             hi = 0, hi[0] * guard.exact + hi[1]
         known = self.facts[node]
-        bits &= ~known.get((lo, hi, guard), 0)
+        key = lo, hi, guard
+        present = known.get(key, 0)
+        bits &= ~present
         if not bits:
             return
+        comparisons = 0
         for (left, right, prior), mask in known.items():
+            comparisons += 1
             if (
                 bits & mask
                 and (prior == guard or _includes(prior, guard))
@@ -136,9 +192,13 @@ class SymbolicCompletion:
             ):
                 bits &= ~mask
                 if not bits:
+                    self.fact_comparisons += comparisons
                     return
-        for key, mask in tuple(known.items()):
-            left, right, prior = key
+        records = tuple(known.items())
+        self.fact_comparisons += comparisons + len(records)
+        removals, updates = 0, 1
+        for prior_key, mask in records:
+            left, right, prior = prior_key
             if (
                 bits & mask
                 and (guard == prior or _includes(guard, prior))
@@ -146,11 +206,18 @@ class SymbolicCompletion:
                 and holds(right, hi, prior)
             ):
                 if remaining := mask & ~bits:
-                    known[key] = remaining
+                    known[prior_key] = remaining
                 else:
-                    del known[key]
-        key = lo, hi, guard
-        known[key] = known.get(key, 0) | bits
+                    del known[prior_key]
+                    removals += 1
+                updates += 1
+        # Incoming bits exclude `present`, so supersession cannot change this
+        # exact key. Reuse its first lookup instead of hashing the guard again.
+        self.fact_records += (not present) - removals
+        known[key] = present | bits
+        self.fact_updates += updates
+        if self.fact_records > self.peak_fact_records:  # noqa: PLR1730 - avoid a call per fact update
+            self.peak_fact_records = self.fact_records
         if node not in self.delta:
             self.delta[node] = {}
             heappush(self.pending, node)
@@ -161,40 +228,55 @@ class SymbolicCompletion:
         if guard is None or not bits:
             return
         family = self.families[node]
-        lower = family.lower + (family.residue - family.lower) % family.period
-        if not (lo[0] or hi[0] or family.horizon[0]) and (
-            family.last is None or not family.last[0]
-        ):
-            left, right = max(lo[1], lower), min(hi[1], family.horizon[1])
-            if family.last is not None:
-                last = family.last[1]
-                if last % family.period != family.residue or not left <= last <= right:
+        activation = self.activation.get(node)
+        if activation is None:
+            horizon, last = family.horizon, family.last
+            if last is not None and self.count is not None and not self.terminal:
+                self.activation[node] = ()
+                return
+            if self.count is not None:
+                # The smallest legal count only changes activation bounds.
+                horizon = (0, horizon[0] * self.count + horizon[1])
+                if last is not None:
+                    last = (0, last[0] * self.count + last[1])
+            if last is not None and not last[0] and last[1] % family.period != family.residue:
+                self.activation[node] = ()
+                return
+            lower = family.lower + (family.residue - family.lower) % family.period
+            activation = self.activation[node] = lower, horizon, last
+        if not activation:
+            return
+        lower, horizon, last = activation
+        if not (lo[0] or hi[0] or horizon[0]) and (last is None or not last[0]):
+            left, right = max(lo[1], lower), min(hi[1], horizon[1])
+            if last is not None:
+                if not left <= last[1] <= right:
                     return
-                left = right = last
+                left = right = last[1]
             if left <= right:
                 self._remember(
                     node,
                     (0, left),
-                    (0, family.horizon[1] if family.monotone else right),
+                    (0, horizon[1] if family.monotone else right),
                     guard,
                     bits,
                 )
             return
         for left, lower_domain in choice(lo, (0, lower), guard, maximum=True):
-            for right, domain in choice(hi, family.horizon, lower_domain, maximum=False):
+            for right, domain in choice(hi, horizon, lower_domain, maximum=False):
                 domain = meet(domain, le(left, right))
                 if domain is None:
                     continue
-                if family.last is not None:
-                    domain = meet(domain, meet(le(left, family.last), le(family.last, right)))
-                    domain = meet(domain, family.residue_guard(family.last))
+                if last is not None:
+                    domain = meet(domain, meet(le(left, last), le(last, right)))
+                    domain = meet(domain, family.residue_guard(last))
                     if domain is None:
                         continue
-                    left = right = family.last
+                    left = right = last
                 if family.monotone:
                     # Reach the real prefix once, then use its transparent
                     # carry cycle. Never extend a native end or Set effect.
-                    right = family.horizon
+                    right = horizon
                 self._remember(node, left, right, domain, bits)
 
     def seed(self, node, point, guard, bits):
@@ -203,6 +285,10 @@ class SymbolicCompletion:
         )
 
     def _transfer(self, target, shift, source_point, target_point, guard, lo, hi, domain, bits):
+        self.transfers += 1
+        if self.transfers % 1024 == 0:
+            poll("symbolic completion propagation", transfers=self.transfers, nodes=len(self.edges))
+        require(self.transfers <= 2_000_000, "symbolic completion propagation budget exceeded")
         domain = meet(domain, guard)
         if domain is None:
             return
@@ -213,19 +299,16 @@ class SymbolicCompletion:
             self.seed(target, target_point, active, bits)
 
     def edge(self, source, target, shift=0, *, source_point=None, target_point=None, guard=ALL):
-        if guard is None:
-            return
-        require((source_point is None) == (target_point is None), "partial boundary binding")
-        if source_point is not None:
-            guard = meet(guard, self.families[source].residue_guard(source_point))
-        if guard is None:
-            return
-        edge = target, shift, source_point, target_point, canonical(guard)
-        if edge in self.edges[source]:
-            return
-        self.edges[source].append(edge)
-        self.edge_count += 1
-        for (lo, hi, domain), bits in tuple(self.facts[source].items()):
+        require(self._owns_topology, "a query domain cannot mutate its shared topology")
+        edge = self.topology.edge(
+            source, target, shift, source_point=source_point, target_point=target_point, guard=guard
+        )
+        if edge is not None:
+            self.replay(source, edge)
+
+    def replay(self, source, edge):
+        """An accepted new arc receives this domain's existing source facts."""
+        for (lo, hi, domain), bits in tuple(self.facts.get(source, {}).items()):
             self._transfer(*edge, lo, hi, domain, bits)
 
     def propagate(self):
@@ -236,28 +319,29 @@ class SymbolicCompletion:
                 if not bits:
                     continue
                 for edge in self.edges[source]:
-                    self.transfers += 1
-                    if self.transfers % 1024 == 0:
-                        poll(
-                            "symbolic completion propagation",
-                            transfers=self.transfers,
-                            nodes=len(self.edges),
-                        )
-                    require(
-                        self.transfers <= 2_000_000,
-                        "symbolic completion propagation budget exceeded",
-                    )
                     self._transfer(*edge, lo, hi, domain, bits)
 
     def coverage(self, node, point, bit, guard):
         result = []
         guard = meet(guard, self.families[node].residue_guard(point))
-        for (lo, hi, domain), bits in self.facts[node].items():
+        for (lo, hi, domain), bits in self.facts.get(node, {}).items():
             if bits & bit:
                 active = meet(meet(domain, guard), meet(le(lo, point), le(point, hi)))
                 if active is not None:
                     result.append(active)
         return result
+
+    def statistics(self):
+        """Stored condition records and actual work, not translated instances."""
+        return {
+            "fact_nodes": sum(bool(facts) for facts in self.facts.values()),
+            "condition_facts": self.fact_records,
+            "peak_condition_facts": self.peak_fact_records,
+            "fact_attempts": self.fact_attempts,
+            "fact_comparisons": self.fact_comparisons,
+            "fact_updates": self.fact_updates,
+            "fact_transfers": self.transfers,
+        }
 
 
 class NativeCompletion:
@@ -271,22 +355,22 @@ class NativeCompletion:
 
     def __init__(self, graph):
         self.graph = graph
+        self.topology = CompletionTopology()
         self.flows, self.origins, self.queries = {}, {}, {}
+        for node in range(len(graph.nodes)):
+            self.node(node)
+        for arc in graph.edges:
+            self.edge(*arc)
 
     @property
     def transfers(self):
         return sum(flow.transfers for flow in self.flows.values())
 
-    def family(self, node, guard):
-        _, first, gap, terminal = guard
-        meta = self.graph.nodes[node]
-        if meta.last_gap is not None and not terminal:
-            return Family(0, (0, -1))
-        return native_family(meta, self.graph.period, (0, first + gap + 1))
-
     def node(self, node):
-        for guard, flow in self.flows.items():
-            require(flow.node(self.family(node, guard)) == node, "symbolic family identity changed")
+        require(
+            self.topology.node(native_family(self.graph.nodes[node], self.graph.period)) == node,
+            "symbolic family identity changed",
+        )
 
     def edge(self, source, target, distance):
         shift = (
@@ -294,23 +378,31 @@ class NativeCompletion:
             + self.graph.nodes[target].residue
             - self.graph.nodes[source].residue
         )
-        for flow in self.flows.values():
-            flow.edge(source, target, shift)
+        edge = self.topology.edge(source, target, shift)
+        if edge is not None:
+            for flow in self.flows.values():
+                flow.replay(source, edge)
 
     def domain(self, guard):
         if guard not in self.flows:
-            flow = self.flows[guard] = SymbolicCompletion()
+            _, first, gap, terminal = guard
+            self.flows[guard] = SymbolicCompletion(
+                topology=self.topology, count=first + gap + 1, terminal=terminal
+            )
             self.origins[guard] = {}
-            for node in range(len(self.graph.nodes)):
-                flow.node(self.family(node, guard))
-            for a, b, delta in self.graph.edges:
-                shift = (
-                    delta * self.graph.period
-                    + self.graph.nodes[b].residue
-                    - self.graph.nodes[a].residue
-                )
-                flow.edge(a, b, shift)
         return self.flows[guard], self.origins[guard]
+
+    def statistics(self):
+        counts = [flow.statistics() for flow in self.flows.values()]
+        return {
+            "query_domains": len(self.flows),
+            "topology_instances": 1,
+            "topology_nodes": len(self.topology.families),
+            "topology_edges": self.topology.edge_count,
+            "queries": len(self.queries),
+            "vacuous_queries": sum(item is None for item in self.queries.values()),
+            **{key: sum(c[key] for c in counts) for key in FACT_STATISTICS},
+        }
 
     @staticmethod
     def key(query):

@@ -1,7 +1,7 @@
 """Restricted Python AST -> typed xDSL regions, without executing a kernel body.
 
-The typed operation builders are shared with the explicit legacy tracer. Control
-flow is owned here: host iterators and arbitrary Python calls are never invoked.
+The typed operation builders are internal to this frontend. Control flow is
+owned here: host iterators and arbitrary Python calls are never invoked.
 Unsupported structured lowering is diagnosed, never sent to finite expansion.
 """
 
@@ -52,7 +52,6 @@ _CALLS = {
     "exp",
     "cast",
     "fill",
-    "gemm",
     "matmul",
     "sqrt",
     "rsqrt",
@@ -221,26 +220,25 @@ class _Parser:
 
     def signature(self, args):
         defaults = dict(zip([arg.arg for arg in args.args[-len(args.defaults) :]], args.defaults))
-        constexpr = {}
+        annotations, constexpr, runtime = {}, {}, {}
         for arg in args.args:
-            # Tensor annotations may mention scalar parameters declared later.
             annotation = arg.annotation
             if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
                 annotation = ast.parse(annotation.value, mode="eval").body
             if annotation is None:
                 self.fail(arg, "expected Tensor, int64, or constexpr annotation")
-            if isinstance(annotation, ast.Attribute) and annotation.attr in {"int64", "constexpr"}:
-                kind = self.expr(annotation)
+            annotations[arg.arg] = annotation
+            target = annotation.func if isinstance(annotation, ast.Call) else annotation
+            if isinstance(target, ast.Attribute) and target.attr in {"int64", "constexpr"}:
+                kind = self.expr(target)
                 if kind == _Symbol("int64"):
                     if arg.arg in defaults:
                         self.fail(arg, "runtime scalars cannot have specialization defaults")
-                    self.env[arg.arg] = N.dynamic(arg.arg)
-                    self.trace.size(self.env[arg.arg])
+                    runtime[arg.arg] = annotation
                 else:
+                    if isinstance(annotation, ast.Call):
+                        self.fail(annotation, "constexpr annotation does not accept arguments")
                     constexpr[arg.arg] = arg
-            else:
-                # Resolve tensors in the second pass.
-                continue
         bound = dict(self.definition.specializations)
         unknown = set(bound) - constexpr.keys()
         if unknown:
@@ -252,14 +250,27 @@ class _Parser:
                 self.env[name] = _constant(self.expr(defaults[name]))
             else:
                 self.fail(arg, f"constexpr {name} requires an explicit value")
+        # Contracts may use constexpr parameters declared later in the signature.
+        # Runtime expressions are never executed as host annotation values.
+        for name, annotation in runtime.items():
+            options = {}
+            if isinstance(annotation, ast.Call):
+                values, options = self.arguments(annotation)
+                if values or set(options) - {"minimum", "multiple_of"}:
+                    self.fail(annotation, "int64 accepts only minimum and multiple_of keywords")
+                if len(options) != len(annotation.keywords):
+                    self.fail(annotation, "int64 contract keywords cannot repeat")
+            try:
+                self.env[name] = N.dynamic(name, **options)
+            except CompileError as error:
+                self.fail(annotation, str(error))
+            self.trace.size(self.env[name])
         for arg in args.args:
-            if arg.arg in constexpr or isinstance(self.env.get(arg.arg), N._Dimension):
+            if arg.arg in constexpr or arg.arg in runtime:
                 continue
             if arg.arg in defaults:
                 self.fail(arg, "only constexpr parameters may have defaults")
-            annotation = arg.annotation
-            if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
-                annotation = ast.parse(annotation.value, mode="eval").body
+            annotation = annotations[arg.arg]
             typ = self.expr(annotation)
             if not isinstance(typ, N.Tensor):
                 self.fail(arg, "expected Tensor shape/dtype/access annotation")
@@ -607,13 +618,5 @@ class _Parser:
                 return self.trace.add(cls(self.scalar(a), self.scalar(b))).result
             if name not in _CALLS:
                 self.fail(node, f"{name} is only valid in its declaration/control position")
-            if name == "gemm":
-                self.fail(
-                    node,
-                    "AST matmul uses explicit L0 buffers and N.copy → N.matmul; "
-                    "N.gemm is the legacy implicit-L0 recipe",
-                )
-            if name.startswith("alloc_") and "versions" in kwargs:
-                self.fail(node, "AST allocations use explicit slot axes, not implicit versions")
             return getattr(N, name)(*args, **kwargs)
         self.fail(node, f"unsupported device expression {type(node).__name__}")

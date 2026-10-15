@@ -6,14 +6,14 @@ import hashlib
 import json
 from pathlib import Path
 
+from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from benchmarks.validation.state import inputs_and_oracle
 from examples.state.recurrence import state_sum
-from xdsl_npu import compile
+from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.model import require
 from xdsl_npu.performance import hardware_snapshot, runtime_work
-from xdsl_npu.toolchain import offline_compile
 
 
 def reference_source(tile, groups):
@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--groups", type=int, default=32)
     parser.add_argument("--counts", nargs="+", type=int, default=[0, 1, 2, 3, 7, 17, 2048])
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--physical", type=int)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
@@ -50,20 +51,33 @@ def main():
         and all(0 <= count <= 65536 for count in args.counts),
         "invalid state validation policy",
     )
-    artifact = compile(state_sum.specialize(B=args.tile, GROUPS=args.groups))
-    sources = {
-        "generated": (artifact.name, artifact.asc),
-        "ascendc": ("state_sum_reference", reference_source(args.tile, args.groups)),
-    }
-    variants = list(sources) if args.variant == "both" else [args.variant]
-    if args.build or args.physical is None:
-        artifact.write(args.output / "generated")
+    variants = ["generated", "ascendc"] if args.variant == "both" else [args.variant]
+    build_generated = args.build and "generated" in variants
+    generated = args.output / "generated"
+    generated_check = generated if build_generated else generated / "source-check"
+    build_module(
+        lambda: state_sum.specialize(B=args.tile, GROUPS=args.groups),
+        generated_check,
+        shared=build_generated,
+        timeout_s=args.timeout,
+    )
+    artifact = read_artifact(generated_check)
+    sources = {"generated": (artifact.name, artifact.asc)}
     manifests = {}
     for variant in variants:
-        name, source = sources[variant]
         directory = (args.output / variant).resolve()
-        if args.build:
-            offline_compile(source, directory, name, shared=True)
+        if variant == "ascendc":
+            check = directory if args.build else directory / "source-check"
+            build_module(
+                lambda: reference_source(args.tile, args.groups),
+                check,
+                name="state_sum_reference",
+                shared=args.build,
+                timeout_s=args.timeout,
+            )
+            reference = read_artifact(check)
+            sources[variant] = reference.name, reference.asc
+        name, source = sources[variant]
         if args.physical is not None:
             manifest = json.loads((directory / f"{name}.compile.json").read_text())
             require(

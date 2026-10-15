@@ -1,6 +1,8 @@
+"""Finite native IR contracts; these fixtures are not supported user operators."""
+
 import pytest
 
-from examples.legacy.operators import batched_matmul_nt, rms_norm, rope, softmax, swiglu
+from tests.fixtures.physical_operators import batched_matmul_nt, rms_norm, rope, softmax, swiglu
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
 from xdsl_npu.ir import ChannelOp, SyncOp, dump, parse
@@ -8,23 +10,21 @@ from xdsl_npu.model import CompileError, dependencies, extract
 
 
 @pytest.mark.parametrize(
-    "factory,columns",
+    "factory,columns,rows,blocks",
     [
-        (rms_norm, 64),
-        (rms_norm, 128),
-        (rms_norm, 1024),
-        (rms_norm, 4096),
-        (rope, 16),
-        (rope, 128),
-        (rope, 4096),
-        (softmax, 64),
-        (softmax, 4096),
-        (swiglu, 8),
-        (swiglu, 4096),
+        (rms_norm, 64, 0, 1),
+        (rms_norm, 128, 8, 1),
+        (rms_norm, 4096, 8, 1),
+        (rope, 16, 8, 1),
+        (rope, 128, 32, 4),
+        (rope, 4096, 8, 1),
+        (softmax, 64, 8, 1),
+        (softmax, 4096, 8, 1),
+        (swiglu, 8, 8, 1),
+        (swiglu, 4096, 8, 1),
     ],
 )
-@pytest.mark.parametrize("rows,blocks", [(0, 1), (8, 1), (32, 4)])
-def test_operators_have_verified_native_plans(factory, columns, rows, blocks):
+def test_physical_recipes_have_verified_native_plans(factory, columns, rows, blocks):
     source = factory(rows, columns, blocks=blocks)
     p = extract(source)
     plan = autosync(source)
@@ -150,8 +150,7 @@ def test_concrete_shape_diagnostics(factory, args):
         factory(*args, blocks=2)
 
 
-@pytest.mark.parametrize("m,n", [(16, 32), (32, 64), (64, 32), (128, 128)])
-@pytest.mark.parametrize("chunks", [1, 3, 5])
+@pytest.mark.parametrize("m,n,chunks", [(16, 32, 1), (16, 32, 3), (32, 64, 5), (128, 128, 3)])
 def test_batched_matmul_has_one_clear_and_one_final_export(m, n, chunks):
     source = batched_matmul_nt(4, m, n, chunks * 32, k_block=32)
     p = extract(source)

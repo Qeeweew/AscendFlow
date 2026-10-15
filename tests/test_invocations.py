@@ -341,7 +341,7 @@ def test_constant_parent_and_child_keep_one_native_body(outputs, panels):
     )
     assert result.report["native_templates"] == 6
     assert result.report["runtime_parameters"] == []
-    assert result.report["proof_domain_states"] < 100000
+    assert 0 < result.report["completion_statistics"]["condition_facts"] < 100000
     assert result.asc.count("asc_mmad(") == 1
     assert result.asc.count("asc_copy_l0c2gm(") == 1
 

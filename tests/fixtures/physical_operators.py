@@ -1,12 +1,14 @@
-"""Operator recipes expose all native work before the shared AutoSync pass.
+"""Test-only finite physical IR inputs for hardware and lifetime regressions.
 
-These factories use static shapes and native arithmetic, not arbitrary Python tracing. No user
-events or hidden scratch/communication are introduced after synchronization.
+These historical native recipes are not user APIs or supported DSL operators.
+They retain explicit footprints, scratch, ownership and issue order so tests can
+break actual RAW/WAR/WAW, read-retirement and Cube/FIX contracts. New executable
+operators belong in the AST examples; these factories are only migration oracles.
 """
 
 from math import isfinite
 
-from xdsl_npu.builder import Kernel
+from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.model import CAPACITY, CompileError, require, round_f32
 
 

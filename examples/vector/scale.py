@@ -9,9 +9,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from xdsl_npu import compile
 from xdsl_npu import language as N
-from xdsl_npu.toolchain import offline_compile
+from xdsl_npu.build import build_file
 
 
 @N.prim_func(disjoint_external=True)
@@ -40,12 +39,18 @@ def main():
     parser.add_argument("--tile", type=int, default=64)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--shared", action="store_true")
+    parser.add_argument("--timeout", type=float, default=300)
     args = parser.parse_args()
-    result = compile(scale.specialize(B=args.tile))
-    result.write(args.output)
-    if args.compile or args.shared:
-        offline_compile(result.asc, args.output, result.name, shared=args.shared)
-    print(result.timings)
+    report = build_file(
+        Path(__file__),
+        args.output,
+        entry="scale",
+        parameters={"B": args.tile},
+        compile_asc=args.compile,
+        shared=args.shared,
+        timeout_s=args.timeout,
+    )
+    print(report["compilation"])
 
 
 if __name__ == "__main__":

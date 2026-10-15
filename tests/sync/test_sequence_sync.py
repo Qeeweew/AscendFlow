@@ -4,8 +4,9 @@ import pytest
 
 from examples.state.recurrence import state_sum
 from tests.models.local_sequence import finite_check, physical_regions
-from xdsl_npu import Kernel, autosync, compile, verify_plan
+from xdsl_npu import autosync, compile, verify_plan
 from xdsl_npu import language as N
+from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.ir import (
     parse,
 )
@@ -116,8 +117,8 @@ def test_large_constant_bound_uses_boundary_families_instead_of_finite_history()
         for count in (1024, 1048576)
     ]
     assert all(r["native_templates"] == 4 for r in reports)
-    assert reports[0]["proof_domain_states"] == reports[1]["proof_domain_states"]
-    assert reports[1]["proof_domain_states"] < 10000
+    assert reports[0]["completion_statistics"] == reports[1]["completion_statistics"]
+    assert 0 < reports[1]["completion_statistics"]["condition_facts"] < 10000
 
 
 def test_two_dma_pipelines_share_readonly_gm_and_release_only_actual_readers():

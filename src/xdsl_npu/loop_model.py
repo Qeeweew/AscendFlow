@@ -543,8 +543,10 @@ def _extract_loop_after_verify(module, *, region=None):
     require(len({s.sym_name.data for s in sizes}) == len(sizes), "duplicate runtime scalar name")
     for size in sizes:
         require(
-            re.fullmatch(r"[A-Za-z_]\w*", size.sym_name.data) and size.multiple.data > 0,
-            "runtime size needs a valid name and positive multiple",
+            re.fullmatch(r"[A-Za-z_]\w*", size.sym_name.data)
+            and 0 <= size.minimum.data <= (1 << 63) - 1
+            and 0 < size.multiple.data <= (1 << 63) - 1,
+            "runtime size needs a valid name, nonnegative minimum and positive multiple",
         )
     names = {s.sym_name.data for s in sizes}
     uniform_values = {}
@@ -1176,7 +1178,9 @@ def compose_loop(name, cube, vector0, vector1, *, disjoint_external):
                     size = child.clone()
                     block.add_op(size)
                 require(
-                    child.sym_name == size.sym_name and child.multiple == size.multiple,
+                    child.sym_name == size.sym_name
+                    and child.minimum == size.minimum
+                    and child.multiple == size.multiple,
                     "actors need the same uniform count contract",
                 )
                 child.value.replace_all_uses_with(size.value)

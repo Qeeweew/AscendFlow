@@ -1,38 +1,45 @@
+"""AST source semantics and physical mixed-protocol regression boundaries."""
+
 import pytest
+from xdsl.dialects import arith, scf
+from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 from xdsl.utils.exceptions import VerifyException
 
-from examples.legacy.multistage import cv_source, vector_source
+from tests.fixtures.cv import cv_source, vector_source
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check
+from xdsl_npu.frontend import FrontendError
 from xdsl_npu.ir import CrossChannelOp, CrossSyncOp, dump, parse
-from xdsl_npu.lowering import lower_source as _lower_source
+from xdsl_npu.lowering import lower_source
 from xdsl_npu.mixed import extract_mixed
 from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import AllocationOp, DomainOp, PipelineOp, StageOp, ViewOp
+from xdsl_npu.source_ir import AllocationOp, DomainOp, PipelineOp, StageOp, TileType, ViewOp
 
 
-# Legacy finite-interleaving regressions explicitly select the diagnostic backend.
-def finite_lower_source(module):
-    return _lower_source(module, symbolic=False)
+def diagnostic_physical(module):
+    """Explicit finite diagnostic; ordinary AST compilation stays symbolic."""
+    return lower_source(module, symbolic=False)
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 4])
-def test_vector_stages_trace_once_and_have_one_task_coordinate(count):
+def test_ast_stages_retain_one_task_coordinate_and_explicit_slot_axes(count):
     source = parse(dump(vector_source(count)))
     pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
     stages = [op for op in pipeline.body.block.ops if isinstance(op, StageOp)]
     assert pipeline.count.data == count
     assert [op.offset.data for op in stages] == [0, 1, 2]
     assert len(pipeline.body.block.args) == 1
-    assert {
-        op.versions.data
+    allocations = [
+        op
         for op in source.walk()
         if isinstance(op, AllocationOp) and op.ref.type.memory.data == "UB"
-    } == {2}
+    ]
+    assert all(op.versions.data == 1 and op.ring.data == 0 for op in allocations)
+    assert {tuple(n.data for n in op.ref.type.shape) for op in allocations} == {(2, 64)}
 
 
-def test_cv_regions_share_stage_one_without_merging_their_semantics():
+def test_ast_cv_regions_share_stage_one_without_merging_their_semantics():
     source = parse(dump(cv_source()))
     pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
     stages = [op for op in pipeline.body.block.ops if isinstance(op, StageOp)]
@@ -53,42 +60,47 @@ def test_cv_regions_share_stage_one_without_merging_their_semantics():
     assert "npu.task" not in dump(source)
 
 
-def test_dynamic_python_if_is_rejected_instead_of_selecting_one_branch():
-    with pytest.raises(TypeError, match="Python if"):
-
-        @N.trace_func
-        def invalid(X: N.Tensor((2, 64), N.f32)):
+def test_device_if_retains_both_sides_instead_of_selecting_a_python_branch():
+    definition = N.from_source("""
+        def branch(X:N.Tensor((2,64),N.f32)):
             with N.Kernel():
-                for task in N.Pipelined(2, stages=1):
+                x=N.alloc_ub((64,))
+                for task in N.Pipelined(2,stages=1):
                     if task == 0:
-                        N.copy(X[task, :], N.alloc_ub((64,)))
+                        N.copy(X[task,:],x)
+                    else:
+                        N.fill(x,0.0)
+    """)
+    source = definition.to_ir()
+    assert sum(isinstance(op, scf.IfOp) for op in source.walk()) == 1
+    assert sum(isinstance(op, arith.CmpiOp) for op in source.walk()) == 1
+    with pytest.raises(CompileError, match="structured scf.if synchronization"):
+        lower_source(source)
 
 
-def test_stage_depth_does_not_silently_change_buffer_versions():
+def test_stage_depth_does_not_silently_change_explicit_buffer_slots():
     source = vector_source()
     pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
-    from xdsl.dialects.builtin import IntAttr
-
     pipeline.attributes["stages"] = IntAttr(2)
     with pytest.raises(VerifyException, match="stage horizon"):
         source.verify()
 
 
 def test_typed_copy_requires_an_explicit_rounding_conversion():
-    with pytest.raises(CompileError, match="explicit cast"):
-
-        @N.trace_func
-        def invalid(X: N.Tensor((1, 64), N.f32)):
+    definition = N.from_source("""
+        def invalid(X:N.Tensor((1,64),N.f32)):
             with N.Kernel():
-                output = N.alloc_ub((64,), N.f16)
-                for task in N.Pipelined(1, stages=1):
-                    with N.Stage(0):
-                        N.copy(X[task, :], output)
+                output=N.alloc_ub((64,),N.f16)
+                for task in N.Pipelined(1,stages=1):
+                    N.copy(X[task,:],output)
+    """)
+    with pytest.raises(FrontendError, match="explicit cast"):
+        definition.to_ir()
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 4])
-def test_source_vector_closes_through_physical_sync_and_asc(count):
-    plan = autosync(finite_lower_source(parse(dump(vector_source(count)))))
+def test_ast_vector_physical_plan_closes_through_sync_and_asc(count):
+    plan = autosync(diagnostic_physical(parse(dump(vector_source(count)))))
     assert verify_plan(plan)["tasks"] == 3 * count
     if count <= 2:
         assert bounded_check(plan).exhaustive
@@ -99,8 +111,8 @@ def test_source_vector_closes_through_physical_sync_and_asc(count):
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 4])
-def test_source_cv_preserves_shared_stage_and_actual_handoff(count):
-    plan = autosync(finite_lower_source(parse(dump(cv_source(count)))))
+def test_ast_local_cv_physical_plan_preserves_handoff_and_rejects_missing_ready(count):
+    plan = autosync(diagnostic_physical(parse(dump(cv_source(count)))))
     report = verify_plan(plan)
     assert report["epochs"] == count
     mixed = extract_mixed(plan)
@@ -131,81 +143,76 @@ def test_source_cv_preserves_shared_stage_and_actual_handoff(count):
 
 
 def test_a_logical_value_is_not_a_snapshot_of_overwritten_storage():
-    @N.trace_func(disjoint_external=True)
-    def stale(X: N.Tensor((1, 64), N.f32), Y: N.Tensor((1, 64), N.f32, access="write")):
-        with N.Kernel():
-            x, y = N.alloc_ub((64,)), N.alloc_ub((64,))
-            for task in N.Pipelined(1, stages=1):
-                with N.Stage(0):
-                    old = N.copy(X[task, :], x)
-                    N.mul(old, 2.0, out=x)
-                    result = N.add(old, 1.0, out=y)
-                    N.copy(result, Y[task, :])
-
+    definition = N.from_source(
+        """
+        def stale(X:N.Tensor((1,64),N.f32),Y:N.Tensor((1,64),N.f32,access="write")):
+            with N.Kernel():
+                x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
+                for task in N.Pipelined(1,stages=1):
+                    old=N.copy(X[task,:],x)
+                    N.mul(old,2.0,out=x)
+                    result=N.add(old,1.0,out=y)
+                    N.copy(result,Y[task,:])
+        """,
+        disjoint_external=True,
+    )
     with pytest.raises(CompileError, match="was overwritten"):
-        finite_lower_source(stale)
+        lower_source(definition.to_ir())
 
 
-def test_nested_pipeline_result_preserves_the_producer_descriptor_and_slot():
-    @N.trace_func(disjoint_external=True)
-    def nested(X: N.Tensor((2, 3, 64), N.f32), Y: N.Tensor((2, 64), N.f32, access="write")):
-        with N.Kernel():
-            x = N.alloc_ub((64,), versions=2, name="x")
-            y = N.alloc_ub((64,), versions=2, name="y")
-            for task in N.Pipelined(2, stages=2):
-                with N.Stage(0, name="inner"):
-                    for part in N.Pipelined(3, stages=2):
-                        with N.Stage(0):
-                            value = N.copy(X[task, part, :], x)
-                        with N.Stage(1):
-                            result = N.mul(value, 2.0, out=y)
-                with N.Stage(1, name="store"):
-                    N.copy(result, Y[task, :])
-
-    from xdsl_npu.model import extract
-
-    physical = finite_lower_source(parse(dump(nested)))
-    program = extract(physical)
-    store = next(t for t in program.tasks if t.uid.startswith("store_"))
-    # Inner final part=2 maps to slot 0 for EVERY outer task. Re-evaluating
-    # default versions against the consumer's outer coordinate would read slot 1.
-    assert [store.refs[0].address(g) for g in range(2)] == [0, 0]
-    plan = autosync(physical)
-    assert verify_plan(plan)["tasks"] == 14
-    assert emit_asc(plan).count("asc_sync_pipe(PIPE_ALL)") == 1
+def test_nested_pipeline_is_refused_instead_of_rebinding_a_borrowed_tile():
+    definition = N.from_source(
+        """
+        def nested(X:N.Tensor((2,3,64),N.f32),Y:N.Tensor((2,64),N.f32,access="write")):
+            with N.Kernel():
+                x=N.alloc_ub((2,64),name="x")
+                y=N.alloc_ub((2,64),name="y")
+                for task in N.Pipelined(2,stages=2):
+                    with N.Stage(0,name="inner"):
+                        for part in N.Pipelined(3,stages=2):
+                            with N.Stage(0):
+                                value=N.copy(X[task,part,:],x[part%2,:])
+                            with N.Stage(1):
+                                result=N.mul(value,2.0,out=y[part%2,:])
+                    with N.Stage(1,name="store"):
+                        N.copy(y[0,:],Y[task,:])
+        """,
+        disjoint_external=True,
+    )
+    with pytest.raises(CompileError, match="do not authorize implicit unrolling"):
+        lower_source(definition.to_ir())
 
 
 def test_two_logical_values_may_share_one_root_with_disjoint_input_views():
-    @N.trace_func(disjoint_external=True)
-    def slices(X: N.Tensor((1, 128), N.f32), Y: N.Tensor((1, 64), N.f32, access="write")):
-        with N.Kernel():
-            x, y = N.alloc_ub((128,)), N.alloc_ub((64,))
-            for task in N.Pipelined(1, stages=1):
-                left = N.copy(X[task, :64], x[:64])
-                right = N.copy(X[task, 64:], x[64:])
-                result = N.add(left, right, out=y)
-                N.copy(result, Y[task, :])
-
-    assert verify_plan(autosync(finite_lower_source(slices)))["tasks"] == 4
+    definition = N.from_source(
+        """
+        def slices(X:N.Tensor((1,128),N.f32),Y:N.Tensor((1,64),N.f32,access="write")):
+            with N.Kernel():
+                x,y=N.alloc_ub((128,)),N.alloc_ub((64,))
+                for task in N.Pipelined(1,stages=1):
+                    left=N.copy(X[task,:64],x[:64])
+                    right=N.copy(X[task,64:],x[64:])
+                    result=N.add(left,right,out=y)
+                    N.copy(result,Y[task,:])
+        """,
+        disjoint_external=True,
+    )
+    assert verify_plan(autosync(diagnostic_physical(definition.to_ir())))["tasks"] == 4
 
 
 def test_source_axis_bounds_are_checked_before_flattening_addresses():
-    with pytest.raises(CompileError, match="logical axis"):
-
-        @N.trace_func
-        def invalid(X: N.Tensor((2, 64), N.f32)):
+    definition = N.from_source("""
+        def invalid(X:N.Tensor((2,64),N.f32)):
             with N.Kernel():
-                x = N.alloc_ub((64,))
-                for task in N.Pipelined(1, stages=1):
-                    # Byte addresses fit the tensor, but row 0's second axis does not.
-                    N.copy(X[task, 64:128], x)
+                x=N.alloc_ub((64,))
+                for task in N.Pipelined(1,stages=1):
+                    N.copy(X[task,64:128],x)
+    """)
+    with pytest.raises(FrontendError, match="logical axis"):
+        definition.to_ir()
 
 
 def test_region_yield_types_are_verified_after_source_roundtrip():
-    from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
-
-    from xdsl_npu.source_ir import TileType
-
     source = parse(dump(vector_source()))
     stage = next(op for op in source.walk() if isinstance(op, StageOp))
     stage.results[0]._type = TileType(ArrayAttr([IntAttr(32)]), StringAttr("f32"))
@@ -214,11 +221,10 @@ def test_region_yield_types_are_verified_after_source_roundtrip():
 
 
 @pytest.mark.parametrize("count,segments", [(0, 3), (1, 1), (2, 3), (4, 3)])
-def test_segmented_cv_uses_inner_prefetch_and_complete_outer_handoffs(count, segments):
-    from examples.legacy.multistage import segmented_cv_source
+def test_internal_cv_fixture_keeps_prefetch_and_complete_outer_handoffs(count, segments):
+    from tests.fixtures.cv import cv_program
 
-    physical = finite_lower_source(parse(dump(segmented_cv_source(count, segments))))
-    plan = autosync(physical)
+    plan = autosync(parse(dump(cv_program(count=count, segments=segments, groups=2))))
     report = verify_plan(plan)
     mixed = extract_mixed(plan)
     aic = mixed.programs["aic"]
@@ -227,14 +233,12 @@ def test_segmented_cv_uses_inner_prefetch_and_complete_outer_handoffs(count, seg
     assert len(qk) == len(pv) == segments
     assert [t.params[-1] for t in pv] == [1] + [0] * (segments - 1)
     assert report["epochs"] == count
-    # Same CV stage horizon regardless of the inner software stage count.
     assert max(t.stage for p in mixed.programs.values() for t in p.tasks) == 2
     if segments > 1:
         prefetch = [t for t in aic.tasks if t.native == "nd2nz" and t.stage == 0][1:]
         assert prefetch[1].issue_order < qk[0].issue_order
     code = emit_asc(plan)
     if count:
-        # ALL new QK contributions must dispatch before the old P-ready gate.
         gate = next(
             line
             for line in code.splitlines()
@@ -243,27 +247,13 @@ def test_segmented_cv_uses_inner_prefetch_and_complete_outer_handoffs(count, seg
         assert code.index("// " + qk[-1].uid) < code.index(gate)
 
 
-def test_unimplemented_runtime_initialization_is_rejected_explicitly():
-    @N.trace_func(disjoint_external=True)
-    def invalid(A: N.Tensor((2, 16, 16), N.f16), B: N.Tensor((2, 16, 16), N.f16)):
-        with N.Kernel(kind="cube"):
-            a, b, c = N.alloc_l1((16, 16)), N.alloc_l1((16, 16)), N.alloc_l0c((16, 16))
-            for task in N.Pipelined(2, stages=1):
-                N.copy(A[task, :, :], a)
-                N.copy(B[task, :, :], b)
-                N.gemm(a, b, c, initialize=(task == 0))
-
-    with pytest.raises(CompileError, match="runtime matmul initialization"):
-        finite_lower_source(invalid)
-
-
-def test_all_segment_contributions_precede_ready_and_an_early_ready_is_rejected():
-    from examples.legacy.multistage import segmented_cv_source
+def test_internal_cv_fixture_rejects_ready_before_all_segment_contributions():
+    from tests.fixtures.cv import cv_program
     from xdsl_npu.ir import TaskOp
     from xdsl_npu.mixed import mixed_execution, mixed_graph
     from xdsl_npu.model import Instance
 
-    plan = autosync(finite_lower_source(segmented_cv_source(1, 3, 1)))
+    plan = autosync(cv_program(count=1, segments=3, groups=1))
     mixed, channels, commands = mixed_execution(plan)
     graph, _, end, sends, *_ = mixed_graph(mixed, channels, commands)
     exports = [
@@ -295,12 +285,13 @@ def test_all_segment_contributions_precede_ready_and_an_early_ready_is_rejected(
 
 
 def test_incompatible_domain_is_rejected_without_silently_dropping_work():
-    with pytest.raises(VerifyException, match="kernel kind"):
-
-        @N.trace_func
-        def invalid(X: N.Tensor((1, 64), N.f32)):
+    definition = N.from_source("""
+        def invalid(X:N.Tensor((1,64),N.f32)):
             with N.Kernel(kind="vector"):
-                x = N.alloc_ub((64,))
-                for task in N.Pipelined(1, stages=1):
+                x=N.alloc_ub((64,))
+                for task in N.Pipelined(1,stages=1):
                     with N.Cube():
-                        N.copy(X[task, :], x)
+                        N.copy(X[task,:],x)
+    """)
+    with pytest.raises(VerifyException, match="kernel kind"):
+        definition.to_ir()

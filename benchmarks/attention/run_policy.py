@@ -7,12 +7,13 @@ import json
 from pathlib import Path
 
 import benchmarks.validation.attention as attention_validation
+from benchmarks.artifacts import read_artifact
 from benchmarks.references.attention import NAME, reference_source
 from benchmarks.validation.attention import decode, inputs_and_oracle
+from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.model import require
 from xdsl_npu.performance import hardware_snapshot
-from xdsl_npu.toolchain import offline_compile
 
 
 def main():
@@ -29,16 +30,21 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--physical", type=int)
     parser.add_argument("--record", type=Path)
     args = parser.parse_args()
     policy = {k: getattr(args, k) for k in ("batch", "heads", "kv_heads", "groups", "dtype")}
-    source = reference_source(**policy)
-    args.output.mkdir(parents=True, exist_ok=True)
-    if args.build:
-        offline_compile(source, args.output, NAME, shared=True)
+    check = args.output if args.build else args.output / "source-check"
+    build_module(
+        lambda: reference_source(**policy),
+        check,
+        name=NAME,
+        shared=args.build,
+        timeout_s=args.timeout,
+    )
+    source = read_artifact(check).asc
     if args.physical is None:
-        (args.output / (NAME + ".asc")).write_text(source)
         print(
             json.dumps(
                 {"policy": policy, "source_sha256": hashlib.sha256(source.encode()).hexdigest()}

@@ -199,6 +199,7 @@ def test_large_fixed_parent_and_child_do_not_expand_proof_windows():
                 timeout_s=10,
             ).report
         )
-    for key in ("native_templates", "proof_domain_states", "invocation_path_visits"):
+    for key in ("native_templates", "completion_statistics", "invocation_path_visits"):
         assert reports[0][key] == reports[1][key]
     assert reports[0]["native_templates"] == 4
+    assert reports[0]["completion_statistics"]["condition_facts"] > 0

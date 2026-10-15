@@ -6,7 +6,8 @@ def attention_target(
     Score: N.Tensor((GROUPS, 2, BQ, BK), N.f32, access="write"),
     P: N.Tensor((GROUPS, 2, BQ, BK), DTYPE, access="write"),
     PV: N.Tensor((GROUPS, 2, BQ, D), N.f32, access="write"),
-    Sq: N.int64, Sk: N.int64,
+    Sq: N.int64(minimum=1, multiple_of=BQ),
+    Sk: N.int64(minimum=1, multiple_of=BK),
     B: N.constexpr = 1, HQ: N.constexpr = 8, HKV: N.constexpr = 8,
     D: N.constexpr = 128, BQ: N.constexpr = 128, BK: N.constexpr = 1024,
     CK: N.constexpr = 128, VR: N.constexpr = 8, GROUPS: N.constexpr = 20,
@@ -14,39 +15,38 @@ def attention_target(
     SCALE: N.constexpr = 0.08838834764831845,
 ):
     with N.Kernel(GROUPS, kind="mixed") as group:
-        with N.Cube():
-            q1 = N.alloc_l1((BQ, D), DTYPE)
-            k1 = N.alloc_l1((2, CK, D), DTYPE)
-            p1 = N.alloc_l1((2, BQ, CK), DTYPE)
-            v1 = N.alloc_l1((2, CK, D), DTYPE)
-            qa = N.alloc_l0a((BQ, D), DTYPE)
-            pa = N.alloc_l0a((BQ, CK), DTYPE)
-            kb = N.alloc_l0b((D, CK), DTYPE)
-            vb = N.alloc_l0b((CK, D), DTYPE)
-            # Shared QK/PV L0C: two native planes, not three allocations.
-            c0 = N.alloc_l0c((2, BQ, CK), N.f32)
-        with N.Vector():
-            score_in = N.alloc_ub((2, VR, BK), N.f32)
-            score_work = N.alloc_ub((VR, BK), N.f32)
-            p_out = N.alloc_ub((2, VR, BK), DTYPE)
-            pv_in = N.alloc_ub((2, VR, D), N.f32)
-            o_out = N.alloc_ub((2, VR, D), DTYPE)
-            m = N.alloc_ub((BQ // 2,), N.f32)
-            l = N.alloc_ub((BQ // 2,), N.f32)
-            o = N.alloc_ub((BQ // 2, D), N.f32)
-            alpha = N.alloc_ub((2, BQ // 2), N.f32)
-            partial = N.alloc_ub((VR, BK // 64), N.f32)
-            next_m = N.alloc_ub((VR,), N.f32)
-            row_sum = N.alloc_ub((VR,), N.f32)
-            ones = N.alloc_ub((VR,), N.f32)
-            inverse = N.alloc_ub((VR,), N.f32)
-            # Physical BRCB scratch is explicit; no full-size broadcast tile.
-            soft_broadcast = N.alloc_ub((VR, 8), N.f32)
-            out_broadcast = N.alloc_ub((VR, 8), N.f32)
+        # Declarations dominate all actor regions that use their storage.
+        q1 = N.alloc_l1((BQ, D), DTYPE)
+        k1 = N.alloc_l1((2, CK, D), DTYPE)
+        p1 = N.alloc_l1((2, BQ, CK), DTYPE)
+        v1 = N.alloc_l1((2, CK, D), DTYPE)
+        qa = N.alloc_l0a((BQ, D), DTYPE)
+        pa = N.alloc_l0a((BQ, CK), DTYPE)
+        kb = N.alloc_l0b((D, CK), DTYPE)
+        vb = N.alloc_l0b((CK, D), DTYPE)
+        # Shared QK/PV L0C: two native planes, not three allocations.
+        c0 = N.alloc_l0c((2, BQ, CK), N.f32)
+        score_in = N.alloc_ub((2, VR, BK), N.f32)
+        score_work = N.alloc_ub((VR, BK), N.f32)
+        p_out = N.alloc_ub((2, VR, BK), DTYPE)
+        pv_in = N.alloc_ub((2, VR, D), N.f32)
+        o_out = N.alloc_ub((2, VR, D), DTYPE)
+        m = N.alloc_ub((BQ // 2,), N.f32)
+        l = N.alloc_ub((BQ // 2,), N.f32)
+        o = N.alloc_ub((BQ // 2, D), N.f32)
+        alpha = N.alloc_ub((2, BQ // 2), N.f32)
+        partial = N.alloc_ub((VR, BK // 64), N.f32)
+        next_m = N.alloc_ub((VR,), N.f32)
+        row_sum = N.alloc_ub((VR,), N.f32)
+        ones = N.alloc_ub((VR,), N.f32)
+        inverse = N.alloc_ub((VR,), N.f32)
+        # Physical BRCB scratch is explicit; no full-size broadcast tile.
+        soft_broadcast = N.alloc_ub((VR, 8), N.f32)
+        out_broadcast = N.alloc_ub((VR, 8), N.f32)
         query_tiles = Sq // BQ
         kv_tiles = Sk // BK
         local_queries = N.max(0, N.ceildiv(B * HQ * query_tiles - group, GROUPS))
-        # Domain contract: Sq>0, Sk>0, complete tiles, HQ%HKV==0, D==CK==128.
+        # Sq/Sk contracts are checked before launch; constexpr head/tile checks remain required.
         # Empty owners do no work. No implicit padding or global Q/K/V packing.
         @TASK_LOOP@
             global_query = group + query * GROUPS

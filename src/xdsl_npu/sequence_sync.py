@@ -303,6 +303,7 @@ def verify_sequence(module, *, _details=False):
             f"missing sequence {obligation.hazard}: {source} -> {destination}, "
             f"{allocation(obligation.storage).sym_name.data}[{obligation.start}:{obligation.stop}]",
         )
+    local_statistics = [analysis[3].completion_statistics() for analysis in analyses.values()]
     report = {
         "kernel": module.body.block.first_op.sym_name.data,
         "verification": "conditional leaf proofs plus exact sequential byte frontiers and native completion/event boundaries",
@@ -314,7 +315,10 @@ def verify_sequence(module, *, _details=False):
         "sequence_summary_visits": sequence.summary.visits,
         "completion_node_families": sum(len(a[3].nodes) for a in analyses.values()),
         "completion_arc_families": sum(len(a[3].edges) for a in analyses.values()),
-        "proof_domain_states": sum(a[3].domain_states for a in analyses.values()),
+        "completion_statistics": {
+            key: sum(counts[key] for counts in local_statistics) for key in local_statistics[0]
+        },
+        "sequence_boundary_statistics": proof.flow.statistics(),
         "proof_path_queries": sum(a[3].path_queries for a in analyses.values()),
         "sequence_boundary_coverage_queries": proof.queries,
         "sequence_completion_sites": len(proof.flow.edges),
@@ -332,7 +336,10 @@ def verify_sequence(module, *, _details=False):
         from .sequence_calls import verify_calls
 
         report.update(verify_calls(sequence, analyses, bridges))
-        report["proof_domain_states"] = sum(a[3].domain_states for a in analyses.values())
+        local_statistics = [analysis[3].completion_statistics() for analysis in analyses.values()]
+        report["completion_statistics"] = {
+            key: sum(counts[key] for counts in local_statistics) for key in local_statistics[0]
+        }
         report["proof_path_queries"] = sum(a[3].path_queries for a in analyses.values())
     checked = CheckedSequence(sequence, analyses, bridges)
     return (report, checked) if _details else report

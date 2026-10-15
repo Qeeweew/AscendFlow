@@ -1,14 +1,14 @@
-"""Static f32 gated-delta recurrence: private carry and explicit snapshot rings.
+"""Test-only finite state stream with separate carry and snapshot lifetimes.
 
-The 64-key recipe retains the upstream arch22 WholeReduceSum and MulAddDst
-instructions. Dynamic state IDs, ragged streams and lower precision snapshots
-need separate contracts and are not silently substituted for this program.
+This historical physical recipe is not a user API or DSL operator. Its native
+WholeReduceSum/MulAddDst, scalar captures and snapshot rings construct concrete
+retirement, initialization, capacity and event-pressure regression inputs.
 """
 
 from math import sqrt
 
-from examples.legacy.operators import align32
-from xdsl_npu.builder import Kernel
+from tests.fixtures.physical_operators import align32
+from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.model import require, round_f32
 
 

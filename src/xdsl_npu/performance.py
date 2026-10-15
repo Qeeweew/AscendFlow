@@ -394,8 +394,6 @@ def physical_work(plan, *, useful_cube_flops=None):
                         "reduce_tile_max64",
                     }:
                         calls = task.params[1] // 64
-                    elif task.native in {"mask_causal", "mask_prefix"}:
-                        calls = task.params[0] * task.params[1] // 64
                     vector_calls[task.native] += groups * calls
     roots = mixed_programs[0].roots
     unique_io = sum(

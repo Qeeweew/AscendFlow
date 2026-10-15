@@ -1,6 +1,6 @@
 """Small real recipes, plus storage-lifetime counterexamples used by regressions."""
 
-from xdsl_npu.builder import Kernel
+from xdsl_npu._physical_builder import Kernel
 
 
 def scalar_pipeline(count=3, blocks=1):

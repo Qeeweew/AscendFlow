@@ -418,46 +418,6 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "Vector fill needs a contiguous f32 UB destination",
         )
         return "V", ("W",)
-    if native == "mask_causal":
-        require(
-            len(params) == 7,
-            "causal mask needs physical rows/columns and a static query-domain map",
-        )
-        rows, cols, block_q, qt, first, owner_row, start = params
-        require(
-            1 <= rows <= 128
-            and cols in {64, 128}
-            and block_q == rows * 2
-            and 1 <= qt <= 1024
-            and first >= 0
-            and owner_row in {0, rows}
-            and start >= 0
-            and max(first, start, qt * block_q) < 2**31
-            and len(refs) == 1
-            and banks == ("UB",)
-            and dtypes == ("f32",)
-            and layouts == ("linear",)
-            and refs[0].contiguous
-            and lengths == (rows * cols * 4,),
-            "causal mask requires a complete f32 score tile and a bounded static query map",
-        )
-        return "V", ("RW",)
-    if native == "mask_prefix":
-        require(len(params) == 3, "prefix mask needs (rows,columns,visible KV prefix)")
-        rows, cols, prefix = params
-        require(
-            1 <= rows <= 128
-            and cols in {64, 128}
-            and 0 < prefix < 2**31
-            and len(refs) == 1
-            and banks == ("UB",)
-            and dtypes == ("f32",)
-            and layouts == ("linear",)
-            and refs[0].contiguous
-            and lengths == (rows * cols * 4,),
-            "prefix mask requires complete f32 rows and an explicit positive prefix",
-        )
-        return "V", ("RW",)
     if native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
         require(len(params) == 2, "row broadcast arithmetic needs (rows,columns)")
         rows, cols = params
@@ -581,7 +541,7 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             "plane reduction writes one compact row-statistic plane for each aligned 64-column chunk",
         )
         return "V", ("R", "W")
-    if native == "reduce_max8":
+    if native in {"reduce_max8", "reduce_sum8"}:
         require(
             len(refs) == 2
             and banks == ("UB", "UB")
@@ -592,7 +552,7 @@ def native_contract(native: str, refs: tuple[Ref, ...], params: tuple[int, ...])
             and lengths[0] % 256 == 0
             and lengths[0] == 8 * lengths[1]
             and not params,
-            "datablock max needs contiguous f32 UB, whole 64-element repeats, and one result per eight inputs",
+            f"datablock {'max' if native == 'reduce_max8' else 'sum'} needs contiguous f32 UB, whole 64-element repeats, and one result per eight inputs",
         )
         return "V", ("R", "W")
     if native in {"reduce_sum64", "reduce_max64"}:

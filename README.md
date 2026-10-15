@@ -4,13 +4,17 @@
 使用 xDSL 0.73.0 → 物理执行 IR → ASC → CANN 9.1，不依赖 MLIR 工程或参考仓库。
 用户表达计算、物理存储和多阶段排步，编译器负责异步访问及缓冲复用的同步。
 
-**当前重构未完成。** 新 AST 支持局部流水和受限串行父体组合；一般嵌套 CV、
-跨 query 连续流水和新 AST Flash Attention 尚不能编译。保留的 legacy FA 与
-独立手写 AscendC 只提供历史实现和对照证据，不能算作新 DSL 已支持。
+**新 AST 的完整 Flash Attention 尚不能编译。** 当前可运行局部流水、受限串行
+层次和单层 CV；runtime BNSD/商余 descriptor、一般 nested CV 仍待实现。
+
+旧 `cube.task/vector.task`、公开 physical builder、Python tracer 与旧 FA 入口
+已删除，不保留兼容层。内部 Task IR 和硬件反例继续用于编译器验证。
+新 DSL 支持 `n: T.int64(minimum=1, multiple_of=B)` 输入合同；文件构建入口统一
+覆盖输入构造、Python、ASC 和 CANN 的300秒总期限。
 
 ## 从这里开始
 
-- [示例目录](examples/README.md)：按算子查找源码和入口，区分 AST 与 legacy。
+- [示例目录](examples/README.md)：按算子查找当前 AST 源码和入口。
 - [DSL 语法](docs/dsl-multistage.md)：运行时循环、Stage、AIC/AIV 和多级流水。
 - [设计](docs/design.md)：统一访问、代次、完成关系与同步算法的目标。
 - [当前状态](docs/refactor-progress.md)：实际支持、已知问题和验证结果。

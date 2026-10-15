@@ -11,14 +11,15 @@ import hashlib
 import json
 from pathlib import Path
 
+from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from examples.normalization.rms_norm import rms_normalize
 from examples.normalization.softmax import softmax
-from xdsl_npu import compile
+from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.model import require, round_f32
 from xdsl_npu.performance import hardware_snapshot, runtime_work
-from xdsl_npu.toolchain import CANN, offline_compile
+from xdsl_npu.toolchain import CANN
 
 
 def oracle(values, columns, epsilon):
@@ -63,6 +64,7 @@ def main():
     parser.add_argument("--tile-rows", type=int, default=8)
     parser.add_argument("--groups", type=int, default=32)
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--physical", type=int)
     parser.add_argument("--record", type=Path, help="unique per-run device evidence JSON")
     parser.add_argument("--rows", type=int, nargs="+", help="rows per execution group")
@@ -101,28 +103,34 @@ def main():
         args.variant not in {"aclnn", "all"} or all(row > 0 for row in args.rows),
         "ACLNN comparison uses nonempty shapes; test zero tiles with generated/ascendc",
     )
-    definition = (
-        softmax.specialize(D=args.columns, R=args.tile_rows, GROUPS=args.groups)
-        if is_softmax
-        else rms_normalize.specialize(D=args.columns, GROUPS=args.groups)
-    )
-    result = compile(definition)
-    if args.build or args.physical is None:
-        result.write(args.output / "generated")
-    manual = ascendc_source("ascendc_softmax.asc.in" if is_softmax else "ascendc_normalize.asc.in")
-    manual = (
-        manual.replace("@D@", str(args.columns))
-        .replace("@GROUPS@", str(args.groups))
-        .replace("@EPS@", repr(round_f32(1e-6)))
-        .replace("@R@", str(args.tile_rows))
-    )
-    sources = {
-        "generated": (result.name, result.asc),
-        "ascendc": ("softmax_reference" if is_softmax else "normalize_reference", manual),
-    }
-    variants = list(sources) if args.variant in {"both", "all"} else [args.variant]
+    definition = softmax if is_softmax else rms_normalize
+    parameters = {"D": args.columns, "GROUPS": args.groups}
+    if is_softmax:
+        parameters["R"] = args.tile_rows
+    variants = ["generated", "ascendc"] if args.variant in {"both", "all"} else [args.variant]
     if args.variant == "all":
         variants.append("aclnn")
+    build_generated = args.build and "generated" in variants
+    generated = args.output / "generated"
+    generated_check = generated if build_generated else generated / "source-check"
+    build_module(
+        lambda: definition.specialize(**parameters),
+        generated_check,
+        shared=build_generated,
+        timeout_s=args.timeout,
+    )
+    result = read_artifact(generated_check)
+    sources = {"generated": (result.name, result.asc)}
+
+    def reference_source():
+        return (
+            ascendc_source("ascendc_softmax.asc.in" if is_softmax else "ascendc_normalize.asc.in")
+            .replace("@D@", str(args.columns))
+            .replace("@GROUPS@", str(args.groups))
+            .replace("@EPS@", repr(round_f32(1e-6)))
+            .replace("@R@", str(args.tile_rows))
+        )
+
     manifests = {}
     for variant in variants:
         if variant == "aclnn":
@@ -135,10 +143,19 @@ def main():
                 },
             }
             continue
-        name, source = sources[variant]
         directory = (args.output / variant).resolve()
-        if args.build:
-            offline_compile(source, directory, name, shared=True)
+        if variant == "ascendc":
+            check = directory if args.build else directory / "source-check"
+            build_module(
+                reference_source,
+                check,
+                name="softmax_reference" if is_softmax else "normalize_reference",
+                shared=args.build,
+                timeout_s=args.timeout,
+            )
+            reference = read_artifact(check)
+            sources[variant] = reference.name, reference.asc
+        name, source = sources[variant]
         if args.physical is None:
             continue
         manifest = json.loads((directory / f"{name}.compile.json").read_text())

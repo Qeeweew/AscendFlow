@@ -9,7 +9,7 @@ from math import prod
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType, IntAttr
 
-from .builder import Kernel
+from ._physical_builder import Kernel
 from .ir import FrameOp
 from .model import ITEMSIZE, require
 from .scalar import ARITHMETIC, expression, from_ssa, literal
@@ -29,7 +29,7 @@ class ActorBindings:
         for op in program.body.block.ops:
             if isinstance(op, SizeOp):
                 self.uniform[op.value] = self.kernel.runtime_size(
-                    op.sym_name.data, multiple=op.multiple.data
+                    op.sym_name.data, minimum=op.minimum.data, multiple=op.multiple.data
                 )
             elif isinstance(op, arith.ConstantOp) or type(op) in ARITHMETIC:
                 cloned = op.clone(self.uniform)
