@@ -190,6 +190,6 @@ examples 只留可运行算法，测试 fixture 和设计模板不混入；运�
 一遍全量测试。每个交付报告真实支持范围、命令、证据和剩余缺口。
 
 旧API删除和关键反例迁移已完成；runtime输入标量与原始轴SSA、BNSD商余及cyclic
-局部任务已接通。下一步保留这些合同，接一般nested CV及跨query状态；同时处理
-FA的`fill(-inf)`、first/last初始化等native/控制缺口。完整FA必须沿同一路径
+局部任务和普通f32 `fill(±inf)`已接通。下一步保留这些合同，接一般nested CV及
+跨query状态，处理first/last初始化与父子完成边界。完整FA必须沿同一路径
 通过同步与设备验收，不继续扩展内部有限测试路径或恢复旧FA性能搜索。

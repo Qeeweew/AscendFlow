@@ -46,8 +46,8 @@ from .model import (
     optional_int,
     ranges_overlap,
     require,
-    round_f32,
     storage_layout,
+    task_scalar,
 )
 from .periodic import MAX_ACCESS_SEGMENTS, MAX_PERIOD_TEMPLATES, bounded_period
 from .scalar import (
@@ -467,7 +467,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 op.stage.data,
                 refs,
                 modes,
-                round_f32(op.scalar.value.data),
+                task_scalar(op),
                 params,
                 issue_order=optional_int(op.issue_order, len(tasks)),
                 logical_phase=optional_int(op.logical_phase, 0),

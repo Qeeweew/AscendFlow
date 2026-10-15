@@ -1,6 +1,6 @@
 """Use xDSL's standard passes for pure integer expressions during ASC emission.
 
-One scope belongs to one guarded command/task. Only arith operations enter
+One scope belongs to adjacent commands with the same activation. Only arith operations enter
 the temporary SSA function; asynchronous calls never enter canonicalize/CSE.
 Placeholders connect its results to C operands, without parsing C expressions.
 All divisors are positive constants, including in unselected event branches.

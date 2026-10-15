@@ -1,6 +1,7 @@
 """ASC emission consumes verified final IR; no instruction selection or hidden DMA."""
 
 from functools import partial
+from math import isinf
 
 from .asc_scalar import ScalarScope
 from .ir import TaskOp
@@ -119,6 +120,8 @@ def native_line(task, count, core="0", *, uniform_names=None, scalar=None):
         )
     if task.native in {"fill", "fill_neg_inf"}:
         value = "-__builtin_inff()" if task.native == "fill_neg_inf" else f"float({task.scalar!r})"
+        if task.native == "fill" and isinf(task.scalar):
+            value = ("-" if task.scalar < 0 else "") + "__builtin_inff()"
         return f"asc_duplicate({p[0]}, {value}, uint32_t({length(refs[0], 4)}));"
     if task.native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
         rows, cols = task.params

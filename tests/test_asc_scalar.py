@@ -15,6 +15,86 @@ from xdsl_npu.ir import dump
 from xdsl_npu.loop_codegen import _event, _guard
 
 
+def test_shared_stage_scope_executes_the_same_guarded_command_trace(tmp_path, monkeypatch):
+    from examples.normalization.softmax import softmax
+    from xdsl_npu import compile, loop_codegen
+    from xdsl_npu.loop_sync import verify_loop
+
+    compiler = shutil.which("c++")
+    assert compiler is not None
+    artifact = compile(softmax)
+    _, (loop, channels, sequences, _, _) = verify_loop(artifact.plan, _details=True)
+    actor, data = next(iter(loop.actors.items()))
+    tasks = {(actor, task.uid): task for task in data.program.tasks}
+    monkeypatch.setattr(
+        loop_codegen,
+        "native_line",
+        lambda task, *args, **kwargs: f'printf("T {task.uid} %lld\\n", (long long)g);',
+    )
+    body = "\n".join(
+        loop_codegen._region_lines(actor, data, sequences, channels, tasks, None, (), {})
+    )
+    assert body.count("const int64_t g =") == 3
+    source = tmp_path / "commands.cpp"
+    source.write_text(
+        "#include <cstdio>\n#include <cstdint>\n"
+        "enum {PIPE_V=1, PIPE_MTE2=2, PIPE_MTE3=3};\nusing event_t=int;\n"
+        'void asc_sync_notify(int a,int b,int id) { printf("S %d %d %d\\n",a,b,id); }\n'
+        'void asc_sync_wait(int a,int b,int id) { printf("W %d %d %d\\n",a,b,id); }\n'
+        'void asc_sync_pipe(int p) { printf("B %d\\n",p); }\n'
+        + 'int main() { for (int64_t n=0; n<=7; ++n) { printf("N %lld\\n",(long long)n);\n'
+        + body
+        + "\n} }\n"
+    )
+    executable = tmp_path / "commands"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-fsanitize=undefined",
+            "-fno-sanitize-recover=undefined",
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=20,
+    )
+    actual = subprocess.check_output([str(executable)], text=True, timeout=5).splitlines()
+    expected, pipes = [], {"V": 1, "MTE2": 2, "MTE3": 3}
+    for count in range(8):
+        expected.append(f"N {count}")
+        for step in range(count + 2):
+            for command in sequences[actor]:
+                g = step - command.task.stage
+                if not 0 <= g < count:
+                    continue
+                if not command.lower <= g < count - command.upper:
+                    continue
+                if g % command.period not in command.residues:
+                    continue
+                if command.last_gap is not None and g != count - 1 - command.last_gap:
+                    continue
+                if command.kind == "task":
+                    expected.append(f"T {command.task.uid} {g}")
+                elif command.kind == "barrier":
+                    expected.append(f"B {pipes[command.task.pipe]}")
+                else:
+                    channel = channels[command.channel]
+                    epoch = g if command.kind == "set" else g - channel.distance
+                    # Independent small notification enumeration, not the emitter.
+                    events = [i for i in range(epoch + 1) if i % channel.period in channel.residues]
+                    event = channel.ids[(len(events) - 1) % len(channel.ids)]
+                    a, b = (
+                        pipes[tasks[end].pipe]
+                        for end in (channel.sources[0], channel.destinations[0])
+                    )
+                    expected.append(f"{'S' if command.kind == 'set' else 'W'} {a} {b} {event}")
+    assert actual == expected
+
+
 def test_standard_passes_fold_identities_and_share_real_ssa_nodes():
     scope = ScalarScope()
     a = scope.div(scope.sub(scope.add("g", 0), 0), 1)

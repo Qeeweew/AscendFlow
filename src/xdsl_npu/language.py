@@ -940,7 +940,7 @@ def _element(kind, values, out, scalar=None, valid=None, scratch=None):
         )
     attrs = {"kind": StringAttr(kind), "dependency_inputs": _dependency_inputs(values)}
     if scalar is not None:
-        attrs["scalar"] = FloatAttr(round_f32(scalar), ir_f32)
+        attrs["scalar"] = FloatAttr(round_f32(scalar, allow_infinity=kind == "fill"), ir_f32)
     op = ElementOp.build(
         operands=[
             [v.emit(valid) for v in inputs],

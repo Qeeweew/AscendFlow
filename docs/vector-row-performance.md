@@ -1,5 +1,9 @@
 # 新 DSL 行运算与大规模设备验证
 
+最新重构后复测见[当前状态](refactor-progress.md#当前-asc-与性能复测)：物理6上
+32768×1024 f32的generated/AscendC/ACLNN三批中位数为210.540/239.590/267.240μs。
+本页以下保留原保存点的政策、测量和硬件分析，不能与最新数据混合计算差值。
+
 2026-10-15。同步复杂度问题保存于 `c4a7ced`，见[已知问题](sync-known-issues.md)。
 本轮接通packed行归约、maximum和显式scratch行广播，新增
 [softmax](../examples/normalization/softmax.py)，复测已有RMS normalization。

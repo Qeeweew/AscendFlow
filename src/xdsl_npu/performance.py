@@ -27,6 +27,11 @@ def runtime_work(module, arguments):
     Verification retains its own graph/search cost; this is not a bound for it.
     These are instruction-requested bytes/elements, not HBM traffic or FLOPs.
     The caller records actual kernel timings and hardware rate assumptions.
+
+    For cyclic ownership, ``group_task_counts`` pairs an owner's logical task
+    count with the number of owners having that count, including idle owners.
+    ``total_tasks`` sums logical tasks across the grid; it is not a native
+    instruction count. ``tasks_per_group`` is None for this distribution.
     """
     from .sequence_model import is_sequence
 
@@ -87,107 +92,177 @@ def runtime_work(module, arguments):
 
 def _runtime_leaf(analysis, arguments):
     from .ir import InvocationChannelOp
-    from .scalar import from_ssa
+    from .scalar import INT64_MAX, Expr, facts_from_sizes, from_ssa, literal
 
     loop, channels, sequences, _, _ = analysis
     require(
         set(arguments) == {size.sym_name.data for size in loop.parameters}
-        and all(type(value) is int and value >= 0 for value in arguments.values()),
-        "runtime accounting needs every nonnegative integer scalar argument",
+        and all(type(value) is int and 0 <= value <= INT64_MAX for value in arguments.values()),
+        "runtime accounting needs every nonnegative int64 scalar argument",
     )
-    count = loop.constant_count if loop.bound is None else loop.bound.evaluate(arguments)
-    invocations = 1 if loop.invocation is None else loop.invocation.bound.evaluate(arguments)
+    for size in loop.parameters:
+        value = arguments[size.sym_name.data]
+        require(
+            value >= size.minimum.data and value % size.multiple.data == 0,
+            f"runtime accounting argument {size.sym_name.data} violates its minimum/multiple contract",
+        )
+    facts = facts_from_sizes(loop.parameters)
+    evaluated = {}
+
+    def checked_uniform(expr):
+        if expr not in evaluated:
+            for arg in expr.args:
+                if isinstance(arg, Expr):
+                    checked_uniform(arg)
+            # Evaluate this node from cached children, not its entire subtree
+            # again at every parent of a shared uniform expression.
+            node = (
+                expr
+                if expr.kind in {"argument", "constant"}
+                else Expr(expr.kind, tuple(literal(evaluated[arg]) for arg in expr.args))
+            )
+            value = node.evaluate(arguments)
+            require(0 <= value <= INT64_MAX, "runtime accounting uniform scalar overflow")
+            evaluated[expr] = value
+        return evaluated[expr]
+
+    host_count = (
+        loop.constant_count if loop.host_bound is None else checked_uniform(loop.host_bound)
+    )
+    stage_margin = max(task.stage for data in loop.actors.values() for task in data.program.tasks)
+    require(
+        0 <= host_count <= INT64_MAX - stage_margin,
+        "runtime accounting loop step overflow",
+    )
+    footprint = 0
+    for root in loop.roots.values():
+        nbytes = (
+            root.nbytes.data
+            if root.extent_count is None
+            else checked_uniform(from_ssa(root.extent_count, facts=facts)) * root.count_scale.data
+        )
+        require(0 <= nbytes <= INT64_MAX, "runtime accounting GM extent byte overflow")
+        footprint += nbytes
+    if loop.cyclic is None:
+        count = host_count
+        owner_counts = [(count, loop.groups)]
+    else:
+        total = checked_uniform(loop.cyclic.total)
+        quotient, remainder = divmod(total, loop.groups)
+        owner_counts = [(quotient, loop.groups - remainder)]
+        if remainder:
+            owner_counts.append((quotient + 1, remainder))
+    invocations = 1 if loop.invocation is None else checked_uniform(loop.invocation.bound)
+    if loop.invocation is not None:
+        for frame in loop.invocation.frames:
+            checked_uniform(frame.extent)
     calls, vectors, memory, transfers, syncs = Counter(), Counter(), Counter(), Counter(), Counter()
-    peaks = {}
-    for actor, data in loop.actors.items():
-        _, peaks[actor] = storage_layout(data.program.storages)
-        for task in data.program.tasks:
-            iterations = min(count, 1) if task.last else count
-            instances = iterations * loop.groups * invocations
-            calls[task.native] += instances
-            amounts = []
-            for index, (ref, mode) in enumerate(zip(task.refs, task.modes)):
-                amount = (
-                    (
-                        iterations * ref.total_nbytes
-                        if ref.prefix_extent is None
-                        else (
+    peaks = {actor: storage_layout(data.program.storages)[1] for actor, data in loop.actors.items()}
+    # Cyclic owners have at most two local counts. Weight templates/guards by
+    # the size of each class instead of visiting owners or runtime generations.
+    for count, groups in owner_counts:
+        for actor, data in loop.actors.items():
+            for task in data.program.tasks:
+                iterations = min(count, 1) if task.last else count
+                instances = iterations * groups * invocations
+                calls[task.native] += instances
+                amounts = []
+                for index, (ref, mode) in enumerate(zip(task.refs, task.modes)):
+                    amount = (
+                        (
+                            iterations * ref.total_nbytes
+                            if ref.prefix_extent is None
+                            else (
+                                max(
+                                    0,
+                                    checked_uniform(ref.prefix_extent)
+                                    - max(0, count - 1) * ref.prefix_elements,
+                                )
+                                if task.last
+                                else checked_uniform(ref.prefix_extent)
+                            )
+                            * ITEMSIZE[ref.dtype]
+                        )
+                        * groups
+                        * invocations
+                    )
+                    amounts.append(amount)
+                    for access in mode:
+                        skipped = (
+                            ref.total_nbytes * groups * invocations
+                            if (
+                                count
+                                and task.native == "mad_first"
+                                and index == 2
+                                and access == "R"
+                            )
+                            else 0
+                        )
+                        memory[f"{task.pipe}:{ref.storage.bank}:{access}"] += amount - skipped
+                if task.pipe == "V":
+                    vectors[task.native] += max(
+                        amount // ITEMSIZE[ref.dtype] for amount, ref in zip(amounts, task.refs)
+                    )
+                if task.pipe in {"MTE1", "MTE2", "MTE3", "FIX"}:
+                    transfers[f"{task.refs[0].storage.bank}->{task.refs[-1].storage.bank}"] += (
+                        amounts[0]
+                    )
+            for command in sequences[actor]:
+                if command.kind == "task":
+                    continue
+                start, end = command.lower, count - command.upper
+                if command.last_gap is not None:
+                    g = count - 1 - command.last_gap
+                    active = int(start <= g < end and g % command.period in command.residues)
+                else:
+                    active = (
+                        sum(
                             max(
                                 0,
-                                ref.prefix_extent.evaluate(arguments)
-                                - max(0, count - 1) * ref.prefix_elements,
+                                (end - 1 - r) // command.period - (start - 1 - r) // command.period,
                             )
-                            if task.last
-                            else ref.prefix_extent.evaluate(arguments)
+                            for r in command.residues
                         )
-                        * ITEMSIZE[ref.dtype]
-                    )
-                    * loop.groups
-                    * invocations
-                )
-                amounts.append(amount)
-                for access in mode:
-                    skipped = (
-                        ref.total_nbytes * loop.groups * invocations
-                        if (count and task.native == "mad_first" and index == 2 and access == "R")
+                        if end > start
                         else 0
                     )
-                    memory[f"{task.pipe}:{ref.storage.bank}:{access}"] += amount - skipped
-            if task.pipe == "V":
-                vectors[task.native] += max(
-                    amount // ITEMSIZE[ref.dtype] for amount, ref in zip(amounts, task.refs)
-                )
-            if task.pipe in {"MTE1", "MTE2", "MTE3", "FIX"}:
-                transfers[f"{task.refs[0].storage.bank}->{task.refs[-1].storage.bank}"] += amounts[
-                    0
-                ]
-        for command in sequences[actor]:
-            if command.kind == "task":
-                continue
-            start, end = command.lower, count - command.upper
-            if command.last_gap is not None:
-                g = count - 1 - command.last_gap
-                active = int(start <= g < end and g % command.period in command.residues)
-            else:
-                active = (
-                    sum(
-                        max(0, (end - 1 - r) // command.period - (start - 1 - r) // command.period)
-                        for r in command.residues
-                    )
-                    if end > start
-                    else 0
-                )
-            occurrences = active * invocations
-            channel = channels.get(command.channel)
-            if channel is not None and channel.carry:
-                occurrences += min(count, channel.distance) * max(0, invocations - 1)
-            syncs[f"{command.kind}:{command.task.pipe}"] += occurrences * loop.groups
+                occurrences = active * invocations
+                channel = channels.get(command.channel)
+                if channel is not None and channel.carry:
+                    occurrences += min(count, channel.distance) * max(0, invocations - 1)
+                syncs[f"{command.kind}:{command.task.pipe}"] += occurrences * groups
     native = {
         (actor, task.uid): task
         for actor, data in loop.actors.items()
         for task in data.program.tasks
     }
-    for protocol in loop.op.body.block.ops:
-        if isinstance(protocol, InvocationChannelOp):
-            occurrences = (
-                max(0, invocations - 1)
-                * int(count > max(protocol.source_gap.data, protocol.destination_index.data))
-                * loop.groups
-            )
-            for action, endpoint in [
-                ("set", protocol.source.data),
-                ("wait", protocol.destination.data),
-            ]:
-                syncs[f"{action}:{native[tuple(endpoint.split('/'))].pipe}"] += occurrences
-    footprint = sum(
-        root.nbytes.data
-        if root.extent_count is None
-        else from_ssa(root.extent_count).evaluate(arguments) * root.count_scale.data
-        for root in loop.roots.values()
-    )
+    for count, groups in owner_counts:
+        for protocol in loop.op.body.block.ops:
+            if isinstance(protocol, InvocationChannelOp):
+                occurrences = (
+                    max(0, invocations - 1)
+                    * int(count > max(protocol.source_gap.data, protocol.destination_index.data))
+                    * groups
+                )
+                for action, endpoint in [
+                    ("set", protocol.source.data),
+                    ("wait", protocol.destination.data),
+                ]:
+                    syncs[f"{action}:{native[tuple(endpoint.split('/'))].pipe}"] += occurrences
     return {
         "arguments": arguments,
-        "tasks_per_group": count * invocations,
+        "tasks_per_group": owner_counts[0][0] * invocations if loop.cyclic is None else None,
+        **(
+            {
+                "group_task_counts": [
+                    {"tasks": count * invocations, "groups": groups}
+                    for count, groups in owner_counts
+                ],
+                "total_tasks": sum(count * groups * invocations for count, groups in owner_counts),
+            }
+            if loop.cyclic is not None
+            else {}
+        ),
         **(
             {"tasks_per_invocation": count, "invocations_per_group": invocations}
             if loop.invocation is not None
@@ -202,7 +277,10 @@ def _runtime_leaf(analysis, arguments):
         "terminal_drains": len(loop.actors) * loop.groups,
         "initial_fix_handshakes": sum(data.program.config for data in loop.actors.values())
         * loop.groups,
-        "initial_load3d_handshakes": sum(data.program.load3d is not None for data in loop.actors.values()) * loop.groups,
+        "initial_load3d_handshakes": sum(
+            data.program.load3d is not None for data in loop.actors.values()
+        )
+        * loop.groups,
         "local_peak_bytes_per_actor": peaks,
         "declared_gm_working_set_bytes": footprint,
         "scope": "instruction-requested footprints; not HBM transactions, measured bandwidth, or hardware FLOP peak",
@@ -415,7 +493,10 @@ def physical_work(plan, *, useful_cube_flops=None):
         "sync_instructions": dict(syncs),
         "local_bank_bytes_by_actor": capacities,
         "terminal_pipe_all_calls": sum(m.op.blocks.data * 3 for m in mixed_programs),
-        "initial_load3d_handshakes": sum(m.op.blocks.data * sum(p.load3d is not None for p in m.programs.values()) for m in mixed_programs),
+        "initial_load3d_handshakes": sum(
+            m.op.blocks.data * sum(p.load3d is not None for p in m.programs.values())
+            for m in mixed_programs
+        ),
         "scope": "exact finite Cube/DMA work; masked Vector call counts are upper bounds; no inferred DRAM misses or CANN reference traffic",
     }
 

@@ -15,6 +15,7 @@ from benchmarks.artifacts import read_artifact
 from xdsl_npu.build import build_file
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.model import require
+from xdsl_npu.performance import runtime_work
 
 
 def run(result, library, output, physical, counts, repeats, *, grouped=False, warmup=5):
@@ -108,6 +109,10 @@ def run(result, library, output, physical, counts, repeats, *, grouped=False, wa
                 "stream_interval_us_per_launch": elapsed.value * 1000 / repeats,
                 "timing_scope": "ACL event stream interval, including submission gaps; not kernel-only",
                 "input_sha256": hashlib.sha256(raw_input).hexdigest(),
+                "requested_work": runtime_work(
+                    result.plan, {result.report["runtime_parameters"][0]: count}
+                ),
+                "work_basis": "generated IR requests; not measured HBM transactions",
             }
             records.append(record)
             print(json.dumps(record), flush=True)

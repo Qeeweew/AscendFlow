@@ -378,6 +378,17 @@ def test_view_checks_scope_dominance_across_stages():
 
 
 @pytest.mark.parametrize("continuous", [False, True])
-def test_real_attention_indices_reach_the_existing_nonfinite_scalar_boundary(continuous):
-    with pytest.raises(FrontendError, match="Vector scalar must be finite"):
-        attention_target(continuous=continuous).to_ir()
+def test_real_attention_math_and_descriptors_reach_verified_source_ir(continuous):
+    from xdsl_npu.source_ir import ElementOp, MatmulOp, ReduceOp
+
+    source = attention_target(continuous=continuous).to_ir()
+    source.verify()
+    assert sum(isinstance(op, MatmulOp) for op in source.walk()) == 2
+    assert sum(isinstance(op, ReduceOp) for op in source.walk()) == 2
+    assert sum(isinstance(op, PipelineOp) for op in source.walk()) == 5
+    assert any(
+        isinstance(op, ElementOp)
+        and op.kind.data == "fill"
+        and op.scalar.value.data == float("-inf")
+        for op in source.walk()
+    )

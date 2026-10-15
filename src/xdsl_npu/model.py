@@ -9,7 +9,7 @@ import re
 import struct
 from dataclasses import dataclass, replace
 from functools import cached_property
-from math import isfinite
+from math import isfinite, isinf
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -53,8 +53,10 @@ def require(condition, message):
         raise CompileError(message)
 
 
-def round_f32(value):
+def round_f32(value, *, allow_infinity=False):
     """The IR literal and emitted C++ float must have the same value."""
+    if allow_infinity and isinf(value):
+        return float(value)
     require(isfinite(value), "Vector scalar must be finite")
     try:
         result = struct.unpack("<f", struct.pack("<f", value))[0]
@@ -62,6 +64,12 @@ def round_f32(value):
         raise CompileError("Vector scalar is outside finite f32 range") from error
     require(isfinite(result), "Vector scalar is outside finite f32 range")
     return result
+
+
+def task_scalar(op):
+    """One scalar contract for finite and parametric physical task parsing."""
+    require(op.scalar.type == f32, "native Vector scalar literals must be f32")
+    return round_f32(op.scalar.value.data, allow_infinity=op.native.data == "fill")
 
 
 def optional_int(attr, default):
@@ -1098,8 +1106,7 @@ def extract(module: ModuleOp) -> Program:
                 native not in {"fix16", "fix"} or config,
                 "Fixpipe needs explicit invariant ND_PARA initialization",
             )
-            require(op.scalar.type == f32, "native Vector scalar literals must be f32")
-            scalar = round_f32(op.scalar.value.data)
+            scalar = task_scalar(op)
             lower, upper = optional_int(op.lower, 0), optional_int(op.upper, -1)
             upper = count if upper == -1 else min(upper, count)
             require(

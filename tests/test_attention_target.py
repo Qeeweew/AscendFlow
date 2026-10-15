@@ -8,7 +8,7 @@ import pytest
 
 from tests.fixtures.attention_target import activation_trace, attention_target, target_source
 from xdsl_npu import compile
-from xdsl_npu.frontend import FrontendError
+from xdsl_npu.model import CompileError
 
 
 def tree(mode):
@@ -46,10 +46,13 @@ def test_both_organizations_share_actual_algorithm_and_explicit_operations():
 
 
 def test_source_is_explicitly_refused_without_falling_back_to_legacy():
-    # Runtime index SSA now admits both descriptors. The next unsupported
-    # numerical contract must remain explicit; this is not an executable FA.
-    for continuous in (False, True):
-        with pytest.raises(FrontendError, match="Vector scalar must be finite"):
+    # The actual infinities and all mathematical operations now reach source
+    # IR. Hierarchical physical synchronization still needs implementation.
+    for continuous, error in (
+        (False, "one local actor and parent"),
+        (True, "nested AST pipelines require hierarchical synchronization"),
+    ):
+        with pytest.raises(CompileError, match=error):
             compile(attention_target(continuous=continuous))
 
 

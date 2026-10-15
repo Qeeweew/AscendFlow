@@ -1,5 +1,7 @@
 """ASC loops with uniform runtime counts and guarded event ordinals."""
 
+from itertools import groupby
+
 from .asc_scalar import ScalarScope
 from .codegen import QUALIFIER, load3d_init, native_line
 from .ir import InvocationChannelOp, MixedOp, OnceOp
@@ -89,60 +91,66 @@ def _region_lines(
         ]
     else:
         lines.append(f"  for (int64_t step = 0; step < n + {maximum}; ++step) {{")
-    for command in sequences[actor]:
-        task = command.task
-        scalar = ScalarScope()
+    # Adjacent commands with the same stage have exactly the same generation
+    # and activation. Share that guard and a pure scalar scope, preserving every
+    # native/sync call and its inner protocol guard in the original order.
+    for stage, stage_commands in groupby(sequences[actor], key=lambda c: c.task.stage):
+        scalar, inner = ScalarScope(), []
+        generation = "step" if stage == 0 else f"step - {stage}"
         lines += [
-            f"    {{ // {actor}/{task.uid}: {command.kind}, stage {task.stage}",
-            f"      const int64_t g = step - {task.stage};",
+            f"    {{ // {actor}: stage {stage}",
+            f"      const int64_t g = {generation};",
             "      if (g >= 0 && g < n) {",
         ]
-        if command.kind == "task":
-            code = native_line(task, "n", "core_id", uniform_names=uniform_names, scalar=scalar)
-            if boundary is not None:
-                code = boundary(task, code)
-            for protocol in invocation_channels:
-                source = tuple(protocol.source.data.split("/"))
-                destination = tuple(protocol.destination.data.split("/"))
-                gap, index = protocol.source_gap.data, protocol.destination_index.data
-                a, b = tasks[source].pipe, tasks[destination].pipe
-                if (actor, task.uid) == destination:
-                    code = (
-                        f"if (npu_invocation > 0 && n > {max(gap, index)} && g == {index}) {{ "
-                        f"asc_sync_wait(PIPE_{a}, PIPE_{b}, event_t({protocol.event_id.data})); }} "
-                        + code
-                    )
-                if (actor, task.uid) == source:
-                    code += (
-                        f" if (npu_invocation + 1 < npu_invocations && n > {max(gap, index)} "
-                        f"&& g == n - {gap + 1}) {{ asc_sync_notify(PIPE_{a}, PIPE_{b}, "
-                        f"event_t({protocol.event_id.data})); }}"
-                    )
-        elif command.kind == "barrier":
-            code = f"asc_sync_pipe(PIPE_{task.pipe});"
-        else:
-            channel = channel_map[command.channel]
-            epoch = (
-                scalar.value("g")
-                if command.kind.endswith("set") or channel.carry
-                else scalar.sub("g", channel.distance)
-            )
-            if channel.kind == "cross":
-                function = (
-                    "asc_sync_block_arrive"
-                    if command.kind == "cross_set"
-                    else "asc_sync_block_wait"
-                )
-                code = f"{function}(PIPE_{task.pipe}, {channel.ids[0]}); // {channel.name}"
+        for command in stage_commands:
+            task = command.task
+            if command.kind == "task":
+                code = native_line(task, "n", "core_id", uniform_names=uniform_names, scalar=scalar)
+                if boundary is not None:
+                    code = boundary(task, code)
+                for protocol in invocation_channels:
+                    source = tuple(protocol.source.data.split("/"))
+                    destination = tuple(protocol.destination.data.split("/"))
+                    gap, index = protocol.source_gap.data, protocol.destination_index.data
+                    a, b = tasks[source].pipe, tasks[destination].pipe
+                    if (actor, task.uid) == destination:
+                        code = (
+                            f"if (npu_invocation > 0 && n > {max(gap, index)} && g == {index}) {{ "
+                            f"asc_sync_wait(PIPE_{a}, PIPE_{b}, event_t({protocol.event_id.data})); }} "
+                            + code
+                        )
+                    if (actor, task.uid) == source:
+                        code += (
+                            f" if (npu_invocation + 1 < npu_invocations && n > {max(gap, index)} "
+                            f"&& g == n - {gap + 1}) {{ asc_sync_notify(PIPE_{a}, PIPE_{b}, "
+                            f"event_t({protocol.event_id.data})); }}"
+                        )
+            elif command.kind == "barrier":
+                code = f"asc_sync_pipe(PIPE_{task.pipe});"
             else:
-                a, b = tasks[channel.sources[0]].pipe, tasks[channel.destinations[0]].pipe
-                function = "asc_sync_notify" if command.kind == "set" else "asc_sync_wait"
-                code = f"{function}(PIPE_{a}, PIPE_{b}, event_t({scalar.use(_event(channel, epoch, scalar))})); // {channel.name}"
-        guard = _guard(command, channel_map.get(command.channel))
-        if guard:
-            body, marker, comment = code.partition("//")
-            code = f"if ({guard}) {{ {body.strip()} }}" + (f" //{comment}" if marker else "")
-        lines.extend(f"        {line}" for line in scalar.finish([code]))
+                channel = channel_map[command.channel]
+                epoch = (
+                    scalar.value("g")
+                    if command.kind.endswith("set") or channel.carry
+                    else scalar.sub("g", channel.distance)
+                )
+                if channel.kind == "cross":
+                    function = (
+                        "asc_sync_block_arrive"
+                        if command.kind == "cross_set"
+                        else "asc_sync_block_wait"
+                    )
+                    code = f"{function}(PIPE_{task.pipe}, {channel.ids[0]}); // {channel.name}"
+                else:
+                    a, b = tasks[channel.sources[0]].pipe, tasks[channel.destinations[0]].pipe
+                    function = "asc_sync_notify" if command.kind == "set" else "asc_sync_wait"
+                    code = f"{function}(PIPE_{a}, PIPE_{b}, event_t({scalar.use(_event(channel, epoch, scalar))})); // {channel.name}"
+            guard = _guard(command, channel_map.get(command.channel))
+            if guard:
+                body, marker, comment = code.partition("//")
+                code = f"if ({guard}) {{ {body.strip()} }}" + (f" //{comment}" if marker else "")
+            inner += [f"// {actor}/{task.uid}: {command.kind}, stage {stage}", code]
+        lines.extend(f"        {line}" for line in scalar.finish(inner))
         lines += ["      }", "    }"]
     lines.append("  }")
     if invocation is not None:

@@ -1,6 +1,7 @@
 # 当前状态与问题清单
 
-2026-10-15，当前基于 `2d94314e7c80` 推进 runtime 索引。之前文档与停止的block-sum
+2026-10-15，runtime索引已保存于 `97b3c5a`，随后推进通用数值合同、ASC可读性
+与当前softmax性能复测。之前文档与停止的block-sum
 实验diff已保存到外层 `runs/refactor/dsl-implementation/starting.patch`。
 本页区分本轮实现、历史性能和仍未接通的能力。
 
@@ -8,7 +9,18 @@
 tracer入口已删除；没有绕行内部构造器的兼容example。runtime BNSD局部流水已
 接通，下一主线是一般nested CV，[计划](refactor-plan.md)规定其退出条件。
 
-本轮已实施的索引闭环：
+追加完成：
+
+- 普通f32 `fill(±inf)`在source、有限与symbolic physical入口使用同一合同；
+  其他scalar仍要求有限值，NaN、有限值溢出和伪造dtype仍拒绝。
+- 两版原始FA数学主体都能生成并验证source IR；nested mixed/CV仍拒绝，未迁入
+  executable examples。祖先clock、Stage、guard与物理读退休是下一步的组合边界。
+- 相邻且同Stage的命令共用generation/激活guard和纯整数CSE作用域；async调用、
+  内层协议guard与同步IR不变。softmax ASC由200行降至108行，g定义只剩3处。
+- cyclic工作量计数按至多两类owner聚合，覆盖空owner，独立于runtime长度；
+  GM流量仅为指令请求，禁止当作HBM实测。参数/派生extent/循环步数溢出会拒绝。
+
+已保存的索引闭环：
 
 - source view改为原始轴SSA origin/width/axes，保留shape与动态radix来源，
   Stage间的纯算术有合法支配关系。先逐轴证明范围，再化简字节地址。
@@ -18,8 +30,8 @@ tracer入口已删除；没有绕行内部构造器的兼容example。runtime BN
   total；空owner正确保留。物理verifier从实际total/blocks/所有GM读写重验ownership。
 - 原始source division先于化简校验，避免`bad-bad`或精确除法消元掩盖负dividend。
   动态父view进一步缩窄明确拒绝，不能只保留最后范围后丢弃父约束。
-- 数值运算仍在examples；完整FA两版前端已越过索引失败点，首个诊断现为
-  `fill(-inf)`的finite标量限制，之后一般nested mixed与控制合同仍未完成。
+- 数值运算仍在examples；该保存点越过索引失败点后遇到的`fill(-inf)`限制已在
+  后续补齐。一般nested mixed与控制合同仍未完成。
 
 详细合同、同步前后和命令见 [runtime索引](runtime-indexing.md)。
 
@@ -45,7 +57,7 @@ tracer入口已删除；没有绕行内部构造器的兼容example。runtime BN
 |---|---|---|
 | AST DSL → source IR → physical IR → AutoSync → ASC | runtime 局部流水、Vector/归约、显式 Cube、受限 serial parent/child、部分局部 CV、BNSD cyclic局部寻址 | 一般 nested mixed/CV、跨query多时钟与完整 FA 未接通 |
 | 内部physical IR测试 | 保留机器访问、事件、ownership与退休反例 | 没有旧用户DSL；有限fixture不证明runtime FA支持 |
-| FA 设计 fixture | 真实数学主体、静态容量与有限派发表检查 | 测试目前要求编译失败，不是 executable example |
+| FA 设计 fixture | 原始完整数学主体可生成source IR，包含负无穷初始化；静态容量与有限派发表检查 | 物理编译仍拒绝，不是 executable example |
 | 独立 AscendC / 安装 ACLNN | 数值、排步与性能参照 | 不证明编译器或新 DSL 支持同一算子 |
 
 AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是全部从零开始。
@@ -109,6 +121,49 @@ AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是
 详细口径分别见 [Vector](vector-row-performance.md)、[legacy FA](flash-attention.md)。
 FP32 求和归约顺序按用户要求允许调整，不再设位级相同门槛；精度、数值误差、
 概率舍入和递推状态仍有明确合同。不能用更宽容差掩盖地址或同步错误。
+
+## 当前 ASC 与性能复测
+
+同Stage合并前后的softmax **after.xdsl逐字节相同**；生成ASC由8258降到6590字节，
+设备aibin由3272降到3224字节。纯整数优化没有移动native/sync调用，也没有改
+buffer容量、搬运或浮点计算配方。独立C++/UBSan轨迹执行覆盖N=0..7的实际
+guard与事件ID；相关codegen/归约/边界/invocation回归91项通过。
+
+物理6→逻辑0，32768×1024 f32，三批generated/AscendC/ACLNN交替运行，
+每批5次warmup、30次测量。下表是kernel duration中位数的中位数，排除host间隙：
+
+| 实现 | 三批p50，μs | 中位数，μs |
+|---|---|---:|
+| 当前DSL生成 | 210.450 / 210.688 / 210.540 | 210.540 |
+| 独立AscendC，同政策 | 239.732 / 239.590 / 239.560 | 239.590 |
+| 安装ACLNN | 267.240 / 264.980 / 267.740 | 267.240 |
+
+该shape生成版耗时低于ACLNN约21.2%，低于固定AscendC约12.1%；不能外推FA或
+其他shape。第三批生成版p90为225.160μs，尾部有波动，原始样本保留。
+每进程检查全部33554432输出、输入与guard；最大绝对误差生成/AscendC为
+9.31e-10，ACLNN为1.40e-9。generated和AscendC均32 AIV，ACLNN使用自己的40核政策。
+
+硬件为910B3，20 AIC/40 AIV、L2 192MiB。工作集256MiB；生成版使用80%的AIV，
+UB131872字节/AIV。Vector/Scalar/MTE2/MTE3活动比例的三批中位数分别为
+`.980/.050/.4155/.184`，ACLNN为`.646/.241/.1755/.094`。比例可重叠，不能相加
+成总延迟或据此单独证明关键路径；后续应优先调查Vector混合指令工作。
+
+当前IR请求GM 268435456字节、UB操作数1355284480字节，包含33521664次max、
+67076096次sub/add及各33554432个exp/div，没有Cube工作。条件下界仍是各资源
+服务时间及依赖路径的最大值；未经核实的AIV频率、exp/div吞吐和HBM流量不能
+替换成Cube峰值。约1274.99GB/s是GM请求/实测kernel时间，不是实测HBM带宽。
+
+五冷进程DSL→ASC p50/max **0.4026/0.4074s**，import与CANN另计。
+最终generated/AscendC全链构建 **5.791/13.000s**，300秒期限始终有效。
+本轮没有同场profile合并前的生成版，不把历史成绩差值归功于本次化简。
+证据：外层 `runs/refactor/softmax-current/`，`build-final/`为被测ASC/IR/库，
+`profiles/`为九次完整测量，`performance.json`绑定源码/库/CSV/hash与硬件，
+`cold-final/`为编译测量。命令模式见 [Vector性能](vector-row-performance.md)。
+
+普通fill正负无穷全链构建5.466s；物理6上10次重复，128个输出的IEEE位模式
+严格等于正/负无穷，guard完好。证据在 `runs/refactor/fill-constants/`。
+fill及真实FA source IR/拒绝边界定向69项通过；cyclic accounting新增19项和
+既有22项通过。未重复运行分钟级全量套件。
 
 ## Runtime 索引闭环的验证
 

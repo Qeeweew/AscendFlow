@@ -21,7 +21,8 @@ continuous: Pipelined task → query=task//kv_tiles, kv=task%kv_tiles
 
 所有输入长度都是runtime参数，目标工厂不接受它们，也不按长度生成Python任务。
 `Sq/Sk` 已使用 `N.int64(minimum=1, multiple_of=BQ/BK)` 声明，通用输入合同
-已接入IR和launcher；索引SSA已能表达两版FA，完整FA仍被native数值合同与nested CV阻塞。buffer声明移到共同Kernel
+已接入IR和launcher；索引SSA与`fill(-inf)`已能表达两版完整FA的source IR，
+物理lowering仍被nested CV阻塞。buffer声明移到共同Kernel
 scope，避免从Cube/Vector region逸出未导出的SSA。
 有限激活表工具只用于审查，限制64个逻辑task；它不是生产编译器或硬件模拟器。
 
@@ -91,9 +92,15 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 | 双AIV贡献、MTE2最后读取、通知/可见性/资源 | 公共同步、event分配与最终实际IR检查 |
 | 大规模AscendC/ACLNN/profile | 完整DSL链验收；已有参考不等于编译器FA结果 |
 
-两版当前首个诊断均为`Vector scalar must be finite`，来自初始化历史max的
-`fill(-inf)`。解决该数值合同之后仍有一般nested mixed、first/last与多时钟
-ownership等缺口；不能只把第一个报错移走就声称FA可用。测试仍要求明确拒绝。
+普通f32 `fill(±inf)`已贯通源/物理合同和ASC，CANN与设备位模式回归通过。
+原始两版源码现在可完整通过source IR验证，未使用有限常量替换负无穷。
+物理lowering仍明确拒绝：nested因mixed父serial，continuous因nested pipeline。
+
+下一步需要把祖先clock/Stage/guard作为独立执行上下文传递。例如Score导出
+的child Stage3仅移动chunk，不能改变父task；O的地址不含kv，仍受父kv的
+last guard约束；PV读取常量地址`c0[0]`仍须等待子循环最后MAD。不能从地址
+变量集合或region yield推断这些完成关系。固定child循环也必须保留，不以
+静态界为理由展开native模板。完整FA仍未通过物理同步或设备验收。
 解决一个诊断后还要检查整个表，不应通过缩小任务域或隐藏调用跳过其他缺口。
 
 **独立参考已有记录**：[AscendC参考及证据](attention-reference.md)覆盖手排控制、
