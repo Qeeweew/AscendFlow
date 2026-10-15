@@ -6,7 +6,8 @@
 
 | 范围 | 入口 | 检查什么 |
 |---|---|---|
-| 条件关系算法 | `sync/test_completion.py`、`sync/test_completion_flow.py`、`sync/test_incremental_completion.py` | 条件交集/差集、增量可达、与有限 BFS 对照；不编译算子 |
+| 条件关系算法 | `sync/test_completion.py`、`sync/test_completion_flow.py`、`sync/test_incremental_completion.py` | 条件交集/差集、增量可达、有限 BFS 对照，以及一个frame编译回归 |
+| 当前候选选择器 | `sync/test_protocol_selection.py` | 未选协议无证明效力、只物化选中指令、无悬空SSA use；不证明选路保持最佳重叠 |
 | region/call 同步生成 | `sync/test_sequence_sync.py`、`sync/test_sequence_invocations.py` | ready/release、多个 reader、跨调用事件复用、保留循环 |
 | frame 与共享输入 | `sync/test_frame_regions.py`、`sync/test_shared_invocation_inputs.py` | 真实别名、零次执行、slot 最后读取、分组地址 |
 | 最终 IR 验证 | `sync/test_plan_validation.py` | 删除/移动同步、错误时钟、event 冲突、伪造 ownership 后必须拒绝 |
@@ -21,6 +22,11 @@
 `sync/conftest.py` 共用四份不可变编译产物。每次 `.plan` 都获得独立可修改 IR，
 破坏测试不会污染其他用例。同一多 reader 程序的多个运行时边界只生成一次同步。
 编译规模测试和修改源码的反例仍各自编译，不使用 fixture 掩盖编译开销。
+
+纯关系测试之外，`test_completion_flow.py` 还有一个小frame编译回归，用来
+禁止普通编译调用旧 `Graph.path`。这个检查不能禁止新的 `route` 搜索，也不能
+作为生成器已经完成直接生成重构的证据。下一版还需检查早/晚capture的等待
+范围，以及独立区域、静态模板数、环宽、条件和层次深度的结构成本。
 
 有限模型不导入生产版的完成关系或访问摘要；它对小规模实际指令建图。
 这能发现不安全的生成计划，但不是任意动态长度的形式化证明。

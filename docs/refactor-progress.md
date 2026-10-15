@@ -1,75 +1,71 @@
 # 当前实现与验证状态
 
-更新：2026-10-15。目录整理保存点为 `1d5c092`，公共查询保存点为 `0ff08c2`。
-当前 serial region/call 已使用真实稀疏执行关系的批量事实传播，局部叶最终验证
-也已按条件域批量传播；
-**整个重构仍未完成，新 AST FA 仍未接通**。
-下一部分的唯一实施顺序见[重构计划](refactor-plan.md)。
+更新：2026-10-15。当前工作保存点 `61c5d06`。
+**同步重构未完成；候选路线生成与层次条件状态仍需重构，新 AST FA 未接通。**
+当前路线见[计划](refactor-plan.md)，算法与复杂度见[设计](design.md)。
 
-## 已实现与未实现
+## 当前实现
 
 | 能力 | 当前结论 |
 |---|---|
-| AST 前端、runtime 循环、explicit stage/slot | 已用于11个局部/父体示例；不按运行长度展开 |
-| 局部 MTE/Vector、Scalar、Cube/Fixpipe | 各自已验证子集可生成 ASC 并离线/设备运行 |
-| 串行父体 init/多个 child/use | 已支持受限 local actor、检查过的 frame 和共享 local scratch |
-| 跨父调用共享 readonly GM | 依据实际 R effects 和 group 范围验证；有1GiB设备证据 |
-| 同一调用多 region 写/读同一个 GM frame | stationary 已检查范围支持；保持 frame SSA 身份 |
-| fresh frame 跨调用 | 只有已验证不相交的 frame 可省跨调用存储冲突，事件寿命仍检查 |
-| 多 region 漂移范围 | 只读的已有子集保留；可写的 translated/drifting frame 仍拒绝 |
-| 源码结构入口 | `region_lowering` 已统一准入和 actor 构造 |
-| 公共完成端点/条件覆盖查询 | Site 与条件路径已共用；region/call 使用原生转移、条件完成事实和共同缺口生成器；层次 CV 未接通 |
-| 一般 AST 嵌套 pipeline/mixed 层次 | 明确拒绝，常量界也不隐式展开 |
-| 多参数 BNSD、runtime task/query 商余关系 | FA 所需完整子集未接通 |
-| 跨 region event ID 共享 | 未完成通用组合；不能套用 legacy 支持声明 |
-| 新 AST 完整 FA、宏、真实编译缓存 | 未完成 |
-| legacy FA/变体和手写 AscendC FA | 有各自历史证据；不计入新 AST 支持 |
+| AST runtime循环、explicit stage/slot | 已用于11个局部/串行父体示例，运行长度不展开 |
+| 物理访问、ready/WAR/多缓冲与最后读取 | 已有局部验证子集，实际边界见回归 |
+| 共同 native milestone 转移 | `native_order` 已由叶与串行 region/call 共用 |
+| 叶生成 | 已去试删；但仍构造全候选图并逐义务选 route，不是下一版直接生成算法 |
+| region/call及单child invocation | 已迁入条件完成传播；首尾窗口和guard事实成本仍偏高 |
+| 最终叶检查与cross-counter义务 | 批量传播；普通编译不调用旧 `Graph.path` |
+| 显式诊断 | `explain_loop` 可调用 `Graph.path`，不在普通编译路径 |
+| 独立有限执行模型 | 保留小域字节/event检查，不构成任意规模证明 |
+| 一般AST nested mixed/CV与跨区域event共享 | 未完成；不能按串行模型推断支持 |
+| 多参数BNSD、runtime商余、完整AST FA | 未完成；legacy FA证据不计作新DSL支持 |
 
-动态间接别名、不平衡 ownership、跨 group 交接、全局 phase、varlen/paged/sparse/
-persistent 等仍需专门合同。无法证明时明确拒绝，不加任意 barrier 或调用 fallback。
+未知动态别名、跨group ownership、全局phase、varlen/paged/sparse/persistent
+仍需实际合同，未实现时拒绝。局部正确性和历史设备结果不证明FA性能目标已达成。
 
-## 当前明确问题
+## 本次算法审查
 
-1. 已删除原 `BoundaryProof.covered` 和 `CallProof` 的独立路径搜索，叶及调用
-   使用共同 Site/CountDomain/条件路径。`RegionCompletion` 仍是串行控制适配器，
-   不能用于重叠 CV；单 count 域尚不能表达完整 query/task/child 时钟。
-2. frame snapshot 的跨 region 传递路径已能组合，直接 MTE3→MTE2 通知缩为 N=0。
-   region/call 已直接生成未覆盖条件，不再逐候选试删。叶流水原有的 witness 剪枝仍在。
-   有界 CountDomain 用于同步条件；一般 bounded child transfer summary 仍明确拒绝。
-3. 同一示例的 slot0 最后读取已按奇偶选择：偶数 N 释放在 N−2，奇数在 N−1；
-   generated 使用互斥 id2/id3，参考使用一个 id2，不能声称 event packing 完全相同。
-4. 核心入口统一不等于同步算法统一；局部设备对照接近也不等于 FA 性能达标。
-5. benchmark 仍有重复设备执行流程。本轮只收敛公共启动、产物校验和数值参考，
-   没有用大型 benchmark 框架替代同步重构。
+两个独立问题已经定位：候选路线以协议条数为代价，没有约束额外等待；层次
+分析维护了远大于源码规模的带条件完成状态，批量队列没有消除这种表示成本。
+关系级反例已用实际 `_DomainFlow.route` 复现：两个同为一对flag的方案，可以
+因候选编号选择等待无关工作X的晚capture。尚未据此发现现有11例的ASC回退。
 
-## 批量完成传播：当前实现
+带计数的实际编译（两个程序各一次）：
 
-`region_completion.py` 已删除 `LeafRelations` 和 `candidates/direct/site_path`
-搜索链。每个原生指令按真实 queue/retirement/Scalar/event 契约建立边，
-`CompletionFlow` 将多个需求源的事实按 guard 批量传递。每个事实的条件保留
-包含关系下的最小表示；已被更宽条件覆盖的传播任务失效，不丢失条件。
+| 指标 | 分层GEMM | frame |
+|---|---:|---:|
+| native模板 | 6 | 7 |
+| 最终跨调用flow节点 | 1143 | 321 |
+| 该flow节点/guard事实记录 | 10079 | 1765 |
+| 整个编译的 `add_fact` 调用 | 28355 | 9455 |
+| 整个GEMM编译的 `_includes` 调用 | 115935 | 未单列 |
 
-循环首尾片段取决于静态 stage、协议边界和需要暴露的首尾位置，不随 N 展开。
-中间仅携带每步均保持的前缀状态；Set effect 没有这种携带规则。内层未显式
-包含的跨流水路径不算已证明。serial 组合保持其准入边界，不能套用于重叠 CV。
+这些数字包括生成/资源检查/最终验证各自的工作，节点与事实栏只描述指定flow，
+不是把不同阶段相加成单图。profile受计数工具影响，不能用于冷编译延迟结论。
+工具与证据在 `runs/refactor/algorithm-review/`，产品Git不包含它们。
 
-局部叶最终验证的内存、Scalar 及 binary event 寿命在共同的翻译域内批量
-传播。frame 最终验证的 `Graph.path` 调用为零，并有禁用旧查询入口的回归。
-**叶内生成器 `_ProofSearch` 试删、旧 invocation、跨核 counter 查询还在，
-第 1 步未全部完成；一般嵌套 CV 和完整 AST FA 仍未接通。**
+生成路线改为物理访问前沿直接决定对应同步，已有事实只用于扣除重复义务；
+层次表示改为可组合的符号边界转移。这是新的实现合同，尚未实现，不能把
+`61c5d06` 的启发式路线搜索描述成已经完成了这套算法。
 
-- 同步定向123项通过；扩展局部/循环/调用/层次回归303项通过，67.70s。
-- 增补禁用旧叶查询及最终 `Graph.path` 的9项检查通过，0.91s。
-- 独立实际执行模型发现并拦截过 barrier/native 端点身份混淆，已修复并保留
-  显式反例：移除偶数 N 的最终 Vector barrier，最终 verifier 和有限模型均拒绝。
-- 11份当前 AST 默认政策的最终 ASC 与 `3debb17` 逐字节一致，buffer/搬运/
-  event/等待位置不变。frame ASC hash 与此前已成功离线编译的 dav-2201 产物相同。
-- 默认 B4096/G32、五独立进程源码→ASC：p50 **0.5317s**、max **0.5449s**，
-  RSS峰值32344KiB；上一保存点p50 **1.3003s**、max **1.3166s**。import/CANN单列。
-  这是当前frame编译结果，不是全部算子编译预算或设备性能结论。
+## 当前检查点的验证边界
 
-证据位于外层 `runs/refactor/completion-flow/`。本段未重复运行历史全量回归，
-未运行设备或调参。完成传播仍有状态/条件碎片开销；达成1s门槛不代表成本最优。
+- 本次51项条件/完成传播/增量/协议选择回归通过，1.10s。
+- 本次frame大常量界1024/1048576的结构回归通过，0.53s；未外推到一般CV。
+- 两个带计数编译均成功；frame ASC hash仍为
+  `bf52539155038e9a0a9eddca6d982b0e186d2d448b90aa0319291b33e71806d8`，
+  GEMM为 `50b466f6f181980d11ab0cb2f3d89a1f694b6241cc85184f9f921925036110d5`。
+- 前序本地扩展回归323项、invocation迁移191项通过，但对应批量队列合并之前
+  的代码；不能算作 `61c5d06` 的完整回归。
+- 共用native规则后11例ASC与 `f32c399` 一致；最新batch修改后本次只重查上述
+  两例，不把旧11例结果重新标成最新全量检查。
+- 最新batch单次源码→ASC：GEMM0.738s、frame0.292s，来自此前运行；没有五冷
+  进程统计，不能标成p50。`f32c399` 的frame五冷p50为0.5317s，属于历史保存点。
+- 本次未运行全量回归、CANN或设备，算子调参仍暂停。
+
+## 历史检查点
+
+以下结果只适用于各自源码保存点。当时的“下一步”和未完成类名不覆盖上面的
+当前结论；原始产物、版本和限制保留以便复现。
 
 ## TileLang 对照后的同步与测试重构
 
