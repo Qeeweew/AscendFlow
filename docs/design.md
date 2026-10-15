@@ -9,8 +9,8 @@
 专家排步与未来自动排步进入同一个物理访问和完成关系模型。自动同步优先，
 性能通过最终 ASC、CANN 产物及设备 profiling 验证。
 
-现有源码入口和原生转移规则已有共用实现，但统一模型不等于生成算法已经合理。
-叶生成器的候选路径选择、层次分析的条件状态膨胀仍需要替换。
+现有源码入口和原生转移规则已有共用实现，叶流水已改为直接生成所需协议。
+层次分析的条件状态膨胀仍需替换，局部生成迁移不能代表一般层次 CV 已接通。
 继续按程序形状增加证明器，会把组合问题变成不断增加特例。下一次重构要替换
 重复的语义和查询职责，而不是增加第四个形状分支或只把文件搬进同一个目录。
 
@@ -58,8 +58,8 @@ ready、read-retired、release/credit、notification-consumed、最终 drain 具
 
 ## 算法再审：直接生成，约束等待范围，压缩层次状态
 
-`61c5d06` 是保存工作用的检查点，不是通过设计验收的新同步核心。它已删除
-试删与生产路径的旧 `Graph.path`，共用 `native_order`，但仍有两个算法问题：
+审查基线 `61c5d06` 已删除试删与生产路径的旧 `Graph.path`，共用
+`native_order`，但当时仍有两个算法问题；下文分别标明当前处理进度：
 
 1. 叶生成器先把所有候选的虚拟指令建图，对每个缺口调用 `route`，再启用相应
    协议。这仍是逐义务搜索。`(新增协议数, mask)` 的选择代价不表示流水性能。
@@ -67,7 +67,7 @@ ready、read-retired、release/credit、notification-consumed、最终 drain 具
    批量队列降低了重复传播，却没有缩小状态空间；`add_fact` 仍扫描已有 guard
    做包含判断。共享转移代码没有解决这种表示成本。
 
-一次带计数和 profile 的实际编译：分层 GEMM 只有6个 native 模板，最终调用
+该基线一次带计数和 profile 的实际编译：分层 GEMM 只有6个 native 模板，最终调用
 检查却有1143个节点、2426条边、10079条节点/guard事实记录，最多23个guard/节点。
 整个编译有28355次 `add_fact`、115935次 `_includes` 调用。profile 热点在条件
 传播与事实维护。计时受 instrumentation 影响，不作为冷编译性能结果。
@@ -80,8 +80,9 @@ TileLang `6ba65d2` 的 `OptimizeSyncPoints` 按既定次序检查当前覆盖，
 
 最小关系级反例：`R` 是 slot 的最后 reader，`X` 是同流水后续无关工作，`W`
 覆盖该 slot。早捕获只要求 R 退休；晚捕获还要求 X 退休。两者都只需要一对
-Set/Wait。当前 `route` 可以因为候选编号选择晚捕获，证明安全但扩大等待范围。
-这个反例已通过实际 `_DomainFlow.route` 复现；它不是已发现的设备 kernel 回退。
+Set/Wait。旧 `route` 可以因为候选编号选择晚捕获，证明安全但扩大等待范围。
+这个反例已在旧 `_DomainFlow.route` 复现；它不是已发现的设备 kernel 回退。
+当前直接生成回归使用真实双输入 Vector 程序，检查release捕获R并在X前发出。
 
 生成必须以真实访问的最早合法 capture 和最晚合法 acquire 为基准。不能为少
 一个 flag 新增对无关工作、其他 slot 或后续 generation 的等待。已有必要协议
@@ -108,14 +109,38 @@ writer 与未退休 readers。逻辑顺序用于提取义务，不作为设备�
 物化已选同步；最终 verifier 从实际 IR 重新提取并检查
 ```
 
-替换对象是 `_proposals → 全候选指令图 → ProtocolSelection.route`，不是给
-`route` 加缓存或改成更快的最短路。不创建未选协议的完成节点，不按候选集
-证明全图无环；实际计划的进展条件单独检查。
+当前已删除 `_proposals → 全候选指令图 → ProtocolSelection.route`。
+`_requirements` 只保存实际访问对应的协议规格，没有虚拟xDSL指令或完成效力。
+`DirectCompletion` 从native图开始，选中协议才增量添加真实Set/Wait/barrier转移；
+既有翻译域原地增加节点与边，不逐协议重建，也不搜索其他未选协议的路线。
+物化只创建选中协议的xDSL操作，不留下未选操作的SSA uses。
+
+每个native位置有固定的issue/queue入口与acquire出口。条件同步跳过时保留
+输入前缀：例如g=0跳过两代credit Wait，后续ready Wait仍继承此前Scalar派发。
+Set只向后传递begin的FIFO关系，不能把发布effect传成后续native的完成屏障。
+这些转移与实际物化指令图作正/负关系差分，最终检查仍重新提取实际IR。
 
 处理顺序以真实消费者/时钟的因果位置为基础，同消费者的义务一起处理。
 RAW/WAR/WAW 标签只决定需要哪种关系，不决定执行顺序。不同 actor 保留偏序，
 不能把 Python 中 AIC/AIV 代码块的先后视作完成顺序。循环携带关系在符号
 generation 上处理，不用从第0次迭代执行到 N 的模拟来构造计划。
+
+当前策略先建立循环体关系，再处理携带关系；同消费者先考虑较晚真实源的
+capture。消费者存在阻塞派发的acquire时，其必要的同pipe原生fence先处理；
+其他位置让外部必要acquire先提供覆盖。该策略不按算子名特判，但选择次序
+仍会影响同步数量，不能称全局最优，也不能把分配失败称硬件不可实现。
+跨核backlog在已选协议上检查；没有凭空添加ack或全局barrier的修复路径。
+
+双缓冲早release的前后序列（省略无关字段，完整IR由测试程序可复现）：
+
+```text
+同步前：load_x(i) → R(i, reads x[i%2])；随后X(i)只访问另一个buffer
+同步后：Wait(release_x, i-2)；load_x(i)
+        R(i)；Set(release_x, i)；X(i)
+```
+
+Set捕获真实R的退休，匹配Wait保护下一次覆盖；X不在该capture内。
+回归见 `tests/sync/test_direct_synthesis.py`，不为此新增公开算子或runner。
 
 ### 完成状态：保留区分，减少不必要的传播
 
@@ -209,10 +234,10 @@ FA 的早 import release、两 AIV 贡献以及新 query QK 早于旧 query PV �
 | 部分 | 当前或目标成本及限制 |
 |---|---|
 | 物理访问前沿 | 访问片段 A、真实冲突 H；密集别名本身可产生二次数量的义务 |
-| 当前逐缺口选路 | Q 次 route，每次初始化 Vd 个 cost 并扫描至多 Ed 条边；另有候选位集合运算 |
+| 已删除的逐缺口选路 | 原有Q次route，每次初始化Vd个cost并扫描至多Ed条边；当前无此项 |
 | 固定 DAG 的一次传播 | `O((V+E)·ceil(S/w))`，S为实际源事实数；不包括增量轮次和 guard 操作 |
 | 当前条件传播 | U次有效更新，每次扫描节点的G个guard，约 `O(U·G)` 次条件/位集合操作；U和G都不是常数 |
-| 直接生成目标 | 对 H 条义务分组并构造选中协议；无逐缺口选路项、无全候选指令图 |
+| 当前直接生成 | 对H条义务分组并构造选中协议；增量成本仍取决于真实域/源事实/传播次数，不保证线性 |
 | 层次组合目标 | 处理真实边界接口与条件；不随 parent 调用数复制 child 内部图 |
 
 图的构建、周期/条件分割、进展检查和 event 分配另计。一般图的势函数求解也

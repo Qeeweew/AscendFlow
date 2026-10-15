@@ -7,7 +7,7 @@
 | 范围 | 入口 | 检查什么 |
 |---|---|---|
 | 条件关系算法 | `sync/test_completion.py`、`sync/test_completion_flow.py`、`sync/test_incremental_completion.py` | 条件交集/差集、增量可达、有限 BFS 对照，以及一个frame编译回归 |
-| 当前候选选择器 | `sync/test_protocol_selection.py` | 未选协议无证明效力、只物化选中指令、无悬空SSA use；不证明选路保持最佳重叠 |
+| 直接同步生成 | `sync/test_direct_synthesis.py` | 原生图无候选同步；增量图与实际指令正/负关系差分；条件Wait透明传递；早release不扩大到无关工作 |
 | region/call 同步生成 | `sync/test_sequence_sync.py`、`sync/test_sequence_invocations.py` | ready/release、多个 reader、跨调用事件复用、保留循环 |
 | frame 与共享输入 | `sync/test_frame_regions.py`、`sync/test_shared_invocation_inputs.py` | 真实别名、零次执行、slot 最后读取、分组地址 |
 | 最终 IR 验证 | `sync/test_plan_validation.py` | 删除/移动同步、错误时钟、event 冲突、伪造 ownership 后必须拒绝 |
@@ -24,9 +24,10 @@
 编译规模测试和修改源码的反例仍各自编译，不使用 fixture 掩盖编译开销。
 
 纯关系测试之外，`test_completion_flow.py` 还有一个小frame编译回归，用来
-禁止普通编译调用旧 `Graph.path`。这个检查不能禁止新的 `route` 搜索，也不能
-作为生成器已经完成直接生成重构的证据。下一版还需检查早/晚capture的等待
-范围，以及独立区域、静态模板数、环宽、条件和层次深度的结构成本。
+禁止普通编译调用旧 `Graph.path`。直接生成回归另外检查初始图只包含native
+指令、选中协议才有完成转移，并比较未要求成立的关系，防止差分只得到两组
+全True答案。模板、环宽、条件和层次深度的结构成本仍需持续验收，不能用
+“没有调用旧路径查询”代替复杂度证据。
 
 有限模型不导入生产版的完成关系或访问摘要；它对小规模实际指令建图。
 这能发现不安全的生成计划，但不是任意动态长度的形式化证明。

@@ -179,6 +179,19 @@ class Graph:
                 return self.potentials
         require(False, "symbolic fixed schedule has a completion cycle or non-well-founded carry")
 
+    def bounds(self, node, residue, first, gap, terminal=False):
+        """Translations where this milestone exists throughout a query domain."""
+        meta = self.nodes[node]
+        difference = meta.residue - residue
+        lower = -((first + difference - meta.lower) // self.period)
+        upper = (gap - meta.upper - difference) // self.period
+        if meta.last_gap is not None:
+            delta = gap - meta.last_gap - difference
+            if not terminal or delta % self.period:
+                return 0, -1
+            lower, upper = max(lower, delta // self.period), min(upper, delta // self.period)
+        return lower, upper
+
     def domain(self, residue, first, gap, terminal=False):
         key = residue, first, gap, terminal
         if key in self.domains:
@@ -189,15 +202,8 @@ class Graph:
         stride, ranks = self.potentials
         bounds = []
         count = 0
-        for node, meta in enumerate(self.nodes):
-            difference = meta.residue - residue
-            lower = -((first + difference - meta.lower) // self.period)
-            upper = (gap - meta.upper - difference) // self.period
-            if meta.last_gap is not None:
-                delta = gap - meta.last_gap - difference
-                if not terminal or delta % self.period:
-                    continue
-                lower, upper = max(lower, delta // self.period), min(upper, delta // self.period)
+        for node in range(len(self.nodes)):
+            lower, upper = self.bounds(node, residue, first, gap, terminal)
             count += max(0, upper - lower + 1)
             bounds.append((node, lower, upper))
         require(
@@ -451,15 +457,15 @@ class Graph:
         return tuple(path)
 
 
-def channels(loop, *, virtual=False, declarations=None, period=None):
-    protocol_period = loop.protocol_period if period is None else period
+def channels(loop, *, virtual=False):
+    protocol_period = loop.protocol_period
     result = {}
     tasks = {
         (actor, task.uid): task
         for actor, data in loop.actors.items()
         for task in data.program.tasks
     }
-    for op in loop.protocol_scope.body.block.ops if declarations is None else declarations:
+    for op in loop.protocol_scope.body.block.ops:
         if not isinstance(op, LoopChannelOp):
             continue
         name = op.sym_name.data
@@ -553,7 +559,7 @@ def channels(loop, *, virtual=False, declarations=None, period=None):
     return result
 
 
-def commands(loop, channel_map, *, additions=(), period=None):
+def commands(loop, channel_map, *, period=None):
     protocol_period = loop.protocol_period if period is None else period
     result, endpoints, native = {}, {}, {}
     number = 0
@@ -587,15 +593,6 @@ def commands(loop, channel_map, *, additions=(), period=None):
                     f"unknown loop stream effect {op.name}",
                 )
         require(not pending, "trailing waits require an explicit drain contract")
-        for owner, uid, op in additions:
-            if owner != actor:
-                continue
-            require(uid in tasks, "candidate instruction targets a missing native task")
-            if op.action.data == "set":
-                # Match insert-after materialization and the reversal below.
-                after.setdefault(uid, []).insert(0, op)
-            else:
-                before.setdefault(uid, []).append(op)
         sequence = []
 
         def add(task, kind, operation=None, *, actor=actor, sequence=sequence):
@@ -716,7 +713,7 @@ def commands(loop, channel_map, *, additions=(), period=None):
     return result, endpoints, native
 
 
-def completion_graph(loop, channel_map, *, additions=(), period=None):
+def completion_graph(loop, channel_map, *, period=None, _planning=None):
     """Linear guarded prefixes; no pairwise guard-bypass arcs.
 
     Analysis-only issue/queue/retire/implicit milestones exist at each physical
@@ -725,7 +722,7 @@ def completion_graph(loop, channel_map, *, additions=(), period=None):
     ASC instructions or storage. A removed Wait loses all its semantic edges;
     a pure prefix cannot retain that Wait's controller gate.
     """
-    sequences, endpoints, native = commands(loop, channel_map, additions=additions, period=period)
+    sequences, endpoints, native = commands(loop, channel_map, period=period)
     period = loop.protocol_period if period is None else period
     count = sum(len(sequence) for sequence in sequences.values())
     require(
@@ -733,7 +730,7 @@ def completion_graph(loop, channel_map, *, additions=(), period=None):
         f"protocol residue/command budget exceeded (period={period}, commands={count}); "
         "no serialization fallback",
     )
-    graph = Graph(period, loop.constant_count)
+    graph = Graph(period, loop.constant_count) if _planning is None else _planning
     for actor, sequence in sequences.items():
         maximum = max(command.task.stage for command in sequence)
         timeline = []
@@ -748,11 +745,16 @@ def completion_graph(loop, channel_map, *, additions=(), period=None):
                     point: (graph.node(command, residue, point, guard=guard), cycle)
                     for point in ("issue", "queue", "retire", "implicit")
                 }
+                inputs = (
+                    milestones
+                    if _planning is None
+                    else _planning.admit(command, residue, milestones)
+                )
                 begin = end = prefix = None
                 if residue % command.period in command.residues:
                     points = instruction_points(
                         command,
-                        milestones,
+                        inputs,
                         lambda point, c=command, r=residue, k=cycle: (graph.node(c, r, point), k),
                         graph.edge,
                     )
@@ -804,6 +806,8 @@ def completion_graph(loop, channel_map, *, additions=(), period=None):
                 if command.channel in prior_send:
                     graph.edge(prior_send[command.channel], end)
                 prior_send[command.channel] = end
+            if _planning is not None:
+                _planning.link(prior_global, prior_pipe[pipe], item)
             prior_pipe[pipe] = prior_global = item
     for name, channel in channel_map.items():
         for residue in range(period):

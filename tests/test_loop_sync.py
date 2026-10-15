@@ -212,7 +212,7 @@ def test_selection_builds_three_graphs_without_a_path_oracle(monkeypatch):
     monkeypatch.setattr(Graph, "path", forbidden)
     result = compile(cv_source(N.dynamic("tasks")))
     assert result.report["channels"] > 10
-    assert len(calls) == 3  # detached candidates, selected instructions, independent final graph
+    assert len(calls) == 3  # native insertion cuts, materialized plan, independent final graph
 
 
 @pytest.mark.parametrize("width", [1, 8, 24])

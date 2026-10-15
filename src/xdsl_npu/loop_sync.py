@@ -10,7 +10,7 @@ from .budget import bounded
 from .ir import InvocationChannelOp, InvocationSyncOp, KernelOp, LoopChannelOp, LoopSyncOp, StreamOp
 from .loop_graph import channels, completion_graph
 from .loop_model import extract_loop, loop_dependencies
-from .loop_planning import Candidate, ProtocolSelection
+from .loop_planning import DirectCompletion, Protocol
 from .model import CompileError, require
 from .periodic import bounded_period, project, union
 
@@ -308,130 +308,151 @@ def _sync(stream, action, channel, lower, upper, period, residues):
     )
 
 
-def _candidates(loop, specs, barriers):
-    operations = []
-    for actor, uid, lower, family in barriers:
-        data = loop.actors[actor]
-        period, chosen = family
-        op = _sync(data.stream, "barrier", "", lower, 0, period, chosen)
-        operations.append(Candidate(None, ((actor, uid, op),)))
-    for number, (kind, sources, destinations, distance, family, terminal) in enumerate(specs):
-        period, chosen = family
-        name = f"loop_c{number}"
-        op = LoopChannelOp.create(
-            attributes={
-                "sym_name": StringAttr(name),
-                "kind": StringAttr(kind),
-                "sources": ArrayAttr(StringAttr("/".join(source)) for source in sources),
-                "destinations": ArrayAttr(
-                    StringAttr("/".join(destination)) for destination in destinations
-                ),
-                "distance": IntAttr(distance),
-                "period": IntAttr(period),
-                "residues": _ints(chosen),
-                "event_ids": _ints(()),
-                **({"last": IntAttr(1)} if terminal else {}),
-            }
-        )
-        placed = []
-        for actor, uid in sources:
-            data = loop.actors[actor]
-            sync = _sync(data.stream, "set", name, 0, distance, period, chosen)
-            if terminal:
-                sync.attributes["last_gap"] = IntAttr(distance)
-            placed.append((actor, uid, sync))
-        shifted = tuple(sorted((r + distance) % period for r in chosen))
-        for actor, uid in destinations:
-            data = loop.actors[actor]
-            sync = _sync(data.stream, "wait", name, distance, 0, period, shifted)
-            if terminal:
-                sync.attributes["last_gap"] = IntAttr(0)
-            placed.append((actor, uid, sync))
-        operations.append(Candidate(op, tuple(placed)))
-    return operations
-
-
-def _materialize(loop, candidates, selected):
+def _materialize(loop, protocols):
+    """Only selected protocols acquire xDSL operations and SSA uses."""
     scope = loop.protocol_scope.body.block
     first = (
         scope.first_op
         if loop.region is not None
         else next(op for op in scope.ops if isinstance(op, (StreamOp, KernelOp, scf.ForOp)))
     )
-    for index, candidate in enumerate(candidates):
-        if not selected & (1 << index):
-            for _, _, op in candidate.placements:
-                op.drop_all_references()
-            continue
-        if candidate.declaration is not None:
-            scope.insert_op_before(candidate.declaration, first)
-        for actor, uid, op in candidate.placements:
+    for protocol in protocols:
+        p = protocol
+        if p.kind != "barrier":
+            declaration = LoopChannelOp.create(
+                attributes={
+                    "sym_name": StringAttr(p.name),
+                    "kind": StringAttr(p.kind),
+                    "sources": ArrayAttr(StringAttr("/".join(x)) for x in p.sources),
+                    "destinations": ArrayAttr(StringAttr("/".join(x)) for x in p.destinations),
+                    "distance": IntAttr(p.distance),
+                    "period": IntAttr(p.period),
+                    "residues": _ints(p.residues),
+                    "event_ids": _ints(()),
+                    **({"last": IntAttr(1)} if p.last else {}),
+                }
+            )
+            scope.insert_op_before(declaration, first)
+        placements = (
+            [(owner, "barrier") for owner in p.destinations]
+            if p.kind == "barrier"
+            else [(owner, "set") for owner in p.sources]
+            + [(owner, "wait") for owner in p.destinations]
+        )
+        for (actor, uid), action in placements:
+            residues = (
+                p.residues
+                if action != "wait"
+                else tuple(sorted((r + p.distance) % p.period for r in p.residues))
+            )
+            lower, upper = (0, p.distance) if action == "set" else (p.distance, 0)
+            op = _sync(loop.actors[actor].stream, action, p.name, lower, upper, p.period, residues)
+            if p.last:
+                op.attributes["last_gap"] = IntAttr(upper)
             target = loop.actors[actor].operations[uid]
-            if op.action.data == "set":
+            if action == "set":
                 target.parent.insert_op_after(op, target)
             else:
                 target.parent.insert_op_before(op, target)
 
 
-def _proposals(loop, obligations):
+def _requirements(loop, obligations):
+    """Group accesses that require the same physical capture/acquire protocol."""
     tasks = {
         (actor, task.uid): task
         for actor, data in loop.actors.items()
         for task in data.program.tasks
     }
-    local, barrier_map, cross = {}, {}, {}
+    local, barriers, cross = {}, {}, {}
     for o in obligations:
         a, b = tasks[o.source], tasks[o.destination]
         if o.source[0] != o.destination[0]:
-            # Acquire at this actual consumer, joining only its overlapping
-            # contributors. A different native subview gets its own gate.
             require(not o.last, "terminal cross-core protocols require collective region analysis")
             key = o.storage, o.distance, o.hazard, o.destination[1]
-            item = cross.setdefault(key, ({}, {}, {}))
-            source_actor, destination_actor = o.source[0], o.destination[0]
-            old_source, old_destination = item[0].get(source_actor), item[1].get(destination_actor)
-            if old_source is None or tasks[old_source].issue_order < a.issue_order:
-                item[0][source_actor] = o.source
-            if old_destination is None or tasks[old_destination].issue_order > b.issue_order:
-                item[1][destination_actor] = o.destination
-            item[2].setdefault(o.period, set()).update(
+            sources, destinations, residues, members = cross.setdefault(key, ({}, {}, {}, []))
+            for table, actor, endpoint, later in (
+                (sources, o.source[0], o.source, True),
+                (destinations, o.destination[0], o.destination, False),
+            ):
+                previous = table.get(actor)
+                if previous is None or (
+                    tasks[previous].issue_order < tasks[endpoint].issue_order
+                    if later
+                    else tasks[previous].issue_order > tasks[endpoint].issue_order
+                ):
+                    table[actor] = endpoint
+            residues.setdefault(o.period, set()).update(
                 (r - o.distance) % o.period for r in o.residues
             )
+            members.append(o)
         elif a.pipe == b.pipe:
-            item = barrier_map.setdefault(o.destination, [o.distance, {}])
-            item[0] = min(item[0], o.distance)
-            item[1].setdefault(o.period, set()).update(o.residues)
+            members = barriers.setdefault(o.destination, [])
+            members.append(o)
         else:
-            local.setdefault((o.source, o.destination, o.distance, o.last), {}).setdefault(
-                o.period, set()
-            ).update((r - o.distance) % o.period for r in o.residues)
-    specs = [
-        (
-            "local",
-            (source,),
-            (destination,),
-            distance,
-            union(residues, f"channel {source}->{destination}"),
-            terminal,
+            local.setdefault((o.source, o.destination, o.distance, o.last), []).append(o)
+
+    def family(members, *, capture):
+        residues = {}
+        for o in members:
+            residues.setdefault(o.period, set()).update(
+                (r - o.distance if capture else r) % o.period for r in o.residues
+            )
+        return union(residues, "required synchronization activation")
+
+    result = []
+    for destination, members in sorted(barriers.items()):
+        period, residues = family(members, capture=False)
+        result.append(
+            (
+                Protocol(
+                    "",
+                    "barrier",
+                    (),
+                    (destination,),
+                    min(o.distance for o in members),
+                    period,
+                    residues,
+                ),
+                tuple(members),
+            )
         )
-        for (source, destination, distance, terminal), residues in sorted(local.items())
-    ]
-    specs += [
-        (
-            "cross",
-            tuple(sorted(sources.values())),
-            tuple(sorted(destinations.values())),
-            distance,
-            union(residues, "cross-core channel"),
-            False,
+    number = 0
+    for (source, destination, distance, terminal), members in sorted(local.items()):
+        period, residues = family(members, capture=True)
+        result.append(
+            (
+                Protocol(
+                    f"loop_c{number}",
+                    "local",
+                    (source,),
+                    (destination,),
+                    distance,
+                    period,
+                    residues,
+                    terminal,
+                ),
+                tuple(members),
+            )
         )
-        for (_, distance, _, _), (sources, destinations, residues) in sorted(cross.items())
-    ]
-    barriers = [
-        (actor, uid, lower, union(residues, f"barrier {actor}/{uid}"))
-        for (actor, uid), (lower, residues) in sorted(barrier_map.items())
-    ]
-    return specs, barriers
+        number += 1
+    for (_, distance, _, _), (sources, destinations, residues, members) in sorted(cross.items()):
+        period, residues = union(residues, "cross-core required activation")
+        result.append(
+            (
+                Protocol(
+                    f"loop_c{number}",
+                    "cross",
+                    tuple(sorted(sources.values())),
+                    tuple(sorted(destinations.values())),
+                    distance,
+                    period,
+                    residues,
+                ),
+                tuple(members),
+            )
+        )
+        number += 1
+    return result
 
 
 def autosync_loop(module, *, _capture=None):
@@ -450,57 +471,60 @@ def _plan_leaf(loop, *, live_in=(), banks=None):
         not any(isinstance(op, (LoopChannelOp, LoopSyncOp)) for op in loop.protocol_scope.walk()),
         "AutoSync expects an unsynchronized symbolic loop",
     )
-    specs, barriers = _proposals(loop, obligations)
-    candidates = _candidates(loop, specs, barriers)
-    additions = tuple(p for c in candidates for p in c.placements)
+    requirements = _requirements(loop, obligations)
     period = 1
-    for _, _, op in additions:
-        period = bounded_period(lcm(period, op.period.data), "candidate synchronization predicates")
-    declarations = [c.declaration for c in candidates if c.declaration is not None]
-    channel_map = channels(loop, virtual=True, declarations=declarations, period=period)
-    graph, _, endpoints, native = completion_graph(
-        loop, channel_map, additions=additions, period=period
-    )
-    # Establish producer->consumer readiness before storage reuse, and inspect
-    # the latest real reader first at a common consumer. A selected prefix can
-    # then cover earlier accesses without manufacturing extra notifications.
-    # These are selection priorities; all coverage still needs real edges.
-    memory = tuple(
-        sorted(
-            _coverage_queries(obligations, graph, native),
-            key=lambda item: (
-                {"RAW": 0, "WAR": 1, "WAW": 2}[item[0].hazard],
-                item[1][2].task.stage,
-                item[1][2].index,
-                -(item[1][1] + item[1][0].task.stage - item[1][3]),
-                -item[1][0].index,
-            ),
-        )
-    )
-    counters = tuple(_counter_queries(graph.period, channel_map, endpoints))
-    selection = ProtocolSelection(
-        graph, candidates, [q for _, q in memory] + [q for _, q in counters]
-    )
-    for obligation, query in memory:
-        selection.ensure(
-            query,
-            f"fixed schedule cannot cover {obligation.hazard}: "
-            f"{obligation.source} -> {obligation.destination}",
-        )
-    # Newly selected cross-core channels introduce real finite backlog duties.
-    # Activate support for these duties too; each pass only adds protocols.
-    owners = {
-        c.declaration.sym_name.data: i
-        for i, c in enumerate(candidates)
-        if c.declaration is not None
+    for protocol, _ in requirements:
+        period = bounded_period(lcm(period, protocol.period), "required synchronization predicates")
+    graph = DirectCompletion(period, loop.constant_count)
+    graph, _, _, native = completion_graph(loop, {}, period=period, _planning=graph)
+    groups = [(p, tuple(_coverage_queries(members, graph, native))) for p, members in requirements]
+    graph.register(q for _, memory in groups for _, q in memory)
+
+    gated = {
+        destination
+        for protocol, _ in groups
+        for destination in protocol.destinations
+        if protocol.kind == "cross"
+        or (protocol.kind == "local" and native[destination].task.pipe == "S")
     }
-    previous = -1
-    while previous != selection.selected:
-        previous = selection.selected
-        for name, query in counters:
-            if selection.selected & (1 << owners[name]):
-                selection.ensure(query, f"{name}: mode-2 notification backlog may exceed 15")
-    _materialize(loop, candidates, selection.selected)
+
+    def order(item):
+        protocol, memory = item
+        carried = all(o.distance > 0 for o, _ in memory)
+        destination = min((q[2].task.stage, q[2].index) for _, q in memory)
+        # Body acquisitions precede backedges. At a dispatch gate retain the
+        # consumer's own native fence before its blocking acquire; elsewhere
+        # external acquisitions may already retire its previous native work.
+        fence_first = not carried and any(d in gated for d in protocol.destinations)
+        kind = (
+            (0 if fence_first else 3)
+            if protocol.kind == "barrier"
+            else (2 if protocol.kind == "cross" else 1)
+        )
+        source = min((o.distance, -q[0].index) for o, q in memory)
+        return carried, destination, kind, source
+
+    for protocol, memory in sorted(groups, key=order):
+        missing = [(o, q) for o, q in memory if not graph.covered(q)]
+        if not missing:
+            continue
+        graph.insert(protocol, native)
+        for o, q in missing:
+            require(
+                graph.covered(q),
+                f"direct {protocol.kind} capture cannot cover {o.hazard}: "
+                f"{o.source} -> {o.destination}",
+            )
+    channel_map = {p.name: p for p in graph.selected if p.kind != "barrier"}
+    counters = tuple(_counter_queries(period, channel_map, graph.endpoints))
+    graph.register(q for _, q in counters)
+    for name, query in counters:
+        require(
+            graph.covered(query),
+            f"{name}: selected protocols do not bound mode-2 notification backlog to 15; "
+            "an explicit consumption milestone protocol is required",
+        )
+    _materialize(loop, graph.selected)
     channel_map = channels(loop, virtual=True)
     graph, _, endpoints, native = completion_graph(loop, channel_map)
     graph.potential()

@@ -1,7 +1,7 @@
 # 当前实现与验证状态
 
-更新：2026-10-15。当前工作保存点 `61c5d06`。
-**同步重构未完成；候选路线生成与层次条件状态仍需重构，新 AST FA 未接通。**
+更新：2026-10-15。直接生成迁移以 `61c5d06` / `760278f` 为审查基线。
+**叶流水已删除候选路线搜索；层次状态压缩、一般nested CV和完整AST FA尚未完成。**
 当前路线见[计划](refactor-plan.md)，算法与复杂度见[设计](design.md)。
 
 ## 当前实现
@@ -10,57 +10,81 @@
 |---|---|
 | AST runtime循环、explicit stage/slot | 已用于11个局部/串行父体示例，运行长度不展开 |
 | 物理访问、ready/WAR/多缓冲与最后读取 | 已有局部验证子集，实际边界见回归 |
-| 共同 native milestone 转移 | `native_order` 已由叶与串行 region/call 共用 |
-| 叶生成 | 已去试删；但仍构造全候选图并逐义务选 route，不是下一版直接生成算法 |
-| region/call及单child invocation | 已迁入条件完成传播；首尾窗口和guard事实成本仍偏高 |
-| 最终叶检查与cross-counter义务 | 批量传播；普通编译不调用旧 `Graph.path` |
-| 显式诊断 | `explain_loop` 可调用 `Graph.path`，不在普通编译路径 |
-| 独立有限执行模型 | 保留小域字节/event检查，不构成任意规模证明 |
-| 一般AST nested mixed/CV与跨区域event共享 | 未完成；不能按串行模型推断支持 |
+| 共同native milestone转移 | `native_order`由叶与serial region/call共用 |
+| 叶生成 | `_requirements`直接确定协议；只为选中同步增量加边，已删除候选图、route和试删 |
+| 条件同步 | 跳过Set/Wait仍传递输入前缀，Set effect不成为后续native fence |
+| region/call与单child invocation | 仍复制首尾窗口并传播条件事实，这是下一主要替换对象 |
+| 最终叶检查与cross-counter义务 | 批量传播；实际IR重提取，资源和进展检查保留 |
+| 显式诊断 | `explain_loop`可调用`Graph.path`，普通编译不调用 |
+| 一般AST nested mixed/CV、跨区域event共享 | 未完成；不能按串行模型推断支持 |
 | 多参数BNSD、runtime商余、完整AST FA | 未完成；legacy FA证据不计作新DSL支持 |
 
 未知动态别名、跨group ownership、全局phase、varlen/paged/sparse/persistent
-仍需实际合同，未实现时拒绝。局部正确性和历史设备结果不证明FA性能目标已达成。
+仍需实际合同，未实现时拒绝。局部结果不证明FA性能目标已达成。
 
-## 本次算法审查
+## 直接生成的实际证据
 
-两个独立问题已经定位：候选路线以协议条数为代价，没有约束额外等待；层次
-分析维护了远大于源码规模的带条件完成状态，批量队列没有消除这种表示成本。
-关系级反例已用实际 `_DomainFlow.route` 复现：两个同为一对flag的方案，可以
-因候选编号选择等待无关工作X的晚capture。尚未据此发现现有11例的ASC回退。
+- 原生图开始时没有候选同步节点；选中协议后原地扩展翻译域，只有物化时才
+  创建xDSL同步指令。没有逐缺口的协议路线搜索或逐候选图重建。
+- 正/负关系差分比较增量图和实际指令流；真实Vector反例保持R后的early release，
+  不等待后续无关X。新增反例拦截并修复过条件credit Wait跳过时丢失Scalar顺序。
+- 11个AST例子及2个局部CV例子均生成最终ASC。同步数没有增加；分段CV省去
+  `pv_15_mad`、`pv_18_mad`前两条已覆盖的Cube barrier，没有改变buffer或搬运。
+- ASC并非逐字节相同：同一native位置的通知/等待排序及部分event编号变化。
+  原生计算、访问和早release保持；尚无新设备性能结果，不能宣称无性能损失。
+- scale、hierarchical GEMM、frame、segmented CV四份ASC通过CANN 9.1/dav-2201
+  离线编译，源码/hash/编译命令与产物记录在外层runs。
 
-带计数的实际编译（两个程序各一次）：
+## 编译规模与剩余热点
 
-| 指标 | 分层GEMM | frame |
+GEMM叶生成图由166节点/3357翻译状态降为91节点/1617状态。91来自
+6×9个native里程碑、7×(3个Set节点+2个Wait节点)、1×2个barrier节点。
+这只描述叶生成器，不能代表层次分析的状态已经压缩。
+
+当前GEMM最终调用检查仍有：
+
+| 项目 | 数值 |
+|---|---:|
+| native / 加同步后的指令模板 | 6 / 21 |
+| 每次调用首/尾窗口 | 6 / 7个位置 |
+| 相邻调用副本 | 2 |
+| 每份窗口有效指令实例 / 图节点 | 176 / 571 |
+| 父层图节点 | 1 + 2×571 = 1143 |
+| 源完成里程碑 / 检查义务 | 41 / 182 |
+| 节点/guard事实记录 / 最大guard数 | 10122 / 23 |
+
+运行时N没有展开，但`指令×首尾窗口×调用副本×里程碑`以及逐事实guard包含
+扫描仍放大成本。下一步将child转移提取并组合，不能只继续优化这1143个节点
+的队列。实际计数见`runs/refactor/direct-sync/complexity-breakdown.json`。
+
+五个独立冷进程、源码到ASC、import/CANN另计：
+
+| 例子 | 审查基线p50/max | 直接生成p50/max |
 |---|---:|---:|
-| native模板 | 6 | 7 |
-| 最终跨调用flow节点 | 1143 | 321 |
-| 该flow节点/guard事实记录 | 10079 | 1765 |
-| 整个编译的 `add_fact` 调用 | 28355 | 9455 |
-| 整个GEMM编译的 `_includes` 调用 | 115935 | 未单列 |
+| frame | 0.3842 / 0.4087s | 0.3923 / 0.4158s |
+| hierarchical GEMM | 0.7594 / 0.7657s | 0.7516 / 0.7634s |
 
-这些数字包括生成/资源检查/最终验证各自的工作，节点与事实栏只描述指定flow，
-不是把不同阶段相加成单图。profile受计数工具影响，不能用于冷编译延迟结论。
-工具与证据在 `runs/refactor/algorithm-review/`，产品Git不包含它们。
+基线和当前的源码/package/ASC hash分别记录。首组基线frame计时开始时短定向
+测试尚在收尾，不以这组细微差异判断性能优劣；没有显著冷编译加速结论。
+直接生成测量在新增插入阶段取消检查之前完成；该新增检查不改变生成ASC。
 
-生成路线改为物理访问前沿直接决定对应同步，已有事实只用于扣除重复义务；
-层次表示改为可组合的符号边界转移。这是新的实现合同，尚未实现，不能把
-`61c5d06` 的启发式路线搜索描述成已经完成了这套算法。
+## 回归与复现
 
-## 当前检查点的验证边界
+本轮扩展同步/周期/层次212项通过（41.45s，条件前缀补充修复之前）。随后6项
+增量差分与早release测试通过。稳定代码一次完整回归为841 passed、1 failed，
+392.09s；唯一失败是取消测试仍挂在已经退出编译路径的`Graph.path`上。
+更新到真实直接生成阶段并保留输入可复用检查后，取消/直接生成14项通过，2.15s。
+未为这一测试挂点修正重复运行完整回归。Ruff和diff检查通过。
 
-- 本次51项条件/完成传播/增量/协议选择回归通过，1.10s。
-- 本次frame大常量界1024/1048576的结构回归通过，0.53s；未外推到一般CV。
-- 两个带计数编译均成功；frame ASC hash仍为
-  `bf52539155038e9a0a9eddca6d982b0e186d2d448b90aa0319291b33e71806d8`，
-  GEMM为 `50b466f6f181980d11ab0cb2f3d89a1f694b6241cc85184f9f921925036110d5`。
-- 前序本地扩展回归323项、invocation迁移191项通过，但对应批量队列合并之前
-  的代码；不能算作 `61c5d06` 的完整回归。
-- 共用native规则后11例ASC与 `f32c399` 一致；最新batch修改后本次只重查上述
-  两例，不把旧11例结果重新标成最新全量检查。
-- 最新batch单次源码→ASC：GEMM0.738s、frame0.292s，来自此前运行；没有五冷
-  进程统计，不能标成p50。`f32c399` 的frame五冷p50为0.5317s，属于历史保存点。
-- 本次未运行全量回归、CANN或设备，算子调参仍暂停。
+```bash
+.venv/bin/python -m pytest -q compiler/tests/sync/test_direct_synthesis.py compiler/tests/test_budget.py
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/gemm/hierarchical.py --entry hierarchical_gemm --trials 5 --output runs/refactor/direct-sync/reproduce-gemm
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/state/frame_snapshot.py --entry frame_state_sum --trials 5 --output runs/refactor/direct-sync/reproduce-frame
+```
+
+证据集中在外层`runs/refactor/direct-sync/`：`final-examples/`保留前后IR、ASC和
+差异，`cann/`保留离线编译，`validation/`保留测试日志，`cold-*`为五冷进程记录。
+本段未运行设备或调整算子政策。整个重构目标仍未完成。
 
 ## 历史检查点
 

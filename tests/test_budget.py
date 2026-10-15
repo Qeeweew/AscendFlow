@@ -4,23 +4,24 @@ import pytest
 
 from examples.vector.scale import scale
 from xdsl_npu import budget, compile
-from xdsl_npu.loop_graph import Graph
+from xdsl_npu.loop_planning import DirectCompletion
 from xdsl_npu.model import CompileError
 
 
-def test_cancellation_during_completion_query_leaves_input_usable(monkeypatch):
+def test_cancellation_during_direct_synthesis_leaves_input_usable(monkeypatch):
     stopped = False
-    original = Graph.path
+    original = DirectCompletion.insert
 
     def stop(self, *args, **kwargs):
         nonlocal stopped
-        stopped = True
+        stopped = bool(self.selected)
         return original(self, *args, **kwargs)
 
     source = scale.to_ir()
-    monkeypatch.setattr(Graph, "path", stop)
-    with pytest.raises(CompileError, match=r"cancelled at completion path.*queries="):
+    monkeypatch.setattr(DirectCompletion, "insert", stop)
+    with pytest.raises(CompileError, match=r"cancelled at direct protocol insertion.*selected=1"):
         compile(source, cancel=lambda: stopped)
+    assert budget._active.get() is None
     # The cancelled context and its partly mutated owned clone do not leak.
     assert compile(source).report["native_templates"] == 3
 
