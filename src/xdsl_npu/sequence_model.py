@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from .ir import BufferOp, KernelOp, LoopChannelOp, OnceOp, RegionChannelOp, StreamOp
-from .loop_model import extract_loop, slope
+from .loop_model import _extract_loop_after_verify, slope
 from .model import require, verify_translated_owners
 from .region_sequence import Part, summarize_sequence
 from .region_summary import summarize_reused_storage
@@ -40,7 +40,7 @@ def extract_sequence(module):
         not any(isinstance(op, LoopChannelOp) for op in kernel.body.block.ops),
         "leaf event channels must belong to their actual region",
     )
-    loops = {op.uid.data: extract_loop(module, region=op) for op in regions}
+    loops = {op.uid.data: _extract_loop_after_verify(module, region=op) for op in regions}
     refs, writes, users = {}, set(), {}
     for name, loop in loops.items():
         for actor, data in loop.actors.items():

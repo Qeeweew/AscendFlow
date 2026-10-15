@@ -479,6 +479,17 @@ def slope(ref):
 
 def extract_loop(module, *, region=None):
     module.verify()
+    return _extract_loop_after_verify(module, region=region)
+
+
+def _extract_loop_after_verify(module, *, region=None):
+    """Internal leaf extraction after the caller verified this entire module.
+
+    Sequence extraction owns one immutable traversal. Repeating the recursive
+    IRDL check for each leaf makes R regions verify O(R * total IR) operations.
+    Physical access, ownership and protocol checks below are still performed.
+    Public extraction and every final sequence check verify the module afresh.
+    """
     require(len(list(module.body.block.ops)) == 1, "one loop program per compilation")
     op = module.body.block.first_op
     require(

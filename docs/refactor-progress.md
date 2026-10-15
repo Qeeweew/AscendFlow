@@ -1,5 +1,50 @@
 # 重构的验证记录
 
+## P1a共享绑定与多区域编译成本：8a1aeea之后
+
+引入[ActorBindings](../src/xdsl_npu/lowering_context.py)：一个actor的Kernel、
+分配、uniform SSA和frame绑定共用，region直接发射到同一物理IR，删除临时
+Kernel/分配合并。按实际首次使用绑定local，晚出现声明插在固定执行锚点前；
+代次相关scalar缓存按region隔离。统一检查AST不得使用隐式L1→L0 GEMM recipe，
+补上原sequence入口跳过该检查的问题。
+
+profile定位到另一个重复成本：34个region分别执行一次全Module IRDL验证。
+现在每个提取阶段验证完整结构一次，再提取叶的物理访问/ownership。最终
+checker仍重新提取最终IR；不读取planner证明，没有减少同步义务。包含末region
+非法属性的负例，以及原RAW/WAR/WAW/初始化/事件/时钟负例。
+
+相关277项回归通过（73.21秒），Ruff通过。最终source-to-ASC五个独立冷进程，
+同机同源码与8a1aeea快照对照，启动/import与CANN另计：
+
+| 源程序 | 原p50 / max | 当前p50 / max | 当前最大RSS |
+|---|---|---|---|
+| state_sum，runtime tiles | 0.18196 / 0.22062 s | 0.16384 / 0.16582 s | 30948 KiB |
+| 32个顺序流水+前后工作，128个未使用声明 | 2.18814 / 2.25170 s | 0.77299 / 0.77643 s | 34292 KiB |
+
+后者是静态结构压力样本，n始终为runtime；不是32个runtime task在Python展开。
+同进程五次的阶段实验中，物理lowering中位数0.6150→0.1284秒，临时Kernel
+34→1、buffer构造102→3，最终仍3个buffer。阶段实验与冷进程总耗时分开统计，
+不据此宣称整个编译器线性或真实FA已达到编译性能目标。
+
+两份源码的最终ASC hash和完整验证报告与原实现完全一致。hierarchical_gemm、
+reduction_gemm的ASC也继续匹配既有设备产物。state_sum仍为
+`22e5aebd2afaf2cef5a77a908818ad9777470b2533df92f6162dbd709ec45dfd`；32流样本为
+`f476833c38ff347ee357dd1da28fb34b8ebe64c73761e1076837bf5f81995bf4`。
+因此复用原设备证据，本次没有新增设备运行或算子调参。
+
+证据在外层`runs/refactor/actor-bindings/`：`final-regressions.log`、
+`before.json/final.json`、`current.prof`、`cold-before/cold-final`、
+`cold-chain-before/cold-chain-after`和`final-source-checks.json`。生成同一压力源码：
+
+```bash
+.venv/bin/python compiler/benchmarks/regions.py --streams 32 --unused 128 --output runs/refactor/actor-bindings/chain.py
+.venv/bin/python compiler/benchmarks/compile.py --input runs/refactor/actor-bindings/chain.py --entry chain --trials 5 --output runs/refactor/actor-bindings/reproduce
+```
+
+这是P1a的绑定/构造切片，**父serial体内一般init→child→use尚未接通**。后续需
+组合跨调用未退休reader与未消费event；不能仅包一层for、重seed或加整段drain。
+P1整体、新AST层次CV及FA仍未完成。
+
 ## P0独立AscendC参考与真实政策反例
 
 在`e954087`后补齐[独立FA参考](attention-reference.md)：完整BK1024 online

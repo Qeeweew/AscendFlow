@@ -3,7 +3,8 @@
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr
 
-from .ir import EndOp, FixConfigOp
+from .ir import EndOp
+from .lowering_context import ActorBindings
 from .model import require
 from .scalar import ARITHMETIC
 from .source_ir import AllocationOp, DomainOp, PipelineOp, SizeOp, ViewOp, YieldOp
@@ -59,6 +60,7 @@ def lower_sequence(program):
     if pending:
         chunks.append((pipelines[0], tuple(pending)))
     actors = []
+    bindings = ActorBindings(program, family, allocations)
     for pipeline, operations in chunks:
         records = _work(program, pipeline, family, 0, operations=operations)
         if not records:
@@ -75,46 +77,13 @@ def lower_sequence(program):
             records=records,
             once=operations is not None,
             region_name=name,
+            bindings=bindings,
         )
-        actor.emit()
+        actor.emit(finalize=False)
         actors.append(actor)
     require(actors, "sequence contains no actual source work")
-    first = actors[0]
-    result, kernel = first.kernel.module, first.kernel.op
-    before = first.kernel.stream
-    values = dict(first.uniform_by_expression)
-    buffers = dict(first.roots)
-    for actor in actors[1:]:
-        for expr, value in actor.uniform_by_expression.items():
-            if expr in values:
-                value.replace_all_uses_with(values[expr])
-            else:
-                operation = value.owner
-                operation.parent.detach_op(operation)
-                kernel.body.block.insert_op_before(operation, before)
-                values[expr] = value
-        for allocation, value in actor.roots.items():
-            if allocation in buffers:
-                original = buffers[allocation]
-                require(
-                    value.owner.attributes == original.owner.attributes
-                    and value.type == original.type
-                    and tuple(value.owner.operands) == tuple(original.owner.operands),
-                    "source allocation changed across sequential regions",
-                )
-                value.replace_all_uses_with(original)
-            else:
-                operation = value.owner
-                operation.parent.detach_op(operation)
-                kernel.body.block.insert_op_before(operation, before)
-                buffers[allocation] = value
-        require(
-            sum(isinstance(op, FixConfigOp) for op in actor.kernel.op.body.block.ops) <= 1,
-            "unexpected region configuration effects",
-        )
-        region = actor.kernel.stream
-        region.parent.detach_op(region)
-        kernel.body.block.insert_op_before(region, kernel.body.block.last_op)
+    result = bindings.kernel.finish()
+    kernel = bindings.kernel.op
     kernel.attributes["source_schedule"] = ArrayAttr(
         item for actor in actors for item in actor.schedule
     )

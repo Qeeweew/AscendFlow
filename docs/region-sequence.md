@@ -7,6 +7,17 @@
 [sequence_codegen](../src/xdsl_npu/sequence_codegen.py)。这是受限的根部组合，
 不是任意层次region闭包；serial父体和mixed层次组合仍未接通。
 
+源码lowering现在使用[ActorBindings](../src/xdsl_npu/lowering_context.py)共享一个
+actor的物理Kernel、allocation身份和uniform表达式；各region直接写入同一IR，
+不再构造临时Kernel后合并。按首次实际使用绑定local分配，所有GM参数只声明
+一次；晚出现的声明插到固定执行锚点之前，避免反复扫描根区域。涉及generation
+的scalar缓存仍按region隔离，不能把另一region的`$g`解释移入当前时钟。
+
+区域提取在阶段入口完整验证一次IRDL结构，然后逐叶提取实际访问/ownership。
+原先R个区域会对全IR做R次递归结构验证，产生`O(R × 全IR大小)`的重复工作。
+公共leaf入口与最终sequence checker仍验证输入；最终检查重新提取物化后的IR，
+不复用planner证明。没有省去RAW/WAR/WAW、event、初始化或最后reader检查。
+
 ## 数据来自哪些实际事实
 
 叶流水仍由`region_summary.summarize_reused_storage`提取每个byte cell的入口

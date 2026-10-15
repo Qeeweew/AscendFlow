@@ -109,8 +109,8 @@ owner、slot或派发顺序会使相应分析失效；最终checker不信任plan
 近期重构按职责收敛，暂不强制目录重排：
 
 - 前端解析及类型/数值检查，统一源码位置与constexpr/runtime分类。
-- 一个actor绑定环境管理allocation、uniform表达式和frame；region访问器递归
-  lower控制，native recipe只处理原语。逐region构造`_Actor`再合并只是过渡。
+- 一个actor绑定环境管理allocation、uniform表达式和frame；根部sequence已移除
+  临时Kernel合并。后续仍需将父体/嵌套控制接到共同region访问器，native recipe只处理原语。
 - 叶区域、顺序组合和循环调用共享边界合同；叶周期证明器保留，父层负责解除
   入口假设、组合ownership与资源寿命，不把整个child变成opaque task。
 - codegen按已验证控制和物化同步发射，不自行补barrier、变换算法或重新规划。

@@ -34,7 +34,7 @@ class Kernel:
             regions=[Region(self.block)],
         )
         self.module = ModuleOp([self.op])
-        self.stream: StreamOp | None = None
+        self.stream: StreamOp | OnceOp | None = None
         self.task_block: Block | None = None
         self.num_tasks = 0
         self.invocation = None
@@ -80,7 +80,7 @@ class Kernel:
 
     def loop(self, count: int | SSAValue, *, symbolic=False):
         if self.stream is not None:
-            raise ValueError("v0.1 supports one finite task stream per kernel")
+            raise ValueError("open another lexical region with region() before adding a stream")
         self.task_block = Block(arg_types=[IndexType()])
         self.task_block.args[0].name_hint = "generation"
         self.stream = StreamOp.create(
@@ -119,7 +119,7 @@ class Kernel:
         if self.invocation is not None:
             raise ValueError("sequential regions inside an invocation are not yet supported")
         if self.task_block is not None:
-            self.task_block.add_op(EndOp())
+            self.finish_region()
         self.stream, self.task_block = None, None
         if count is None:
             return self.once(uid)
@@ -259,9 +259,13 @@ class Kernel:
     def fixpipe(self, uid, source, destination, *, stage=0):
         return self.task(uid, "fix16", source, destination, stage=stage)
 
-    def finish(self) -> ModuleOp:
+    def finish_region(self):
         assert self.task_block is not None
-        self.task_block.add_op(EndOp())
+        if not isinstance(self.task_block.last_op, EndOp):
+            self.task_block.add_op(EndOp())
+
+    def finish(self) -> ModuleOp:
+        self.finish_region()
         if self.invocation is not None:
             self.invocation.body.block.add_op(scf.YieldOp())
         self.block.add_op(EndOp())

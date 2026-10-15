@@ -9,7 +9,7 @@
 | 工作包 | 现有资产 | 尚缺 |
 |---|---|---|
 | P0目标合同 | FA目标源码、数值/派发表、独立AscendC的小例及8K记录 | 新AST fixture仍不能运行；参考不代表专家性能 |
-| P1局部组合 | 根部once/stream、共享ref、真实init/use、只读GM；1 GiB闭环 | 父serial体组合、统一绑定环境、跨region资源复用、snapshot切片 |
+| P1局部组合 | 根部once/stream、真实init/use、只读GM；1 GiB闭环；统一actor绑定已接入 | 父serial体组合、跨region资源复用、snapshot切片 |
 | P2多级CV/FA | 旧CV/分段反例、native与cross-core基础 | 新AST嵌套、完整softmax/FA、同政策对照 |
 | P3连续任务 | 目标query/KV解码源码与有限派发表 | runtime商余的分析合同及完整编译/设备路径 |
 | P4收敛 | 不可变Compilation、通用benchmark、算子已在examples | 宏/真缓存/基础变体/重复路径收敛及独立安装验收 |
@@ -71,8 +71,10 @@ CANN/正确性/固定性能证据。任何一次超预算先保存phase/计数�
 不再复制`_Actor`能力。按以下小步迁移，每步保持原例可用：
 
 1. 分离allocation/uniform/frame绑定、native原语lowering和region遍历；为同一
-   actor创建一个绑定环境，根部sequence不再生成多份临时module后按名字合并。
+   actor创建一个绑定环境，根部sequence不再生成多份临时module后重绑定SSA。
    实际SSA身份与source allocation身份必须保留，文本相等不代表值相同。
+   此项的共享绑定和直接IR构造已接入；还移除了逐叶重复验证全Module的成本，
+   [验证记录](refactor-progress.md)包含完整冷编译对照。父体组合仍按下一项实施。
 2. 将once/stream和旧invocation接到共同入口/出口合同，先实现
    `serial parent { init; child; use }`。父调用坐标及child入口bound保留为SSA，
    空child执行init/use，parent=0则整个body不执行。
@@ -249,7 +251,7 @@ layout变换。偏差超过5%触发归因；噪声覆盖差异则标未决，不
 ## 11. 下一次开发从哪里开始
 
 P0的[独立参考和政策差异](attention-reference.md)已补齐，并修正单槽L0的内层
-issue_order。下一步P1a抽取actor绑定环境，接通父体`init; child; use`，紧接P3a验证双runtime轴
+issue_order。P1a的共享actor绑定已接入；下一步接通父体`init; child; use`，紧接P3a验证双runtime轴
 及query/task/child代次关系，再推进资源复用与层次CV。每步完成具体退出条件
 才登记，不以测试总数或文档完成代替功能交付。
 

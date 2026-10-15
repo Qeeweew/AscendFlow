@@ -15,7 +15,7 @@ from xdsl_npu.loop_model import extract_loop, loop_dependencies
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import CopyOp, MatmulOp
+from xdsl_npu.source_ir import CopyOp, MatmulOp, PipelineOp
 from xdsl_npu.source_ir import ViewOp as SourceViewOp
 
 
@@ -189,8 +189,12 @@ def test_first_mad_cannot_accumulate_uninitialized_local_storage():
         compile(replace(batched_matmul, source=source))
 
 
-def test_serialized_ast_cannot_bypass_explicit_operand_contract():
+@pytest.mark.parametrize("sequence", [False, True])
+def test_serialized_ast_cannot_bypass_explicit_operand_contract(sequence):
     source = batched_matmul.to_ir()
+    if sequence:
+        pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
+        pipeline.parent.insert_op_after(pipeline.clone(), pipeline)
     matmul = next(op for op in source.walk() if isinstance(op, MatmulOp))
     a1 = next(
         op.ref

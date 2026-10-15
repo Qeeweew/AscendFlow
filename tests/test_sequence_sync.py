@@ -4,7 +4,8 @@ from collections import defaultdict, deque
 
 import pytest
 from ast_state_sum import state_sum
-from xdsl.dialects.builtin import IntAttr
+from xdsl.dialects.builtin import IntAttr, StringAttr
+from xdsl.utils.exceptions import VerifyException
 
 from xdsl_npu import Kernel, autosync, compile, verify_plan
 from xdsl_npu import language as N
@@ -307,6 +308,14 @@ def test_removed_initialization_cannot_be_replaced_by_live_in_assumptions(artifa
     region = physical_regions(plan)[0]
     region.parent.erase_op(region)
     with pytest.raises(CompileError, match="undefined sequence entry read"):
+        verify_plan(plan)
+
+
+def test_final_structure_check_includes_late_regions(artifact):
+    plan = artifact.plan
+    task = next(o for o in physical_regions(plan)[-1].walk() if isinstance(o, TaskOp))
+    task.attributes["issue_order"] = StringAttr("invalid")
+    with pytest.raises(VerifyException, match="issue_order"):
         verify_plan(plan)
 
 

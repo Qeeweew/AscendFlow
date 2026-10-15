@@ -23,6 +23,11 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 及独立AscendC/profile证据，冷源码→ASC p50约0.185秒。父serial体一般组合、
 跨region事件ID复用和mixed层次仍未接通，不能由此推断FA性能已达标。
 
+P1a已共享actor分配/标量绑定，并移除逐叶重复验证全IR的开销。同一32流静态
+压力样本的完整冷源码→ASC p50从2.188秒降到0.773秒，最终ASC和验证报告保持
+一致；普通state_sum为0.164秒。口径、复现及尚缺的父体组合见
+[编译成本记录](docs/refactor-progress.md)。
+
 两个独立长度参数、`ceildiv` 循环和有效前缀的可运行例子见
 [ast_prefix.py](examples/ast_prefix.py)；实际同步、拒绝条件和设备命令见
 [运行时尾部](docs/runtime-prefix.md)。

@@ -6,15 +6,16 @@ No events, completion certificates, or operator-name cases are supplied here.
 """
 
 import re
+from collections import ChainMap
 from dataclasses import dataclass
 from math import prod
 
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IndexType, IntAttr, StringAttr
+from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
 from xdsl.ir import Block, Region
 
-from .builder import Kernel
-from .ir import BoundaryOp, EndOp, FrameOp
+from .ir import BoundaryOp, EndOp
+from .lowering_context import ActorBindings
 from .mixed import compose, extract_mixed, global_dependencies
 from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
 from .scalar import ARITHMETIC, expression, from_ssa, literal, prefix
@@ -275,6 +276,7 @@ class _Actor:
         records=None,
         once=False,
         region_name=None,
+        bindings=None,
     ):
         self.program, self.pipeline = program, pipeline
         self.invocation = invocation
@@ -286,136 +288,39 @@ class _Actor:
             "ordinary source work cannot borrow a child stage or boundary predicate",
         )
         require(self.records, f"{actor}: execution domain has no real work")
-        self.kernel = Kernel(
-            program.sym_name.data,
-            "aic" if family == "cube" else "aiv",
-            blocks=program.groups.data,
-            disjoint_external=bool(program.disjoint_external.data),
+        self.bindings = bindings or ActorBindings(
+            program, family, allocations, invocation=invocation
         )
+        require(
+            self.bindings.program is program
+            and self.bindings.family == family
+            and self.bindings.invocation is invocation,
+            "region binding scope changed",
+        )
+        used = {_root(ref) for record in self.records for ref in _refs(record.op)}
+        self.bindings.bind(used, self.records, pipeline)
+        self.kernel = self.bindings.kernel
+        self.uniform = self.bindings.uniform
+        self.uniform_by_expression = self.bindings.uniform_by_expression
+        self.roots, self.frame_specs = self.bindings.roots, self.bindings.frame_specs
+        self.operand_buffers = self.bindings.operand_buffers
+        # A coordinate-dependent expression may only be cached within this region.
+        self.scalar_cache = ChainMap({}, self.bindings.scalar_cache)
         self.runtime = None
-        self.uniform = {}
-        for scalar_op in program.body.block.ops:
-            if isinstance(scalar_op, SizeOp):
-                self.uniform[scalar_op.value] = self.kernel.runtime_size(
-                    scalar_op.sym_name.data, multiple=scalar_op.multiple.data
-                )
-            elif isinstance(scalar_op, arith.ConstantOp) or type(scalar_op) in ARITHMETIC:
-                cloned = scalar_op.clone(self.uniform)
-                self.kernel.block.add_op(cloned)
-                self.uniform.update(zip(scalar_op.results, cloned.results))
         if pipeline.limit is not None:
             require(
                 pipeline.limit in self.uniform, "pipeline bound must be uniform at region entry"
             )
             self.runtime = self.uniform[pipeline.limit]
-        self.scalar_cache = {}
-        self.uniform_by_expression = {
-            from_ssa(source, memo=self.scalar_cache): target
-            for source, target in self.uniform.items()
-        }
-        self.roots = {}
-        self.frame_specs = {}
-        used = {_root(ref) for record in self.records for ref in _refs(record.op)}
-        for allocation in allocations:
-            typ = allocation.ref.type
-            if allocation not in used and typ.memory.data != "GM":
-                continue
-            dimensions = shape(allocation.ref)
-            size = (
-                prod(n if n != -1 else 1 for n in dimensions)
-                * ITEMSIZE[typ.dtype.data]
-                * allocation.versions.data
+        if self.kernel.stream is not None:
+            require(region_name is not None, "another region needs a lexical identity")
+            self.kernel.region(
+                region_name,
+                None
+                if once
+                else (self.runtime if self.runtime is not None else pipeline.count.data),
             )
-            dynamic = bool(allocation.dimensions)
-            require(
-                not dynamic
-                or (
-                    all(d in self.uniform for d in allocation.dimensions)
-                    and (len(allocation.dimensions) == 1 or invocation is not None)
-                ),
-                "GM extent requires a declared uniform scalar expression",
-            )
-            if allocation.ring.data:
-                size *= program.groups.data
-            external = typ.memory.data == "GM"
-            if not external:
-                size = (size + 31) // 32 * 32
-            self.roots[allocation] = self.kernel.buffer(
-                allocation.sym_name.data,
-                typ.memory.data,
-                0 if dynamic else size,
-                typ.dtype.data,
-                layout=typ.layout.data,
-                external=external,
-                initialized=allocation.access.data in {"read", "read_write"},
-                extent_count=self.uniform_product(tuple(from_ssa(d) for d in allocation.dimensions))
-                if dynamic
-                else None,
-                count_scale=size if dynamic else 0,
-            )
-            if invocation is not None and external:
-                require(
-                    len(dimensions) >= 3, "invocation GM shape needs group/invocation/frame axes"
-                )
-                axes = [d.data for d in allocation.dynamic_axes]
-                values = dict(zip(axes, allocation.dimensions))
-                parent_extent = from_ssa(values[1]) if 1 in values else literal(dimensions[1])
-                require(
-                    len(dimensions) >= 3
-                    and dimensions[0] == program.groups.data
-                    and parent_extent == from_ssa(invocation.ub)
-                    and all(i in {1, 2} for i in axes),
-                    "invocation tensors need leading [group, invocation] axes and bounded frame dimensions",
-                )
-                extent = from_ssa(values[2]) if 2 in values else literal(1)
-                require(
-                    2 not in values
-                    or pipeline.limit is not None
-                    and extent == from_ssa(pipeline.limit),
-                    "dynamic frame axis must match the child pipeline bound",
-                )
-                scale = prod(n for n in dimensions[2:] if n != -1) * ITEMSIZE[typ.dtype.data]
-                self.frame_specs[allocation] = extent, scale
-        self.operand_buffers = {}
-        for record in self.records:
-            op = record.op
-            if (
-                isinstance(op, MatmulOp)
-                and op.a.type.memory.data == "L1"
-                and op not in self.operand_buffers
-            ):
-                require(family == "cube", "matmul requires a Cube execution domain")
-                dtype = op.a.type.dtype.data
-                m, k = shape(op.a)
-                n = shape(op.b)[0 if op.transpose_b.data else 1]
-                name = f"operand_{len(self.operand_buffers)}"
-                self.operand_buffers[op] = (
-                    self.kernel.buffer(
-                        name + "_a", "L0A", m * k * ITEMSIZE[dtype], dtype, layout="ZZ"
-                    ),
-                    self.kernel.buffer(
-                        name + "_b", "L0B", n * k * ITEMSIZE[dtype], dtype, layout="ZN"
-                    ),
-                )
-        if family == "cube":
-            self.kernel.init_fixpipe()
-        if invocation is not None:
-            bound = self.uniform[invocation.ub]
-            frame_values = {
-                allocation: self.uniform_product((extent,))
-                for allocation, (extent, _) in self.frame_specs.items()
-            }
-            parent = self.kernel.invocations(bound)
-            for allocation, (extent, scale) in self.frame_specs.items():
-                root = self.roots[allocation]
-                frame = FrameOp.create(
-                    operands=[root, parent.body.block.args[0], frame_values[allocation]],
-                    attributes={"scale": IntAttr(scale)},
-                    result_types=[root.type],
-                )
-                parent.body.block.add_op(frame)
-                self.roots[allocation] = frame.ref
-        if once:
+        elif once:
             self.kernel.once(region_name)
         else:
             self.kernel.loop(
@@ -423,24 +328,12 @@ class _Actor:
             )
             if region_name is not None:
                 self.kernel.stream.attributes["uid"] = StringAttr(region_name)
+        self.region = self.kernel.stream
+        self.bindings.mark_region(self.region)
         self.schedule = []
         self.definitions = {}
         self.readers = {}
         self.scalar_values = {}
-
-    def uniform_product(self, factors):
-        result = literal(1)
-        for factor in factors:
-            result = expression("mul", result, factor)
-        if result not in self.uniform_by_expression:
-            if result.constant is not None:
-                op = arith.ConstantOp.from_int_and_width(result.constant, IndexType())
-            else:
-                require(result.kind == "mul", "unbound uniform frame expression")
-                op = arith.MuliOp(*(self.uniform_product((arg,)) for arg in result.args))
-            self.kernel.block.add_op(op)
-            self.uniform_by_expression[result] = op.results[0]
-        return self.uniform_by_expression[result]
 
     def view(self, value, record, *, matrix=False):
         view, allocation = value.owner, _root(value)
@@ -625,7 +518,7 @@ class _Actor:
             prefix_elements=prefix_elements,
         )
 
-    def emit(self):
+    def emit(self, *, finalize=True):
         ranks = {
             id(record): rank
             for rank, record in enumerate(sorted(self.records, key=lambda r: r.order))
@@ -884,9 +777,12 @@ class _Actor:
         for block in boundaries.values():
             block.add_op(EndOp())
         self.kernel.task_block = stream_block
-        module = self.kernel.finish()
-        module.body.block.first_op.attributes["source_schedule"] = ArrayAttr(self.schedule)
-        return module
+        if finalize:
+            module = self.kernel.finish()
+            module.body.block.first_op.attributes["source_schedule"] = ArrayAttr(self.schedule)
+            return module
+        self.kernel.finish_region()
+        return self.kernel.module
 
 
 def _tile_producer(value, outer):
