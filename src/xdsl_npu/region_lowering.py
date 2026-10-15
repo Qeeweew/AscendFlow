@@ -6,7 +6,7 @@ local serial parent with ordinary work and direct pipelines, or one mixed
 pipeline. The explicit legacy path alone admits finite nested subdivisions.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, StringAttr
@@ -15,12 +15,16 @@ from .lowering_context import ActorBindings
 from .model import require
 from .scalar import ARITHMETIC, from_ssa, literal
 from .source_ir import AllocationOp, DomainOp, MatmulOp, PipelineOp, SizeOp, ViewOp, YieldOp
+from .source_scopes import Scope, collect_source_scopes
+from .source_scopes import Work as ScopedWork
 
 
 @dataclass(frozen=True)
 class SourceRegion:
     pipeline: PipelineOp
     operations: tuple | None = None
+    work: tuple[ScopedWork, ...] | None = None
+    scope: Scope | None = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,7 @@ class SourceBody:
     invocation: scf.ForOp | None
     regions: tuple[SourceRegion, ...]
     allocations: tuple[AllocationOp, ...]
+    scope: Scope | None
 
 
 def _has_work(op):
@@ -83,7 +88,7 @@ def source_body(program, *, symbolic):
         "mixed sequence ownership is not yet implemented",
     )
     ast = program.attributes.get("frontend") == StringAttr("ast")
-    allocations = []
+    allocations, conditions = [], []
     for op in program.walk():
         if isinstance(op, AllocationOp):
             allocations.append(op)
@@ -107,7 +112,52 @@ def source_body(program, *, symbolic):
             symbolic or not isinstance(op, scf.IfOp),
             "boundary regions require the symbolic compiler; no finite fallback",
         )
-    return SourceBody(invocation, tuple(regions), tuple(allocations))
+        if ast and isinstance(op, scf.IfOp):
+            conditions.append(op)
+    # Admit the entire control tree before interpreting a predicate in the
+    # current one-clock subset. A nested clock must not lose its ancestor facts
+    # and be misdiagnosed as invalid scalar arithmetic.
+    for op in conditions:
+        from .lowering import _last_condition
+
+        parent = op.parent_op()
+        while parent is not None and not isinstance(parent, PipelineOp):
+            require(
+                not isinstance(parent, scf.IfOp),
+                "nested boundary predicates need hierarchical analysis",
+            )
+            parent = parent.parent_op()
+        require(
+            parent is not None,
+            "ordinary source work cannot borrow a child stage or boundary predicate",
+        )
+        _last_condition(op, parent)
+    source_scope = None
+    if ast:
+        source_scope = collect_source_scopes(program)
+        by_scope = {item.op: item for item in source_scope.walk_scopes()}
+        direct_work = {
+            op: tuple(item for item in tree.items if isinstance(item, ScopedWork))
+            for op, tree in by_scope.items()
+        }
+        owner_scope = by_scope[scope]
+        owner_ops = tuple(scope.body.block.ops)
+        prefix = len(owner_scope.context.path)
+        by_operation = {}
+        for item in direct_work[scope]:
+            op = owner_ops[item.context.path[prefix]]
+            by_operation.setdefault(op, []).append(item)
+        regions = [
+            replace(
+                region,
+                scope=by_scope[region.pipeline] if region.operations is None else owner_scope,
+                work=direct_work[region.pipeline]
+                if region.operations is None
+                else tuple(item for op in region.operations for item in by_operation.get(op, ())),
+            )
+            for region in regions
+        ]
+    return SourceBody(invocation, tuple(regions), tuple(allocations), source_scope)
 
 
 def lower_regions(program, *, symbolic):
@@ -130,7 +180,15 @@ def lower_regions(program, *, symbolic):
         bindings = ActorBindings(program, family, body.allocations, invocation=body.invocation)
         leaves = []
         for region in body.regions:
-            records = _work(program, region.pipeline, family, owner, operations=region.operations)
+            records = _work(
+                program,
+                region.pipeline,
+                family,
+                owner,
+                operations=region.operations,
+                scoped=region.work,
+                scope=region.scope,
+            )
             if not records and multiple:
                 continue
             leaf = _Actor(

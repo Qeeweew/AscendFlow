@@ -834,6 +834,7 @@ def _check_accesses(loop, all_views):
         storage = refs[0].storage
         groups = loop.access_groups(storage)
         drift = {slope(ref) for ref in refs}
+        finite_affine = False
         if loop.cyclic is not None and storage.external:
             from .cyclic import check_stream
 
@@ -869,18 +870,25 @@ def _check_accesses(loop, all_views):
                     loop.constant_count is not None,
                     f"{root}: unbounded stream exceeds its fixed allocation",
                 )
-                translations = {
-                    tuple(ref.address(0, core) - ref.address(0) for core in range(groups))
-                    for ref in refs
-                }
-                require(
-                    len(translations) == 1, f"{root}: written stream aliases change between groups"
-                )
-                shifts = next(iter(translations))
-                require(
-                    all(b - a >= loop.constant_count * frame for a, b in pairwise(shifts)),
-                    f"{root}: cross-group stream ownership overlap",
-                )
+                if period == 1:
+                    from .affine_ownership import verify_affine_frames
+
+                    verify_affine_frames(refs, loop.constant_count, groups, frame, root=root)
+                    finite_affine = True
+                else:
+                    translations = {
+                        tuple(ref.address(0, core) - ref.address(0) for core in range(groups))
+                        for ref in refs
+                    }
+                    require(
+                        len(translations) == 1,
+                        f"{root}: written stream aliases change between groups",
+                    )
+                    shifts = next(iter(translations))
+                    require(
+                        all(b - a >= loop.constant_count * frame for a, b in pairwise(shifts)),
+                        f"{root}: cross-group stream ownership overlap",
+                    )
         elif root in writes and storage.external:
             require(
                 all(not ref.count_offset and not ref.count_core_stride for ref in refs),
@@ -944,7 +952,7 @@ def _check_accesses(loop, all_views):
                         coefficient % itemsize == 0 and all(lo % itemsize == 0 for lo, _ in parts),
                         f"{root}: dtype alignment violated",
                     )
-                    if root in loop.frames:
+                    if root in loop.frames and not finite_affine:
                         translation = ref.address(0, core) - ref.address(0)
                         require(
                             all(
@@ -1063,6 +1071,11 @@ def access_cells(loop, *, roots=None, include_readonly=False):
                         ],
                     )
                 )
+    yield from cut_access_cells(cells)
+
+
+def cut_access_cells(cells):
+    """Exact interval cuts shared by periodic and fixed-domain access scans."""
     for root, work in cells.items():
         points = sorted({p for _, _, _, parts in work for lo, hi, _, _ in parts for p in (lo, hi)})
         cuts = {point: i for i, point in enumerate(points)}

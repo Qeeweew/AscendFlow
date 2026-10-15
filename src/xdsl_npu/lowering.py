@@ -1,8 +1,8 @@
 """Lower stage/domain source regions to exact dav-2201 physical work.
 
-The outer software task clock stays intact. Finite nested pipelines expand
-their native operations in semantic order, with independent inner issue keys.
-No events, completion certificates, or operator-name cases are supplied here.
+The AST path consumes collected lexical scopes without expanding child clocks.
+The explicit non-AST fixture path retains finite subdivisions. No events,
+completion certificates, or operator-name cases are supplied here.
 """
 
 import re
@@ -35,6 +35,7 @@ from .source_ir import (
     ViewOp,
     YieldOp,
 )
+from .source_scopes import Context
 
 
 def shape(value):
@@ -50,6 +51,7 @@ class Work:
     order: tuple[int, ...]
     constants: tuple
     boundary: object = None
+    context: Context | None = None
 
 
 def _last_condition(op, pipeline):
@@ -73,7 +75,98 @@ def _last_condition(op, pipeline):
     )
 
 
-def _work(program, pipeline, family, owner, *, operations=None):
+def _check_work_order(records, program, pipeline, family, pinned, ranks):
+    first_boundary = next(
+        (i for i, record in enumerate(records) if record.boundary is not None), len(records)
+    )
+    require(
+        all(r.boundary is not None for r in records[first_boundary:]),
+        "last-generation regions must form a terminal logical effect suffix",
+    )
+    if first_boundary < len(records):
+        require(
+            program.kind.data != "mixed", "mixed boundary protocols need collective region analysis"
+        )
+    if pinned:
+        require(
+            set(ranks) == {record.label for record in records},
+            f"{family}: issue_order must name every active Stage exactly once",
+        )
+        labels = [op.label.data for op in pipeline.body.block.ops if isinstance(op, StageOp)]
+        require(len(labels) == len(set(labels)), "issue_order requires unambiguous Stage names")
+    return records
+
+
+def _work(program, pipeline, family, owner, *, operations=None, scoped=None, scope=None):
+    if program.attributes.get("frontend") != StringAttr("ast"):
+        return _legacy_work(program, pipeline, family, owner, operations=operations)
+    require(
+        scoped is not None and scope is not None,
+        "AST native records need their collected source scope",
+    )
+    require(
+        operations is not None or scope.op is pipeline,
+        "AST native records changed their source pipeline",
+    )
+    phases = {op: i for i, op in enumerate(pipeline.body.block.ops) if isinstance(op, StageOp)}
+    issue_order = () if pipeline.issue_order is None else pipeline.issue_order.data.get(family, ())
+    ranks = {label.data: i for i, label in enumerate(issue_order)}
+    pinned = (
+        operations is None
+        and pipeline.issue_order is not None
+        and family in pipeline.issue_order.data
+    )
+    records = []
+    for item in scoped:
+        if item.actor != family:
+            continue
+        clock = item.clock
+        if operations is None:
+            require(
+                clock is not None and clock.op is pipeline,
+                "nested AST pipelines require hierarchical synchronization; "
+                "constant bounds do not authorize implicit unrolling",
+            )
+            stage = clock.stage
+        else:
+            require(
+                clock is None or isinstance(clock.op, scf.ForOp),
+                "ordinary source work cannot borrow a child clock",
+            )
+            stage = None
+        guards = item.context.guards
+        require(len(guards) <= 1, "nested boundary predicates need hierarchical analysis")
+        require(
+            not guards or guards[0].taken,
+            "structured scf.if synchronization currently needs a last-generation equality with no else/results",
+        )
+        boundary = guards[0].op if guards else None
+        label = "pipeline" if stage is None else stage.label.data
+        entry = scope.context.path
+        require(
+            item.context.path[: len(entry)] == entry,
+            "AST native work escaped its collected source scope",
+        )
+        order = item.context.path[len(entry) :]
+        if stage is not None and ranks:
+            order = (ranks.get(label, -1), *order)
+        constants = () if item.context.owner is None else ((item.context.owner, owner),)
+        records.append(
+            Work(
+                item.op,
+                0 if stage is None else stage.offset.data,
+                0 if stage is None else phases[stage],
+                label,
+                order,
+                constants,
+                boundary,
+                item.context,
+            )
+        )
+    return _check_work_order(records, program, pipeline, family, pinned, ranks)
+
+
+def _legacy_work(program, pipeline, family, owner, *, operations=None):
     records = []
     phases = {op: i for i, op in enumerate(pipeline.body.block.ops) if isinstance(op, StageOp)}
     default_domain = None if program.kind.data == "mixed" else program.kind.data
@@ -185,25 +278,7 @@ def _work(program, pipeline, family, owner, *, operations=None):
         default_domain,
         (),
     )
-    first_boundary = next(
-        (i for i, record in enumerate(records) if record.boundary is not None), len(records)
-    )
-    require(
-        all(r.boundary is not None for r in records[first_boundary:]),
-        "last-generation regions must form a terminal logical effect suffix",
-    )
-    if first_boundary < len(records):
-        require(
-            program.kind.data != "mixed", "mixed boundary protocols need collective region analysis"
-        )
-    if pinned:
-        require(
-            set(ranks) == {record.label for record in records},
-            f"{family}: issue_order must name every active Stage exactly once",
-        )
-        labels = [op.label.data for op in pipeline.body.block.ops if isinstance(op, StageOp)]
-        require(len(labels) == len(set(labels)), "issue_order requires unambiguous Stage names")
-    return records
+    return _check_work_order(records, program, pipeline, family, pinned, ranks)
 
 
 def _refs(op):

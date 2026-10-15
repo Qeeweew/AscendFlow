@@ -41,7 +41,7 @@ def operations(region):
 
 
 def pipe(task):
-    if task.native.data == "copy":
+    if task.native.data in {"copy", "copy_rows"}:
         return "MTE2" if task.refs[0].type.bank.data == "GM" else "MTE3"
     return "S" if task.native.data == "scalar_load" else "V"
 
@@ -271,6 +271,7 @@ def finite_check(plan, n, *, invocations=1, group=0):
                     continue
                 modes = {
                     "copy": ("R", "W"),
+                    "copy_rows": ("R", "W"),
                     "add": ("R", "R", "W"),
                     "fill": ("W",),
                     "muls": ("R", "W"),

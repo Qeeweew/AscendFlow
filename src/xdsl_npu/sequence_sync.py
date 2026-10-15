@@ -43,7 +43,9 @@ def _requirements(sequence):
     result = []
     for obligation in sequence.summary.obligations:
         source = _point(sequence.regions, obligation.source, obligation.domain, source=True)
-        destination = _point(sequence.regions, obligation.destination, obligation.domain, source=False)
+        destination = _point(
+            sequence.regions, obligation.destination, obligation.domain, source=False
+        )
         require(
             _valid_point(sequence.regions, source, obligation.domain)
             and _valid_point(sequence.regions, destination, obligation.domain),
@@ -69,6 +71,22 @@ def _plan_boundaries(sequence, analyses, banks):
         tasks = _data(sequence.regions, point.region).program.tasks
         return point.position.end, generation + task.stage, task.issue_order, tasks.index(task)
 
+    def fixed_producer_issue(point):
+        # A later capture on the same producer pipe includes its earlier real
+        # retirements. Try it first for one consumer so no add-then-delete proof
+        # loop is needed. Runtime endpoint ordering retains its existing domain
+        # policy; a head and a tail cannot be ranked by textual offset alone.
+        count = sequence.regions[point.region].constant_count
+        if count is None:
+            return (0, 0, 0)
+        task = _task(sequence.regions, point)
+        tasks = _data(sequence.regions, point.region).program.tasks
+        return (
+            -(point.position.evaluate(count) + task.stage),
+            -task.issue_order,
+            -tasks.index(task),
+        )
+
     ordered = sorted(
         requirements,
         key=lambda r: (
@@ -77,6 +95,7 @@ def _plan_boundaries(sequence, analyses, banks):
             r[3].hazard != "WAR",
             -order[r[0].region],
             _task(sequence.regions, r[0]).pipe == _task(sequence.regions, r[1]).pipe,
+            fixed_producer_issue(r[0]),
             repr(r[:3]),
         ),
     )
@@ -208,7 +227,11 @@ def _read_bridges(sequence, analyses):
             domains.append(domain)
         require(domains and len(set(domains)) == len(domains), "empty/duplicate region activation")
         require(
-            all(_valid_point(sequence.regions, point, domain) for point in points for domain in domains),
+            all(
+                _valid_point(sequence.regions, point, domain)
+                for point in points
+                for domain in domains
+            ),
             "region event has no actual producer/consumer for its activation",
         )
         sp, dp = _task(sequence.regions, source).pipe, _task(sequence.regions, destination).pipe
@@ -319,6 +342,7 @@ def verify_sequence(module, *, _details=False):
             key: sum(counts[key] for counts in local_statistics) for key in local_statistics[0]
         },
         "sequence_boundary_statistics": proof.flow.statistics(),
+        "sequence_child_projection_statistics": proof.projection_statistics,
         "proof_path_queries": sum(a[3].path_queries for a in analyses.values()),
         "sequence_boundary_coverage_queries": proof.queries,
         "sequence_completion_sites": len(proof.flow.edges),

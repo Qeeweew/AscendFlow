@@ -107,6 +107,7 @@ def verify_calls(sequence, analyses, bridges):
         "invocation_proof_queries": proof.queries,
         "invocation_path_visits": 0,
         "invocation_completion_sites": len(proof.flow.edges),
+        "invocation_child_projection_statistics": proof.projection_statistics,
         "invocation_completion_facts": len(proof.sources),
         "invocation_completion_transfers": proof.flow.transfers,
         "invocation_completion_edges": proof.flow.edge_count,
@@ -124,7 +125,8 @@ def plan_calls(sequence, analyses, forward, banks):
         memory,
         key=lambda r: (
             not r.reason.startswith("WAR"),
-            _task(sequence.regions, r.source.location).pipe == _task(sequence.regions, r.destination.location).pipe,
+            _task(sequence.regions, r.source.location).pipe
+            == _task(sequence.regions, r.destination.location).pipe,
             -proof.order[r.source.region],
             proof.order[r.destination.region],
             repr(r),

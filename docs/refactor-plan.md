@@ -73,6 +73,11 @@ query tile 分给20组已经产生12/13差异，不能追加长度整除组数�
 
 父子关系保留 actor/clock/guard 和暴露的完成边界；共享不可变拓扑与必要边界，
 不为每个源、查询域复制整张图，不把所有 actor 强行排成一条串行时钟。
+现已接入AST词法scope和fixed child完成投影，local sequence实际使用同一投影，
+固定行步长列切片及其跨child访问frontier也已进入最终检查。以下下一步必须
+在已有实现上扩展，不能再写一套脱离lowering的summary原型：先保留父Pipelined
+中的真实child callsite及祖先地址绑定，再按父Stage/issue policy组合实际端点；
+用共享L0C的FIX→下一MAD和两AIV最后reader贡献作为首个CV验收。
 双 AIV 的完整贡献、MTE2 import 的早 release、FIX 与共享 L0C 冲突都要表达。
 源码控制退出不插入 child drain；不以增加 buffer、搬运或 barrier 接通。
 先核实每个 native 的读退休、写完成和配置资源合同；当前主要使用 task end，

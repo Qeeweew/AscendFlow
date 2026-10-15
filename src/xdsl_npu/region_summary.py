@@ -1,8 +1,10 @@
 """Exact access frontiers at the boundary of a repeated leaf pipeline.
 
 These are memory obligations, not completion certificates or event plans. The
-caller selects stationary storage roots. Checked invocation frames retain their
-actual FrameOp identity, rather than losing the owning call in a root name.
+caller selects storage roots. Periodic summaries require stationary storage;
+fixed summaries inspect the real constant child domain. Checked invocation
+frames retain their actual FrameOp identity, rather than losing the owning call
+in a root name.
 
 For period P, enumerate N=1..P-1 and P long domains N>=P, N%P=r. A periodic
 writer leaves a suffix of at most P generations. With no periodic writer, a
@@ -16,13 +18,16 @@ from math import gcd
 
 from xdsl.ir import SSAValue
 
+from .budget import poll
 from .completion import CountDomain, Position
 from .ir import BufferOp, FrameOp
-from .loop_model import access_cells, slope
-from .model import require
+from .loop_model import access_cells, cut_access_cells, slope
+from .model import require, verify_translated_owners
 from .scalar import Expr
 
 MAX_SUMMARY_VISITS = 1_000_000
+MAX_FIXED_ACCESS_SEGMENTS = 65_536
+MAX_FIXED_SUMMARY_VISITS = 262_144
 
 
 def allocation(storage):
@@ -230,6 +235,149 @@ def _scan(events):
             first = first or access
             last, pending = access, []
     return tuple(live_in), first, last, tuple(pending)
+
+
+def summarize_fixed_storage(loop, roots):
+    """Exact boundary transfer over one genuinely fixed child domain.
+
+    Inspect actual generation/core footprints, including row holes. This does
+    not expand native IR or make the child count a storage period. Coordinates
+    stay absolute even for a checked finite affine stream frame; invocation
+    FrameOps and count-dependent parent translations need a different contract.
+    """
+    roots = tuple(sorted(set(roots)))
+    require(len(loop.actors) == 1, "mixed fixed summaries require participant analysis")
+    count = loop.constant_count
+    require(type(count) is int and count >= 0, "fixed summary requires an actual constant count")
+    require(
+        all(
+            data.stream.limit is None
+            and data.stream.count is not None
+            and data.stream.count.data == count
+            for data in loop.actors.values()
+        ),
+        "fixed summary count must match the actual constant child stream",
+    )
+    selected = set(roots)
+    known = {
+        loop.root(actor, ref)
+        for actor, data in loop.actors.items()
+        for task in data.program.tasks
+        for ref in task.refs
+    }
+    require(selected <= known, "fixed summary names an unknown storage root")
+    require(
+        loop.invocation is None
+        or not selected.intersection(frame.name for frame in loop.invocation.frames),
+        "fixed invocation-frame summary needs parent ownership",
+    )
+    work = []
+    segments = ownership_segments = events = 0
+    physical_refs = []
+    for _, _, _, actor, task in sorted(
+        (task.logical_phase, owner, index, actor, task)
+        for owner, (actor, data) in enumerate(loop.actors.items())
+        for index, task in enumerate(data.program.tasks)
+    ):
+        parts = []
+        generations = int(count > 0) if task.last else count
+        for number, ref in enumerate(task.refs):
+            root = loop.root(actor, ref)
+            if root not in selected:
+                continue
+            require(
+                not ref.count_offset and not ref.count_core_stride and not ref.storage.count_scale,
+                "fixed translated storage needs parent ownership",
+            )
+            require(ref.prefix_extent is None, "fixed summary needs unclipped physical storage")
+            require(ref.rows > 0, "fixed summary needs nonempty physical row declarations")
+            cores = loop.access_groups(ref.storage) if ref.storage.external else 1
+            fragments = generations * ref.rows * cores
+            segments += fragments
+            if ref.storage.external:
+                ownership_segments += fragments
+                physical_refs.append(ref)
+            parts.append((root, number, ref, cores))
+        if parts:
+            events += generations
+            work.append((actor, task, parts))
+    # Reject before asking Ref.segments to allocate any row tuple. Counts are
+    # analysis bounds, never periods or permission to materialize native tasks.
+    require(
+        segments <= MAX_FIXED_ACCESS_SEGMENTS,
+        "fixed summary physical access-segment budget exceeded",
+    )
+    visits = segments + events + ownership_segments + len(physical_refs) * loop.groups
+    require(visits <= MAX_FIXED_SUMMARY_VISITS, "fixed summary visit budget exceeded")
+    poll("fixed child summary", count=count, segments=segments, visits=visits)
+    cells, effects = {}, []
+    order = {(actor, task.uid): i for i, (actor, task, _) in enumerate(work)}
+    iterations = 0
+    for actor, task, parts in work:
+        generations = (count - 1,) if task.last and count else () if task.last else range(count)
+        for g in generations:
+            modes = task.modes_for(g)
+            touched = {}
+            for root, number, ref, cores in parts:
+                mode = modes[number]
+                for core in range(cores):
+                    for lo, hi in ref.segments(g, core):
+                        require(
+                            0 <= lo < hi <= ref.storage.nbytes,
+                            f"{root}: fixed child footprint exceeds actual allocation",
+                        )
+                        if core == 0:
+                            touched.setdefault(root, []).append(
+                                (lo, hi, mode, ref.storage.initialized)
+                            )
+                            if ref.storage.external:
+                                effects.append((ref.storage.name, lo, hi, mode))
+                        iterations += 1
+                        if iterations % 256 == 0:
+                            poll("fixed child footprints", segments=iterations, visits=visits)
+            for root, intervals in touched.items():
+                cells.setdefault(root, []).append((g, actor, task.uid, intervals))
+    if count and physical_refs:
+        poll("fixed child owners", effects=len(effects), groups=loop.groups)
+        verify_translated_owners(
+            physical_refs,
+            effects,
+            loop.groups,
+            translation_error="fixed child views disagree on GM ownership",
+            overlap_error="fixed child GM owners overlap",
+        )
+    # Charge cuts AND frontier visits before the shared sweep allocates its
+    # per-cell event lists. Interval count alone does not bound intersecting cuts.
+    for root, accesses in cells.items():
+        accesses.sort(key=lambda access: (access[0], order[access[1], access[2]]))
+        points = sorted(
+            {p for _, _, _, parts in accesses for lo, hi, _, _ in parts for p in (lo, hi)}
+        )
+        cuts = {point: i for i, point in enumerate(points)}
+        cut_visits = sum(
+            cuts[hi] - cuts[lo] for _, _, _, parts in accesses for lo, hi, _, _ in parts
+        )
+        visits += len(points) + 2 * cut_visits
+        require(visits <= MAX_FIXED_SUMMARY_VISITS, "fixed summary cut/scan visit budget exceeded")
+        poll("fixed child cuts", root=root, points=len(points), visits=visits)
+    summaries = []
+    for root, lo, hi, accesses in cut_access_cells(cells):
+        frontier = _scan(
+            (Access((actor, uid), Position(False, g)), read, write)
+            for (g, actor, uid), read, write, _ in accesses
+        )
+        summaries.append(CellSummary(root, lo, hi, CountDomain(1, 0, exact=count), *frontier))
+        if len(summaries) % 256 == 0:
+            poll("fixed child frontiers", cells=len(summaries), visits=visits)
+    origins = {root: op.ref for root, op in loop.roots.items() if root in selected}
+    for actor, data in loop.actors.items():
+        for op in data.kernel.body.block.ops:
+            if isinstance(op, BufferOp):
+                root = op.sym_name.data if op.external.data else actor + "/" + op.sym_name.data
+                if root in selected:
+                    origins[root] = op.ref
+    require(set(origins) == selected, "fixed summary needs actual allocation roots")
+    return RegionSummary(roots, tuple(summaries), visits, loop.bound, count, tuple(origins.items()))
 
 
 def summarize_reused_storage(loop, roots):

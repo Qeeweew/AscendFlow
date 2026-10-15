@@ -1,6 +1,6 @@
 """Actual local region extraction and open physical-access contracts."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from xdsl.dialects import scf
 
@@ -85,7 +85,7 @@ def extract_sequence(module):
                     users.setdefault(root, set()).add(name)
                     if "W" in mode:
                         writes.add(root)
-    stationary = set()
+    stationary, finite = set(), set()
     for root, accesses in refs.items():
         fixed = all(
             not slope(ref)
@@ -109,18 +109,49 @@ def extract_sequence(module):
         if fixed:
             stationary.add(root)
         elif len(users[root]) > 1:
-            require(
-                root not in writes and all(ref.storage.initialized for _, ref, _ in accesses),
-                f"{root}: cross-region drifting writes need a joint ownership proof",
+            bounded = all(
+                loop.constant_count is not None
+                and not ref.count_offset
+                and not ref.count_core_stride
+                and ref.prefix_extent is None
+                and not ref.storage.count_scale
+                for loop, ref, _ in accesses
             )
-        if root in writes and fixed and accesses[0][1].storage.external:
+            if root in writes and bounded:
+                finite.add(root)
+            else:
+                require(
+                    root not in writes and all(ref.storage.initialized for _, ref, _ in accesses),
+                    f"{root}: cross-region drifting writes need a joint ownership proof",
+                )
+        if root in writes and (fixed or root in finite) and accesses[0][1].storage.external:
             # A per-leaf owner proof is insufficient: two locally disjoint grids
             # could still alias another region's owners. Verify the union.
             physical = [ref for _, ref, _ in accesses]
+            from .budget import poll
+
+            counts = [
+                loop.constant_count if root in finite else loop.storage_periods[root]
+                for loop, _, _ in accesses
+            ]
+            if root in finite:
+                from .region_summary import MAX_FIXED_ACCESS_SEGMENTS
+
+                groups = next(iter(loops.values())).groups
+                require(
+                    groups * sum(count * ref.rows for count, (_, ref, _) in zip(counts, accesses))
+                    <= MAX_FIXED_ACCESS_SEGMENTS,
+                    f"{root}: cross-region fixed access budget exceeded",
+                )
+                require(
+                    groups * len(physical) <= MAX_FIXED_ACCESS_SEGMENTS,
+                    f"{root}: cross-region fixed translation budget exceeded",
+                )
+            poll("sequence owner union", root=root, accesses=len(accesses))
             effects = [
                 (ref.storage.name, lo, hi, mode)
-                for loop, ref, mode in accesses
-                for g in range(loop.storage_periods[root])
+                for count, (loop, ref, mode) in zip(counts, accesses)
+                for g in range(count)
                 for lo, hi in ref.segments(g)
             ]
             verify_translated_owners(
@@ -132,11 +163,22 @@ def extract_sequence(module):
             )
     live_in, parts = {}, []
     for name, loop in loops.items():
-        roots = stationary & {
-            root for root, regions_using_root in users.items() if name in regions_using_root
-        }
-        live_in[name] = roots
-        parts.append(Part(name, summarize_reused_storage(loop, roots)))
+        used = {root for root, regions_using_root in users.items() if name in regions_using_root}
+        roots, fixed_roots = stationary & used, finite & used
+        live_in[name] = roots | fixed_roots
+        summary = summarize_reused_storage(loop, roots)
+        if fixed_roots:
+            from .region_summary import summarize_fixed_storage
+
+            projected = summarize_fixed_storage(loop, fixed_roots)
+            summary = replace(
+                summary,
+                roots=(*summary.roots, *projected.roots),
+                cells=(*summary.cells, *projected.cells),
+                origins=(*summary.origins, *projected.origins),
+                visits=summary.visits + projected.visits,
+            )
+        parts.append(Part(name, summary))
     summary = summarize_sequence(parts)
     for cell in summary.cells:
         root = allocation(cell.storage)

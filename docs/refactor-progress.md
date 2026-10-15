@@ -1,13 +1,82 @@
 # 当前状态与问题清单
 
-2026-10-15，runtime索引已保存于 `97b3c5a`，随后推进通用数值合同、ASC可读性
-与当前softmax性能复测。之前文档与停止的block-sum
+2026-10-15，runtime索引已保存于 `97b3c5a`，数值合同、ASC可读性与当前softmax
+性能复测已保存于 `f21b57e`；随后接入词法作用域和固定子循环的完成投影。
+之前文档与停止的block-sum
 实验diff已保存到外层 `runs/refactor/dsl-implementation/starting.patch`。
 本页区分本轮实现、历史性能和仍未接通的能力。
 
 **新 DSL 的完整 Flash Attention 仍不能编译。** 旧FA、公开physical builder与
 tracer入口已删除；没有绕行内部构造器的兼容example。runtime BNSD局部流水已
 接通，下一主线是一般nested CV，[计划](refactor-plan.md)规定其退出条件。
+
+## 本次推进：真实作用域与固定 child 边界
+
+- AST lowering已实际使用一次收集的`Scope/Context`，保留原始clock SSA、
+  祖先Stage、guard和actor；每个源效果只收集一次。现有Vector、Cube、serial、
+  grouped、单层mixed五类程序的物理IR与改动前一致。AST不再进入旧的展开walker。
+- 固定child完成投影已接入现有**local sequence**的规划及最终检查。
+  `child_completion.py`复用真实native graph，只暴露指定端点与actor/pipe的
+  issue、queue、retire、implicit端口。调用退出只传递对应流水状态，不产生child-done。
+  完整single-child invocation已有跨调用协议时，仍走原完整检查，不冒充独立叶。
+- 最小Cube反例保留5个native模板：`FIX(7).end → 下一调用 MAD(0).begin`
+  本来不可达；从真实`FIX(7).prefix`连接后可达，误用`MAD(7).prefix`仍不可达。
+  同时覆盖Set效果与读退休不同、Wait消费、零次child、多actor同UID和端点alias。
+- 固定GM列切片不再被“每代必须落在宽度等于stride的连续frame内”误拒绝。
+  以地址商/余数区间证明不同代次与owner不重叠；不将child次数放进storage period。
+  父级需要的精确frontier按真实固定K扫描行区间，保留每个列块的writer/reader，
+  不把最后一个列块writer当作整张矩阵writer。
+- `sequence_sync`优先尝试同一consumer真正需要的较晚producer prefix；覆盖仍由
+  完成关系证明，直接选出所需同步，不先插入再删除。新增跨owner预算在区间
+  物化前计算groups×generation×rows，避免只计core0后产生巨量owner区间。
+
+真实DSL反例在 [pitched_children.py](../tests/fixtures/pitched_children.py)，属于
+编译器边界测试，不是FA example。其源程序先用4次循环逐列块写Y，再用1次循环
+整体读取Y。同步前有16个跨child byte-cell RAW义务；同步后只有1个边界channel：
+
+```text
+r0: MTE3 store(Y[:, j*8:(j+1)*8]), j=0..3
+    j=3: Set(MTE3 -> MTE2, ID=2)   // 捕获实际producer prefix
+r1: k=0: Wait(MTE3 -> MTE2, ID=2)
+    MTE2 load(Y[:, :])
+```
+
+两个child循环、5个native模板和双缓冲保留；只有kernel return处最终drain。
+删除这对边界同步，最终verifier和独立有限byte/event模型均拒绝；少写一个列块
+也不能通过初始化检查。Cube列切片另保持8次循环、5个模板、真实GM row pitch。
+
+| 验证 | 本次结果 |
+|---|---|
+| Python源码→ASC，五冷进程p50/max | pitched children 0.3132/0.3141秒；Cube列切片0.2834/0.2900秒；层次GEMM 0.5869/0.5895秒 |
+| Python→ASC→CANN及共享库，单次总期限300秒 | 两个新fixture分别5.609/5.573秒完成 |
+| 设备正确性，物理6→逻辑0 | 所有卡健康/进程/显存/利用率已检查；两个fixture各10次，512/4096个输出精确一致，input/guard不变 |
+| 完成投影规模 | count=8和2^40+3的同一leaf有相同native模板、节点、边与投影关系数量 |
+| 固定Score访问摘要 | 128行×8列块：1024 cells、7179 visits、2个native模板，storage period=1 |
+
+最后一项摘要成本受静态tile的K和实际访问片段影响，**不是**关于任意K的常数
+成本声明；其有65536片段和累计visit预算，运行时N不进入这个扫描入口。
+投影事实传播和端点关系提取也有成本，已分别计入
+`sequence_child_projection_statistics`，不能只报告父图缩小后的节点数。
+端点/端口两两关系提取为二次候选数；在建图前检查100万候选预算，并在覆盖
+提取中响应编译取消，不依赖300秒子进程硬截止来掩盖结构膨胀。
+本次小设备检查没有吞吐量/ACLNN/profile结论；已有softmax性能不能外推FA。
+
+证据在外层`runs/refactor/nested-child/`：`build/`包含同步前后IR、最终ASC、
+CANN选项/hash；`device/result.json`记录正确性；`cold-*-final`记录最终独立进程计时。
+最终ASC hash与设备所用共享库的manifest一致。可从工作区根目录复现构建：
+
+```bash
+PYTHONPATH=compiler .venv/bin/python - <<'PY'
+from tests.fixtures.pitched_children import pitched_children, cube_columns
+from xdsl_npu.build import build_module
+for name, source in (("pitched_children", pitched_children), ("cube_columns", cube_columns)):
+    build_module(source, f"runs/refactor/nested-child/build/{name}", shared=True, timeout_s=300)
+PY
+```
+
+**未完成：**父级Pipelined中重叠的child调用、父代次地址捕获、跨child的双AIV
+贡献与资源寿命、独立query/kv运行时钟及first/last路径。当前nested FA仍明确
+拒绝，不能将本次local sequence接线称为nested CV或FA接入完成。
 
 追加完成：
 

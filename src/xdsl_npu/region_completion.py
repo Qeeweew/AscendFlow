@@ -6,6 +6,7 @@ shared with leaf/invocation checks in completion.py.
 """
 
 from collections import defaultdict
+from dataclasses import replace
 
 from .completion import (
     Point,
@@ -113,11 +114,7 @@ class RegionCompletion:
         }
         self.bindings = defaultdict(list)
         self.scopes = {}
-        state = {}
-        self.templates = {name: self._template(name) for name in regions}
-        for call in calls:
-            for name in regions:
-                self._compose(call, name, state)
+        self.projected_scopes = {}
         marks = {s for r in self.requirements for s in (r.source, r.destination)}
         for r in self.requirements:
             marks.add(mark(regions, r.source.location, "prefix", r.source.call))
@@ -127,7 +124,21 @@ class RegionCompletion:
                 if target in calls:
                     marks.add(mark(regions, bridge.source, "prefix", call))
                     marks.add(mark(regions, bridge.destination, "begin", target))
+        state = {}
+        self.templates = {name: self._template(name, marks) for name in regions}
+        self.projection_statistics = {
+            name: template.statistics()
+            for name, template in self.templates.items()
+            if not isinstance(template, tuple)
+        }
+        for call in calls:
+            for name in regions:
+                self._compose(call, name, state)
         for site in marks:
+            projected = self.projected_scopes.get((site.call, site.region))
+            if projected is not None:
+                self.bindings[site].append((projected[replace(site, call=0)], (0, 0)))
+                continue
             graph, commands, mapping = self.scopes[site.call, site.region]
             command = commands[site.task, site.channel, site.action]
             point = _expression(regions, site.location)
@@ -144,12 +155,21 @@ class RegionCompletion:
         count = self.regions[name].constant_count
         return (a, b) if count is None else (0, a * count + b)
 
-    def _template(self, name):
+    def _template(self, name, marks):
         _, channels, streams, graph, _ = self.analyses[name]
         require(
             len(streams) == 1 and all(c.kind == "local" for c in channels.values()),
             "serial completion transfers require one local actor and local event contracts",
         )
+        loop = self.regions[name]
+        if loop.constant_count is not None and (loop.invocation is None or loop.region is not None):
+            from .child_completion import project_fixed_child
+
+            endpoints = sorted(
+                {replace(site, call=0) for site in marks if site.region == name},
+                key=repr,
+            )
+            return project_fixed_child(self.analyses[name], endpoints)
         actor, commands = next(iter(streams.items()))
         families = tuple(
             native_family(meta, graph.period, self._expr(name, 1, 0)) for meta in graph.nodes
@@ -172,6 +192,12 @@ class RegionCompletion:
                 yield mapping[node], point
 
     def _compose(self, call, name, state):
+        from .child_completion import FixedChildProjection
+
+        template = self.templates[name]
+        if isinstance(template, FixedChildProjection):
+            self._compose_projection(call, name, template, state)
+            return
         actor, commands, graph, families, edges = self.templates[name]
         mapping = tuple(self.flow.node(family) for family in families)
         by_identity = {
@@ -213,6 +239,26 @@ class RegionCompletion:
                 points.setdefault("end", points["begin"])
                 if (node := prefix_inputs(last, points).get(kind)) is not None:
                     self.flow.edge(node, after, source_point=exit_point, target_point=(0, 0))
+
+    def _compose_projection(self, call, name, projection, state):
+        """Only proved child relations and matching native ports cross scope."""
+        nodes = {}
+        for port in projection.inputs:
+            key = (
+                (port.actor, port.kind) if port.pipe is None else (port.actor, port.pipe, port.kind)
+            )
+            nodes[port] = state.get(key, 0)
+        for port in projection.outputs:
+            key = (
+                (port.actor, port.kind) if port.pipe is None else (port.actor, port.pipe, port.kind)
+            )
+            nodes[port] = self.flow.node(Family(0, (0, 0)))
+            state[key] = nodes[port]
+        for site in projection.endpoints:
+            nodes[site] = self.flow.node(Family(0, (0, 0)))
+        for source, target in sorted(projection.relations, key=repr):
+            self.flow.edge(nodes[source], nodes[target])
+        self.projected_scopes[call, name] = nodes
 
     def add_bridge(self, bridge):
         for call in self.calls:
