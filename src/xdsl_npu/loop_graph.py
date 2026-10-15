@@ -10,7 +10,6 @@ from collections import deque
 from dataclasses import dataclass
 
 from .budget import poll
-from .completion_flow import propagate_ordered
 from .ir import EndOp, InvocationSyncOp, LoopChannelOp, LoopSyncOp, RegionSyncOp, TaskOp, ViewOp
 from .loop_boundary import stream_operations
 from .model import optional_int, require
@@ -99,6 +98,7 @@ class Graph:
         self.nodes, self.ids, self.edges = [], {}, []
         self.outgoing = []
         self.domains = {}
+        self._completion = None
         self.potentials = None
         self._arcs = set()
         self.domain_states = 0
@@ -112,6 +112,8 @@ class Graph:
             self.ids[key] = len(self.nodes)
             self.nodes.append(Node(command, residue, point, guard))
             self.outgoing.append([])
+            if self._completion is not None:
+                self._completion.node(self.ids[key])
         else:
             require(self.nodes[self.ids[key]].guard == guard, "completion milestone guard changed")
         return self.ids[key]
@@ -125,6 +127,8 @@ class Graph:
         self._arcs.add(arc)
         self.edges.append(arc)
         self.outgoing[a].append((b, bc - ac))
+        if self._completion is not None:
+            self._completion.edge(*arc)
 
     def potential(self):
         if self.potentials is not None:
@@ -304,35 +308,22 @@ class Graph:
             (destination, 0),
         )
 
-    def covered_many(self, queries):
-        """Propagate all demanded sources once per actual guard domain.
+    def completion(self):
+        if self._completion is None:
+            from .symbolic_completion import NativeCompletion
 
-        This consumes the sparse native graph; it does not discover graph
-        edges by asking whether arbitrary pairs happen to be reachable.
-        """
+            self._completion = NativeCompletion(self)
+        return self._completion
+
+    def covered_many(self, queries):
+        """Batch obligations on native families; no translated instance graph."""
         queries = tuple(queries)
         self.batch_queries += len(queries)
-        answers = [True] * len(queries)
-        groups = {}
-        for number, args in enumerate(queries):
-            query = self._query(*args)
-            if query is not None:
-                groups.setdefault(query[0], []).append((number, query[1], query[2]))
-        for guard, group in groups.items():
-            domain = self.domain(*guard)
-            origins, targets = {}, []
-            for number, source, destination in group:
-                source, target = domain.index.get(source), domain.index.get(destination)
-                if source is None or target is None:
-                    answers[number] = False
-                    continue
-                bit = origins.setdefault(source, 1 << len(origins))
-                targets.append((number, target, bit))
-            facts, transfers = propagate_ordered(domain.successors, origins.items())
-            self.batch_passes += 1
-            self.fact_transfers += transfers
-            for number, target, bit in targets:
-                answers[number] = bool(facts[target] & bit)
+        proof = self.completion()
+        proof.register(queries)
+        answers = [proof.covered(query) for query in queries]
+        self.batch_passes += 1
+        self.fact_transfers = proof.transfers
         return answers
 
     def path(

@@ -159,25 +159,22 @@ def test_direct_domains_propagate_new_edges_and_nodes_without_rebuilding():
     from types import SimpleNamespace
 
     from xdsl_npu.loop_graph import Command
-    from xdsl_npu.loop_planning import _DomainFlow
-
     task = SimpleNamespace(stage=0)
     graph = DirectCompletion(1, None)
-    a = graph.node(Command(0, "aiv0", task, "task"), 0, "end")
-    b = graph.node(Command(1, "aiv0", task, "task"), 0, "begin")
-    flow = _DomainFlow(graph, (0, 0, 0, False))
-    graph.flows[flow.guard] = flow
-    _, target, bit = flow.query((a, 0), (b, 0))
-    flow.propagate()
-    assert not flow.facts[target] & bit
+    source, target = (Command(i, "aiv0", task, "task") for i in range(2))
+    a = graph.node(source, 0, "end")
+    b = graph.node(target, 0, "begin")
+    query = source, 0, target, 0, 0, False
+    graph.register((query,))
+    proof = graph.completion()
+    guard, flow = next(iter(proof.flows.items()))
+    assert not graph.covered(query)
     capture = graph.node(Command(2, "aiv0", task, "set"), 0, "end")
     graph.edge((a, 0), (capture, 0))
-    flow.propagate()
-    assert not flow.facts[target] & bit
+    assert not graph.covered(query)
     graph.edge((capture, 0), (b, 0))
-    flow.propagate()
-    assert flow.facts[target] & bit
-    assert flow is graph.flows[flow.guard]
+    assert graph.covered(query)
+    assert proof is graph.completion() and flow is proof.flows[guard]
 
 
 def test_skipped_earlier_wait_preserves_scalar_dispatch_facts(monkeypatch):

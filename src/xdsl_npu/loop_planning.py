@@ -7,14 +7,12 @@ translation domains in place. Final checking reconstructs ordinary command
 streams, including independent event-lifetime and progress checks.
 """
 
-from collections import deque
 from dataclasses import dataclass
 
 from .budget import poll
 from .loop_graph import Command, Graph
 from .model import require
 from .native_order import instruction_points, prefix_inputs
-from .periodic import MAX_PROOF_STATES
 
 
 @dataclass(frozen=True)
@@ -29,98 +27,13 @@ class Protocol:
     last: bool = False
 
 
-class _DomainFlow:
-    """Incremental multi-source reachability on an actual translation domain."""
-
-    def __init__(self, graph, guard):
-        self.graph, self.guard = graph, guard
-        self.index, self.cycles, self.origins = {}, {}, {}
-        self.facts, self.delta, self.successors = [], [], []
-        self.pending = deque()
-        self.transfers = 0
-        for node in range(len(graph.nodes)):
-            self.node(node)
-        for arc in graph.edges:
-            self.edge(*arc)
-
-    def node(self, node):
-        lower, upper = self.graph.bounds(node, *self.guard)
-        self.cycles[node] = range(lower, upper + 1)
-        require(
-            self.graph.domain_states + max(0, upper - lower + 1) <= MAX_PROOF_STATES,
-            "direct synthesis completion-domain budget exceeded",
-        )
-        for cycle in self.cycles[node]:
-            self.index[node, cycle] = len(self.facts)
-            self.facts.append(0)
-            self.delta.append(0)
-            self.successors.append(set())
-            self.graph.domain_states += 1
-
-    def seed(self, node, bits):
-        bits &= ~self.facts[node]
-        if bits:
-            self.facts[node] |= bits
-            if not self.delta[node]:
-                self.pending.append(node)
-            self.delta[node] |= bits
-
-    def edge(self, source, target, distance):
-        for cycle in self.cycles[source]:
-            destination = self.index.get((target, cycle + distance))
-            if destination is not None:
-                origin = self.index[source, cycle]
-                if destination not in self.successors[origin]:
-                    self.successors[origin].add(destination)
-                    self.seed(destination, self.facts[origin])
-
-    def query(self, source, target):
-        source, target = self.index.get(source), self.index.get(target)
-        require(source is not None and target is not None, "missing direct synthesis endpoint")
-        if source not in self.origins:
-            self.origins[source] = 1 << len(self.origins)
-            self.seed(source, self.origins[source])
-        return self, target, self.origins[source]
-
-    def propagate(self):
-        while self.pending:
-            source = self.pending.popleft()
-            bits, self.delta[source] = self.delta[source], 0
-            for target in self.successors[source]:
-                self.seed(target, bits)
-                self.transfers += 1
-                if self.transfers % 4096 == 0:
-                    poll("direct synchronization facts", transfers=self.transfers)
-
-
-def _key(query):
-    source, sg, destination, dg, *rest = query
-    return source.index, sg, destination.index, dg, tuple(rest)
-
-
 class DirectCompletion(Graph):
     def __init__(self, period, maximum):
         super().__init__(period, maximum)
         self.cuts, self.next_queue = {}, {}
-        self.flows, self.queries = {}, {}
         self.selected = []
         self.endpoints = {}
         self.command_count = 0
-
-    def node(self, *args, **kwargs):
-        previous = len(self.nodes)
-        index = super().node(*args, **kwargs)
-        if len(self.nodes) != previous:
-            for flow in self.flows.values():
-                flow.node(index)
-        return index
-
-    def edge(self, source, target):
-        previous = len(self.edges)
-        super().edge(source, target)
-        if len(self.edges) != previous:
-            for flow in self.flows.values():
-                flow.edge(*self.edges[-1])
 
     def admit(self, command, residue, milestones):
         """Fixed native insertion cuts, independent of any possible protocol."""
@@ -152,26 +65,10 @@ class DirectCompletion(Graph):
                 self.next_queue[key] = target[0], target[1] - cycle
 
     def register(self, queries):
-        for query in queries:
-            key = _key(query)
-            if key in self.queries:
-                continue
-            normalized = self._query(*query)
-            if normalized is None:
-                self.queries[key] = None
-                continue
-            guard, source, target = normalized
-            if guard not in self.flows:
-                self.flows[guard] = _DomainFlow(self, guard)
-            self.queries[key] = self.flows[guard].query(source, target)
+        self.completion().register(queries)
 
     def covered(self, query):
-        item = self.queries[_key(query)]
-        if item is None:
-            return True
-        flow, target, bit = item
-        flow.propagate()
-        return bool(flow.facts[target] & bit)
+        return self.completion().covered(query)
 
     def _forward(self, command, residue, cut, kind, before, added):
         """A skipped sync retains its input prefix for later instructions."""
