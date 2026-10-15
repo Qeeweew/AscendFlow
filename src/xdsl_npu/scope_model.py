@@ -6,7 +6,7 @@ ownership/completion. Every final check rebuilds this view from actual IR.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType, IntAttr, ModuleOp, StringAttr
@@ -28,6 +28,7 @@ from .ir import (
     OnceOp,
     RuntimeSizeOp,
     ScopeChannelOp,
+    ScopeGuardOp,
     ScopeSyncOp,
     StreamOp,
     TaskOp,
@@ -58,6 +59,15 @@ class Captured:
 
 
 @dataclass(frozen=True)
+class ScopeLeafCase:
+    label: str
+    activation: object
+    module: ModuleOp
+    loop: object | None
+    value_map: dict
+
+
+@dataclass(frozen=True)
 class ScopeLeaf:
     actor: str
     call: CallOp
@@ -67,6 +77,7 @@ class ScopeLeaf:
     loop: object
     # Mapping only for moving selected leaf protocols back to their actual IR.
     value_map: dict
+    cases: dict[str, ScopeLeafCase] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -158,7 +169,17 @@ def _child_clock(call, stream, channels):
     )
     coordinate = stream.body.block.args[0]
     maximum = 0
-    for op, _ in stream_operations(stream):
+    conditional = any(
+        isinstance(op, ScopeGuardOp) or "scope_cases" in op.attributes for op in stream.walk()
+    )
+    if conditional:
+        from .scope_variants import scope_operations, validate_child_scopes
+
+        validate_child_scopes(stream, call)
+        operations = scope_operations(stream)
+    else:
+        operations = stream_operations(stream)
+    for op, _ in operations:
         require(
             isinstance(op, (ViewOp, TaskOp, LoopChannelOp, LoopSyncOp, ScopeSyncOp, EndOp)),
             f"unsupported nested child effect {op.name}",
@@ -187,7 +208,7 @@ def _child_clock(call, stream, channels):
     )
 
 
-def _leaf(kernel, call, stream, captures):
+def _leaf(kernel, call, stream, captures, *, case=None):
     """Normalize one actual leaf with one alias per underlying allocation."""
     block, values = Block(), {}
     for captured in captures:
@@ -209,7 +230,16 @@ def _leaf(kernel, call, stream, captures):
     for op in kernel.body.block.ops:
         if isinstance(op, (FixConfigOp, Load3DConfigOp)):
             block.add_op(op.clone())
-    child = stream.clone(value_mapper=values)
+    if case is None:
+        child = stream.clone(value_mapper=values)
+    elif case == "template":
+        from .scope_variants import describe_child
+
+        child = describe_child(stream, call, value_mapper=values)
+    else:
+        from .scope_variants import filter_child
+
+        child = filter_child(stream, call, case, value_mapper=values)
     for op in list(child.walk()):
         if isinstance(op, ScopeSyncOp):
             op.parent.erase_op(op)  # Parent graph checks these actual insertions separately.
@@ -218,6 +248,9 @@ def _leaf(kernel, call, stream, captures):
     attrs.update(sym_name=call.uid, blocks=IntAttr(1), disjoint_external=IntAttr(1))
     attrs.pop("source_schedule", None)
     normalized = ModuleOp([KernelOp.create(attributes=attrs, regions=[Region(block)])])
+    if not any(isinstance(op, TaskOp) for op in child.walk()):
+        require(case is not None, "a nested child needs real work")
+        return normalized, None, values
     loop = extract_loop(normalized, region=child)
     # Padding in the temporary local descriptor does not authorize an actual
     # native access beyond the captured span.
@@ -471,7 +504,25 @@ def extract_scopes(module):
                     available.update(op.results)
                 else:
                     require(isinstance(op, EndOp), f"unknown callsite effect {op.name}")
-            child_module, loop, values = _leaf(kernel, call, stream, captures)
+            conditional = any(
+                isinstance(op, ScopeGuardOp) or "scope_cases" in op.attributes
+                for op in stream.walk()
+            )
+            child_module, loop, values = _leaf(
+                kernel, call, stream, captures, case="template" if conditional else None
+            )
+            require(loop is not None, "conditional child has no real native template")
+            cases = {}
+            if conditional:
+                from .scope_predicates import PARENT_CASES, case_activation
+
+                for label in PARENT_CASES:
+                    current_module, current_loop, current_values = _leaf(
+                        kernel, call, stream, captures, case=label
+                    )
+                    cases[label] = ScopeLeafCase(
+                        label, case_activation(label), current_module, current_loop, current_values
+                    )
             # Normalizing a captured base to zero does not prove the actual
             # native origin alignment. Check the frozen ancestor offset too;
             # boundary-cell cuts deliberately do not carry this native rule.
@@ -500,7 +551,7 @@ def extract_scopes(module):
                     f"{captured.op.sym_name.data}: captured base violates native {alignment}-byte alignment",
                 )
             leaves[call.uid.data] = ScopeLeaf(
-                actor, call, stream, tuple(captures), child_module, loop, values
+                actor, call, stream, tuple(captures), child_module, loop, values, cases
             )
     require(
         len(bounds) == 1 and leaves, "nested actors need one shared parent domain and real work"

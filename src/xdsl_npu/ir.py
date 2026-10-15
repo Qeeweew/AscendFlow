@@ -256,6 +256,28 @@ class ScopeSyncOp(IRDLOperation):
 
 
 @irdl_op_definition
+class ScopeGuardOp(IRDLOperation):
+    """Native work selected by the retained parent's first or last generation.
+
+    The child coordinate remains independent: a last-parent condition never
+    means the last row/chunk of this fixed native software pipeline.
+    """
+
+    name = "npu.scope_guard"
+    parent_generation = operand_def(IndexType)
+    child_generation = operand_def(IndexType)
+    kind = attr_def(StringAttr)
+    body = region_def("single_block")
+    traits = traits_def(RecursiveMemoryEffect())
+
+    def verify_(self):
+        if self.kind.data not in {"first", "last"}:
+            raise VerifyException("scope guard requires parent first or last")
+        if self.body.block.args or not isinstance(self.body.block.last_op, EndOp):
+            raise VerifyException("scope guard needs no block arguments and an EndOp terminator")
+
+
+@irdl_op_definition
 class ViewOp(IRDLOperation):
     name = "npu.view"
     source = operand_def(RefType)
@@ -396,6 +418,15 @@ def _verify_runtime_contract(name, minimum, multiple):
         raise VerifyException("runtime input contract has no representable int64 value")
 
 
+def _verify_conditional_loop_context(op):
+    ancestor = op.parent_op()
+    while ancestor is not None:
+        if isinstance(ancestor, CallOp):
+            return
+        ancestor = ancestor.parent_op()
+    raise VerifyException("conditional loop protocol requires an actual enclosing CallOp")
+
+
 @irdl_op_definition
 class LoopChannelOp(IRDLOperation):
     name = "npu.loop_channel"
@@ -409,7 +440,12 @@ class LoopChannelOp(IRDLOperation):
     event_ids = attr_def(ArrayAttr[IntAttr])
     last = opt_attr_def(IntAttr)
     carry = opt_attr_def(IntAttr)
+    scope_cases = opt_attr_def(ArrayAttr[StringAttr])
     traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        if self.scope_cases is not None:
+            _verify_conditional_loop_context(self)
 
 
 @irdl_op_definition
@@ -445,13 +481,19 @@ class LoopSyncOp(IRDLOperation):
     name = "npu.loop_sync"
     last_gap = opt_attr_def(IntAttr)
     generation = operand_def(IndexType)
+    parent_generation = opt_operand_def(IndexType)
     action = attr_def(StringAttr)
     channel = attr_def(StringAttr)
     lower = attr_def(IntAttr)
     upper_gap = attr_def(IntAttr)
     period = attr_def(IntAttr)
     residues = attr_def(ArrayAttr[IntAttr])
+    scope_cases = opt_attr_def(ArrayAttr[StringAttr])
     traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        if self.parent_generation is not None or self.scope_cases is not None:
+            _verify_conditional_loop_context(self)
 
 
 @irdl_op_definition
@@ -554,6 +596,7 @@ NPU = Dialect(
         CallOp,
         ScopeChannelOp,
         ScopeSyncOp,
+        ScopeGuardOp,
         ViewOp,
         StreamOp,
         OnceOp,

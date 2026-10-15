@@ -120,12 +120,11 @@ def test_storage_period_projection_cannot_promote_a_startup_path_to_steady(resid
     proof.access = SimpleNamespace(
         endpoints={before.task: ("source", before), after.task: ("target", after)}
     )
-    proof.completion = SimpleNamespace(
-        commands={
-            ("source", replace(before, point="end")): source,
-            ("target", after): target,
-        }
-    )
+    commands = {
+        ("source", replace(before, point="end")): source,
+        ("target", after): target,
+    }
+    proof.completion = SimpleNamespace(commands_for=lambda uid, site: (commands[uid, site],))
     obligation = Dependence(before.task, after.task, 0, 2, (residue,), "RAW", "ring", 0, 32)
     # The two-slot alias domain projects onto the single protocol period.
     # Reaching only epoch zero cannot prove either infinite residue stream.

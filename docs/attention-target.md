@@ -85,8 +85,8 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 |---|---|
 | local ordinary work/init/child/use | 已有受限子集与符号完成关系；一般mixed组合仍缺失 |
 | Q/K/V共享、runtime BNSD地址、group任务数 | 局部cyclic BNSD搬运已接通；共享KV和mixed分组组合仍待证明 |
-| AST嵌套pipeline、内外generation、共享L0C | 一般nested CV与父子完成关系 |
-| first/last、初始化与空路径 | 控制/激活域合同；不能只支持最后一代后缀 |
+| AST嵌套pipeline、内外generation、共享L0C | 直接固定child的nested CV与stationary私有L0C复用已接通；外层mixed serial query仍缺失 |
+| first/last、初始化与空路径 | 一个实际parent时钟中的native首末条件已贯通；runtime周期首末与更深时钟仍缺失 |
 | maximum/reduce/broadcast | 已有AST基元；完整FA集成仍待完成 |
 | runtime商余、跨query延迟descriptor | 前端SSA已支持商余；跨query完成/状态时钟仍未接通，不能按K枚举 |
 | 双AIV贡献、MTE2最后读取、通知/可见性/资源 | 公共同步、event分配与最终实际IR检查 |
@@ -94,9 +94,11 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 
 普通f32 `fill(±inf)`已贯通源/物理合同和ASC，CANN与设备位模式回归通过。
 原始两版源码现在可完整通过source IR验证，未使用有限常量替换负无穷。
-物理lowering仍明确拒绝：nested因mixed父serial，continuous因nested pipeline。
+物理lowering仍明确拒绝：nested因mixed父serial，continuous因`task % kv_tiles`
+首末谓词不是实际parent的first/last。不能把这一周期谓词误当作整个task stream
+的初始化/收尾条件。
 
-下一步需要把祖先clock/Stage/guard作为独立执行上下文传递。例如Score导出
+下一步需要将现有祖先clock/Stage/guard上下文扩展到外层query。例如Score导出
 的child Stage3仅移动chunk，不能改变父task；O的地址不含kv，仍受父kv的
 last guard约束；PV读取常量地址`c0[0]`仍须等待子循环最后MAD。不能从地址
 变量集合或region yield推断这些完成关系。固定child循环也必须保留，不以

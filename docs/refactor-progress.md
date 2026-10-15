@@ -9,10 +9,89 @@
 **新 DSL 的完整 Flash Attention 仍不能编译。** 旧FA、公开physical builder与
 tracer入口已删除；没有绕行内部构造器的兼容example。runtime BNSD局部流水与
 一层固定child的嵌套CV已通过CANN与设备正确性；stationary私有L0C的跨调用复用
-现也完成设备闭环。完整FA仍受native first/last、独立query/kv运行时钟与更一般
-ownership限制，[计划](refactor-plan.md)规定其退出条件。
+现也完成设备闭环。本轮接通一个实际parent时钟上的native first/last执行；
+完整FA仍受外层mixed serial query、独立query/kv时钟及其ownership限制，
+[计划](refactor-plan.md)规定其退出条件。
 
-## 当前推进：保留逻辑结果的共享 L0C 生命周期
+## 本轮：保留子流水中的原生首末条件
+
+公开DSL fixture [native_guarded_recurrence](../tests/fixtures/guarded.py)现在贯通
+源码→同步前后IR→ASC→CANN→设备。它在首次parent初始化state/factor，固定的
+两行子流水每轮执行`state=(state+X)*0.5`，仅末次parent在原compute/store stage
+转换f16并输出。N=0不读输入也不写输出；N是运行时参数。
+
+`ScopeGuardOp`同时保留parent和child的真实SSA坐标。分析分别检查N=1、first、
+middle、last四个互斥域，再合并相同的event配置；实际IR和ASC仍只有9个native
+模板、2个call，不复制四份设备程序，不枚举N。每个case独立完成约简，不能先
+合并互斥case的边再做SCC。依赖从实际激活访问重建，不是把无条件依赖加个if。
+首次写入→全域reader和全域reader→末次覆盖使用带首末锚点的区间覆盖查询。
+
+同步前只有首轮fill、每轮load/add/brcb/mul、末轮cast/store。同步后关键关系为：
+
+| 真实访问义务 | 生成同步及等待范围 |
+|---|---|
+| 首次state/factor初始化→后续使用 | 首个add前`PIPE_V`栅栏，之后由已证明的流水关系传递；不每轮重置 |
+| 本行GM→UB完成→add读取 | `MTE2→V` Set/Wait，ID为`row%2` |
+| add最后读取x行→下一parent覆盖该行 | add后`V→MTE2` Set，下一parent相同行load前Wait；两行分别使用常量ID 0/1 |
+| 末轮cast完成→GM store | 仅`parent_g==N-1`执行`V→MTE3` Set/Wait，ID为`row%2` |
+
+x的release不等待后续mul或GM输出；没有新增buffer、copy或child drain。UB仍为
+原来的10528字节，4个父协议含2个局部栅栏及2个release channel。循环内无
+`PIPE_ALL`，仅kernel返回处最终drain。完整对照在外层
+`runs/refactor/native-guards/build/{source,before,after}.xdsl`及
+`native_guarded_recurrence.asc`，不是只检查source IR就宣称同步正确。
+
+同时修复共享符号求解器的一个错误：处理singleton时修改了外层分支的左端点，
+污染后续affine分支，使只在N=2成立的首→尾移位路径被误判在N=1也成立。
+独立BFS反例固定该错误；实际IR verifier还新增检查，父Set/Wait/barrier的
+声明激活域必须落在其实际native存在域内，扩大或删除first-only条件会被拒绝。
+
+fixed child的local row访问现在接受统一正stride的有限frame，逐项检查行孔洞、
+frame内范围及最终allocation边界。runtime无界local stride、同root不同drift、
+跨frame以及越界均明确拒绝；没有把不同view当作不同storage。
+
+| 验证 | 当前结果 |
+|---|---|
+| scope/事件/符号关系、实际IR破坏与独立有限模型 | 666项通过，84.54秒；fixed local frame另8项通过 |
+| 独立实际IR数值解释 | N=0/1/2/3/7，f32递推后f16输出精确一致；零次输出sentinel不变 |
+| Python→ASC→CANN/shared，总期限300秒 | 6.640秒；CANN 9.1.0、dav-2201、`-O2 -std=c++20` |
+| 设备，同一binary | 全卡健康/进程/显存/利用率检查后，物理6→逻辑0；N=0/1/2/3/7/31/257，各10次，输出/输入/保护区全通过 |
+
+有限模型与设备点检不是任意规模形式化证明，本例也不是FA或吞吐量基准。
+父完成图438节点/728边、30个内存义务，条件事实不按runtime N实例化。
+四case仍有重复的叶分析与投影成本，未宣称编译目标已经达成。最终源码五个
+独立冷进程计时（源码读取/构造至最终验证与ASC；import/CANN另计）如下：
+
+| 输入 | p50 / max | RSS峰值 |
+|---|---|---|
+| native_guarded_recurrence | 1.9528 / 1.9667秒 | 41716 KiB |
+| nested_copy | 1.3382 / 1.3411秒 | 39868 KiB |
+| nested_cv | 1.6672 / 1.6690秒 | 41240 KiB |
+| shared_l0c_qk_pv | 3.2294 / 3.2371秒 | 48608 KiB |
+
+三个已有fixture的ASC均与上一阶段设备验证版本逐字节相同；本例冷测ASC也与
+设备所用CANN manifest一致，核对结果在`validation.json`。未达到常用kernel
+p50≤1秒目标，没有FA、ACLNN或profiling性能结论。
+
+证据在`runs/refactor/native-guards/`的`regression.log`、`cold-final/`、
+`build/`和`build/device/result.json`。设备所用ASC SHA256为
+`05006bac6fa2afff4f4ec45826006c63ac771bb46ec56018b4fe8c083aca5ccd`。
+以下命令从工作区根目录执行；运行前须再次确认物理6仍健康空闲：
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m tests.support.run_native_guards --output runs/refactor/native-guards/build --build
+ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_native_guards --output runs/refactor/native-guards/build --physical 6
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/tests/fixtures/guarded.py --entry native_guarded_recurrence --output runs/refactor/native-guards/cold-reproduce
+```
+
+**边界：**只支持一个实际parent时钟上的first/last、直接固定child与stationary
+条件root。runtime周期谓词、条件parent ring、更深mixed query时钟、缺少跨parent
+消费证明时的条件child event宽度调整仍拒绝。nested FA实际报mixed父serial限制；
+continuous实际报`runtime-cycle predicates are unsupported`。下一步按原FA主体
+接通serial query→runtime KV→fixed child及跨query最后reader/event消费，
+不将`task%kv_tiles`冒充整个parent的首末条件。
+
+## 已保存阶段 d83635c：保留逻辑结果的共享 L0C 生命周期
 
 `tests/fixtures/nested.py:shared_l0c_qk_pv`现已走通公开DSL→实际IR验证→ASC→CANN→
 设备。它是编译器反例，不是完整FA或性能基准：QK、PV使用独立L1/L0A/L0B，
@@ -351,9 +430,9 @@ AST 的两 runtime 轴、只读共享、serial 层次已有受限实例，不是
 | API | 旧公开task/tracer及FA入口已删除，AST接口保留 | 不再维护兼容层；内部物理fixture不成为用户入口 |
 | INPUT | minimum/multiple合同已贯通IR/launcher；多参数关系与head映射仍未完成 | 继续完善可验证地址/owner前提，保留溢出和空工作语义 |
 | INDEX | 原始轴SSA与受限runtime商余已贯通局部流水；runtime row pitch/多时钟动态stride仍拒绝 | 延伸同一范围/ownership合同，不把合法长度放入编译键 |
-| CV | `scope_lowering`已保留直接固定child与父代次capture；更深层、first/last和多时钟仍拒绝 | 从当前真实call继续扩展；完整 QK/softmax/PV/update 纵向闭环 |
+| CV | `scope_lowering`已保留直接固定child、父代次capture及实际parent first/last；mixed query外壳与多时钟仍拒绝 | 从当前真实call继续扩展；完整 QK/softmax/PV/update 纵向闭环 |
 | MEMORY | cyclic局部不等长/空group已证明；共享 Q/K/V、间接地址及跨 child 复用仍不足 | 真实范围、有效域、最后读取和 owner 分区；buffer 分配/布局/可见性与同步一同验证 |
-| SYNC | runtime叶与直接固定child已有双AIV quorum；已接跨parent事件宽度与parent池共享；更一般的parent epoch轮转、独立定义复用和legacy候选试删仍待处理 | 共用硬件完成语义，分开物理访问与事件寿命；最终从实际 IR 检查，不能旁路或加任意 barrier |
+| SYNC | runtime叶与直接固定child已有双AIV quorum；跨parent事件宽度/池共享、stationary私有独立定义复用及首末访问域已接通；跨query消费与条件ring仍不足 | 共用硬件完成语义，分开物理访问与事件寿命；最终从实际 IR 检查，不能旁路或加任意 barrier |
 | EFFECT | 细粒度 native 已能在最后 reader 后早 release，但主要使用 task end；SPR/入口协议另有特殊处理 | 明确每个 native 的读退休、写完成与配置资源合同；不能让高层 recipe 隐藏多个里程碑 |
 | EVENT | 已有有限表分段周期压缩和标准整数 pass；有限 ID 表仍随 generation 增长，runtime 跨 channel/region 共享不足 | 从符号寿命直接分配/表达 ID；化简不得改变配对、代次或等待位置 |
 | COMPILE | 查询域拓扑已共享；条件记录扫描、激活绑定、父层重复工作仍需测量 | 拒绝用结构改善代替真实耗时；事实成本和父层计数继续跟踪 |

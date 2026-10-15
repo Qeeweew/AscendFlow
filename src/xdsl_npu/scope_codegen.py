@@ -1,11 +1,15 @@
 """Emit retained parent calls using the ordinary verified native-region emitter."""
 
+from collections import defaultdict
+from itertools import combinations, product
+
 from .asc_scalar import ScalarScope
 from .codegen import QUALIFIER
-from .ir import CallOp, ScopeSyncOp, TaskOp
-from .loop_boundary import stream_operations
+from .ir import CallOp, LoopChannelOp, LoopSyncOp, ScopeSyncOp, TaskOp
 from .model import require
 from .scalar import INT64_MAX, Expr
+from .scope_predicates import PARENT_CASES, case_activation, guard_active
+from .scope_variants import operation_cases, scope_operations
 
 
 def _source_epoch(action, distance, scalar):
@@ -129,6 +133,159 @@ def _parent_tasks(checked):
     }
 
 
+def _parent_case_guard(cases):
+    """Minimize a union of the four cases inside an already active parent call.
+
+    First/last are two Boolean coordinates: the single case satisfies both,
+    and a middle generation satisfies neither. At most nine Boolean cubes
+    exist, so exact simplification costs a fixed amount independent of N.
+    Bounds come from the same case activations used by verification.
+    """
+    selected = frozenset(cases)
+    require(selected <= frozenset(PARENT_CASES), "unknown ASC parent case")
+    if not selected:
+        return "false"
+    activations = {case: case_activation(case) for case in PARENT_CASES}
+    truth = {
+        case: (guard_active("first", case), guard_active("last", case)) for case in PARENT_CASES
+    }
+    candidates = []
+    for cube in product((None, True, False), repeat=2):
+        covered = frozenset(
+            case
+            for case, values in truth.items()
+            if all(term is None or term == value for term, value in zip(cube, values))
+        )
+        if covered and covered <= selected:
+            candidates.append((cube, covered))
+    best, cost = None, None
+    for size in range(1, len(selected) + 1):
+        for cover in combinations(candidates, size):
+            if frozenset().union(*(covered for _, covered in cover)) != selected:
+                continue
+            score = (sum(sum(value is not None for value in cube) for cube, _ in cover), size)
+            if cost is None or score < cost:
+                best, cost = cover, score
+    require(best is not None, "ASC parent cases have no Boolean cover")
+
+    def boundary(position):
+        return (
+            _integer_expression(lambda scalar: scalar.sub("npu_parent_n", position.offset + 1))
+            if position.end
+            else str(position.offset)
+        )
+
+    first = boundary(activations["first"].first)
+    last = boundary(activations["last"].last)
+    clauses = []
+    for cube, covered in best:
+        if covered == frozenset(("single",)):
+            clauses.append(f"npu_parent_n == {activations['single'].count.exact}")
+            continue
+        terms = []
+        for value, point, comparison in zip(cube, (first, last), (">", "<")):
+            if value is not None:
+                terms.append(f"npu_parent_g {'==' if value else comparison} {point}")
+        if not terms:
+            return ""
+        clause = " && ".join(terms)
+        clauses.append(f"({clause})" if len(terms) > 1 and len(best) > 1 else clause)
+    return " || ".join(clauses)
+
+
+def scope_command_guard(leaf, sequence):
+    """Map the complete descriptor back to actual guarded native/sync ops.
+
+    Descriptor clones deliberately have no parent-case fields. Identity, or
+    one unique native endpoint and action, locates the original operation;
+    only that operation's real annotations determine its activation.
+    """
+    operations = tuple(scope_operations(leaf.stream))
+    if not any(guards or "scope_cases" in op.attributes for op, guards in operations):
+        return None
+    all_cases = frozenset(PARENT_CASES)
+    natives, declarations, sync_cases, by_endpoint = {}, {}, {}, defaultdict(list)
+    pending, previous = [], None
+
+    def cases(op, guards):
+        return frozenset(operation_cases(op)) & frozenset(
+            case for case in PARENT_CASES if all(guard_active(kind, case) for kind in guards)
+        )
+
+    def placed(op, uid):
+        by_endpoint[op.channel.data, op.action.data, uid].append(op)
+
+    for op, guards in operations:
+        if isinstance(op, LoopChannelOp):
+            name = op.sym_name.data
+            require(name not in declarations, "duplicate ASC child channel")
+            declarations[name] = cases(op, guards)
+        elif isinstance(op, TaskOp):
+            uid = op.uid.data
+            require(uid not in natives, "duplicate ASC child native uid")
+            natives[uid] = cases(op, guards)
+            for sync in pending:
+                placed(sync, uid)
+            pending, previous = [], uid
+        elif isinstance(op, LoopSyncOp):
+            sync_cases[op] = cases(op, guards)
+            if op.action.data == "set":
+                require(previous is not None and not pending, "ASC Set has no native producer")
+                placed(op, previous)
+            else:
+                pending.append(op)
+    require(not pending, "ASC acquisition has no following native consumer")
+    mapped, native_seen, sync_seen = {}, set(), set()
+    for command in sequence:
+        uid = command.task.uid
+        if command.kind == "task":
+            require(uid in natives and uid not in native_seen, "ASC native descriptor changed")
+            native_seen.add(uid)
+            active = natives[uid]
+        else:
+            action = command.kind.removeprefix("cross_")
+            choices = by_endpoint.get((command.channel, action, uid), ())
+            operation = command.operation
+            if operation not in choices and isinstance(operation, LoopSyncOp):
+                choices = tuple(
+                    op
+                    for op in choices
+                    if {
+                        name: value
+                        for name, value in op.attributes.items()
+                        if name != "scope_cases"
+                    }
+                    == operation.attributes
+                )
+            if operation not in choices:
+                require(len(choices) == 1, "ASC synchronization has no unique actual operation")
+                (operation,) = choices
+            require(operation not in sync_seen, "ASC synchronization descriptor is duplicated")
+            sync_seen.add(operation)
+            active = sync_cases[operation]
+            if command.channel:
+                require(command.channel in declarations, "ASC child sync has no actual channel")
+                active &= declarations[command.channel]
+        require(active, "ASC command has contradictory parent cases")
+        mapped[id(command)] = _parent_case_guard(active) if active != all_cases else ""
+    require(
+        native_seen == natives.keys() and sync_seen == sync_cases.keys(),
+        "ASC needs the complete actual child descriptor, not one parent case",
+    )
+
+    def emit(command, code):
+        require(id(command) in mapped, "ASC command is outside its actual child descriptor")
+        guard = mapped[id(command)]
+        if not guard:
+            return code
+        # A channel comment may follow an inner protocol guard. Close the
+        # parent guard before that comment can consume its enclosing brace.
+        body, marker, comment = code.partition("//")
+        return f"if ({guard}) {{ {body.rstrip()} }}" + (f" //{comment}" if marker else "")
+
+    return emit
+
+
 def _endpoint_matches(checked, key, leaf, task, position):
     require(key in checked.access.endpoints, "scope channel has an unknown native endpoint")
     uid, site = checked.access.endpoints[key]
@@ -146,7 +303,7 @@ def scope_boundary(checked, leaf):
 
     tasks = _parent_tasks(checked)
     before, after, pending, previous = {}, {}, [], None
-    for op, _ in stream_operations(leaf.stream):
+    for op, _ in scope_operations(leaf.stream):
         if isinstance(op, TaskOp):
             before[op.uid.data], pending, previous = pending, [], op.uid.data
         elif isinstance(op, ScopeSyncOp):
@@ -341,6 +498,7 @@ def emit_scope_actor(checked, actor, uniform_names):
                 (),
                 uniform_names,
                 boundary=scope_boundary(checked, leaf),
+                command_guard=scope_command_guard(leaf, sequences[inner_actor]),
                 display_actor=actor,
             )
         )

@@ -10,7 +10,7 @@ from .budget import bounded, poll
 from .child_completion import ChildPort, project_fixed_child
 from .ir import LoopChannelOp, ScopeChannelOp, ScopeSyncOp, TaskOp
 from .loop_graph import Command
-from .loop_sync import _lifetime, _plan_leaf, _requirements, _verify_leaf
+from .loop_sync import _lifetime, _plan_leaf, _requirements
 from .model import require
 from .native_order import instruction_points, prefix_inputs
 from .periodic import bounded_period, project
@@ -66,9 +66,11 @@ class ParentCompletion:
     ):
         self.program, self.access = program, access
         self.events, self.protocols = {}, []
-        self.node_activations, self._guarded = {}, None
+        self.node_activations, self._guarded, self._anchored = {}, None, None
         marks = defaultdict(set)
-        if any(isinstance(o, ScopedDependence) for o in access.obligations):
+        if any(leaf.cases for leaf in program.leaves.values()) or any(
+            isinstance(o, ScopedDependence) for o in access.obligations
+        ):
             # Definition extraction retains interior versions for logical RAW
             # binding, but those records need no parent completion projection.
             # Project only actual obligations and native insertion milestones.
@@ -112,60 +114,87 @@ class ParentCompletion:
         for (uid, site), points in selected:
             marks[uid].update(_point(site, point) for point in points)
         self.resource_pairs = []
-        for uid, analysis in analyses.items():
+        for uid in analyses:
             poll("child event resource projection")
             leaf = program.leaves[uid]
-            resources = (
-                summarize_local_events(analysis[0])
-                if resource_inputs is None
-                else resource_inputs.get(uid, ())
+            variants = (
+                analyses.variants(uid)
+                if hasattr(analyses, "variants")
+                else ((None, analyses[uid]),)
             )
-            for resource in resources:
-                if not resource.domain.contains(analysis[0].constant_count):
-                    continue
-                sites = resource_sites(uid, leaf.actor, analysis[0].constant_count, resource)
-                marks[uid].update(sites)
-                self.resource_pairs.append((uid, *sites, resource))
+            for _, analysis in variants:
+                resources = (
+                    summarize_local_events(analysis[0])
+                    if resource_inputs is None
+                    else resource_inputs.get(uid, ())
+                )
+                for resource in resources:
+                    if not resource.domain.contains(analysis[0].constant_count):
+                        continue
+                    sites = resource_sites(uid, leaf.actor, analysis[0].constant_count, resource)
+                    marks[uid].update(sites)
+                    self.resource_pairs.append((uid, *sites, resource))
+        self.resource_pairs = list(dict.fromkeys(self.resource_pairs))
         calls = {}
         for uid, leaf in program.leaves.items():
             poll("child completion projection")
-            local_actor = next(iter(analyses[uid][0].actors))
-            local = tuple(
-                replace(site, task=(local_actor, site.task[1]))
-                for site in sorted(marks[uid], key=repr)
-            )
-            projection = project_fixed_child(analyses[uid], local, insertion_cuts=True)
 
-            def retarget(point, *, actor=leaf.actor):
-                return (
-                    replace(point, actor=actor)
-                    if isinstance(point, ChildPort)
-                    else replace(point, task=(actor, point.task[1]))
+            def project_case(analysis, *, uid=uid, leaf=leaf):
+                local_actor, data = next(iter(analysis[0].actors.items()))
+                natives = {task.uid for task in data.program.tasks}
+                local = tuple(
+                    replace(site, task=(local_actor, site.task[1]))
+                    for site in sorted(marks[uid], key=repr)
+                    if site.task[1] in natives and (not site.channel or site.channel in analysis[1])
+                )
+                projection = project_fixed_child(analysis, local, insertion_cuts=True)
+                renamed = {
+                    point: (
+                        replace(point, actor=leaf.actor)
+                        if isinstance(point, ChildPort)
+                        else replace(point, task=(leaf.actor, point.task[1]))
+                    )
+                    for point in (*projection.inputs, *projection.outputs, *projection.endpoints)
+                }
+                return replace(
+                    projection,
+                    inputs=tuple(renamed[p] for p in projection.inputs),
+                    outputs=tuple(renamed[p] for p in projection.outputs),
+                    endpoints=tuple(renamed[p] for p in projection.endpoints),
+                    relations=frozenset((renamed[a], renamed[b]) for a, b in projection.relations),
                 )
 
-            # Retarget each boundary point once. Rebuilding Site objects for
-            # both ends of every proved relation adds quadratic allocation
-            # work without changing any physical participant or relation.
-            renamed = {
-                p: retarget(p)
-                for p in (*projection.inputs, *projection.outputs, *projection.endpoints)
-            }
-            projection = replace(
-                projection,
-                inputs=tuple(renamed[p] for p in projection.inputs),
-                outputs=tuple(renamed[p] for p in projection.outputs),
-                endpoints=tuple(renamed[p] for p in projection.endpoints),
-                relations=frozenset((renamed[a], renamed[b]) for a, b in projection.relations),
-            )
+            if leaf.cases:
+                from .scope_case_completion import ConditionalProjection, ProjectionCase
+
+                projection = ConditionalProjection(
+                    leaf.loop.constant_count,
+                    sum(len(data.program.tasks) for data in leaf.loop.actors.values()),
+                    tuple(
+                        ProjectionCase(label, leaf.cases[label].activation, project_case(analysis))
+                        for label, analysis in analyses.variants(uid)
+                    ),
+                )
+            else:
+                projection = project_case(analyses[uid])
             calls[uid] = leaf.call, projection
         self.completion = compose_calls(calls, period=period, count=program.count)
         self.graph = self.completion.graph
+        self.node_activations.update(self.completion.node_activations)
         self.number = 1 + max(node.command.index for node in self.graph.nodes)
         self.waits, self.sends = {}, {}
 
     def site(self, endpoint, point, generation):
         uid, site = self.access.endpoints[endpoint]
-        return self.completion.at(uid, _point(site, point), generation)
+        points = self.completion.ats(uid, _point(site, point), generation)
+        return points[0] if len(points) == 1 else points
+
+    def edge(self, source, target):
+        sources = (source,) if isinstance(source[0], int) else source
+        targets = (target,) if isinstance(target[0], int) else target
+        for first in sources:
+            for last in targets:
+                self.completion.edge(first, last)
 
     @property
     def period(self):
@@ -195,22 +224,22 @@ class ParentCompletion:
 
         source_uid, source = self.access.endpoints[obligation.source]
         target_uid, target = self.access.endpoints[obligation.destination]
-        endpoints = (
-            self.completion.commands[
+        endpoints = tuple(
+            (a, b, obligation.distance)
+            for a in self.completion.commands_for(
                 source_uid, _point(source, "prefix" if obligation.prefix else "end")
-            ],
-            self.completion.commands[target_uid, _point(target, "begin")],
-            obligation.distance,
+            )
+            for b in self.completion.commands_for(target_uid, _point(target, "begin"))
         )
         if isinstance(obligation, ScopedDependence):
-            return ((*endpoints, obligation.activation),)
+            return tuple((*pair, obligation.activation) for pair in endpoints)
         # Prove the stronger translation family from the first real alias
         # intersection, as in ordinary Graph queries. The guarded solver still
         # checks every epoch, including all first/last paths; no conditional
         # path is assumed translation invariant by this projection.
         return tuple(
             (
-                *endpoints,
+                *pair,
                 Activation(
                     first=Position(False, first - obligation.distance),
                     last=Position(True, obligation.distance),
@@ -221,10 +250,38 @@ class ParentCompletion:
             for residue, first in project(
                 obligation.period, obligation.residues, self.graph.period, obligation.distance
             )
+            for pair in endpoints
         )
 
     def covered_obligations(self, obligations):
         obligations = tuple(obligations)
+        if any(hasattr(o, "source_position") for o in obligations):
+            results = [False] * len(obligations)
+            fixed = [(i, o) for i, o in enumerate(obligations) if not hasattr(o, "source_position")]
+            for (index, _), result in zip(
+                fixed, self.covered_obligations(o for _, o in fixed), strict=True
+            ):
+                results[index] = result
+            anchored = self.anchored()
+            for index, obligation in enumerate(obligations):
+                if not hasattr(obligation, "source_position"):
+                    continue
+                source_uid, source = self.access.endpoints[obligation.source]
+                target_uid, target = self.access.endpoints[obligation.destination]
+                results[index] = all(
+                    anchored.covered(
+                        a,
+                        b,
+                        obligation.source_position,
+                        obligation.destination_position,
+                        obligation.activation,
+                    )
+                    for a in self.completion.commands_for(
+                        source_uid, _point(source, "prefix" if obligation.prefix else "end")
+                    )
+                    for b in self.completion.commands_for(target_uid, _point(target, "begin"))
+                )
+            return results
         if self.node_activations or any(isinstance(o, ScopedDependence) for o in obligations):
             groups = [self._guarded_obligation(o) for o in obligations]
             answers = self.guarded().covered_many(q for group in groups for q in group)
@@ -242,6 +299,13 @@ class ParentCompletion:
 
             self._guarded = GuardedCompletion(self.graph, self.node_activations)
         return self._guarded
+
+    def anchored(self):
+        if self._anchored is None:
+            from .scope_anchored_completion import AnchoredCompletion
+
+            self._anchored = AnchoredCompletion(self.guarded())
+        return self._anchored
 
     def covered_many(self, queries):
         """Resource queries must see every actual conditional protocol too."""
@@ -268,13 +332,17 @@ class ParentCompletion:
         # A synchronization may be absent in fill/drain even while its native
         # is active. Preserve the incoming prefix through that skipped sync.
         after = self.graph.node(command, residue, "after_" + kind, guard=(0, 0)), 0
-        self.completion.edge(before, after)
-        self.completion.edge(added, after)
+        self.edge(before, after)
+        self.edge(added, after)
         return after
 
     def insert(self, protocol):
         """Real Set/Wait transitions at child native admission cuts, not child exits."""
         require(protocol.name not in {p.name for p in self.protocols}, "duplicate scope protocol")
+        if any(leaf.cases for leaf in self.program.leaves.values()):
+            from .scope_native_activation import validate_scope_protocol
+
+            validate_scope_protocol(self.program, self.access, protocol)
         if protocol.activation is not None:
             validate_activation(protocol.activation, distance=protocol.distance)
             require(
@@ -369,20 +437,20 @@ class ParentCompletion:
                     command,
                     before,
                     node,
-                    self.completion.edge,
+                    self.edge,
                 )
                 points[owner[0], action, residue] = actual
                 if action == "set":
                     self.sends[key] = self._forward(
                         command, residue, "queue", before["queue"], actual["begin"]
                     )
-                    self.completion.edge(self.sends[key], self.site(owner, "after_queue", residue))
+                    self.edge(self.sends[key], self.site(owner, "after_queue", residue))
                 else:
                     for point, value in prefix_inputs(command, actual).items():
                         after = self._forward(command, residue, point, before[point], value)
                         # Native admission cuts carry the acquire forward on
                         # the actual destination pipe/controller only.
-                        self.completion.edge(after, self.site(owner, "admit_" + point, residue))
+                        self.edge(after, self.site(owner, "admit_" + point, residue))
                         self.waits.setdefault(key, {})[point] = after
         if protocol.kind == "barrier":
             return
@@ -399,6 +467,13 @@ class ParentCompletion:
                     self.completion.edge(source, (target[0], generation // self.graph.period))
 
     def check_child_resources(self):
+        if any(leaf.cases for leaf in self.program.leaves.values()):
+            for uid, consumed, republished, resource in self.resource_pairs:
+                require(
+                    self.resource_covered(uid, consumed, republished),
+                    f"{uid}/{resource.channel}: conditional child event {resource.event_id} may be re-Set before its previous Wait",
+                )
+            return len(self.resource_pairs) * self.graph.period
         if self.node_activations:
             answers = self.guarded().covered_many(
                 (
@@ -428,12 +503,33 @@ class ParentCompletion:
     def resource_covered(self, uid, consumed, republished):
         """A selected ID's final Wait is consumed before this call republishes it."""
         if self.node_activations:
-            return self.guarded().covered(
-                self.completion.commands[uid, consumed],
-                self.completion.commands[uid, republished],
-                1,
-                legacy_activation(1),
+            from .completion import CountDomain, Position
+
+            pairs = tuple(
+                (a, b)
+                for a in self.completion.commands_for(uid, consumed)
+                for b in self.completion.commands_for(uid, republished)
             )
+            if not all(
+                self.guarded().covered_many((a, b, 1, legacy_activation(1)) for a, b in pairs)
+            ):
+                return False
+            if self.program.leaves[uid].cases:
+                # Native case sets can skip every interior invocation. The
+                # next actual publication then spans first to last, not g+1.
+                return all(
+                    self.anchored().covered_many(
+                        (
+                            a,
+                            b,
+                            Position(False, 0),
+                            Position(True, 0),
+                            Activation(CountDomain(1, 0, minimum=2)),
+                        )
+                        for a, b in pairs
+                    )
+                )
+            return True
         return all(
             self.graph.covered_many(
                 self.completion.query(uid, consumed, r, uid, republished, r + 1, minimum=1)
@@ -443,22 +539,19 @@ class ParentCompletion:
 
 
 def _analyses(program):
-    reports, analyses = {}, {}
-    for uid, leaf in program.leaves.items():
-        roots = {
-            leaf.loop.root(actor, ref)
-            for actor, data in leaf.loop.actors.items()
-            for task in data.program.tasks
-            for ref in task.refs
-        }
-        reports[uid], analyses[uid] = _verify_leaf(leaf.loop, live_in=roots, _details=True)
-    return reports, analyses
+    from .scope_analysis import verify_children
+
+    return verify_children(program)
 
 
 def _scope_access(program):
     from .scope_access import analyze_scope_access
 
     access = analyze_scope_access(program, definitions=True)
+    if any(leaf.cases for leaf in program.leaves.values()):
+        from .scope_guarded_access import analyze_guarded_access
+
+        access = analyze_guarded_access(program, base=access)
     if access.definition_roots:
         from .scope_lifetimes import plan_lifetimes
 
@@ -480,6 +573,8 @@ def _scope_requirements(access):
     ordinary, guarded = [], {}
     tasks = {(a, t.uid): t for a, data in access.loop.actors.items() for t in data.program.tasks}
     for obligation in access.obligations:
+        if hasattr(obligation, "source_position"):
+            continue  # A fixed first/last acquire must prove the entire span below.
         if not isinstance(obligation, ScopedDependence):
             ordinary.append(obligation)
             continue
@@ -633,6 +728,10 @@ def _allocate_child_resources(program, analyses, access, proof, selected):
     )
     if valid:
         return proof, _leaf_banks(program, analyses)
+    require(
+        not any(leaf.cases for leaf in program.leaves.values()),
+        "conditional child event reuse needs a proved parent lifetime; width adaptation is unsupported",
+    )
     choices = event_choices(program, analyses)
     proof = ParentCompletion(
         program,
@@ -707,6 +806,17 @@ def autosync_scopes(module, *, _capture=None):
         if data.program.load3d is not None:
             key = next(iter(loop.actors)), "S", "MTE1"
             banks[leaf.actor][key] = max(1, banks[leaf.actor][key])
+        if leaf.cases:
+            from .scope_variants import plan_child_variants
+
+            plan_child_variants(
+                leaf.stream,
+                leaf.call,
+                {label: case.loop for label, case in leaf.cases.items()},
+                live_in=roots,
+                banks=banks[leaf.actor],
+            )
+            continue
         _plan_leaf(loop, live_in=roots, banks=banks[leaf.actor])
         aliases = {leaf.value_map[c.op.ref]: c.op.ref for c in leaf.captures}
         replacement = data.stream.clone(value_mapper=aliases)
@@ -751,6 +861,13 @@ def autosync_scopes(module, *, _capture=None):
             "parent protocol cannot cover its actual child access obligation",
         )
         selected.append(p)
+    for obligation in access.obligations:
+        if hasattr(obligation, "source_position"):
+            require(
+                proof.covered(obligation),
+                f"uncovered anchored {obligation.hazard} on {obligation.storage}: "
+                "first/last native protocols do not cover the complete access span",
+            )
     proof.graph.potential()
     proof, used = _allocate_child_resources(program, analyses, access, proof, selected)
     from .scope_event_pools import allocate_parent_pools
@@ -773,7 +890,7 @@ def autosync_scopes(module, *, _capture=None):
 
 
 def _read_protocols(program, access, analyses):
-    from .loop_boundary import stream_operations
+    from .scope_variants import scope_operations
 
     by_encoding = {_encode(access, key): key for key in access.endpoints}
     tasks = {(a, t.uid): t for a, d in access.loop.actors.items() for t in d.program.tasks}
@@ -872,7 +989,7 @@ def _read_protocols(program, access, analyses):
     for uid, leaf in program.leaves.items():
         poll("actual parent synchronization extraction")
         pending, previous, parent = [], None, None
-        for op, _ in stream_operations(leaf.stream):
+        for op, _ in scope_operations(leaf.stream):
             if op.parent is not parent:
                 require(not pending, "parent acquire escaped its actual native region")
                 parent, previous = op.parent, None
@@ -953,7 +1070,7 @@ def verify_scopes(module, *, _details=False):
         require(
             valid,
             f"missing scoped {obligation.hazard}: {obligation.source} -> {obligation.destination}, "
-            f"distance {obligation.distance} on {obligation.storage}[{obligation.start}:{obligation.stop}]",
+            f"distance {getattr(obligation, 'distance', 'anchored')} on {obligation.storage}[{obligation.start}:{obligation.stop}]",
         )
     child_lifetimes = proof.check_child_resources()
     from .scope_event_pools import verify_parent_pools
@@ -985,6 +1102,7 @@ def verify_scopes(module, *, _details=False):
             if proof.node_activations
             else proof.graph.completion_statistics()
         ),
+        "scope_anchored_facts": None if proof._anchored is None else proof._anchored.statistics(),
         "parent_memory_obligations": len(access.obligations),
         "parent_access_visits": access.visits,
         "definition_lifetimes": access.lifetime_report,

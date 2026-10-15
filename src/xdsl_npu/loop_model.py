@@ -835,7 +835,21 @@ def _check_accesses(loop, all_views, *, native=True):
         groups = loop.access_groups(storage)
         drift = {slope(ref) for ref in refs}
         finite_affine = False
-        if loop.cyclic is not None and storage.external:
+        if not storage.external and any(drift):
+            require(
+                loop.constant_count is not None,
+                f"{root}: local lifetime is unbounded; declare a ring",
+            )
+            require(
+                len(drift) == 1 and next(iter(drift)) > 0,
+                f"{root}: fixed local frames require one uniform positive byte stride",
+            )
+            # A real fixed child may traverse distinct rows of one allocation.
+            # This is a checked frame translation, not a modulo ring. Bounds
+            # below check the final real frame and every footprint stays within
+            # its own stride; parent summaries retain the absolute byte rows.
+            loop.frames[root] = next(iter(drift))
+        elif loop.cyclic is not None and storage.external:
             from .cyclic import check_stream
 
             frame = check_stream(loop.cyclic, storage, refs, facts_from_sizes(loop.parameters))
@@ -911,7 +925,7 @@ def _check_accesses(loop, all_views, *, native=True):
             )
         for ref in refs:
             require(
-                storage.external or slope(ref) == 0,
+                storage.external or slope(ref) == 0 or root in loop.frames,
                 f"{root}: local lifetime is unbounded; declare a ring",
             )
             itemsize = ITEMSIZE[ref.dtype]

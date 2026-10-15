@@ -14,7 +14,7 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import DictionaryAttr, IntAttr, StringAttr
 from xdsl.ir import Block, Region
 
-from .ir import BoundaryOp, EndOp
+from .ir import BoundaryOp, EndOp, ScopeGuardOp
 from .lowering_context import ActorBindings
 from .mixed import extract_mixed, global_dependencies
 from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
@@ -52,6 +52,7 @@ class Work:
     constants: tuple
     boundary: object = None
     context: Context | None = None
+    parent_guard: str | None = None
 
 
 def _last_condition(op, pipeline):
@@ -98,7 +99,16 @@ def _check_work_order(records, program, pipeline, family, pinned, ranks):
 
 
 def _work(
-    program, pipeline, family, owner, *, operations=None, scoped=None, scope=None, nested=False
+    program,
+    pipeline,
+    family,
+    owner,
+    *,
+    operations=None,
+    scoped=None,
+    scope=None,
+    nested=False,
+    parent_guards=None,
 ):
     if program.attributes.get("frontend") != StringAttr("ast"):
         return _legacy_work(program, pipeline, family, owner, operations=operations)
@@ -142,7 +152,12 @@ def _work(
             not guards or guards[0].taken,
             "structured scf.if synchronization currently needs a last-generation equality with no else/results",
         )
-        boundary = guards[0].op if guards else None
+        parent_guard = (
+            None if not guards or parent_guards is None else parent_guards.get(guards[0].op)
+        )
+        boundary = guards[0].op if guards and parent_guard is None else None
+        if boundary is not None:
+            _last_condition(boundary, pipeline)
         label = "pipeline" if stage is None else stage.label.data
         entry = scope.context.path
         require(
@@ -163,6 +178,7 @@ def _work(
                 constants,
                 boundary,
                 item.context,
+                parent_guard,
             )
         )
     return _check_work_order(records, program, pipeline, family, pinned, ranks)
@@ -363,12 +379,24 @@ class _Actor:
         bindings=None,
         ambient_frames=(),
         capture=None,
+        parent_generation=None,
     ):
         self.program, self.pipeline = program, pipeline
         self.invocation = invocation
         self.ambient_frames, self.capture = tuple(ambient_frames), capture
+        self.parent_generation = parent_generation
         self.records = _work(program, pipeline, family, owner) if records is None else records
         self.once, self.region_name = once, region_name
+        require(
+            all(
+                record.parent_guard is None
+                or record.parent_guard in {"first", "last"}
+                and parent_generation is not None
+                and record.boundary is None
+                for record in self.records
+            ),
+            "native parent guard needs its actual parent generation and a separate child clock",
+        )
         require(
             not once
             or all(record.boundary is None and record.stage == 0 for record in self.records),
@@ -658,8 +686,19 @@ class _Actor:
         }
         stream_block = self.kernel.task_block
         boundaries = {}
+        parent_blocks = []
         for number, record in enumerate(self.records):
-            if record.boundary is not None:
+            if record.parent_guard is not None:
+                block = Block()
+                guard = ScopeGuardOp.create(
+                    operands=[self.parent_generation, stream_block.args[0]],
+                    attributes={"kind": StringAttr(record.parent_guard)},
+                    regions=[Region(block)],
+                )
+                stream_block.add_op(guard)
+                parent_blocks.append(block)
+                self.kernel.task_block = block
+            elif record.boundary is not None:
                 if record.boundary not in boundaries:
                     block = Block()
                     guard = BoundaryOp.create(
@@ -932,6 +971,8 @@ class _Actor:
                 if initialization != 1:
                     self.readers[number, 2] = uid + "_mad"
         for block in boundaries.values():
+            block.add_op(EndOp())
+        for block in parent_blocks:
             block.add_op(EndOp())
         self.kernel.task_block = stream_block
         self.kernel.finish_region()

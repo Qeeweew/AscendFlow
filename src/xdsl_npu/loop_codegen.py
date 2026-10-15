@@ -68,6 +68,7 @@ def _region_lines(
     uniform_names,
     *,
     boundary=None,
+    command_guard=None,
     display_actor=None,
 ):
     lines = []
@@ -151,6 +152,8 @@ def _region_lines(
             if guard:
                 body, marker, comment = code.partition("//")
                 code = f"if ({guard}) {{ {body.strip()} }}" + (f" //{comment}" if marker else "")
+            if command_guard is not None:
+                code = command_guard(command, code)
             inner += [f"// {label}/{task.uid}: {command.kind}, stage {stage}", code]
         lines.extend(
             f"        {line}"

@@ -50,7 +50,7 @@ def test_source_is_explicitly_refused_without_falling_back_to_legacy():
     # IR. Hierarchical physical synchronization still needs implementation.
     for continuous, error in (
         (False, "one local actor and parent"),
-        (True, "nested AST pipelines require hierarchical synchronization"),
+        (True, "runtime-cycle predicates are unsupported"),
     ):
         with pytest.raises(CompileError, match=error):
             compile(attention_target(continuous=continuous))

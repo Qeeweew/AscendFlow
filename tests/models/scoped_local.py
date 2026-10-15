@@ -24,6 +24,7 @@ from xdsl_npu.ir import (
     OnceOp,
     RuntimeSizeOp,
     ScopeChannelOp,
+    ScopeGuardOp,
     ScopeSyncOp,
     StreamOp,
     TaskOp,
@@ -43,6 +44,9 @@ MODES = {
     "div": ("R", "R", "W"),
     "max": ("R", "R", "W"),
     "scalar_load": ("R",),
+    "brcb8": ("R", "W"),
+    "mul_row_broadcast": ("R", "R", "W"),
+    "convert_rn": ("R", "W"),
     "nd2nz": ("R", "W"),
     "load2d_a": ("R", "W"),
     "load2d_b_nt": ("R", "W"),
@@ -373,16 +377,85 @@ def _event_id(channel, epoch):
     return ids[ordinal % len(ids)]
 
 
-def _templates(child):
-    tasks = [op for op in child.body.block.ops if isinstance(op, TaskOp)]
+PARENT_CASES = ("single", "first", "middle", "last")
+
+
+def _cases(op):
+    value = op.attributes.get("scope_cases")
+    if value is None:
+        return PARENT_CASES
+    result = tuple(item.data for item in value)
+    assert result and result == tuple(case for case in PARENT_CASES if case in result), (
+        "invalid actual scope_cases"
+    )
+    return result
+
+
+def _parent_case(generation, count):
+    assert 0 <= generation < count
+    return (
+        "single"
+        if count == 1
+        else "first"
+        if generation == 0
+        else "last"
+        if generation == count - 1
+        else "middle"
+    )
+
+
+def _selected(op, contexts, pg, count):
+    for guard in contexts[op]:
+        if guard.kind.data == "first" and pg != 0:
+            return False
+        if guard.kind.data == "last" and pg != count - 1:
+            return False
+    return _parent_case(pg, count) in _cases(op)
+
+
+def _templates(child, call):
+    contexts, operations = {}, []
+
+    def collect(block, guards=()):
+        for op in block.ops:
+            if isinstance(op, ScopeGuardOp):
+                assert op.kind.data in {"first", "last"}, "unknown actual parent guard"
+                assert op.parent_generation is call.generation, (
+                    "guard uses a different parent clock"
+                )
+                assert op.child_generation is child.body.block.args[0], (
+                    "guard uses a different child clock"
+                )
+                collect(op.body.block, (*guards, op))
+            elif not isinstance(op, EndOp):
+                contexts[op] = guards
+                operations.append(op)
+
+    collect(child.body.block)
+    tasks = [op for op in operations if isinstance(op, TaskOp)]
     assert tasks, "child has no native instructions"
     for task in tasks:
         pipe(task)
     before, after, pending, previous = {}, defaultdict(list), [], None
-    for op in child.body.block.ops:
+    for op in operations:
         if isinstance(op, TaskOp):
             before[op], pending, previous = pending, [], op
         elif isinstance(op, (LoopSyncOp, ScopeSyncOp)):
+            if isinstance(op, LoopSyncOp):
+                assert op.generation is child.body.block.args[0], (
+                    "sync uses a different child clock"
+                )
+                assert (
+                    op.parent_generation is call.generation
+                    if "scope_cases" in op.attributes
+                    else op.parent_generation is None
+                ), "sync uses a different parent clock"
+                _cases(op)
+            else:
+                assert op.parent_generation is call.generation, "sync uses a different parent clock"
+                assert op.child_generation is child.body.block.args[0], (
+                    "sync uses a different child clock"
+                )
             if op.action.data == "set":
                 assert previous is not None, "Set has no actual native predecessor"
                 after[previous].append(op)
@@ -394,10 +467,15 @@ def _templates(child):
                 f"unsupported actual child instruction: {op.name}"
             )
     assert not pending, "Wait has no actual native successor"
-    return tasks, before, after
+    channels = {op.sym_name.data: op for op in operations if isinstance(op, LoopChannelOp)}
+    for op in operations:
+        if isinstance(op, LoopSyncOp) and op.action.data != "barrier":
+            assert op.channel.data in channels, "sync has no actual child channel"
+            assert _cases(op) == _cases(channels[op.channel.data]), "actual scope_cases mismatch"
+    return tasks, before, after, contexts, channels
 
 
-def finite_check(plan, n, *, group=0, parameters=None):
+def finite_check(plan, n, *, group=0, parameters=None, _execute=None):
     """Check actual issue, binary-event consumption, and every byte dependency."""
     parameters = {"n": n} | ({} if parameters is None else parameters)
     kernels = [op for op in plan.walk() if isinstance(op, KernelOp)]
@@ -425,12 +503,10 @@ def finite_check(plan, n, *, group=0, parameters=None):
         regions = [op for op in call.body.block.ops if isinstance(op, (StreamOp, OnceOp))]
         assert len(regions) == 1
         children[call] = child = regions[0]
-        templates[call] = _templates(child)
+        templates[call] = _templates(child, call)
         tables[call.uid.data] = {task.uid.data: task for task in templates[call][0]}
         assert len(tables[call.uid.data]) == len(templates[call][0])
-        channels[call] = {
-            op.sym_name.data: op for op in child.body.block.ops if isinstance(op, LoopChannelOp)
-        }
+        channels[call] = templates[call][4]
 
     def scope_endpoint(encoded):
         actor, uid, task, position = encoded.data.split("/")
@@ -439,6 +515,8 @@ def finite_check(plan, n, *, group=0, parameters=None):
 
     def sync_info(op, call, task, pg, g, child_count, environment):
         action = op.action.data
+        if not _selected(op, templates[call][3], pg, count):
+            return None
         if isinstance(op, LoopSyncOp):
             assert op.generation is children[call].body.block.args[0]
             if (
@@ -453,6 +531,9 @@ def finite_check(plan, n, *, group=0, parameters=None):
                 # an empty channel name and no LoopChannelOp declaration.
                 return action, None, None
             channel = channels[call][op.channel.data]
+            assert _selected(channel, templates[call][3], pg, count), (
+                "actual sync executes outside its channel case"
+            )
             assert not _integer(channel.last, 0) and not _integer(channel.carry, 0)
             assert channel.kind.data == "local" and action in {"set", "wait"}
             source, destination = (
@@ -502,7 +583,7 @@ def finite_check(plan, n, *, group=0, parameters=None):
     queue, prefixes, begins, ends, accesses = {}, {}, {}, {}, {}
     sends, waits = defaultdict(list), defaultdict(list)
     dispatch, gate, command_count = None, None, 0
-    instances, event_trace, issued = [], [], []
+    instances, event_trace, issued, executions = [], [], [], {}
     maximum = max(call.stage.data for call in calls)
     for parent_step in range(count + maximum):
         for call in sorted(calls, key=lambda c: (c.issue_order.data, lexical_calls[c])):
@@ -517,7 +598,7 @@ def finite_check(plan, n, *, group=0, parameters=None):
                 if child.limit is not None
                 else child.count.data
             )
-            tasks, before, after = templates[call]
+            tasks, before, after, contexts, _ = templates[call]
             lexical_tasks = {task: index for index, task in enumerate(tasks)}
             for step in range(child_count + max(task.stage.data for task in tasks)):
                 for task in sorted(
@@ -529,6 +610,8 @@ def finite_check(plan, n, *, group=0, parameters=None):
                     environment = call_environment | {child.body.block.args[0]: g}
                     key = pg, call, g, task
                     for op in (*before[task], None, *after[task]):
+                        if op is None and not _selected(task, contexts, pg, count):
+                            continue
                         info = (
                             ("task", None, None)
                             if op is None
@@ -553,6 +636,8 @@ def finite_check(plan, n, *, group=0, parameters=None):
                             edge(end, prefix)
                             prefixes[native_pipe] = prefix
                             begins[key], ends[key] = begin, end
+                            if _execute is not None:
+                                executions[end] = task, environment, captures, child_count
                             modes = _modes(task, g)
                             touched = [] if cube else defaultdict(set)
                             for value, mode in zip(task.refs, modes, strict=True):
@@ -638,6 +723,29 @@ def finite_check(plan, n, *, group=0, parameters=None):
         return FiniteResult(
             tuple(issued), tuple(event_trace), command_count, bytes_read, bytes_written
         )
+    # Rebuild Vector source order independently of physical issue/Stage order.
+    # Inactive first/last natives never create a writer or a reader frontier.
+    logical = []
+    for pg in range(count):
+        for call in sorted(calls, key=lambda op: (op.logical_phase.data, lexical_calls[op])):
+            child = children[call]
+            environment = {parent.body.block.args[0]: pg}
+            child_count = (
+                _scalar(child.limit, environment, parameters, group)
+                if child.limit is not None
+                else child.count.data
+            )
+            tasks, _, _, contexts, _ = templates[call]
+            source_tasks = sorted(
+                enumerate(tasks), key=lambda item: (_integer(item[1].logical_phase, 0), item[0])
+            )
+            for generation in range(child_count):
+                for _, task in source_tasks:
+                    if _active(task, generation, child_count) and _selected(
+                        task, contexts, pg, count
+                    ):
+                        logical.append((pg, call, generation, task))
+    assert set(logical) == set(begins), "physical and logical actual native instances disagree"
     writers, readers = {}, defaultdict(set)
     bytes_read = bytes_written = 0
     for key in logical:
@@ -666,4 +774,101 @@ def finite_check(plan, n, *, group=0, parameters=None):
                 readers[byte].add(key)
             if "W" in modes:
                 writers[byte], readers[byte] = key, set()
+    if _execute is not None:
+        for end in order:
+            if end in executions:
+                _execute(*executions[end], parameters, group)
     return FiniteResult(tuple(issued), tuple(event_trace), command_count, bytes_read, bytes_written)
+
+
+def execute(plan, n, arrays, *, group=0, parameters=None):
+    """Execute supported actual Vector natives in a checked physical DAG order.
+
+    Supplied external arrays are copied, including output sentinels. This is a
+    numerical test interpreter, not a native instruction bit-level simulator.
+    """
+    import numpy as np
+
+    assert all(op.core.data == "aiv" for op in plan.walk() if isinstance(op, KernelOp))
+    parameters = {"n": n} | ({} if parameters is None else parameters)
+    roots = [op for op in plan.walk() if isinstance(op, BufferOp)]
+    memory = {}
+    for root in roots:
+        name = root.sym_name.data
+        extent = _extent(root, {}, parameters, group)
+        if name in arrays:
+            data = np.ascontiguousarray(arrays[name]).view(np.uint8).reshape(-1).copy()
+            assert data.nbytes == extent, "external value has the wrong actual allocation size"
+            memory[root] = data
+        else:
+            assert not root.external.data, "missing actual external array"
+            memory[root] = np.zeros(extent, dtype=np.uint8)
+
+    def values(value, environment, captures, count, parameters, group):
+        dtype = {"f16": np.float16, "f32": np.float32}[value.type.dtype.data]
+        return np.concatenate(
+            [
+                memory[root][start : start + width].view(dtype)
+                for root, start, width in _spans(
+                    value, environment, captures, count, parameters, group
+                )
+            ]
+        )
+
+    def run(task, environment, captures, count, parameters, group):
+        native = task.native.data
+        assert native in {
+            "copy",
+            "copy_rows",
+            "fill",
+            "add",
+            "brcb8",
+            "mul_row_broadcast",
+            "convert_rn",
+        }, "unsupported numerical native: " + native
+        inputs = [
+            values(value, environment, captures, count, parameters, group)
+            for value in task.refs[:-1]
+        ]
+        dtype = {"f16": np.float16, "f32": np.float32}[task.refs[-1].type.dtype.data]
+        if native in {"copy", "copy_rows", "convert_rn"}:
+            result = inputs[0].astype(dtype)
+        elif native == "fill":
+            width = sum(
+                width
+                for _, _, width in _spans(
+                    task.refs[-1], environment, captures, count, parameters, group
+                )
+            )
+            result = np.full(width // np.dtype(dtype).itemsize, task.scalar.value.data, dtype=dtype)
+        elif native == "add":
+            result = np.add(inputs[0], inputs[1], dtype=np.float32)
+        elif native == "brcb8":
+            rows = task.params.data[0].data
+            assert inputs[0].size == rows
+            result = np.repeat(inputs[0], 8)
+        else:
+            rows, columns = (value.data for value in task.params)
+            factors = inputs[1].reshape(rows, 8)
+            assert np.all(factors == factors[:, :1]), "BRCB scratch has inconsistent row words"
+            result = np.multiply(
+                inputs[0].reshape(rows, columns), factors[:, :1], dtype=np.float32
+            ).reshape(-1)
+        raw, offset = np.ascontiguousarray(result).view(np.uint8).reshape(-1), 0
+        for root, start, width in _spans(
+            task.refs[-1], environment, captures, count, parameters, group
+        ):
+            memory[root][start : start + width] = raw[offset : offset + width]
+            offset += width
+        assert offset == raw.size, "native numerical result has the wrong actual footprint"
+
+    checked = finite_check(plan, n, group=group, parameters=parameters, _execute=run)
+    outputs = {
+        root.sym_name.data: memory[root]
+        .view(arrays[root.sym_name.data].dtype)
+        .reshape(arrays[root.sym_name.data].shape)
+        .copy()
+        for root in roots
+        if root.sym_name.data in arrays
+    }
+    return checked, outputs

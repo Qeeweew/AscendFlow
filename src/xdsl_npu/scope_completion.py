@@ -9,7 +9,7 @@ their controller gates cannot survive a skipped call. Neither clock expands.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from .budget import bounded, poll
 from .child_completion import ChildPort, FixedChildProjection, ProjectionPoint
@@ -41,6 +41,22 @@ class ScopeCompletion:
     call_order: dict[str, tuple[str, ...]]
     max_stage: dict[str, int]
     projections: dict[str, FixedChildProjection]
+    case_sites: dict = field(default_factory=dict)
+    case_commands: dict = field(default_factory=dict)
+    node_activations: dict = field(default_factory=dict)
+
+    def ats(self, uid, point, generation):
+        key = uid, point, generation % self.graph.period
+        if key in self.case_sites:
+            return tuple((node, generation // self.graph.period) for node in self.case_sites[key])
+        return (self.at(uid, point, generation),)
+
+    def commands_for(self, uid, point):
+        key = uid, point
+        if key in self.case_commands:
+            return self.case_commands[key]
+        require(key in self.commands, "unknown scoped child completion query endpoint")
+        return (self.commands[key],)
 
     @property
     def ports(self):
@@ -94,7 +110,11 @@ class ScopeCompletion:
             "arc_families": len(self.graph.edges),
             "physical_prefixes": len(self.prefixes),
             "active_components": len(
-                {(uid, component) for (uid, _), component in self.aliases.items()}
+                {
+                    node.command.index
+                    for node in self.graph.nodes
+                    if node.command.kind == "scope_component"
+                }
             ),
             "native_templates": sum(p.native_templates for p in self.projections.values()),
         }
@@ -229,6 +249,10 @@ def compose_calls(
     dispatch order. logical_phase supplies no completion or dispatch relation.
     All child Site kinds, including insertion cuts, remain opaque exact points.
     """
+    if any(not isinstance(projection, FixedChildProjection) for _, projection in calls.values()):
+        from .scope_case_completion import compose_conditional_calls
+
+        return compose_conditional_calls(calls, period=period, count=count)
     require(type(period) is int, "scope completion needs an integer protocol period")
     bounded_period(period, "scope completion")
     require(count is None or type(count) is int and count >= 0, "invalid parent scope count")

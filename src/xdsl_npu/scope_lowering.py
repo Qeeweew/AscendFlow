@@ -16,6 +16,7 @@ from .ir import CallOp, CaptureOp, CoreIdOp, EndOp, StreamOp, ViewOp
 from .lowering_context import ActorBindings
 from .model import require
 from .scalar import ARITHMETIC, from_ssa
+from .scope_predicates import classify_guard
 from .source_ir import AllocationOp, MatmulOp, PipelineOp
 from .source_scopes import ClockFrame, Scope, Work, collect_source_scopes
 
@@ -110,10 +111,12 @@ def lower_scopes(program):
         "nested AST pipelines require hierarchical synchronization: one parent Pipelined is required",
     )
     parent = tree.items[0]
-    require(
-        all(not isinstance(op, scf.IfOp) for op in program.walk()),
-        "nested AST pipelines require hierarchical synchronization of first/last guards",
-    )
+    parent_guards = {
+        op: kind
+        for op in program.walk()
+        if isinstance(op, scf.IfOp)
+        if (kind := classify_guard(op, parent.op)) is not None
+    }
     allocations = tuple(op for op in program.walk() if isinstance(op, AllocationOp))
     for op in program.walk():
         if isinstance(op, MatmulOp):
@@ -216,6 +219,7 @@ def lower_scopes(program):
                 scoped=items,
                 scope=scope,
                 nested=True,
+                parent_guards=parent_guards,
             )
             leaf = _Actor(
                 program,
@@ -231,6 +235,7 @@ def lower_scopes(program):
                 bindings=bindings,
                 ambient_frames=(ClockFrame(parent.op),),
                 capture=capture,
+                parent_generation=call.generation,
             )
             leaf.emit()
             lowered[uid] = family, leaf

@@ -4,7 +4,8 @@
 “继续优化 legacy FA”与“先取消首尾窗口”的安排。当前已完成旧公开API删除、输入minimum/multiple合同、局部查询域拓扑共享
 和通用构建期限；随后接通runtime轴SSA、商余寻址和cyclic局部ownership。
 实际测试与编译结果见状态页。以下保留整个重构的目标和退出
-条件；当前已接通直接固定child的nested CV和stationary私有L0C复用，完整FA仍未完成。
+条件；当前已接通直接固定child的nested CV、stationary私有L0C复用和一个实际
+parent时钟上的native first/last条件。完整FA仍未完成。
 
 ## 目标、边界与次序
 
@@ -87,11 +88,33 @@ query tile 分给20组已经产生12/13差异，不能追加长度整除组数�
   重排。`QK(t+1)→PV(t)`有负逻辑代次差；同步epoch与实际访问generation必须
   分开表示。同步IR现在保存来源epoch的count与首末激活域，最终检查按实际IR
   重建；`n=1`、启动及最终PV连续占用已通过独立实际IR模型与设备。该支持
-  限定stationary私有root，不包含native first/last执行或独立runtime时钟。
+  限定stationary私有root；条件执行的root另外按实际case重建访问义务，不直接
+  套用fresh-definition重排。
+- native first/last已经从源条件接到实际固定child中的初始化、递推和末次导出。
+  分析使用N=1、first、middle、last四个互斥域，实际IR/ASC保留一份native模板。
+  首次写入到所有reader、所有reader到末次覆盖均需全域完成关系，不能只检查
+  相邻代次；父event激活域还必须落在实际native存在域内。fixed local row
+  frame支持以固定次数、统一正stride、frame内访问与allocation边界为前提。
+  这一能力不接纳runtime余数周期、parent条件ring或缺少复用证明的event宽度调整。
 
-下一主线是native first/last与独立query/kv时钟；同步条件支持不能冒充native
-条件执行支持。先用初始化、稳态更新、末次导出三段的小型递推接通源条件到真实
-访问域，再接多运行时钟与原FA source主体。保留共享L0C的原容量和source政策。
+下一主线是**原nested FA的serial query → runtime KV → fixed child**，不改
+target主体、不把query扁平化成展开任务，也不把首尾条件改成child末次。源码审查
+确认根serial当前落入`region_lowering`的单actor限制；只删除该检查不能接通：
+`scope_lowering`与`scope_model`目前也只接一个根Stream。按以下顺序扩展同一路径：
+
+1. 保留query、KV、child三个真实SSA时钟，Stage只位移KV；把query坐标和原BNSD
+   轴来源传入Capture/地址检查与ASC，不能用字符串或旧连续Frame假设重绑地址。
+2. query使用既有cyclic ownership合同，证明同group的AIC和两个AIV有相同
+   `ceildiv(max(0,total_queries-group),groups)`域；覆盖12/13次与零工作owner。
+   KV保持uniform runtime bound，三块GM双槽和local状态跨query复用同一root。
+3. 将query尾的真实最后读取、退休和旧Wait消费接到下query的重写/初始化及
+   新Set；serial控制退出不提供异步完成，不添加query drain或额外buffer。
+4. 先用同结构mixed递推做公开DSL→实际IR破坏/独立有限模型→ASC/CANN→设备
+   闭环，覆盖query=0/1/2/3和KV=1/2/3、漏一方AIV及错clock/root；随后用原FA
+   source验证下一具体阻塞。小反例不代替FA数值或性能验收。
+
+continuous版本的`task % kv_tiles`另需runtime周期边界和跨query重叠合同，不能
+借用当前四个parent case放行。保留共享L0C的原容量和source政策。
 `test_definition_lifetimes.py`固定独立逻辑合同，`test_scope_shared_l0c_model.py`
 检查当前编译结果；二者不替代完整FA数值与性能验收。
 双 AIV 的完整贡献、MTE2 import 的早 release、FIX 与共享 L0C 冲突都要表达。
