@@ -92,8 +92,9 @@ PV保留3stage累加子流水，issue_order为load/MAD/operand，循环外只做
 
 **P0独立参考已落地**：[AscendC参考及证据](attention-reference.md)覆盖手排控制、
 小例完整数值、8K大例采样/profile及条件硬件下界；没有新AST FA的CANN或设备
-结果，参考性能也未达到最终目标。P1已接通根部local顺序区域
-的同步、代码生成和设备例，但父体组合及本fixture所需mixed层次仍缺，见
+结果，参考性能也未达到最终目标。局部顺序区域已接通；`ed87249`又接通严格
+frame下的父体init/多个child/use，但本fixture需要的共享GM、mixed层次和连续
+task关系仍缺，见
 [区域组合](region-sequence.md)。最新实施次序以[重构方案](refactor-plan.md)为准。
 
 复现源码和有限派发表（不启动设备，也不宣称编译FA）：

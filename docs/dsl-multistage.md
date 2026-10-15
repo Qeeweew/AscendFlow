@@ -1,41 +1,40 @@
-# DSL规格：TileLang风格的结构化多阶段程序
+# DSL 规格：结构化控制与多级流水
 
-2026-10-14修订，对照实现`be957e8`。本文的“目标”是待实现合同，“可运行”只用于
-已经接通的子集。架构见[design](design.md)，工作次序见[refactor-plan](refactor-plan.md)。
+2026-10-15，代码基线 `ed87249`。这是语言合同，不是全量支持声明。
+可运行例、目标片段分别标注；总体取舍见[设计](design.md)，接通顺序见
+[重构方案](refactor-plan.md)。
 
-## 1. API与语法边界
+## 1. 采用的语法及理由
 
-使用`import xdsl_npu.language as T`，设备函数不作为Python执行或tracing。
-前端解析受限AST，产生xDSL控制流；宿主Python只选择显式constexpr配置。
+参考 TileLang 的 tensor、tile、循环和 stage 表达，使用受限 Python AST。
+`prim_func` 捕获源码，不执行设备函数体。普通循环生成设备控制；宿主 Python
+只配置 constexpr。用户能直接从源码读出数据流、物理存储和流水排步。
 
-| 语法 | 语义 |
+| 语法 | 合同 |
 |---|---|
-| `@T.prim_func` | 捕获源码、解析AST、保留source map |
-| `T.Tensor(shape, dtype, access=...)` | 有类型的外部引用；shape可引用后声明的runtime标量 |
-| `n: T.int64` / `B: T.constexpr` | 设备值 / 特化常量，调用时已知n也不自动特化 |
-| `T.Kernel(groups, kind=...) as group` | launch和group域；mixed固定1 AIC+2 AIV |
-| `T.Cube()` / `T.Vector() as lane` | actor作用域；lane为组内AIV编号 |
-| `T.serial(...)` | 保留的设备顺序控制，迭代边界不隐含硬件drain |
-| `T.Pipelined(N, stages=S, issue_order=...)` | N个逻辑任务与最多S个stage位移；不展开N |
-| `T.Stage(s, name=...)` | 最近pipeline的代次偏移与排步标签 |
-| `T.unroll(...)` | 显式constexpr展开，受结构预算限制 |
-| `alloc_ub/l1/l0a/l0b/l0c` | 片上分配，容量与layout显式；view保持同一root |
-| `copy/matmul/reduce/cast/...` | typed原语；具体支持见已有例子与诊断 |
-| `@T.macro`（目标） | 受限AST内联；宏位于examples，不是同步或ASC逃生接口 |
+| `@T.prim_func` | 设备函数、源码位置；不退回 tracing |
+| `T.Tensor(shape, dtype, access=...)` | 外部引用，shape 可使用 runtime 参数 |
+| `n: T.int64` / `B: T.constexpr` | 设备值 / 特化常量，不按实参值猜测 |
+| `T.Kernel(groups, kind=...) as group` | launch 域；mixed 每组1 AIC+2 AIV |
+| `T.Cube()` / `T.Vector() as lane` | actor 作用域，lane 是组内 AIV 编号 |
+| `T.serial(N)` | 保留的顺序控制，无隐式 drain |
+| `T.Pipelined(N, stages=S, issue_order=...)` | N 个逻辑任务，显式偏移范围和 actor 派发政策 |
+| `T.Stage(s, name=...)` | 最近 pipeline 的代次偏移，0≤s<S |
+| `alloc_ub/l1/l0a/l0b/l0c` | 显式空间、容量、layout 和 slots |
+| `copy/matmul/reduce/cast/...` | typed 原语，所有 native effects 可见 |
+| `T.unroll(...)` | 显式静态展开，受结构预算约束 |
+| `@T.macro`（待实现） | 受限 AST 内联，内部普通循环保留 |
 
-保留现有`stages`拼写，不再增加`num_stages`同义参数；它只限制`0<=s<S`，不
-分配S份buffer。首版要求显式Stage；默认每actor按源码的stage顺序派发，
-`issue_order`则完整指定该actor的直接stage标签。标签只在所属pipeline内解析，
-不可跨层引用child stage。源码语义规定读写版本，派发政策不能改变数值依赖。
+保留当前 `stages` 参数，不增加同义拼写。它不等于 phase 数，不自动分配 S 份
+存储，也不承诺并发性能。首轮全部 Stage 显式；后续自动政策仍生成同一模型。
+不恢复 `cube.task/vector.task` 或要求用户手写 ready/release。
 
-前端应在源码位置报告未知参数、非法作用域、漏/重复标签和不支持控制流。
-不执行任意Python注解、闭包或调用；不以退回tracing解决解析失败。当前并非
-表中所有语法组合已能lower，实际矩阵见末节。
+actor 决定核，原语决定 engine；Cube 作用域也能包含 DMA/Fixpipe。常见 vector
+源代码可省略能唯一推断的 actor，mixed 有歧义则要求显式作用域。
 
-## 2. 可运行的局部流水
+## 2. 可运行局部例：双缓冲
 
-下面是当前AST子集的完整示例；`tiles`为runtime，B为constexpr。Tensor的
-`(tiles,B)`表达需要多少存储，launcher检查范围/溢出/别名，分配真实性由调用合同保证。
+以下属于现有 AST 子集，tiles 为 runtime，B 为 constexpr：
 
 ```python
 from __future__ import annotations
@@ -60,47 +59,34 @@ def scale(X: T.Tensor((tiles, B), T.f32),
 compiled = compile(scale)
 ```
 
-同一binary用于tiles=0/1/百万，不能通过host循环生成百万份操作。一般元素尾部
-需要显式valid；已有对齐prefix见[ast_prefix](../examples/ast_prefix.py)，不授权
-越界读取或扩大外部allocation。实际prelude→pipeline→epilogue见
-[ast_state_sum](../examples/ast_state_sum.py)：加载Initial、逐代FP32累加、导出；
-零次循环仍执行加载与导出。
+同一 binary 接收 tiles=0/1/百万。shape 参与地址范围和 launch 合同检查，不生成
+tiles 份 Python 对象。一般尾部要明确 valid/padding；已有对齐 prefix 见
+[ast_prefix](../examples/ast_prefix.py)，不能默认外部 allocation 有额外 padding。
 
-## 3. 类型、存储和数值合同
+真实初始化、循环、导出见 [state_sum](../examples/ast_state_sum.py)；两个 runtime
+轴见 [grouped_state_sum](../examples/ast_grouped_state_sum.py)：父循环内初始化，
+子流水累加，最后导出。child=0 仍执行初始化和导出；parent=0 不执行 body。
+当前父体要求严格 GM frame，不代表所有共享输入均已支持。
 
-前端区分constexpr、uniform runtime scalar、actor/代次相关scalar、storage ref
-和借用tile result。运行时标量计算使用SSA；动态shape/地址不是不可分析字符串。
-无数据相关side effect的表达式可重算，但只能使用该逻辑代次捕获的输入。
-异步Scalar metadata有自己的读写及捕获寿命，不能读控制器当前下一任务的值。
+## 3. Stage 的精确定义
 
-- GM extent/stride允许受支持的runtime表达式；片上capacity和layout为constexpr。
-  有符号范围、乘法溢出、除零、alignment和有效域分别检查。
-- `x[t%2]`是明确的物理复用。`state[q%2]`、`Score[t%2]`、`L1[k%3]`使用不同
-  时钟，编译器不因同为2槽便视作同一generation。目标代次身份包含region路径、
-  parent调用坐标与local iv，不能仅用变量名字匹配。
-- slice、转置和recast保留allocation provenance。logical valid与native实际
-  读取padding/fractal分开；缺初始化或容量则拒绝。
-- `v=T.copy(...)`借用该次写的版本，覆盖后再读取旧v拒绝；需要快照应明确copy。
-  `out=`原地操作记R/W。当前跨region借用值仍拒绝，mutable ref组合已部分支持。
-- 外部`access=read`声明必须与effects一致。`disjoint_external=True`通过直接
-  指针区间检查约束别名，不解决间接索引唯一性；只读跨owner重读可以合法。
-- UB由各AIV私有，不能跨actor传local handle。GM scratch显式传入并分group/lane；
-  自动workspace分配不作为首轮语法可用的前提，也不隐式建立全尺寸中间矩阵。
+源码 iv 是逻辑任务坐标。在一个 actor 的本地派发 step j，Stage s 使用
+`iv=j-s`，仅在 `0<=j-s<N` 时激活。编译器位移其整个表达式环境：地址、view、
+first/last、descriptor、子循环捕获值一起移动，不只移动数据指针。
 
-精确Cube入口保留`T.matmul(a_l0, b_l0, accum=c_l0c, initialize=first)`。
-算法层的GEMM/softmax由examples中的宏组合原语。宏接受实际refs、scratch和
-constexpr政策；只内联静态源码结构，普通循环保留，内部名字卫生化，来源链和
-宏传递内容参与诊断/cache key。禁止递归宏、任意host调用、裸同步和opaque ASC。
-宏系统尚未实现，现阶段完整低层源码仍是可审查的依据。
+同一 pipeline 的多个 Stage 可有相同 s。它们是独立区域，没有共同完成点；
+不同 actor 的 j 不同步。prologue/steady/epilogue 从激活域生成，N=0 无任务也
+不能留下无匹配 Wait/Set。最终 drain 发生在真正 kernel 生命周期边界。
 
-FP32 carry、低精度snapshot、P cast和输出cast拥有不同版本与寿命。reduce树、
-exp实现、round/saturate、FMA或分开的Mul/Add，以及div或reciprocal+mul必须固定。
-宏展开及同步变换不能凭数学恒等式重结合数值运算。
+默认各 actor 按源码直接 Stage 顺序派发；`issue_order` 完整指定该 actor 的
+Stage 标签，必须唯一且不遗漏。标签只在当前 pipeline 解析。政策改变派发位置，
+不改变原源码的数学版本和累计顺序。任何违背依赖、容量或产生等待环的政策
+给出诊断，不静默重排或扩 buffer。
 
-## 4. CV多阶段：同一任务、不同actor、独立进度
+## 4. CV multi-stage 的源码表达
 
-以下为**目标语法骨架**，省略的宏均需在examples展开为实际原语，不可直接作为
-可运行FA发布。完整待接通源码见[FA目标](attention-target.md)。
+以下为**目标片段**，四个函数代表待实现的 examples 宏，不能作为已可运行 FA。
+完整低层 fixture 见 [attention_target](attention-target.md)。
 
 ```python
 for kv in T.Pipelined(
@@ -118,11 +104,7 @@ for kv in T.Pipelined(
         update_rows(kv, lane, PV, alpha, l, o, O, out_scratch)
 ```
 
-源码kv始终指逻辑任务。actor本地step为j，Stage s绑定`kv=j-s`；所有地址、
-guard、scalar、first/last和子循环调用坐标一起移动。两处Stage1是不同区域，
-没有共同完成点；两个AIV也不是一个UB空间。
-
-| 本地step（N=3） | AIC派发 | 每AIV派发 |
+| 本地 step，N=3 | AIC 派发 | 每个 AIV 派发 |
 |---|---|---|
 | 0 | QK[0] | 无 |
 | 1 | QK[1]，PV[0] | Softmax[0] |
@@ -130,21 +112,22 @@ guard、scalar、first/last和子循环调用坐标一起移动。两处Stage1�
 | 3 | PV[2] | Update[1]，Softmax[2] |
 | 4 | 无 | Update[2] |
 
-这是派发表，AIC/AIV的step j并不同步到达。实际依赖包括QK全部必要FIX写→
-Score对应区域可读、两AIV的P写→PV可读、PV写→Update；每个GM槽的释放则来自
-实际最后MTE2 reader。完整tile需要多个贡献时不能第一份贡献就ready，但也不
-应把独立范围的consumer都扩大到无关范围的完成点。
+这是派发表，不是墙钟时间线。真实顺序另由访问产生：QK 的 FIX 写完成才能读
+Score；两个 AIV 的 P 分片都写完，PV 才能读取完整范围；PV 写完成后 Update
+读取。Score/P/PV 的槽分别在对应所有 MTE2 reader 退休后释放。
 
-cross-core Wait是后续派发的gate。所选policy要求新QK先于旧P gate，旧Update
-先于新Score gate；若固定顺序死锁或bank不够，诊断，不静默改序。此policy是
-待验证的专家选择，不是ops-transformer所有模板的统一顺序；当前arch22
-`Process`可见Vec1在Vec2前，其Matmul内部派发还需结合代码与profile核对。
+两 AIV 的行分片是实际不重叠 views，UB 私有，不能把两个192KiB合成384KiB。
+GM workspace 显式按 group/slot 分配，初始未定义，读必须来自真实 writer；
+不隐式分配随 Sq×Sk 增长的完整 Score/P。
 
-## 5. Stage内部的子流水
+当前政策使新 QK 先于旧 P gate、旧 Update 先于新 Score gate。过早 cross-core
+Wait 会阻挡整个 actor 后续派发。此顺序是候选政策，不冒称 ops-transformer
+所有模板均如此；当前 arch22 Process 可见 Vec1 在 Vec2 前，实际库内行为还需
+代码和 profile 对照。语法必须能表达两种政策，状态分配和合法性分别验证。
 
-通信块BQ128×BK1024、Cube128子块、Vector8行块是不同层级。一个CV Stage可以
-包含普通工作、serial和自己的Pipelined；child Stage只改变child iv。下面为
-目标片段，父kv从其stage捕获，chunk是另一个代次：
+## 5. Stage 内部仍是普通多级程序
+
+通信 BK1024、Cube CK128、Vector VR8 独立，不要求整个通信块进入 UB。目标片段：
 
 ```python
 with T.Stage(0, name="qk"), T.Cube():
@@ -165,22 +148,18 @@ with T.Stage(0, name="qk"), T.Cube():
             T.copy(c0[chunk % 2, :, :], Score[slot, :, chunk, :])
 ```
 
-此处地址为分块示意，真实BNSD例必须使用保持原layout的views，不能靠隐式输入
-packing成立。child退出不drain，不自动把父PV插入child循环。若需要这样的
-穿插，要明确改变执行政策；不得为追求重叠暗中改变固定源码组织。
+此处地址是分块示意，实际 BNSD fixture 使用保持原 layout 的 views，不预打包输入。
+父 kv 在 Stage 入口捕获，child chunk 有自己的 pipeline clock；固定 BK/CK 的
+循环也保留在设备。单槽 kb 要先派发旧 MAD，再装下一块 operand，不能依 Stage
+数字排序。当前 fixture 已修正这一点，不靠加 buffer 解决。
 
-这里的L0B只有一槽，所以每step必须先派发旧块MAD，再装下一块operand；
-否则Stage1的新写先于Stage2的旧读，同步会形成等待环。原目标fixture遗漏了
-这项内层policy，现已显式修正。增加第二份L0B会超过该配置的分配预算，不能
-用扩buffer隐瞒问题。PV的单槽L0A/L0B有相同约束。
+child 填排退出不等于全部异步完成，不额外 drain。共享 L0C 的两个 child 必须
+组合 FIX→下一写的 WAR 和事件寿命。普通嵌套不自动把父 PV 插入 QK child；若
+专家政策要求这种穿插，必须明确表达，不能隐含变换。
 
-边界必须保留真实首读/末写/未退休reader和未消费event。`init; child; use`在
-child=0时让use读取init；多reader的cache覆写等全部reader而非最后派发者。
-父子同bank不能因为作用域不同就都分配ID0。一般嵌套CV尚未实现。
+## 6. 连续 task、状态和输入合同
 
-## 6. 规则跨query连续流
-
-目标保留一个设备task循环，显式区别于每query一个kv循环：
+跨 query 的目标控制形态：
 
 ```python
 if K > 0:
@@ -191,77 +170,63 @@ if K > 0:
         kv = task % K
         first = kv == 0
         last = kv == K - 1
-        # 同上四个Stage，均使用本任务捕获的query/kv/first/last。
+        # 相同四个 Stage；使用该逻辑 task 的 query/kv/first/last。
 ```
 
-K在流入口捕获且uniform，保留`task=query*K+kv, 0<=kv<K`关系；编译器不枚举
-K个余数，也不按queries×K展开。K=0的输出语义由算法明确给出，除法不执行。
-每actor必须对空任务达成一致的通知激活，不能一侧skip而另一侧Wait。
+此处纯 descriptor 表达式属于逻辑任务，在每个 Stage 的正确代次求值或捕获。
+有副作用的 metadata 读取不能当普通纯表达式复制。首批 K 在流入口 uniform 且
+不变；保留商余关系，不枚举 K 个余数。K=0 的输出由算法显式定义，不能省略后
+宣称支持空序列。
 
-task槽、query状态和chunk槽独立。在所选update-before-softmax政策下，旧query
-最后Update先于新query重置m/l；单份状态能否复用仍需实际读退休证明。换政策
-后不能沿用这一假设。Q cache覆写只等其QK最后reader，不因旧PV尚未结束就等
-整个query；反之也不能仅凭QK调用已返回就覆盖。
+`state[query%2]`、`Score[task%2]`、`L1[chunk%3]` 有不同 owner/generation；同为
+两槽不意味着同一时钟。固定 update-before-softmax 下能否复用单份 m/l/O 仍由
+真实 reader 证明；换政策不能沿用假设。Q cache 覆写等其最后 QK reader，不
+扩大到整个 query 的 PV/Update 完成。
 
-本子集只接纳uniform K和受限规则解码；动态分段、页表、稀疏索引、persistent
-工作队列需要另外的descriptor/owner合同。商余语法能够解析不等于已经支持。
+类型/别名规则：
 
-## 7. FA数学与变体
+- GM extent/stride 是受支持的 runtime SSA，片上 capacity/layout 为 constexpr。
+  边界、乘法溢出、除零、alignment、padding 和有效域分别检查。
+- view/recast 保留 root；不同 tensor 名不证明 disjoint。外部 disjoint 合同在
+  launch 检查直接指针区间，间接索引唯一性需要另有可验证合同。
+- `access=read` 必须与真实 effects 一致；initialized 只说明初值，不说明永不写。
+  共享只读 GM 要覆盖真实 group/调用域，不能从单 frame 假设推导。
+- 借用 tile 绑定写版本，覆盖后旧借用不可读；跨 region 借用在版本验证接通前
+  拒绝。需要 snapshot 明确 copy，低精度 snapshot 不替代 FP32 carry。
+- 任意 Python、递归宏、裸 ASC、手写 flags 和未知 native effects 不作为源语言逃生口。
 
-真实例必须实现以下在线更新，不能用乘法/cast代替softmax：
+## 7. 数值与 FA 变体
+
+真实 FA 必须实现 online softmax，FP32 m/l/O，p32 先做 denominator，再显式
+舍入 P；O 的 rescale/add 次序、PV 累计顺序、reduce 树、exp、最终 div 或
+reciprocal+mul 均固定。逻辑 BK 改变舍入边界，不能当作纯同步优化。
+
+每变体有独立数值和参与者合同：f16/bf16、MHA/GQA/MQA、prefill/decode，随后
+causal/非方形绝对位置/tails/空序列/全 mask，再到 varlen/paged/sparse/persistent。
+全 mask 的 -inf-(-inf) 必须定义；split-KV 增加全局合并语义，backward/dropout/RNG
+另立合同。新语法不自动获得 legacy 变体支持。
+
+## 8. 同步前后与诊断
+
+局部例的物理访问及必要同步关系：
 
 ```text
-m' = max(m, row_max(scores))
-alpha = exp(m - m')
-p32 = exp(scores - m')
-l' = f32(alpha*l) + row_sum(p32)
-o' = f32(alpha*o) + RN_operand(p32) @ V
-output = 指定的归一化recipe(o_final,l_final)，再显式输出cast
+前：MTE2 X[g]→x[g%2] ; V x[g%2]→y[g%2] ; MTE3 y[g%2]→Y[g]
+后：MTE2.write_done[g] → V.read_begin[g]       # ready
+    V.read_retired[g] → MTE2.write_begin[g+2]  # input release
+    V.write_done[g] → MTE3.read_begin[g]       # ready
+    MTE3.read_retired[g] → V.write_begin[g+2]  # output release
 ```
 
-初始m=-inf、l/o=0；p32归约在P cast之前。全mask可能产生-inf-(-inf)，必须有
-明确identity/输出合同；不能只mask最终store。当前目标fixture先限定正长度无mask。
+删 input release 可覆盖在读 x；将其推到输出 MTE3 会扩大等待范围。上述是语义
+关系，不是已分配 ID 的完整程序，配对/零域/event 复用/drain 还要检查。真实
+同步前后 IR 与序列见 [synchronization](synchronization.md) 和
+[region-sequence](region-sequence.md)。每个新增问题交付同样的最小反例。
 
-BQ128/BK1024/D128、VR8检验通信与native/UB独立粒度；Q cache、m/l/O、alpha、
-Score/P/PV和L1/L0环分别检查寿命。64×1024 f32不能作为一个AIV的整片UB工作区。
-CV workspace随group和固定slots有界，不允许随完整Sq×Sk分配Score。
+错误分三类：已证非法、不支持、分析未决。报告 source 位置、双方任务/代次、
+真实 root/字节范围、相关 phase/计数。预算耗尽不称程序非法；失败不改变政策，
+不生成可运行 fallback，不写入成功缓存。
 
-变体分批：dense MHA/GQA/MQA、f16/bf16、prefill/decode；再加causal、非方形绝对
-位置、tails、空序列/全mask；随后varlen/paged/sparse/动态persistent与split-KV。
-训练backward/dropout/RNG另立合同。每个配置有明确支持矩阵，不静默调用CANN。
-
-## 8. 同步反例与诊断
-
-局部三阶段流水的物理IR投影及插入后的必要关系：
-
-```text
-前：MTE2 X[t]→x[t%2] ; V x[t%2]→y[t%2] ; MTE3 y[t%2]→Y[t]
-后：MTE2.write_done[t] → V.read[t]              # ready
-    V.read_retired[t] → MTE2.write[t+2]         # input release/WAR
-    V.write_done[t] → MTE3.read[t]              # ready
-    MTE3.read_retired[t] → V.write[t+2]         # output release/WAR
-```
-
-这不是完整事件程序，ID复用、guard、零域和最终收尾还要验证。漏input release
-会覆盖在读x；把它推到MTE3结束会损失预取。实际含零域的前后IR与同步序列见
-[region-sequence](region-sequence.md)，单流见[synchronization](synchronization.md)。
-
-诊断分三类：已证非法（冲突路径/容量/初始化反例）；不支持（具体view/control/
-ownership缺口）；分析未决（phase、结构计数、预算和最小定位）。均包含source
-位置、双方任务/代次及真实root/字节范围。失败不改变输入IR或留下可执行缓存。
-
-## 9. 实际支持矩阵
-
-| 能力 | 当前状态 |
-|---|---|
-| AST单流水、对齐prefix、归约/Scalar、显式L0/runtime K | 声明子集已贯通，有设备证据 |
-| serial父×单local child | 严格frame子集已贯通 |
-| 根部普通工作/多个local stream顺序组合 | 已贯通；单共同bound、stationary共享存储和实际只读GM |
-| serial父体一般前后工作/多child、跨region借用值 | 未接通/拒绝 |
-| Pipelined内嵌Pipelined、mixed层次组合 | 未接通/拒绝 |
-| uniform K商余的连续query流 | 待实现 |
-| AST宏、新AST真实FA | 待实现；fixture和legacy设备记录不计入 |
-| 一般分支、间接动态ownership、paged/sparse | 无完整合同，拒绝 |
-
-支持标记必须绑定实际编译入口、最终ASC及输入合同，不能把source verifier通过
-作为整个编译路径或任意规模同步证明。
+当前可运行边界是单 local 流、受限父体和顺序组合；一般层次 mixed、连续商余
+流、宏、完整 AST FA 仍待实现。支持状态统一查[设计的保存点表](design.md#7-实现边界与来源)，
+不能把目标片段、source verifier 通过或有限 legacy 路径当作已贯通能力。

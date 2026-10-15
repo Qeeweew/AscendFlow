@@ -1,5 +1,53 @@
 # 重构的验证记录
 
+## 2026-10-15：设计重审与父体保存点 ed87249
+
+本轮按用户要求重写[设计](design.md)、[DSL规格](dsl-multistage.md)和
+[重构方案](refactor-plan.md)，停止继续实现和算子调参。先将上一轮未提交的
+父体组合保存为`ed87249`，未修改原有编译器逻辑。该提交是保存点，不代表全量
+重构或本轮全量回归完成。新的G0–G5门槛取代旧工作顺序，旧记录保留溯源。
+
+核对上一轮已完成的进程和日志：
+
+- `runs/refactor/parent-sequence/more-tests.log`：21 passed，11.44s，包括两个child、
+  实际frame坐标、提前release、通知不能fence后续native等反例；不是全测试集。
+- `device-small.log/json`：generated和独立AscendC共20条结果，最大绝对误差均0，
+  包括9组outputs:tiles及各自一组FP32舍入反例。设备physical1→logical0，
+  warmup1/repeats3，ACL stream间隔含host空隙，不能作kernel性能结论。
+- `build.log`：两版本CANN离线与shared构建已完成。父体1GiB大例及三批profile
+  尚未完成，本轮没有启动新的设备测试。
+
+新例[源码](../examples/ast_grouped_state_sum.py)保留父outputs和子tiles两个runtime
+循环、四native模板。局部state跨调用复用，由实际旧输出MTE3 reader退休保护
+下一次MTE2初始化；child=0仍初始化/导出，parent=0不执行。当前严格GM frame，
+跨sibling写同frame和无frame跨调用共享GM拒绝，一般mixed层次仍未支持。
+
+本轮补测五个独立冷进程，完整源码读取/捕获到最终检查和ASC，import/CANN另计：
+
+| 指标 | 结果 |
+|---|---:|
+| source→ASC p50 / max | 0.8804487 / 0.8824122 s |
+| Compilation内部 p50 / max | 0.8567909 / 0.8589185 s |
+| 最大RSS | 38320 KiB |
+| 首次样本planning / final-check | 0.2865267 / 0.4656385 s |
+
+数据：`runs/refactor/design-review-20261015/cold-parent/benchmark.json`，包含机器、
+Python、package/source/ASC hash及各试验计数。复现：
+
+```bash
+.venv/bin/python compiler/benchmarks/compile.py --input compiler/examples/ast_grouped_state_sum.py --entry grouped_state_sum --trials 5 --output runs/refactor/design-review-20261015/cold-parent-recheck
+```
+
+最终检查约占内部耗时的一半，需要优化查询/域组织，不能跳过检查。此例达当前
+常用门槛，不外推FA或一般嵌套成本。已有百万常量界结构回归也不是任意动态
+alias/ownership的证明。已知父体性能账本会继承首个once的
+`tasks_per_invocation=1`，在G0修正前不把该聚合字段当准确工作量。
+
+下一步仍为待执行计划：G0收尾基线→G1替换重复区域职责→G2双轴/层次CV合并
+检查点→G3真实FA。不可用旧legacy FA结果或慢参考的一致性宣布专家性能达标。
+本轮文档检查：六份修改文档的本地链接和代码围栏完整，DSL中的可运行scale
+示例实际通过源码→ASC，`git diff --check`通过。未因纯文档修改重跑全测试集。
+
 ## P1a共享绑定与多区域编译成本：8a1aeea之后
 
 引入[ActorBindings](../src/xdsl_npu/lowering_context.py)：一个actor的Kernel、

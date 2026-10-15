@@ -3,11 +3,11 @@
 基于 xDSL 0.73.0 的独立 Python 编译器，目标 Ascend 910B / dav-2201，直接输出
 ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构建。
 
-2026-10-14对照保存点 `be957e8` 重写了[总体设计](docs/design.md)、
+2026-10-15对照保存点 `ed87249` 重写了[总体设计](docs/design.md)、
 [DSL 前端与 CV 多阶段规格](docs/dsl-multistage.md)和[重构计划](docs/refactor-plan.md)。
-新计划分别验收语言表达、编译成本和最终机器执行；规则跨query连续CV流水
-进入本轮范围，动态任务队列另行扩展。独立FA参考已补齐；下一步收敛区域lowering
-入口，并提前检验连续流的query/task代次与编译规模，再接通层次CV和真实FA。
+新计划同时验收语言、冷编译规模与设备执行：先收尾现有父体组合，再统一区域
+合同，以双runtime轴和层次CV的合并切片检验架构，随后迁移完整FA。
+同政策AscendC只验收编译器保真，专家性能还需源码、profile和硬件分析。
 受限 AST 已接通单循环 Vector、运行时原始
 长度与精确对齐尾部；
 一般多层CV同步和真实FA迁移尚未完成。新 `prim_func` 不执行设备函数体，遗留
@@ -20,12 +20,14 @@ ASC 并调用 CANN 9.1。源码不依赖 reference、TileLang、TVM 或 MLIR 构
 已经可运行，首批性能也不是最终竞争目标。
 [顺序区域组合](docs/region-sequence.md)已接通根部单actor的普通工作、多个流水、
 真实初始化与异步出口协议。[state_sum](examples/ast_state_sum.py)有1 GiB设备例
-及独立AscendC/profile证据，冷源码→ASC p50约0.185秒。父serial体一般组合、
-跨region事件ID复用和mixed层次仍未接通，不能由此推断FA性能已达标。
+及独立AscendC/profile证据，历史冷源码→ASC p50约0.185秒。
+[父体init/child/use](examples/ast_grouped_state_sum.py)已接通严格frame子集，
+含多个child的21项回归及小设备对照通过，五次冷源码→ASC p50为0.8804秒。
+一般GM ownership、跨region事件ID复用和mixed层次仍缺，不能由此推断FA达标。
 
 P1a已共享actor分配/标量绑定，并移除逐叶重复验证全IR的开销。同一32流静态
 压力样本的完整冷源码→ASC p50从2.188秒降到0.773秒，最终ASC和验证报告保持
-一致；普通state_sum为0.164秒。口径、复现及尚缺的父体组合见
+一致；普通state_sum为0.164秒。口径、复现及父体组合的新证据见
 [编译成本记录](docs/refactor-progress.md)。
 
 两个独立长度参数、`ceildiv` 循环和有效前缀的可运行例子见
@@ -172,7 +174,8 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_DEVICE_ID=0 .venv/bin/python compiler/example
 AST 路径支持多个非负 uniform 参数及 min/max/ceildiv 上界；对齐尾部目前限于
 单独 AIV 和共同有效前缀。单actor末代effect后缀已接通；一般分支与嵌套循环
 保留为IR；目前接通单local actor的serial父循环×一个pipeline子循环，以及
-根部单actor普通工作与流水的顺序组合。父体一般组合和mixed层次仍未接通；
+根部单actor普通工作与流水的顺序组合。父体init/多个child/use已接通严格frame
+子集；无frame共享GM、跨sibling写同frame及mixed层次仍拒绝；
 legacy 静态内层仍有展开。两条路径的准确边界见[重构记录](docs/refactor-progress.md)。
 
 | 能力 | 实际支持 |
