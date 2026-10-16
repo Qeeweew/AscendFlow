@@ -48,6 +48,8 @@ src/xdsl_npu/
     native.py         # 原语合法性、物理effects、数值与原生表示合同
   analysis/
     iteration.py      # 真实SSA循环域、控制句柄，供admission和PLE共用
+    native.py         # 首次解码保留实际effects/cut，后续只绑定clock
+    transitions.py    # 将目标单指令规则应用到有类型边界，不做协议选择
     access.py         # root/view/范围、ownership、reaching definitions
     dependencies.py   # RAW/WAR/WAW与slot carried依赖
     frontier.py       # 有类型完成前沿与覆盖/合流，不是全源闭包
@@ -55,6 +57,7 @@ src/xdsl_npu/
     resources.py      # event lease、冲突、配对与进展事实
   passes/
     lower_native.py   # 显式recipe、地址/布局、完整effects
+    native_recipes.py # 原语展开，返回真实定义和全部reader，独立于控制构造
     lower_pipeline.py # 固定排步 → 统一PLE；递归处理所有循环
     insert_sync.py    # 消费依赖和前沿，构造逻辑通知
     assign_events.py  # bank/ID/width/共享选择，不重新推导内存关系

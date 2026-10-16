@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from ..diagnostics import CompileError, ErrorKind, require
-from .frontier import Clock, Frontier, FrontierWork, KnownPrefix, PrefixRank
+from .frontier import Clock, Frontier, FrontierWork, KnownPrefix
 from .regions import BoundaryLayout, BoundaryTransfer, Port, Requirement
 
 
@@ -188,15 +188,14 @@ def check_loop_invariant(
     if work is not None:
         work.body_applications += 1
     following = {}
+    rebinding_work = frontier_work
+    if rebinding_work is None and work is not None:
+        rebinding_work = FrontierWork()
     for port, state in candidate.items():
-        prefixes = []
-        for domain, rank in state.known.items():
-            if domain.clock == clock:
-                rank = PrefixRank(clock, rank.offset + 1, rank.lexical)
-                if work is not None:
-                    work.rebound_prefixes += 1
-            prefixes.append(KnownPrefix(domain, rank))
-        following[port] = Frontier(body.layout.frontier, prefixes)
+        before = 0 if rebinding_work is None else rebinding_work.updates
+        following[port] = state.rebase(clock, 1, work=rebinding_work)
+        if work is not None:
+            work.rebound_prefixes += rebinding_work.updates - before
     following = MappingProxyType(following)
     missing = _missing(following, after, work=work)
     if missing:

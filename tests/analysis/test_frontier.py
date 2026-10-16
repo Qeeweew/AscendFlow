@@ -400,3 +400,93 @@ def test_controller_issue_is_distinct_from_engine_admission():
     assert not state.covers(prefix(admission))
     with pytest.raises(FrontierError, match="no pipeline engine"):
         domain(engine=Engine.V, milestone=Milestone.ISSUE)
+
+
+def test_rebase_source_capture_into_consumer_coordinate_preserves_exact_pairing():
+    clock = Clock("g")
+    key = domain(clock=clock)
+    layout = FrontierLayout((key,))
+    original = Frontier(layout, (prefix(key, 2, 7),))
+    handoff = Handoff("ready", clock, ordinal=1,
+                      partition=Partition(owner="tile", slot="slot0"))
+    capture = original.capture(Actor.AIV0, Engine.V, handoff=handoff)
+    distance = 3
+    rebased = capture.rebase(clock, -distance)
+    assert rebased.producer is capture.producer and rebased.engine is capture.engine
+    assert rebased.frontier.layout is layout
+    assert rebased.frontier.known[key] == PrefixRank(clock, -1, 7)
+    assert rebased.handoff == replace(handoff, ordinal=-2)
+    assert rebased.handoff.partition is handoff.partition
+    for consumer_generation in (3, 8, 10**12):
+        source_generation = consumer_generation - distance
+        assert consumer_generation + rebased.frontier.known[key].offset == source_generation + 2
+        assert consumer_generation + rebased.handoff.ordinal == source_generation + 1
+    with pytest.raises(FrontierError, match="expected handoff"):
+        layout.empty().acquire(rebased, expected=handoff)
+    assert layout.empty().acquire(rebased, expected=rebased.handoff).covers(prefix(key, -1, 7))
+    assert original.known[key] == PrefixRank(clock, 2, 7)
+    assert capture.rebase(clock, -distance).rebase(clock, distance) == capture
+
+
+def test_rebase_changes_only_the_same_declared_clock_and_preserves_keys_and_partitions():
+    clock, foreign, same_name = Clock("g"), Clock("outer"), Clock("g")
+    keys = tuple(domain(clock=which, partition=Partition(owner=owner, slot=slot, guard=guard))
+                 for which, owner, slot, guard in (
+                     (clock, "left", "slot0", "first"),
+                     (clock, "right", "slot1", "last"),
+                     (foreign, "left", "slot0", "all"),
+                     (same_name, "left", "slot0", "all"),
+                 ))
+    original = Frontier(FrontierLayout(keys), tuple(prefix(key, index, 3)
+                                                   for index, key in enumerate(keys)))
+    work = FrontierWork()
+    rebased = original.rebase(clock, -2, work=work)
+    assert rebased.layout is original.layout
+    assert rebased.known.keys() == original.known.keys()
+    assert len(rebased) == len(original) == 4
+    for index, key in enumerate(keys):
+        if key.clock is clock:
+            assert rebased.known[key] == PrefixRank(clock, index - 2, 3)
+        else:
+            assert rebased.known[key] is original.known[key]
+    assert work.entries == work.copied_entries == 4
+    assert work.updates == 2 and work.comparisons == 0
+
+
+def test_rebase_zero_offset_or_absent_clock_does_not_copy_frontier_or_capture():
+    clock = Clock("g")
+    key = domain(clock=clock)
+    state = Frontier(FrontierLayout((key,)), (prefix(key),))
+    capture = state.capture(Actor.AIV0, Engine.V, handoff=Handoff("ready", clock))
+    work = FrontierWork()
+    assert state.rebase(clock, 0, work=work) is state
+    assert capture.rebase(clock, 0, work=work) is capture
+    assert work == FrontierWork()
+    distinct = Clock(clock.name)
+    assert state.rebase(distinct, 5) is state
+    assert capture.rebase(distinct, 5) is capture
+
+
+def test_rebase_handoff_and_payload_clocks_are_independent():
+    payload_clock, event_clock = Clock("payload"), Clock("event")
+    key = domain(clock=payload_clock)
+    state = Frontier(FrontierLayout((key,)), (prefix(key, 4),))
+    handoff = Handoff("ready", event_clock, ordinal=2)
+    capture = state.capture(Actor.AIV0, Engine.V, handoff=handoff)
+    payload_only = capture.rebase(payload_clock, -1)
+    assert payload_only.handoff is handoff
+    assert payload_only.frontier.known[key].offset == 3
+    event_only = capture.rebase(event_clock, -3)
+    assert event_only.frontier is state
+    assert event_only.handoff == replace(handoff, ordinal=-1)
+    native_snapshot = state.capture(Actor.AIV0, Engine.V).rebase(payload_clock, 1)
+    assert native_snapshot.handoff is None
+    assert native_snapshot.frontier.known[key].offset == 5
+
+
+@pytest.mark.parametrize("clock,offset", (("g", 1), (Clock("g"), True), (Clock("g"), 1.5)))
+def test_rebase_rejects_non_declared_clock_or_noninteger_offset(clock, offset):
+    state = FrontierLayout(()).empty()
+    with pytest.raises(FrontierError) as error:
+        state.rebase(clock, offset)
+    assert error.value.kind is ErrorKind.INVALID

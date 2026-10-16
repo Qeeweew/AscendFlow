@@ -17,7 +17,6 @@ from xdsl.ir import Block, Region
 from .diagnostics import require
 from .dialects.physical import BoundaryOp, EndOp, ScopeGuardOp
 from .dialects.source import (
-    AllocationOp,
     CopyOp,
     DomainOp,
     ElementOp,
@@ -29,19 +28,16 @@ from .dialects.source import (
     ScalarReadOp,
     ScaleOp,
     StageOp,
-    ViewOp,
-    block8_reduction_widths,
 )
 from .lowering_context import ActorBindings
 from .mixed import extract_mixed, global_dependencies
 from .model import Instance, dependencies, extract, ranges_cover
+from .passes import native_recipes
+from .passes.native_recipes import source_allocation as _root
+from .passes.native_recipes import source_shape as shape
 from .scalar import Expr, expression, from_ssa, literal, prefix
 from .source_scopes import Context
 from .target.native import ITEMSIZE
-
-
-def shape(value):
-    return tuple(n.data for n in value.type.shape)
 
 
 @dataclass(frozen=True)
@@ -196,22 +192,6 @@ def _refs(op):
     return op.a, op.b, op.accumulator
 
 
-def _native_input_index(op, index):
-    if isinstance(op, MatmulOp) and op.a.type.memory.data == "L1" and index < 2:
-        return 0  # Each input is read by a separate Load2D.
-    if isinstance(op, ElementOp) and op.kind.data.endswith("_rows") and index == 1:
-        return 0  # The row statistic's last reader is BRCB, not the arithmetic.
-    return index
-
-
-def _root(value):
-    owner = value.owner
-    require(isinstance(owner, ViewOp), "source work requires explicit typed views")
-    root = owner.source.owner
-    require(isinstance(root, AllocationOp), "view must retain one allocation identity")
-    return root
-
-
 def _initialize(op, record, coordinate=None):
     predicate = op.initialize.owner
     if isinstance(predicate, arith.CmpiOp):
@@ -328,8 +308,7 @@ class _Actor:
         self.region = self.kernel.stream
         self.bindings.mark_region(self.region)
         self.schedule = []
-        self.definitions = {}
-        self.readers = {}
+        self.recipe_results = {}
         self.scalar_values = {}
 
     def view(self, value, record, *, matrix=False):
@@ -642,209 +621,41 @@ class _Actor:
                 )
                 return operation
 
+            def source_view(value, *, matrix=False, record=record):
+                return self.view(value, record, matrix=matrix)
+
+            context = native_recipes.RecipeContext(source_view, self.kernel.view, task)
             if isinstance(op, CopyOp):
-                require(
-                    _root(op.destination).access.data != "read", "copy writes a read-only tensor"
-                )
-                require(
-                    (
-                        shape(op.source)[::-1]
-                        if op.transpose is not None and op.transpose.data
-                        else shape(op.source)
-                    )
-                    == shape(op.destination)
-                    and op.source.type.dtype == op.destination.type.dtype,
-                    "copy must preserve element type/extent; use an explicit cast",
-                )
-                banks = op.source.type.memory.data, op.destination.type.memory.data
-                if banks == ("GM", "L1"):
-                    require(len(shape(op.source)) == 2, "ND→NZ copy requires a matrix")
-                    task(
-                        "_copy",
-                        "nd2nz",
-                        self.view(op.source, record, matrix=True),
-                        self.view(op.destination, record),
-                        params=shape(op.source),
-                    )
-                elif banks in {("L1", "L0A"), ("L1", "L0B")}:
-                    transpose = op.transpose is not None and op.transpose.data
-                    task(
-                        "_copy",
-                        "load2d_a"
-                        if banks[1] == "L0A"
-                        else "load2d_b_nt"
-                        if transpose
-                        else "load2d_b_nn",
-                        self.view(op.source, record),
-                        self.view(op.destination, record),
-                        params=shape(op.source),
-                    )
-                elif banks == ("L0C", "GM"):
-                    task(
-                        "_export",
-                        "fix",
-                        self.view(op.source, record),
-                        self.view(op.destination, record, matrix=True),
-                        params=shape(op.source),
-                    )
-                else:
-                    source, destination = (
-                        self.view(op.source, record),
-                        self.view(op.destination, record),
-                    )
-                    dimensions = shape(op.source)
-                    padded = len(dimensions) == 2 and any(
-                        ref.owner.rows.data > 1 for ref in (source, destination)
-                    )
-                    if padded:
-                        # Preserve row footprints even if the other side is compact.
-                        source, destination = (
-                            self.view(op.source, record, matrix=True),
-                            self.view(op.destination, record, matrix=True),
-                        )
-                    task("_copy", "copy_rows" if padded else "copy", source, destination)
+                result = native_recipes.lower_copy(op, context)
             elif isinstance(op, ElementOp):
-                require(
-                    _root(op.destination).access.data != "read",
-                    "arithmetic writes a read-only tensor",
-                )
-                native = {
-                    "mul_scalar": "muls",
-                    "add_scalar": "adds",
-                    "fill": "fill",
-                    "mul": "mul",
-                    "add": "add",
-                    "sub": "sub",
-                    "exp": "exp",
-                    "sqrt": "sqrt",
-                    "rsqrt": "rsqrt",
-                    "div": "div",
-                    "maximum": "max",
-                }.get(op.kind.data)
-                if op.kind.data.endswith("_rows"):
-                    require(op.scratch is not None, "row broadcast requires scratch")
-                    rows, cols = shape(op.destination)
-                    source, statistic, destination = (
-                        self.view(value, record) for value in (*op.inputs, op.destination)
-                    )
-                    temporary = self.view(op.scratch, record)
-                    task("_broadcast", "brcb8", statistic, temporary, params=(rows,))
-                    task(
-                        "_" + op.kind.data,
-                        op.kind.data.removesuffix("_rows") + "_row_broadcast",
-                        source,
-                        temporary,
-                        destination,
-                        params=(rows, cols),
-                        order_delta=1,
-                    )
-                    self.definitions[number] = uid + "_" + op.kind.data
-                    self.readers[number, 0] = self.definitions[number]
-                    self.readers[number, 1] = uid + "_broadcast"
-                    continue
-                if op.kind.data == "cast":
-                    require(len(op.inputs) == 1, "cast takes one source tile")
-                    source_dtype, destination_dtype = (
-                        op.inputs[0].type.dtype.data,
-                        op.destination.type.dtype.data,
-                    )
-                    require(
-                        source_dtype != destination_dtype,
-                        "identity cast needs no conversion operation",
-                    )
-                    native = "convert_f32" if destination_dtype == "f32" else "convert_rn"
-                require(native is not None, f"unsupported typed element operation {op.kind.data}")
-                refs = [self.view(value, record) for value in (*op.inputs, op.destination)]
-                task(
-                    "_" + op.kind.data,
-                    native,
-                    *refs,
-                    scalar=0.0 if op.scalar is None else op.scalar.value.data,
-                )
+                result = native_recipes.lower_element(op, context)
             elif isinstance(op, ReduceOp):
-                require(
-                    _root(op.scratch).access.data != "read"
-                    and _root(op.destination).access.data != "read",
-                    "reduction writes a read-only buffer",
-                )
-                rows, cols = (
-                    (1, shape(op.source)[0]) if len(shape(op.source)) == 1 else shape(op.source)
-                )
-                source, temporary, destination = (
-                    self.view(value, record, matrix=True)
-                    for value in (op.source, op.scratch, op.destination)
-                )
-                block8 = op.order.data == "block8_then_packed_merge"
-                if block8:
-                    workspace, byte_offset = temporary, 0
-                    widths = block8_reduction_widths(cols)
-                    for level, columns in enumerate(widths):
-                        temporary = self.kernel.view(
-                            workspace,
-                            columns * 4,
-                            offset=byte_offset,
-                            rows=rows,
-                            row_stride=columns * 4,
-                        )
-                        task(
-                            "_partial" if level == 0 else f"_block8_{level}",
-                            "reduce_" + op.kind.data + "8",
-                            source,
-                            temporary,
-                            order_delta=level,
-                        )
-                        source = temporary
-                        byte_offset += rows * columns * 4
-                    partials, merge_order = widths[-1], len(widths)
-                else:
-                    task(
-                        "_partial",
-                        "reduce_" + op.kind.data + "64",
-                        source,
-                        temporary,
-                        params=(rows, cols),
-                    )
-                    partials, merge_order = cols // 64, 1
-                task(
-                    "_merge",
-                    "merge_"
-                    + op.kind.data
-                    + ("_packed" if block8 or op.order.data == "r64_then_packed_merge" else ""),
-                    temporary,
-                    destination,
-                    params=(rows, partials),
-                    order_delta=merge_order,
-                )
+                result = native_recipes.lower_reduce(op, context)
             elif isinstance(op, ScalarReadOp):
-                captured = task("_capture", "scalar_load", self.view(op.source, record))
-                self.scalar_values[op.value] = captured.value
+                result = native_recipes.lower_scalar_read(op, context)
+                self.scalar_values[op.value] = result.scalar_value
             elif isinstance(op, ScaleOp):
                 require(
                     op.factor in self.scalar_values and op.factor.owner.parent is op.parent,
                     "captured scalar must be read earlier in the same source scope",
                 )
-                require(
-                    _root(op.destination).access.data != "read", "scale writes a read-only buffer"
-                )
-                task(
-                    "_scale",
-                    "scale_value",
-                    self.view(op.source, record),
-                    self.view(op.destination, record),
-                    self.scalar_values[op.factor],
+                result = native_recipes.lower_scale(
+                    op, context, factor=self.scalar_values[op.factor]
                 )
             elif isinstance(op, MatmulOp):
                 initialization = _initialize(op, record, self.pipeline.body.block.args[0])
-                m, k = shape(op.a)
-                n, bk = shape(op.b) if op.transpose_b.data else (shape(op.b)[1], shape(op.b)[0])
-                require(k == bk and shape(op.accumulator) == (m, n), "gemm shapes disagree")
                 if op.a.type.memory.data == "L1":
+                    # Only the legacy adapter owns implicit operand storage.
+                    # The reusable native recipe accepts explicit L0 operands.
+                    m, n, k = native_recipes.matmul_dimensions(op)
                     a_buffer, b_buffer = self.operand_buffers[op]
                     dtype = op.a.type.dtype.data
                     a = self.kernel.view(a_buffer, m * k * ITEMSIZE[dtype])
                     b = self.kernel.view(b_buffer, n * k * ITEMSIZE[dtype])
-                    task("_operand_a", "load2d_a", self.view(op.a, record), a, params=(m, k))
-                    task(
+                    load_a = task(
+                        "_operand_a", "load2d_a", self.view(op.a, record), a, params=(m, k)
+                    )
+                    load_b = task(
                         "_operand_b",
                         "load2d_b_nt" if op.transpose_b.data else "load2d_b_nn",
                         self.view(op.b, record),
@@ -852,39 +663,31 @@ class _Actor:
                         params=shape(op.b),
                         order_delta=1,
                     )
+                    mad = task(
+                        "_mad",
+                        "mad_first" if initialization == "first" else "mad",
+                        a,
+                        b,
+                        self.view(op.accumulator, record),
+                        params=(m, n, k)
+                        if initialization == "first"
+                        else (m, n, k, initialization),
+                        order_delta=2,
+                    )
+                    readers = [
+                        native_recipes.NativeRead(0, load_a, 0),
+                        native_recipes.NativeRead(1, load_b, 0),
+                    ]
+                    if initialization != 1:
+                        readers.append(native_recipes.NativeRead(2, mad, 2))
+                    result = native_recipes.RecipeResult(
+                        (load_a, load_b, mad), mad, 2, tuple(readers)
+                    )
                 else:
-                    a, b = self.view(op.a, record), self.view(op.b, record)
-                task(
-                    "_mad",
-                    "mad_first" if initialization == "first" else "mad",
-                    a,
-                    b,
-                    self.view(op.accumulator, record),
-                    params=(m, n, k) if initialization == "first" else (m, n, k, initialization),
-                    order_delta=2 if op.a.type.memory.data == "L1" else 0,
-                )
-            if isinstance(op, CopyOp):
-                suffix = "_export" if op.source.type.memory.data == "L0C" else "_copy"
-                self.definitions[number] = uid + suffix
-                self.readers[number, 0] = uid + suffix
-            elif isinstance(op, ElementOp):
-                self.definitions[number] = uid + "_" + op.kind.data
-                for i in range(len(op.inputs)):
-                    self.readers[number, i] = self.definitions[number]
-            elif isinstance(op, ReduceOp):
-                self.definitions[number] = uid + "_merge"
-                self.readers[number, 0] = uid + "_partial"
-            elif isinstance(op, ScalarReadOp):
-                self.definitions[number] = self.readers[number, 0] = uid + "_capture"
-            elif isinstance(op, ScaleOp):
-                self.definitions[number] = self.readers[number, 0] = uid + "_scale"
+                    result = native_recipes.lower_matmul(op, context, initialization=initialization)
             else:
-                self.definitions[number] = uid + "_mad"
-                explicit = op.a.type.memory.data == "L0A"
-                self.readers[number, 0] = uid + ("_mad" if explicit else "_operand_a")
-                self.readers[number, 1] = uid + ("_mad" if explicit else "_operand_b")
-                if initialization != 1:
-                    self.readers[number, 2] = uid + "_mad"
+                require(False, f"unsupported source native recipe {op.name}")
+            self.recipe_results[number] = result
         for block in boundaries.values():
             block.add_op(EndOp())
         for block in parent_blocks:
@@ -959,7 +762,12 @@ def _check_values(physical, actors, outer, *, _facts=None):
                             for var, literal in source_record.constants
                         ):
                             candidates.append(
-                                (source_actor, source_lowering.definitions[source_number])
+                                (
+                                    source_actor,
+                                    source_lowering.recipe_results[
+                                        source_number
+                                    ].definition.uid.data,
+                                )
                             )
                 require(
                     len(candidates) == 1,
@@ -970,31 +778,36 @@ def _check_values(physical, actors, outer, *, _facts=None):
                 if private and len(actors) == 3:
                     root_name = f"{actor}/{root_name}"
                 read_index = input_index.data
+                readers = tuple(
+                    reader
+                    for reader in lowering.recipe_results[number].readers
+                    if reader.source_input == read_index
+                )
                 require(
-                    (number, read_index) in lowering.readers and _root(refs[read_index]) is root,
+                    readers and _root(refs[read_index]) is root,
                     "logical tile result does not match a consumed storage view",
                 )
-                read_uid = lowering.readers[number, read_index]
-                task_index = indices[actor][read_uid]
-                read_task = programs[actor].tasks[task_index]
-                native_index = _native_input_index(record.op, read_index)
-                ref = read_task.refs[native_index]
-                for generation in range(programs[actor].count):
-                    expected = (
-                        source_actor,
-                        Instance(generation, indices[source_actor][source_uid]),
-                    )
-                    consumer = (actor, Instance(generation, task_index))
-                    produced = [
-                        (lo, hi)
-                        for writer, lo, hi in writers.get((consumer, root_name), ())
-                        if writer == expected
-                    ]
-                    require(
-                        ranges_cover(produced, ref.segments(generation)),
-                        f"logical tile from {source_uid} was overwritten before {read_uid}; "
-                        "use the current buffer or a distinct declared destination",
-                    )
+                for reader in readers:
+                    read_uid = reader.operation.uid.data
+                    task_index = indices[actor][read_uid]
+                    read_task = programs[actor].tasks[task_index]
+                    ref = read_task.refs[reader.ref_index]
+                    for generation in range(programs[actor].count):
+                        expected = (
+                            source_actor,
+                            Instance(generation, indices[source_actor][source_uid]),
+                        )
+                        consumer = (actor, Instance(generation, task_index))
+                        produced = [
+                            (lo, hi)
+                            for writer, lo, hi in writers.get((consumer, root_name), ())
+                            if writer == expected
+                        ]
+                        require(
+                            ranges_cover(produced, ref.segments(generation)),
+                            f"logical tile from {source_uid} was overwritten before {read_uid}; "
+                            "use the current buffer or a distinct declared destination",
+                        )
 
 
 def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=(), _facts=None):
@@ -1041,27 +854,38 @@ def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=(), _
                                 else ("aic" if source_actor == "cube" else "aiv0")
                             )
                             candidates.append(
-                                (source_owner, source_lowering.definitions[source_number])
+                                (
+                                    source_owner,
+                                    source_lowering.recipe_results[
+                                        source_number
+                                    ].definition.uid.data,
+                                )
                             )
                 require(len(candidates) == 1, "logical tile producer has ambiguous ownership")
                 index = input_index.data
-                read_uid = lowering.readers[number, index]
-                task = tasks[read_uid]
-                native_index = _native_input_index(record.op, index)
-                ref = task.refs[native_index]
-                root_name = loop.root(owner, ref)
-                for r in range(loop.storage_periods[root_name]):
-                    produced = [
-                        (o.start, o.stop)
-                        for o in writers.get((candidates[0], (owner, read_uid), root_name), ())
-                        if o.distance == 0 and r % o.period in o.residues
-                    ]
-                    frame = loop.frames.get(root_name, 0)
-                    needed = [(lo - r * frame, hi - r * frame) for lo, hi in ref.segments(r)]
-                    require(
-                        ranges_cover(produced, needed),
-                        f"logical tile from {candidates[0][1]} was overwritten before {read_uid}",
-                    )
+                readers = tuple(
+                    reader
+                    for reader in lowering.recipe_results[number].readers
+                    if reader.source_input == index
+                )
+                require(readers, "logical tile input has no native reader")
+                for reader in readers:
+                    read_uid = reader.operation.uid.data
+                    task = tasks[read_uid]
+                    ref = task.refs[reader.ref_index]
+                    root_name = loop.root(owner, ref)
+                    for r in range(loop.storage_periods[root_name]):
+                        produced = [
+                            (o.start, o.stop)
+                            for o in writers.get((candidates[0], (owner, read_uid), root_name), ())
+                            if o.distance == 0 and r % o.period in o.residues
+                        ]
+                        frame = loop.frames.get(root_name, 0)
+                        needed = [(lo - r * frame, hi - r * frame) for lo, hi in ref.segments(r)]
+                        require(
+                            ranges_cover(produced, needed),
+                            f"logical tile from {candidates[0][1]} was overwritten before {read_uid}",
+                        )
 
 
 def lower_source(module, *, symbolic=True, _facts=None):

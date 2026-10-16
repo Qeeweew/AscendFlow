@@ -13,6 +13,12 @@ from math import lcm
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType
 
+from .analysis.native import (
+    DecodedNativeEffects,
+    decode_native_task,
+    native_task_contract,
+    own_native_effects,
+)
 from .budget import poll
 from .diagnostics import require
 from .dialects.physical import (
@@ -36,7 +42,7 @@ from .dialects.physical import (
     ViewOp,
 )
 from .loop_boundary import stream_operations
-from .model import Ref, Storage, Task, optional_int, ranges_overlap, storage_layout, task_scalar
+from .model import Ref, Storage, Task, optional_int, ranges_overlap, storage_layout
 from .periodic import MAX_ACCESS_SEGMENTS, MAX_PERIOD_TEMPLATES, bounded_period
 from .scalar import (
     ARITHMETIC,
@@ -48,7 +54,8 @@ from .scalar import (
     literal,
     uniform,
 )
-from .target.native import CAPACITY, ITEMSIZE, check_load3d, native_contract
+from .target.ascend910b import Actor as TargetActor
+from .target.native import CAPACITY, ITEMSIZE, check_load3d
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,7 @@ class Actor:
     stream: StreamOp
     program: Templates
     operations: dict
+    owned_effects: DecodedNativeEffects | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +212,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
     declarations, streams = dict(shared), []
     config = False
     load3d = None
+    configurations = {}
     for op in kernel.body.block.ops:
         if isinstance(op, BufferOp):
             declarations[op.ref] = _storage(op, limit, uniform_values)
@@ -224,12 +233,14 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 "FIX config is unique and precedes the stream",
             )
             config = True
+            configurations[FixConfigOp] = op
         elif isinstance(op, Load3DConfigOp):
             require(
                 load3d is None and kernel.core.data == "aic" and not streams,
                 "Load3D configuration must be unique and precede the stream",
             )
             load3d = op.a_width.data, op.b_width.data
+            configurations[Load3DConfigOp] = op
             require(
                 all(16 <= w <= 256 and w % 16 == 0 for w in load3d),
                 "invalid invariant Load3D fmatrix width",
@@ -269,6 +280,13 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
             f"{bank} capacity/owner violation",
         )
     views, tasks, operations = {}, [], {}
+    provenance = {value: value for value in declarations}
+    owned_tasks = (
+        []
+        if invocation is None and region is None and not isinstance(kernel.parent_op(), MixedOp)
+        else None
+    )
+    physical_actor = TargetActor.AIC if kernel.core.data == "aic" else TargetActor.AIV0
     scalar_values = {}
     for op, last in stream_operations(stream):
         if isinstance(op, ViewOp):
@@ -376,6 +394,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
             # Nested periodic views are checked later for every residue, with
             # the same count translation. No bounding box replaces their holes.
             views[op.ref] = ref
+            provenance[op.ref] = provenance[op.source]
             if parent is not None:
                 require(
                     (ref.count_offset, ref.count_core_stride)
@@ -400,12 +419,12 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 all(ref in views for ref in operands), "native operands need physical bounded views"
             )
             refs = tuple(views[ref] for ref in operands)
-            params = tuple(value.data for value in op.params)
             require(
                 not isinstance(stream, OnceOp) or op.stage.data == 0,
                 "ordinary block operations cannot have a pipeline stage offset",
             )
-            pipe, modes = native_contract(op.native.data, refs, params)
+            contract = native_task_contract(op, refs)
+            pipe, modes, params = contract.engine.value, contract.modes, contract.params
             if invocation is not None:
                 frames = {frame.name for frame in invocation.frames}
                 framed_roots = {frame.root.sym_name.data for frame in invocation.frames}
@@ -456,7 +475,7 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 op.stage.data,
                 refs,
                 modes,
-                task_scalar(op),
+                contract.scalar,
                 params,
                 issue_order=optional_int(op.issue_order, len(tasks)),
                 logical_phase=optional_int(op.logical_phase, 0),
@@ -490,6 +509,20 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
                 )
             tasks.append(task)
             operations[uid] = op
+            if owned_tasks is not None:
+                owned_tasks.append(
+                    decode_native_task(
+                        op,
+                        contract,
+                        refs,
+                        operands,
+                        provenance,
+                        actor=physical_actor,
+                        issue_order=task.issue_order,
+                        configurations=configurations,
+                        last=last,
+                    )
+                )
             if op.value is not None:
                 scalar_values[op.value] = uid
         else:
@@ -515,6 +548,9 @@ def _actor(name, kernel, shared, limit, groups, uniform_values, invocation=None,
             load3d,
         ),
         operations,
+        None
+        if owned_tasks is None
+        else own_native_effects(kernel, stream, physical_actor, owned_tasks),
     ), views
 
 

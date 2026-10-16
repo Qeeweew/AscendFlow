@@ -17,7 +17,7 @@ keys or retained notification history.
 """
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
 from ..diagnostics import CompileError, ErrorKind
@@ -252,6 +252,34 @@ class Frontier:
             ((prefix.domain, prefix.rank) for prefix in prefixes), work=work
         )
 
+    def rebase(self, clock: Clock, offset: int, *, work: FrontierWork | None = None) -> "Frontier":
+        """Substitute ``g_old = g_new + offset`` in one declared clock.
+
+        This is coordinate substitution, not execution progress. Domain keys,
+        owner/slot/guard partitions, lexical ranks and other clocks are kept
+        exactly. No historical snapshot is reconstructed or token inferred.
+        """
+        _require(isinstance(clock, Clock), "frontier rebasing needs a declared clock")
+        _require(type(offset) is int, "frontier rebasing offset must be an integer")
+        if offset == 0:
+            return self
+        known = self.known
+        changed = False
+        for domain, rank in self.known.items():
+            if work is not None:
+                work.entries += 1
+            if domain.clock is not clock:
+                continue
+            if not changed:
+                if work is not None:
+                    work.copied_entries += len(known)
+                known = dict(known)
+                changed = True
+            known[domain] = PrefixRank(clock, rank.offset + offset, rank.lexical)
+            if work is not None:
+                work.updates += 1
+        return self._from_known(self.layout, known) if changed else self
+
     def _acquire_entries(self, entries, *, work):
         known = self.known
         changed = False
@@ -406,3 +434,18 @@ class Capture:
             self.handoff is None or isinstance(self.handoff, Handoff),
             "capture needs a typed handoff identity",
         )
+
+    def rebase(self, clock: Clock, offset: int, *, work: FrontierWork | None = None) -> "Capture":
+        """Re-express this existing snapshot and its ordinal in one clock.
+
+        Producer, engine and handoff partition retain their identities. A
+        subsequent acquire must still supply the exact rebased handoff; this
+        operation neither finds a matching Wait nor replays the producer.
+        """
+        frontier = self.frontier.rebase(clock, offset, work=work)
+        handoff = self.handoff
+        if offset != 0 and handoff is not None and handoff.clock is clock:
+            handoff = replace(handoff, ordinal=handoff.ordinal + offset)
+        if frontier is self.frontier and handoff is self.handoff:
+            return self
+        return Capture(self.producer, self.engine, frontier, handoff)

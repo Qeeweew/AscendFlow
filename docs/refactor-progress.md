@@ -4,7 +4,7 @@
 
 ## 1. 当前工作和代码现场
 
-用户已授权按新方案完成重构。算子优化和旧求解器局部调优仍停止。M0文档整理已完成，当前M1实施中；本轮已修改底层结构并建立新的控制/前沿/边界组件，尚未替换公共入口的同步算法，没有运行CANN或设备。
+用户已授权按新方案完成重构。算子优化和旧求解器局部调优仍停止。M0文档整理已完成，M1基础组件保存于`a111140`；当前继续M1接线和M2局部同步。尚未替换公共入口的同步算法，没有运行CANN或设备。
 
 此前 `7ddaa54ec060a92e219d0462df162939b8b32d72` 的交付未达标。重构前全部实验和文档已保存到 `bbc1458`，标题为“Checkpoint paused synchronization experiments and structured-loop refactor plan”，不是资格声明。根目录没有产品Git。
 
@@ -29,6 +29,15 @@
 随后把loop domain数据下沉`analysis/iteration.py`，source算术admission与PLE共用真实lower/upper/stride，修正负下界被误当0、非零起点被误拒、非零上界空循环仍检查不执行除法的问题；相关39项通过。`Actor.view`仍有旧零起点地址假设，所以控制/admission支持nonzero lower/stride不代表完整设备路径已支持。
 
 M1尚缺控制有效域与实际native完成/入口出口的接线，以及由真实effects推导有限layout、carried候选和精确出口。一步保持结果是带前提的合同：相同guard标签本身不证明FIRST/LAST等条件在下一代仍成立，必须由控制层建立合法successor域。M2–M6未完成。
+
+### M2当前接线（未完成）
+
+- `passes/native_recipes.py`从旧`_Actor.emit`抽出copy、element/BRCB、reduce、Scalar和显式L0 matmul，返回真实task、定义位置、每个源输入的全部实际reader。旧logical Tile检查已消费这些reader，避免仅检查第一个reader而漏掉后续覆盖。控制、地址绑定及legacy L1 operand展开仍在旧adapter。
+- `analysis/native.py`把已admit的单actor局部流水绑定到实际TaskOp/operand/root SSA、精确Ref及SPR effects。原语合同和view根在首次解码时建立，后续绑定clock不再重解码。嵌套/CV/动态任务尚不由此入口处理。
+- `analysis/hazards.py`一次消费已有物理依赖，保留RAW/WAR/WAW、真实首尾cut、距离/余数/末次域和实际root。显式区分consumer logical generation与physical step坐标；没有通过名字证明不别名，没有枚举运行长度。
+- `analysis/transitions.py`使用目标合同给出单指令native/Set/Wait/pipe fence转移。退休端口只是完成时的条件状态，派发不能取得它；Set effect不回注后续源流水。filtered implicit只覆盖满足目标合同的原语，不能借large MAD证明此前short MAD退休。已有capture的坐标代换同时处理prefix和handoff ordinal，不重放历史。
+
+定向证据：recipe相关16项通过，四个小例native IR与抽取前相同；effects提取14项通过；hazard绑定10项通过；单指令转移14项通过。合并后的analysis、loop归纳、recipe及小例公共compile/API组共137项通过（5.89s），各组存在重叠，不相加。这些不是新同步生成器或整条公共路径验收。尚缺协议选择、carried/首尾合同接通、资源分配与新同步IR物化；Scalar SPR setup也必须在实际指令排步中明确，不能只靠effects字段宣称完成。
 
 ## 2. 编译耗时：明确未达标
 
