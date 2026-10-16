@@ -6,6 +6,7 @@ controls the number of native nodes or templates. A retirement output carries
 captured facts on its own pipe, not completion of the child as a whole.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
 from sys import int_info
@@ -41,6 +42,26 @@ class ChildPort:
 
 
 ProjectionPoint = ChildPort | Site
+Binding = tuple[int, tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class FixedNativeView:
+    """One actual fixed native topology, before any endpoint-origin projection."""
+
+    count: int
+    inputs: tuple[ChildPort, ...]
+    outputs: tuple[ChildPort, ...]
+    flow: SymbolicCompletion
+    graph: object
+    streams: dict
+    port_bindings: dict[ChildPort, Binding]
+    bind_site: Callable[[Site], Binding]
+
+
+def native_fixed_child(analysis, *, insertion_cuts=False) -> FixedNativeView:
+    """Retain one native body for exact local transfer, without projecting sites."""
+    return _fixed_child(analysis, (), insertion_cuts=insertion_cuts, native_only=True)
 
 
 @dataclass(frozen=True)
@@ -249,6 +270,10 @@ def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
     begins to the actual FIFO successor without entering the source begin.
     These cuts do not create asynchronous completion.
     """
+    return _fixed_child(analysis, endpoints, insertion_cuts=insertion_cuts, native_only=False)
+
+
+def _fixed_child(analysis, endpoints, *, insertion_cuts, native_only):
     loop, channel_map, streams, graph, _ = analysis
     count = loop.constant_count
     require(
@@ -342,7 +367,7 @@ def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
             "admit_queue",
             "after_queue",
         }
-    for site in endpoints:
+    def site_binding(site):
         require(
             site.point in milestones
             and isinstance(site.position, Position)
@@ -368,7 +393,10 @@ def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
         require(0 <= generation < count, "inactive child completion endpoint")
         endpoint = binding(command, site.point, generation)
         require(endpoint is not None, "inactive or unsupported child completion endpoint milestone")
-        bindings[site] = endpoint
+        return endpoint
+
+    for site in endpoints:
+        bindings[site] = site_binding(site)
 
     inputs, outputs = [], []
     for actor, sequence in streams.items():
@@ -423,6 +451,18 @@ def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
                 points.setdefault("end", points["begin"])
                 if (gate := prefix_inputs(last, points).get(kind)) is not None:
                     flow.edge(gate, exit, source_point=(0, generation), target_point=(0, 0))
+
+    if native_only:
+        return FixedNativeView(
+            count,
+            tuple(inputs),
+            tuple(outputs),
+            flow,
+            graph,
+            streams,
+            dict(bindings),
+            site_binding,
+        )
 
     # Head/tail names and normalized wait milestones may bind to one actual
     # native point. Share their instrumentation origin, keeping every Site.

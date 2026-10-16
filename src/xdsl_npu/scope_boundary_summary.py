@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from .budget import bounded
 from .completion import CountDomain, Position, _first
+from .region_patterns import FrontierGroup, PhysicalRanges, TransferCase, materialize_frontiers
 from .region_summary import Access, CellSummary, ReadSpan, _scan
 from .scope_guarded_access import BoundaryEffect, _Budget, _cells, _domains, _word
 from .symbolic_completion import meet
@@ -146,28 +147,10 @@ def _long(records, domain, period, budget):
     return _then(_then(first, middle), last)
 
 
-@bounded
-def summarize_frontiers(
-    records: Iterable[BoundaryEffect], *, statistics: dict | None = None
-) -> tuple[CellSummary, ...]:
-    """Summarize incoming reads, first/last writes and surviving readers.
-
-    Endpoints keep their actual actor/native-inner identity. Access positions
-    and ReadSpan bounds refer only to the parent generation. Count predicates,
-    sparse byte cells, logical word order and supported first/middle/last
-    geometry use the existing guarded-access contracts; unknown geometry is
-    rejected. N=0 and domains without effects are identity transfers, with no
-    cells. Reads before the first write require an incoming value; this API has
-    no initialization assumption and supplies no definition or completion fact.
-
-    Identical effect sequences share transfer computation within this call.
-    Physical cells are still emitted separately, including adjacent rows and
-    cells separated by holes. ``transfer_visits`` counts only actual transfer
-    computation; ``visits`` also counts indexing, signatures and output cells.
-    """
-    records, budget, summaries = tuple(records), _Budget(), []
+def _frontier_patterns(records, statistics, *, materialize):
+    records, budget = tuple(records), _Budget()
     cells = short_domains = long_domains = 0
-    reused_cells = transfer_visits = 0
+    reused_cells = transfer_visits = summaries = 0
     transfers = {}
     max_period = 1
     for root, lo, hi, work in _cells(records, budget):
@@ -193,39 +176,82 @@ def summarize_frontiers(
                         long_count += 1
                         frontier = _long(work, domain, period, budget)
                     if frontier != IDENTITY:
-                        frontiers.append((domain, frontier))
-            transfers[signature] = tuple(frontiers), short_count, long_count, word_period
+                        frontiers.append(
+                            TransferCase(
+                                domain,
+                                frontier.reads_before_write,
+                                frontier.first_write,
+                                frontier.last_write,
+                                frontier.pending_reads,
+                            )
+                        )
+            transfers[signature] = tuple(frontiers), short_count, long_count, word_period, {}
             transfer_visits += budget.visits - before
+            if not materialize:
+                budget.charge(
+                    sum(1 + len(c.reads_before_write) + len(c.pending_reads) for c in frontiers)
+                )
         else:
             reused_cells += 1
-        frontiers, short_count, long_count, word_period = transfers[signature]
+        frontiers, short_count, long_count, word_period, ranges = transfers[signature]
         short_domains += short_count
         long_domains += long_count
         max_period = max(max_period, word_period)
-        for domain, frontier in frontiers:
-            budget.charge(1 + len(frontier.reads_before_write) + len(frontier.pending_reads))
-            summaries.append(
-                CellSummary(
-                    root,
-                    lo,
-                    hi,
-                    domain,
-                    frontier.reads_before_write,
-                    frontier.first_write,
-                    frontier.last_write,
-                    frontier.pending_reads,
+        if frontiers:
+            if materialize:
+                budget.charge(
+                    sum(1 + len(c.reads_before_write) + len(c.pending_reads) for c in frontiers)
                 )
-            )
+            else:
+                budget.charge(1)
+            ranges.setdefault(root, []).append((lo, hi, cells - 1))
+            summaries += len(frontiers)
+    groups = tuple(
+        FrontierGroup(
+            word, tuple(PhysicalRanges(root, tuple(spans)) for root, spans in ranges.items())
+        )
+        for word, _, _, _, ranges in transfers.values()
+        if ranges
+    )
     if statistics is not None:
         statistics.update(
             visits=budget.visits,
             cells=cells,
-            summaries=len(summaries),
+            summaries=summaries,
             short_domains=short_domains,
             long_domains=long_domains,
             max_period=max_period,
             unique_transfer_words=len(transfers),
             reused_cells=reused_cells,
             transfer_visits=transfer_visits,
+            shared_frontier_cases=sum(len(group.word) for group in groups),
+            physical_range_groups=sum(len(group.ranges) for group in groups),
+            materialized_cells=summaries if materialize else 0,
         )
-    return tuple(summaries)
+    return groups
+
+
+@bounded
+def summarize_frontier_patterns(
+    records: Iterable[BoundaryEffect], *, statistics: dict | None = None
+) -> tuple[FrontierGroup, ...]:
+    """Build semantic transfer words before attaching exact physical coverage.
+
+    A repeated word creates no per-byte ``CellSummary``. Its ranges retain
+    every cut, hole and root; all reader spans and count domains remain in the
+    shared word. This is a memory relation with no completion or initialization
+    assumption. Work and budgets count actual words and physical range pieces.
+    """
+    return _frontier_patterns(records, statistics, materialize=False)
+
+
+@bounded
+def summarize_frontiers(
+    records: Iterable[BoundaryEffect], *, statistics: dict | None = None
+) -> tuple[CellSummary, ...]:
+    """Materialize the complete frontier API, retaining physical/case order.
+
+    Semantic computation is shared with ``summarize_frontier_patterns``. This
+    explicit full adapter charges every output cell and reader as before.
+    """
+    return materialize_frontiers(_frontier_patterns(records, statistics, materialize=True))

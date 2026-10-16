@@ -2,7 +2,7 @@
 
 from .budget import bounded
 from .model import require
-from .scope_query_checks import check_memory, prepare_memory_checks
+from .scope_query_checks import check_memory, memory_check_reason, prepare_memory_checks
 from .scope_query_completion import QueryCompletion
 from .scope_query_protocols import read_query_protocols
 from .scope_resources import invocation_resources
@@ -36,14 +36,10 @@ def verify_query_invocations(checked, parent, *, resources=None, query_plan=None
         query_plan._check_owned(checked, parent, resources)
         query, checks, answers = query_plan.completion, query_plan.checks, query_plan.answers
     for check, valid in zip(checks, answers, strict=True):
-        obligation = check.obligations[0]
-        roots = [
-            name for name, root in checked.access.origins.items() if root is obligation.storage
-        ]
         require(
             valid,
             "missing cross-query memory and event lifetime synchronization: "
-            f"{obligation.hazard} {'/'.join(roots)}[{obligation.start}:{obligation.stop}], "
+            f"{memory_check_reason(check, checked.access)}, "
             f"{check.source} -> {check.target}, {check.domain}",
         )
     resource_report = _verify_query_resources(checked, parent, query, resources, query_plan)

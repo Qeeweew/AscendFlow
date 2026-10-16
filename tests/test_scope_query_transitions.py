@@ -107,6 +107,7 @@ class FiniteQueryTransitions(FiniteQueries):
                         continue
                     endpoint = replace(endpoint, query=index)
                     generation = endpoint.parent.evaluate(count)
+                    assert native_points(endpoint, "begin"), "query event lost its actual native"
                     owner = owners[endpoint.call, replace(endpoint.site, point="begin")]
                     task = tasks[owner]
                     before_issue = native_points(

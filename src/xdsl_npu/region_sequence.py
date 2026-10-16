@@ -18,6 +18,7 @@ from xdsl.ir import SSAValue
 from .budget import bounded, poll
 from .model import require
 from .periodic import bounded_period
+from .region_patterns import HazardCoverage, HazardPattern, PhysicalRanges, materialize_hazards
 from .region_summary import Access, CountDomain, ReadSpan, RegionSummary
 from .scalar import Expr
 
@@ -123,6 +124,60 @@ class SequenceSummary:
         return tuple(result)
 
 
+@dataclass(frozen=True)
+class SequenceTransfer:
+    """One complete semantic transfer word over exact allocation ranges."""
+
+    word: tuple
+    ranges: tuple[PhysicalRanges, ...]
+
+
+@dataclass(frozen=True)
+class SequencePatternSummary:
+    bound: Expr | None
+    bound_value: SSAValue | None
+    frontiers: tuple[SequenceTransfer, ...]
+    patterns: tuple[HazardPattern, ...]
+    visits: int
+
+    def materialize(self, *, materialize_cells=True):
+        """Explicit diagnostic/reference expansion; normal consumers use patterns."""
+        output, work = [], _Work(self.visits)
+        if materialize_cells:
+            for group in self.frontiers:
+                for ranges in group.ranges:
+                    for lo, hi, order in ranges.pieces():
+                        for index, (domain, frontier, _) in enumerate(group.word):
+                            work.charge(
+                                1 + len(frontier.reads_before_write) + len(frontier.pending_reads),
+                                "output-piece",
+                            )
+                            output.append(
+                                (
+                                    (order, index),
+                                    Cell(
+                                        ranges.storage,
+                                        lo,
+                                        hi,
+                                        domain,
+                                        frontier.reads_before_write,
+                                        frontier.first_write,
+                                        frontier.last_write,
+                                        frontier.pending_reads,
+                                    ),
+                                )
+                            )
+            output.sort(key=lambda item: item[0])
+        work.charge(sum(pattern.physical_count for pattern in self.patterns), "obligation")
+        return SequenceSummary(
+            self.bound,
+            self.bound_value,
+            tuple(item[1] for item in output),
+            materialize_hazards(self.patterns),
+            work.visits,
+        )
+
+
 def _domains(entries):
     """Partition N only where a participating *dynamic* region changes transfer.
 
@@ -212,6 +267,181 @@ def _transfers(entries, work):
                 )
             )
     return tuple(result)
+
+
+@bounded
+def summarize_sequence_patterns(parts, *, obligation_source_regions=None, statistics=None):
+    """Compose shared words without constructing physical cells or obligations.
+
+    The sweep indexes one word occurrence per exact physical piece. It keeps
+    multiplicity, original allocations and all count-domain checks. Only a new
+    entry-word combination runs ``_transfers``; hazards then reference shared
+    range collections. Source selection happens after the complete transfer.
+    """
+    sources = None if obligation_source_regions is None else frozenset(obligation_source_regions)
+    parts = tuple(parts)
+    require(
+        len({part.name for part in parts}) == len(parts), "sequence region names must be unique"
+    )
+    require(all(part.name for part in parts), "sequence regions need nonempty identities")
+    bounds = {part.summary.bound for part in parts if part.summary.constant_count is None}
+    bound_values = {
+        part.summary.bound_value for part in parts if part.summary.constant_count is None
+    }
+    require(
+        None not in bounds
+        and len(bounds) <= 1
+        and len(bound_values) == len(bounds)
+        and all(isinstance(value, SSAValue) for value in bound_values),
+        "sequence needs one shared immutable bound with its actual SSA identity",
+    )
+    bound = next(iter(bounds)) if bounds else None
+    bound_value = next(iter(bound_values)) if bound_values else None
+    roots, root_order, words, word_values = {}, {}, {}, []
+    word_cases, duplicate_pairs, work = [], {}, _Work()
+    input_cells = input_pieces = 0
+    for index, part in enumerate(parts):
+        origins = dict(part.summary.origins)
+        require(
+            len(origins) == len(part.summary.origins)
+            and set(origins) == set(part.summary.roots)
+            and all(isinstance(root, SSAValue) for root in origins.values()),
+            "sequence requires original SSA allocation identities",
+        )
+        shapes = {}
+        for group in part.summary.groups:
+            require(
+                group.word and (not group.orders or len(group.orders) == len(group.word)),
+                "invalid child transfer word",
+            )
+            word = words.get(group.word)
+            if word is None:
+                word = len(word_values)
+                words[group.word] = word
+                word_values.append(group.word)
+                word_cases.append(frozenset(group.word))
+                require(len(word_cases[-1]) == len(group.word), "duplicate child byte/count cell")
+                work.charge(
+                    sum(
+                        2 + len(case.reads_before_write) + len(case.pending_reads)
+                        for case in group.word
+                    ),
+                    "input pattern",
+                )
+            for ranges in group.ranges:
+                require(ranges.storage in origins and ranges.spans, "invalid child byte cell")
+                root = origins[ranges.storage]
+                first = index, ranges.first_order
+                root_order[root] = min(root_order.get(root, first), first)
+                events = roots.setdefault(root, {})
+                for lo, hi, _ in ranges.pieces():
+                    require(
+                        type(lo) is int and type(hi) is int and 0 <= lo < hi,
+                        "invalid child byte cell",
+                    )
+                    # Exact duplicates are invalid even in inactive fixed-count
+                    # domains. Compare a repeated word pair only once, without
+                    # expanding its cases over every physical interval.
+                    shape = shapes.setdefault((root, lo, hi), [])
+                    for previous in shape:
+                        pair = min(previous, word), max(previous, word)
+                        duplicate = duplicate_pairs.get(pair)
+                        if duplicate is None:
+                            duplicate = bool(word_cases[previous] & word_cases[word])
+                            duplicate_pairs[pair] = duplicate
+                        require(not duplicate, "duplicate child byte/count cell")
+                    shape.append(word)
+                    events.setdefault(lo, []).append((True, index, input_pieces, word))
+                    events.setdefault(hi, []).append((False, index, input_pieces, word))
+                    input_pieces += 1
+                    input_cells += len(group.word)
+                    work.charge(1, "input-piece")
+                    if input_pieces % 256 == 0:
+                        poll("sequential access indexing", pieces=input_pieces)
+    transfers = {}
+    physical_intervals = reused_intervals = transfer_visits = 0
+    input_pattern_visits = work.visits
+    for root in sorted(roots, key=root_order.__getitem__):
+        events, active = roots[root], {}
+        for point, stop in pairwise(sorted(events)):
+            for add, index, piece, word in events[point]:
+                if add:
+                    active.setdefault(index, {})[piece] = word
+                else:
+                    del active[index][piece]
+                    if not active[index]:
+                        del active[index]
+            if not active:
+                continue
+            indices = sorted(active)
+            work.charge(sum(len(active[i]) for i in indices), "entry pattern")
+            signature = tuple((i, tuple(sorted(active[i].values()))) for i in indices)
+            if signature not in transfers:
+                before = work.visits
+                entries = tuple(
+                    (parts[i], tuple(case for word in word_ids for case in word_values[word]))
+                    for i, word_ids in signature
+                )
+                transfers[signature] = _transfers(entries, work), {}
+                transfer_visits += work.visits - before
+            else:
+                reused_intervals += 1
+            transfers[signature][1].setdefault(root, []).append((point, stop, physical_intervals))
+            physical_intervals += 1
+            work.charge(1, "coverage")
+            if physical_intervals % 256 == 0:
+                poll(
+                    "sequential access composition",
+                    visits=work.visits,
+                    intervals=physical_intervals,
+                )
+    frontiers, hazards = [], {}
+    represented_cells = represented_obligations = omitted_obligations = 0
+    for semantic, range_lists in transfers.values():
+        ranges = tuple(PhysicalRanges(root, tuple(spans)) for root, spans in range_lists.items())
+        pieces = sum(len(physical.spans) for physical in ranges)
+        frontiers.append(SequenceTransfer(semantic, ranges))
+        represented_cells += len(semantic) * pieces
+        for case_index, (domain, _, obligations) in enumerate(semantic):
+            for hazard_index, (hazard, source, destination) in enumerate(obligations):
+                if sources is not None and source.region not in sources:
+                    omitted_obligations += pieces
+                    continue
+                key = domain, hazard, source, destination
+                hazards.setdefault(key, []).append(
+                    HazardCoverage(ranges, (case_index, hazard_index))
+                )
+                represented_obligations += pieces
+                work.charge(1, "hazard pattern")
+    patterns = tuple(
+        sorted(
+            (HazardPattern(*key, tuple(coverage)) for key, coverage in hazards.items()),
+            key=lambda pattern: pattern.first_order,
+        )
+    )
+    if statistics is not None:
+        statistics.update(
+            input_cells=input_cells,
+            input_physical_pieces=input_pieces,
+            input_pattern_visits=input_pattern_visits,
+            physical_intervals=physical_intervals,
+            unique_cell_patterns=len(set().union(*word_cases)) if word_cases else 0,
+            unique_transfer_words=len(words),
+            unique_entry_patterns=len(transfers),
+            reused_intervals=reused_intervals,
+            transfer_visits=transfer_visits,
+            hazard_patterns=len(patterns),
+            hazard_coverages=sum(len(pattern.coverage) for pattern in patterns),
+            represented_cells=represented_cells,
+            represented_obligations=represented_obligations,
+            materialized_cells=0,
+            materialized_obligations=0,
+            omitted_cells=represented_cells,
+            omitted_obligations=omitted_obligations,
+            materialized_visits=0,
+            visits=work.visits,
+        )
+    return SequencePatternSummary(bound, bound_value, tuple(frontiers), patterns, work.visits)
 
 
 @bounded

@@ -6,7 +6,7 @@ ring cells use an exact cyclic frontier with explicit first-occurrence checks.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from math import lcm
 
@@ -1037,31 +1037,78 @@ def _check_accesses(loop, all_views, *, native=True):
                     )
 
 
-def verify_access_ownership(loop):
+def _ownership_footprints(refs):
+    """Exact interval unions for validation, never for dependence construction.
+
+    A shared translation maps a union to the same union for every generation,
+    owner and count. Bounds and cross-owner overlap therefore need one copy of
+    that footprint, not every native's identical byte cut. Dtype residues and
+    lengths stay separate so a valid union cannot hide a misaligned member.
+    Pitched, clipped and tail-dependent views retain their original contracts.
+    """
+    groups, retained = {}, []
+    for ref in refs:
+        size = ITEMSIZE[ref.dtype]
+        if (
+            ref.rows != 1
+            or ref.tail_generation != -1
+            or ref.prefix_extent is not None
+            or ref.nbytes <= 0
+            or ref.nbytes % size
+        ):
+            retained.append(ref)
+            continue
+        bias = sum(offset for offset, _, _, _ in ref.terms)
+        terms = tuple(
+            (0, stride, modulus, divisor) for _, stride, modulus, divisor in ref.terms if stride
+        )
+        shape = replace(ref, terms=terms, nbytes=0)
+        groups.setdefault((shape, bias % size), []).append((bias, bias + ref.nbytes))
+    for (shape, _), intervals in groups.items():
+        merged = []
+        for lo, hi in sorted(intervals):
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = merged[-1][0], max(merged[-1][1], hi)
+            else:
+                merged.append((lo, hi))
+        retained.extend(
+            replace(shape, terms=((lo, 0, 0, 1), *shape.terms), nbytes=hi - lo) for lo, hi in merged
+        )
+    return tuple(retained)
+
+
+def verify_access_ownership(loop, *, statistics=None):
     """Check derived boundary byte fragments, whose natives were checked below.
 
     Fragments preserve real allocation identities and capture offsets. A cut
     inside a DMA row need not have DMA-origin alignment; the original native
     view, not the cut, carries that separate contract.
     """
-    views = {
-        actor: dict(
-            enumerate(dict.fromkeys(ref for task in data.program.tasks for ref in task.refs))
-        )
+    originals = {
+        actor: tuple(dict.fromkeys(ref for task in data.program.tasks for ref in task.refs))
         for actor, data in loop.actors.items()
     }
     visits = sum(
         loop.storage_periods[loop.root(actor, ref)]
         * ref.rows
         * (loop.access_groups(ref.storage) if ref.storage.external else 1)
-        for actor, refs in views.items()
-        for ref in refs.values()
+        for actor, refs in originals.items()
+        for ref in refs
     )
     require(visits <= MAX_ACCESS_SEGMENTS, "scope ownership fragment/group budget exceeded")
     require(
-        all(ref.prefix_extent is None for refs in views.values() for ref in refs.values()),
+        all(ref.prefix_extent is None for refs in originals.values() for ref in refs),
         "scope boundary ownership cannot assume clipped native fragments",
     )
+    views = {
+        actor: dict(enumerate(_ownership_footprints(refs))) for actor, refs in originals.items()
+    }
+    if statistics is not None:
+        statistics.update(
+            input_refs=sum(map(len, originals.values())),
+            coverage_refs=sum(map(len, views.values())),
+            input_group_visits=visits,
+        )
     _check_accesses(loop, views, native=False)
 
 

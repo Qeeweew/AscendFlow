@@ -1,40 +1,21 @@
-# 产品文档索引
+# 编译器文档
 
-当前入口如下；算子优化已停止，编译流程重构的实现和测量以状态页为准：
+当前正在重新设计循环与自动同步算法，算子优化暂停。**实现、测量与未解决问题只在[状态页](refactor-progress.md)登记；设计和计划不能当支持证据。**
 
-| 文档 | 负责回答 |
+| 文档 | 唯一职责 |
 |---|---|
-| [design.md](design.md) | 当前复杂度来源、真实调用链与新的结构化编译算法 |
-| [compilation-invariants.md](compilation-invariants.md) | 不变量的唯一建立者、变换保持/失效、正常与深度验证边界 |
-| [dsl-multistage.md](dsl-multistage.md) | 如何表达 runtime、局部/CV 多阶段和嵌套流水 |
-| [refactor-progress.md](refactor-progress.md) | 实际支持、明确缺陷及已验证证据 |
-| [refactor-plan.md](refactor-plan.md) | 下一部分具体修改、替换职责及退出门槛 |
+| [design.md](design.md) | 统一prologue/loop/epilogue、边界/回边、完成前沿与资源语义 |
+| [source-layout.md](source-layout.md) | 包结构、依赖方向、当前模块去留和迁移纪律 |
+| [compilation-invariants.md](compilation-invariants.md) | 每项保证的建立者、保持/失效与normal/debug边界 |
+| [refactor-plan.md](refactor-plan.md) | M0–M6实施顺序、具体交付和退出门槛 |
+| [refactor-progress.md](refactor-progress.md) | 当前代码身份、支持范围、失败指标及证据 |
+| [dsl-multistage.md](dsl-multistage.md) | 用户语法、运行时/constexpr、CV多阶段和组合限制 |
+| [attention-target.md](attention-target.md) | 当前FA example的数学、存储和资格合同 |
+| [validation.md](validation.md) | 分层测试、复杂度、冷编译、CANN及设备性能验收 |
+| [source-notes.md](source-notes.md) | 参考HEAD、必须保留的硬件语义和来源边界 |
 
-当前专项：[同步与事件已知问题](sync-known-issues.md)。[Vector设备记录](vector-row-performance.md)
-和FA性能页保留历史证据，其中的旧“下一步”不覆盖当前停止优化和编译流程重构安排。
-旧 task DSL 和旧FA入口已删除；硬件反例迁入内部测试，不继续增加旧算子优化。
+用户源码在[examples](../examples/README.md)，工具入口在[benchmarks](../benchmarks/README.md)，现有测试入口在[tests](../tests/README.md)。
 
-[算子示例](../examples/README.md)与[验证工具](../benchmarks/README.md)分别给源码和
-复现入口。设计模板不作为可运行示例；历史证据不自动适用于新 AST 路径。
+重写前36份文档和四个README原文保存在[产品仓库外的归档](../../reports/compiler-refactor/20261016-before-structured-loops/README.md)，有HEAD、状态和SHA256清单。历史性能/阶段报告不再堆在产品docs，也不保留指向旧计划的转发页。历史链接和命令按原文保存，不保证在当前代码上可运行。
 
-## FA 实现与对照
-
-- [已实现数学、存储与验证范围](attention-target.md)，[DSL 算子源码](../examples/flash_attention/attention.py)。
-- [新DSL与AscendC/ACLNN的4K设备基线](attention-performance.md)。
-- [独立 AscendC 的合同和测量](attention-reference.md)。
-- [legacy FA 的变体与性能](flash-attention.md)。
-
-## 已有能力的详细合同和证据
-
-以下是相应保存点的详细验证记录。若其“仍不支持”或“下一步”与当前状态不同，
-以状态页和当前计划为准；保留原始测量，复现路径已随目录清理更新。
-
-| 范围 | 记录 |
-|---|---|
-| 同步、effects、事件、ownership | [同步反例](synchronization.md)、[事件分配](event-allocation.md)、[混合核](mixed-ownership.md)、[物理扩展](physical-extensions.md) |
-| runtime 与局部流水 | [prefix](runtime-prefix.md)、[周期分解](factored-periods.md)、[归一化](ast-normalization.md)、[Cube](ast-cube.md) |
-| 归约和 region 组合 | [K归约](runtime-reduction.md)、[层次边界](hierarchy-boundaries.md)、[父子调用](runtime-hierarchy.md)、[sequence](region-sequence.md)、[父体](runtime-sequence-calls.md)、[共享输入](shared-invocation-inputs.md) |
-| legacy 算子 | [算子合同](operators.md)、[GEMM](hierarchical-gemm.md)、[GDN](recurrent-gdn.md) |
-| 来源与历史 | [源码依据](source-notes.md)、[首轮验证](validation-stage1.md)、[旧算子验证](validation-operators.md)、[旧保存点](checkpoint-before-refactor.md)、[历史进度](history/refactor-progress-20261015.md) |
-
-参考源码和外层报告只作为研究材料，不成为 wheel 或构建依赖。
+维护约定：新能力更新对应合同和状态；新阶段只更新计划完成标记，不再追加一份“当前设计”。测量JSON、ASC、日志和历史报告放外层，Git仅提交产品文件。必要的新文档须有独立长期职责，避免重复状态页。

@@ -1,77 +1,38 @@
-# 回归测试
+# 测试入口与迁移原则
 
-从工作区 `/workspace/xdsl-910b` 执行。默认 `pytest compiler/tests` 仍运行全部
-回归，不静默跳过旧实现或昂贵检查。修改同步时先选择对应层，稳定后再跑一次全集。
-这些命令不运行设备，也不把 Python 回归耗时当成编译性能。
+从工作区 `/workspace/xdsl-910b` 使用 `.venv`。本轮只更新文档，没有运行编译或测试；历史测试总数不代表停止的未提交工作树全部通过。
 
-2026-10-15迁移：旧task/tracer公开入口与兼容测试已删除。原有关键机器反例迁到
-`fixtures/physical_operators.py`、`physical_state.py`、`cv.py`，不作为公开算子API。
-成功shape扫描裁剪为代表组合，RAW/WAR、最后reader、双AIV、event资源与破坏IR
-负例保留；旧FA的2048group/整算子策略测试退出，改为小型CV/状态反例。
+重构目标分组为frontend、dialects/effects、analysis/access、loops/PLE、sync、resources、backend、integration、models、cost。目前多数文件仍平铺，目录迁移按[计划](../docs/refactor-plan.md)推进，不在文档中宣称已经完成。
 
-新增重点：`test_ast_api.py`验证旧入口不存在；`test_runtime_contract.py`验证
-minimum/multiple从AST贯通launcher（CPU测试仅替换设备派发行）；
-`test_compile_watchdog.py`验证整个构建总期限/子进程清理/产物身份；
-`sync/test_symbolic_cost.py`用独立有限路径验证共享拓扑的域隔离与真实结构计数；
-`test_cv_protocols.py`与`test_attention_math.py`分别验证机器协议和独立数值参考。
-默认dense f16 FA已有独立CANN/设备资格；continuous等拒绝变体仍不能计作成功。
-当前算子优化停止；测试重构方案见[计划](../docs/refactor-plan.md)，
-不变量与normal/deep边界见[合同](../docs/compilation-invariants.md)。普通AST编译消费
-构造时建立的事实，deep和外部同步IR仍独立检查。pytest默认继续覆盖全部回归。
+## 当前有价值的入口
 
-本轮新增：`test_compilation.py`、`test_scope_planning_reuse.py`和
-`sync/test_owned_sequence_plans.py`约束普通路径不重建独立证明，同时破坏物化结果
-检查绑定失效；`test_scope_resource_reuse.py`保留event碰撞/guard/clock反例；
-`test_compact_fixed_summary.py`对照字节模型并检查大固定count的合格摘要工作量；
-`sync/test_incremental_potential.py`检查新增边的排名与零推进环。
-normal/deep报告比较使用显式列出的工作字段过滤，未列字段仍按语义比较。
-
-| 范围 | 入口 | 检查什么 |
+| 范围 | 现有路径/文件 | 保留的合同 |
 |---|---|---|
-| 条件关系算法 | `sync/test_completion.py`、`sync/test_completion_flow.py`、`sync/test_incremental_completion.py` | 条件交集/差集、增量可达、有限 BFS 对照，以及一个frame编译回归 |
-| 直接同步生成 | `sync/test_direct_synthesis.py` | 原生图无候选同步；增量图与实际指令正/负关系差分；条件Wait透明传递；早release不扩大到无关工作 |
-| region/call 同步生成 | `sync/test_sequence_sync.py`、`sync/test_sequence_invocations.py` | ready/release、多个 reader、跨调用事件复用、保留循环 |
-| frame 与共享输入 | `sync/test_frame_regions.py`、`sync/test_shared_invocation_inputs.py` | 真实别名、零次执行、slot 最后读取、分组地址 |
-| 最终 IR 验证 | `sync/test_plan_validation.py` | 删除/移动同步、错误时钟、event 冲突、伪造 ownership 后必须拒绝 |
-| 嵌套固定child | `test_scope_address.py`、`test_scope_access.py`、`test_scope_completion.py`、`test_scope_codegen.py` | 祖先地址别名、独立byte oracle、父子时钟、投影可达性与实际ASC |
-| 父同步负例 | `test_scope_protocol_review.py`、`test_scope_lifetimes.py` | 实际Wait顺序、event消费与FIFO、尚未支持的共享L0C独立生命周期 |
-| 事件池与实际指令模型 | `test_fixed_event_summary.py`、`test_scope_events.py`、`test_scope_event_pools.py`、`test_scope_event_device_model.py` | 固定通知ordinal、跨父消费、完整pool共享及逐字节/物理ID的独立有限检查 |
-| 独立有限执行模型 | `models/local_sequence.py` | 解释实际命令、逐字节 RAW/WAR/WAW、二值 event 覆盖和死锁 |
+| 语言/API | test_ast_api.py、test_runtime_contract.py | 旧task入口不存在，runtime合同贯通 |
+| 变换所有权 | test_compilation.py、test_scope_planning_reuse.py | normal不重复独立证明；旧snapshot不能授权变更 |
+| 同步与反例 | sync/test_direct_synthesis.py、sync/test_plan_validation.py | ready/release、实际IR破坏、等待不能扩大 |
+| 物理访问 | test_scope_access.py、test_ownership_footprints.py | 精确字节/alias/owner，区间压缩不丢孔洞 |
+| 资源与CV | test_scope_event_pools.py、test_scope_event_device_model.py、test_cv_protocols.py | ID/lease/参与者/派发进展 |
+| 有限模型 | models/ | 有界的指令、字节和通知行为；需标明独立性 |
+| 成本 | sync/test_symbolic_cost.py、test_compact_fixed_summary.py | 当前算法实际工作计数，新算法需改测边界条款与比较数 |
+| 构建期限 | test_compile_watchdog.py | 整个构建进程组期限、失败清理和产物身份 |
+| 数值 | test_attention_math.py、benchmarks.validation | 数学参考，不代替生成代码设备资格 |
+
+停止的实验包含尚未提交的新测试；文件存在不意味着已全部通过。旧硬件反例保留，固定旧节点数、缓存命中或内部模块名的断言要按新语义改写。
+
+## 验证独立性
+
+从实际IR解释访问/指令的模型，与读取生产native topology后独立BFS的差分不是同一等级。`models/finite_query_native.py`复用生产native topology，只能独立检查求解器路径；full/compact共享转移函数的对照主要检查表示。它们都不能冒充任意N或硬件合同的独立证明。
+
+最小反例矩阵和各层口径统一见[validation.md](../docs/validation.md)，变换保持见[不变量](../docs/compilation-invariants.md)。
+
+## 运行纪律
 
 ```bash
-.venv/bin/python -m pytest -q compiler/tests/sync/test_completion.py compiler/tests/sync/test_completion_flow.py compiler/tests/sync/test_incremental_completion.py
+.venv/bin/python -m pytest -q compiler/tests/test_ast_api.py compiler/tests/test_runtime_contract.py
 .venv/bin/python -m pytest -q compiler/tests/sync --durations=10
-.venv/bin/python -m pytest -q compiler/tests --durations=15
 ```
 
-`sync/conftest.py` 共用四份不可变编译产物。每次 `.plan` 都获得独立可修改 IR，
-破坏测试不会污染其他用例。同一多 reader 程序的多个运行时边界只生成一次同步。
-编译规模测试和修改源码的反例仍各自编译，不使用 fixture 掩盖编译开销。
+根据变更选择相关小组，稳定集成后才运行一次必要的全量回归。默认`pytest compiler/tests`仍覆盖现有回归；不默认跳过旧失败或预算超限。修改IR的测试各取独立副本，共用不可变编译产物；成本输入和冷编译不复用cache。
 
-纯关系测试之外，`test_completion_flow.py` 还有一个小frame编译回归，用来
-禁止普通编译调用旧 `Graph.path`。直接生成回归另外检查初始图只包含native
-指令、选中协议才有完成转移，并比较未要求成立的关系，防止差分只得到两组
-全True答案。模板、环宽、条件和层次深度的结构成本仍需持续验收，不能用
-“没有调用旧路径查询”代替复杂度证据。
-
-有限模型不导入生产版的完成关系或访问摘要；它对小规模实际指令建图。
-这能发现不安全的生成计划，但不是任意动态长度的形式化证明。
-大常量界测试另检查1024/1048576下模板、端点、前沿和真实query-domain/条件
-事实数量；旧proof_domain_states=0的比较已移除。新计数覆盖叶层最终分析，
-父层仍需补全；各域peak之和及增量replay的新计数不能直接与旧统计同比。
-
-编译耗时用 `benchmarks.compile` 的五个独立进程测量，import 和 CANN 单列。
-ASC、离线编译和设备性能的入口见 [benchmarks](../benchmarks/README.md)。
-
-嵌套CV的小规模设备回归用一份binary覆盖多个runtime长度，检查所有输出、两个
-workspace槽、输入和guard。它没有FA或吞吐量性能结论。先检查全卡状态，选择健康
-空闲物理卡；示例中的6须按实际状态选择，不得通过换卡绕过设备错误。
-
-```bash
-PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --output runs/refactor/nested-cv/build --build
-ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 PYTHONPATH=compiler .venv/bin/python -m tests.support.run_nested_cv --output runs/refactor/nested-cv/build --physical 6
-```
-
-同一runner加`--entry nested_copy`可复现两个child共用UB时的事件池回归；产物应
-写入单独目录。`models/scoped_local.py`是独立的single-AIV有限指令模型，读取
-实际双时钟IR与物理ID配对，不导入生产完成关系/摘要/分配器；不宣称覆盖Cube/CV。
+单个算子构建≤300s，失败停止后续候选并清理所属子进程。设备runner在tests/support中只负责小规模资格，不当大算子性能证据；设备运行规则见[benchmark入口](../benchmarks/README.md)。

@@ -15,6 +15,7 @@ from .completion import CountDomain, Position, Site, _first, canonical, coalesce
 from .loop_graph import Command
 from .model import require
 from .periodic import bounded_period
+from .scope_child_transfer import VirtualNode, direct, point_guard
 from .scope_domains import affine, shifted
 from .symbolic_completion import FACT_STATISTICS, CompletionTopology, SymbolicCompletion, meet
 
@@ -43,6 +44,14 @@ class QueryEvent:
     channel: str
     action: str
     parent: Position
+
+
+@dataclass(frozen=True)
+class QueryVirtual:
+    """One native cut in one static query copy; never a parent graph vertex."""
+
+    query: int
+    native: VirtualNode
 
 
 class QueryCompletion:
@@ -109,6 +118,7 @@ class QueryCompletion:
         self._carry_cross_counters()
         self.counter_edges = self.topology.edge_count - before
         self.origins, self.bindings, self.answers = {}, {}, {}
+        self.local_cuts, self.origin_sources = {}, {}
         self._incomplete = {}
         self.queries = self.cases = 0
         from .scope_query_transitions import install_query_transitions
@@ -132,6 +142,82 @@ class QueryCompletion:
 
     def _node(self, query, node):
         return query * self.size + node
+
+    def _routes(self, endpoint, *, source):
+        if not isinstance(endpoint, QueryVirtual):
+            return (endpoint,)
+        owner = self.parent.completion
+        native = endpoint.native
+        ports = owner.inject(native) if source else owner.extract(native)
+        routes = [self._node(endpoint.query, node) for node in ports]
+        routes.extend(
+            node
+            for cut, node in self.local_cuts.items()
+            if cut.query == endpoint.query
+            and (direct(native, cut.native) if source else direct(cut.native, native))
+        )
+        return tuple(dict.fromkeys(routes))
+
+    def _physical_cut(self, cut):
+        """Expose an actual query synchronization cut in this copy only.
+
+        Parent/native proofs stay immutable. Local child reachability connects
+        this real cut to the retained boundaries and any earlier real cuts.
+        Hidden query endpoints remain virtual, including after this insertion.
+        """
+        if not isinstance(cut, QueryVirtual):
+            return cut
+        if cut in self.local_cuts:
+            return self.local_cuts[cut]
+        before, after = self._routes(cut, source=False), self._routes(cut, source=True)
+        # Mutual native reachability identifies one physical milestone. Reuse
+        # its retained node instead of adding a zero-distance alias cycle.
+        shared = set(before).intersection(after)
+        if shared:
+            node = min(shared)
+            self.local_cuts[cut] = node
+            return node
+        node = self.topology.node(cut.native.family)
+        require(
+            len(self.topology.families) <= MAX_QUERY_NODES,
+            "query completion topology node budget exceeded",
+        )
+        self.local_cuts[cut] = node
+        for source in before:
+            self._edge(source, node, guard=cut.native.condition)
+        for target in after:
+            self._edge(node, target, guard=cut.native.condition)
+        # Existing semantic sources gain precisely the newly exposed local
+        # route. Their origin identity and old propagated facts do not change.
+        flow = getattr(self, "flow", None)
+        if flow is not None:
+            for bit, (origin, point, guard) in self.origin_sources.items():
+                if (
+                    isinstance(origin, QueryVirtual)
+                    and origin.query == cut.query
+                    and direct(origin.native, cut.native)
+                ):
+                    flow.seed(node, point, meet(guard, cut.native.condition), bit)
+        return node
+
+    def _prepare(self, queries):
+        if not hasattr(self.parent.graph, "child_transfer"):
+            return
+        endpoints = {}
+        for query in queries:
+            for endpoint in query[:2]:
+                # Validate before hashing: malformed external identity fields
+                # must receive a contract diagnostic, not a Python hash error.
+                self._validate_identity(endpoint)
+                endpoints.setdefault(endpoint, None)
+        cuts = []
+        for endpoint in endpoints:
+            if isinstance(endpoint, QuerySite):
+                require(
+                    endpoint.call in self.parent.program.leaves, "unknown query completion call"
+                )
+                cuts.extend(self.parent.completion.commands_for(endpoint.call, endpoint.site))
+        self.parent.completion.prepare_virtual(cuts)
 
     def _edge(self, source, target, shift=0, **kwargs):
         edge = self.topology.edge(source, target, shift, **kwargs)
@@ -440,7 +526,7 @@ class QueryCompletion:
                 "query completion needs a full QuerySite identity",
             )
 
-    def _bindings(self, endpoint):
+    def _bindings(self, endpoint, *, physical=False):
         self._validate_identity(endpoint)
         if isinstance(endpoint, QueryEvent):
             if endpoint.channel in self.query_protocols:
@@ -466,11 +552,21 @@ class QueryCompletion:
                         continue
                     guard = self.guarded._point_guard(node, point)
                     if guard is not None:
-                        selected[self._node(endpoint.query, node), point] = guard
+                        identity = (
+                            QueryVirtual(endpoint.query, node)
+                            if isinstance(node, VirtualNode)
+                            else self._node(endpoint.query, node)
+                        )
+                        selected[identity, point] = guard
             self.bindings[endpoint] = tuple(
                 (node, point, guard) for (node, point), guard in selected.items()
             )
-        return self.bindings[endpoint]
+        result = self.bindings[endpoint]
+        return (
+            tuple((self._physical_cut(node), point, guard) for node, point, guard in result)
+            if physical
+            else result
+        )
 
     def _origin(self, node, point, guard):
         key = node, point
@@ -479,7 +575,11 @@ class QueryCompletion:
                 len(self.origins) < MAX_QUERY_ORIGINS, "query completion origin budget exceeded"
             )
             bit = self.origins[key] = 1 << len(self.origins)
-            self.flow.seed(node, point, guard, bit)
+            if not hasattr(self, "origin_sources"):
+                self.origin_sources = {}
+            self.origin_sources[bit] = node, point, guard
+            for target in self._routes(node, source=True):
+                self.flow.seed(target, point, guard, bit)
         return self.origins[key]
 
     def _check_snapshot(self):
@@ -533,6 +633,8 @@ class QueryCompletion:
         # existing flow. The case ledger belongs to its first completed batch.
         if not hasattr(self, "_incomplete"):
             self._incomplete = {}
+        queries = tuple(queries)
+        self._prepare(queries)
         prepared, ordered = {}, []
         for source, destination, domain in queries:
             if len(ordered) % 128 == 0:
@@ -546,12 +648,43 @@ class QueryCompletion:
                 # Node identity includes the static query copy. Keep the full
                 # count domain; equal residue alone does not mean equal need.
                 groups.setdefault((node, point, needed), {})[bit] = None
-        coverage = {}
-        for (node, point, needed), origins in groups.items():
-            if len(coverage) % 128 == 0:
-                poll("query completion coverage", groups=len(coverage))
+        physical, bindings = {}, {}
+        for key, origins in groups.items():
+            node, point, needed = key
+            bindings[key] = self._routes(node, source=False)
+            for target in bindings[key]:
+                physical.setdefault((target, point, needed), {}).update(origins)
+        completed = {}
+        for (node, point, needed), origins in physical.items():
+            if len(completed) % 128 == 0:
+                poll("query completion coverage", groups=len(completed))
             results = self.flow.coverage_many(node, point, origins, needed)
-            coverage[node, point, needed] = dict(zip(origins, results, strict=True))
+            completed[node, point, needed] = dict(zip(origins, results, strict=True))
+        coverage = {}
+        for key, origins in groups.items():
+            node, point, needed = key
+            answers = coverage[key] = {}
+            for bit in origins:
+                domains = [
+                    domain
+                    for target in bindings[key]
+                    for domain in completed[target, point, needed][bit]
+                ]
+                if isinstance(node, QueryVirtual):
+                    origin, source_point, source_guard = self.origin_sources[bit]
+                    if (
+                        isinstance(origin, QueryVirtual)
+                        and origin.query == node.query
+                        and direct(origin.native, node.native)
+                    ):
+                        from .symbolic_completion import le
+
+                        same = meet(le(source_point, point), le(point, source_point))
+                        same = meet(same, meet(needed, source_guard))
+                        same = meet(same, point_guard(node.native, point))
+                        if same is not None:
+                            domains.append(same)
+                answers[bit] = coalesce(domains)
         for key, (required, cases) in prepared.items():
             result = self.answers[key] = self._complete(cases, coverage)
             if required is not None and covers(required, result):

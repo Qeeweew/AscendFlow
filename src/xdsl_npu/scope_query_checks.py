@@ -11,12 +11,13 @@ from dataclasses import dataclass, replace
 from .budget import bounded, poll
 from .completion import CountDomain, Position, coalesce, covers
 from .model import require
+from .region_patterns import HazardPattern
 from .region_sequence import Obligation
 from .region_summary import Access, ReadSpan
 from .scope_domains import Activation, affine, validate_activation
 from .scope_guarded_completion import _activation
 from .scope_query_completion import QuerySite
-from .scope_query_summary import QuerySummary
+from .scope_query_summary import QueryPatternSummary, QuerySummary
 from .symbolic_completion import holds, meet
 
 MAX_QUERY_MEMORY_CHECKS = 262_144
@@ -28,12 +29,59 @@ class QueryMemoryCheck:
     target: QuerySite
     domain: CountDomain
     obligations: tuple[Obligation, ...]
+    patterns: tuple[HazardPattern, ...] = ()
 
 
 def _reason(obligation, access):
-    names = [name for name, root in access.origins.items() if root is obligation.storage]
+    if isinstance(obligation, HazardPattern):
+        storage, start, stop = obligation.first_range()
+    else:
+        storage, start, stop = obligation.storage, obligation.start, obligation.stop
+    names = [name for name, root in access.origins.items() if root is storage]
     root = "/".join(names) if names else "unknown allocation"
-    return f"{obligation.hazard} {root}[{obligation.start}:{obligation.stop}]"
+    return f"{obligation.hazard} {root}[{start}:{stop}]"
+
+
+def memory_check_reason(check, access):
+    """Name a real physical hazard without expanding its other byte witnesses."""
+    require(
+        isinstance(check, QueryMemoryCheck) and (check.obligations or check.patterns),
+        "query memory check has no physical hazard witness",
+    )
+    return _reason(check.patterns[0] if check.patterns else check.obligations[0], access)
+
+
+def _validate_patterns(patterns, roots, seen):
+    for pattern in patterns:
+        require(
+            isinstance(pattern, HazardPattern) and pattern.coverage,
+            "query memory check lost its actual allocation identity",
+        )
+        for coverage in pattern.coverage:
+            require(coverage.ranges, "query memory check has no physical coverage")
+            identity = id(coverage.ranges)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            for ranges in coverage.ranges:
+                require(
+                    id(ranges.storage) in roots
+                    and roots[id(ranges.storage)] is ranges.storage
+                    and ranges.spans
+                    and type(ranges.shift) is int,
+                    "query memory check lost its actual allocation identity",
+                )
+                require(
+                    all(
+                        type(lo) is int
+                        and type(hi) is int
+                        and 0 <= lo < hi
+                        and type(order) is int
+                        and order >= 0
+                        for lo, hi, order in ranges.pieces()
+                    ),
+                    "query memory check has invalid physical byte coverage",
+                )
 
 
 def _required(domain, parent):
@@ -104,15 +152,20 @@ def prepare_memory_checks(checked, parent) -> tuple[QueryMemoryCheck, ...]:
     left for ``check_memory`` so a planner can add a real protocol.
     """
     summary = checked.query_summary
-    require(isinstance(summary, QuerySummary), "query memory needs an actual query summary")
+    require(
+        isinstance(summary, (QuerySummary, QueryPatternSummary)),
+        "query memory needs an actual query summary",
+    )
     require(
         parent.access is checked.access and parent.program is checked.program,
         "query memory preparation changed its actual parent/access identities",
     )
-    require(
-        len(summary.obligations) <= MAX_QUERY_MEMORY_CHECKS,
-        "query memory obligation budget exceeded",
-    )
+    compact = isinstance(summary, QueryPatternSummary)
+    hazards = summary.patterns if compact else summary.obligations
+    require(len(hazards) <= MAX_QUERY_MEMORY_CHECKS, "query memory obligation budget exceeded")
+    roots = {id(root): root for root in checked.access.origins.values()}
+    if compact:
+        _validate_patterns(hazards, roots, set())
     guarded = parent.guarded()
     guarded._sync()
     witnesses, endpoints, checks = {}, {}, {}
@@ -181,18 +234,21 @@ def prepare_memory_checks(checked, parent) -> tuple[QueryMemoryCheck, ...]:
         endpoints[key] = result
         return result
 
-    for index, obligation in enumerate(summary.obligations):
+    for index, obligation in enumerate(hazards):
         if index % 128 == 0:
             poll("query memory preparation", obligations=index, witnesses=len(witnesses))
-        require(
-            any(obligation.storage is root for root in checked.access.origins.values()),
-            "query memory obligation lost its actual allocation identity",
-        )
+        if not compact:
+            require(
+                id(obligation.storage) in roots
+                and roots[id(obligation.storage)] is obligation.storage,
+                "query memory obligation lost its actual allocation identity",
+            )
         domain = _required(obligation.domain, parent)
         require(domain is not None, "query memory obligation has no actual parent count")
         source = endpoint(obligation.source, domain, source=True, obligation=obligation)
         target = endpoint(obligation.destination, domain, source=False, obligation=obligation)
-        checks.setdefault((source, target, obligation.domain), []).append(obligation)
+        bucket = checks.setdefault((source, target, obligation.domain), ([], []))
+        bucket[1 if compact else 0].append(obligation)
 
     # Register every origin before allowing either forward or reverse flow to
     # propagate. Byte-cell duplicates do not create another witness query.
@@ -204,8 +260,8 @@ def prepare_memory_checks(checked, parent) -> tuple[QueryMemoryCheck, ...]:
             f"({query[2]}, {query[3]}, {query[4]})",
         )
     return tuple(
-        QueryMemoryCheck(source, target, domain, tuple(obligations))
-        for (source, target, domain), obligations in checks.items()
+        QueryMemoryCheck(source, target, domain, tuple(obligations), tuple(patterns))
+        for (source, target, domain), (obligations, patterns) in checks.items()
     )
 
 
@@ -213,17 +269,20 @@ def prepare_memory_checks(checked, parent) -> tuple[QueryMemoryCheck, ...]:
 def check_memory(checks, query_completion) -> tuple[bool, ...]:
     """Check one prepared batch, retaining missing paths for protocol planning."""
     checks = tuple(checks)
-    roots = tuple(query_completion.parent.access.origins.values())
+    roots = {id(root): root for root in query_completion.parent.access.origins.values()}
+    seen = set()
     for check in checks:
         require(
             isinstance(check, QueryMemoryCheck)
-            and check.obligations
+            and (check.obligations or check.patterns)
             and all(
-                any(obligation.storage is root for root in roots)
+                id(obligation.storage) in roots
+                and roots[id(obligation.storage)] is obligation.storage
                 for obligation in check.obligations
             ),
             "query memory check lost its actual allocation identity",
         )
+        _validate_patterns(check.patterns, roots, seen)
     return tuple(
         query_completion.covered_many(
             (check.source, check.target, check.domain) for check in checks

@@ -7,7 +7,6 @@ from math import lcm
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from .budget import bounded, poll
-from .child_completion import ChildPort, project_fixed_child
 from .ir import LoopChannelOp, QueryChannelOp, QuerySyncOp, ScopeChannelOp, ScopeSyncOp, TaskOp
 from .loop_graph import Command
 from .loop_sync import _plan_leaf, _requirements, establishes_directly
@@ -15,7 +14,8 @@ from .model import require
 from .native_order import instruction_points, prefix_inputs
 from .periodic import bounded_period, project
 from .region_summary import summarize_local_events
-from .scope_completion import compose_calls
+from .scope_child_transfer import ConditionalChildTransfer, FixedChildTransfer, TransferCase
+from .scope_completion import compose_transfers
 from .scope_domains import (
     Activation,
     ScopedDependence,
@@ -93,52 +93,8 @@ class ParentCompletion:
         from .scope_guarded_completion import NodeActivations
 
         self.node_activations, self._guarded, self._anchored = NodeActivations(), None, None
-        marks = defaultdict(set)
-        if any(leaf.cases for leaf in program.leaves.values()) or any(
-            isinstance(o, ScopedDependence) for o in access.obligations
-        ):
-            # Definition extraction retains interior versions for logical RAW
-            # binding, but those records need no parent completion projection.
-            # Project only actual obligations and native insertion milestones.
-            directions = defaultdict(set)
-            for obligation in access.obligations:
-                directions[obligation.source].update(
-                    ("end", "prefix", "begin", "admit_issue", "after_queue")
-                )
-                directions[obligation.destination].update(
-                    ("begin", "issue", "queue", "retire", "admit_issue", "admit_queue")
-                )
-            for protocol in extra_protocols:
-                for source in protocol.sources:
-                    directions[source].update(
-                        ("end", "prefix", "begin", "admit_issue", "after_queue")
-                    )
-                for destination in protocol.destinations:
-                    directions[destination].update(
-                        ("begin", "issue", "queue", "retire", "admit_issue", "admit_queue")
-                    )
-            selected = ((access.endpoints[key], points) for key, points in directions.items())
-        else:
-            selected = (
-                (
-                    endpoint,
-                    (
-                        "begin",
-                        "end",
-                        "prefix",
-                        "issue",
-                        "queue",
-                        "retire",
-                        "implicit",
-                        "admit_issue",
-                        "admit_queue",
-                        "after_queue",
-                    ),
-                )
-                for endpoint in access.endpoints.values()
-            )
-        for (uid, site), points in selected:
-            marks[uid].update(_point(site, point) for point in points)
+        # Access and resource endpoints remain exact virtual handles. Only
+        # actual protocol insertion cuts are promoted into the parent graph.
         for uid, site in boundary_sites:
             require(uid in program.leaves, "query boundary names an unknown actual call")
             leaf = program.leaves[uid]
@@ -151,7 +107,6 @@ class ParentCompletion:
                 in {task.uid for data in leaf.loop.actors.values() for task in data.program.tasks},
                 "query boundary needs an actual native in its original call and actor",
             )
-            marks[uid].add(site)
         self.resource_pairs = []
         for uid in analyses:
             poll("child event resource projection")
@@ -171,57 +126,29 @@ class ParentCompletion:
                     if not resource.domain.contains(analysis[0].constant_count):
                         continue
                     sites = resource_sites(uid, leaf.actor, analysis[0].constant_count, resource)
-                    marks[uid].update(sites)
                     self.resource_pairs.append((uid, *sites, resource))
         self.resource_pairs = list(dict.fromkeys(self.resource_pairs))
         calls = {}
         for uid, leaf in program.leaves.items():
             poll("child completion projection")
 
-            def project_case(analysis, *, uid=uid, leaf=leaf):
-                local_actor, data = next(iter(analysis[0].actors.items()))
-                natives = {task.uid for task in data.program.tasks}
-                local = tuple(
-                    replace(site, task=(local_actor, site.task[1]))
-                    for site in sorted(marks[uid], key=repr)
-                    if site.task[1] in natives and (not site.channel or site.channel in analysis[1])
-                )
-                projection = project_fixed_child(analysis, local, insertion_cuts=True)
-                if local_actor == leaf.actor:
-                    return projection
-                renamed = {
-                    point: (
-                        replace(point, actor=leaf.actor)
-                        if isinstance(point, ChildPort)
-                        else replace(point, task=(leaf.actor, point.task[1]))
-                    )
-                    for point in (*projection.inputs, *projection.outputs, *projection.endpoints)
-                }
-                return replace(
-                    projection,
-                    inputs=tuple(renamed[p] for p in projection.inputs),
-                    outputs=tuple(renamed[p] for p in projection.outputs),
-                    endpoints=tuple(renamed[p] for p in projection.endpoints),
-                    relations=frozenset((renamed[a], renamed[b]) for a, b in projection.relations),
-                )
-
             if leaf.cases:
-                from .scope_case_completion import ConditionalProjection, ProjectionCase
-
-                projection = ConditionalProjection(
+                projection = ConditionalChildTransfer(
                     leaf.loop.constant_count,
                     sum(len(data.program.tasks) for data in leaf.loop.actors.values()),
                     tuple(
-                        ProjectionCase(label, leaf.cases[label].activation, project_case(analysis))
+                        TransferCase(label, leaf.cases[label].activation,
+                                     FixedChildTransfer(analysis, leaf.actor))
                         for label, analysis in analyses.variants(uid)
                     ),
                 )
             else:
-                projection = project_case(analyses[uid])
+                projection = FixedChildTransfer(analyses[uid], leaf.actor)
             calls[uid] = leaf.call, projection
-        self.completion = compose_calls(calls, period=period, count=program.count)
+        self.completion = compose_transfers(calls, period=period, count=program.count)
         self.graph = self.completion.graph
         self.node_activations.update(self.completion.node_activations)
+        self.completion.transfer_state.activation_sink = self.node_activations
         self.number = 1 + max(node.command.index for node in self.graph.nodes)
         self.waits, self.sends = {}, {}
 
@@ -323,8 +250,12 @@ class ParentCompletion:
                     for b in self.completion.commands_for(target_uid, _point(target, "begin"))
                 )
             return results
-        if self.node_activations or any(isinstance(o, ScopedDependence) for o in obligations):
+        if self.completion.transfer_state is not None or self.node_activations or any(
+            isinstance(o, ScopedDependence) for o in obligations
+        ):
             groups = [self._guarded_obligation(o) for o in obligations]
+            self.completion.prepare_virtual(command for group in groups for query in group
+                                            for command in query[:2])
             answers = self.guarded().covered_many(q for group in groups for q in group)
             results, offset = [], 0
             for group in groups:
@@ -350,7 +281,7 @@ class ParentCompletion:
 
     def covered_many(self, queries):
         """Resource queries must see every actual conditional protocol too."""
-        if not self.node_activations:
+        if not self.node_activations and self.completion.transfer_state is None:
             return self.graph.covered_many(queries)
         converted = []
         for source, sg, destination, dg, *rest in queries:
@@ -403,6 +334,22 @@ class ParentCompletion:
             else [(owner, "set") for owner in protocol.sources]
             + [(owner, "wait") for owner in protocol.destinations]
         )
+        promoted_sites = []
+        for owner, action in placements:
+            task = tasks[owner]
+            names = (("end" if task.pipe == "S" else "admit_issue", "begin", "prefix", "after_queue")
+                     if action == "set" else
+                     ("issue", "queue", "retire", "admit_issue", "admit_queue")
+                     if action == "barrier" else
+                     ("issue", "queue", "admit_issue", "admit_queue"))
+            uid, site = self.access.endpoints[owner]
+            for name in names:
+                promoted_sites.append((uid, _point(site, name)))
+        self.completion.prepare_virtual(cut for uid, site in promoted_sites
+                                        for cut in self.completion.commands_for(uid, site))
+        for uid, site in promoted_sites:
+            self.completion.transfer_state.promote(uid, site)
+        self.number = 1 + max(node.command.index for node in self.graph.nodes)
         points = {}
         for owner, action in placements:
             poll("parent synchronization insertion")
@@ -540,7 +487,7 @@ class ParentCompletion:
         if not resources:
             return []
         groups, queries = [], []
-        if self.node_activations:
+        if self.node_activations or self.completion.transfer_state is not None:
             from .completion import CountDomain, Position
 
             pairs = []
@@ -624,9 +571,9 @@ def _scope_access(program):
 def _query_boundary_summary(program, access):
     if not program.invocations:
         return None, ()
-    from .scope_query_summary import query_native_sites, summarize_queries
+    from .scope_query_summary import query_native_sites, summarize_query_patterns
 
-    summary = summarize_queries(program, access)
+    summary = summarize_query_patterns(program, access)
     return summary, query_native_sites(summary, access)
 
 

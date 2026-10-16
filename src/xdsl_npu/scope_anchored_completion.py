@@ -11,6 +11,30 @@ from .completion_flow import ALL
 from .model import require
 from .scope_domains import affine
 from .scope_guarded_completion import GuardedCompletion, _activation
+from .scope_transfer_queries import (
+    VirtualNode,
+)
+from .scope_transfer_queries import (
+    condition as transfer_condition,
+)
+from .scope_transfer_queries import (
+    direct as transfer_direct,
+)
+from .scope_transfer_queries import (
+    family as transfer_family,
+)
+from .scope_transfer_queries import (
+    point_guard as transfer_point_guard,
+)
+from .scope_transfer_queries import (
+    prepare as prepare_virtual,
+)
+from .scope_transfer_queries import (
+    revision as transfer_revision,
+)
+from .scope_transfer_queries import (
+    routes as transfer_routes,
+)
 from .symbolic_completion import (
     FACT_STATISTICS,
     CompletionTopology,
@@ -58,6 +82,7 @@ class _Reverse:
         self.topology = CompletionTopology()
         self.flow = SymbolicCompletion(topology=self.topology)
         self.origins, self.arcs = {}, 0
+        self.bindings, self.transfer_revision = {}, 0
 
     def sync(self, guarded):
         period = guarded.graph.period
@@ -98,6 +123,28 @@ class _Reverse:
             if edge is not None:
                 self.flow.replay(target, edge)
         self.arcs = len(guarded.graph.edges)
+        current = transfer_revision(guarded.graph)
+        if current != self.transfer_revision:
+            for (node, point), bit in self.origins.items():
+                if not isinstance(node, VirtualNode):
+                    continue
+                guard = transfer_point_guard(
+                    node,
+                    point,
+                    self.topology.families,
+                    guarded.conditions,
+                    count_residue=self.count_residue,
+                )
+                guard = meet(guard, CountDomain(period, self.count_residue, minimum=0))
+                for boundary in transfer_routes(
+                    guarded.graph,
+                    node,
+                    source=True,
+                    reverse=True,
+                    since=self.transfer_revision,
+                ):
+                    self.flow.seed(boundary, point, guard, bit)
+            self.transfer_revision = current
 
 
 class AnchoredCompletion:
@@ -119,7 +166,12 @@ class AnchoredCompletion:
     def _sync(self):
         guarded = self.guarded
         guarded._sync()
-        version = len(guarded.topology.families), guarded.arcs, len(guarded.graph.ids)
+        version = (
+            len(guarded.topology.families),
+            guarded.arcs,
+            len(guarded.graph.ids),
+            transfer_revision(guarded.graph),
+        )
         if version != self.version:
             self.answers.clear()
             self._topology_budget(len(self.reverse))
@@ -156,16 +208,13 @@ class AnchoredCompletion:
         return self.reverse[count_residue]
 
     def _point_guard(self, node, point, state):
-        if state is None:
-            return self.guarded._point_guard(node, point)
-        if node is None:
-            return None
-        family = state.topology.families[node]
-        guard = meet(self.guarded.conditions[node], family.residue_guard(point))
-        guard = meet(guard, meet(le((0, family.lower), point), le(point, family.horizon)))
-        if family.last is not None:
-            guard = meet(guard, meet(le(point, family.last), le(family.last, point)))
-        return guard
+        return transfer_point_guard(
+            node,
+            point,
+            (self.guarded.topology if state is None else state.topology).families,
+            self.guarded.conditions,
+            count_residue=None if state is None else state.count_residue,
+        )
 
     def _seed(self, node, point, state):
         if state is None:
@@ -177,20 +226,27 @@ class AnchoredCompletion:
             self.reverse_origins += 1
             self._check_budget()
             bit = state.origins[origin] = 1 << len(state.origins)
+            state.bindings[bit] = node, point
             domain = CountDomain(self.guarded.graph.period, state.count_residue, minimum=0)
-            state.flow.seed(node, point, meet(domain, self.guarded.conditions[node]), bit)
+            guard = meet(domain, self._point_guard(node, point, state))
+            for boundary in transfer_routes(self.guarded.graph, node, source=True, reverse=True):
+                state.flow.seed(boundary, point, guard, bit)
         return state.flow, state.origins[origin]
 
-    def _case(self, cases, flow, node, left, right, bit, needed, count_residue):
+    def _case(self, cases, flow, node, left, right, bit, needed, count_residue, state=None):
         self.cases += 1
         require(self.cases <= MAX_ANCHORED_CASES, "anchored completion case budget exceeded")
         if self.cases % 128 == 0:
             poll("anchored completion cases", cases=self.cases, queries=self.queries)
-        cases.append((flow, node, left, right, bit, needed, count_residue))
+        cases.append((flow, node, left, right, bit, needed, count_residue, state))
 
     def _spans(self, node, activation, needed, state, count_residue):
-        family = (self.guarded.topology if state is None else state.topology).families[node]
-        needed = meet(needed, self.guarded.conditions[node])
+        family = transfer_family(
+            node,
+            (self.guarded.topology if state is None else state.topology).families,
+            count_residue=None if state is None else state.count_residue,
+        )
+        needed = meet(needed, transfer_condition(node, self.guarded.conditions))
         if needed is None:
             return
         first, last = affine(activation.first), affine(activation.last)
@@ -271,7 +327,7 @@ class AnchoredCompletion:
                 target = destination[(point[0] * count_residue + point[1]) % graph.period]
                 needed = meet(domain, self._point_guard(target, point, None))
                 if needed is not None:
-                    self._case(cases, flow, target, point, point, bit, needed, count_residue)
+                    self._case(cases, flow, target, point, point, bit, needed, count_residue, state)
                 continue
             for residue, target in enumerate(destination):
                 if target is None or residue % activation.period not in activation.residues:
@@ -279,16 +335,72 @@ class AnchoredCompletion:
                 for left, right, needed in self._spans(
                     target, activation, domain, state, count_residue
                 ):
-                    self._case(cases, flow, target, left, right, bit, needed, count_residue)
+                    self._case(cases, flow, target, left, right, bit, needed, count_residue, state)
         prepared[key] = required, cases
         return key
 
-    def _span_missing(self, flow, node, left, right, bit, needed, count_residue):
-        period, residue = flow.families[node].period, flow.families[node].residue
+    def _direct_record(self, flow, node, bit, state):
+        bindings = self.guarded.source_bindings[flow] if state is None else state.bindings
+        source, point = bindings[bit]
+        if transfer_direct(self.guarded.graph, source, node, reverse=state is not None):
+            guard = meet(
+                self._point_guard(source, point, state), self._point_guard(node, point, state)
+            )
+            if state is not None:
+                guard = meet(
+                    guard, CountDomain(self.guarded.graph.period, state.count_residue, minimum=0)
+                )
+            if guard is not None:
+                return point, point, guard
+        return None
+
+    def _records(self, flow, node, bit, state, *, needed=None, physical=None):
+        records = {}
+        for boundary in transfer_routes(
+            self.guarded.graph, node, source=False, reverse=state is not None
+        ):
+            if physical is None:
+                for key, bits in flow.facts.get(boundary, {}).items():
+                    if bits & bit:
+                        records[key] = None
+            else:
+                records.update(dict.fromkeys(physical[flow, boundary, needed][bit]))
+        local = self._direct_record(flow, node, bit, state)
+        if local is not None:
+            records[local] = None
+        return records
+
+    def _coverage(self, flow, node, point, bit, needed, state, physical=None):
+        result = []
+        needed = meet(needed, self._point_guard(node, point, state))
+        for boundary in transfer_routes(
+            self.guarded.graph, node, source=False, reverse=state is not None
+        ):
+            result.extend(
+                flow.coverage(boundary, point, bit, needed)
+                if physical is None
+                else physical[flow, boundary, point, needed][bit]
+            )
+        local = self._direct_record(flow, node, bit, state)
+        for lo, hi, guard in () if local is None else (local,):
+            active = meet(meet(needed, guard), meet(le(lo, point), le(point, hi)))
+            if active is not None:
+                result.append(active)
+        return result
+
+    def _span_missing(
+        self, flow, node, left, right, bit, needed, count_residue, state=None, physical=None
+    ):
+        family = transfer_family(
+            node,
+            flow.families,
+            count_residue=None if state is None else state.count_residue,
+        )
+        period, residue = family.period, family.residue
         missing = [(left, right, needed)]
-        for (lo, hi, guard), bits in flow.facts.get(node, {}).items():
-            if not bits & bit:
-                continue
+        for lo, hi, guard in self._records(
+            flow, node, bit, state, needed=needed, physical=physical
+        ):
             lo = _aligned(lo, residue, period, count_residue)
             hi = _aligned(hi, residue, period, count_residue, upper=True)
             guard = meet(guard, le(lo, hi))
@@ -328,6 +440,53 @@ class AnchoredCompletion:
                 break
         return tuple(domain for _, _, domain in missing)
 
+    def _batch_coverage(self, prepared):
+        points, spans = {}, {}
+        for _, cases in prepared.values():
+            for flow, node, left, right, bit, needed, _, state in cases:
+                for boundary in transfer_routes(
+                    self.guarded.graph, node, source=False, reverse=state is not None
+                ):
+                    if left == right:
+                        guard = meet(needed, self._point_guard(node, left, state))
+                        points.setdefault((flow, boundary, left, guard), {})[bit] = None
+                    else:
+                        spans.setdefault((flow, boundary, needed), {})[bit] = []
+        physical_points = {}
+        for index, ((flow, boundary, point, needed), origins) in enumerate(points.items()):
+            if index % 128 == 0:
+                poll("anchored batched point coverage", groups=index)
+            values = flow.coverage_many(boundary, point, origins, needed)
+            physical_points[flow, boundary, point, needed] = dict(zip(origins, values, strict=True))
+        physical_spans = {}
+        for index, (key, origins) in enumerate(spans.items()):
+            if index % 128 == 0:
+                poll("anchored batched span coverage", groups=index)
+            flow, boundary, needed = key
+            requested = 0
+            for bit in origins:
+                requested |= bit
+            flow.coverage_batches += 1
+            flow.coverage_requests += len(origins)
+            for (lo, hi, guard), bits in flow.facts.get(boundary, {}).items():
+                flow.coverage_fact_scans += 1
+                if flow.coverage_fact_scans % 4096 == 0:
+                    poll("anchored span fact coverage", facts=flow.coverage_fact_scans)
+                selected = bits & requested
+                if not selected:
+                    continue
+                active = meet(guard, needed)
+                if active is None:
+                    continue
+                record = lo, hi, active
+                while selected:
+                    bit = selected & -selected
+                    origins[bit].append(record)
+                    flow.coverage_result_items += 1
+                    selected ^= bit
+            physical_spans[key] = origins
+        return physical_points, physical_spans
+
     def _complete(self, prepared):
         flows = dict.fromkeys(case[0] for _, cases in prepared.values() for case in cases)
         for flow in flows:
@@ -337,22 +496,31 @@ class AnchoredCompletion:
                 if flow is self.guarded.flows.get(None):
                     self.guarded.propagations += 1
                 self._check_budget()
+        physical_points, physical_spans = self._batch_coverage(prepared)
         for index, (key, (required, cases)) in enumerate(prepared.items()):
             if index % 128 == 0:
                 poll("anchored completion results", queries=index)
             missing = []
-            for flow, node, left, right, bit, needed, count_residue in cases:
+            for flow, node, left, right, bit, needed, count_residue, state in cases:
                 if left == right:
-                    missing.extend(uncovered(needed, flow.coverage(node, left, bit, needed)))
+                    missing.extend(
+                        uncovered(
+                            needed,
+                            self._coverage(flow, node, left, bit, needed, state, physical_points),
+                        )
+                    )
                 else:
                     missing.extend(
-                        self._span_missing(flow, node, left, right, bit, needed, count_residue)
+                        self._span_missing(
+                            flow, node, left, right, bit, needed, count_residue, state, physical_spans
+                        )
                     )
             self.answers[key] = coalesce(uncovered(required, missing))
 
     @bounded
     def coverage(self, source, destination, source_position, destination_position, activation):
         self._sync()
+        prepare_virtual(self.guarded.graph, (source, destination))
         prepared = {}
         key = self._register(
             source, destination, source_position, destination_position, activation, prepared
@@ -377,6 +545,10 @@ class AnchoredCompletion:
     @bounded
     def covered_many(self, queries):
         self._sync()
+        queries = tuple(queries)
+        prepare_virtual(
+            self.guarded.graph, (endpoint for query in queries for endpoint in query[:2])
+        )
         prepared, keys = {}, []
         for index, query in enumerate(queries):
             if index % 128 == 0:

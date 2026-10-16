@@ -51,7 +51,9 @@ def append_query_transitions(query, protocols):
     }
 
     def site_bindings(endpoint, point):
-        return query._bindings(replace(endpoint, site=replace(endpoint.site, point=point)))
+        return query._bindings(
+            replace(endpoint, site=replace(endpoint.site, point=point)), physical=True
+        )
 
     def parent_forwarding(endpoint, owner, action, kind):
         """Existing parent syncs precede query syncs at this actual native."""

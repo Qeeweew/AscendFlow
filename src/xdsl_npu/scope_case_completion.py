@@ -78,7 +78,7 @@ def compose_conditional_calls(calls, *, period, count):
     result = compose_calls(skeletons, period=period, count=count)
     graph = result.graph
     number = 1 + max(node.command.index for node in graph.nodes)
-    sites, commands, activations = defaultdict(list), defaultdict(list), {}
+    sites, commands, activations, case_ports = defaultdict(list), defaultdict(list), {}, {}
     for uid, variant in conditional.items():
         call = calls[uid][0]
         for case in variant.cases:
@@ -117,6 +117,9 @@ def compose_conditional_calls(calls, *, period, count):
                         commands[uid, point].append(command)
                         for residue in range(period):
                             sites[uid, point, residue].append(nodes[component, residue])
+                    else:
+                        for residue in range(period):
+                            case_ports[uid, case.label, point, residue] = nodes[component, residue]
             for residue in range(period):
                 for source, target in arcs:
                     graph.edge((nodes[source, residue], 0), (nodes[target, residue], 0))
@@ -129,5 +132,6 @@ def compose_conditional_calls(calls, *, period, count):
         case_sites={key: tuple(value) for key, value in sites.items()},
         case_commands={key: tuple(value) for key, value in commands.items()},
         node_activations=activations,
+        case_ports=case_ports,
         projections={uid: projection for uid, (_, projection) in calls.items()},
     )

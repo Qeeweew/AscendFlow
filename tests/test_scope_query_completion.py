@@ -8,15 +8,17 @@ from collections import defaultdict
 from copy import copy
 from dataclasses import replace
 from random import Random
+from types import SimpleNamespace
 
 import pytest
 
 from tests.fixtures.guarded import native_guarded_recurrence
 from tests.fixtures.nested import nested_cv
+from tests.models.finite_query_native import ExpandedNativeBodies, input_ports, native_sites
 from xdsl_npu import compile
 from xdsl_npu import language as N
-from xdsl_npu.child_completion import ChildPort, FixedChildProjection
-from xdsl_npu.completion import CountDomain, Position
+from xdsl_npu.child_completion import ChildPort
+from xdsl_npu.completion import CountDomain, Position, Site
 from xdsl_npu.ir import CallOp, dump
 from xdsl_npu.model import CompileError
 from xdsl_npu.scope_domains import Activation
@@ -60,25 +62,22 @@ def parent(checked_scopes):
 
 
 def sites(parent):
-    return sorted(
-        parent.completion.commands.keys() | parent.completion.case_commands.keys(), key=repr
-    )
+    return native_sites(parent)
 
 
 def inputs(projection):
-    if isinstance(projection, FixedChildProjection):
-        return set(projection.inputs)
-    return {port for case in projection.cases for port in case.projection.inputs}
+    return input_ports(projection)
 
 
 class FiniteQueries:
-    """Expand original Graph arcs and actual CallOp physical slots independently."""
+    """Expand actual native bodies, Graph arcs and CallOp slots independently."""
 
     def __init__(self, parent, count, *, copies=2):
         self.parent, self.count = parent, count
         self.following = defaultdict(set)
         self.nodes = set()
         self.closures = {}
+        self.native = ExpandedNativeBodies(parent, count, copies)
         graph, period = parent.graph, parent.period
         for query in range(copies):
             for node, meta in enumerate(graph.nodes):
@@ -98,10 +97,14 @@ class FiniteQueries:
                         continue
                     self.nodes.add((query, node, generation))
             for source, target, cycles in graph.edges:
+                if self.native.native_macro(graph.nodes[source], graph.nodes[target]):
+                    continue
                 shift = cycles * period + graph.nodes[target].residue - graph.nodes[source].residue
                 source_meta = graph.nodes[source]
                 for generation in range(source_meta.lower, count - source_meta.upper):
                     self.edge((query, source, generation), (query, target, generation + shift))
+        self.parent_nodes = frozenset(self.nodes)
+        self.native.attach(self)
 
         # Reproduce the actor's physical parent loop and source issue order.
         # This deliberately does not use the adapter's boundary expressions.
@@ -142,7 +145,7 @@ class FiniteQueries:
                 command = parent.events[actor, protocol.name, "set"]
                 effects = sorted(
                     (generation + command.task.stage, generation, command.index, node)
-                    for query, node, generation in self.nodes
+                    for query, node, generation in self.parent_nodes
                     if query == 0
                     and graph.nodes[node].command is command
                     and graph.nodes[node].point == "end"
@@ -172,6 +175,8 @@ class FiniteQueries:
             return (point,) if point in self.nodes else ()
         key = endpoint.call, endpoint.site, generation % self.parent.period
         completion = self.parent.completion
+        if self.native.cases:
+            return self.native.endpoint(endpoint)
         nodes = completion.case_sites.get(key)
         if nodes is None:
             nodes = (completion.sites[key],)
@@ -264,6 +269,117 @@ def test_actual_guarded_and_mixed_graphs_match_independent_two_query_execution(
         )
 
 
+def test_actual_native_candidates_survive_empty_materialized_command_tables(parent):
+    assert parent.completion.transfer_state is not None
+    changed = independent_parent(parent)
+    changed.completion = replace(parent.completion, commands={}, case_commands={})
+    assert sites(changed) == sites(parent)
+    known = set(sites(changed))
+    assert all(
+        (uid, replace(site, point="begin")) in known
+        for uid, site in parent.access.endpoints.values()
+    )
+
+
+def test_finite_oracle_retains_the_original_graph_fixture_path():
+    begin = Site(("aiv0", "native"), FIRST, "begin", region="child")
+    end = replace(begin, point="end")
+    command = SimpleNamespace(index=0)
+    nodes = [
+        SimpleNamespace(lower=0, upper=0, residue=0, last_gap=None, command=command, point=point)
+        for point in ("begin", "end")
+    ]
+    graph = SimpleNamespace(nodes=nodes, edges={(0, 1, 0)})
+    completion = SimpleNamespace(
+        transfer_state=None,
+        commands={("child", begin): command, ("child", end): command},
+        case_commands={},
+        case_sites={},
+        sites={("child", begin, 0): 0, ("child", end, 0): 1},
+    )
+    parent = SimpleNamespace(
+        graph=graph,
+        completion=completion,
+        period=1,
+        node_activations={},
+        protocols=(),
+        program=SimpleNamespace(parents={}),
+    )
+    finite = FiniteQueries(parent, 3)
+    first, last = QuerySite(0, "child", begin, FIRST), QuerySite(0, "child", end, FIRST)
+    assert set(sites(parent)) == {("child", begin), ("child", end)}
+    assert not finite.native.cases
+    assert finite.covered(first, last) and not finite.covered(last, first)
+    assert not finite.covered(first, replace(last, query=1))
+
+
+def test_finite_oracle_uses_actual_native_body_without_production_transfer_queries(
+    parent, monkeypatch
+):
+    state = parent.completion.transfer_state
+    assert state is not None
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("finite native oracle called production transfer reachability")
+
+    for _, value in state.calls.values():
+        transfers = (
+            tuple(case.transfer for case in value.cases) if hasattr(value, "cases") else (value,)
+        )
+        for transfer in transfers:
+            monkeypatch.setattr(transfer, "covered", forbidden)
+            for method in ("covered", "reachable", "predecessors"):
+                monkeypatch.setattr(transfer.reach, method, forbidden)
+    monkeypatch.setattr(state, "routes", forbidden)
+    finite = FiniteQueries(parent, 2)
+    assert finite.native.nodes
+    available = [point for point in candidates(parent) if finite.endpoint(point)]
+    assert available and any(point.site.action for point in available)
+    assert all(finite.covered(point, point) for point in available)
+
+
+def distinct_native_ports(finite):
+    completion = finite.parent.completion
+    for case in finite.native.cases:
+        body = finite.native.bodies[id(case.transfer.view)]
+        ports = []
+        for local, (node, (_, inner)) in body.view.port_bindings.items():
+            port = replace(local, actor=case.transfer.actor)
+            key = (case.uid, port, 0) if case.label is None else (case.uid, case.label, port, 0)
+            table = completion.active_ports if case.label is None else completion.case_ports
+            parent_node = table[key]
+            actual = finite.native.point(0, case.uid, case.label, (node, inner), 0)
+            if actual in finite.native.nodes:
+                ports.append((key, parent_node, (node, inner)))
+        for first in ports:
+            for last in ports:
+                if first[1] != last[1] and not body.reaches(first[2], last[2]):
+                    return case, first, last
+    raise AssertionError("finite oracle has no distinct native port pair")
+
+
+def test_finite_oracle_replaces_same_call_macros_with_native_arcs(parent, monkeypatch):
+    original = FiniteQueries(parent, 1)
+    _, first, last = distinct_native_ports(original)
+    # A false projected relation must not become an oracle premise.
+    monkeypatch.setattr(parent.graph, "edges", {*parent.graph.edges, (first[1], last[1], 0)})
+    changed = FiniteQueries(parent, 1)
+    assert dict(changed.following) == dict(original.following)
+
+
+def test_finite_oracle_independently_rejects_false_native_component_aliases(parent):
+    finite = FiniteQueries(parent, 1)
+    case, first, last = distinct_native_ports(finite)
+    completion = parent.completion
+    field = "active_ports" if case.label is None else "case_ports"
+    changed_ports = dict(getattr(completion, field))
+    changed_ports[last[0]] = first[1]
+    changed = independent_parent(parent)
+    changed.completion = replace(completion, **{field: changed_ports})
+    with pytest.raises(AssertionError, match="merged distinct native points"):
+        FiniteQueries(changed, 1)
+
+
 def test_conditional_count_domains_keep_actual_endpoint_existence(parent, finite_oracle):
     proof = QueryCompletion(parent)
     available = candidates(parent)
@@ -354,12 +470,10 @@ def test_child_event_consumption_queries_keep_wait_and_set_identity(parent, fini
             expected = finite_oracle(count).covered(source, target)
             assert proof.covered(source, target, CountDomain(1, 0, exact=count)) == expected
     # A Set effect and the producer's native end must remain different nodes.
+    known = set(sites(parent))
     for uid, _, send, _ in parent.resource_pairs:
         native = replace(send, point="end", channel="", action="")
-        if (uid, native) in parent.completion.commands or (
-            uid,
-            native,
-        ) in parent.completion.case_commands:
+        if (uid, native) in known:
             assert set(parent.completion.commands_for(uid, send)).isdisjoint(
                 parent.completion.commands_for(uid, native)
             )
@@ -368,7 +482,7 @@ def test_child_event_consumption_queries_keep_wait_and_set_identity(parent, fini
 def test_native_completion_cannot_replace_old_wait_consumption(parent, finite_oracle):
     proof, finite = QueryCompletion(parent), finite_oracle(1)
     differences = 0
-    known = parent.completion.commands.keys() | parent.completion.case_commands.keys()
+    known = set(sites(parent))
     for uid, wait, send, _ in parent.resource_pairs:
         native = replace(send, channel="", action="")
         if (uid, native) not in known:
@@ -386,7 +500,7 @@ def test_native_completion_cannot_replace_old_wait_consumption(parent, finite_or
 def test_set_effect_does_not_enter_native_retirement_prefix(parent, finite_oracle):
     proof, finite = QueryCompletion(parent), finite_oracle(1)
     differences = 0
-    known = parent.completion.commands.keys() | parent.completion.case_commands.keys()
+    known = set(sites(parent))
     for uid, _, send, _ in parent.resource_pairs:
         native = replace(send, channel="", action="")
         retire = replace(native, point="retire")
@@ -487,6 +601,12 @@ def test_final_inactive_call_preserves_the_real_retirement_prefix():
 
 
 def test_large_symbolic_counts_do_not_expand_either_clock(parent, monkeypatch):
+    endpoints = candidates(parent)[0], event_candidates(parent)[0]
+    # Resolving a typed Site uses its actual fixed child count. Bind that
+    # constant inner position before prohibiting evaluation of either runtime
+    # clock; the query proof below must remain entirely symbolic in parent N.
+    parent.completion.commands_for(endpoints[0].call, endpoints[0].site)
+
     def no_expansion(*args, **kwargs):
         pytest.fail("query completion must not instantiate parent or query clocks")
 
@@ -495,7 +615,7 @@ def test_large_symbolic_counts_do_not_expand_either_clock(parent, monkeypatch):
     proof = QueryCompletion(parent)
     proof.coverage_many(
         (endpoint, replace(endpoint, query=1), CountDomain(1, 0, minimum=1, maximum=10**12))
-        for endpoint in (candidates(parent)[0], event_candidates(parent)[0])
+        for endpoint in endpoints
     )
     statistics = proof.statistics()
     assert statistics["query_copies"] == 2
@@ -613,7 +733,7 @@ def test_cross_counter_fifo_carries_actual_last_to_first_set_effect(parent, fini
                 command = parent.events[actor, protocol.name, "set"]
                 generations = sorted(
                     generation
-                    for query, node, generation in finite.nodes
+                    for query, node, generation in finite.parent_nodes
                     if query == 0
                     and parent.graph.nodes[node].command is command
                     and parent.graph.nodes[node].point == "end"
@@ -667,7 +787,7 @@ def test_periodic_cross_fifo_keeps_residues_empty_ranges_and_signed_endpoints(ch
                 command = parent.events[actor, protocol.name, "set"]
                 generations = sorted(
                     generation
-                    for query, node, generation in finite.nodes
+                    for query, node, generation in finite.parent_nodes
                     if query == 0
                     and parent.graph.nodes[node].command is command
                     and parent.graph.nodes[node].point == "end"
@@ -689,7 +809,7 @@ def test_cross_set_effect_does_not_complete_native_retirement(parent, finite_ora
         return
     proof, finite = QueryCompletion(parent), finite_oracle(1)
     differences = 0
-    known = parent.completion.commands.keys() | parent.completion.case_commands.keys()
+    known = set(sites(parent))
     for protocol in crosses:
         for actor, owner in protocol.sources:
             uid, native = parent.access.endpoints[actor, owner]
@@ -731,7 +851,7 @@ def parent_local(
     parent = checked_parent(source)
     proof, finite = QueryCompletion(parent), FiniteQueries(parent, 1)
     differences = 0
-    known = parent.completion.commands.keys() | parent.completion.case_commands.keys()
+    known = set(sites(parent))
     for protocol in parent.protocols:
         if protocol.kind != "local":
             continue
@@ -838,7 +958,7 @@ def test_batch_registers_all_origins_before_one_propagation(parent, finite_oracl
         for node, point, guard in proof._bindings(endpoint)
         if guard.contains(1)
     }
-    calls = []
+    calls, registered = [], []
     seed, propagate = proof.flow.seed, proof.flow.propagate
 
     def record_seed(*args):
@@ -846,6 +966,7 @@ def test_batch_registers_all_origins_before_one_propagation(parent, finite_oracl
         # public source registration before entering that single pass.
         if "propagate" not in calls:
             calls.append("seed")
+            registered.append(args)
         return seed(*args)
 
     def record_propagate():
@@ -856,7 +977,12 @@ def test_batch_registers_all_origins_before_one_propagation(parent, finite_oracl
     monkeypatch.setattr(proof.flow, "seed", record_seed)
     monkeypatch.setattr(proof.flow, "propagate", record_propagate)
     assert proof.covered_many(iter(requests + requests[::-1])) == [True] * (2 * len(requests))
-    assert calls == ["seed"] * len(expected_origins) + ["propagate"]
+    # Each virtual origin may seed several physical interface vertices, or
+    # stay wholly within its native body. Every logical origin must still be
+    # registered before the sole propagation pass, with no repeated seed.
+    assert calls == ["seed"] * len(registered) + ["propagate"]
+    assert len(set(registered)) == len(registered)
+    assert len(registered) >= sum(isinstance(node, int) for node, _ in expected_origins)
     assert proof.statistics()["queries"] == len(requests)
 
 

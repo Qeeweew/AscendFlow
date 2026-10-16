@@ -15,6 +15,31 @@ from .completion_flow import ALL
 from .loop_graph import Command
 from .model import require
 from .scope_domains import Activation, affine
+from .scope_transfer_queries import (
+    VirtualCut,
+    VirtualNode,
+)
+from .scope_transfer_queries import (
+    condition as transfer_condition,
+)
+from .scope_transfer_queries import (
+    direct as transfer_direct,
+)
+from .scope_transfer_queries import (
+    family as transfer_family,
+)
+from .scope_transfer_queries import (
+    point_guard as transfer_point_guard,
+)
+from .scope_transfer_queries import (
+    prepare as prepare_virtual,
+)
+from .scope_transfer_queries import (
+    revision as transfer_revision,
+)
+from .scope_transfer_queries import (
+    routes as transfer_routes,
+)
 from .symbolic_completion import (
     FACT_STATISTICS,
     CompletionTopology,
@@ -141,6 +166,8 @@ class GuardedCompletion:
         self.flows, self.origins, self.answers = {}, {}, {}
         self.endpoints, self.boundaries = {}, {}
         self.conditions, self.registered = [], {}
+        self.source_bindings = {}
+        self._transfer_revision = transfer_revision(graph)
         self._activation_revision = 0
         self.activation_checks = 0
         self.arcs = self.cases = self.origin_count = self.queries = self.propagations = 0
@@ -203,7 +230,12 @@ class GuardedCompletion:
                 node >= old_nodes or self.registered.get(node) == activation,
                 "an existing guarded scope node activation changed",
             )
-        changed = old_nodes != len(self.graph.nodes) or self.arcs != len(self.graph.edges)
+        current_transfer = transfer_revision(self.graph)
+        changed = (
+            old_nodes != len(self.graph.nodes)
+            or self.arcs != len(self.graph.edges)
+            or current_transfer != self._transfer_revision
+        )
         for node in range(old_nodes, len(self.graph.nodes)):
             if node % 4096 == 0:
                 poll("guarded scope topology", nodes=node)
@@ -228,6 +260,16 @@ class GuardedCompletion:
                 for flow in self.flows.values():
                     flow.replay(source, edge)
         self.arcs = len(self.graph.edges)
+        if current_transfer != self._transfer_revision:
+            for flow, bindings in self.source_bindings.items():
+                for bit, (node, point) in bindings.items():
+                    if isinstance(node, VirtualNode):
+                        guard = self._point_guard(node, point)
+                        for boundary in transfer_routes(
+                            self.graph, node, source=True, since=self._transfer_revision
+                        ):
+                            flow.seed(boundary, point, guard, bit)
+            self._transfer_revision = current_transfer
         if owned:
             self.node_activations.seal_nodes(len(self.graph.nodes))
             self._activation_revision = self.node_activations.revision
@@ -248,6 +290,16 @@ class GuardedCompletion:
         self._check_transfers()
 
     def _endpoint(self, endpoint, point, *, source):
+        if isinstance(endpoint, VirtualCut):
+            require(
+                point is None or point == endpoint.site.point,
+                "virtual native cut milestone changed",
+            )
+            require(
+                endpoint.parent_period == self.graph.period,
+                "virtual native cut belongs to a different parent period",
+            )
+            return tuple(endpoint.resolve(residue) for residue in range(self.graph.period))
         if type(endpoint) is int:
             require(0 <= endpoint < len(self.graph.nodes), "unknown guarded scope endpoint")
             meta = self.graph.nodes[endpoint]
@@ -278,14 +330,7 @@ class GuardedCompletion:
         return endpoint[residue]
 
     def _point_guard(self, node, point):
-        if node is None:
-            return None
-        family = self.topology.families[node]
-        guard = meet(self.conditions[node], family.residue_guard(point))
-        guard = meet(guard, meet(le((0, family.lower), point), le(point, family.horizon)))
-        if family.last is not None:
-            guard = meet(guard, meet(le(point, family.last), le(family.last, point)))
-        return guard
+        return transfer_point_guard(node, point, self.topology.families, self.conditions)
 
     def _flow(self, extent):
         if extent not in self.flows:
@@ -293,6 +338,7 @@ class GuardedCompletion:
                 topology=self.topology, count=extent, terminal=extent is None
             )
             self.origins[extent] = {}
+            self.source_bindings[self.flows[extent]] = {}
         return self.flows[extent], self.origins[extent]
 
     def _reach(self, source, target, point, distance, needed, *, extent=None):
@@ -304,8 +350,34 @@ class GuardedCompletion:
                 self.origin_count <= MAX_GUARDED_ORIGINS, "guarded scope origin budget exceeded"
             )
             bit = origins[origin] = 1 << len(origins)
-            flow.seed(source, point, self.conditions[source], bit)
+            self.source_bindings[flow][bit] = source, point
+            guard = (
+                self._point_guard(source, point)
+                if isinstance(source, VirtualNode)
+                else self.conditions[source]
+            )
+            for boundary in transfer_routes(self.graph, source, source=True):
+                flow.seed(boundary, point, guard, bit)
         return flow, target, add(point, distance), origins[origin], needed
+
+    def _coverage(self, flow, node, point, bit, needed, physical=None):
+        result = []
+        for boundary in transfer_routes(self.graph, node, source=False):
+            result.extend(
+                flow.coverage(boundary, point, bit, needed)
+                if physical is None
+                else physical[flow, boundary, point, needed][bit]
+            )
+        source, source_point = self.source_bindings[flow][bit]
+        if transfer_direct(self.graph, source, node):
+            guard = meet(
+                needed,
+                meet(self._point_guard(source, source_point), self._point_guard(node, point)),
+            )
+            guard = meet(guard, meet(le(source_point, point), le(point, source_point)))
+            if guard is not None:
+                result.append(guard)
+        return result
 
     def _check_transfers(self):
         require(
@@ -365,23 +437,33 @@ class GuardedCompletion:
         taken before integer division, so one count-specific scan suffices.
         """
         period = self.graph.period
-        rs, rt = self.graph.nodes[source].residue, self.graph.nodes[target].residue
+        source_nodes = transfer_routes(self.graph, source, source=True)
+        target_nodes = transfer_routes(self.graph, target, source=False)
+        if not source_nodes or not target_nodes:
+            return None, None
+        rs = source.residue if isinstance(source, VirtualNode) else self.graph.nodes[source].residue
+        rt = target.residue if isinstance(target, VirtualNode) else self.graph.nodes[target].residue
+        source_rank = min(ranks[node] for node in source_nodes)
+        target_rank = max(ranks[node] for node in target_nodes)
         head, tail = boundary
         return (
-            None if head is None else rs + (head - period * ranks[source]) // stride,
-            None if tail is None else distance - rt - 1 + (tail + period * ranks[target]) // stride,
+            None if head is None else rs + (head - period * source_rank) // stride,
+            None if tail is None else distance - rt - 1 + (tail + period * target_rank) // stride,
         )
 
     def _interval_cases(self, source, target, distance, activation, required, boundary, potential):
         first, last = affine(activation.first), affine(activation.last)
         lo, gap = first[1], -1 - last[1]
         source_family, target_family = (
-            self.topology.families[source],
-            self.topology.families[target],
+            transfer_family(source, self.topology.families),
+            transfer_family(target, self.topology.families),
         )
         lo = max(lo, source_family.lower, target_family.lower - distance)
         gap = max(gap, -1 - source_family.horizon[1], -1 - target_family.horizon[1] + distance)
-        required = meet(required, meet(self.conditions[source], self.conditions[target]))
+        required = meet(
+            required,
+            meet(transfer_condition(source, self.conditions), transfer_condition(target, self.conditions)),
+        )
         required = meet(required, le((0, lo), (1, -1 - gap)))
         if required is None:
             return ()
@@ -398,7 +480,8 @@ class GuardedCompletion:
             )
         head, tail = self._bounds(source, target, distance, boundary, *potential)
         cases = []
-        residue, period = self.graph.nodes[source].residue, self.graph.period
+        residue = source.residue if isinstance(source, VirtualNode) else self.graph.nodes[source].residue
+        period = self.graph.period
         if head is not None:
             begin = lo + (residue - lo) % period
             require(
@@ -465,6 +548,12 @@ class GuardedCompletion:
         if required is None:
             self.answers[key] = ()
             return key
+        if distance == 0 and all(
+            a is None or b is None or transfer_direct(self.graph, a, b)
+            for a, b in zip(source, target, strict=True)
+        ):
+            self.answers[key] = (required,)
+            return key
         cases = []
         potential = self.graph.potential()
         boundary = self._boundary_measures(required, potential) if first != last else None
@@ -497,6 +586,17 @@ class GuardedCompletion:
                 self.propagations += 1
                 flow.propagate()
                 self._check_transfers()
+        groups = {}
+        for _, cases in prepared.values():
+            for flow, node, point, bit, needed in cases:
+                for boundary in transfer_routes(self.graph, node, source=False):
+                    groups.setdefault((flow, boundary, point, needed), {})[bit] = None
+        physical = {}
+        for index, ((flow, boundary, point, needed), origins) in enumerate(groups.items()):
+            if index % 128 == 0:
+                poll("guarded scope batched coverage", groups=index)
+            results = flow.coverage_many(boundary, point, origins, needed)
+            physical[flow, boundary, point, needed] = dict(zip(origins, results, strict=True))
         for query, (key, (required, cases)) in enumerate(prepared.items()):
             if query % 128 == 0:
                 poll("guarded scope query results", queries=query)
@@ -504,7 +604,9 @@ class GuardedCompletion:
             for index, (flow, node, point, bit, needed) in enumerate(cases):
                 if index % 128 == 0:
                     poll("guarded scope coverage", cases=index, queries=self.queries)
-                missing.extend(uncovered(needed, flow.coverage(node, point, bit, needed)))
+                missing.extend(
+                    uncovered(needed, self._coverage(flow, node, point, bit, needed, physical))
+                )
             self.answers[key] = coalesce(uncovered(required, missing))
 
     @bounded
@@ -526,6 +628,7 @@ class GuardedCompletion:
         ownership must separately validate their claimed activations.
         """
         self._sync()
+        prepare_virtual(self.graph, (source, destination))
         prepared = {}
         key = self._register(
             source,
@@ -553,6 +656,8 @@ class GuardedCompletion:
     def covered_many(self, queries):
         """Seed all unique obligations before propagating shared domains."""
         self._sync()
+        queries = tuple(queries)
+        prepare_virtual(self.graph, (endpoint for query in queries for endpoint in query[:2]))
         prepared, keys = {}, []
         for index, query in enumerate(queries):
             if index % 128 == 0:

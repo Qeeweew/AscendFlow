@@ -18,8 +18,16 @@ from .ir import CallOp, OnceOp, StreamOp
 from .loop_graph import Command, Graph
 from .model import require
 from .periodic import MAX_PERIOD_TEMPLATES, bounded_period
+from .scope_child_transfer import (
+    ConditionalChildTransfer,
+    TransferComposition,
+    VirtualCut,
+    VirtualNode,
+    direct,
+)
 
 MAX_SCOPE_ARCS = 1_000_000
+__all__ = ("ScopeCompletion", "VirtualCut", "VirtualNode", "compose_calls", "compose_transfers")
 
 
 @dataclass(frozen=True)
@@ -44,14 +52,39 @@ class ScopeCompletion:
     case_sites: dict = field(default_factory=dict)
     case_commands: dict = field(default_factory=dict)
     node_activations: dict = field(default_factory=dict)
+    case_ports: dict = field(default_factory=dict)
+    transfer_state: object | None = None
+
+    @property
+    def transfer_revision(self):
+        return 0 if self.transfer_state is None else self.transfer_state.revision
+
+    def inject(self, node, *, since=None):
+        require(self.transfer_state is not None, "scope completion has no native transfer")
+        return self.transfer_state.routes(node, source=True, since=since)
+
+    def extract(self, node, *, since=None):
+        require(self.transfer_state is not None, "scope completion has no native transfer")
+        return self.transfer_state.routes(node, source=False, since=since)
+
+    def direct(self, first, last):
+        return direct(first, last)
+
+    def prepare_virtual(self, cuts):
+        if self.transfer_state is not None:
+            self.transfer_state.prepare(cuts)
 
     def ats(self, uid, point, generation):
+        if self.transfer_state is not None and isinstance(point, Site):
+            self.transfer_state.promote(uid, point)
         key = uid, point, generation % self.graph.period
         if key in self.case_sites:
             return tuple((node, generation // self.graph.period) for node in self.case_sites[key])
         return (self.at(uid, point, generation),)
 
     def commands_for(self, uid, point):
+        if self.transfer_state is not None:
+            return self.transfer_state.commands_for(uid, point)
         key = uid, point
         if key in self.case_commands:
             return self.case_commands[key]
@@ -64,6 +97,8 @@ class ScopeCompletion:
 
     def at(self, uid, point, generation):
         """Locate an exact child milestone on the parent generation clock."""
+        if self.transfer_state is not None and isinstance(point, Site):
+            self.transfer_state.promote(uid, point)
         table = self.sites if isinstance(point, Site) else self.active_ports
         key = uid, point, generation % self.graph.period
         require(key in table, "unknown scoped child completion endpoint")
@@ -80,6 +115,11 @@ class ScopeCompletion:
         These commands locate already-proved component nodes. They are never
         passed to native_order and grant no instruction begin/end relation.
         """
+        if self.transfer_state is not None:
+            first = self.commands_for(source_uid, source)
+            last = self.commands_for(target_uid, target)
+            require(len(first) == len(last) == 1, "conditional transfer query needs explicit cases")
+            return first[0], source_g, last[0], target_g, minimum, False
         require(
             (source_uid, source) in self.commands and (target_uid, target) in self.commands,
             "unknown scoped child completion query endpoint",
@@ -412,3 +452,29 @@ def compose_calls(
         maxima,
         projections,
     )
+
+
+def compose_transfers(calls, *, period, count):
+    """Compose physical child interfaces, retaining native query points virtually."""
+    from .scope_case_completion import ConditionalProjection, ProjectionCase
+
+    projected = {}
+    for uid, (call, transfer) in calls.items():
+        if isinstance(transfer, ConditionalChildTransfer):
+            value = ConditionalProjection(
+                transfer.count, transfer.native_templates,
+                tuple(ProjectionCase(case.label, case.activation, case.transfer.projection())
+                      for case in transfer.cases),
+            )
+        else:
+            value = transfer.projection()
+        projected[uid] = call, value
+    completion = compose_calls(projected, period=period, count=count)
+    state = TransferComposition(completion, calls)
+    from dataclasses import replace
+
+    completion = replace(completion, projections={uid: value for uid, (_, value) in calls.items()},
+                         transfer_state=state)
+    state.completion = completion
+    completion.graph.child_transfer = completion
+    return completion
