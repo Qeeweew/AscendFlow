@@ -6,6 +6,7 @@ queries consume a guard's relations; no query establishes completion or ownershi
 Tables die with this analysis, never live in process-global memoized methods.
 """
 
+from dataclasses import dataclass
 from functools import cache, wraps
 from types import MappingProxyType
 
@@ -15,6 +16,7 @@ from ..scalar import DIVISION, Expr, expression, infer, literal
 from .structured_schedule import Comparison
 
 _OPPOSITE = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
+_NO_ANSWER = object()
 
 
 def _query(method):
@@ -23,9 +25,11 @@ def _query(method):
     @wraps(method)
     def query(self, *args):
         key = (method.__name__, *args)
-        if key not in self._answers:
-            self._answers[key] = method(self, *args)
-        return self._answers[key]
+        answer = self._answers.get(key, _NO_ANSWER)
+        if answer is _NO_ANSWER:
+            answer = method(self, *args)
+            self._answers[key] = answer
+        return answer
 
     return query
 
@@ -39,14 +43,16 @@ def normalize_integer(value, facts, *, identity):
         return value
 
 
-def _term(test):
-    if test.predicate in {">", ">="}:
-        value = expression("sub", test.lhs, test.rhs)
-        return expression("sub", value, literal(int(test.predicate == ">")))
-    if test.predicate in {"<", "<="}:
-        value = expression("sub", test.rhs, test.lhs)
-        return expression("sub", value, literal(int(test.predicate == "<")))
-    return None
+@dataclass(frozen=True, slots=True, eq=False)
+class _PremiseContext:
+    """One owner's exact ordered premises, with an identity-only query key.
+
+    The sequence is neither sorted nor deduplicated. This record establishes
+    no additional facts and performs no eager arithmetic or definedness query.
+    """
+
+    owner: object
+    tests: tuple[Comparison, ...]
 
 
 class IntegerFacts:
@@ -56,10 +62,41 @@ class IntegerFacts:
         self._facts = MappingProxyType(dict(facts))
         self._answers = {}
         self._atom_identity = AtomIdentity()
+        self._premise_owner = object()
+        self._contexts: dict[tuple[Comparison, ...], _PremiseContext] = {}
 
     @property
     def facts(self):
         return self._facts
+
+    def _context(self, assumptions: tuple[Comparison, ...]) -> _PremiseContext:
+        if not isinstance(assumptions, tuple):
+            raise TypeError("integer premises must be an immutable tuple")
+        context = self._contexts.get(assumptions)
+        if context is None:
+            context = _PremiseContext(self._premise_owner, assumptions)
+            self._contexts[assumptions] = context
+        return context
+
+    def _check_context(self, context: _PremiseContext):
+        if not isinstance(context, _PremiseContext) or context.owner is not self._premise_owner:
+            raise ValueError("integer premise context belongs to another owner")
+
+    @_query
+    def _constraint(self, test):
+        """Retain the original factored predicate, without integer reduction."""
+        if test.predicate in {">", ">="}:
+            value = expression("sub", test.lhs, test.rhs)
+            return expression("sub", value, literal(int(test.predicate == ">")))
+        if test.predicate in {"<", "<="}:
+            value = expression("sub", test.rhs, test.lhs)
+            return expression("sub", value, literal(int(test.predicate == "<")))
+        return None
+
+    @_query
+    def _difference(self, lhs, rhs):
+        """Construct and bound one operand difference in this facts owner."""
+        return self.bounded(expression("sub", lhs, rhs))
 
     @_query
     def normalize(self, value):
@@ -91,9 +128,15 @@ class IntegerFacts:
                 # to skip a later expression or accept a missing operand fact.
                 return False
 
-        def check(value, prefix):
+        def check(value, prefix, completed):
+            identity = id(value)
+            if identity in completed:
+                return None
             for child in value.args:
-                if isinstance(child, Expr) and (missing := check(child, prefix)) is not None:
+                if (
+                    isinstance(child, Expr)
+                    and (missing := check(child, prefix, completed)) is not None
+                ):
                     return missing
             if value.kind in DIVISION:
                 numerator, divisor = value.args
@@ -103,12 +146,16 @@ class IntegerFacts:
                 ):
                     if not proved(required, prefix):
                         return required
+            completed.add(identity)
             return None
 
         for index, test in enumerate(tests):
             prefix = tests[:index]
+            # Only these two operands share one complete ordered premise set.
+            # Another comparison must establish its raw nodes under its prefix.
+            completed = set()
             for value in (test.lhs, test.rhs):
-                if (missing := check(value, prefix)) is not None:
+                if (missing := check(value, prefix, completed)) is not None:
                     return missing, prefix
             if proved(Comparison(test.lhs, _OPPOSITE[test.predicate], test.rhs), prefix):
                 return None
@@ -162,8 +209,13 @@ class IntegerFacts:
 
         return self._atom_identity.retained(encode(value))
 
+    def bounds(self, value, assumptions: tuple[Comparison, ...] = ()):
+        return self._bounds(value, self._context(assumptions))
+
     @_query
-    def bounds(self, value, assumptions=()):
+    def _bounds(self, value, context: _PremiseContext):
+        self._check_context(context)
+        assumptions = context.tests
         # Preserve factors/clamps for interval reasoning. Polynomial expansion
         # is for equivalence queries: expanding (g-1)*k to g*k-k would lose
         # the fact that the complete first factor is nonnegative.
@@ -173,7 +225,7 @@ class IntegerFacts:
             if test.rhs.constant is not None and (
                 value.kind == "argument" or self.bounded(test.lhs) == self.bounded(value)
             ):
-                offset = self.normalize(self.bounded(expression("sub", test.lhs, value))).constant
+                offset = self.normalize(self._difference(test.lhs, value)).constant
                 if offset is None:
                     continue
                 bound = test.rhs.constant - offset
@@ -188,7 +240,7 @@ class IntegerFacts:
         if lower is not None and upper is not None:
             return lower, upper
         if value.kind in {"add", "mul", "min", "max", *DIVISION}:
-            (al, au), (bl, bu) = (self.bounds(arg, assumptions) for arg in value.args)
+            (al, au), (bl, bu) = (self._bounds(arg, context) for arg in value.args)
             if value.kind in DIVISION:
                 # These are unsigned operations, not signed floor division.
                 # Neither a zero/unknown denominator nor a possibly negative
@@ -252,16 +304,21 @@ class IntegerFacts:
                 upper = calculated_upper if upper is None else min(upper, calculated_upper)
         return lower, upper
 
+    def prove(self, test, assumptions: tuple[Comparison, ...]):
+        return self._prove(test, self._context(assumptions))
+
     @_query
-    def prove(self, test, assumptions):
+    def _prove(self, test, context: _PremiseContext):
+        self._check_context(context)
+        assumptions = context.tests
         if test in assumptions:
             return True
-        difference = self.bounded(expression("sub", test.lhs, test.rhs))
+        difference = self._difference(test.lhs, test.rhs)
         if difference.constant is not None:
             return Comparison(difference, test.predicate, literal(0)).evaluate({})
-        constraint = _term(test)
+        constraint = self._constraint(test)
         if constraint is not None:
-            lower, _ = self.bounds(constraint, assumptions)
+            lower, _ = self._bounds(constraint, context)
             if lower is not None and lower >= 0:
                 return True
         difference = self.normalize(difference)
@@ -274,7 +331,7 @@ class IntegerFacts:
                     and self.normalize(
                         expression(
                             "sub",
-                            self.bounded(expression("sub", prior.lhs, prior.rhs)),
+                            self._difference(prior.lhs, prior.rhs),
                             difference,
                         )
                     ).constant
@@ -282,22 +339,22 @@ class IntegerFacts:
                 ):
                     return True
             if test.predicate == "!=":
-                lower, upper = self.bounds(difference, assumptions)
+                lower, upper = self._bounds(difference, context)
                 return lower is not None and lower > 0 or upper is not None and upper < 0
-            return self.prove(Comparison(test.lhs, ">=", test.rhs), assumptions) and self.prove(
-                Comparison(test.lhs, "<=", test.rhs), assumptions
+            return self._prove(Comparison(test.lhs, ">=", test.rhs), context) and self._prove(
+                Comparison(test.lhs, "<=", test.rhs), context
             )
-        term = self.bounded(_term(test))
+        term = self.bounded(self._constraint(test))
         for prior in assumptions:
-            constraint = _term(prior)
+            constraint = self._constraint(prior)
             if constraint is not None:
-                remainder = self.bounded(expression("sub", term, constraint))
+                remainder = self._difference(term, constraint)
                 if remainder.constant is not None:
                     if remainder.constant >= 0:
                         return True
                     continue
-                bound, _ = self.bounds(remainder, assumptions)
+                bound, _ = self._bounds(remainder, context)
                 if bound is not None and bound >= 0:
                     return True
-        lower, _ = self.bounds(term, assumptions)
+        lower, _ = self._bounds(term, context)
         return lower is not None and lower >= 0

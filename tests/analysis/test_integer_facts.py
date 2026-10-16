@@ -98,33 +98,42 @@ def test_caller_mutation_cannot_change_hot_or_cold_queries_in_the_snapshot():
 
 def test_changed_or_reordered_premises_get_their_own_query(monkeypatch):
     queries = IntegerFacts({})
-    bounded = queries.bounded
+    check = queries._check_context
     calls = []
 
-    def observed(value):
-        calls.append(value)
-        return bounded(value)
+    def observed(context):
+        calls.append(context)
+        return check(context)
 
-    monkeypatch.setattr(queries, "bounded", observed)
+    monkeypatch.setattr(queries, "_check_context", observed)
     lower = Comparison(X, ">=", literal(2))
     upper = Comparison(X, "<=", literal(4))
     premises = (lower, upper)
     equivalent = tuple(Comparison(test.lhs, test.predicate, test.rhs) for test in premises)
     positive = Comparison(X, ">", literal(0))
+    context = queries._context(premises)
+    reordered = queries._context(premises[::-1])
 
     assert queries.bounds(X, premises) == (2, 4)
+    assert calls[-1] is context and context.tests is premises
     count = len(calls)
     assert queries.bounds(X, equivalent) == (2, 4)
     assert len(calls) == count
     assert queries.bounds(X, premises[::-1]) == (2, 4)
     assert len(calls) > count
+    assert all(item is reordered for item in calls[count:])
+    assert reordered is not context and reordered.tests == premises[::-1]
 
+    count = len(calls)
     assert queries.prove(positive, premises)
+    assert len(calls) > count
+    assert all(item is context for item in calls[count:])
     count = len(calls)
     assert queries.prove(positive, equivalent)
     assert len(calls) == count
     assert queries.prove(positive, premises[::-1])
     assert len(calls) > count
+    assert all(item is reordered for item in calls[count:])
 
     assert queries.bounds(X, (upper,)) == (None, 4)
     assert not queries.prove(positive, (upper,))

@@ -24,7 +24,7 @@
 | 事件域 | `analysis/event_domains.py`、`event_families.py`、`event_windows.py` | 实际配对、整条时钟链的参数分区、精确 membership/首末/存在投影；不分配 ID |
 | 有限周期 | `analysis/periodic.py` | 结构周期及数学相位求值；不证明原程序的无符号算术定义性 |
 | 模条件 | `analysis/modular.py` | 相关多项式整体的余数及比较mask；只用于证明，不生成运行期表达式 |
-| 整数关系事实 | `analysis/integer_facts.py` | 固定输入范围及完整有序前提下的规约、范围和比较；同一事实只建立一次，不提供异步完成证明 |
+| 整数关系事实 | `analysis/integer_facts.py` | 固定输入范围、owned有序前提context及唯一递归查询；共享原式检查按当前前缀遍历，不提供异步完成证明 |
 | 整数代数与atom身份 | `indexing.py` | 一个有界多项式实现；函数实参的规范key与当前查询raw代表分开，供普通索引与保留函数的整数关系共用 |
 | 局部条件覆盖 | `analysis/guard_cover.py` | 在一项义务内证明条件OR覆盖；有序定义性、整数三分和余数集合，不持有通知或排步 |
 | 实际消费路径 | `analysis/event_paths.py` | 组合真实队列/controller接口和路径条件，完整覆盖即停止；生命周期与有限ID共享共用 |
