@@ -1,46 +1,28 @@
-# 同步处理：已知问题与历史保存点
+# 同步与编译复杂度：当前问题
 
-2026-10-15 全面重整：当前顺序见[计划](refactor-plan.md)，实际支持见
-[状态页](refactor-progress.md)。旧 task DSL 已删除，有限物理路径仅保留内部硬件反例，不再扩展。
-runtime 的完成关系、事件和复杂度随真实DSL接入推进；自动同步与最终检查不能
-以手写flag、额外barrier或fallback绕过。下列保存点和旧测试是历史证据。
+2026-10-16，审查基线 `fdff8c5`。算子优化停止；当前主线是
+[编译流程重构](refactor-plan.md)。[设计](design.md)解释复杂度，
+[不变量清单](compilation-invariants.md)规定事实的建立、保持与失效。
 
-## 保存状态
-
-已提交基线 `20b4869` 在 runtime 叶路径从实际物理义务直接生成协议，删除该
-路径的候选路线和试删；legacy有限路径仍有试删，不属于此结论。
-随本页保存的符号代次修改取消了 region/call 首尾指令窗口，并让局部查询使用
-同一 SymbolicCompletion 转移规则。它是迁移保存点，不是同步重构完成点。
-新路径的定向回归与后续算子设备结果分别记录；历史全量通过不能代替新验证。
-保存前运行符号关系、直接生成、取消预算、loop sync和periodic定向回归：
-78 passed / 29.18s。修复了仍导入已删除 `_DomainFlow` 的测试挂点。
-未运行全量或新设备测试，SYNC-06仍开放。
-
-## 待解决问题
-
-| ID | 问题与影响 | 后续验收 |
+| ID | 当前问题 | 替换方向与验收 |
 |---|---|---|
-| SYNC-01 | 条件区间包含仍扫描每个节点已有记录；累计插入可能平方增长 | 记录条件碎片、比较/更新次数，约束随模板与条件增长的成本 |
-| SYNC-02 | 已共享NativeCompletion的局部拓扑，各query domain事实仍隔离 | 独立有限路径/terminal/增量边差分已通过；真实耗时与剩余事实成本见状态页 |
-| SYNC-03 | 局部规划检查、父层组合、最终检查仍有重复提取与传播 | 最终从实际 IR 独立检查，但减少重复构建；不能删除 verifier |
-| SYNC-04 | 已移除旧零计数，新增completion_statistics；父调用层计数仍不完整 | 叶层域/拓扑/事实/比较/更新/传播实计数；各域峰值之和不能称全程峰值 |
-| SYNC-05 | 一般 nested mixed/CV、多时钟映射与跨 region event 共享未完成 | 独立 QK/PV/Vector 时钟、最后读取与完整贡献的真实 FA 反例 |
-| SYNC-06 | 最新局部符号迁移尚缺完整迁移回归/设备验收 | 保存定向回归、ASC 对照和设备证据，不沿用历史全量结论 |
-| SYNC-07 | 有限event分配仍供内部小域反例使用，旧FA入口已删 | 既有分段周期编码保留；后续产品从符号寿命分配，不继续优化有限FA展开 |
-| SYNC-08 | runtime按channel/region独占ID，尚未按不重叠寿命共享 | 合法共享与真正并发超容量均有反例；不加barrier换资源 |
-| SYNC-09 | Load3D入口S→MTE1 ID0出现在ASC中，却未完整进入event资源报告 | 入口/steady/收尾同步统一报告及验证；当前未据此发现实际ID冲突 |
-| SYNC-10 | 现有独立local sequence模型覆盖有限native集合，不能验证一般Cube/CV | 按字节访问/二值event/参与者补独立有限反例，不复用生产依赖算法当独立证明 |
+| SYNC-01 | origin/guard事实仍可能在节点桶反复扫描，累积超线性 | typed prefix/结构化条件/需求端点；记录实际K、插入和比较，不仅改cache |
+| SYNC-02 | native语义已共享，但child/parent/query分析对象和部分拓扑重复构造 | 参数化region transfer与内部cuts；不能只保留whole-child完成 |
+| SYNC-03 | planning和final重建；final内部还重复child/pool/counter验证 | 同快照事实一次建立；query仅处理新增跨query义务；正常流程按合同传递 |
+| SYNC-04 | 各统计作用域/峰值/重复计数易误读 | unique、累计、单实例、全pipeline、CPU/RSS分列；case不等于依赖 |
+| SYNC-05 | 一般动态CV、多时钟、连续跨query状态未完成 | 保留现有dense与受限借用，未知ownership明确拒绝；不以简化语义缩减现有能力 |
+| SYNC-06 | 新不变量/构造算法尚无实现，不能直接删除现有检查 | 局部合同、反例、物化对应接通后逐段退出重复检查 |
+| SYNC-07 | 仍有finite/source兼容分析和多种组织分派 | 迁移机器反例后删除旧生产分流；独立有限oracle留tests |
+| SYNC-08 | 已支持部分ID共享/借用，但width/parent/query阶段反复资源查询 | 联合逻辑寿命模型，分配只改ID时不重算memory；保留FIRST/LAST与跨query整池义务 |
+| SYNC-09 | 配置、local、cross-counter资源必须统一参与计划 | 现有入口配置检查已存在；新资源模型保留，不恢复旧“未纳入”的描述 |
+| SYNC-10 | 独立有限模型仅覆盖受限native/actor集合 | 扩展按实际硬件规则；有界检查不冒充任意程序证明 |
+| SYNC-11 | 普通region summary部分路径枚举固定count；scope组合按行/cell放大 | 紧凑足迹/transfer，计数增长与真实描述/输出相关 |
+| SYNC-12 | 事件安全和进展与memory TRUE混在查询流程 | 分开INV-07/09/10；增同步不保证无死锁，ID相同不产生完成边 |
 
-旧 GEMM 跨调用最终检查：6 native 模板，21 同步后模板，首6/尾7窗口、两次
-调用副本，1143节点/2426边/10122条件记录/22063次传播。这些是分析图，
-不是 GEMM 的运行状态。符号层次原型对应275节点/509边/2351记录/4380次传播；
-局部层仍有上述重复结构，不能由层次图缩小推断整体问题解决。
+近期已有改动：sequence完整pattern共享、fixed child稀疏投影、query coverage合批、
+append-only完整正答案保留、singleton查询化简。它们没有完成以上架构替换，不能继续
+通过预算补丁宣称总体复杂度已解决。
 
-最近一次内部源码→ASC计时：GEMM 0.414s（规划0.152s、检查0.171s），frame
-0.262s、segmented CV 3.172s；均为单次，不含CANN，不是五冷性能结论。
-原始证据：外层 `runs/refactor/direct-sync/complexity-breakdown.json` 和
-`runs/refactor/symbolic-frontier/domains/`。临时动态N统一图曾使CV约8.64s，
-该实现已替换；不得把此失败尝试作为当前可用性能。
-
-恢复同步优化时，先解决表示和结构成本，再研究Python热点；不靠缓存掩盖。
-本阶段新算子只使用已接通的合同，不能以局部softmax/GEMM宣称完整新DSL FA。
+历史GEMM图计数、旧阶段结果和被替换方案保存在Git及
+[旧状态](history/refactor-progress-before-query-20261016.md)。这些不是当前HEAD的耗时。
+当前设备资格、五次BQ256拒绝和准确证据目录见[状态页](refactor-progress.md)。

@@ -1,15 +1,17 @@
 # 产品文档索引
 
-当前入口只有四份，避免历史进度与目标互相覆盖：
+当前入口如下；算子优化已停止，新重构尚处于方案阶段：
 
 | 文档 | 负责回答 |
 |---|---|
-| [design.md](design.md) | 为什么采用公共符号访问/完成关系，统一同步算法如何组织 |
+| [design.md](design.md) | 当前复杂度来源、真实调用链与新的结构化编译算法 |
+| [compilation-invariants.md](compilation-invariants.md) | 不变量的唯一建立者、变换保持/失效、正常与深度验证边界 |
 | [dsl-multistage.md](dsl-multistage.md) | 如何表达 runtime、局部/CV 多阶段和嵌套流水 |
 | [refactor-progress.md](refactor-progress.md) | 实际支持、明确缺陷及已验证证据 |
 | [refactor-plan.md](refactor-plan.md) | 下一部分具体修改、替换职责及退出门槛 |
 
-当前专项：[同步与事件已知问题](sync-known-issues.md)、[新DSL Vector算子及设备性能](vector-row-performance.md)。
+当前专项：[同步与事件已知问题](sync-known-issues.md)。[Vector设备记录](vector-row-performance.md)
+和FA性能页保留历史证据，其中的旧“下一步”不覆盖当前停止优化和编译流程重构安排。
 旧 task DSL 和旧FA入口已删除；硬件反例迁入内部测试，不继续增加旧算子优化。
 
 [算子示例](../examples/README.md)与[验证工具](../benchmarks/README.md)分别给源码和

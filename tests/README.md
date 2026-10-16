@@ -14,7 +14,10 @@ minimum/multiple从AST贯通launcher（CPU测试仅替换设备派发行）；
 `test_compile_watchdog.py`验证整个构建总期限/子进程清理/产物身份；
 `sync/test_symbolic_cost.py`用独立有限路径验证共享拓扑的域隔离与真实结构计数；
 `test_cv_protocols.py`与`test_attention_math.py`分别验证机器协议和独立数值参考。
-新FA目标失败回归仍代表未支持，不能计作完整FA成功。
+默认dense f16 FA已有独立CANN/设备资格；continuous等拒绝变体仍不能计作成功。
+当前算子优化停止；测试重构方案见[计划](../docs/refactor-plan.md)，
+不变量与normal/deep边界见[合同](../docs/compilation-invariants.md)。本轮仅改文档，
+尚未改变pytest默认行为或移除独立最终IR验证。
 
 | 范围 | 入口 | 检查什么 |
 |---|---|---|

@@ -1,284 +1,374 @@
-# 设计：结构化程序上的统一自动同步
+# 编译流程重构：控制分析规模，按不变量组合变换
 
-2026-10-15 再审；工作保存点 `61c5d06`。本文是下一部分重构的技术合同，
-**不是已经实现的统一算法**。实际能力集中记录在[状态页](refactor-progress.md)。
+2026-10-16。源码审查基线 `fdff8c55b0cddc51331c637ffecc75ce0e34401f`。
+本文是待实现设计，**不表示新算法已实现或证明完成**。实际状态见
+[状态页](refactor-progress.md)，实施顺序见[重构计划](refactor-plan.md)，
+pass 合同见[编译不变量](compilation-invariants.md)。
 
-2026-10-15 最新重整：DSL 不保向后兼容，旧 task 用户入口已删除；编译器
-内部物理 TaskOp 按需要保留。首尾窗口已迁为符号关系，本轮已共享局部查询域拓扑，
-条件事实扫描与父层组合成本仍待优化。本页给语义目标，实际工作顺序以[新计划](refactor-plan.md)为准。
+用户已停止算子优化。本轮只审查源码和既有记录、重写文档，没有进行编译、profiling、
+设备测试或关闭现有检查。旧 BQ256/GM→L1 优化计划停止。
 
-## 目标与纠正
+## 1. 先明确问题，而不是继续补热点
 
-以 TileLang 风格的受限 Python AST 表达计算、存储、局部流水和 CV 多阶段流水。
-专家排步与未来自动排步进入同一个物理访问和完成关系模型。自动同步优先，
-性能通过最终 ASC、CANN 产物及设备 profiling 验证。
+当前流程把原生语义、依赖构造、完成关系、事件寿命、分配后检查，反复转成图查询。
+循环虽保留，物理访问分片、条件域、里程碑和父子投影仍放大了分析状态；各阶段又重复
+解释这些状态。Python 的对象、大整数开销会放大成本，但换语言不能消除这些工作量。
 
-现有源码入口和原生转移规则已有共用实现，runtime 叶流水已直接生成所需协议；
-将退出的 legacy 有限路径仍有候选试删，不能将 runtime 结论外推到所有入口。
-层次分析的条件状态膨胀仍需替换，局部生成迁移不能代表一般层次 CV 已接通。
-继续按程序形状增加证明器，会把组合问题变成不断增加特例。下一次重构要替换
-重复的语义和查询职责，而不是增加第四个形状分支或只把文件搬进同一个目录。
+历史默认 FA 源码到 ASC 构建为 141.225 秒：
 
-同时保留已核实的 native 契约、原语 lowering、ASC emitter 和反例。xDSL 是程序
-的唯一可改写表示，分析索引引用它；不建立第二套可变程序树，不引入 MLIR 工程。
+| 阶段 | 秒 | 口径 |
+|---|---:|---|
+| frontend / input clone | 0.135 / 0.011 | AST 与编译器私有副本 |
+| lowering | 1.625 | 原生物理 IR |
+| planning | 79.685 | 含规划内部分析/检查，并非纯插入指令 |
+| final check | 58.583 | 从同步后实际 IR 重建分析 |
+| emission / snapshot | 0.753 / 0.433 | ASC、IR 与报告 |
 
-## 语言与执行边界
+来源：外层 `runs/refactor/cv-order/build/compilation.json`。这是历史单次构建，不是
+当前 HEAD 的五次冷编译。规划和终检合计约 97.9%；**即使全部移走终检，仍约 82.6 秒**。
+因此只删 final verifier、换 C++、加 cache 或放宽预算，都不是完整解法。
 
-详细语法见 [DSL](dsl-multistage.md)。runtime shape/stride、循环界和 descriptor
-是设备 SSA；容量、layout、dtype 和固定 stage 政策是 constexpr。常量循环界也
-默认保留，只有显式且有预算的 unroll 才展开。输入长度不参与编译期任务枚举。
+该默认 FA 有 76 个 native 模板、12 个 call；Sq/Sk 是 runtime 参数，没有按长度
+枚举。另一个 BQ256 候选的当前 HEAD 只读诊断如下：
 
-`Cube/Vector` 指定 actor，原语决定 Scalar、Vector、MTE1/2/3、Cube、Fixpipe。
-Stage 表示逻辑任务的派发偏移，不等于执行引擎、buffer 数、event 数或完成屏障。
-嵌套 child 有自己的迭代坐标；离开 child 控制流不能证明其异步访问已经退休。
+| 统计 | 值 |
+|---|---:|
+| guarded topology 节点 / 边 | 8,469 / 12,895 |
+| flow / origin | 5 / 1,599 |
+| condition facts | 117,189 |
+| fact attempts / comparisons | 774,448 / 1,528,601 |
+| propagation passes / transfers | 96 / 792,389 |
+| 累计query注册次数 / charged cases | 9,501 / 16,384 |
+| 有效 `_reach` 调用 / 不同参数元组 | 14,166 / 5,900 |
 
-整个路径为：
+来源：`runs/refactor/l1-reuse/case-probe.json`。这些是编译分析状态，**不是 kernel
+必需的运行状态**。这是一个 guarded 实例，不是整次编译所有分析器的总和。`_reach`
+还包含 anchored origin 初始化，case 计费与它不是同一集合；两者之差不能精确称为
+无效 case，去重比例也不能直接推成可获得的加速比。
+query注册次数包含图更新后partial/false答案的重注册，并不是全局唯一key数。
+
+已合入的 transfer 共享、稀疏投影、查询合批、单调答案保留和 singleton 简化保留。
+它们减少具体重复，尚未改变总体流程。
+
+## 2. 实际调用链与三种不同问题
 
 ```text
-Python AST → xDSL 结构化源码 → 保留控制的物理执行 IR
- → 访问/代次/完成约束 → 同步协议和有限资源分配
- → 物化同步 → 从最终 IR 重提取检查 → ASC → CANN
+Compilation._build
+  PrimFunction.to_ir → clone → lower_source
+  autosync → autosync_scopes
+    extract_scopes
+    _plan_scope_parent
+      _plan_leaf / plan_child_variants
+      extract_scopes → _scope_access → verify_children
+      summarize_queries → ParentCompletion
+      覆盖查询 → 插入协议 → 再查询覆盖
+      child lifetime / width / parent pool / borrow
+      特定宽度调整后再次 extract/access/verify_children/ParentCompletion
+    plan_query_memory
+    _finish → verify_plan → verify_scopes
+      extract/access/verify_children/ParentCompletion
+      memory / event / query / progress
+  _emit_checked（复用终检结果）→ snapshots
 ```
 
-## 公共分析模型
+定位：[compilation.py](../src/xdsl_npu/compilation.py)、
+[scope_sync.py](../src/xdsl_npu/scope_sync.py)、
+[scope_query_resources.py](../src/xdsl_npu/scope_query_resources.py)。
 
-下面是必要信息，不预先承诺类名或再创建一组空接口。
+需要分清：
 
-| 对象 | 必须保留的含义 |
+1. **不同命题的必要分析**：内存安全、通知消费、CV 可见性和无死锁各自有义务。
+   内存依赖正确不等于 event 可复用，也不等于参与者不会互相阻塞。
+2. **同一事实的重复证明**：规划后重新验证 leaf；协议刚插入又查询其必然保证；改 ID
+   后重提取访问；最后全量重建。同一 final snapshot 内还有明确重复：
+   `_verify_scope_parent` 检查 child resources/parent pools，query resource preparation
+   又检查，`verify_query_resources` 再检查 pools/counters。中间没有修改 IR。
+3. **单次求解本身过大**：片段、条件和源事实扩张，即使只运行一次也昂贵，必须改表示。
+
+`Compilation` 已把 final analysis 交给 `_emit_checked`，正常 emission 没有再做
+第三次完整终检。外部可编辑 IR 和显式 `explain()` 的检查另算，不能笼统称所有读取都重查。
+
+便于复查的源码位置（行号对应本页基线）：
+
+| 位置 | 具体工作 |
 |---|---|
-| 操作模板 | 原生工作、actor/engine、源码位置、所属 region、派发位置 |
-| 迭代实例域 | 符号迭代坐标、uniform 参数、activation/guard；不枚举所有实例 |
-| 物理访问 | allocation 身份、view/layout 后字节集合、R/W/RW、开始/退休端点 |
-| 代次与归属 | owner、slot 映射、generation；fresh frame 的已验证不相交关系 |
-| 顺序约束 | 源/目标里程碑、两端实例关系、条件、覆盖范围和硬件强度 |
-| 区域边界 | 所需初值、末 writer、尚未退休 reader、可见完成关系、存活通知 |
+| `lowering.py:1124`、`loop_sync.py:467/527/164` | 值检查、规划、物化后检查、leaf终检中的依赖/完成图工作 |
+| `scope_sync.py:904–910` | 再提取scopes、access、child证明和父图 |
+| `scope_sync.py:796`、`989–1002` | child宽度适配的候选父图与选定后实际父图 |
+| `scope_query_planning.py:82–109` | query宽度候选构造QueryCompletion |
+| `scope_sync.py:1213–1268` | final重建访问、child、parent及资源检查 |
+| `scope_query_resources.py:214/217/423/454` | 同快照资源检查再次调用 |
+| `compilation.py:85`、`codegen.py:454` | 内部复用analysis与外部可变IR重新检查的不同入口 |
 
-逻辑值依赖和物理访问分别保留。tensor 名不同不证明不别名；SSA 使用不是异步
-完成；借用 view 不是 snapshot。DMA padding、scratch、Scalar 读取及 SPR 状态
-也要进入 effects。未知 native effects 直接拒绝，通用 DCE/CSE/移动不能忽略它们。
+TileLang 参考 HEAD 为 `6ba65d204c937fcb1c43b1a22b32979506595655`；
+`insert_sync.cc::OptimizeSyncPoints` 先消费已有覆盖、为缺口加入确定协议，固定端点后
+计算消费证据供宽度选择复用。借鉴职责顺序，但它也有闭包、重试和耦合，不能以 C++
+实现或文件更短作为复杂度证明，不迁移其整套 pass。
 
-ready、read-retired、release/credit、notification-consumed、最终 drain 具有
-不同语义。每个访问只使用 dav-2201 真实可观测的完成点；没有 native 保证时
-不能虚构比操作完成更早的 reader retirement。
+## 3. 复杂度变量和真实增长来源
 
-## 算法再审：直接生成，约束等待范围，压缩层次状态
-
-审查基线 `61c5d06` 已删除试删与生产路径的旧 `Graph.path`，共用
-`native_order`，但当时仍有两个算法问题；下文分别标明当前处理进度：
-
-1. 叶生成器先把所有候选的虚拟指令建图，对每个缺口调用 `route`，再启用相应
-   协议。这仍是逐义务搜索。`(新增协议数, mask)` 的选择代价不表示流水性能。
-2. 层次分析复制首尾指令片段，并在各节点维护多个 guard 下的源事实集合。
-   批量队列降低了重复传播，却没有缩小状态空间；`add_fact` 仍扫描已有 guard
-   做包含判断。共享转移代码没有解决这种表示成本。
-
-该基线一次带计数和 profile 的实际编译：分层 GEMM 只有6个 native 模板，最终调用
-检查却有1143个节点、2426条边、10079条节点/guard事实记录，最多23个guard/节点。
-整个编译有28355次 `add_fact`、115935次 `_includes` 调用。profile 热点在条件
-传播与事实维护。计时受 instrumentation 影响，不作为冷编译性能结果。
-
-TileLang `6ba65d2` 的 `OptimizeSyncPoints` 按既定次序检查当前覆盖，保留缺失
-关系的对应协议，再增量更新闭包。它没有为每条缺口搜索所有可选协议的路径。
-采用这一生成职责划分；不复制其全对闭包，也不把 C++ 当作复杂度解决方案。
-
-### 先确定性能约束，再减少同步数量
-
-最小关系级反例：`R` 是 slot 的最后 reader，`X` 是同流水后续无关工作，`W`
-覆盖该 slot。早捕获只要求 R 退休；晚捕获还要求 X 退休。两者都只需要一对
-Set/Wait。旧 `route` 可以因为候选编号选择晚捕获，证明安全但扩大等待范围。
-这个反例已在旧 `_DomainFlow.route` 复现；它不是已发现的设备 kernel 回退。
-当前直接生成回归使用真实双输入 Vector 程序，检查release捕获R并在X前发出。
-
-生成必须以真实访问的最早合法 capture 和最晚合法 acquire 为基准。不能为少
-一个 flag 新增对无关工作、其他 slot 或后续 generation 的等待。已有必要协议
-已覆盖某义务时可直接省去它，因为没有添加新的顺序。合并 capture 时必须检查
-guard、参与者、代次和被等待工作集合，而不只比较同步条数。
-
-不承诺全局最少 event。若当前选择/分配未找到可行方案，应报告具体冲突与未决
-原因，不能把启发式失败称为硬件不可能，也不能延迟 release 或增加 barrier 兜底。
-
-### 生成器：访问前沿 → 对应协议 → 更新完成状态
-
-保留 `loop_dependencies`、`region_summary`、`region_sequence` 中的物理访问
-分析。按 allocation root、实际字节片段、owner、slot/generation 维护最近
-writer 与未退休 readers。逻辑顺序用于提取义务，不作为设备已经完成的证据。
-
-```text
-对实际消费者的访问义务分组：
-    从真实 native 顺序与已选协议取得该消费者的完成状态
-    扣除已覆盖的 RAW/WAR/WAW 义务
-    对剩余义务，直接构造对应的 ready 或 release 协议
-    只有同一合法 capture 确实包含的义务才合并
-    将选定协议的真实转移加入状态，影响后续消费者
-检查已选协议的 event 代次、配对、容量和 drain，再分配 ID
-物化已选同步；最终 verifier 从实际 IR 重新提取并检查
-```
-
-当前已删除 `_proposals → 全候选指令图 → ProtocolSelection.route`。
-`_requirements` 只保存实际访问对应的协议规格，没有虚拟xDSL指令或完成效力。
-`DirectCompletion` 从native图开始，选中协议才增量添加真实Set/Wait/barrier转移；
-既有翻译域原地增加节点与边，不逐协议重建，也不搜索其他未选协议的路线。
-物化只创建选中协议的xDSL操作，不留下未选操作的SSA uses。
-
-每个native位置有固定的issue/queue入口与acquire出口。条件同步跳过时保留
-输入前缀：例如g=0跳过两代credit Wait，后续ready Wait仍继承此前Scalar派发。
-Set只向后传递begin的FIFO关系，不能把发布effect传成后续native的完成屏障。
-这些转移与实际物化指令图作正/负关系差分，最终检查仍重新提取实际IR。
-
-处理顺序以真实消费者/时钟的因果位置为基础，同消费者的义务一起处理。
-RAW/WAR/WAW 标签只决定需要哪种关系，不决定执行顺序。不同 actor 保留偏序，
-不能把 Python 中 AIC/AIV 代码块的先后视作完成顺序。循环携带关系在符号
-generation 上处理，不用从第0次迭代执行到 N 的模拟来构造计划。
-
-当前策略先建立循环体关系，再处理携带关系；同消费者先考虑较晚真实源的
-capture。消费者存在阻塞派发的acquire时，其必要的同pipe原生fence先处理；
-其他位置让外部必要acquire先提供覆盖。该策略不按算子名特判，但选择次序
-仍会影响同步数量，不能称全局最优，也不能把分配失败称硬件不可实现。
-跨核backlog在已选协议上检查；没有凭空添加ack或全局barrier的修复路径。
-
-双缓冲早release的前后序列（省略无关字段，完整IR由测试程序可复现）：
-
-```text
-同步前：load_x(i) → R(i, reads x[i%2])；随后X(i)只访问另一个buffer
-同步后：Wait(release_x, i-2)；load_x(i)
-        R(i)；Set(release_x, i)；X(i)
-```
-
-Set捕获真实R的退休，匹配Wait保护下一次覆盖；X不在该capture内。
-回归见 `tests/sync/test_direct_synthesis.py`，不为此新增公开算子或runner。
-
-### 完成状态：保留区分，减少不必要的传播
-
-只需要传播仍服务于内存或 event 义务的完成信息。状态必须区分：
-
-- 实际操作/访问的退休，与 FIFO 派发/开始顺序。
-- 真实 capture 覆盖的原生退休前缀，与一个独立任务的结束。
-- Set 发布、匹配 Wait 消费和 buffer read-retired。
-- actor、时钟、generation、参与者及激活条件。
-
-只有经硬件契约证明包含关系的 capture 前缀可用最大位置压缩。同一流水后一个
-任务结束不一定证明前一个退休；不能将所有状态简化成“每引擎一个最大序号”。
-多个独立 reader、双 AIV 的贡献也不能合为一个完成位。
-
-原生转移继续由 `native_order` 统一定义：Set 捕获其前序退休，Wait 传递匹配
-发布，Scalar gate 影响后续派发；Set effect 不进入后续 native retirement
-前缀。SSA use-def 与源码控制退出都不提供这种完成事实。
-
-条件表示先规范化实际 guard，再共享相同条件的转移。避免在每次事实抵达时
-遍历所有历史 guard 做包含比较。只细分实际相交的条件；无关环不取全局 LCM。
-条件因子化的具体实现仍须通过反例及规模测试，不能把“使用位图”算作完成。
-任意条件组合可能膨胀，必须记录碎片数和诊断未决，不承诺通用线性算法。
-
-### 层次摘要：编译 child 一次，组合其边界转移
-
-当前首尾窗口适配器是可保留的回归对照，不再作为一般 nested CV 的扩展基础。
-目标摘要由 child 的真实转移在其自身时钟上构成，保留输入前沿、暴露的 capture、
-未退休访问以及活跃 event；父层引用这些接口，不为每个 source/destination 或
-调用复制 child 的首尾指令图。摘要不得由调用者自报一个可信 child-done。
-
-对规则环，义务直接写为：
-
-```text
-MTE2.write_done(i)    → Vector.read_begin(i)
-Vector.read_retired(i) → MTE2.write_begin(i+B)
-```
-
-需要构造并验证有限的符号状态转移：入口基例、generation 平移后的归纳步骤、
-真实出口。状态数量由静态访问/环/条件决定，不能出现 runtime N 因子。零次
-child 是恒等转移；slot0 的末读取按 N 的奇偶选择 N−2/N−1，而非统一等待最后
-一代。摘要仍必须表达“所有历史 reader 的退休前缀”，不能只留下最后一个 end。
-
-这项摘要实现尚未完成。先用现有双缓冲、frame 和层次 GEMM 验证组合；再用
-FA 的早 import release、两 AIV 贡献以及新 query QK 早于旧 query PV 的反例
-验证接口。不能未经这些检查就宣称同一个串行摘要已支持一般 CV。
-
-### 验证与反例
-
-最终 verifier 保留，检查实际 IR 的内存关系、event 生命周期和进展；不信任
-生成器的覆盖标记。生成与检查共用硬件/条件语义，独立有限执行模型用作差分，
-不冒充任意长度的证明。以下反例先于大规模算子测试：
-
-| 反例 | 必须保留的结论 |
+| 符号 | 含义 |
 |---|---|
-| R 后还有无关 X，再复用 R 的 slot | 不为了合并 flag 将 release 移到 X 后 |
-| 同 UB 的两个 reader | 一个 reader end 不代表全部 reader 已退休 |
-| Set 后有后续 native 工作 | Set effect 不成为后续任务的 fence |
-| 两条路径分别只在奇/偶数激活 | 不组成全域完成路径 |
-| snapshot child=0 | 保留真实 MTE3→MTE2 ready |
-| frame child>0 | 由已有 MTE3→V→MTE2 路径覆盖，不新增直接通知 |
-| 偶数 N 的 slot0 release | 等 N−2；最终 state 写仍须覆盖 N−1 |
-| 两个 AIV 生产 P | 一方发布不代表全部字节或贡献到齐 |
-| 跨调用 event 复用 | Wait 消费完成不代表其 consumer 的读取已退休 |
+| N | runtime 输入长度/迭代数；不得成为静态枚举维度 |
+| T | native 模板数，不含 runtime 实例 |
+| A | 精确访问描述数，包括布局、scratch、SPR |
+| B、I | 必须区分的范围片段数、访问与片段实际相交记录数 |
+| H | 真实 RAW/WAR/WAW 等依赖记录数 |
+| K | 前沿条款数，区分 clock、guard、owner、generation、里程碑 |
+| P | 同一相连约束分量必须区分的周期/余数类数 |
+| V、E | 分析图实际节点、边 |
+| O、D、F | origin 数、分析域数、条件事实总数 |
+| U、Q | 累计事实插入尝试、语义查询数 |
+| C、J | 逻辑事件数、需处理的寿命冲突/共享约束数 |
+| W | 静态query证明窗口的副本数，不是runtime query数 |
+| Z | 输出 IR/ASC 大小 |
 
-## 符号关系的可实现范围
+当前成本至少包含：
 
-首轮限定结构化循环、uniform 非负长度、静态 stage/slot、规则直接 views 和
-可验证的 owner 分区。两端关系组合必须匹配中间实例、guard 和完成强度；
-只看最小距离或忽略条件的图可达不能替代指定实例关系的覆盖。
+- `scope_access.py` 的固定 child 次数 × ref 行段 × 部分 group 坐标。保留 runtime
+  for 只消除了 N，没有消除此静态乘积。
+- 访问按端点切分后，宽访问覆盖多个细分区间。一般交错范围的相交记录 I 可达
+  `Θ(A²)`，不能只统计 B，更不能把每个字节当一个必要状态。
+- `region_sequence.py` 还按 count 边界、period 和 frontier 组合；共享 pattern 后，
+  真实物理区间与义务仍需实例化。
+- 旧 child 投影的端点平方步骤已由 `7a32407` 改为稀疏投影；1,800 点链生成 1,799 边。
+  不应再把它写成当前仍执行的平方算法。但端点数量、投影成本和条件传播尚未消失。
+- 对有 f 条记录的节点/域桶，每次包含判断扫描 f 项；累计成本为
+  `Σ每次插入尝试 f(目标桶)`，单桶增长可达平方。origin bitset 成本还随位数增长，
+  大整数 `&`/`|` 不是任意大小 O(1)。
+- 全 origin 传播包含 V × D × 条件碎片 × origin 信息。不同 guard 无包含关系时不能
+  简单合并；一般布尔条件的互不支配集合可能指数增长。
+- 图增边使部分/失败答案重算，触发 replay，影响后续资源查询；总代价必须包含各轮，
+  不能只报告最后图的规模。
+- event pool 同 bank 两两组合、宽度和 parent/child 首末借用会增加查询。物理 ID
+  只有 8 个不意味着数百个逻辑通知的分配是常数时间。
+- 不相关 buffer 的周期取全局 LCM 会放大状态。只合并真实相连的约束分量；确有耦合
+  时保留并报告，不靠省略 guard/余数降低数字。
 
-`task=query*K+kv` 在 K 为 runtime 时包含参数乘积；`task//K` 也不是普通的
-常量除数仿射关系。不能声称交给通用仿射分析就解决。需要为这类规则时钟映射
-保留因子化关系及 `K>0, 0<=kv<K` 合同，利用商余唯一性做受限组合；不展开 K
-个余数，也不支持任意非线性整数求解。独立测试乘法溢出、零 K 和 query 边界。
+还有几个容易漏算的具体项：`completion.py::coalesce` 当前反复两两合并，最坏可达
+条件片段数的三次方；`_uncovered` 的工作含阈值切点×组合period×guards。
+`loop_graph.py::potential` 的一般差分约束松弛最坏 O(VE)，不是普通DAG遍历。
+`scope_query_planning._query_width` 还可能重建 QueryCompletion，以静态窗口 W 复制
+parent拓扑，单次仅复制就要 O(W(V+E))；历史默认BQ128的W=3将4979个parent节点扩为
+14945个query节点。W不是runtime query数，但必须计入总成本。
 
-多参数 GM 地址同样保留 shape/stride 结构，先证明直接矩形 view 的范围和分区。
-普通外部指针 disjoint 合同在 launch 检查实际区间；间接索引、数据相关 ownership
-需要更强可验证合同，否则诊断为不支持或分析未决。
+所以现状不能诚实简写为一个 `O(T)` 或 `O(T²)`。**不随 N 增长只是必要条件，远不是
+编译够快的充分条件。** 各阶段必须记录输入、实际输出、中间状态和重复次数。
 
-统一模型不要求硬件协议相同：local HardEvent 是每核每有向 bank 八 ID 的二值
-事件；cross-core 的参与者、计数、quorum、反向 ack 与 GM 可见性另有 dav-2201
-契约。消费通知不等于消费方最后读取完成；两个 AIV 的 UB 始终私有。
+### 新算法的有条件目标
 
-## 编译复杂度与退出门槛
+规则流水（仿射/规则 strided 足迹、结构化 guard、有限 stage/slot、固定参与者）：
 
-运行长度 N 不应进入编译规模。目前 frame 的常量界1024与1048576结构回归
-通过；这只覆盖已实现子集，不能外推到尚未实现的多时钟 CV。
-
-必须把下列成本分开统计，不再用“稀疏图+位图”概括总复杂度：
-
-| 部分 | 当前或目标成本及限制 |
+| 阶段 | 输出敏感目标 |
 |---|---|
-| 物理访问前沿 | 访问片段 A、真实冲突 H；密集别名本身可产生二次数量的义务 |
-| 已删除的逐缺口选路 | 原有Q次route，每次初始化Vd个cost并扫描至多Ed条边；当前无此项 |
-| 固定 DAG 的一次传播 | `O((V+E)·ceil(S/w))`，S为实际源事实数；不包括增量轮次和 guard 操作 |
-| 当前条件传播 | U次有效更新，每次扫描节点的G个guard，约 `O(U·G)` 次条件/位集合操作；U和G都不是常数 |
-| 当前直接生成 | 对H条义务分组并构造选中协议；增量成本仍取决于真实域/源事实/传播次数，不保证线性 |
-| 层次组合目标 | 处理真实边界接口与条件；不随 parent 调用数复制 child 内部图 |
+| 前端/标量规范化 | O(AST + 表达式 DAG + 实际重写工作) |
+| 连续区间访问索引 | O(A log A + I) |
+| 依赖与 region transfer | O(I + H + K 的实际合并工作) |
+| 协议构造 | O(H + 对外边界条款 + 新协议数 + 实际条款匹配/条件求交工作)，不含全源全点闭包 |
+| 事件分配/进展 | O(C log C + J + 有界资源求解工作 + 排名约束求解工作) |
+| 物化/输出 | O(T + 新协议数 + Z) |
 
-图的构建、周期/条件分割、进展检查和 event 分配另计。一般图的势函数求解也
-不保证线性。Python 会放大每次操作的成本，但换语言不能消除这些工作量。
+这不是任意动态程序的线性时间保证。fractal/间接访问求交另计；K 的合并、J 都可能
+平方；一般偏序资源冲突不能当区间着色。不能把昂贵全图求解藏进 `covers()`、
+`summary()` 后声称只有一遍扫描。明确的非法、当前不支持和分析预算未决须分开诊断。
+对能用同域capture前缀rank比较的义务，覆盖可用常数次比较；需要索引区间查询时计
+O(log K)，扫描reader antichain/guard条款时计实际长度，不能一律算O(1)。已有进展排名
+被变换保持时只处理新增约束；确需一般求解时仍将最坏O(VE)列入成本。
 
-验收首先检查结构：runtime N不增长；独立区域增加时工作量按区域相加；增加
-静态操作、环宽和嵌套深度分别测量，不以固定的七模板例子代替规模分析。
-记录真实/候选节点、边界接口、guard片段、事实更新、条件比较及选路次数。
-新生成器候选路线搜索必须为零；“Graph.path为零”已不足以表示完成重构。
+## 4. 编译阶段与所有权
 
-当前性能门槛常用例 p50≤1s/max≤2s，完整 FA p50≤5s/max≤10s，五独立冷进程。
-门槛不是合理成本的充分条件。import、CANN、设备计时分开；最终 ASC 的搬运、
-buffer、早 release 和等待范围同时验收，不通过省略检查或串行化换编译速度。
+只保留 source IR、physical IR、同步后 physical IR 三个可打印边界，使用 xDSL 的
+SSA/region/rewriter/pass；不可变分析索引引用同一份私有 IR，不建立第二套可变程序树。
 
-## 正确性与性能验收
+| 阶段 | 工作 | 输出保证 |
+|---|---|---|
+| A 输入归一化 | AST、runtime/constexpr、类型、alias/owner 合同 | 输入合法、假设显式 |
+| B 标量规范化 | 纯整数 DAG、canonicalize/CSE | 数值/地址等价，effects 不变 |
+| C 原生 lowering/固定排步 | 原语、layout、scratch、engine、stage | 完整物理效果、数值边界、确定 issue 结构 |
+| D 依赖/region transfer | root/range frontier，RAW/WAR/WAW | 实际访问的唯一义务及边界摘要 |
+| E 同步构造 | ready/release、首末、局部/CV 协议 | 覆盖内存义务，导出事件寿命和进展约束 |
+| F 资源/进展 | 配对、width/ID、ownership、seed/drain、阻塞 | 资源合法，原内存/排步事实保持 |
+| G 物化/ASC | 具体同步映射、标量表达式输出 | 位置、guard、参与者、ID 与确定计划一致 |
 
-依次检查 IR/输入合同、访问与生命周期、有限交错反例、CANN 离线编译和设备。
-最终 verifier 可共用数学工具，但不能宣称与 planner 完全独立；有限模型检查
-不等于任意规模形式化证明。失败分为已证非法、不支持、预算未决。
+这是职责划分，不要求每行新建 dialect/目录。先用少量有明确所有者的结果类型替换
+匿名 tuple 和隐式缓存。会改变访问的布局、buffer 复用和算子政策在 D 之前固定；
+晚改时只失效受影响的 root/scope/消费者，不能继续沿用旧事实。
 
-固定政策下先逐项对比 ASC 的 native 指令、累计顺序、搬运、buffer、wait/release、
-CV gate 和填排，再对照独立 AscendC 及 timeline。与同政策参考接近，只能支持
-编译器保真结论；还需对照 ops-transformer/CATLASS、安装 ACLNN 和硬件工作量。
-不得通过新增 packing、全局 barrier、每 query drain 或扩大缓冲取得表面正确。
+## 5. 前端、表达式和可读 ASC
 
-硬件分析使用真实 SKU、核数、频率依据和 dtype，条件下界为
-`max(各共享资源总需求/对应吞吐上界, 依赖与派发关键路径下界)`。
-有效/native FLOPs、GM 请求/HBM 实际流量分开；未知持续吞吐保持参数化。
-大规模配置、测量口径与 FA 变体次序见[重构计划](refactor-plan.md)。算子调参仍暂停。
+保持 TileLang 风格 `prim_func/serial/Pipelined/Stage/Cube/Vector`，不恢复旧 task DSL。
+详见[DSL](dsl-multistage.md)。stage、buffer slots、event width 是三个不同量。
 
-## 源码依据
+当前 AST 的 serial/Pipelined 各构造一次 region；仅显式 unroll（≤64）复制。仍有内部
+`_legacy_work` 和 `symbolic=False` 有限 source 路径，迁完机器反例后删除生产分流。
+固定 child 也应通过转移组合处理，避免源码不展开、分析却枚举全部次数。
 
-本轮只读核对 HEAD，未 pull：TileLang `6ba65d2`，ops-transformer `4bbfb3b`，
-CATLASS `698379e`，ops-nn `64b41ad`。固定提交报告与当前 checkout 分开溯源。
-依据为 [910B 契约](../../reference/tilelang/docs/compiler_internals/ascend_910b.md)、
-[InsertSync](../../reference/tilelang/docs/compiler_internals/ascend_910b_insert_sync.md)、
-[算子审查](../../docs/xdsl-npu-operator-source-audit.md)及[FA 目标合同](attention-target.md)。
-现有 FA 候选政策的 AIV update-before-softmax 与 ops-transformer arch22 可见的
-Vec1-before-Vec2 不同，不能称为逐条复刻专家实现。
+runtime 长度、stride、metadata 坐标保持设备 SSA。dtype、tile 容量、layout、显式
+固定政策才参与特化；常量界也不自动 unroll。native recipe 必需的静态分段单独计数。
+
+现有 canonicalize/CSE 位于 `asc_scalar.py` 的纯整数临时 func，不是全程序 pass。
+应显式组织这个阶段，但单纯前移不算减少总工作。`scalar.Expr` 的数学整数/非负合同
+与 ASC i64 signed 除法语义不同；必须明确溢出、除数、原始轴和 dominance 条件。
+已有 uniform DAG 临时变量输出予以保留。
+
+异步 copy/MAD/FIX/Vector、event、SPR setter 不能因 SSA 结果未使用而 DCE，不能按
+相同 operands 做 CSE，也不能忽略 ownership 移动。通用优化只进入已知纯的子图。
+
+分配后 width=1 的 event 输出常量；连续 ID 轮换优先 `base + ordinal % width`；
+非连续映射确有需要时保留小映射。证明整数映射完全等价后，不重新证明 kernel 同步。
+禁止 regex 改 ASC、算子名或特定 shape 特判。emitter 只消费确定结构，不再次选择协议。
+
+## 6. 依赖和层次边界：压缩表示，不缩小语义
+
+访问身份为 root、精确 footprint、owner、generation/slot、activation、milestone。
+逻辑值版本绑定来源，物理 root/range 找复用冲突；SSA use-def 不证明异步完成。
+
+连续范围用分组端点扫描，规则二维/fractal 优先保留紧凑 descriptor，仅在必要求交处
+细分。padding、stride 孔洞、recast 和 subview 必须准确；包围盒导致过度等待也不合格。
+
+每个范围的逻辑访问 frontier：
+
+```text
+read  → 从最近定义建立 RAW；加入 reader
+write → 从旧定义建立 WAW；从待保护 readers 建立 WAR；更新定义/reader 集
+```
+
+“最近”和“更新”只是依赖构造，**不是宣布设备已经完成**。只有 E 阶段的真实硬件关系
+才允许覆盖。不同 engine/owner 的 reader 不可因源码较早而删掉。
+
+同端点、完整条件、强度的多字节义务共享一次同步求解，并保留 footprint 列表；不为
+每个 cell 复制完成图，也不把不同条件和范围随意并集。
+
+region transfer 保留 entry reads、first/last writes、pending readers、slot 相位、
+guard、输入/输出完成事实及存活通知。父层只导入需要的边界；内部 scratch 在 child
+解决。**不能只保留 entry/exit**：当前父同步和借用会插在 child 的实际 native
+`admit_issue/admit_queue/after_queue` 切点，需按需导出有类型的中间端口，保持排步。
+
+N=0 的 transfer 为恒等映射，不制造 first/last 或 drain。N>0 用首、体转移、末和
+slot 相位组合；固定重复用封闭表达或可组合转移，必须先证明摘要族闭合，不能先枚举
+再叫摘要。child 控制返回不能证明内部异步访问退休。
+
+摘要首先实现为三个内部数据结构，而不是一个无定义的 `summary()`：
+
+1. `AccessIndex[root]`：精确范围/规则descriptor索引，以及带域的定义和reader前沿；
+   独立存储的相交查询不会遍历其他root。
+2. `Transfer`：输入参数、需要的typed cuts、输出条款和未决义务。相同native body的
+   转移共享一次；call仅绑定真实root、clock、owner与坐标，不共享这些调用身份。
+3. `FactRef`：指向一次建立的规则结论，记录直接前提。数据不是“所有origin在每个节点
+   的位集”；只有对外frontier/实际acquire所需事实进入对应状态。
+
+构造时对相同完整语义条款建立唯一ID。相邻范围只有在访问/域/里程碑都相等时共用一条
+transfer；物理范围仍保留。按已证capture包含关系去除被支配reader，而不是无条件保留
+“最后一条reader”。没有包含证明时保留antichain，并把它的实际长度计入K。
+
+结构化条件不立即展开成所有分支组合。分支内事实保留原guard；同一域的两条可能路径
+在join处只能保留双方都保证的完成信息，不可直接并集。不同互斥域可并列为带guard条款，
+不能把EVEN上的reader A和ODD上的reader B并成ALL上A、B都完成。只有消费端实际需要时
+才对相关条件求交，记录碎片增量。一般布尔条件仍可能昂贵，这个表示不承诺消除真复杂度。
+
+## 7. 同步构造与循环归纳
+
+分开保存 D 的访问义务和 E 的已知完成前沿。按真实 issue 结构处理 acquire：
+
+```text
+义务已被相同域/强度的事实覆盖 → 直接引用，不生成同步
+否则 → 在真实最后访问后 capture、目标访问前 acquire
+       协议构造器满足局部前提后直接产生保证，不再用全图求解确认这条保证
+组合 region transfer → 建立循环归纳合同 → 导出资源/进展约束
+```
+
+不建立所有候选协议图，不全插后试删，不承诺全局最少 event。同步选择改变性能，不能
+把“少一条同步”当唯一目标。
+
+完成前沿必须区分 `IssuePrefix/QueueBeginPrefix/RetireCapturePrefix/ImplicitCompletion`
+以及通知消费。只有同 actor/clock/guard 且已证明完整 capture 包含关系时才能压成前缀。
+`native_order.py` 的 task.prefix 是 `join(task.end, before.retire)`，**不是最后一个
+native 的 end**；Set.effect 捕获 retire，但不能回灌成后续 native 的退休或开始保证。
+Wait 仅向真实 admission cut 之后传播，不能反向给过去的操作添加完成关系。
+
+不可压缩的 reader 集和偏序保留为显式小 DAG/条款，按唯一需求一次求解并计数。
+若它仍退化成全 origin×全节点传播，应报告设计尚未达标，不能更名为 frontier 验收。
+
+循环合同包含 slot 代次、entry credits、pending readers、通知消费和退出状态，分三步：
+
+1. 零次和 startup：没有虚构 reader/token；短循环和未使用 credits 有定义。
+2. 任意合法 g→g+1：同一体转移保持访问、代次和事件合同。
+3. exit：所有对外访问/通知按合同退休，最终 drain 恰好位于真实边界。
+
+有限 stage/slot 决定有限边界类别，不能按 N 或独立周期的乘积枚举。guard 保留结构化
+分支和孔洞；动态 stream 按实际 task generation 推进。一般数据依赖流尚未接通，明确
+拒绝，不写成已支持。不同 actor block 的 Python 顺序不是 CV 完成关系。
+
+循环实现先以entry frontier/prefix为符号参数解释一次body，得到 `S_out=F(S_in,g)`，
+再将backedge连接为slot/通知的代次关系。规则环应直接求解“g与g+B使用同一slot”的
+关系；reader跨度保存为带步长的范围，由归纳合同建立退休覆盖，不枚举范围内每次读取。
+不能靠不断展开g直到状态看似稳定，更不能用小N样本代替这一步证明。
+
+方案仍需在R2/R3原型回答三个具体问题：这种transfer族是否对当前嵌套CV的组合封闭；
+内部cut参数是否足以保持当前borrow所需事实；对规则FA是否真正将K降至边界/依赖规模。
+如果必须退回全源传播才能回答，原型不通过，应修改表示后再推进，不将问题藏到F阶段。
+
+内存安全、Set/Wait 配对仍不保证无死锁。固定排步另建立阻塞依赖和 token 义务；零距
+等待环拒绝，跨代环还需启动 token 与参与者激活。不能只凭 distance>0 宣称进展，
+也不能补全局 barrier/ack 改变用户政策。首版只接受能由结构化归纳合同闭合的协议。
+
+等待范围反例（省略 ID 和收尾，只说明放置）：
+
+```text
+before: load X[g%2]; R(g, 最后读X); U(g, 无关计算)
+        load X[(g+2)%2] 将复用X
+
+after:  if g>=2: Wait(release,g-2)
+        load X[g%2]; Set(ready,g)
+        Wait(ready,g); R(g); Set(release,g); U(g)
+```
+
+release 捕获 R 的真实退休，不等 U。若后续 cast 又读 X，最后 reader 必须改为 cast；
+若两 AIV 都读，必须保留两者贡献。MTE1 读完 L1、MAD 读完 L0、FIX 读完 L0C 分别
+建模，不全等到 PV 输出完成。局部 event 不自动授予 CV ownership 或 GM 可见性。
+
+## 8. 事件分配只解决资源问题
+
+E 产生逻辑 channel 和寿命义务，避免 child 先独占物理 ID、父层再修补。F 一次收集
+scope 内所有 Set、Wait、再次发布、guard、clock、bank、参与者和配置占用，联合求解。
+parent/child/query 是同一个 region 组合，不再建立三套逐步扩大的语义图。
+
+- local 二值 event：旧 Wait 消费必须先于同 ID 再 Set；width 依据真实通知 ordinal
+  和允许重叠推导，不能简单等于 buffer slots。必要的 1..8 宽度试探只处理资源约束。
+- CV counter 使用真实计数、参与者和可见性合同，不能套 local 二值规则。本地每核
+  有向 bank 8 ID；跨核物理空间和当前实现使用子集单独列出。
+- 保留已支持的 parent/child 空档共享；必须证明旧 child Wait→parent Set、parent
+  Wait→新 child Set，条件缺席和跨 query 同样处理。不能以独占 ID 或额外等待退化。
+- 只有具有已证总序切点的寿命才用区间扫描；偏序用显式约束。一般冲突着色可能困难，
+  允许只针对资源的有界求解，不能重跑依赖和全图传播。
+- ID-only 改写保持逻辑拓扑，但共享必须先证明整个池的消费关系；不能通过“分配到
+  同 ID”凭空增加顺序，再用该顺序证明自己合法。
+- 改 Set/Wait 数量、cut、guard、ordinal、width 会改变寿命，需重算相应资源/进展，
+  不能假装只是 ID 改名；端点和访存不变时不重算内存依赖。
+- 资源不足报告实际 bank/存活关系/未决原因；启发式无解不等于硬件无解。不增加 barrier、
+  搬运、buffer 或延后 release 兜底。
+
+## 9. 正常编译与深度验证的边界
+
+正常路径应从合法输入，经保持不变量的构造/变换得到确定产物。后续直接使用已有事实，
+不再全局证明“刚才那个正确变换是否正确”。实现是否遵守合同，由针对性反例、差分、
+独立有限执行模型、debug 深度验证和设备资格检验。
+
+但现在尚未建立这些合同，**不能先删 final checker**。迁移必须逐阶段提供前提、
+保证、失效规则和实现验证，再移出对应重复检查。任意导入/修改的 physical IR 重新
+建立信任，不接受 `verified=True`、用户提供的 summary 或普通 Python frozen dataclass
+当作不可变 xDSL 的证明。详见[不变量清单](compilation-invariants.md)。
+
+## 10. 性能和能力边界
+
+本轮不恢复算子优化。未来编译器替换的资格保持同一 DSL/政策，比较搬运、buffer、
+MAD/Vector 工作、舍入边界、release 范围、CV 阻塞位置、填排与最终 drain，再测设备。
+没有多余 flag 不等于没有性能损失，也不能通过降低接收能力获得漂亮编译数字。
+
+独立 AscendC、ACLNN、ops-transformer 源码、PMU、理论算力/带宽各自提供证据；
+后续测量仍用大规模输入和同一 runtime binary，不以小 kernel 的 launch 时间作吞吐结论。
+默认 FA 的历史 ACLNN 差距 18.3% 仍未解决。重构无回退与达到 ACLNN 目标是两项验收。
+
+新方案的核心变化是：访问与合同一次构造，协议构造直接产生保证，region 只导出必需
+切点，资源分配保持已有内存事实，物化保持确定映射。若关键 CV/共享仍依赖重复全图
+求解，则迁移未完成，不宣称统一、线性或性能无损。
