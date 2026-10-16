@@ -23,6 +23,10 @@ FACT_STATISTICS = (
     "fact_comparisons",
     "fact_updates",
     "fact_transfers",
+    "coverage_batches",
+    "coverage_requests",
+    "coverage_fact_scans",
+    "coverage_result_items",
 )
 
 
@@ -161,6 +165,8 @@ class SymbolicCompletion:
         self.transfers = 0
         self.fact_attempts = self.fact_comparisons = self.fact_updates = 0
         self.fact_records = self.peak_fact_records = 0
+        self.coverage_batches = self.coverage_requests = 0
+        self.coverage_fact_scans = self.coverage_result_items = 0
 
     @property
     def edge_count(self):
@@ -329,14 +335,58 @@ class SymbolicCompletion:
                     self._transfer(*edge, lo, hi, domain, bits)
 
     def coverage(self, node, point, bit, guard):
+        self.coverage_batches += 1
+        self.coverage_requests += 1
         result = []
         guard = meet(guard, self.families[node].residue_guard(point))
         for (lo, hi, domain), bits in self.facts.get(node, {}).items():
+            self.coverage_fact_scans += 1
             if bits & bit:
                 active = meet(meet(domain, guard), meet(le(lo, point), le(point, hi)))
                 if active is not None:
                     result.append(active)
+        self.coverage_result_items += len(result)
         return result
+
+    def coverage_many(self, node, point, origins, guard):
+        """Read one endpoint/domain once, retaining each single-bit origin's guards.
+
+        Repeated origins preserve request order and receive independent lists.
+        The scalar reader retains its more general any-matching-bit semantics.
+        No result survives this call or observes a different flow's facts.
+        """
+        origins = tuple(origins)
+        require(
+            all(type(bit) is int and bit > 0 and bit & (bit - 1) == 0 for bit in origins),
+            "batched symbolic coverage requires single-bit origins",
+        )
+        self.coverage_batches += 1
+        self.coverage_requests += len(origins)
+        result = {bit: [] for bit in origins}
+        requested = 0
+        for bit in result:
+            requested |= bit
+        guard = meet(guard, self.families[node].residue_guard(point))
+        if requested and guard is not None:
+            for (lo, hi, domain), bits in self.facts.get(node, {}).items():
+                self.coverage_fact_scans += 1
+                if self.coverage_fact_scans % 4096 == 0:
+                    poll("symbolic completion coverage", facts=self.coverage_fact_scans)
+                selected = bits & requested
+                if not selected:
+                    continue
+                active = meet(meet(domain, guard), meet(le(lo, point), le(point, hi)))
+                if active is None:
+                    continue
+                # Keep this exact guard paired with only its matching origins;
+                # unioning all selected masks would mix disjoint count paths.
+                while selected:
+                    bit = selected & -selected
+                    result[bit].append(active)
+                    selected ^= bit
+        ordered = [list(result[bit]) for bit in origins]
+        self.coverage_result_items += sum(map(len, ordered))
+        return ordered
 
     def statistics(self):
         """Stored condition records and actual work, not translated instances."""
@@ -348,6 +398,10 @@ class SymbolicCompletion:
             "fact_comparisons": self.fact_comparisons,
             "fact_updates": self.fact_updates,
             "fact_transfers": self.transfers,
+            "coverage_batches": self.coverage_batches,
+            "coverage_requests": self.coverage_requests,
+            "coverage_fact_scans": self.coverage_fact_scans,
+            "coverage_result_items": self.coverage_result_items,
         }
 
 

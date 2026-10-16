@@ -455,12 +455,12 @@ class QueryCompletion:
         prepared[key] = cases
         return key
 
-    def _complete(self, cases):
+    def _complete(self, cases, coverage):
         active = coalesce(needed for _, _, _, needed in cases)
         missing = [
             failure
             for node, point, bit, needed in cases
-            for failure in uncovered(needed, self.flow.coverage(node, point, bit, needed))
+            for failure in uncovered(needed, coverage[node, point, needed][bit])
         ]
         result = coalesce(covered for needed in active for covered in uncovered(needed, missing))
         return result
@@ -476,8 +476,20 @@ class QueryCompletion:
             ordered.append(self._register(source, destination, domain, prepared))
         self._check_snapshot()
         self.flow.propagate()
+        groups = {}
+        for cases in prepared.values():
+            for node, point, bit, needed in cases:
+                # Node identity includes the static query copy. Keep the full
+                # count domain; equal residue alone does not mean equal need.
+                groups.setdefault((node, point, needed), {})[bit] = None
+        coverage = {}
+        for (node, point, needed), origins in groups.items():
+            if len(coverage) % 128 == 0:
+                poll("query completion coverage", groups=len(coverage))
+            results = self.flow.coverage_many(node, point, origins, needed)
+            coverage[node, point, needed] = dict(zip(origins, results, strict=True))
         for key, cases in prepared.items():
-            self.answers[key] = self._complete(cases)
+            self.answers[key] = self._complete(cases, coverage)
         return [self.answers[key] for key in ordered]
 
     @bounded
