@@ -4,7 +4,7 @@
 
 ## 1. 当前工作和代码现场
 
-用户已恢复重构，当前基线为`959f79e`。M0文档整理已完成，M1基础组件保存于`a111140`，effects/原语接线保存于`8773953`；M2局部同步已有可运行的新入口。公共入口仍未切换；新scale/批量GEMM已有CANN离线结果，没有运行设备。算子优化和旧求解器局部调优继续停止。
+用户已恢复重构，局部同步基线为`959f79e`，源码事实交接已提交为`a5ed7e6`。M0文档整理已完成，M1基础组件保存于`a111140`，effects/原语接线保存于`8773953`；M2局部同步已有可运行的新入口。公共入口仍未切换；新scale/批量GEMM已有CANN离线结果，没有运行设备。算子优化和旧求解器局部调优继续停止。
 
 此前 `7ddaa54ec060a92e219d0462df162939b8b32d72` 的交付未达标。重构前全部实验和文档已保存到 `bbc1458`，标题为“Checkpoint paused synchronization experiments and structured-loop refactor plan”，不是资格声明。根目录没有产品Git。
 
@@ -74,6 +74,18 @@ print(emit_local(plan))
 两个结果均未设备执行，不是FA的加速成绩。对应ASC可直接查看[scale.asc](../../runs/structured-loops/m2-local/scale/scale.asc)和[batched_matmul.asc](../../runs/structured-loops/m2-local/batched_matmul/batched_matmul.asc)。
 
 恢复后的顺序：先把真实source控制、native lowering与已建立的effects/依赖交接成一个入口；再完成嵌套loop边界、terminal/SPR、CV和共享lease；然后切换公共compile并删除旧专用求解器及过渡编码/打印适配；最后执行默认FA五次冷编译、相关算子回归、CANN和大规模设备资格。继续保持FA≤5s/≤10s等验收门槛。
+
+### 递归 native 结构降级（尚未接入同步）
+
+`passes/lower_native.py::lower_native_structure`现可直接消费真实DSL：普通`scf.For/If`保留初值、结果和yield；显式Pipeline降到`PipelineLoopOp/StageOp`，每stage绑定自己的logical ordinal/iv。循环前后/相邻/内部普通native走同一递归遍历，不调用旧lower_source/region/scopes分派。显式issue_order仍保留，循环体不按N展开。
+
+`passes/native_addresses.py`用原Buffer root和完整SSA byte offset表达地址，保留所有祖先坐标、源axis及subview displacement。同root不同基址不再被合并到单capture。`analysis/value_bindings.py`保留实际writer、所有native reader以及PipelineLast有限DAG；Stage/Domain只转发，SCF carry保持零次初值。Task scope按真实循环/Stage/分支共享父链接，不复制访问历史。source除法检查只为实际存在的除法收集祖先范围，仍检查未使用的原除法，不强迫无关scalar carry化成旧access公式。
+
+当前只完成单actor结构/原语构造，返回`NativeStructure`而不是可执行计划。**动态bounds、ownership、原语/SPR接纳、stale Tile及LastTile非空使用条件、递归边界同步还没有接通；不能直接生成ASC。** 跨Stage Scalar引用、SCF Tile carry/merge、valid prefix、动态native row pitch和partial fractal明确拒绝；不是静默选择旧路径。现有局部同步入口仍消费旧lower_source的物理表示，下一步必须把这两部分接在一起。
+
+相关集成和index组59项通过（2.52s）；随后补充未使用除法/无关carry反例，iteration组9项通过（0.56s）。新物理IR45项、地址26项、值绑定13项分别通过；各组不合计成全量结果。真实Scale派发/地址、Cube排步与writer/reader、嵌套前后work、零/短循环有有限轨迹对照。固定N=2^10与2^20保持相同native/loop模板及构造工作量。未跑FA新路径、CANN或设备，不给出整编译加速结论。
+
+用户已明确下一步的CV代码形态：AIC:AIV=1:2时两个AIV共用一份body，通过runtime sid区分地址/角色。同步分析仍区分两参与者的私有UB、ownership和quorum，不以复制AIV IR来区分身份。目前正在核对并接入此表示，旧mixed生成器尚未切换。
 
 ## 2. 编译耗时：明确未达标
 

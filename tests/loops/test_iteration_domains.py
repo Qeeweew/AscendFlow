@@ -46,3 +46,24 @@ def test_uniform_runtime_lower_is_preserved_in_the_range_proof():
     module, source = program("n", "n+8", "(i-n)//2", step=3)
     normalize_loop_controls(module)
     validate_source_arithmetic(source)
+
+
+@pytest.mark.parametrize("origin", ["i-3", "i-8"])
+def test_unrelated_scalar_carry_does_not_hide_or_require_division_premises(origin):
+    module = N.from_source(f"""
+        def carried(n: N.int64):
+            with N.Kernel():
+                total=7
+                for k in N.serial(n):
+                    total=total+1
+                for t in N.Pipelined(total,stages=1):
+                    pass
+                for i in N.serial(3,7):
+                    unused=({origin})//2
+    """).to_ir()
+    source = module.body.block.first_op
+    if origin == "i-8":
+        with pytest.raises(CompileError, match="nonnegative dividend"):
+            validate_source_arithmetic(source)
+    else:
+        validate_source_arithmetic(source)

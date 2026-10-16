@@ -31,6 +31,7 @@ from xdsl.traits import IsTerminator, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
 from .loops import LoopScheduleAttr
+from .structured import AddressOp, PipelineLoopOp, PipelineStageOp
 from .types import AsyncEffects, RefType, TaskType, verify_runtime_contract
 
 
@@ -582,6 +583,9 @@ NPU = Dialect(
         StaticDispatchOp,
         StaticCaseOp,
         BufferOp,
+        AddressOp,
+        PipelineLoopOp,
+        PipelineStageOp,
         FrameOp,
         CoreIdOp,
         CaptureOp,

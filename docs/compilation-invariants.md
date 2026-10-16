@@ -35,6 +35,8 @@ IRDL verifier 负责结构和类型，不能替代异步正确性。有限模型
 5. sequence 的右项从左项真实出口接收状态，loop 回边使用同样的接线规则；子循环不因为被嵌套就换一种语义。
 6. 同一 ring 的末代/首代和 event ordinal 使用各自真实时钟。owner、guard、slot 相关性不能通过分别取模后拼错。
 
+普通SCF for保留真实lower/upper/step及iter_args/yield，不能通过附加pipeline属性改变其执行次数。显式流水stage使用本stage的`g=j-s`及`iv=lower+g*step`；纯索引的重建缓存以实际stage作用域为界，不能从别的stage借用含旧g的表达式。Tile yield转发只保留数值writer身份；PipelineLast必须在实际use处证明非空并绑定该loop的末次逻辑迭代，未用的空循环导出不制造值，也不一概拒绝。
+
 正确性论证写在变换旁；normal 只验证实际适用前提并构造结果，不针对每个 N 再跑归纳检查。
 
 ## 3. 完成与同步的关键限制

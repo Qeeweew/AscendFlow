@@ -41,6 +41,7 @@ src/xdsl_npu/
   dialects/
     source.py         # 逻辑操作、布局、排步与控制
     physical.py       # native、统一loop和typed同步，去掉query专有op
+    structured.py     # 真实pipeline/stage与多祖先SSA地址，中间IR尚待完整admission
     types.py          # 必需共享types/traits/effects
     io.py             # dialect注册、parse/print
   target/
@@ -49,6 +50,7 @@ src/xdsl_npu/
   analysis/
     iteration.py      # 真实SSA循环域、控制句柄，供admission和PLE共用
     native.py         # 首次解码保留实际effects/cut，后续只绑定clock
+    value_bindings.py # 实际writer/reader、yield转发和条件last选择，无完成承诺
     transitions.py    # 将目标单指令规则应用到有类型边界，不做协议选择
     access.py         # root/view/范围、ownership、reaching definitions
     dependencies.py   # RAW/WAR/WAW与slot carried依赖
@@ -56,7 +58,8 @@ src/xdsl_npu/
     loops.py          # region边界、坐标绑定与循环归纳合同
     resources.py      # event lease、冲突、配对与进展事实
   passes/
-    lower_native.py   # 显式recipe、地址/布局、完整effects
+    lower_native.py   # 递归控制和原语接线，返回未admit的NativeStructure
+    native_addresses.py# 完整SSA地址与原axis/几何，动态bounds仍待admission
     native_recipes.py # 原语展开，返回真实定义和全部reader，独立于控制构造
     lower_pipeline.py # 固定排步 → 统一PLE；递归处理所有循环
     insert_sync.py    # 消费依赖和前沿，构造逻辑通知

@@ -362,6 +362,18 @@ def validate_source_arithmetic(program):
     from .dialects.source import DomainOp, PipelineOp
     from .scalar import facts_from_sizes, from_ssa, positive
 
+    # Only unsigned divisions need these range premises. Keep all of them,
+    # including dead expressions, but do not demand an access-bound formula
+    # for unrelated SCF carries. Propagate relevance once up the actual IR;
+    # walking each division's ancestor chain would repeat work at every depth.
+    divisions = (arith.DivUIOp, arith.RemUIOp, arith.CeilDivUIOp)
+    relevant = set()
+    for operation in reversed(tuple(program.walk())):
+        if isinstance(operation, divisions) or operation in relevant:
+            relevant.add(operation)
+            if (parent := operation.parent_op()) is not None:
+                relevant.add(parent)
+
     facts = facts_from_sizes(program.body.block.ops)
     owner = program.body.block.args[0]
     core = Expr("argument", ("$core",))
@@ -370,7 +382,9 @@ def validate_source_arithmetic(program):
     def walk(block, coordinates, domains):
         nonlocal number
         for op in block.ops:
-            if isinstance(op, (arith.DivUIOp, arith.RemUIOp, arith.CeilDivUIOp)):
+            if op not in relevant:
+                continue
+            if isinstance(op, divisions):
                 lhs, rhs = (
                     from_ssa(value, coordinates=coordinates, facts=facts) for value in op.operands
                 )
