@@ -78,9 +78,7 @@ def test_valid_first_and_last_ports_do_not_hide_a_missing_middle_wait():
         consumers=tuple(
             replace(
                 p,
-                guard=ActionGuard(
-                    p.guard.comparisons + (Comparison(ordinal, "!=", literal(1)),)
-                ),
+                guard=ActionGuard(p.guard.comparisons + (Comparison(ordinal, "!=", literal(1)),)),
             )
             for p in original.consumers
         ),
@@ -124,7 +122,8 @@ def finite_ports(*, at_most_one=False):
 
     def port(template, *, first, source):
         coordinate = literal(0) if first else expression("sub", count, literal(1))
-        activation = (Comparison(count, ">", literal(0)),)
+        nonempty = Comparison(count, ">", literal(0))
+        activation = (nonempty,)
         if at_most_one:
             activation += (Comparison(count, "<=", literal(1)),)
         occurrence = AccessOccurrence(
@@ -132,13 +131,13 @@ def finite_ports(*, at_most_one=False):
             (LoopBinding(loop, coordinate),),
         )
         return BoundPlacement(
-            occurrence,
-            Placement.AFTER if source else Placement.BEFORE,
-            ActionGuard(activation + (Comparison(ordinal, "==", coordinate),)),
-            ((ordinal, coordinate),),
-            ((loop, coordinate),),
-            (),
-            ((loop, coordinate),),
+            occurrence=occurrence,
+            placement=Placement.AFTER if source else Placement.BEFORE,
+            guard=ActionGuard(activation + (Comparison(ordinal, "==", coordinate),)),
+            substitutions=((ordinal, coordinate),),
+            coordinate_guards=((loop, ActionGuard((nonempty,))),),
+            families=(),
+            coordinates=((loop, coordinate),),
         )
 
     notifications = (
@@ -223,11 +222,7 @@ def test_emitted_ring_ids_pair_each_actual_generation_across_clocks(source):
     actors = {actor for _, actor in selection.dispatch.tasks}
     for count in (0, 1, 2, 3):
         uniform = {"tiles": count, "n": count, "$group": 0, "$sid": 0}
-        actual = {
-            key
-            for actor in actors
-            for key, _ in actual_dispatch(selection, uniform, actor)
-        }
+        actual = {key for actor in actors for key, _ in actual_dispatch(selection, uniform, actor)}
         for assignment in plan.assignments:
             notification = assignment.notification
             assert notification.mechanism is NotificationKind.LOCAL_EVENT
@@ -242,8 +237,7 @@ def test_emitted_ring_ids_pair_each_actual_generation_across_clocks(source):
                     ):
                         for point in points:
                             coordinates = tuple(
-                                (loop, value.evaluate(context))
-                                for loop, value in point.coordinates
+                                (loop, value.evaluate(context)) for loop, value in point.coordinates
                             )
                             assert (point.operation, point.actor, coordinates) in actual
                             runtime = context | {

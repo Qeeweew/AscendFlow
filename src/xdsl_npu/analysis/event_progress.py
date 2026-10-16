@@ -19,7 +19,6 @@ from ..diagnostics import CompileError, ErrorKind
 from ..scalar import Expr, expression, literal, substitute
 from ..target.ascend910b import Actor, Engine
 from .event_contracts import ProgressPoint, StructuredProgress, _Order
-from .event_domains import _normalize
 from .structured_protocols import BoundPlacement, LogicalNotification, NotificationKind
 from .structured_schedule import ActionGuard, Comparison
 
@@ -154,6 +153,16 @@ def _key(port):
     )
 
 
+def _binding_key(port):
+    """The complete actual placement and its containing proof binding."""
+    if isinstance(port, QueueCut):
+        return (QueueCut, port)
+    return (ProgressPort, id(port.notification), port.phase, port.bound, port.bindings)
+
+
+_UNESTABLISHED = object()
+
+
 def _wait(node):
     return node.phase in {"wait", "output"}
 
@@ -174,6 +183,11 @@ class _Composer:
         self.domains = domains
         self.control = domains.control
         self.dispatch = domains.dispatch
+        # These facts belong to this immutable domain/dispatch invocation.
+        # Equal own/imported placements share one established bound instance;
+        # no notification-only or cross-compilation result is reused.
+        self._bound_facts = {}
+        self._invocation_facts = {}
         self.root = domains.memory.module.body.block.first_op
         self.events = tuple(
             n for n in domains.notifications if n.mechanism is not NotificationKind.PIPE_FENCE
@@ -225,7 +239,7 @@ class _Composer:
             reference = dict(bounds[0].coordinates)
             assumptions = self.domains.tests[notification]
             if all(
-                self.domains._prove(
+                self.domains.arithmetic.prove(
                     Comparison(reference[loop], "==", dict(bound.coordinates)[loop]), assumptions
                 )
                 for loop in strict
@@ -262,7 +276,12 @@ class _Composer:
         return self._instance(port).guard.comparisons
 
     def _instance(self, port):
-        return self.domains._instance(port.bound, dict(port.bindings))
+        key = _binding_key(port)
+        instance = self._bound_facts.get(key)
+        if instance is None:
+            instance = self.domains._instance(port.bound, dict(port.bindings))
+            self._bound_facts[key] = instance
+        return instance
 
     def _coordinates(self, port):
         return port.coordinates if isinstance(port, QueueCut) else self._instance(port).coordinates
@@ -285,8 +304,8 @@ class _Composer:
             if loop is self.root:
                 continue
             ordinal = self.control.loops[loop].ordinal
-            offset = _normalize(
-                expression("sub", coordinates[loop], ordinal), self.domains.facts
+            offset = self.domains.arithmetic.normalize(
+                expression("sub", coordinates[loop], ordinal)
             ).constant
             if offset is None:
                 self.fail(region, "stream ancestor binding is not an actual unit-rate invocation")
@@ -296,11 +315,21 @@ class _Composer:
     def _invocation_guard(self, region, *ports):
         if region is self.root or len(ports) < 2:
             return ActionGuard()
+        ambient = tuple(self._ambient(port) for port in ports)
+        key = (region, tuple(_binding_key(port) for port in ports), ambient)
+        established = self._invocation_facts.get(key, _UNESTABLISHED)
+        if established is not _UNESTABLISHED:
+            return established
+        established = self._establish_invocation(region, ports, ambient)
+        self._invocation_facts[key] = established
+        return established
+
+    def _establish_invocation(self, region, ports, ambient):
         coordinates = tuple(dict(self._coordinates(port)) for port in ports)
         # Queue endpoints may be active at different iterations of this loop.
         # Their local membership cannot disprove a shared ancestor invocation.
         assumptions = self._export_guard(
-            _guard(tuple(test for port in ports for test in self._ambient(port))), region
+            _guard(tuple(test for tests in ambient for test in tests)), region
         ).comparisons
         reference = coordinates[0]
         tests = []
@@ -311,7 +340,7 @@ class _Composer:
                 return None
             for item in coordinates[1:]:
                 test = Comparison(reference[loop], "==", item[loop])
-                if not self.domains._prove(test, assumptions):
+                if not self.domains.arithmetic.prove(test, assumptions):
                     tests.append(test)
         if self._impossible(assumptions + tuple(tests)):
             return None
@@ -382,7 +411,7 @@ class _Composer:
         opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
         tests = tuple(dict.fromkeys(tests))
         return any(
-            self.domains._prove(
+            self.domains.arithmetic.prove(
                 Comparison(test.lhs, opposite[test.predicate], test.rhs),
                 tests[:index] + tests[index + 1 :],
             )
@@ -454,11 +483,10 @@ class _Composer:
             bg, br = self._position(source, region)
             av = dict(before.coordinates).get(region, literal(0))
             bv = dict(after.coordinates).get(region, literal(0))
-            delta = _normalize(
+            delta = self.domains.arithmetic.normalize(
                 expression(
                     "sub", expression("add", bv, literal(bg)), expression("add", av, literal(ag))
                 ),
-                self.domains.facts,
             )
             if delta.constant == 0:
                 continue
@@ -486,11 +514,10 @@ class _Composer:
             bg, br = self._position(source, region)
             av = dict(self._coordinates(wait)).get(region, literal(0))
             bv = dict(self._coordinates(source)).get(region, literal(0))
-            delta = _normalize(
+            delta = self.domains.arithmetic.normalize(
                 expression(
                     "sub", expression("add", bv, literal(bg)), expression("add", av, literal(ag))
                 ),
-                self.domains.facts,
             )
             if delta.constant == 0:
                 if index + 1 < common:
@@ -507,7 +534,7 @@ class _Composer:
         if value is None:
             return None
         ordinal = self.control.loops[loop].ordinal
-        return _normalize(expression("sub", value, ordinal), self.domains.facts).constant
+        return self.domains.arithmetic.normalize(expression("sub", value, ordinal)).constant
 
     def _gate_step(self, wait, source, loop):
         wo, so = self._stream_offset(wait, loop), self._stream_offset(source, loop)

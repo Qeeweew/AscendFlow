@@ -3,24 +3,16 @@
 import pytest
 
 from xdsl_npu import language as N
-from xdsl_npu.analysis.event_domains import EventDomains
 from xdsl_npu.analysis.event_windows import build_event_window
+from xdsl_npu.analysis.integer_facts import IntegerFacts
 from xdsl_npu.analysis.structured_control import build_control_facts
 from xdsl_npu.analysis.structured_protocols import LogicalNotification, NotificationKind
 from xdsl_npu.analysis.structured_regions import LoopDomain
 from xdsl_npu.analysis.structured_schedule import Comparison
 from xdsl_npu.diagnostics import CompileError, ErrorKind
 from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.scalar import expression, literal
+from xdsl_npu.scalar import Expr, expression, literal
 from xdsl_npu.target.ascend910b import Engine
-
-
-class PredicateQueries:
-    _prove = EventDomains._prove
-    _range = EventDomains._range
-
-    def __init__(self, facts):
-        self.facts = facts
 
 
 @pytest.fixture(scope="module")
@@ -51,7 +43,7 @@ def clock_guard(control, logical):
 def window(control, logical, extra=(), domains=()):
     # Only reuse the already defined predicate arithmetic. Constructing a
     # complete EventDomains here would call the window stage recursively.
-    predicates = PredicateQueries(control.environment.facts)
+    predicates = IntegerFacts(control.environment.facts)
     notification = LogicalNotification(
         "test_window",
         (),
@@ -73,8 +65,8 @@ def window(control, logical, extra=(), domains=()):
         count=logical.count,
         guards=clock_guard(control, logical) + tuple(extra),
         facts=control.environment.facts,
-        proves=predicates._prove,
-        bounds=predicates._range,
+        proves=predicates.prove,
+        bounds=predicates.bounds,
         invariant=lambda value: control.invariant_over(value, logical.operation),
     )
 
@@ -119,6 +111,23 @@ def test_runtime_true_count_empty_short_and_nonzero_first(control):
     )
     for count in (0, 1, 2, 3, 4, 9):
         check_exact_membership(contract, {"n": count, "m": 0}, count)
+
+
+def test_clamped_owner_count_keeps_empty_and_nonempty_invocations():
+    source = N.from_source("""
+    def owners(n:N.int64(minimum=8, multiple_of=8)):
+        with N.Kernel(20) as group:
+            for query in N.serial(N.ceildiv(N.max(n // 8 - group, 0), 20)):
+                pass
+    """)
+    control = build_control_facts(lower_native_structure(source).module)
+    logical = next(iter(control.loops.values()))
+    contract = window(control, logical)
+    for extent in (8, 16, 160, 168, 320):
+        for group in (0, 1, 19):
+            remaining = max(extent // 8 - group, 0)
+            count = (remaining + 19) // 20
+            check_exact_membership(contract, {"n": extent, "$group": group}, count)
 
 
 def test_first_last_exclusions_preserve_exact_interval(control):
@@ -284,6 +293,25 @@ def test_unproved_sparse_or_noninvariant_activation_is_explicitly_unsupported(co
     with pytest.raises(CompileError, match="loop-varying guard") as failure:
         window(control, outer, (test,))
     assert failure.value.kind is ErrorKind.UNSUPPORTED
+
+
+def test_parameter_dependent_parent_activation_is_not_assumed_to_be_one_window(control):
+    parent = next(iter(control.loops.values()))
+    count = Expr("argument", ("m",))
+    predicate = Comparison(
+        count, ">", expression("rem", expression("mul", parent.ordinal, count), literal(2))
+    )
+    # A child has a residue member on even parents only when m=1, and on
+    # every parent when m>=2. One unconditional parent interval is unsound.
+    for child_count in (1, 2, 3):
+        active = [
+            p for p in range(6) if predicate.evaluate({"m": child_count, parent.ordinal.args[0]: p})
+        ]
+        assert active == ([0, 2, 4] if child_count == 1 else list(range(6)))
+    with pytest.raises(CompileError, match="exact interval/residue") as failure:
+        window(control, parent, (Comparison(count, ">=", literal(1)), predicate))
+    assert failure.value.phase == "event-window-membership"
+    assert any(item.startswith("unresolved:") for item in failure.value.witness)
 
 
 def test_unknown_scalar_carry_cannot_be_a_window_parameter():

@@ -1,6 +1,6 @@
 # 编译、正确性与性能工具
 
-从 `/workspace/xdsl-910b` 使用独立 `.venv`，模块入口加 `PYTHONPATH=compiler`。源码在examples；产物、日志、profile和运行数据写外层runs，不纳入产品Git。**当前完整算子构建、FA、设备与性能验证暂停；本轮只做静态检查和小 IR 报告测试，未执行本页构建/设备命令。**
+从 `/workspace/xdsl-910b` 使用独立 `.venv`，模块入口加 `PYTHONPATH=compiler`。源码在examples；产物、日志、profile和运行数据写外层runs，不纳入产品Git。**当前按重构顺序验收CPU与CANN编译；设备性能调优尚未恢复，实际结果见[状态页](../docs/refactor-progress.md)。**
 
 工具参数支持不等于对应算子已取得资格。当前失败指标与历史证据只见[状态页](../docs/refactor-progress.md)；完整测试/性能口径见[validation.md](../docs/validation.md)。
 

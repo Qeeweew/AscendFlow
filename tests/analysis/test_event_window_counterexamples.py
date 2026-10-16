@@ -9,8 +9,8 @@ Explicit unsupported arithmetic is allowed instead of an unsafe certificate.
 import pytest
 from xdsl.dialects.builtin import ModuleOp
 
-from xdsl_npu.analysis.event_domains import EventDomains
 from xdsl_npu.analysis.event_windows import build_event_window
+from xdsl_npu.analysis.integer_facts import IntegerFacts
 from xdsl_npu.analysis.structured_protocols import LogicalNotification, NotificationKind
 from xdsl_npu.analysis.structured_schedule import Comparison
 from xdsl_npu.diagnostics import CompileError, ErrorKind
@@ -20,16 +20,6 @@ from xdsl_npu.target.ascend910b import Engine
 G = Expr("argument", ("g",))
 PARENT = Expr("argument", ("parent",))
 MASK64 = (1 << 64) - 1
-
-
-class _PredicateQueries:
-    """Use the scalar proof callbacks without constructing owned domain facts."""
-
-    _prove = EventDomains._prove
-    _range = EventDomains._range
-
-    def __init__(self, facts):
-        self.facts = facts
 
 
 def _contains_ordinal(value):
@@ -60,7 +50,7 @@ def _window(count, extra=(), *, facts=None):
         Comparison(G, "<", literal(count)),
         *extra,
     )
-    queries = _PredicateQueries({} if facts is None else facts)
+    queries = IntegerFacts({} if facts is None else facts)
     return build_event_window(
         notification,
         loop,
@@ -68,8 +58,8 @@ def _window(count, extra=(), *, facts=None):
         count=literal(count),
         guards=guards,
         facts=queries.facts,
-        proves=queries._prove,
-        bounds=queries._range,
+        proves=queries.prove,
+        bounds=queries.bounds,
         invariant=lambda value: not _contains_ordinal(value),
     )
 
@@ -138,6 +128,8 @@ def test_a_later_guard_cannot_authorize_an_earlier_unsigned_remainder():
             ),
         )
     assert failure.value.kind is ErrorKind.UNSUPPORTED
+    assert failure.value.witness[1] == f"required: {remainder.args[0].text()} >= 0"
+    assert failure.value.witness[2] == "ordered prefix: g >= 0; g < 3"
 
 
 def test_dynamic_crt_cannot_certify_a_nonmember_after_i64_intermediate_wrap():

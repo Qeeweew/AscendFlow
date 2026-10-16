@@ -1,8 +1,9 @@
 """Dense f16 BNSD Flash Attention with retained query/KV/child pipelines.
 
-The validated configuration uses B1/Hq8/Hkv8/D128 and BQ128/BK1024/CK128/VR8.
+The default configuration uses B1/Hq8/Hkv8/D128 and BQ128/BK1024/CK128/VR8.
 Score, P and PV are explicit double-buffered GM workspaces. Other constexpr
-variants are not covered by the current device validation; see docs/attention-target.md.
+variants have no current qualification. Historical device evidence does not
+qualify the refactored compiler; see docs/refactor-progress.md.
 """
 
 from __future__ import annotations

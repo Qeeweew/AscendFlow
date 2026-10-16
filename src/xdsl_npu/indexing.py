@@ -35,7 +35,7 @@ def _product(a, b):
     require(len(a) * len(b) <= MAX_TERMS, "index algebra product budget exceeded")
     result = {}
     for (at, ac), (bt, bc) in product(a.items(), b.items()):
-        term = tuple(sorted((*at, *bt), key=repr))
+        term = tuple(sorted((*at, *bt), key=lambda atom: atom.order_key))
         result = _sum(result, {term: ac * bc})
     return result
 
@@ -60,7 +60,9 @@ def _integral(polynomial, facts):
 def _to_expr(polynomial):
     """Reconstruct only integral coefficients; proof fractions stay internal."""
     result = literal(0)
-    for term, coefficient in sorted(polynomial.items(), key=lambda item: repr(item[0])):
+    for term, coefficient in sorted(
+        polynomial.items(), key=lambda item: tuple(atom.order_key for atom in item[0])
+    ):
         require(coefficient.denominator == 1, "runtime address retains a fractional coefficient")
         value = literal(int(coefficient))
         for atom in term:
@@ -142,7 +144,9 @@ def polynomial(expr, facts, *, periodic=False, _memo=None, _work=None):
                     counts = Counter(term)
                     needed = Counter(dt)
                     if needed <= counts:
-                        remaining = tuple(sorted((counts - needed).elements(), key=repr))
+                        remaining = tuple(
+                            sorted((counts - needed).elements(), key=lambda atom: atom.order_key)
+                        )
                         candidate = {remaining: coefficient / dc}
                         if _integral(candidate, facts):
                             quotient = _sum(quotient, candidate)
@@ -173,9 +177,18 @@ def normalize(expr, facts):
 
 
 def arguments(expr):
-    if expr.kind == "argument":
-        return {expr.args[0]}
-    return set().union(*(arguments(arg) for arg in expr.args if isinstance(arg, Expr)))
+    result, seen, pending = set(), set(), [expr]
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if current.kind == "argument":
+            result.add(current.args[0])
+        else:
+            pending.extend(arg for arg in current.args if isinstance(arg, Expr))
+    return result
 
 
 def physical_terms(expr, facts):

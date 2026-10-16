@@ -159,13 +159,13 @@ class _Builder:
         self.period, self.residue, self.single = 1, literal(0), False
         self.invariants, self.pending = [], []
 
-    def fail(self, message):
+    def fail(self, message, *, witness=()):
         raise CompileError(
             f"{self.notification.name}: {message}",
             kind=ErrorKind.UNSUPPORTED,
             phase="event-window-membership",
             location=str(self.loop.location),
-            witness=(f"clock={self.ordinal.text()}",),
+            witness=(f"clock={self.ordinal.text()}", *witness),
         )
 
     def constant(self, value):
@@ -204,10 +204,19 @@ class _Builder:
                     check(child)
             if value.kind in {"floordiv", "ceildiv", "rem"}:
                 a, b = value.args
-                if not self.proves(
-                    Comparison(a, ">=", literal(0)), tuple(prefix)
-                ) or not self.proves(Comparison(b, ">", literal(0)), tuple(prefix)):
-                    self.fail("unsigned arithmetic lacks an ordered activation prefix proof")
+                for test in (Comparison(a, ">=", literal(0)), Comparison(b, ">", literal(0))):
+                    if not self.proves(test, tuple(prefix)):
+                        self.fail(
+                            "unsigned arithmetic lacks an ordered activation prefix proof",
+                            witness=(
+                                f"required: {test.lhs.text()} {test.predicate} {test.rhs.text()}",
+                                "ordered prefix: "
+                                + "; ".join(
+                                    f"{prior.lhs.text()} {prior.predicate} {prior.rhs.text()}"
+                                    for prior in prefix
+                                ),
+                            ),
+                        )
 
         for test in self.actual:
             check(test.lhs)
@@ -454,7 +463,13 @@ class _Builder:
                 else:
                     self.pending.append(test)
             if self.pending and not changed:
-                self.fail("loop-varying guard lacks an exact interval/residue membership proof")
+                self.fail(
+                    "loop-varying guard lacks an exact interval/residue membership proof",
+                    witness=tuple(
+                        f"unresolved: {test.lhs.text()} {test.predicate} {test.rhs.text()}"
+                        for test in self.pending
+                    ),
+                )
         delta = literal(0)
         if self.period != 1:
             delta = _difference_mod(

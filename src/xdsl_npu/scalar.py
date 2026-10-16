@@ -83,8 +83,13 @@ class Expr:
     args: tuple
     weight: int = field(init=False, compare=False, repr=False)
     depth: int = field(init=False, compare=False, repr=False)
+    order_key: tuple = field(init=False, compare=False, repr=False)
+    _hash: int = field(init=False, compare=False, repr=False)
 
     def __post_init__(self):
+        require(
+            isinstance(self.args, tuple), "scalar expression arguments must be an immutable tuple"
+        )
         require(
             self.kind in {"constant", "argument", *BINARY},
             f"unsupported scalar expression kind: {self.kind}",
@@ -119,6 +124,12 @@ class Expr:
         )
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "depth", depth)
+        object.__setattr__(self, "_hash", hash((self.kind, self.args)))
+        key = tuple(arg.order_key for arg in children) if children else self.args
+        object.__setattr__(self, "order_key", (self.kind, key))
+
+    def __hash__(self):
+        return self._hash
 
     @property
     def constant(self):
@@ -193,11 +204,29 @@ def substitute(value: Expr, bindings: Mapping[Expr, Expr]) -> Expr:
     loop/guard scope that makes any division or selected occurrence valid.
     This shared operation supplies no alias or completion proof.
     """
-    if value in bindings:
-        return bindings[value]
-    if value.kind in {"constant", "argument"}:
+    if not bindings:
         return value
-    return expression(value.kind, *(substitute(child, bindings) for child in value.args))
+    memo = {}
+
+    def visit(current):
+        identity = id(current)
+        if identity in memo:
+            return memo[identity]
+        if current in bindings:
+            result = bindings[current]
+        elif current.kind in {"constant", "argument"}:
+            result = current
+        else:
+            children = tuple(visit(child) for child in current.args)
+            result = (
+                current
+                if all(old is new for old, new in zip(current.args, children, strict=True))
+                else expression(current.kind, *children)
+            )
+        memo[identity] = result
+        return result
+
+    return visit(value)
 
 
 def expression(kind, a, b):
@@ -228,7 +257,7 @@ def expression(kind, a, b):
             return a
     if kind in {"min", "max"} and a == b:
         return a
-    if kind in {"add", "mul", "min", "max"} and repr(a) > repr(b):
+    if kind in {"add", "mul", "min", "max"} and a.order_key > b.order_key:
         a, b = b, a
     return Expr(kind, (a, b))
 

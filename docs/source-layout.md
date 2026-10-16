@@ -18,6 +18,7 @@
 | 排步绑定 | `analysis/structured_dispatch.py` | 固定 Stage 与 issue order 到实际 native 的映射 |
 | 通知选择 | `passes/select_notifications.py`、`analysis/structured_protocols.py` | 完整激活域中的 capture/acquire 与 coverage；不分配 ID |
 | 事件域 | `analysis/event_domains.py`、`event_windows.py` | 配对及精确 membership、首末和存在投影；不分配 ID |
+| 整数关系事实 | `analysis/integer_facts.py` | 固定输入范围及完整有序前提下的规约、范围和比较；同一事实只建立一次，不提供异步完成证明 |
 | 事件生命周期 | `analysis/event_lifetimes.py`、`structured_event_sharing.py` | 消费到复用、有限子循环再次调用和有证据的 ID 共享 |
 | 派发进展 | `analysis/event_progress.py` | 实际阻塞接口及循环组合；不读取分配 ID |
 | 事件分配 | `analysis/structured_resources.py`、`event_contracts.py` | 连接资源阶段、bank/ID 台账、配置预留与最终 drain |

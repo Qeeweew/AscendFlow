@@ -49,7 +49,7 @@ FA的真实数学主体在[attention.py](../examples/flash_attention/attention.p
 
 数学块名称不是编译器内置attention API，也不是目前已有的通用函数宏。任意Python函数调用仍被拒绝。透明宏如后续加入，必须保留source位置、类型、scratch/effects、作用域和内部循环，不靠opaque Python回调隐藏原语；这不是本轮已经支持的能力。
 
-新设计将serial、pipeline、嵌套及循环前后操作统一成[PLE与边界组合](design.md)。当前代码还未完成这次统一；禁止把设计示意复制为“可运行”示例。
+serial、pipeline、嵌套及循环前后操作使用统一控制与region接口，语义见[PLE与边界组合](design.md)。各实际示例的当前资格见[状态页](refactor-progress.md)；设计示意本身不构成可运行API。
 
 ## 4. 当前识别与lowering边界
 

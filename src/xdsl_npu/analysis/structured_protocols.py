@@ -41,7 +41,9 @@ class BoundPlacement:
     placement: Placement
     guard: ActionGuard
     substitutions: tuple[tuple[Expr, Expr], ...]
-    selections: tuple[tuple[Operation, Expr], ...]
+    # Prerequisites in the requirement's canonical coordinates. They precede
+    # evaluation of a selected FIRST/LAST in the named actual loop's guards.
+    coordinate_guards: tuple[tuple[Operation, ActionGuard], ...]
     families: tuple[FamilyCapture, ...]
     # Actual ordinals expressed in the requirement's canonical coordinates.
     # Selection happens exactly once. Resource proofs consume these values.

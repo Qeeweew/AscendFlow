@@ -56,14 +56,22 @@ def port(selection, template, *, source, coordinates, activation):
     selectors = tuple(
         Comparison(memory.control.loops[loop].ordinal, "==", value) for loop, value in coordinates
     )
+    coordinate_guards = tuple(
+        (
+            loop,
+            ActionGuard((Comparison(memory.control.loops[loop].count, ">", literal(0)),)),
+        )
+        for loop, value in coordinates
+        if value != memory.control.loops[loop].ordinal
+    )
     return BoundPlacement(
-        AccessOccurrence(AccessEndpoint.from_template(template, Actor.AIV0), bindings),
-        Placement.AFTER if source else Placement.BEFORE,
-        ActionGuard(activation + selectors),
-        substitutions,
-        coordinates,
-        (),
-        coordinates,
+        occurrence=AccessOccurrence(AccessEndpoint.from_template(template, Actor.AIV0), bindings),
+        placement=Placement.AFTER if source else Placement.BEFORE,
+        guard=ActionGuard(activation + selectors),
+        substitutions=substitutions,
+        coordinate_guards=coordinate_guards,
+        families=(),
+        coordinates=coordinates,
     )
 
 

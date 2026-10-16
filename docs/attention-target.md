@@ -1,6 +1,6 @@
 # Flash Attention 示例合同
 
-源码：[examples/flash_attention/attention.py](../examples/flash_attention/attention.py)，入口 `attention_target`。算法与固定排步属于example，不属于编译器内部。**当前编译性能未达标；新的统一循环重构尚未实现。**
+源码：[examples/flash_attention/attention.py](../examples/flash_attention/attention.py)，入口 `attention_target`。算法与固定排步属于example，不属于编译器内部。统一编译路径已替换旧实现；本例的当前编译与设备资格只以[状态页](refactor-progress.md)为准。
 
 ## 当前默认配置
 
@@ -23,7 +23,7 @@ QK产生FP32 score，online softmax保留FP32 m/l；denominator使用未舍入p3
 
 ## 资格边界
 
-旧实现曾对默认政策完成CANN和设备数值验证：Sq:Sk为128:1024、384:3072、768:1024、512:2048，阈值rtol=0.002、atol=0.0002；4K/8K另有采样记录。这些是对应旧产物的历史资格，不是当前未提交求解器实验的新设备结果。
+旧产物曾对默认政策完成CANN和设备数值验证：Sq:Sk为128:1024、384:3072、768:1024、512:2048，阈值rtol=0.002、atol=0.0002；4K/8K另有采样记录。这些是历史资格，不能用于证明当前编译器的设备结果，产品中不保留旧编译实现。
 
 历史4K同卡msprof摘要为生成代码605.780µs、ACLNN512.152µs，差18.3%，仍未达标。旧库、部分profiler原始数据和旧目录已经清理，需要重建后才能再次运行；历史报告与当前状态入口见[状态页](refactor-progress.md)。
 

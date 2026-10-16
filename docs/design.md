@@ -1,6 +1,6 @@
 # 结构化循环与统一自动同步设计
 
-2026-10-16。统一 source→结构化物理 IR 的主线已经建立；完整嵌套/CV 与 FA 功能资格仍未完成。实际结果见[状态](refactor-progress.md)，实施顺序见[计划](refactor-plan.md)。
+2026-10-16。统一 source→结构化物理 IR 的主线已经建立；默认FA及设备资格仍未完成。各示例的实际结果见[状态](refactor-progress.md)，实施顺序见[计划](refactor-plan.md)。
 
 ## 1. 单一编译模型
 

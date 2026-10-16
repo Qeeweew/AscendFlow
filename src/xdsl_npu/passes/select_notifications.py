@@ -169,7 +169,14 @@ def _bind_endpoint(need, occurrence, memory, *, source):
     control, environment = memory.control, memory.control.environment
     template = next(item for item in memory.templates if item.operation is occurrence.operation)
     engine = template.contract.engine
-    substitutions, selections, tests, families, selector_tests, coordinates = {}, [], [], [], [], []
+    substitutions, coordinate_guards, tests, families, selector_tests, coordinates = (
+        {},
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     own_bindings = {binding.loop: binding.ordinal for binding in occurrence.bindings}
     family_map = {domain.loop: domain for domain in occurrence.families}
     available = {control.group.args[0], control.sid.args[0]}
@@ -190,7 +197,9 @@ def _bind_endpoint(need, occurrence, memory, *, source):
             first, last = _selected(
                 family.count, family.period, family.residue, max(family.distance, family.first)
             )
-            tests.append(Comparison(family.count, ">", first))
+            activation = Comparison(family.count, ">", first)
+            tests.append(activation)
+            coordinate_guards.append((binding.loop, ActionGuard((activation,))))
             families.append(
                 FamilyCapture(
                     binding.loop,
@@ -213,7 +222,9 @@ def _bind_endpoint(need, occurrence, memory, *, source):
             }
             count = substitute(count, outer)
             first, last = _selected(count, value.period, value.residue)
-            tests.append(Comparison(count, ">", first))
+            activation = Comparison(count, ">", first)
+            tests.append(activation)
+            coordinate_guards.append((binding.loop, ActionGuard((activation,))))
             value = first if value.position is ResiduePosition.FIRST else last
         assert isinstance(value, Expr)
         if not selector and logical.ordinal.args[0] in arguments(value):
@@ -232,7 +243,6 @@ def _bind_endpoint(need, occurrence, memory, *, source):
             )
         selected = substitute(value, substitutions)
         coordinates.append((binding.loop, value))
-        selections.append((binding.loop, selected))
         substitutions[logical.ordinal] = selected
         selector_tests.append(Comparison(logical.ordinal, "==", value))
 
@@ -286,7 +296,7 @@ def _bind_endpoint(need, occurrence, memory, *, source):
         Placement.AFTER if source else Placement.BEFORE,
         guard,
         tuple(substitutions.items()),
-        tuple(selections),
+        tuple(coordinate_guards),
         tuple(families),
         tuple(coordinates),
     )
@@ -387,6 +397,7 @@ def _point_key(point, *, actor=True):
         point.placement,
         point.guard,
         point.coordinates,
+        point.coordinate_guards,
     )
 
 

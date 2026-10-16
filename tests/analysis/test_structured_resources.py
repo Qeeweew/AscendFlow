@@ -198,7 +198,7 @@ def test_each_region_certifies_stream_ranks_and_guarded_interfaces(repeated):
         for cycle in region.excluded_cycles:
             tests = cycle.condition.comparisons
             assert any(
-                domains._prove(
+                domains.arithmetic.prove(
                     type(test)(test.lhs, opposite[test.predicate], test.rhs),
                     tests[:index] + tests[index + 1 :],
                 )

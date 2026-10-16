@@ -1,67 +1,68 @@
 # 当前重构状态
 
-本页是当前状态入口。合同见[编译不变量](compilation-invariants.md)，实施顺序见[重构计划](refactor-plan.md)。
+本页是实现与证据入口，算法合同见[编译不变量](compilation-invariants.md)，剩余工作见[重构计划](refactor-plan.md)。主干结构和旧实现清退已提交于`e5920d4`及之前；其后的整数事实、端点绑定与定义性修复已完成。**整体目标尚未完成：默认FA仍被参数相关事件域的表示限制阻塞。** 算子调优未恢复，没有本轮设备结果。
 
-**先完成代码重构，再分析编译性能。** 算子优化、profiling 和冷编译基准尚未恢复。整体重构仍未完成，不能以代码删除、小合同通过或历史产物替代当前完整资格。
-
-## 已收敛的产品结构
+## 当前唯一编译链路
 
 ```text
-DSL/source
-  → 保留控制与地址 SSA 的 native IR
-  → 物理访问、准入与 ownership
-  → region 依赖
-  → 逻辑通知
-  → 精确事件域、生命周期、进展、资源分配
-  → 实际同步 IR
-  → ASC → CANN
+DSL/source → 保留控制与地址SSA的native IR
+  → 物理访问/准入/ownership → region依赖 → 逻辑通知
+  → 精确事件域 → 进展/生命周期/资源分配
+  → 实际同步IR → 通用纯整数化简 → ASC → CANN
 ```
 
-- 公共编译只接受 DSL/source；后端只打印最终 IR 的实际控制、地址、原语参数和通知。
-- 按最新要求，旧 planner、scope/query/loop/sequence 路径、过渡解码器和旧物理协议直接删除。没有兼容 wrapper，也没有测试目录中的历史求解器。实现历史由 Git 追溯。
-- `physical.py` 仅保留当前 native、配置、地址、参与者、循环和通知。`NativeGeometry` 只表达完整静态 footprint；原语格式化不再解释旧 Ref、prefix/count 地址。
-- 测试清退了 137 个旧文件，保留当前 source/IR 合同、几何与 packet 准入、实际 SSA recipe、独立字节/event 模型。没有将删除旧测试描述为新链路全部通过。
-- 基准工具统一读取当前产物；`source-work-v1` 区分模板清单与算法工作量。旧运行期计数器已删除；尚未重建的 native、搬运与同步请求计数明确标为不可得，不能据此报告 native 吞吐或带宽。
-- Attention runner 检查一份共享 Cube/Vector 控制结构及各参与者的私有存储；host launcher 保留源 buffer 参数名，实际编译器输出与 runner 的命名 ABI 有独立回归。
+- 已删除被替代的planner、scope/query/loop/sequence求解器、旧物理协议和过渡解码器；没有兼容wrapper或tests中的历史实现，历史由Git追溯。
+- 公共compile只接受DSL/source；后端只打印最终IR的真实控制、地址、原语参数和通知，不另用计划重建执行。
+- 算法和分块政策留在examples。两个AIV共用一份body，通过runtime sid区分；参与者的私有存储、贡献与ownership分别分析。
+- 父region只消费child接口。实际开放通知与queue/controller阻塞接口不代表native完成或buffer退休；跨代次关系由拥有实际时钟的祖先组合。
+- 整数推导由一个`IntegerFacts`环境持有完整有序前提；端点绑定只建立一次。Expr保存结构hash/确定性排序信息，替换保留共享节点和不变子树。不跨编译缓存结果，不按runtime长度展开。
+- 区间推导保留因子/clamp，代数规约负责等价比较；unsigned除法和余数保留定义性前提。选中FIRST/LAST的非空前提随canonical绑定保存，早于选中坐标的求值；不对上一父代次二次平移。
+- 基准工具读取当前产物。`source-work-v1`区分静态模板与显式算法量；尚未建立的运行期native/搬运请求计数明确不可得，不能据此报告设备吞吐/带宽。
 
-## 同步重构的准确边界
+## 编译与验证结果
 
-| 部分 | 已实现 | 尚缺资格或结构 |
-|---|---|---|
-| 控制与访问 | runtime 循环、Stage、标量 carry、完整地址 SSA、物理范围、初始化与 ownership；共享 AIV body 使用 runtime sid | 未证明的动态别名/ownership 明确拒绝 |
-| 依赖与通知 | RAW/WAR/WAW、最后 reader、slot/generation、首末有效域；统一 LogicalNotification | 默认 FA 的完整资源结果未建立 |
-| 事件域与生命周期 | Set/Wait 等价域、精确窗口及内向外存在投影、consume→reuse、双 AIV quorum、显式资源台账 | 一般重复 channel 的 ID 共享仍有限制 |
-| 循环进展 | 内部 stream rank、实际 open 通知端口与参数化 queue/controller 接口分开；父层只消费 child.interface | 大例完整构建尚未完成，任意条件投影不据此宣称支持 |
-| 最终 IR 与 ASC | 真实 SCF/Notification/Address SSA；单份 AIV 代码，无隐藏全局 barrier | 完整嵌套/CV、默认 FA 以及相关 CANN/设备资格未恢复 |
+`e5920d4`上的嵌套CV完整构建曾在300秒被终止，见[原构建状态](../../runs/refactor-no-legacy/nested-cv/build-result.json)。随后30秒cProfile诊断停在progress、尚未进入lease/allocator：8个native、19条通知却构造了约53万个Expr，执行约23万次polynomial调用。中断链为`_local_arcs → _impossible → _prove → normalize → expression → repr`，证据见[diagnostics](../../runs/refactor-no-legacy/diagnostics/)。采样耗时不是正常编译时间，各累计时间也不能相加。
 
-进展阶段不再向父层导出隐藏 native。每个 region 只导出 ancestor 拥有匹配的实际通知端口及自身 queue 输入、queue/controller 阻塞输出；实际 native、窗口和 rank 留在本地 witness。一次导入绑定同时处理端点与 guard，rank 与组合图复用同一结果。
+完成上述职责收拢后，当前默认配置的独立新进程单次记录为：
 
-跨调用 gate 由拥有时钟的祖先按真实坐标连接，不能在 child 拼成零步边。独立 n=1/n=2 外层等待反例验证了这一点；原有父层组合已经能正确拒绝该例，未宣称修复新的漏检。额外显式复制 queue 调用实例的候选已经删除，没有保留第二条路径。这些接口只描述可能阻塞/发布，不代表异步完成或 buffer 退休。
+| 示例 | source→ASC | 证据 |
+|---|---:|---|
+| Scale，B64 | 0.76s | [benchmark.json](../../runs/refactor-no-legacy/compile-scale-final/benchmark.json) |
+| 批量GEMM，M32/N64/K64，20 groups | 2.30s | [benchmark.json](../../runs/refactor-no-legacy/compile-gemm-final/benchmark.json) |
+| Softmax，R8/D1024，32 groups | 1.16s | [benchmark.json](../../runs/refactor-no-legacy/compile-softmax-final/benchmark.json) |
+| RMSNorm，D4096，32 groups | 1.21s | [benchmark.json](../../runs/refactor-no-legacy/compile-rms-final/benchmark.json) |
 
-## 本次验证及限制
+包含源码读取、构造、全部分析、ASC和IR快照；import与进程墙钟另列。运行长度仍为参数。这些是单次probe，不是五次p50资格；没有对应旧基线时不声称加速倍数。一份较早Scale记录可能与测试重叠，已标为不使用其计时，表中只使用隔离后的final记录。
 
-- 原 20 项小进展/接口合同通过；最终受调整影响的新增 n=1/n=2 两项通过。独立 queue 接口文件共7项已通过。CV 域检查只验证参与者与缺失贡献拒绝，不代替完整 CV 构建。
-- 独立手工最终 IR 模型及 native 合同的小组已执行；修复了迁移暴露的 packet 身份准入缺口，并将 block8 recipe 断言改为实际 SSA root 和不重叠字节区间。
-- 后端定向检查验证实际地址、控制和通知 SSA、MAD 首块初始化。新的通用整数标量pass已经接入物化后的实际管线，6项规则/接线回归及1项期限机制回归通过；前端与源语言相关57项通过。host C++ 检查不能替代设备执行。
-- Attention 元数据检查已迁移共享 body 布局；新增实际编译器 launcher→runner ABI 回归。元数据 fixture 不代表完整 FA 编译。
-- 七项工作量记录/schema 检查通过。清退后的全局 collection 成功；没有执行完整测试集。
-- 有限 GM→UB→Vector→GM 用例已通过公共链路与 CANN，产物在 [finite](../../runs/refactor-no-legacy/finite/)。随后实际 [Scale 双缓冲示例](../examples/vector/scale.py)也通过同一路径和 CANN，产物在 [scale-current](../../runs/refactor-no-legacy/scale-current/)，运行长度仍是参数。这两项都不是设备或 CV/FA 资格。
-- 已检查 Scale 最终 ASC：保留3个native模板、输入/输出双槽及4条ready/release通知，没有增加搬运。event ID仍含较多min/max和重复取模；新通用标量pass只处理可安全应用的stock规则，没有宣称输出已充分简化或性能已达标。
-- 一次期限机制测试中的 `compile(scale, timeout_s=3)` 曾到达期限。该机制测试改用有限三native输入，原现象仍记录为待后续编译性能分析项；更换测试输入不是性能改善。
-- 实际批量 GEMM 的6个native模板、L1/L0/L0C多缓冲及Cube/Fixpipe经公共链路和CANN离线编译通过，产物在 [gemm-current](../../runs/refactor-no-legacy/gemm-current/)。这是独立矩阵批次，不是完整attention或多层K-reduction资格。
-- 本轮没有设备执行或性能结果。
+嵌套CV当前通过公共CLI与CANN：编译器内部9.17s、CANN2.43s、总构建11.81s，见[构建状态](../../runs/refactor-no-legacy/nested-cv-final/build-result.json)。实际有8个native模板、40条依赖、19条通知，进展图80点/135边；8个native均只打印一次。可直接查看[最终ASC](../../runs/refactor-no-legacy/nested-cv-final/nested_cv.asc)、[同步前IR](../../runs/refactor-no-legacy/nested-cv-final/before.xdsl)和[同步后IR](../../runs/refactor-no-legacy/nested-cv-final/after.xdsl)。
 
-最近完整嵌套 CV 构建触及300秒硬期限，worker被终止，已确认进程组无残留；状态见 [nested-cv/build-result.json](../../runs/refactor-no-legacy/nested-cv/build-result.json)。没有发布ASC/CANN产物，现有日志不足以定位全部耗时。本批停止，不继续FA或其他构建候选。
+该最终IR/ASC与前一合格产物逐字节相同；独立最终IR事件/访问模型已覆盖n=0/1/2、groups=0/1及双AIV，见[有限模型记录](../../runs/refactor-no-legacy/nested-cv-current/finite-model.log)。不重复检查相同产物，也不将这些有限实例称为任意N证明或设备资格。
 
-更早的完整FA同步曾达到300秒上限，未进入CANN；窗口/进展重写期间的嵌套CV局部检查也曾达到45秒测试上限。它们都不是硬件event容量不足的证据。代码结构改造已落地，但完整CV/FA资格和编译耗时问题仍未完成。
+本轮集成组首次173项通过，9项因手工fixture仍按旧字段位置构造而失败；按当前绑定合同迁移后，对应两文件17项重跑全部通过。没有增加兼容分支或删除反例。表达式/index组另有52项通过、2项host构建检查未选。当前有真实IR事件/字节模型、条件进展、配对/资源破坏、定义性和DAG工作量回归；没有运行全量suite。全局Ruff和diff检查通过。
 
-旧完整 QK/PV 共享 L0C 跨 query 的全部启动/稳态/收尾场景尚未逐项在新路径取得资格。通用硬件反例的覆盖不能代替这些实际算子测试。
+Vector、Cube/Fixpipe和嵌套CV的CANN证据不等于设备数值/性能结果。默认FA尚无当前成功ASC/CANN产物。通用标量pass已接入；event ID中仍有多余min/max和取模，没有宣称可读性或设备性能已经达标。
 
-## 后续顺序
+## 默认FA的实际阻塞
 
-1. 保存当前单一路径、region接口和通用标量pass检查点，不恢复旧实现。
-2. 在这份结构已稳定的代码上，定位未完成构建的阶段与编译工作量；先做有界的阶段诊断，不继续完整算子候选批次或无界测试。
-3. 根据实证处理编译性能问题并完成嵌套CV、默认FA的功能与CANN资格。当前的超时不能算功能通过，亦不能算重构目标全部完成。
-4. 之后再恢复算子性能工作，比较最终ASC、AscendC/ACLNN、profiling与硬件理论指标。
+默认FA有44个native、473条依赖、213条通知。通用整数规则及选中坐标条件顺序修复后，已越过此前的无符号算术定义性错误。最新拒绝为：
 
-源码、回归和产品文档只提交独立compiler Git；外层运行数据不提交，不推送或发布。
+```text
+loop-varying guard lacks an exact interval/residue membership proof
+```
+
+证据见[fa-binding-diagnostic](../../runs/refactor-no-legacy/fa-binding-diagnostic/)。具体待证明表达式和有序前提已加入错误诊断。失败退出时间不算编译性能结果；一次较早失败诊断还可能与1.55秒测试短暂重叠，不作为独占计时。
+
+最小通用反例是`m > (p*m)%2`：子长度m=1时父激活只取偶数，m>=2时每代激活。当前单窗口模型没有这种参数分区能力。必须保持真实activation、配对、slot复用与条件下的生命周期；不能调大最小输入、丢条件、关闭检查或加barrier换取通过。该明确拒绝已有小回归，不作为支持能力。
+
+## 下一部分与复现
+
+下一部分实现参数相关事件域及其消费接口，按[计划第2节](refactor-plan.md#2-当前重点把事件合同补完整)先验收数学/通用DSL反例，再恢复默认FA完整资格。没有新域模型前不重复FA构建。随后再做独立进程编译资格和设备验证；算子调优继续留到这些工作之后。
+
+工作区根目录命令：
+
+```bash
+.venv/bin/python -m xdsl_npu.cli --input compiler/tests/fixtures/nested.py --entry nested_cv --compile --timeout 300 --output runs/reproduce/nested-cv
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/vector/scale.py --entry scale --mode normal --trials 1 --timeout 60 --output runs/reproduce/scale
+```
+
+源码、回归和产品文档仅提交compiler Git；外层数据不提交，不推送或发布。

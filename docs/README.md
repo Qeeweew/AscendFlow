@@ -1,13 +1,13 @@
 # 编译器文档
 
-当前正在重新设计循环与自动同步算法，算子优化暂停。**实现、测量与未解决问题只在[状态页](refactor-progress.md)登记；设计和计划不能当支持证据。**
+当前统一编译链路及旧实现清退已落地，继续补齐完整算子的编译资格与编译耗时分析；算子优化暂停。**实现、测量与未解决问题只在[状态页](refactor-progress.md)登记；设计和计划不能当支持证据。**
 
 | 文档 | 唯一职责 |
 |---|---|
 | [design.md](design.md) | 统一prologue/loop/epilogue、边界/回边、完成前沿与资源语义 |
 | [source-layout.md](source-layout.md) | 包结构、依赖方向、当前模块去留和迁移纪律 |
 | [compilation-invariants.md](compilation-invariants.md) | 每项保证的建立者、保持/失效与normal/debug边界 |
-| [refactor-plan.md](refactor-plan.md) | M0–M6实施顺序、具体交付和退出门槛 |
+| [refactor-plan.md](refactor-plan.md) | 当前结构、剩余事件域任务与验收顺序 |
 | [refactor-progress.md](refactor-progress.md) | 当前代码身份、支持范围、失败指标及证据 |
 | [dsl-multistage.md](dsl-multistage.md) | 用户语法、运行时/constexpr、CV多阶段和组合限制 |
 | [attention-target.md](attention-target.md) | 当前FA example的数学、存储和资格合同 |

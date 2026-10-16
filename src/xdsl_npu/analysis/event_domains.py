@@ -16,11 +16,12 @@ from types import MappingProxyType
 from xdsl.dialects import arith
 
 from ..diagnostics import CompileError, ErrorKind, require
-from ..indexing import arguments, normalize
-from ..scalar import Expr, Fact, expression, infer, literal
+from ..indexing import arguments
+from ..scalar import Fact, expression, literal
 from ..target.ascend910b import Actor, Engine
 from .event_contracts import ResourceWork, _Order
 from .event_windows import EventWindow, WindowExistence, build_event_window
+from .integer_facts import IntegerFacts
 from .structured_control import ControlFacts
 from .structured_dispatch import StructuredDispatch
 from .structured_memory import NativeMemoryFacts
@@ -31,59 +32,6 @@ from .structured_protocols import (
     substitute,
 )
 from .structured_schedule import ActionGuard, Comparison
-
-
-def _normalize(value, facts):
-    try:
-        return normalize(value, facts)
-    except CompileError as error:
-        if error.message != "runtime address retains a fractional coefficient":
-            raise
-        return value
-
-
-def _bounded(value, facts=None):
-    """Normalize integer ring arithmetic while retaining division atoms.
-
-    Quotient expansion is useful for equality, but loses the actual remainder
-    interval needed by inequalities. These temporary names are local algebra
-    variables only; none enters an event expression or emitted program.
-    """
-    facts = {} if facts is None else facts
-    atoms, replacements = {}, {}
-
-    def encode(current):
-        if current.kind in {"constant", "argument"}:
-            return current
-        if current.kind in {"add", "mul"}:
-            return expression(current.kind, *(encode(child) for child in current.args))
-        atom = expression(current.kind, *(_bounded(child, facts) for child in current.args))
-        if atom.kind in {"floordiv", "ceildiv", "rem"} and atom.args[1].constant == 1:
-            return encode(literal(0) if atom.kind == "rem" else atom.args[0])
-        if atom.kind in {"min", "max"}:
-            a, b = (infer(arg, facts) for arg in atom.args)
-            if a is not None and b is not None:
-                if a.maximum is not None and b.minimum is not None and a.maximum <= b.minimum:
-                    return encode(atom.args[0 if atom.kind == "min" else 1])
-                if b.maximum is not None and a.minimum is not None and b.maximum <= a.minimum:
-                    return encode(atom.args[1 if atom.kind == "min" else 0])
-        if atom not in atoms:
-            symbol = Expr("argument", (f"$resource_atom_{len(atoms)}",))
-            atoms[atom], replacements[symbol] = symbol, atom
-        return atoms[atom]
-
-    encoded = encode(value)
-    return substitute(normalize(encoded, {}), replacements)
-
-
-def _term(test):
-    if test.predicate in {">", ">="}:
-        value = expression("sub", test.lhs, test.rhs)
-        return expression("sub", value, literal(int(test.predicate == ">")))
-    if test.predicate in {"<", "<="}:
-        value = expression("sub", test.rhs, test.lhs)
-        return expression("sub", value, literal(int(test.predicate == "<")))
-    return None
 
 
 def _loop_ancestors(control, operation):
@@ -101,7 +49,8 @@ class EventDomains:
 
     Endpoint activation/ID checks may reject an unsupported proof. ``tests``
     and ``windows`` are built once and exposed through read-only mappings.
-    Query counters in ``work`` are the only mutation after construction.
+    Integer queries belong to one immutable input-fact environment; their
+    answers and query counters may be filled without altering established domains.
     """
 
     selection: SynchronizationSelection
@@ -109,6 +58,7 @@ class EventDomains:
     control: ControlFacts
     facts: Mapping[str, Fact]
     dispatch: StructuredDispatch
+    arithmetic: IntegerFacts
     notifications: tuple[LogicalNotification, ...]
     work: ResourceWork
     tests: Mapping[LogicalNotification, tuple[Comparison, ...]]
@@ -123,6 +73,7 @@ class EventDomains:
             ("control", memory.control),
             ("facts", memory.control.environment.facts),
             ("dispatch", selection.dispatch),
+            ("arithmetic", IntegerFacts(memory.control.environment.facts)),
             ("notifications", selection.notifications),
             ("work", work),
             ("tests", {}),
@@ -211,8 +162,8 @@ class EventDomains:
                     count=count,
                     guards=projected,
                     facts=self.facts,
-                    proves=self._prove,
-                    bounds=self._range,
+                    proves=self.arithmetic.prove,
+                    bounds=self.arithmetic.bounds,
                     invariant=lambda value, loop=loop: self.control.invariant_over(value, loop),
                 )
                 windows[loop] = window
@@ -232,8 +183,8 @@ class EventDomains:
             if tests == reference:
                 # Equality of canonical domains includes the empty domain.
                 continue
-            if not all(self._prove(test, reference) for test in tests) or not all(
-                self._prove(test, tests) for test in reference
+            if not all(self.arithmetic.prove(test, reference) for test in tests) or not all(
+                self.arithmetic.prove(test, tests) for test in reference
             ):
                 self.fail(
                     notification,
@@ -244,7 +195,7 @@ class EventDomains:
     def _paired_id(self, assignment, bound, event):
         bindings = {self.control.loops[loop].ordinal: value for loop, value in bound.coordinates}
         restored = substitute(bound.expression(event), bindings)
-        if _normalize(expression("sub", restored, event), self.facts).constant != 0:
+        if self.arithmetic.normalize(expression("sub", restored, event)).constant != 0:
             self.fail(
                 assignment.notification,
                 "event ID does not round-trip through the actual endpoint coordinates",
@@ -265,9 +216,11 @@ class EventDomains:
         a, b = uniform(left), uniform(right)
         opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
         return any(
-            self._prove(Comparison(test.lhs, opposite[test.predicate], test.rhs), b) for test in a
+            self.arithmetic.prove(Comparison(test.lhs, opposite[test.predicate], test.rhs), b)
+            for test in a
         ) or any(
-            self._prove(Comparison(test.lhs, opposite[test.predicate], test.rhs), a) for test in b
+            self.arithmetic.prove(Comparison(test.lhs, opposite[test.predicate], test.rhs), a)
+            for test in b
         )
 
     def fail(self, notification, message, *, phase="structured-event-resources"):
@@ -287,16 +240,30 @@ class EventDomains:
             self.control.loops[loop].ordinal: value for loop, value in placement.coordinates
         }
         bindings[self.control.sid] = literal(1 if placement.actor is Actor.AIV1 else 0)
+        coordinate_guards = dict(placement.coordinate_guards)
         tests = []
-        # These already hold before the placed action is reached. Keep their
-        # lexical order ahead of the action guard so later conjuncts cannot
-        # authorize an earlier undefined divide/remainder.
-        # These are actual lexical activation conditions, including empty
-        # enclosing loops. A selected coordinate does not remove its scope.
+
+        def bind(test, substitutions):
+            return Comparison(
+                substitute(test.lhs, substitutions),
+                test.predicate,
+                substitute(test.rhs, substitutions),
+            )
+
+        # Retain lexical activation order, including empty enclosing loops.
+        # A selected ordinal is evaluated only after its own nonempty fiber
+        # prerequisite, and cannot borrow a later action-guard conjunct.
+        # Coordinate prerequisites are already canonical; applying the actual
+        # coordinate map again would translate a previous invocation twice.
+        canonical = {self.control.sid: bindings[self.control.sid]}
         for frame in self.control.frames[placement.operation].ancestors():
             if frame.loop is not None:
+                prerequisite = coordinate_guards.get(frame.loop.operation)
+                if prerequisite is not None:
+                    tests.extend(bind(test, canonical) for test in prerequisite.comparisons)
                 tests.extend(
-                    (
+                    bind(test, bindings)
+                    for test in (
                         Comparison(frame.loop.ordinal, ">=", literal(0)),
                         Comparison(frame.loop.count, ">", frame.loop.ordinal),
                     )
@@ -325,21 +292,17 @@ class EventDomains:
                         "<=": ">",
                     }[predicate]
                 tests.append(
-                    Comparison(
-                        self.control.environment.expression(compare.lhs),
-                        predicate,
-                        self.control.environment.expression(compare.rhs),
+                    bind(
+                        Comparison(
+                            self.control.environment.expression(compare.lhs),
+                            predicate,
+                            self.control.environment.expression(compare.rhs),
+                        ),
+                        bindings,
                     )
                 )
-        tests.extend(placement.guard.comparisons)
-        return tuple(
-            dict.fromkeys(
-                Comparison(
-                    substitute(test.lhs, bindings), test.predicate, substitute(test.rhs, bindings)
-                )
-                for test in tests
-            )
-        )
+        tests.extend(bind(test, bindings) for test in placement.guard.comparisons)
+        return tuple(dict.fromkeys(tests))
 
     def _instance(self, placement, bindings):
         tests = tuple(
@@ -375,92 +338,9 @@ class EventDomains:
             ),
         )
 
-    def _range(self, value, assumptions=()):
-        value = _bounded(value, self.facts)
-        fact = infer(value, self.facts)
-        lower, upper = (None, None) if fact is None else (fact.minimum, fact.maximum)
-        for test in assumptions:
-            if test.rhs.constant is not None and (
-                value.kind == "argument" or _bounded(test.lhs, self.facts) == value
-            ):
-                offset = _normalize(
-                    _bounded(expression("sub", test.lhs, value), self.facts), self.facts
-                ).constant
-                if offset is None:
-                    continue
-                bound = test.rhs.constant - offset
-                if test.predicate in {">", ">=", "=="}:
-                    candidate = bound + int(test.predicate == ">")
-                    lower = candidate if lower is None else max(lower, candidate)
-                if test.predicate in {"<", "<=", "=="}:
-                    candidate = bound - int(test.predicate == "<")
-                    upper = candidate if upper is None else min(upper, candidate)
-        if value.kind == "constant":
-            return value.constant, value.constant
-        if value.kind == "rem" and value.args[1].constant is not None:
-            return 0, value.args[1].constant - 1
-        if lower is not None and upper is not None:
-            return lower, upper
-        if value.kind in {"add", "mul"}:
-            (al, au), (bl, bu) = (self._range(arg, assumptions) for arg in value.args)
-            if value.kind == "add":
-                calculated_lower = None if al is None or bl is None else al + bl
-                calculated_upper = None if au is None or bu is None else au + bu
-            elif all(bound is not None for bound in (al, au, bl, bu)):
-                products = (al * bl, al * bu, au * bl, au * bu)
-                calculated_lower, calculated_upper = min(products), max(products)
-            else:
-                calculated_lower = (
-                    0 if al is not None and bl is not None and al >= 0 and bl >= 0 else None
-                )
-                calculated_upper = None
-            lower = calculated_lower if lower is None else lower
-            upper = calculated_upper if upper is None else upper
-        return lower, upper
-
-    def _prove(self, test, assumptions):
-        difference = _normalize(
-            _bounded(expression("sub", test.lhs, test.rhs), self.facts), self.facts
-        )
-        if difference.constant is not None:
-            return Comparison(difference, test.predicate, literal(0)).evaluate({})
-        if test in assumptions:
-            return True
-        if test.predicate in {"==", "!="}:
-            for prior in assumptions:
-                if (
-                    prior.predicate == test.predicate
-                    and _normalize(
-                        expression("sub", expression("sub", prior.lhs, prior.rhs), difference),
-                        self.facts,
-                    ).constant
-                    == 0
-                ):
-                    return True
-            if test.predicate == "!=":
-                lower, upper = self._range(difference, assumptions)
-                return lower is not None and lower > 0 or upper is not None and upper < 0
-            return self._prove(Comparison(test.lhs, ">=", test.rhs), assumptions) and self._prove(
-                Comparison(test.lhs, "<=", test.rhs), assumptions
-            )
-        term = _bounded(_term(test), self.facts)
-        for prior in assumptions:
-            constraint = _term(prior)
-            if constraint is not None:
-                remainder = _bounded(expression("sub", term, constraint), self.facts)
-                if remainder.constant is not None:
-                    if remainder.constant >= 0:
-                        return True
-                    continue
-                bound, _ = self._range(remainder)
-                if bound is not None and bound >= 0:
-                    return True
-        lower, _ = self._range(term, assumptions)
-        return lower is not None and lower >= 0
-
     def _exists(self, placements, assumptions):
         return all(
-            self._prove(test, assumptions)
+            self.arithmetic.prove(test, assumptions)
             for placement in placements
             for test in placement.guard.comparisons
         )
@@ -520,24 +400,28 @@ class EventDomains:
         for index in range(common):
             ag, ar = position(a, ap, before, False, index)
             bg, br = position(b, bp, after, True, index)
-            difference = _normalize(expression("sub", bg, ag), self.facts)
+            difference = self.arithmetic.normalize(expression("sub", bg, ag))
             if difference.constant == 0:
                 if index + 1 < common:
                     continue
                 return _Order.PROVED if br >= ar else _Order.IMPOSSIBLE
             if difference.constant is not None:
                 return _Order.PROVED if difference.constant > 0 else _Order.IMPOSSIBLE
-            if self._prove(Comparison(difference, ">", literal(0)), assumptions):
+            if self.arithmetic.prove(Comparison(difference, ">", literal(0)), assumptions):
                 return _Order.PROVED
-            if self._prove(Comparison(difference, "<", literal(0)), assumptions):
+            if self.arithmetic.prove(Comparison(difference, "<", literal(0)), assumptions):
                 return _Order.IMPOSSIBLE
             if index + 1 == common:
-                if br >= ar and self._prove(Comparison(difference, ">=", literal(0)), assumptions):
+                if br >= ar and self.arithmetic.prove(
+                    Comparison(difference, ">=", literal(0)), assumptions
+                ):
                     return _Order.PROVED
-                if br < ar and self._prove(Comparison(difference, "<=", literal(0)), assumptions):
+                if br < ar and self.arithmetic.prove(
+                    Comparison(difference, "<=", literal(0)), assumptions
+                ):
                     return _Order.IMPOSSIBLE
                 return _Order.POSSIBLE
-            if not self._prove(Comparison(difference, "==", literal(0)), assumptions):
+            if not self.arithmetic.prove(Comparison(difference, "==", literal(0)), assumptions):
                 return _Order.POSSIBLE
         return _Order.IMPOSSIBLE
 
@@ -617,7 +501,7 @@ class EventDomains:
         tests = tuple(test for bound in bounds for test in bound.guard.comparisons)
         opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
         return not any(
-            self._prove(
+            self.arithmetic.prove(
                 Comparison(test.lhs, opposite[test.predicate], test.rhs),
                 tests[:index] + tests[index + 1 :],
             )

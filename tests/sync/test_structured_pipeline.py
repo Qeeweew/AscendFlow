@@ -21,12 +21,14 @@ from xdsl_npu.scalar import Expr, expression, literal
 from xdsl_npu.target.ascend910b import Actor, Engine
 
 
-@pytest.fixture(params=[scale, batched_matmul])
+@pytest.fixture(scope="module", params=[scale, batched_matmul])
 def selected(request):
+    # Consumers below only read this owned result; parsed snapshots are fresh.
+    # Runtime-count cases must not each rebuild the same symbolic program.
     return synchronize_structure(request.param)
 
 
-def test_actual_local_pipeline_needs_no_legacy_completion_graph(selected):
+def test_actual_local_pipeline_has_one_owned_structure(selected):
     selected.selection.require_closed()
     assert selected.selection.dispatch.memory is selected.memory
     assert len(selected.selection.coverage) == len(selected.dependencies.required)
@@ -44,7 +46,11 @@ def test_actual_selected_actions_materialize_as_guarded_ssa_ir(selected):
     from xdsl_npu.dialects.structured import NotificationOp
 
     memory = selected.memory
-    original_operations = tuple(memory.control.frames)
+    # The final scalar pass can replace/delete arith SSA. Execution, control
+    # and address operations must keep their identities and relative order.
+    original_operations = tuple(
+        op for op in memory.control.frames if not op.name.startswith("arith.")
+    )
     module = selected.module
     assert module is memory.module is selected.structure.module
     module.verify()
