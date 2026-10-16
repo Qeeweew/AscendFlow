@@ -9,7 +9,7 @@ from xdsl.ir import Block, Region
 from examples.gemm.reduction import reduction_gemm
 from tests.report_contract import semantic_report
 from tests.test_loop_sync import finite_hardware_dag
-from xdsl_npu import compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.diagnostics import CompileError
@@ -25,6 +25,7 @@ from xdsl_npu.dialects.physical import (
 )
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.performance import runtime_work
+from xdsl_npu.sync import verify_plan
 
 
 @pytest.fixture(scope="module", params=[False, True])

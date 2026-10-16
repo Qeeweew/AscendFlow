@@ -1,4 +1,4 @@
-"""One bounded ordering certificate for an already selected local protocol.
+"""Historical M2 local ordering certificate used by the test oracle.
 
 This checks progress, not memory coverage or event reuse. One physical-step
 template supplies V milestone variables and E ordering inequalities. With
@@ -17,9 +17,9 @@ whose mutually exclusive guards are necessary to break its cycle.
 from bisect import bisect_left
 from dataclasses import dataclass
 
-from ..diagnostics import CompileError, ErrorKind, require
-from ..target.ascend910b import Engine
-from .protocols import LocalCommand
+from tests.legacy.analysis.protocols import LocalCommand
+from xdsl_npu.diagnostics import CompileError, ErrorKind, require
+from xdsl_npu.target.ascend910b import Engine
 
 
 @dataclass(frozen=True, slots=True)

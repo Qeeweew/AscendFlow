@@ -1,4 +1,4 @@
-"""Conditional binary-event leases from real queue or Scalar controller order.
+"""Historical M2 conditional binary-event leases used by the test oracle.
 
 A lease proves old Wait consumption precedes the next Set effect using that
 ID. It does not prove the selected protocols can make progress: in particular
@@ -26,10 +26,10 @@ from dataclasses import dataclass
 from enum import Enum
 from math import gcd, lcm
 
-from ..diagnostics import CompileError, ErrorKind, require
-from ..target.ascend910b import Actor, Engine, Milestone, supports_engine
-from .native import NativeCut, NativeTask
-from .protocols import EventAssignment, LocalMechanism, LocalProtocol
+from tests.legacy.analysis.protocols import EventAssignment, LocalMechanism, LocalProtocol
+from xdsl_npu.analysis.native import NativeCut, NativeTask
+from xdsl_npu.diagnostics import CompileError, ErrorKind, require
+from xdsl_npu.target.ascend910b import Actor, Engine, Milestone, supports_engine
 
 LocalBank = tuple[Actor, Engine, Engine]
 LOCAL_EVENT_CAPACITY = 8

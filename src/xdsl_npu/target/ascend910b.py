@@ -25,6 +25,14 @@ class Engine(str, Enum):
     FIX = "FIX"
 
 
+class SyncKind(str, Enum):
+    LOCAL_SET = "local_set"
+    LOCAL_WAIT = "local_wait"
+    FENCE = "fence"
+    CROSS_SET = "cross_set"
+    CROSS_WAIT = "cross_wait"
+
+
 class Milestone(str, Enum):
     # ISSUE belongs to the actor's controller and has no pipeline engine.
     ISSUE = "issue"

@@ -22,7 +22,7 @@ from xdsl.ir import Operation
 from ..diagnostics import ErrorKind, require
 from ..dialects.physical import CoreIdOp, KernelOp, MixedOp, RuntimeSizeOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
-from ..indexing import interval, nonnegative
+from ..indexing import arguments, interval, nonnegative
 from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
 from ..target.ascend910b import Actor
 from .structured_addresses import ScalarEnvironment
@@ -103,13 +103,20 @@ class ControlFrame:
     loop: LogicalLoop | None = None
     branch: int | None = None
 
-    def domains(self) -> tuple[Range, ...]:
-        """Only lexical depth, with no replay of executed iterations."""
+    def ancestors(self) -> tuple[ControlFrame, ...]:
+        """The one retained lexical scope chain, including this frame."""
         frames, current = [], self
         while current is not None:
             frames.append(current)
             current = current.parent
-        return tuple(domain for frame in reversed(frames) for domain in frame.ranges)
+        return tuple(reversed(frames))
+
+    def loops(self) -> tuple[LogicalLoop, ...]:
+        return tuple(frame.loop for frame in self.ancestors() if frame.loop is not None)
+
+    def domains(self) -> tuple[Range, ...]:
+        """Only lexical depth, with no replay of executed iterations."""
+        return tuple(domain for frame in self.ancestors() for domain in frame.ranges)
 
     @property
     def statically_empty(self):
@@ -130,6 +137,19 @@ class ControlFacts:
     group: Expr
     sid: Expr
     operations_visited: int
+
+    def invariant_over(self, value: Expr, operation: Operation) -> bool:
+        """Whether an expression is fixed throughout this actual invocation.
+
+        Uniform inputs/group/sid and enclosing loop coordinates are stable.
+        Unknown scalar carry/results have no invariance contract merely
+        because their expression lacks this loop's ordinal symbol.
+        """
+        names = set(self.environment.facts)
+        frame = self.frames.get(operation)
+        if frame is not None and frame.parent is not None:
+            names.update(loop.ordinal.args[0] for loop in frame.parent.loops())
+        return arguments(value) <= names
 
 
 def build_control_facts(module: ModuleOp) -> ControlFacts:

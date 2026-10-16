@@ -1,11 +1,11 @@
-"""Conditional memory premises from real scale and short-MAD native hazards."""
+"""Historical M2 conditional premises from scale and short-MAD native hazards."""
 
 from dataclasses import replace
 
 import pytest
 
 from tests.fixtures.pipelines import cube_pipeline, vector_pipeline
-from xdsl_npu.analysis.contracts import ContractWork, WitnessKind, build_memory_contracts
+from tests.legacy.analysis.contracts import ContractWork, WitnessKind, build_memory_contracts
 from xdsl_npu.analysis.frontier import Capture, Clock, Partition
 from xdsl_npu.analysis.hazards import HazardKind, bind_hazards
 from xdsl_npu.analysis.native import extract_native_tasks

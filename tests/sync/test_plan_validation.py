@@ -7,7 +7,7 @@ from xdsl.utils.exceptions import VerifyException
 
 from examples.state.grouped import grouped_state_sum
 from tests.models.local_sequence import finite_check, physical_regions
-from xdsl_npu import compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.physical import (
     BufferOp,
@@ -17,6 +17,7 @@ from xdsl_npu.dialects.physical import (
     TaskOp,
     ViewOp,
 )
+from xdsl_npu.sync import verify_plan
 
 
 def test_preceding_vector_barrier_cannot_retire_the_task_that_follows_it(frame_artifact):
@@ -90,7 +91,7 @@ def test_zero_trip_guard_cannot_publish_a_nonexistent_final_writer(state_artifac
 
 
 def test_bounded_predicate_is_checked_and_emitted_without_expanding_counts(state_artifact):
-    from xdsl_npu import emit_asc
+    from xdsl_npu.codegen import emit_asc
 
     plan = state_artifact.plan
     c = next(

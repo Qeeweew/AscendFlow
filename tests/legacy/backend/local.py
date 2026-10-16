@@ -1,16 +1,15 @@
-"""Transitional local ASC printing from an owned, already selected schedule.
+"""Historical M2 local ASC printing retained as a test oracle.
 
-Reuses native formatting and launch ABI while the unified region emitter is
-being implemented. No completion planner, graph construction, or validation
-entry is called. The public compiler has not switched to this M2 entry yet.
+Reuses native formatting and the old launch ABI for an already selected
+schedule. It does not qualify the current source compiler or its emitter.
 """
 
 from dataclasses import dataclass
 
-from ..asc_scalar import ScalarScope
-from ..codegen import native_line
-from ..diagnostics import require
-from ..loop_codegen import _event, emit_loop
+from xdsl_npu.asc_scalar import ScalarScope
+from xdsl_npu.backend.native import native_line
+from xdsl_npu.diagnostics import require
+from xdsl_npu.loop_codegen import _event, emit_loop
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +39,7 @@ class _Command:
 
 
 def _body(actor, data, sequences, channels, tasks, invocation, invocation_channels, uniform_names):
-    from .loops import emit_pipeline_body
+    from xdsl_npu.backend.loops import emit_pipeline_body
 
     require(
         invocation is None and not invocation_channels,

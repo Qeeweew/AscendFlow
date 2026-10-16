@@ -18,13 +18,14 @@ from examples.state.grouped import grouped_state_sum
 from examples.vector.scale import scale
 from tests.fixtures.cv import cv_source
 from tests.report_contract import semantic_report
-from xdsl_npu import compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu import language as T
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import parse
 from xdsl_npu.dialects.physical import RuntimeSizeOp
 from xdsl_npu.dialects.source import SizeOp
 from xdsl_npu.frontend import FrontendError
+from xdsl_npu.sync import verify_plan
 
 
 def contract_source(*, minimum=1, multiple=4):

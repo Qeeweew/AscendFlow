@@ -7,8 +7,8 @@ from xdsl.transforms.dead_code_elimination import dce
 from benchmarks.validation.operators import mixed_inputs
 from tests.fixtures.physical_operators import gemm_bias_silu
 from tests.fixtures.pipelines import mixed_pipeline
-from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import (
@@ -34,7 +34,7 @@ from xdsl_npu.mixed import (
 )
 from xdsl_npu.mixed_check import bounded_mixed_check
 from xdsl_npu.model import Instance
-from xdsl_npu.sync import explain_plan
+from xdsl_npu.sync import autosync, explain_plan, verify_plan
 from xdsl_npu.sync import verify_plan as local_verify
 
 

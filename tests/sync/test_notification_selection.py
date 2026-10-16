@@ -1,0 +1,352 @@
+"""Finite retained-control checks of the one logical notification contract.
+
+These tests check selection/placement and exact notification existence. They
+are not hardware retirement, binary-event lifetime or progress proofs.
+"""
+
+from collections import Counter
+from dataclasses import replace
+from importlib import import_module
+
+import pytest
+from xdsl.dialects import arith, scf
+
+from examples.flash_attention.attention import attention_target
+from examples.gemm.batched import batched_matmul
+from examples.vector.scale import scale
+from tests.analysis.test_structured_dependencies import (
+    expression_value,
+    guard_active,
+    occurrence_key,
+)
+from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
+from xdsl_npu import language as N
+from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
+from xdsl_npu.analysis.structured_dispatch import bind_structured_dispatch
+from xdsl_npu.analysis.structured_memory import collect_native_memory
+from xdsl_npu.analysis.structured_protocols import NotificationKind
+from xdsl_npu.analysis.structured_regions import AccessOccurrence
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import TaskOp
+from xdsl_npu.dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
+from xdsl_npu.indexing import arguments
+from xdsl_npu.passes.lower_native import lower_native_structure
+from xdsl_npu.passes.select_notifications import select_notifications
+from xdsl_npu.target.ascend910b import Actor, Engine
+
+
+def selected(source):
+    structure = lower_native_structure(N.from_source(source) if isinstance(source, str) else source)
+    memory = collect_native_memory(structure.module)
+    dependencies = build_structured_dependencies(memory)
+    dispatch = bind_structured_dispatch(memory)
+    result = select_notifications(dependencies, dispatch)
+    result.require_closed()
+    return result
+
+
+@pytest.fixture(
+    scope="module",
+    params=[
+        scale,
+        batched_matmul,
+        nested_copy,
+        nested_cv,
+        shared_l0c_qk_pv,
+        attention_target,
+    ],
+)
+def actual_selection(request):
+    return selected(request.param)
+
+
+def actual_dispatch(selection, uniform, actor):
+    """Independent lexical/physical-step interpreter; no production rank helper."""
+    memory, events = selection.dependencies.memory, []
+    environment = memory.control.environment
+    family = "cube" if actor is Actor.AIC else "vector"
+    base = uniform | {"$sid": int(actor is Actor.AIV1)}
+
+    def scalar(value, context):
+        return environment.expression(value).evaluate(context)
+
+    def visit(block, context, coordinates):
+        for operation in block.ops:
+            if isinstance(operation, ActorDomainOp):
+                if operation.kind.data == family:
+                    visit(operation.body.block, context, coordinates)
+            elif isinstance(operation, PipelineLoopOp):
+                iterations = range(*(scalar(value, context) for value in operation.operands))
+                stages = [op for op in operation.body.block.ops if isinstance(op, PipelineStageOp)]
+                if operation.issue_order is not None and family in operation.issue_order.data:
+                    by_name = {stage.label.data: stage for stage in stages}
+                    stages = [by_name[label.data] for label in operation.issue_order.data[family]]
+                symbol = memory.control.loops[operation].ordinal.args[0]
+                for clock in range(len(iterations) + operation.schedule.horizon.data):
+                    for stage in stages:
+                        ordinal = clock - stage.offset.data
+                        if 0 <= ordinal < len(iterations):
+                            visit(
+                                stage.body.block,
+                                context | {symbol: ordinal},
+                                coordinates + ((operation, ordinal),),
+                            )
+            elif isinstance(operation, scf.ForOp):
+                symbol = memory.control.loops[operation].ordinal.args[0]
+                for ordinal, _ in enumerate(
+                    range(
+                        *(
+                            scalar(v, context)
+                            for v in (
+                                operation.lb,
+                                operation.ub,
+                                operation.step,
+                            )
+                        )
+                    )
+                ):
+                    visit(
+                        operation.body.block,
+                        context | {symbol: ordinal},
+                        coordinates + ((operation, ordinal),),
+                    )
+            elif isinstance(operation, scf.IfOp):
+                comparison = operation.cond.owner
+                assert isinstance(comparison, arith.CmpiOp)
+                a, b = (scalar(value, context) for value in comparison.operands)
+                truth = {0: a == b, 1: a != b, 2: a < b, 3: a <= b, 4: a > b, 5: a >= b}[
+                    comparison.predicate.value.data
+                ]
+                region = operation.true_region if truth else operation.false_region
+                if region.blocks:
+                    visit(region.block, context, coordinates)
+            elif isinstance(operation, TaskOp) and (operation, actor) in selection.dispatch.tasks:
+                events.append(((operation, actor, coordinates), dict(context)))
+
+    visit(memory.module.body.block.first_op.body.block, base, ())
+    return events
+
+
+def need_cases(need, uniform, memory):
+    domains = need.domains + need.source.families + need.consumer.families
+    loops = [
+        loop for op, loop in memory.control.loops.items() if any(d.loop is op for d in domains)
+    ]
+
+    def visit(index, context):
+        if index == len(loops):
+            if all(guard_active(g, context, memory) for g in need.guards):
+                yield context
+            return
+        logical = loops[index]
+        current = [d for d in domains if d.loop is logical.operation]
+        limit = max(d.count.evaluate(context) for d in current)
+        for ordinal in range(limit):
+            child = context | {logical.ordinal.args[0]: ordinal}
+            if all(
+                max(d.distance, d.first) <= ordinal < d.count.evaluate(child)
+                and ordinal % d.period == expression_value(d.residue, child)
+                for d in current
+            ):
+                yield from visit(index + 1, child)
+
+    yield from visit(0, uniform)
+
+
+def point_key(point, context, memory):
+    coordinates = tuple((loop, value.evaluate(context)) for loop, value in point.coordinates)
+    actual = (
+        context
+        | {memory.control.loops[loop].ordinal.args[0]: value for loop, value in coordinates}
+        | {"$sid": int(point.actor is Actor.AIV1)}
+    )
+    assert point.guard.evaluate(actual)
+    return point.operation, point.actor, coordinates
+
+
+def test_one_selection_covers_every_actual_required_relation(actual_selection):
+    result = actual_selection
+    assert not result.unresolved
+    assert len(result.coverage) == len(result.dependencies.required)
+    assert {id(c.requirement) for c in result.coverage} == {
+        id(n) for n in result.dependencies.required
+    }
+    for notification in result.notifications:
+        assert notification.requirements
+        assert all(
+            point.coordinates == tuple(point.coordinates)
+            for point in (
+                *notification.sources,
+                *notification.consumers,
+            )
+        )
+        if notification.mechanism is NotificationKind.CROSS_EVENT:
+            a, b = (
+                {p.actor for p in notification.sources},
+                {p.actor for p in notification.consumers},
+            )
+            assert (a, b) in [
+                ({Actor.AIC}, {Actor.AIV0, Actor.AIV1}),
+                ({Actor.AIV0, Actor.AIV1}, {Actor.AIC}),
+            ]
+            assert sorted((len(notification.sources), len(notification.consumers))) == [1, 2]
+        elif notification.mechanism is NotificationKind.LOCAL_EVENT:
+            assert notification.source_engine is not notification.destination_engine
+            assert notification.destination_engine is not Engine.S
+
+
+def test_actual_captures_and_acquires_cover_sources_and_earliest_consumers(actual_selection):
+    result, memory = actual_selection, actual_selection.dependencies.memory
+    actors = {actor for _, actor in result.dispatch.tasks}
+    for count in (0, 1, 2, 3):
+        uniform = {
+            "tiles": count,
+            "n": count,
+            "Sq": 512,
+            "Sk": max(1, count) * 1024,
+            "$group": 0,
+            "$sid": 0,
+        }
+        traces = {actor: actual_dispatch(result, uniform, actor) for actor in actors}
+        positions = {
+            key: index for actor, events in traces.items() for index, (key, _) in enumerate(events)
+        }
+        for coverage in result.coverage:
+            need, notification = coverage.requirement, coverage.notification
+            assert isinstance(need.source, AccessOccurrence)
+            for context in need_cases(need, uniform, memory):
+                source = occurrence_key(need.source, context, memory)
+                consumer = occurrence_key(need.consumer, context, memory)
+                if source not in positions or consumer not in positions:
+                    # Ambient Task regions remain part of occurrence existence;
+                    # a same-branch internal need is inert outside that branch.
+                    assert source not in positions and consumer not in positions
+                    continue
+                if notification is None:
+                    assert coverage.ordering is not None
+                    assert source[1] is consumer[1] and positions[source] < positions[consumer]
+                    continue
+                capture = next(p for p in notification.sources if p.actor is source[1])
+                acquire = next(p for p in notification.consumers if p.actor is consumer[1])
+                a, b = point_key(capture, context, memory), point_key(acquire, context, memory)
+                assert a in positions and b in positions
+                assert positions[b] <= positions[consumer]
+                if notification.mechanism is NotificationKind.PIPE_FENCE:
+                    assert positions[source] < positions[b]
+                else:
+                    assert positions[source] <= positions[a]
+
+
+def test_selected_set_and_wait_existence_is_exact_for_empty_short_and_reentry(actual_selection):
+    result = actual_selection
+    actors = {actor for _, actor in result.dispatch.tasks}
+    maximum_group = result.dependencies.memory.control.environment.facts["$group"].maximum
+    assert maximum_group is not None
+    for count, requested_group in [(0, 0), (1, 0), (2, 0), (3, 0), (2, 19)]:
+        group = min(requested_group, maximum_group)
+        uniform = {
+            "tiles": count,
+            "n": count,
+            "Sq": 128 if requested_group else 512,
+            "Sk": max(1, count) * 1024,
+            "$group": group,
+            "$sid": 0,
+        }
+        traces = {actor: actual_dispatch(result, uniform, actor) for actor in actors}
+        for notification in result.notifications:
+            if notification.mechanism is NotificationKind.PIPE_FENCE:
+                continue
+            points = (*notification.sources, *notification.consumers)
+            common = set.intersection(*(set(dict(p.substitutions)) for p in points))
+            free = [
+                coordinate
+                for coordinate in common
+                if all(
+                    coordinate.args[0] in arguments(dict(p.substitutions)[coordinate])
+                    for p in points
+                )
+            ]
+            counters = []
+            for point in points:
+                counter = Counter()
+                for key, context in traces[point.actor]:
+                    if key[0] is point.operation and point.guard.evaluate(context):
+                        identity = tuple(
+                            (e.args[0], point.expression(e).evaluate(context))
+                            for e in sorted(free, key=lambda e: e.args[0])
+                        )
+                        counter[identity] += 1
+                counters.append(counter)
+            assert all(counter == counters[0] for counter in counters), (
+                notification.name,
+                count,
+                group,
+                counters,
+            )
+
+
+def test_first_count_and_dynamic_residues_are_not_replaced_by_unbounded_activation():
+    result = selected(attention_target)
+    dynamic = [
+        domain
+        for n in result.dependencies.required
+        for domain in n.domains
+        if not isinstance(domain.residue, int)
+    ]
+    assert dynamic
+    assert any(d.first > 0 for n in result.dependencies.required for d in n.domains)
+    assert any(p.families for n in result.notifications for p in n.sources)
+    assert all(all(p.coordinates for p in (*n.sources, *n.consumers)) for n in result.notifications)
+    assert any(n.distance is None for n in result.notifications)
+
+
+def test_selection_never_invokes_old_local_adapters_or_rebuilds_memory(monkeypatch):
+    result = selected(nested_cv)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unified selection called a discarded local/infinite-model adapter")
+
+    targets = [
+        ("tests.legacy.passes.local_sync", "select_local_protocols"),
+        ("xdsl_npu.analysis.hazards", "Activation"),
+        ("tests.legacy.analysis.resources", "allocate_local_events"),
+        ("xdsl_npu.analysis.structured_memory", "collect_native_memory"),
+        ("xdsl_npu.analysis.structured_dependencies", "build_structured_dependencies"),
+        ("xdsl_npu.target.native", "native_contract"),
+    ]
+    modules = [(import_module(name), attribute) for name, attribute in targets]
+    for module, attribute in modules:
+        monkeypatch.setattr(module, attribute, forbidden)
+    again = select_notifications(result.dependencies, result.dispatch)
+    again.require_closed()
+    assert again == result
+
+
+def test_incomplete_mode2_quorum_stays_explicitly_unresolved():
+    result = selected(nested_cv)
+    broken = replace(
+        result.dependencies,
+        required=tuple(
+            n
+            for n in result.dependencies.required
+            if not (n.source.participant is Actor.AIV1 and n.consumer.participant is Actor.AIC)
+        ),
+    )
+    rejected = select_notifications(broken, result.dispatch)
+    assert any("quorum" in issue.reason for issue in rejected.unresolved)
+    with pytest.raises(CompileError, match="quorum"):
+        rejected.require_closed()
+
+
+def test_unordered_same_engine_dependency_cannot_be_repaired_by_a_fence():
+    with pytest.raises(CompileError, match="same-engine source"):
+        selected("""
+        def bad(n:N.int64):
+            with N.Kernel():
+                x=N.alloc_ub((2,64))
+                for t in N.Pipelined(n,stages=3):
+                    with N.Stage(2,name="first"):
+                        N.fill(x[t%2,:],1.0)
+                    with N.Stage(0,name="later"):
+                        N.mul(x[t%2,:],2.0,out=x[t%2,:])
+        """)

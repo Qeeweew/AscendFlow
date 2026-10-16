@@ -3,7 +3,7 @@
 面向Ascend 910B / dav-2201，使用xDSL 0.73.0 → 物理执行IR → ASC → CANN 9.1。
 用户表达计算、物理存储、缓冲和多阶段排步，编译器负责真实异步访问与资源复用同步。不引入MLIR工程或参考仓库构建依赖。
 
-**编译复杂度尚未达标，正在按新方案实施重构。** 默认FA的旧提交source→ASC冷测p50为53.114s，停止前实验单次31.022s、最近诊断37.840s，均不满足≤5s目标。M1已拆分底层职责并建立PLE/有界前沿/边界组件，公共同步路径尚未替换；算子优化暂停。实际结果和剩余项见状态页。
+**先完成结构重构，再分析编译性能；算子优化继续暂停。** 当前 source 入口已接到递归物理访问、统一逻辑通知、事件资源与最终 IR 后端。事件生命周期、嵌套/CV 和默认 FA 的完整资格仍在收口，旧路径尚未全部退场。历史耗时和设备结果不代表当前工作树，具体证据见[当前状态](docs/refactor-progress.md)。
 
 ## 文档与代码入口
 
@@ -16,7 +16,7 @@
 
 ## 现有环境中的示例
 
-从 `/workspace/xdsl-910b` 运行，使用已有 `.venv`，产物写到外层runs。本轮文档整理未运行以下命令：
+从 `/workspace/xdsl-910b` 运行，使用已有 `.venv`，产物写到外层runs。功能产物包含 source、同步前后 IR 和 ASC：
 
 ```bash
 PYTHONPATH=compiler .venv/bin/python -m examples.vector.scale --output runs/quickstart/vector
@@ -32,7 +32,7 @@ artifact = compile(scale.specialize(B=64))
 print(artifact.asc)
 ```
 
-`tiles`是runtime参数，B是tile容量。`debug_verify=True`显式独立检查最终IR；normal应消费变换已建立的事实。旧`cube.task/vector.task`已删除，不恢复兼容。
+`tiles`是runtime参数，B是tile容量。`debug_verify=True`执行最终IR的结构检查，不能替代异步正确性证明；普通编译消费各阶段已建立的事实。旧`cube.task/vector.task`已删除，不恢复兼容。
 
 ## 仓库边界
 

@@ -263,8 +263,25 @@ def test_shared_group_cann_cannot_start_an_independent_shorter_timeout(tmp_path,
     assert not (tmp_path / "inner").exists()
 
 
+def source_fixture(directory):
+    # Process/ABI tests need one finite source build, independent of the
+    # repeated-loop synchronization qualification in tests/sync.
+    source = directory / "definition.py"
+    source.write_text("""from __future__ import annotations
+from xdsl_npu import language as N
+@N.prim_func(disjoint_external=True)
+def point(X:N.Tensor((B,),N.f32),Y:N.Tensor((B,),N.f32,access="write"),B:N.constexpr=64):
+    with N.Kernel():
+        x,y=N.alloc_ub((B,)),N.alloc_ub((B,))
+        value=N.copy(X,x)
+        value=N.mul(value,2.0,out=y)
+        N.copy(value,Y)
+""")
+    return source
+
+
 def test_command_watchdog_allows_one_cli_build_with_its_inherited_deadline(tmp_path):
-    source = Path(__file__).parents[1] / "examples/vector/scale.py"
+    source = source_fixture(tmp_path)
     output = tmp_path / "build"
     record = bounded_process(
         [
@@ -274,7 +291,7 @@ def test_command_watchdog_allows_one_cli_build_with_its_inherited_deadline(tmp_p
             "--input",
             str(source),
             "--entry",
-            "scale",
+            "point",
             "--output",
             str(output),
         ],
@@ -282,7 +299,7 @@ def test_command_watchdog_allows_one_cli_build_with_its_inherited_deadline(tmp_p
         timeout_s=3,
     )
     assert record["status"] == "passed"
-    assert (output / "scale.asc").exists()
+    assert (output / "point.asc").exists()
     assert json.loads((output / "build-result.json").read_text())["status"] == "passed"
 
 
@@ -317,33 +334,30 @@ def test_command_watchdog_cannot_leave_a_nested_cli_worker_or_its_child(tmp_path
     assert not list(output.glob(".building-*"))
 
 
-def test_file_ast_build_specializes_then_publishes_a_checked_plan(tmp_path):
+def test_file_ast_build_specializes_and_publishes_owned_source_artifacts(tmp_path):
     from benchmarks.artifacts import read_artifact
-    from xdsl_npu.diagnostics import CompileError
-    from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp
-    from xdsl_npu.sync import verify_plan
+    from xdsl_npu.dialects.io import dump
+    from xdsl_npu.dialects.structured import NotificationOp
 
-    source = Path(__file__).parents[1] / "examples/vector/scale.py"
-    report = build_file(source, tmp_path, entry="scale", parameters={"B": 32}, timeout_s=5)
+    source = source_fixture(tmp_path)
+    report = build_file(source, tmp_path, entry="point", parameters={"B": 32}, timeout_s=5)
     assert report["native_templates"] == 3
-    assert "npu_size_tiles" in (tmp_path / "scale.asc").read_text()
+    assert report["pipeline"] == "structured-regions"
+    assert (tmp_path / "point.asc").exists()
     assert (tmp_path / "source.xdsl").exists()
     assert (tmp_path / "after.xdsl").exists()
     assert json.loads((tmp_path / "build-result.json").read_text())["status"] == "passed"
     artifact = read_artifact(tmp_path)
     first, second = artifact.plan, artifact.plan
     assert first is not second
-    channel = next(op for op in first.walk() if isinstance(op, LoopChannelOp))
-    for op in list(first.walk()):
-        if isinstance(op, LoopSyncOp) and op.channel == channel.sym_name:
-            op.parent.erase_op(op)
-    channel.parent.erase_op(channel)
-    with pytest.raises(CompileError, match="missing"):
-        verify_plan(first)
-    assert verify_plan(second)["channels"] == artifact.report["channels"]
+    expected = dump(second)
+    notification = next(op for op in first.walk() if isinstance(op, NotificationOp))
+    notification.parent.erase_op(notification)
+    assert dump(first) != expected
+    assert dump(artifact.plan) == expected
     changed = artifact.report
-    changed["channels"] = -1
-    assert artifact.report["channels"] >= 0
+    changed["sync_instructions"] = -1
+    assert artifact.report["sync_instructions"] > 0
 
 
 def test_source_only_reference_artifact_does_not_import_stale_plan_ir(tmp_path):

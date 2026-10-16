@@ -5,12 +5,13 @@ import pytest
 from examples.state.recurrence import state_sum
 from tests.models.local_sequence import finite_check, physical_regions
 from tests.report_contract import semantic_report
-from xdsl_npu import autosync, compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import parse
 from xdsl_npu.performance import runtime_work
+from xdsl_npu.sync import autosync, verify_plan
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 7, 17])

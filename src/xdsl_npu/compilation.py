@@ -1,8 +1,7 @@
-"""Owned compilation snapshots; ordinary reuse never rechecks a mutable IR.
+"""One owned source pipeline and immutable public compilation artifacts.
 
-Owned transformations establish and preserve physical contracts. Explicit
-``debug_verify`` independently reconstructs the final IR; imported synchronized
-IR always enters that checker. Only immutable strings leave this invocation.
+External physical snapshots are inspection output, not proof-carrying input.
+Normal compilation never selects an alternate legacy solver by input shape.
 """
 
 import json
@@ -10,14 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
+from xdsl.dialects.builtin import ModuleOp
+
 from .budget import limit, poll
-from .codegen import _emit_checked
-from .diagnostics import require
+from .diagnostics import ErrorKind, require
 from .dialects.io import dump, parse
-from .dialects.physical import KernelOp, TaskOp
 from .dialects.source import ProgramOp
-from .lowering import lower_source
-from .sync import autosync, explain_plan, verify_plan
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -35,137 +32,117 @@ class Compilation:
         self,
         module,
         *,
-        synchronize=True,
         host_launcher=True,
         timeout_s=60.0,
         cancel=None,
-        load3d=False,
         debug_verify=False,
     ):
-        from .completion import completion_math
+        from .frontend import PrimFunction
 
-        with limit(timeout_s, cancel), completion_math(isolated=True):
-            self._build(
+        with limit(timeout_s, cancel):
+            require(
+                isinstance(module, PrimFunction)
+                or isinstance(module, ModuleOp)
+                and isinstance(module.body.block.first_op, ProgramOp),
+                "compile accepts a DSL PrimFunction or source ProgramOp; "
+                "physical snapshots cannot establish source compilation contracts",
+                kind=ErrorKind.UNSUPPORTED,
+                phase="compilation input",
+            )
+            self._build_structured(
                 module,
-                synchronize=synchronize,
                 host_launcher=host_launcher,
-                load3d=load3d,
                 debug_verify=debug_verify,
             )
 
-    def _build(self, module, *, synchronize, host_launcher, load3d, debug_verify):
+    def _build_structured(self, module, *, host_launcher, debug_verify):
+        """Orchestrate the sole source pipeline; print its final physical IR."""
+        from dataclasses import asdict
+
+        from .backend.structured import EmissionWork, _emit_owned
+        from .passes.structured_sync import synchronize_structure
+
         started = perf_counter()
-        poll("frontend")
-        require(type(synchronize) is bool, "synchronize must be an explicit boolean policy")
-        from .compilation_facts import PhysicalFacts
-        from .frontend import PrimFunction
-
         require(type(debug_verify) is bool, "debug_verify must be an explicit boolean policy")
-        facts = PhysicalFacts()
-
-        if isinstance(module, PrimFunction):
-            module = module.to_ir()
-        frontend = perf_counter()
-        poll("input ownership")
-        module = module.clone()
-        owned = perf_counter()
-        source = isinstance(module.body.block.first_op, ProgramOp)
-        poll("native lowering")
-        if source:
-            require(synchronize, "source regions must lower through automatic synchronization")
-            physical = lower_source(module, _facts=facts)
-        else:
-            physical = module
-        require(
-            type(load3d) is bool and (not load3d or synchronize),
-            "Load3D selection requires an unsynchronized compilation",
-        )
-        if load3d:
-            from .load3d import select_load3d
-
-            physical = select_load3d(physical)
-        lowered = perf_counter()
-        # Synchronization consumes the private physical program in place. Keep
-        # the pre-sync artifact once, before that controlled transformation.
-        # Serialize only after admission succeeds: a forged external literal
-        # may be unprintable, and must receive the native-contract diagnostic.
-        physical_before = physical.clone()
-        early_snapshot_s = perf_counter() - lowered
-        poll("synchronization planning")
-        checked = []
-        if synchronize:
-            plan = autosync(physical, _capture=checked.append, _facts=facts)
-        else:
-            # Expert physical synchronization uses the same independent checker.
-            plan = physical.clone()
-            checking = perf_counter()
-            report, analysis = verify_plan(plan, _details=True)
-            checked.append((report, analysis, perf_counter() - checking))
-        planned = perf_counter()
-        report, analysis, final_check_s = checked[0]
-        from .completion import completion_math_statistics
-
-        report = {**report, "analysis_work": facts.statistics()}
-        debug_check_s = 0.0
-        if debug_verify and synchronize:
-            checking = perf_counter()
-            deep_report, analysis = verify_plan(plan, _details=True)
-            debug_check_s = perf_counter() - checking
-            report["debug_verification"] = deep_report
-        report["verification_mode"] = "deep" if debug_verify or not synchronize else "normal"
-        poll("ASC emission")
-        code = _emit_checked(plan, analysis, host_launcher=host_launcher)
+        poll("structured source compilation")
+        plan = synchronize_structure(module)
+        assembled = perf_counter()
+        if debug_verify:
+            plan.module.verify()  # Explicit structural check, not a completion proof.
+        poll("final physical IR emission")
+        emission = EmissionWork()
+        asc = _emit_owned(plan, host_launcher=host_launcher, work=emission)
         emitted = perf_counter()
-        report["completion_math"] = completion_math_statistics()
-        poll("IR snapshots")
-        schedule = {}
-        for kernel in plan.walk():
-            if not isinstance(kernel, KernelOp):
-                continue
-            actor = kernel.parent_op()
-            key = (
-                kernel.sym_name.data if actor is not None and actor.name == "npu.mixed" else "local"
-            )
-            # Dispatch cases have separate tables, preserving their selector scopes.
-            key = f"{key}:{len(schedule)}"
-            schedule[key] = [
+        poll("owned compilation snapshots")
+        report = {
+            "kernel": plan.module.body.block.first_op.sym_name.data,
+            "pipeline": "structured-regions",
+            "verification_mode": "owned-construction",
+            "debug_structural_verification": debug_verify,
+            "analysis_work": {
+                "lowering": dict(plan.structure.work),
+                "admission": dict(plan.admission.work),
+                "dependencies": asdict(plan.dependencies.work),
+                "resources": asdict(plan.resources.work),
+                "emission": {
+                    "native_templates": emission.native_templates,
+                    "native_prints": emission.native_prints,
+                    "actions_printed": emission.actions_printed,
+                    "output_bytes": emission.output_bytes,
+                },
+            },
+            "native_templates": len(plan.memory.templates),
+            "required_dependencies": len(plan.dependencies.required),
+            "selected_protocols": len(plan.selection.notifications),
+            "sync_instructions": len(plan.resources.actions),
+            "witnesses": [
                 {
-                    "task": op.uid.data,
-                    "region": op.attributes["source_region"].data,
-                    "stage": op.stage.data,
-                    "logical_phase": 0 if op.logical_phase is None else op.logical_phase.data,
-                    "issue_order": op.issue_order.data,
-                    "logical_generation": "g",
-                    "physical_step": f"g + {op.stage.data}",
+                    "source": getattr(coverage.requirement.source, "operation", None).uid.data
+                    if hasattr(getattr(coverage.requirement.source, "operation", None), "uid")
+                    else None,
+                    "consumer": coverage.requirement.consumer.operation.uid.data,
+                    "hazard": coverage.requirement.kind.value,
+                    "distance": coverage.requirement.distance,
+                    "rule": coverage.rule,
+                    "protocol": None
+                    if coverage.notification is None
+                    else coverage.notification.name,
                 }
-                for op in kernel.walk()
-                if isinstance(op, TaskOp) and "source_region" in op.attributes
+                for coverage in plan.selection.coverage
+            ],
+        }
+        schedule = {
+            scope.clock.name: [
+                {
+                    "task": task.operation.uid.data,
+                    "stage": task.stage,
+                    "issue_order": task.lexical,
+                    "actor": task.actor.value,
+                }
+                for task in body
             ]
+            for scope, body in plan.selection.dispatch.bodies.items()
+            if body
+        }
         snapshots = {
-            "asc": code,
-            "name": plan.body.block.first_op.sym_name.data,
-            "source_ir": dump(module) if source else None,
-            "before_ir": dump(physical_before),
-            "plan_ir": dump(plan),
+            "asc": asc,
+            "name": plan.module.body.block.first_op.sym_name.data,
+            "source_ir": dump(plan.structure.source),
+            "before_ir": plan.before_ir,
+            "plan_ir": dump(plan.module),
             "_report_json": json.dumps(report),
             "_schedule_json": json.dumps(schedule),
         }
         frozen = perf_counter()
-        poll("completed compilation")
         snapshots["_timings_json"] = json.dumps(
             {
-                "frontend_s": frontend - started,
-                "own_input_s": owned - frontend,
-                "lowering_s": lowered - owned,
-                "planning_and_final_check_s": planned - lowered - early_snapshot_s,
-                "planning_s": planned - lowered - early_snapshot_s - final_check_s,
-                "final_check_s": final_check_s,
-                "debug_check_s": debug_check_s,
-                "emission_s": emitted - planned - debug_check_s,
-                "snapshot_s": frozen - emitted + early_snapshot_s,
+                "assembly_s": assembled - started,
+                "emission_s": emitted - assembled,
+                "snapshot_s": frozen - emitted,
                 "total_s": frozen - started,
             }
         )
+        poll("completed structured compilation")
         for name, value in snapshots.items():
             object.__setattr__(self, name, value)
 
@@ -187,8 +164,8 @@ class Compilation:
         return parse(self.plan_ir)
 
     def explain(self):
-        """Explicit, potentially expensive per-access synchronization witnesses."""
-        return explain_plan(self.plan)
+        """Return the already established capture/acquire coverage witnesses."""
+        return self.report["witnesses"]
 
     def write(self, directory, *, diagnostics=False):
         directory = Path(directory)
@@ -208,20 +185,16 @@ class Compilation:
 def compile(
     module,
     *,
-    synchronize=True,
     host_launcher=True,
     timeout_s=60.0,
     cancel=None,
-    load3d=False,
     debug_verify=False,
 ):
-    """Typed source or physical IR -> frozen code, proof summary, and IR snapshots."""
+    """DSL/source IR -> frozen ASC, established facts, and inspection snapshots."""
     return Compilation(
         module,
-        synchronize=synchronize,
         host_launcher=host_launcher,
         timeout_s=timeout_s,
         cancel=cancel,
-        load3d=load3d,
         debug_verify=debug_verify,
     )

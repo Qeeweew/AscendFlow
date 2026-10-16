@@ -1,4 +1,4 @@
-"""Real local integration and counterexamples for the explicit structured entry.
+"""Historical M2 local integration and counterexamples for the test oracle.
 
 The isolated legacy-verifier test is a migration cross-check. It is not an
 independent hardware-semantics oracle; other tests forbid that verifier and
@@ -15,14 +15,14 @@ from examples.gemm.batched import batched_matmul
 from examples.gemm.reduction import reduction_gemm
 from examples.vector.scale import scale
 from tests.fixtures.pipelines import scalar_pipeline
+from tests.legacy.analysis.protocols import LocalMechanism
+from tests.legacy.backend.local import emit_local
+from tests.legacy.passes.insert_sync import synchronize_local
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.analysis.protocols import LocalMechanism
-from xdsl_npu.backend.local import emit_local
 from xdsl_npu.diagnostics import CompileError, ErrorKind
 from xdsl_npu.dialects.io import dump
 from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp, TaskOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.passes.insert_sync import synchronize_local
 from xdsl_npu.target.ascend910b import Engine
 
 
@@ -56,7 +56,8 @@ def _forbid_old_solver(monkeypatch):
     monkeypatch.setattr(planning.DirectCompletion, "__init__", forbidden)
     for module, attributes in modules:
         for attribute in attributes:
-            monkeypatch.setattr(module, attribute, forbidden)
+            if hasattr(module, attribute):
+                monkeypatch.setattr(module, attribute, forbidden)
 
 
 def _assert_progress_certificate(certificate):
@@ -94,7 +95,7 @@ def _steady_lines(asc):
 @pytest.mark.parametrize("entry", [scale.specialize(B=64), _cube()])
 def test_real_dsl_entry_and_asc_never_call_old_completion_solver(entry, monkeypatch):
     # Source admission still uses its existing logical-value checks. The ban
-    # starts at the new physical entry and includes final ASC formatting.
+    # starts at the M2 physical entry and includes its ASC formatting.
     physical = lower_source(entry.to_ir())
     before = dump(physical)
     _forbid_old_solver(monkeypatch)
@@ -222,7 +223,7 @@ def test_same_physical_step_wait_allows_a_later_fix_set():
 
 def test_same_generation_reuse_self_lock_reports_the_actual_cycle(monkeypatch):
     physical = lower_source(scale.specialize(B=64).to_ir())
-    insertion = import_module("xdsl_npu.passes.insert_sync")
+    insertion = import_module("tests.legacy.passes.insert_sync")
     select = insertion.select_local_protocols
     corrupted = []
 
@@ -302,7 +303,7 @@ def test_terminal_native_is_explicitly_rejected_without_old_fallback(monkeypatch
     assert dump(physical) == before
 
 
-def test_scalar_spr_setup_is_explicitly_rejected_without_old_fallback(monkeypatch):
+def test_closed_mask_packet_uses_local_sync_without_fake_scalar_writes(monkeypatch):
     k = Kernel("spr_setup")
     partials = k.buffer("partials", "UB", 64)
     statistics = k.buffer("statistics", "UB", 32)
@@ -318,10 +319,11 @@ def test_scalar_spr_setup_is_explicitly_rejected_without_old_fallback(monkeypatc
     physical = k.finish()
     before = dump(physical)
     _forbid_old_solver(monkeypatch)
-    with pytest.raises(CompileError, match="Scalar register setup") as failure:
-        synchronize_local(physical)
-    assert failure.value.kind is ErrorKind.UNSUPPORTED
-    assert failure.value.phase == "local-sync"
+    plan = synchronize_local(physical)
+    merge = next(task for task in plan.selection.tasks if task.native == "merge_sum_packed")
+    assert merge.packet.closed_mask
+    assert not any(access.mode.writes for access in merge.registers)
+    assert all(protocol.source.engine is not Engine.S for protocol in plan.selection.protocols)
     assert dump(physical) == before
 
 

@@ -1,125 +1,58 @@
-# 源码职责与包结构重构
+# 源码职责与所有权
 
-2026-10-16，结构审查基线为 `7ddaa54` 加停止的实验，已整体保存至 `bbc1458`。**以下为目标结构；M1已经迁移dialects/frontend/target及进程控制，剩余planner和后端仍待替换。** 实际状态见[状态页](refactor-progress.md)，不以搬文件数量代表完成。
+当前主线按下表组织。实际功能资格见[状态页](refactor-progress.md)，阶段保证见[编译不变量](compilation-invariants.md)。旧模块还未全部退场，不能将新目录存在等同于重构完成。
 
-## 1. 当前问题
+## 唯一 source 编译链路
 
-审查基线核心包有93个Python模块、35,848行，全部平铺；36个模块以scope_开头。`model.py` 1461行、`scope_sync.py` 1383行、`loop_model.py` 1381行、`language.py` 1128行、`lowering.py` 1088行。下面的依赖问题记录基线，不将已迁移部分继续称为当前未改动。
+| 层 | 实际模块 | 输入与职责 |
+|---|---|---|
+| 编排 | `compilation.py`、`passes/structured_sync.py` | 一次调用持有私有 IR，连接阶段、冻结产物；不选择协议 |
+| DSL | `language.py`、`frontend/` | AST、类型、runtime/constexpr、`serial/Pipelined/Stage/Cube/Vector` |
+| IR | `dialects/source.py`、`physical.py`、`structured.py` | 真实控制、地址 SSA、native 和通知；不包含算子策略 |
+| native lowering | `passes/lower_native.py`、`native_recipes.py`、`native_addresses.py` | 保留递归控制、值来源与完整物理地址；不展开 runtime 次数 |
+| 控制与访问事实 | `analysis/structured_control.py`、`structured_addresses.py`、`structured_memory.py` | 实际 SSA 坐标、作用域、参与者、原语 effects 与 root/view 几何 |
+| 准入 | `analysis/structured_bounds.py`、`structured_admission.py` | 范围、值初始化、alias、配置与原语输入合同 |
+| ownership 与 host 合同 | `analysis/structured_ownership.py`、`structured_host.py` | group/sid 写入分区、host 参数和整数范围；不选择同步 |
+| 访问分区 | `analysis/structured_access.py` | 按实际物理范围、stride/slot/代次分区；不构造 event |
+| region 合成 | `analysis/access_frontier.py`、`structured_regions.py`、`structured_dependencies.py` | sequence/branch/loop 的 RAW/WAR/WAW、首末访问和回边 |
+| 排步绑定 | `analysis/structured_dispatch.py` | 固定 Stage 与 issue order 到实际 native 的映射 |
+| 通知选择 | `passes/select_notifications.py`、`analysis/structured_protocols.py` | 完整激活域中的 capture/acquire 与 coverage；不分配 ID |
+| 事件域 | `analysis/event_domains.py`、`event_windows.py` | 配对及精确 membership、首末和存在投影；不分配 ID |
+| 事件生命周期 | `analysis/event_lifetimes.py`、`structured_event_sharing.py` | 消费到复用、有限子循环再次调用和有证据的 ID 共享 |
+| 派发进展 | `analysis/event_progress.py` | 实际阻塞接口及循环组合；不读取分配 ID |
+| 事件分配 | `analysis/structured_resources.py`、`event_contracts.py` | 连接资源阶段、bank/ID 台账、配置预留与最终 drain |
+| 物化 | `passes/materialize_structure.py`、`analysis/structured_schedule.py` | 将已确定指令写成真实 SCF 条件、event SSA 和 NotificationOp |
+| ASC | `backend/structured.py`、`structured_native.py`、`native.py` | 读取最终 IR；不得另用动作表重建执行，不插隐藏同步 |
+| CANN 与构建 | `backend/cann.py`、`build.py`、`runtime/process.py` | 一个算子一次进程组期限、离线工具调用、成功产物发布 |
 
-问题是职责重叠而不只是行数。model 同时包含错误类型、物理对象、原语合同、提取和依赖，79个模块依赖它；scope_sync 同时构图、查询、插入、分配、检查和编排。各层持有不同的“已完成事实”，形成适配和重复查询。
+`structured_regions.py` 存共享关系类型；`structured_access.py` 负责范围投影；`structured_dependencies.py` 负责递归合成。这三者不能各自重新解释一次地址、slot 或循环有效域。
 
-静态审查排除TYPE_CHECKING后，初始化阶段没有依赖环；计入函数内runtime imports则有10组依赖闭环。延迟import避免了初始化冲突，但没有解决职责反向依赖：
+资源阶段已经拆开事实、生命周期、进展和分配；窗口等价及存在投影已经接通，多层有限端口与重复流的组合仍待完成。它们共享一次建立的 `EventDomains`，没有通过 mixin 或回调总 planner 拼装另一套求解器。
 
-| 当前依赖 | 要解除的关系 |
-|---|---|
-| scope_query_completion / scope_resources → scope_sync.ParentCompletion | 分析/资源模块不能依赖顶层planner类来定义输入 |
-| child_completion → loop_planning.DirectCompletion | 原生milestone/插入cut不能归属于协议选择器 |
-| scope_child_transfer ↔ scope_completion | 公共身份类型下沉，新的组合不沿用两套互调适配器 |
-| codegen → sync，loop/scope_codegen → codegen | 公开检查入口、计划、通用打印分别归属 |
-| frontend ↔ language | 公开语法、AST解析、内部builder分开 |
-| ir.parse → source_ir → ir | 共享traits/types与dialect注册IO分开 |
-| build ↔ toolchain | 进程组、deadline从高层构建编排下沉 |
-
-这些是当前代码事实；不能将它们称作已发生的循环导入崩溃。
-
-## 2. 目标目录
-
-不引入插件框架或大型pass管理框架。使用xDSL已有基础设施，顶层只保留薄入口，子包按职责建立：
-
-```text
-src/xdsl_npu/
-  __init__.py          # compile / Compilation / language 等明确公开入口
-  compilation.py      # 一条阶段编排、产物与计时；不含同步算法
-  cli.py              # 参数、输入与产物输出
-  language.py         # 薄语法入口，内部实现进入 frontend
-  diagnostics.py      # 错误类别、源位置、阶段、最小witness
-  frontend/
-    syntax.py         # Tensor/constexpr/serial/Pipelined/Stage 等声明
-    parser.py         # AST捕获、名称/作用域、源码位置
-    builders.py       # 内部source IR构造；不依赖sync/backend
-    contracts.py      # 源语言能力/admission及runtime输入合同
-  dialects/
-    source.py         # 逻辑操作、布局、排步与控制
-    physical.py       # native、统一loop和typed同步，去掉query专有op
-    structured.py     # 真实pipeline/stage与多祖先SSA地址，中间IR尚待完整admission
-    types.py          # 必需共享types/traits/effects
-    io.py             # dialect注册、parse/print
-  target/
-    ascend910b.py     # engine、milestone、event bank、可见性/阻塞合同
-    native.py         # 原语合法性、物理effects、数值与原生表示合同
-  analysis/
-    iteration.py      # 真实SSA循环域、控制句柄，供admission和PLE共用
-    native.py         # 首次解码保留实际effects/cut，后续只绑定clock
-    value_bindings.py # 实际writer/reader、yield转发和条件last选择，无完成承诺
-    transitions.py    # 将目标单指令规则应用到有类型边界，不做协议选择
-    access.py         # root/view/范围、ownership、reaching definitions
-    dependencies.py   # RAW/WAR/WAW与slot carried依赖
-    frontier.py       # 有类型完成前沿与覆盖/合流，不是全源闭包
-    loops.py          # region边界、坐标绑定与循环归纳合同
-    resources.py      # event lease、冲突、配对与进展事实
-  passes/
-    lower_native.py   # 递归控制和原语接线，返回未admit的NativeStructure
-    native_addresses.py# 完整SSA地址与原axis/几何，动态bounds仍待admission
-    native_recipes.py # 原语展开，返回真实定义和全部reader，独立于控制构造
-    lower_pipeline.py # 固定排步 → 统一PLE；递归处理所有循环
-    insert_sync.py    # 消费依赖和前沿，构造逻辑通知
-    assign_events.py  # bank/ID/width/共享选择，不重新推导内存关系
-    materialize.py    # 已接受同步计划写回真实IR
-    simplify_scalar.py# 纯标量canonicalize/CSE与映射化简
-  backend/
-    asc.py            # 已确定指令与控制结构的输出
-    expressions.py    # 已规范表达式的命名和打印
-    cann.py           # dav-2201离线编译，不包含设备初始化
-  runtime/
-    process.py        # 有界子进程、整个进程组期限与清理
-    launch.py         # ABI、运行时合同、设备launch
-    device.py         # 卡状态及显式物理映射
-```
-
-这是一张职责地图，不要求立即创建每个空文件；原语recipe多到需要分文件时按copy/cube/vector分组，不按FA或query分组。公共language名字可保留，它是稳定产品入口，不为旧task语法提供兼容。
-
-独立检查作为明确的验证入口消费实际IR，可放在analysis下独立模块；有限执行模型留tests/models。benchmark、profiling、数值oracle和手写参考留benchmarks，算子算法与政策留examples。runtime不负责产品报告和调参。
-
-## 3. 依赖方向与数据所有权
+## 必须保持的依赖方向
 
 ```text
-compilation / CLI → frontend、passes、backend、runtime
-frontend          → dialects、diagnostics
-passes            → dialects、target、analysis
-analysis          → dialects、target、diagnostics
-backend           → dialects、target；只消费完成的计划
-runtime           → diagnostics / process；不导入编译分析
+compilation → frontend / passes / backend
+frontend    → dialects / diagnostics
+passes      → analysis / dialects / target
+analysis    → dialects / target / scalar facts
+backend     → 最终 IR + 未改变的 native 合同 / target
+runtime     → process / diagnostics
 ```
 
-dialect的结构类型不导入planner；目标原语合同可读取physical类型，但physical类型不能反向导入代码生成。分析结果是边界合同、依赖或lease的数据，不携带可回调顶层planner的能力。源码位置和错误类别是底层公共数据。
+循环坐标替换使用共同的 `scalar.substitute`；实际词法归属使用 `ControlFrame`。分析结果不持有回调顶层 planner 的能力。`BoundPlacement` 保留真实端点，`SyncAction` 仅是物化输入，最终执行事实在物理 IR 中。
 
-编排持有一份私有IR；pass返回其明确建立的分析结果。只有会改变相关前提的变换才使结果失效。不可用跨阶段的任意Module哈希缓存代替所有权，也不建立独立可变程序树。
+一份 owned invocation 只建立一次前提。新增通知不改变 native、地址和循环身份，因此可以沿用这些事实；改变访问、排步或激活域时，必须重新建立受影响合同。不能把可伪造的 `verified=True` 当授权。
 
-## 4. 现有模块的去留
+## 尚待退出的旧职责
 
-| 现有部分 | 处理 |
-|---|---|
-| frontend.py / language.py / _physical_builder.py | 拆公开语法、AST parser与内部builder；_physical_builder仍被lowering使用，不能直接扔进tests |
-| ir.py / source_ir.py | source/physical/shared/IO；淘汰Query/Scope/Invocation/Region专用同步op，按机制保留必要属性 |
-| model.py / loop_model.py | 分离诊断、目标原语、访问提取、依赖；不把整个大文件搬到analysis/model.py |
-| lowering.py / region_lowering.py / scope_lowering.py / lowering_context.py | 合并结构化递归与地址绑定，按原语recipe拆；取消serial/KV/fixed-child结构识别分派 |
-| loop_planning / scope_sync / sequence_sync / invocation | 新的同步构造入口替代，迁移有价值的硬件合同和反例，旧planner按阶段删除 |
-| scope_query_* / guarded与anchored适配图 / child投影 | 不迁成新的query子包；统一循环边界与carry接替，生产路径退出旧传播模型 |
-| events / scope_event_* / scope_query_resources等 | 统一逻辑lease输入、按bank分解的资源分配与进展；不保留child→parent→query三层资源重证 |
-| scalar / indexing / asc_scalar | 纯算术合同及通用pass在前，backend只打印；避免两套表达式等价系统各自改语义 |
-| codegen / loop_codegen / scope_codegen / sequence_codegen | 统一控制输出与native格式；公开外部IR验证在编排入口，不从emitter回调planner |
-| build / toolchain / device | deadline和进程组下沉；离线编译与设备launch分离 |
+以下不是新的普通 source 编译路径：
 
-旧完成求解器若暂留作对照，必须通过显式debug/test入口使用，不能作为未支持结构的静默fallback。迁移期可有明确实验入口；每个阶段结束列出还剩哪条旧生产调用及删除门槛。
+- 根目录的 `scope_*`、`loop_*`、`sequence_*` 和旧 `sync.py/codegen.py`：旧 completion/query/物理输入体系。
+- M2 单循环过渡实现的 7 个模块已经移出 `src`，保存在 `tests/legacy/`，不提供兼容 wrapper。
+- `Compilation._build` 和旧公共 `autosync/verify_plan/emit_asc` 已删除；公共编译只接受 DSL/source IR。物理快照是检查产物，不能重新导入充当已证明的输入。
+- 构建工具的旧交错检查入口已删除；独立最终 IR 模型留在测试。`performance.py` 的旧物理计数及两个 benchmark 解码器仍待迁移，尚阻止剩余旧闭包整体退出产品。
 
-## 5. 原语、lowering与输出的界限
+清退时保留硬件反例的语义，并将用例迁至新链路或独立有限模型。不得通过删测试、默认跳过失败、保留第二套普通 source 编译器来宣称完成。历史模型可以作为明确标识的测试 oracle，不能从公共编译入口调用。
 
-目前一个操作在frontend名单、language builder、source verifier、lowering、model.native_contract和codegen.native_line分别登记，容易漏effects或改变语义。重构明确一份原语合同：合法类型/布局、完整读写/配置、数值边界、完成里程碑和对应native表示。前端检查语法，lowering选择透明recipe，target给硬件事实，emitter打印；无需建立复杂注册框架。
-
-现有Load2D在emitter内部展开循环。重构必须把其完整读写与实际指令工作量放到native表示或显式recipe中；不能让同步只看到一个较小的假访问范围。无需按每条静态指令建全局完成来源，recipe可以用已论证的参数化效果。
-
-## 6. 迁移纪律
-
-先抽底层合同和共享身份，再替换控制/同步，再统一输出，最后删除旧内部路径。每次移动与测试导入变更同一补丁，避免长期转发兼容层。普通循环和kernel不增加算子名/shape特判。
-
-通过静态依赖审查确认没有analysis→passes/backend或backend→sync规划反向依赖；通过真实示例确认公共路径已切换。文件少了、名字变了或测试只验证旧模块不存在，都不足以验收。
+算子及分块政策在 `examples/`；数值 oracle、手写 AscendC/ACLNN、profiling 在 `benchmarks/`；独立有限执行语义在 `tests/models/`。参考资料和运行数据留外层，不进入产品包。

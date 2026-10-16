@@ -5,14 +5,14 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
 from tests.fixtures.physical_state import recurrent_gdn
 from tests.fixtures.pipelines import phased_pipeline, vector_pipeline
-from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import ChannelOp
 from xdsl_npu.events import minimum_chains, pack_event_lifetimes, selection_expression
 from xdsl_npu.model import extract
-from xdsl_npu.sync import explain_plan
+from xdsl_npu.sync import autosync, explain_plan, verify_plan
 
 
 def test_matching_minimum_against_every_five_node_partial_order():

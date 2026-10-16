@@ -3,14 +3,14 @@ from xdsl.dialects.builtin import IntAttr, StringAttr
 from xdsl.transforms.dead_code_elimination import dce
 
 from tests.fixtures.pipelines import cube_pipeline, vector_pipeline
-from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.check import bounded_check
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import ChannelOp, SyncOp, ViewOp
 from xdsl_npu.model import dependencies, extract
-from xdsl_npu.sync import explain_plan
+from xdsl_npu.sync import autosync, explain_plan, verify_plan
 
 
 @pytest.mark.parametrize("build", [vector_pipeline, cube_pipeline])

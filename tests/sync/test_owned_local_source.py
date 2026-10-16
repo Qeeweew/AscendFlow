@@ -1,24 +1,24 @@
-"""Owned source facts cross lowering and local synchronization exactly once."""
+"""Historical M2 source facts cross lowering and local synchronization once."""
 
 import pytest
 from xdsl.dialects.builtin import ArrayAttr, FloatAttr, IntAttr, UnitAttr, f32, f64
 
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
+from tests.legacy.backend.local import emit_local
+from tests.legacy.passes import insert_sync
+from tests.legacy.passes.insert_sync import lower_and_synchronize_local, synchronize_local
 from tests.sync.test_structured_local_sync import _forbid_old_solver
 from xdsl_npu import language as N
 from xdsl_npu import loop_model
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.analysis import dependencies, native
-from xdsl_npu.backend.local import emit_local
 from xdsl_npu.compilation_facts import PhysicalFacts
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp, TaskOp
 from xdsl_npu.dialects.source import ProgramOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.passes import insert_sync
-from xdsl_npu.passes.insert_sync import lower_and_synchronize_local, synchronize_local
 
 SCALE = scale.specialize(B=64)
 CUBE = batched_matmul.specialize(M=16, N=16, K=16, GROUPS=1, L1_SLOTS=2, L0_SLOTS=2, C_SLOTS=2)

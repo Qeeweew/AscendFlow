@@ -151,6 +151,12 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
         if operation.value is not None:
             scalar_values[operation.value] = operation
         contract = NativeContract(operation.native.data, engine, modes, params, scalar)
+        require(
+            contract.packet is not None and contract.packet.closed_mask,
+            "native requires an audited closed instruction packet",
+            phase="structured-memory",
+            location=str(operation.location),
+        )
         accesses = tuple(
             MemoryAccess(operand, index, ref, AccessMode(mode))
             for index, (operand, ref, mode) in enumerate(zip(operands, refs, modes, strict=True))

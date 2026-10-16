@@ -1,9 +1,8 @@
-"""Explicit structured-synchronization entry during the M2 migration.
+"""Historical M2 synchronization entry retained as an explicit test oracle.
 
-The public compiler still handles nested regions through the old entry until
-M3/M4 are complete. This local entry never falls back to that planner. It
-admits the physical module once, constructs memory and notification contracts,
-then materializes the accepted local schedule at its actual native anchors.
+This local entry admits the physical module once, constructs memory and
+notification contracts, then materializes the accepted local schedule at its
+actual native anchors. It does not qualify the current source compiler.
 """
 
 from collections.abc import Mapping
@@ -12,22 +11,22 @@ from types import MappingProxyType
 
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, ModuleOp, StringAttr
 
-from ..analysis.contracts import MemoryContracts, build_memory_contracts
-from ..analysis.dependencies import DependencyAnalysis
-from ..analysis.frontier import Clock
-from ..analysis.hazards import bind_hazards
-from ..analysis.native import extract_native_tasks
-from ..analysis.progress import ProgressCertificate, establish_local_progress
-from ..analysis.protocols import LocalCommand, LocalMechanism, local_commands
-from ..analysis.resources import LocalEventPlan, LocalResourceWork, allocate_local_events
-from ..compilation_facts import PhysicalFacts
-from ..diagnostics import require
-from ..dialects.io import dump
-from ..dialects.loops import LoopScheduleAttr
-from ..dialects.physical import LoopChannelOp, LoopSyncOp
-from ..loop_model import Loop
-from ..target.ascend910b import Engine
-from .local_sync import LocalSelection, SelectionWork, select_local_protocols
+from tests.legacy.analysis.contracts import MemoryContracts, build_memory_contracts
+from tests.legacy.analysis.progress import ProgressCertificate, establish_local_progress
+from tests.legacy.analysis.protocols import LocalCommand, LocalMechanism, local_commands
+from tests.legacy.analysis.resources import LocalEventPlan, LocalResourceWork, allocate_local_events
+from tests.legacy.passes.local_sync import LocalSelection, SelectionWork, select_local_protocols
+from xdsl_npu.analysis.dependencies import DependencyAnalysis
+from xdsl_npu.analysis.frontier import Clock
+from xdsl_npu.analysis.hazards import bind_hazards
+from xdsl_npu.analysis.native import extract_native_tasks
+from xdsl_npu.compilation_facts import PhysicalFacts
+from xdsl_npu.diagnostics import require
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.loops import LoopScheduleAttr
+from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp
+from xdsl_npu.loop_model import Loop
+from xdsl_npu.target.ascend910b import Engine
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,8 +195,8 @@ def lower_and_synchronize_local(source) -> LocalSynchronization:
     DependencyAnalysis. No verified attribute or result from another invocation
     authorizes this handoff. External physical input uses synchronize_local.
     """
-    from ..frontend import PrimFunction
-    from ..lowering import lower_source
+    from xdsl_npu.frontend import PrimFunction
+    from xdsl_npu.lowering import lower_source
 
     if isinstance(source, PrimFunction):
         source = source.to_ir()

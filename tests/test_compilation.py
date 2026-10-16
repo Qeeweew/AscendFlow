@@ -1,104 +1,96 @@
+"""One public source path, immutable artifacts, and no imported proof markers."""
+
 from dataclasses import FrozenInstanceError
 
 import pytest
-from xdsl.dialects.builtin import FloatAttr, f32
+from xdsl.dialects.builtin import ModuleOp
 
-from tests.fixtures.cv import cv_source, vector_source
-from tests.report_contract import semantic_report
-from xdsl_npu import autosync, emit_asc, verify_plan
-from xdsl_npu.compilation import Compilation, compile
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp, TaskOp
-from xdsl_npu.lowering import lower_source
+from tests.support.forbid_legacy import forbid_legacy_planning
+from xdsl_npu import compile
+from xdsl_npu import language as N
+from xdsl_npu.compilation import Compilation
+from xdsl_npu.diagnostics import CompileError, ErrorKind
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.structured import NotificationOp
+
+SOURCE = """
+def point(X:N.Tensor((64,),N.f32),Y:N.Tensor((64,),N.f32,access="write")):
+    with N.Kernel():
+        x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
+        value=N.copy(X,x)
+        value=N.mul(value,2.0,out=y)
+        N.copy(value,Y)
+"""
 
 
-@pytest.mark.parametrize("factory", [vector_source, cv_source])
-def test_frozen_compile_matches_independent_public_physical_path(factory, tmp_path):
-    source = factory(2)
+@pytest.fixture(scope="module")
+def artifact():
+    return compile(N.from_source(SOURCE, disjoint_external=True))
+
+
+def test_public_source_owns_and_preserves_its_input(monkeypatch):
+    forbid_legacy_planning(monkeypatch)
+    source = N.from_source(SOURCE, disjoint_external=True).to_ir()
+    before = dump(source)
     result = compile(source)
-    physical = lower_source(source)
-    plan = autosync(physical)
-    assert result.asc == emit_asc(plan)
-    assert semantic_report(result.report) == semantic_report(verify_plan(plan))
-    assert result.report["verification_mode"] == "normal"
-    assert result.schedule
-    assert result.timings["total_s"] > 0
-    result.write(tmp_path)
-    assert not (tmp_path / "witnesses.json").exists()
-    assert (tmp_path / "after.xdsl").read_text() == result.plan_ir
-    assert (tmp_path / "source.xdsl").read_text() == result.source_ir
+    assert dump(source) == before
+    source.body.block.erase_op(source.body.block.first_op)
+    assert result.source_ir == before
+    assert result.report["pipeline"] == "structured-regions"
+    assert result.report["verification_mode"] == "owned-construction"
+    assert "npu.notification" not in result.before_ir
+    assert "npu.notification" in result.plan_ir
 
 
-def test_cached_code_owns_no_externally_mutable_ir_or_verification_flag():
-    physical = lower_source(vector_source(2))
-    result = Compilation(physical)
-    expected = result.asc
-    compute = next(
-        op for op in physical.walk() if isinstance(op, TaskOp) and op.native.data == "muls"
-    )
-    compute.attributes["scalar"] = FloatAttr(3.0, f32)
-    assert result.asc == expected
-    assert compile(physical).asc != expected
-    report = result.report
-    report["channels"] = -1
-    assert result.report["channels"] >= 0
+def test_exported_ir_and_reports_cannot_mutate_an_artifact(artifact):
+    plan = artifact.plan
+    notify = next(op for op in plan.walk() if isinstance(op, NotificationOp))
+    notify.parent.erase_op(notify)
+    assert dump(plan) != artifact.plan_ir
+    assert dump(artifact.plan) == artifact.plan_ir
+    report = artifact.report
+    report["sync_instructions"] = -1
+    assert artifact.report["sync_instructions"] > 0
     with pytest.raises(FrozenInstanceError):
-        result.asc = "unsafe"
+        artifact.asc = "unsafe"
     with pytest.raises(TypeError):
-        Compilation(physical, verified=True)
+        Compilation(N.from_source(SOURCE), verified=True)
 
 
-def test_an_edited_exported_plan_is_rechecked_and_cannot_reuse_the_artifact_proof():
-    result = compile(cv_source(1))
-    plan = result.plan
-    channel = next(
-        op for op in plan.walk() if isinstance(op, LoopChannelOp) and op.kind.data == "cross"
+def test_physical_exports_are_not_proof_carrying_public_inputs(artifact):
+    for module in (artifact.plan, ModuleOp([]), object()):
+        with pytest.raises(CompileError, match="source ProgramOp") as failure:
+            compile(module)
+        assert failure.value.kind is ErrorKind.UNSUPPORTED
+        assert failure.value.phase == "compilation input"
+    # Removal of a Wait does not let a caller bypass the owned source chain.
+    changed = artifact.plan
+    wait = next(
+        op
+        for op in changed.walk()
+        if isinstance(op, NotificationOp) and op.kind.data == "local_wait"
     )
-    for op in list(plan.walk()):
-        if isinstance(op, LoopSyncOp) and op.channel == channel.sym_name:
-            op.parent.erase_op(op)
-    channel.parent.erase_op(channel)
-    with pytest.raises(CompileError):
-        emit_asc(plan)
-    with pytest.raises(CompileError):
-        compile(plan, synchronize=False)
-    # The export is a copy; the frozen result still has its original complete plan.
-    assert emit_asc(result.plan) == result.asc
+    wait.parent.erase_op(wait)
+    with pytest.raises(CompileError, match="source ProgramOp"):
+        compile(changed)
 
 
-def test_expert_synchronization_has_the_same_final_check():
-    plan = autosync(lower_source(vector_source(2)))
-    result = compile(plan, synchronize=False, host_launcher=False)
-    assert result.asc == emit_asc(plan, host_launcher=False)
-    with pytest.raises(CompileError, match="missing"):
-        compile(lower_source(vector_source(2)), synchronize=False)
+def test_debug_is_explicit_structural_verification_not_a_second_solver(artifact, monkeypatch):
+    forbid_legacy_planning(monkeypatch)
+    deep = compile(N.from_source(SOURCE, disjoint_external=True), debug_verify=True)
+    assert not artifact.report["debug_structural_verification"]
+    assert deep.report["debug_structural_verification"]
+    assert deep.asc == artifact.asc
+    assert deep.plan_ir == artifact.plan_ir
+    deep.plan.verify()
 
 
-def test_owned_normal_path_reuses_facts_and_deep_is_explicit(monkeypatch):
-    import xdsl_npu.compilation as pipeline
-    import xdsl_npu.loop_sync as leaf
-    from examples.vector.scale import scale
-
-    original = pipeline.verify_plan
-    checks = []
-
-    def check(*args, **kwargs):
-        checks.append(True)
-        return original(*args, **kwargs)
-
-    def unexpected(*args, **kwargs):
-        raise AssertionError("normal compilation rebuilt an independent leaf proof")
-
-    monkeypatch.setattr(pipeline, "verify_plan", check)
-    with monkeypatch.context() as normal_context:
-        normal_context.setattr(leaf, "_verify_leaf", unexpected)
-        normal = compile(scale)
-    assert not checks
-    assert normal.timings["final_check_s"] == normal.timings["debug_check_s"] == 0
-    assert "npu.loop_channel" not in normal.before_ir
-    assert "npu.loop_channel" in normal.plan_ir
-    deep = compile(scale, debug_verify=True)
-    assert len(checks) == 1
-    assert normal.asc == deep.asc
-    assert semantic_report(normal.report) == semantic_report(deep.report)
-    assert deep.timings["debug_check_s"] > 0
+def test_writing_artifacts_uses_only_frozen_snapshots(artifact, tmp_path, monkeypatch):
+    forbid_legacy_planning(monkeypatch)
+    artifact.write(tmp_path, diagnostics=True)
+    assert (tmp_path / "after.xdsl").read_text() == artifact.plan_ir
+    assert (tmp_path / "before.xdsl").read_text() == artifact.before_ir
+    assert (tmp_path / "source.xdsl").read_text() == artifact.source_ir
+    assert (tmp_path / f"{artifact.name}.asc").read_text() == artifact.asc
+    assert (tmp_path / "witnesses.json").exists()
+    assert artifact.explain() == artifact.report["witnesses"]

@@ -186,6 +186,20 @@ def literal(value):
     return Expr("constant", (value,))
 
 
+def substitute(value: Expr, bindings: Mapping[Expr, Expr]) -> Expr:
+    """Simultaneous coordinate substitution, without assumptions about its domain.
+
+    Replacements are not recursively substituted. Callers retain the actual
+    loop/guard scope that makes any division or selected occurrence valid.
+    This shared operation supplies no alias or completion proof.
+    """
+    if value in bindings:
+        return bindings[value]
+    if value.kind in {"constant", "argument"}:
+        return value
+    return expression(value.kind, *(substitute(child, bindings) for child in value.args))
+
+
 def expression(kind, a, b):
     if kind == "sub":
         return expression("add", a, expression("mul", literal(-1), b))

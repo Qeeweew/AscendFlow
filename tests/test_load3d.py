@@ -4,10 +4,11 @@ import pytest
 from xdsl.dialects.builtin import IntAttr
 
 from examples.gemm.batched import batched_matmul
-from xdsl_npu import compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.physical import Load3DConfigOp
 from xdsl_npu.loop_model import extract_loop
+from xdsl_npu.sync import verify_plan
 
 
 @pytest.fixture(scope="module")

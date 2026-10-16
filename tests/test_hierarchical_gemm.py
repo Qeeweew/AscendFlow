@@ -4,13 +4,14 @@ import pytest
 from xdsl.dialects.builtin import IntAttr
 
 from tests.fixtures.physical_operators import gemm_nt
-from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.check import bounded_check
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import ChannelOp, SyncOp, TaskOp, ViewOp
 from xdsl_npu.model import extract
+from xdsl_npu.sync import autosync, verify_plan
 
 
 @pytest.mark.parametrize("ratio,slots", [(1, 1), (2, 1), (2, 2), (3, 2), (3, 3), (4, 3)])

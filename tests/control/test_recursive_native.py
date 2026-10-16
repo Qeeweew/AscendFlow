@@ -15,7 +15,14 @@ from xdsl_npu import language as N
 from xdsl_npu.analysis.value_bindings import LastTile, TileDefinition
 from xdsl_npu.diagnostics import CompileError, ErrorKind
 from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.physical import BufferOp, CoreIdOp, EndOp, RuntimeSizeOp, TaskOp
+from xdsl_npu.dialects.physical import (
+    BufferOp,
+    CoreIdOp,
+    EndOp,
+    FixConfigOp,
+    RuntimeSizeOp,
+    TaskOp,
+)
 from xdsl_npu.dialects.source import CopyOp, PipelineOp
 from xdsl_npu.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
 from xdsl_npu.passes.lower_native import lower_native_structure
@@ -24,7 +31,9 @@ from xdsl_npu.passes.lower_native import lower_native_structure
 def interpret(block, values, arguments, trace):
     """Independent scalar evaluation; plain clock enumeration only in tests."""
     for op in block.ops:
-        if isinstance(op, RuntimeSizeOp):
+        if isinstance(op, FixConfigOp):
+            result = ()  # Register setup is outside this scalar/address oracle.
+        elif isinstance(op, RuntimeSizeOp):
             result = (arguments[op.sym_name.data],)
         elif isinstance(op, CoreIdOp):
             result = (arguments.get("group", 0),)

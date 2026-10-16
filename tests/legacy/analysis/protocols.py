@@ -1,4 +1,4 @@
-"""Selected local capture/acquire relations, before event ID assignment.
+"""Historical M2 local capture/acquire relations used by the test oracle.
 
 The endpoints are actual native insertion anchors. Activation is expressed in
 the destination's logical generation, as for physical memory requirements.
@@ -8,9 +8,9 @@ Neither a relation nor its selected flag IDs is a completed notification.
 from dataclasses import dataclass
 from enum import Enum
 
-from ..diagnostics import require
-from .hazards import Activation, NativeHazard
-from .native import NativeTask
+from xdsl_npu.analysis.hazards import Activation, NativeHazard
+from xdsl_npu.analysis.native import NativeTask
+from xdsl_npu.diagnostics import require
 
 
 class LocalMechanism(str, Enum):

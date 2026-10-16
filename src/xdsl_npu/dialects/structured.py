@@ -23,6 +23,7 @@ from xdsl.irdl import (
     irdl_op_definition,
     operand_def,
     opt_attr_def,
+    opt_operand_def,
     region_def,
     result_def,
     traits_def,
@@ -32,7 +33,7 @@ from xdsl.traits import RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
 from .loops import LoopScheduleAttr
-from .types import RefType
+from .types import AsyncEffects, RefType
 
 
 @irdl_op_definition
@@ -223,3 +224,54 @@ class AddressOp(IRDLOperation):
             )
         if self.displacement.data < 0:
             raise VerifyException("address displacement must be nonnegative")
+
+
+@irdl_op_definition
+class NotificationOp(IRDLOperation):
+    """One selected instruction at an actual control insertion point.
+
+    Guards are ordinary surrounding SCF control and IDs are scalar SSA values.
+    This op is observable even without tensor results. Structural verification
+    establishes neither matching partners nor progress or an event lease.
+    """
+
+    name = "npu.notification"
+    event = opt_operand_def(IndexType)
+    kind = attr_def(StringAttr)
+    participants = attr_def(ArrayAttr[StringAttr])
+    source = attr_def(StringAttr)
+    destination = attr_def(StringAttr)
+    protocol = attr_def(StringAttr)
+    traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        from ..target.ascend910b import Actor, Engine, SyncKind, supports_engine
+
+        try:
+            kind = SyncKind(self.kind.data)
+            participants = tuple(Actor(value.data) for value in self.participants)
+            source, destination = Engine(self.source.data), Engine(self.destination.data)
+        except ValueError as error:
+            raise VerifyException(
+                "notification has an invalid participant, kind, or engine"
+            ) from error
+        if not participants or len(set(participants)) != len(participants):
+            raise VerifyException("notification needs distinct participants")
+        if Actor.AIC in participants and len(participants) != 1:
+            raise VerifyException("notification cannot span both Cube and Vector code")
+        if kind is SyncKind.FENCE:
+            if self.event is not None or source is not destination:
+                raise VerifyException("pipe fence needs one engine and no event ID")
+        elif self.event is None:
+            raise VerifyException("notification needs an actual event ID SSA value")
+        if kind in {SyncKind.LOCAL_SET, SyncKind.LOCAL_WAIT} and source is destination:
+            raise VerifyException("local notification needs two different engines")
+        engines = (
+            (source,)
+            if kind is SyncKind.CROSS_SET
+            else (destination,)
+            if kind is SyncKind.CROSS_WAIT
+            else (source, destination)
+        )
+        if any(not supports_engine(actor, engine) for actor in participants for engine in engines):
+            raise VerifyException("notification engine belongs to another participant")

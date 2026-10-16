@@ -3,7 +3,7 @@
 from itertools import groupby
 
 from .asc_scalar import ScalarScope
-from .codegen import QUALIFIER, load3d_init, native_line
+from .backend.native import QUALIFIER, load3d_init, native_line
 from .diagnostics import require
 from .dialects.physical import InvocationChannelOp, MixedOp, OnceOp
 from .model import storage_layout

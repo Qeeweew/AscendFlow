@@ -1,4 +1,4 @@
-"""Direct conditional memory contracts, without completion propagation.
+"""Historical M2 direct conditional memory contracts used by the test oracle.
 
 A real source retirement capture carries facts established at its native's
 admission. This index retains those admission obligations as conditions, not
@@ -15,12 +15,12 @@ from types import MappingProxyType
 
 from xdsl.ir import SSAValue
 
-from ..diagnostics import require
-from ..dialects.physical import TaskOp
-from ..target.ascend910b import Milestone
-from .hazards import Activation, MemoryWitness, NativeHazard
-from .native import NativeCut, NativeTask
-from .regions import Output
+from xdsl_npu.analysis.hazards import Activation, MemoryWitness, NativeHazard
+from xdsl_npu.analysis.native import NativeCut, NativeTask
+from xdsl_npu.analysis.regions import Output
+from xdsl_npu.diagnostics import require
+from xdsl_npu.dialects.physical import TaskOp
+from xdsl_npu.target.ascend910b import Milestone
 
 
 @dataclass(slots=True)

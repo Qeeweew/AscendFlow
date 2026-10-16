@@ -6,9 +6,9 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 from xdsl.utils.exceptions import VerifyException
 
 from tests.fixtures.cv import cv_source, vector_source
-from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import CrossChannelOp, CrossSyncOp
@@ -17,6 +17,7 @@ from xdsl_npu.dialects.types import TileType
 from xdsl_npu.frontend import FrontendError
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.mixed import extract_mixed
+from xdsl_npu.sync import autosync, verify_plan
 
 
 def diagnostic_physical(module):

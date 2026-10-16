@@ -34,30 +34,10 @@ def _build_one(value, directory, options, end):
     else:
         result = compile(
             value,
-            synchronize=options["synchronize"],
-            load3d=options["load3d"],
             timeout_s=build_process.remaining(end, "Python compilation"),
         )
         report = result.report
         report["compilation"] = result.timings
-        if options["check_interleavings"]:
-            from dataclasses import asdict
-
-            from .check import bounded_check
-            from .dialects.physical import MixedOp
-            from .mixed_check import bounded_mixed_check
-
-            plan = result.plan
-            scope = options["check_interleavings"]
-            if isinstance(plan.body.block.first_op, MixedOp):
-                checked = bounded_mixed_check(
-                    plan, scope=scope, max_states=options["max_check_states"]
-                )
-            elif scope == "all":
-                checked = bounded_check(plan, max_states=options["max_check_states"])
-            else:
-                raise ValueError("shared interleaving scope requires a mixed kernel")
-            report["bounded_interleavings"] = asdict(checked)
         result.write(directory, diagnostics=options["diagnostics"])
         name, source = result.name, result.asc
     if options["compile_asc"] or options["shared"]:
@@ -111,13 +91,9 @@ def build_module(
     module,
     output,
     *,
-    synchronize=True,
     compile_asc=False,
     shared=False,
     diagnostics=False,
-    check_interleavings=None,
-    max_check_states=200_000,
-    load3d=False,
     timeout_s=build_process.MAX_BUILD_SECONDS,
     name=None,
 ):
@@ -137,13 +113,9 @@ def build_module(
     output.mkdir(parents=True, exist_ok=True)
     build_process.invalidate_build_artifacts(output)
     options = {
-        "synchronize": synchronize,
         "compile_asc": compile_asc,
         "shared": shared,
         "diagnostics": diagnostics,
-        "check_interleavings": check_interleavings,
-        "max_check_states": max_check_states,
-        "load3d": load3d,
         "name": name,
     }
     status, code, error = "failed", None, None

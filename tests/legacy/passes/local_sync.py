@@ -1,6 +1,6 @@
-"""Construct local protocols from actual memory requirements, without closure.
+"""Historical M2 local protocol selection retained as a test oracle.
 
-This is the explicit M2 single-clock entry. A dependency scan has already
+This is the M2 single-clock entry. A dependency scan has already
 removed only requirements with a retained read-carry certificate. Selection
 uses actual native order, cumulative source captures, and earlier Waits on
 the same consumer queue. It never inserts a candidate and then deletes it.
@@ -11,13 +11,14 @@ this selection and before materialization.
 from collections import defaultdict
 from dataclasses import dataclass
 
-from ..analysis.frontier import PrefixRank
-from ..analysis.hazards import Activation, NativeHazard
-from ..analysis.native import NativeTask
-from ..analysis.protocols import LocalMechanism, LocalProtocol
-from ..diagnostics import ErrorKind, require
-from ..periodic import union
-from ..target.ascend910b import Engine
+from tests.legacy.analysis.protocols import LocalMechanism, LocalProtocol
+from xdsl_npu.analysis.frontier import PrefixRank
+from xdsl_npu.analysis.hazards import Activation, NativeHazard
+from xdsl_npu.analysis.native import NativeTask
+from xdsl_npu.diagnostics import ErrorKind, require
+from xdsl_npu.periodic import union
+from xdsl_npu.target.ascend910b import Engine
+from xdsl_npu.target.packets import audited_packet
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +87,8 @@ def select_local_protocols(
     source-engine retirement capture. This cannot defer an earlier consumer
     or wait for an unrelated later source. Earlier queue acquisitions are
     reused only with the same stage and a proved containing activation.
-    No scalar setup effects or terminal-only control are silently ignored.
+    Closed actor issue packets retain their internal configuration order.
+    External register writes and terminal-only control remain separate duties.
     """
     tasks, requirements = tuple(tasks), tuple(requirements)
     if not tasks:
@@ -106,8 +108,20 @@ def select_local_protocols(
         phase="local-sync",
     )
     require(
+        all(
+            task.packet is not None
+            and task.packet is audited_packet(task.native)
+            and task.packet.native == task.native == task.operation.native.data
+            and task.packet.closed_mask
+            for task in tasks
+        ),
+        "local native needs an audited closed actor issue packet",
+        kind=ErrorKind.UNSUPPORTED,
+        phase="local-sync",
+    )
+    require(
         not any(access.mode.writes for task in tasks for access in task.registers),
-        "native Scalar register setup must be lowered into actual dispatch steps",
+        "external native register setup needs its actual dispatch contract",
         kind=ErrorKind.UNSUPPORTED,
         phase="local-sync",
     )

@@ -27,6 +27,7 @@ from ..dialects.physical import (
     BufferOp,
     CoreIdOp,
     EndOp,
+    FixConfigOp,
     KernelOp,
     MixedOp,
     RuntimeSizeOp,
@@ -140,6 +141,7 @@ class _Lowerer:
         self.domains = {}
         self.family_work = Counter()
         self.task_scopes = {}
+        self.needs_fix = False
         self.work = Counter(source_operations=0, native_templates=0, expanded_iterations=0)
 
     def scalar(self, value, scope):
@@ -238,6 +240,7 @@ class _Lowerer:
         number = len(self.results)
 
         def emit(suffix, native, *refs, params=(), scalar=0.0, order_delta=0):
+            self.needs_fix |= native in {"fix", "fix16"}
             task = TaskOp.build(
                 operands=[refs],
                 attributes=task_attrs(
@@ -549,6 +552,11 @@ def lower_native_structure(source) -> NativeStructure:
     )
     lowerer = _Lowerer(source, program, controls)
     lowerer.block(program.body.block, scope)
+    if lowerer.needs_fix:
+        # One actual invariant register initializer dominates every Fixpipe
+        # reader, even when a containing runtime loop has zero iterations.
+        # Its native packet includes the target S -> FIX readiness handshake.
+        body.insert_op_before(FixConfigOp(), core)
     body.add_op(EndOp())
     values, uses = bind_values(source, lowerer.results, lowerer.loops)
     # The constructors preserve structure from the admitted source. Developer

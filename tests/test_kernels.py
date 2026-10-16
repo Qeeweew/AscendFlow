@@ -3,12 +3,13 @@
 import pytest
 
 from tests.fixtures.physical_operators import batched_matmul_nt, rms_norm, rope, softmax, swiglu
-from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import ChannelOp, SyncOp
 from xdsl_npu.model import dependencies, extract
+from xdsl_npu.sync import autosync, verify_plan
 
 
 @pytest.mark.parametrize(

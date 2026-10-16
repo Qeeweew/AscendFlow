@@ -49,8 +49,9 @@ def test_batch_facts_after_each_protocol_match_independent_per_count_bfs(seed):
 
 def test_frame_planning_and_verification_do_not_call_pairwise_leaf_oracle(monkeypatch):
     from examples.state.frame_snapshot import frame_state_sum
-    from xdsl_npu import compile, verify_plan
+    from xdsl_npu import compile
     from xdsl_npu.loop_graph import Graph
+    from xdsl_npu.sync import verify_plan
 
     def forbidden(*args, **kwargs):
         raise AssertionError("region composition called a pairwise leaf oracle")

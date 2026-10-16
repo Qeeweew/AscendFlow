@@ -3,13 +3,15 @@
 import pytest
 from xdsl.utils.exceptions import VerifyException
 
-from xdsl_npu import compile, emit_asc, verify_plan
+from xdsl_npu import compile
 from xdsl_npu import language as N
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import LoopSyncOp, TaskOp
 from xdsl_npu.dialects.source import ReduceOp
 from xdsl_npu.loop_model import extract_loop
+from xdsl_npu.sync import verify_plan
 
 
 def definition(kind="sum", rows=8, columns=1024, workspace=1152):

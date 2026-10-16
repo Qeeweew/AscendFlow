@@ -1,9 +1,9 @@
 import pytest
 
 from tests.fixtures.cv import cv_program
-from xdsl_npu import autosync
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.performance import physical_work, profile_evidence, theoretical_metrics
+from xdsl_npu.sync import autosync
 
 
 def test_exact_typed_dma_and_cube_work_distinguish_cache_footprint_from_requests():

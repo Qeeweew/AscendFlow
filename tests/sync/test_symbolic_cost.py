@@ -210,9 +210,10 @@ def test_wider_fact_preserves_existing_bits_at_its_exact_condition():
 
 
 def test_public_verifier_rebuilds_after_actual_release_is_removed():
-    from xdsl_npu import compile, verify_plan
+    from xdsl_npu import compile
     from xdsl_npu import language as N
     from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp
+    from xdsl_npu.sync import verify_plan
 
     artifact = compile(
         N.from_source(

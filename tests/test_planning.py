@@ -5,9 +5,8 @@ from itertools import pairwise
 import pytest
 
 from tests.fixtures.pipelines import cube_pipeline, vector_pipeline
-from xdsl_npu import autosync
 from xdsl_npu.reachability import ProofSearch
-from xdsl_npu.sync import CompletionPrefixes, Graph, completion_graph, execution
+from xdsl_npu.sync import CompletionPrefixes, Graph, autosync, completion_graph, execution
 
 
 @pytest.mark.parametrize("seed", range(10))

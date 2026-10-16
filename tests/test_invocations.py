@@ -13,7 +13,7 @@ from xdsl.dialects.builtin import IntAttr, StringAttr
 
 from examples.gemm.hierarchical import hierarchical_gemm
 from tests.report_contract import semantic_report
-from xdsl_npu import compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import parse
@@ -28,6 +28,7 @@ from xdsl_npu.dialects.physical import (
 )
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.performance import runtime_work
+from xdsl_npu.sync import verify_plan
 
 
 @pytest.fixture(scope="module")

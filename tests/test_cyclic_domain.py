@@ -5,7 +5,7 @@ from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType, IntAttr, StringAttr
 
 from tests.report_contract import semantic_report
-from xdsl_npu import compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
@@ -20,6 +20,7 @@ from xdsl_npu.dialects.physical import (
     ViewOp,
 )
 from xdsl_npu.loop_model import extract_loop
+from xdsl_npu.sync import verify_plan
 
 
 def cyclic_program(groups=3, *, offset=0, width=64, split_extent=False, invoked=False):

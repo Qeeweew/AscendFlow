@@ -11,15 +11,17 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
 from tests.fixtures.cv import cv_source, segmented_cv_program, vector_source
 from tests.report_contract import semantic_report
-from xdsl_npu import compile, emit_asc, verify_plan
+from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import parse
 from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp
 from xdsl_npu.loop_model import loop_dependencies
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.model import Program
+from xdsl_npu.sync import verify_plan
 
 
 @pytest.fixture(scope="module", params=[vector_source, cv_source, segmented_cv_program])

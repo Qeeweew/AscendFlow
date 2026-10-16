@@ -12,7 +12,7 @@ An end cut is an anchor for a real capture, not a cumulative retirement fact.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -24,6 +24,7 @@ from ..dialects.physical import BufferOp, FixConfigOp, KernelOp, Load3DConfigOp,
 from ..target.ascend910b import Actor, Engine, Milestone, supports_engine
 from ..target.native import implicit_completion as native_implicit_completion
 from ..target.native import native_contract
+from ..target.packets import NativePacket, audited_packet
 from ..target.scalars import round_f32
 from .frontier import Clock, PrefixRank
 
@@ -55,6 +56,10 @@ class NativeContract:
     modes: tuple[str, ...]
     params: tuple[int, ...]
     scalar: float
+    packet: NativePacket | None = field(init=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "packet", audited_packet(self.native))
 
     @property
     def pipe(self):
@@ -176,6 +181,7 @@ class NativeTask:
     implicit_completion: bool
     last: bool = False
     scalar_source: TaskOp | None = None
+    packet: NativePacket | None = None
 
     @property
     def rank(self):
@@ -214,22 +220,6 @@ class NativeTask:
         return modes
 
 
-_MASK_SETUP = frozenset(
-    {
-        "broadcast_rows64",
-        "mul_row_broadcast",
-        "sub_row_broadcast",
-        "div_row_broadcast",
-        "merge_sum_packed",
-        "merge_max_packed",
-        "mul_columns64",
-        "fma_columns64",
-        "reduce_tile_sum64",
-        "reduce_tile_max64",
-    }
-)
-
-
 def _registers(operation, actor, engine, configurations):
     native = operation.native.data
     if native in {"fix", "fix16"}:
@@ -257,13 +247,6 @@ def _registers(operation, actor, engine, configurations):
                 Register.L13D_SIZE,
             )
         )
-    if native in _MASK_SETUP:
-        # These audited recipes overwrite mask state before their Vector read.
-        # A task's setup writes are visible effects, not an incoming mask read.
-        return tuple(
-            NativeRegisterAccess(operation, actor, Engine.S, resource, AccessMode.WRITE)
-            for resource in (Register.VECTOR_MASK_MODE, Register.VECTOR_MASK)
-        )
     return ()
 
 
@@ -280,6 +263,10 @@ class DecodedNativeTask:
     last: bool
     scalar_source: TaskOp | None
     lexical: int = -1
+
+    @property
+    def packet(self):
+        return self.contract.packet
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +385,7 @@ def extract_native_tasks(loop: Loop, *, clock: Clock) -> tuple[NativeTask, ...]:
             task.contract.implicit_completion,
             task.last,
             task.scalar_source,
+            packet=task.packet,
         )
         for task in owned.tasks
     )

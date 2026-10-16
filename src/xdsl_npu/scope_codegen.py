@@ -4,7 +4,7 @@ from collections import defaultdict
 from itertools import combinations, product
 
 from .asc_scalar import ScalarScope
-from .codegen import QUALIFIER
+from .backend.native import QUALIFIER
 from .diagnostics import require
 from .dialects.physical import CallOp, LoopChannelOp, LoopSyncOp, QuerySyncOp, ScopeSyncOp, TaskOp
 from .scalar import INT64_MAX, Expr

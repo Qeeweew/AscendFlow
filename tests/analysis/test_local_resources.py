@@ -1,4 +1,4 @@
-"""Real selected pipelines and independent checks of binary-event leases."""
+"""Historical M2 pipelines and independent checks of their binary-event leases."""
 
 from dataclasses import replace
 
@@ -7,24 +7,24 @@ from xdsl.dialects.builtin import IntAttr, StringAttr
 from xdsl.ir import Block, Region
 
 from tests.fixtures.pipelines import cube_pipeline, scalar_pipeline, vector_pipeline
-from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.analysis.dependencies import analyze_dependencies
-from xdsl_npu.analysis.frontier import Clock
-from xdsl_npu.analysis.hazards import Activation, bind_hazards
-from xdsl_npu.analysis.native import extract_native_tasks
-from xdsl_npu.analysis.protocols import LocalMechanism, LocalProtocol
-from xdsl_npu.analysis.resources import (
+from tests.legacy.analysis.protocols import LocalMechanism, LocalProtocol
+from tests.legacy.analysis.resources import (
     ControllerBridge,
     ControllerWitness,
     EventAction,
     LocalResourceWork,
     allocate_local_events,
 )
+from tests.legacy.passes.insert_sync import synchronize_local
+from tests.legacy.passes.local_sync import select_local_protocols
+from xdsl_npu._physical_builder import Kernel
+from xdsl_npu.analysis.dependencies import analyze_dependencies
+from xdsl_npu.analysis.frontier import Clock
+from xdsl_npu.analysis.hazards import Activation, bind_hazards
+from xdsl_npu.analysis.native import extract_native_tasks
 from xdsl_npu.diagnostics import CompileError, ErrorKind
 from xdsl_npu.dialects.physical import BoundaryOp, EndOp, TaskOp
 from xdsl_npu.loop_model import extract_loop
-from xdsl_npu.passes.insert_sync import synchronize_local
-from xdsl_npu.passes.local_sync import select_local_protocols
 from xdsl_npu.target.ascend910b import Engine, Milestone
 
 

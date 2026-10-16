@@ -1,13 +1,14 @@
 import pytest
 from xdsl.dialects.builtin import IntAttr
 
-from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.check import bounded_check
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import ChannelOp
 from xdsl_npu.model import dependencies, extract
+from xdsl_npu.sync import autosync, verify_plan
 
 
 @pytest.mark.parametrize("native", ["reduce_max8", "reduce_sum8"])

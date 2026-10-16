@@ -20,6 +20,7 @@ from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.model import Program, Ref
 from xdsl_npu.target.ascend910b import Actor, Engine, Milestone
+from xdsl_npu.target.packets import MaskStep
 
 
 def byte_set(ref, generation, *, core=0):
@@ -278,17 +279,15 @@ def test_mask_setup_and_masked_partial_reads_keep_their_actual_state_and_byte_ra
         if task.operation is operation
     )
     assert merge.accesses[0].ref.segments(0) == ((0, 12), (32, 44))
-    assert {access.resource for access in merge.registers} == {
-        Register.VECTOR_MASK,
-        Register.VECTOR_MASK_MODE,
-    }
-    assert all(
-        access.mode is AccessMode.WRITE
-        and access.engine is Engine.S
-        and access.configuration is None
-        and access.operation is operation
-        for access in merge.registers
+    assert not merge.registers
+    assert merge.packet is not None and merge.packet.closed_mask
+    assert merge.packet.mask_steps == (
+        MaskStep.SET_NORMAL,
+        MaskStep.SET_PARTIALS,
+        MaskStep.VECTOR_READ,
     )
+    assert not merge.packet.restores_normal_mode
+    assert merge.packet.clobbers == {"VECTOR_MASK", "VECTOR_MASK_MODE"}
 
 
 def test_external_physical_input_is_readmitted_before_bad_contracts_can_be_used():

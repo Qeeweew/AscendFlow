@@ -8,11 +8,12 @@ from types import SimpleNamespace
 import pytest
 
 from tests.fixtures.pipelines import vector_pipeline
-from xdsl_npu import autosync, emit_asc
 from xdsl_npu.asc_scalar import ScalarScope
+from xdsl_npu.codegen import emit_asc
 from xdsl_npu.dialects.io import dump
 from xdsl_npu.events import selection_expression
 from xdsl_npu.loop_codegen import _event, _guard
+from xdsl_npu.sync import autosync
 
 
 def test_shared_stage_scope_executes_the_same_guarded_command_trace(tmp_path, monkeypatch):

@@ -7,13 +7,14 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
 from examples.vector.independent_rings import independent_rings
 from tests.test_loop_sync import finite_hardware_dag
-from xdsl_npu import compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.physical import BufferOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
 from xdsl_npu.loop_model import extract_loop, loop_dependencies
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.periodic import normalize, project, union
+from xdsl_npu.sync import verify_plan
 
 
 def test_crt_projection_preserves_first_occurrence_and_all_protocol_residues():

@@ -28,6 +28,7 @@ from xdsl.ir import SSAValue
 from ..diagnostics import require
 from ..dialects.physical import BufferOp, TaskOp
 from ..dialects.structured import PipelineLoopOp
+from ..scalar import Expr
 from ..target.ascend910b import Actor, Milestone
 from .hazards import HazardKind
 from .native import AccessMode
@@ -395,7 +396,7 @@ class LoopResidueSelection:
 
     loop: PipelineLoopOp | scf.ForOp
     period: int
-    residue: int
+    residue: int | Expr
     position: ResiduePosition
 
     def __post_init__(self):
@@ -403,21 +404,31 @@ class LoopResidueSelection:
             isinstance(self.loop, (PipelineLoopOp, scf.ForOp))
             and type(self.period) is int
             and self.period > 0
-            and type(self.residue) is int
-            and 0 <= self.residue < self.period
+            and (
+                type(self.residue) is int
+                and 0 <= self.residue < self.period
+                or isinstance(self.residue, Expr)
+                and self.residue.kind == "rem"
+                and self.residue.args[1].constant == self.period
+            )
             and isinstance(self.position, ResiduePosition),
             "loop residue selection needs an actual loop, period/residue and FIRST/LAST",
         )
 
-    def evaluate(self, count: int) -> int | None:
+    def evaluate(self, count: int, values: dict[str, int] | None = None) -> int | None:
         """Bounded test/materialization interpreter; never enumerate N.
 
         The guard precedes N-1 arithmetic. Induction remains lb+ordinal*step;
         selecting a task's last occurrence proves no native retirement.
         """
         require(type(count) is int and count >= 0, "selection count must be nonnegative")
-        if count <= self.residue:
+        require(
+            values is not None or type(self.residue) is int,
+            "symbolic residue needs coordinate values",
+        )
+        residue = self.residue if type(self.residue) is int else self.residue.evaluate(values)
+        if count <= residue:
             return None
         if self.position is ResiduePosition.FIRST:
-            return self.residue
-        return count - 1 - ((count - 1 - self.residue) % self.period)
+            return residue
+        return count - 1 - ((count - 1 - residue) % self.period)

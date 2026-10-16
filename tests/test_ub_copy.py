@@ -8,7 +8,7 @@ from xdsl.dialects.builtin import StringAttr
 from tests.fixtures.ub_copy import ub_copy
 from tests.report_contract import semantic_report
 from tests.test_loop_sync import finite_hardware_dag
-from xdsl_npu import compile, verify_plan
+from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.diagnostics import CompileError
@@ -17,6 +17,7 @@ from xdsl_npu.loop_graph import channels, commands
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.model import Ref, Storage
+from xdsl_npu.sync import verify_plan
 from xdsl_npu.target.native import native_contract
 
 
