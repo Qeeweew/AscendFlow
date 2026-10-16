@@ -4,7 +4,7 @@
 
 ## 1. 当前工作和代码现场
 
-用户已要求本轮commit后暂时暂停重构。M0文档整理已完成，M1基础组件保存于`a111140`，effects/原语接线保存于`8773953`；M2局部同步已有可运行的新入口。公共入口仍未切换；新scale/批量GEMM已有CANN离线结果，没有运行设备。算子优化和旧求解器局部调优继续停止。
+用户已恢复重构，当前基线为`959f79e`。M0文档整理已完成，M1基础组件保存于`a111140`，effects/原语接线保存于`8773953`；M2局部同步已有可运行的新入口。公共入口仍未切换；新scale/批量GEMM已有CANN离线结果，没有运行设备。算子优化和旧求解器局部调优继续停止。
 
 此前 `7ddaa54ec060a92e219d0462df162939b8b32d72` 的交付未达标。重构前全部实验和文档已保存到 `bbc1458`，标题为“Checkpoint paused synchronization experiments and structured-loop refactor plan”，不是资格声明。根目录没有产品Git。
 
@@ -48,22 +48,23 @@ M1尚缺控制有效域与实际native完成/入口出口的接线，以及由�
 
 本轮相关合并组148项通过（9.97s）；最后统一canonical phase来源后，输出与真实集成组59项通过（3.02s）。各组有重叠，非全量回归。真实scale/Cube固定N从2^10改到2^20，模板/协议/进展变量及selection/resource工作量相同。Scalar管线复用MTE2→S ready对controller的贡献，省掉重复MTE2→V通知，lease通过真实Scalar桥闭合。
 
-明确边界：该入口目前只接受一个已admit的本地actor/clock；terminal-only native、尚未显式展开的Scalar SPR setup、嵌套/CV、跨调用lease仍未接通。legacy local LoopChannel/LoopSync编码和native/launcher打印工具暂时复用，不代表M4统一IR/后端完成。主线的query/child/parent求解器仍未删除；FA尚不走新入口。当前示例分开调用旧`lower_source`与新物理入口，前者的逻辑Tile检查建立的访问/依赖尚未直接交接，整个DSL闭环仍有重复提取；不能把新物理入口内的一次admission称作全产品已消除重复工作。
+明确边界：该入口目前只接受一个已admit的本地actor/clock；terminal-only native、尚未显式展开的Scalar SPR setup、嵌套/CV、跨调用lease仍未接通。legacy local LoopChannel/LoopSync编码和native/launcher打印工具暂时复用，不代表M4统一IR/后端完成。主线的query/child/parent求解器仍未删除；FA尚不走新入口。`lower_and_synchronize_local`现已把源码所有权、逻辑Tile检查与新局部同步交接成一个入口：每次编译保留同一Loop和完整DependencyAnalysis，原语合同、物理提取和访问扫描各建立一次。外部物理IR入口仍每次独立接纳，不信任verified属性或跨编译缓存。递归控制仍通过旧lower_source，尚未替换其结构分派。
 
 可复现的CPU新入口（产品目录内执行）：
 
 ```python
 from examples.vector.scale import scale
-from xdsl_npu.lowering import lower_source
-from xdsl_npu.passes.insert_sync import synchronize_local
+from xdsl_npu.passes.insert_sync import lower_and_synchronize_local
 from xdsl_npu.backend.local import emit_local
-plan = synchronize_local(lower_source(scale.to_ir()))
+plan = lower_and_synchronize_local(scale)
 print(emit_local(plan))
 ```
 
-真实scale和`examples/gemm/batched.py`的源码/同步前后IR/ASC、源码hash及CANN日志在[本地闭环产物](../../runs/structured-loops/m2-local/)。构建由该目录的`build_probe.py`与`runtime.process.bounded_process`执行，单次整个Python→CANN进程组上限300秒。小例离线结果不能替代FA编译门槛或设备正确性/性能。
+源码事实交接新增10项回归；与局部同步、scope lowering和编译入口合并49项通过（10.74s），Ruff及diff检查通过。验证覆盖真实Scale/Cube逐native一次合同、一次Loop提取/依赖扫描、不可变统计与快照、外部修改重新接纳、逻辑Tile覆盖诊断；未重跑FA、CANN或设备。
 
-最终代码的单次新进程结果（source→ASC含源码载入和IR快照，Python包import另列在JSON；不是五次冷测）：
+提交`959f79e`对应的真实scale和`examples/gemm/batched.py`源码/同步前后IR/ASC、源码hash及CANN日志在[本地闭环产物](../../runs/structured-loops/m2-local/)。构建由该目录的`build_probe.py`与`runtime.process.bounded_process`执行，单次整个Python→CANN进程组上限300秒。小例离线结果不能替代FA编译门槛或设备正确性/性能。
+
+`959f79e`的单次新进程结果（不作为此后事实交接改动的重新离线资格）（source→ASC含源码载入和IR快照，Python包import另列在JSON；不是五次冷测）：
 
 | 真实DSL | source→ASC | 其中同步 | 整个Python→CANN构建 | 资格 |
 |---|---:|---:|---:|---|
@@ -72,7 +73,7 @@ print(emit_local(plan))
 
 两个结果均未设备执行，不是FA的加速成绩。对应ASC可直接查看[scale.asc](../../runs/structured-loops/m2-local/scale/scale.asc)和[batched_matmul.asc](../../runs/structured-loops/m2-local/batched_matmul/batched_matmul.asc)。
 
-恢复后的顺序：先把真实source控制、native lowering与已建立的effects/依赖交接成一个入口；再完成嵌套loop边界、terminal/SPR、CV和共享lease；然后切换公共compile并删除旧专用求解器及过渡编码/打印适配；最后执行默认FA五次冷编译、相关算子回归、CANN和大规模设备资格。当前暂停不改变FA≤5s/≤10s等验收门槛。
+恢复后的顺序：先把真实source控制、native lowering与已建立的effects/依赖交接成一个入口；再完成嵌套loop边界、terminal/SPR、CV和共享lease；然后切换公共compile并删除旧专用求解器及过渡编码/打印适配；最后执行默认FA五次冷编译、相关算子回归、CANN和大规模设备资格。继续保持FA≤5s/≤10s等验收门槛。
 
 ## 2. 编译耗时：明确未达标
 

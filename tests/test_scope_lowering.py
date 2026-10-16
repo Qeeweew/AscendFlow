@@ -108,7 +108,7 @@ def test_unmarked_source_keeps_the_l1_machine_recipe():
 
 @pytest.mark.parametrize("organization", ("loop", "sequence", "nested"))
 def test_source_value_checks_handoff_the_same_native_dependencies(organization, monkeypatch):
-    from xdsl_npu import loop_model
+    from xdsl_npu.analysis import dependencies
 
     definition = N.from_source("""
         def values(X: N.Tensor((n, 64), N.f32), n: N.int64):
@@ -137,15 +137,15 @@ def test_source_value_checks_handoff_the_same_native_dependencies(organization, 
         """,
             disjoint_external=True,
         )
-    dependencies = loop_model.loop_dependencies
+    analyze = dependencies.analyze_dependencies
     established = []
 
     def record(loop, *, live_in=()):
-        result = dependencies(loop, live_in=live_in)
+        result = analyze(loop, live_in=live_in)
         established.append((loop, frozenset(live_in), result))
         return result
 
-    monkeypatch.setattr(loop_model, "loop_dependencies", record)
+    monkeypatch.setattr(dependencies, "analyze_dependencies", record)
     facts = PhysicalFacts()
     physical = lower_source(definition.to_ir(), _facts=facts)
     assert established
@@ -154,10 +154,13 @@ def test_source_value_checks_handoff_the_same_native_dependencies(organization, 
     def no_rebuild(*args, **kwargs):
         pytest.fail("unchanged source effects were rebuilt instead of handed to the planner")
 
-    monkeypatch.setattr(loop_model, "loop_dependencies", no_rebuild)
+    monkeypatch.setattr(dependencies, "analyze_dependencies", no_rebuild)
+    reuses = facts.statistics().get("dependency_reuses", 0)
     for loop, live_in, expected in established:
-        assert facts.loop_dependencies(loop, live_in=live_in) is expected
+        assert facts.dependency_analysis(loop, live_in=live_in) is expected
+        assert facts.loop_dependencies(loop, live_in=live_in) is expected.obligations
     assert facts.statistics()["dependency_builds"] == builds
+    assert facts.statistics()["dependency_reuses"] == reuses + 2 * len(established)
     assert physical is not None
 
 

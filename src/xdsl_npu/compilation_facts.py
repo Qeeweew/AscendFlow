@@ -39,20 +39,25 @@ class PhysicalFacts:
 
         return self._extract("sequence", module, extract_sequence)
 
-    def loop_dependencies(self, loop, *, live_in=()):
-        from .loop_model import loop_dependencies
+    def dependency_analysis(self, loop, *, live_in=()):
+        """Retain the complete result shared by value checks and synchronization."""
+        from .analysis.dependencies import analyze_dependencies
 
         # Keep the object alive, not just its id. Names in live_in are the exact
         # admitted root set; a weaker entry assumption needs a new analysis.
         key = id(loop), frozenset(live_in)
         if key not in self._dependencies:
-            dependencies = tuple(loop_dependencies(loop, live_in=key[1]))
-            self._dependencies[key] = loop, dependencies
+            analysis = analyze_dependencies(loop, live_in=key[1])
+            self._dependencies[key] = loop, analysis
             self.work["dependency_builds"] += 1
-            self.work["dependency_records"] += len(dependencies)
+            self.work["dependency_records"] += len(analysis.obligations)
         else:
             self.work["dependency_reuses"] += 1
         return self._dependencies[key][1]
+
+    def loop_dependencies(self, loop, *, live_in=()):
+        """Legacy view of the very same complete analysis, without another scan."""
+        return self.dependency_analysis(loop, live_in=live_in).obligations
 
     def statistics(self):
         return dict(self.work)

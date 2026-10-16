@@ -6,22 +6,26 @@ admits the physical module once, constructs memory and notification contracts,
 then materializes the accepted local schedule at its actual native anchors.
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, ModuleOp, StringAttr
 
 from ..analysis.contracts import MemoryContracts, build_memory_contracts
-from ..analysis.dependencies import DependencyAnalysis, analyze_dependencies
+from ..analysis.dependencies import DependencyAnalysis
 from ..analysis.frontier import Clock
 from ..analysis.hazards import bind_hazards
 from ..analysis.native import extract_native_tasks
 from ..analysis.progress import ProgressCertificate, establish_local_progress
 from ..analysis.protocols import LocalCommand, LocalMechanism, local_commands
 from ..analysis.resources import LocalEventPlan, LocalResourceWork, allocate_local_events
+from ..compilation_facts import PhysicalFacts
 from ..diagnostics import require
+from ..dialects.io import dump
 from ..dialects.loops import LoopScheduleAttr
 from ..dialects.physical import LoopChannelOp, LoopSyncOp
-from ..loop_model import Loop, extract_loop
+from ..loop_model import Loop
 from ..target.ascend910b import Engine
 from .local_sync import LocalSelection, SelectionWork, select_local_protocols
 
@@ -38,6 +42,9 @@ class LocalSynchronization:
     progress: ProgressCertificate
     selection_work: SelectionWork
     resource_work: LocalResourceWork
+    source_ir: str | None = None
+    before_ir: str | None = None
+    analysis_work: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
 
 
 def _ints(values):
@@ -121,16 +128,19 @@ def materialize_local(loop, commands, resources):
             block.insert_op_before(operation, task.operation)
 
 
-def synchronize_local(module) -> LocalSynchronization:
-    """Clone/admit one local physical loop, with no old completion solver."""
-    owned = module.clone()
-    loop = extract_loop(owned)
+def _synchronize_admitted_local(
+    owned: ModuleOp, loop: Loop, dependencies: DependencyAnalysis
+) -> LocalSynchronization:
+    """Consume one invocation's actual admitted facts without rebuilding them."""
+    require(
+        owned.body.block.first_op is loop.op,
+        "admitted local facts must retain their actual owned module",
+    )
     require(
         not any(isinstance(op, (LoopChannelOp, LoopSyncOp)) for op in owned.walk()),
         "structured synchronization requires an unsynchronized physical input",
     )
     tasks = extract_native_tasks(loop, clock=Clock("physical-step"))
-    dependencies = analyze_dependencies(loop)
     hazards = bind_hazards(loop, tasks, dependencies.required)
     contracts = build_memory_contracts(tasks, hazards)
     selection_work = SelectionWork()
@@ -147,6 +157,9 @@ def synchronize_local(module) -> LocalSynchronization:
     if data.program.config:
         reserved[tasks[0].actor, Engine.S, Engine.FIX] = (0,)
     resources = allocate_local_events(selection.protocols, reserved=reserved, work=resource_work)
+    # Native admission and the selected contracts have succeeded. Serialize
+    # only now: a forged external literal may itself be unprintable.
+    before_ir = dump(owned)
     data.stream.attributes["npu.loop_schedule"] = LoopScheduleAttr(
         IntAttr(max((task.stage for task in tasks), default=0))
     )
@@ -162,4 +175,41 @@ def synchronize_local(module) -> LocalSynchronization:
         progress,
         selection_work,
         resource_work,
+        before_ir=before_ir,
+    )
+
+
+def synchronize_local(module: ModuleOp) -> LocalSynchronization:
+    """Independently clone/admit external physical IR on every invocation."""
+    owned = module.clone()
+    facts = PhysicalFacts()
+    loop = facts.extract_loop(owned)
+    dependencies = facts.dependency_analysis(loop)
+    result = _synchronize_admitted_local(owned, loop, dependencies)
+    return replace(result, analysis_work=MappingProxyType(facts.statistics()))
+
+
+def lower_and_synchronize_local(source) -> LocalSynchronization:
+    """Own source once and hand its exact lowering facts to local synchronization.
+
+    Source logical-value admission and synchronization share the same Loop and
+    DependencyAnalysis. No verified attribute or result from another invocation
+    authorizes this handoff. External physical input uses synchronize_local.
+    """
+    from ..frontend import PrimFunction
+    from ..lowering import lower_source
+
+    if isinstance(source, PrimFunction):
+        source = source.to_ir()
+    require(isinstance(source, ModuleOp), "local source entry requires typed source IR")
+    owned_source = source.clone()
+    facts = PhysicalFacts()
+    owned = lower_source(owned_source, _facts=facts)
+    loop = facts.extract_loop(owned)
+    dependencies = facts.dependency_analysis(loop)
+    result = _synchronize_admitted_local(owned, loop, dependencies)
+    return replace(
+        result,
+        source_ir=dump(owned_source),
+        analysis_work=MappingProxyType(facts.statistics()),
     )
