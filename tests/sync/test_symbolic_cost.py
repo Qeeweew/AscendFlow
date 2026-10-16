@@ -203,7 +203,9 @@ def test_wider_fact_preserves_existing_bits_at_its_exact_condition():
     assert flow.facts[node] == {((0, 0), (0, 8), ALL): 1 | 2 | 4}
     counts = flow.statistics()
     assert counts["condition_facts"] == 1 and counts["peak_condition_facts"] == 2
-    assert counts["fact_attempts"] == 3 and counts["fact_comparisons"] == 6
+    # The independent bit 2 skips both scans; the mixed third insert still
+    # compares both records twice before superseding the narrower fact.
+    assert counts["fact_attempts"] == 3 and counts["fact_comparisons"] == 4
     assert counts["fact_updates"] == 4
 
 

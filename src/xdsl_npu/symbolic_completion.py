@@ -152,6 +152,7 @@ class SymbolicCompletion:
         self.families, self.edges = self.topology.families, self.topology.edges
         # A domain allocates facts only at reached nodes, not V empty maps.
         self.facts = defaultdict(dict)
+        self._node_bits = {}
         self.count, self.terminal = count, terminal
         # Bind immutable family bounds once, only when a fact touches a node.
         # This is domain-local activation, not another copy of the topology.
@@ -181,40 +182,45 @@ class SymbolicCompletion:
         bits &= ~present
         if not bits:
             return
-        comparisons = 0
-        for (left, right, prior), mask in known.items():
-            comparisons += 1
-            if (
-                bits & mask
-                and (prior == guard or _includes(prior, guard))
-                and holds(left, lo, guard)
-                and holds(hi, right, guard)
-            ):
-                bits &= ~mask
-                if not bits:
-                    self.fact_comparisons += comparisons
-                    return
-        records = tuple(known.items())
-        self.fact_comparisons += comparisons + len(records)
         removals, updates = 0, 1
-        for prior_key, mask in records:
-            left, right, prior = prior_key
-            if (
-                bits & mask
-                and (guard == prior or _includes(guard, prior))
-                and holds(lo, left, prior)
-                and holds(right, hi, prior)
-            ):
-                if remaining := mask & ~bits:
-                    known[prior_key] = remaining
-                else:
-                    del known[prior_key]
-                    removals += 1
-                updates += 1
+        node_bits = self._node_bits.get(node, 0)
+        # Both containment scans require a shared origin bit. Supersession
+        # moves bits between records, so their node-local union is monotone.
+        if bits & node_bits:
+            comparisons = 0
+            for (left, right, prior), mask in known.items():
+                comparisons += 1
+                if (
+                    bits & mask
+                    and (prior == guard or _includes(prior, guard))
+                    and holds(left, lo, guard)
+                    and holds(hi, right, guard)
+                ):
+                    bits &= ~mask
+                    if not bits:
+                        self.fact_comparisons += comparisons
+                        return
+            records = tuple(known.items())
+            self.fact_comparisons += comparisons + len(records)
+            for prior_key, mask in records:
+                left, right, prior = prior_key
+                if (
+                    bits & mask
+                    and (guard == prior or _includes(guard, prior))
+                    and holds(lo, left, prior)
+                    and holds(right, hi, prior)
+                ):
+                    if remaining := mask & ~bits:
+                        known[prior_key] = remaining
+                    else:
+                        del known[prior_key]
+                        removals += 1
+                    updates += 1
         # Incoming bits exclude `present`, so supersession cannot change this
         # exact key. Reuse its first lookup instead of hashing the guard again.
         self.fact_records += (not present) - removals
         known[key] = present | bits
+        self._node_bits[node] = node_bits | bits
         self.fact_updates += updates
         if self.fact_records > self.peak_fact_records:  # noqa: PLR1730 - avoid a call per fact update
             self.peak_fact_records = self.fact_records
