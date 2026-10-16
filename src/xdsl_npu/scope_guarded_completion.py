@@ -164,7 +164,14 @@ class GuardedCompletion:
                     flow.replay(source, edge)
         self.arcs = len(self.graph.edges)
         if changed or self.aliases != len(self.graph.ids):
-            self.answers.clear()
+            # Appended paths cannot invalidate a proof covering its entire
+            # required count domain. Partial answers still need fresh queries.
+            # Endpoint tuples are part of the key: newly published residue
+            # aliases receive a different key after clearing the lookup below.
+            for key in tuple(self.answers):
+                required = self._required(key[-1])
+                if required is not None and not covers(required, self.answers[key]):
+                    del self.answers[key]
             self.endpoints.clear()
             self.boundaries.clear()
         self.aliases = len(self.graph.ids)
