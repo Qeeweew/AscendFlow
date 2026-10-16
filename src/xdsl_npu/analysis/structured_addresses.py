@@ -176,7 +176,7 @@ class StructuredAddresses:
         ownership, initialization, or asynchronous completion proof. A caller
         must exclude inactive iterations before requesting an access proof.
         A failed dynamic range proof is unsupported; only an explicit constant
-        axis violation retains the legacy helper's default invalid-input kind.
+        axis violations use the invalid-input diagnostic kind.
         """
         require(
             address.axes is not None,

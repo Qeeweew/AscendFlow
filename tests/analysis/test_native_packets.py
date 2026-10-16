@@ -4,14 +4,12 @@ from dataclasses import replace
 
 import pytest
 
-from tests.fixtures.pipelines import vector_pipeline
-from tests.legacy.passes.insert_sync import synchronize_local
-from tests.legacy.passes.local_sync import select_local_protocols
-from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.analysis.frontier import Clock
-from xdsl_npu.analysis.native import NativeContract, extract_native_tasks
+from examples.vector.scale import scale
+from xdsl_npu.analysis import native
+from xdsl_npu.analysis.native import NativeContract
+from xdsl_npu.analysis.structured_memory import collect_native_memory
 from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.loop_model import extract_loop
+from xdsl_npu.passes.lower_native import lower_native_structure
 from xdsl_npu.target.ascend910b import Engine
 from xdsl_npu.target.packets import MaskStep, NativePacket, audited_packet
 
@@ -39,7 +37,7 @@ def test_mask_free_packets_do_not_invent_mask_consumers(native):
     assert packet.mask_steps == () and not packet.clobbers
 
 
-def test_old_contract_constructor_and_replace_derive_the_correct_packet_once():
+def test_contract_constructor_and_replace_derive_the_correct_packet_once():
     original = NativeContract("muls", Engine.V, ("R", "W"), (), 2.0)
     assert original.packet is not None and original.packet.each_count_call
     assert original.packet is audited_packet("muls")
@@ -55,48 +53,13 @@ def test_old_contract_constructor_and_replace_derive_the_correct_packet_once():
     assert audited_packet("unmodeled_future_native") is None
 
 
-def test_binding_preserves_admitted_packet_and_actual_task_identity():
-    loop = extract_loop(vector_pipeline())
-    data = next(iter(loop.actors.values()))
-    tasks = extract_native_tasks(loop, clock=Clock("packets"))
-    for decoded, bound in zip(data.owned_effects.tasks, tasks, strict=True):
-        assert bound.operation is decoded.operation
-        assert bound.packet is decoded.packet is decoded.contract.packet
-        assert bound.accesses is decoded.accesses
-
-
 @pytest.mark.parametrize(
-    "packet",
-    [
-        None,
-        NativePacket("muls"),
-        NativePacket("muls", (MaskStep.VECTOR_READ,)),
-        replace(audited_packet("muls")),
-    ],
+    "packet", [None, NativePacket("muls"), NativePacket("muls", (MaskStep.VECTOR_READ,))]
 )
-def test_local_admission_rejects_missing_or_incoming_mask_packets(packet):
-    loop = extract_loop(vector_pipeline())
-    task = next(t for t in extract_native_tasks(loop, clock=Clock("missing")) if t.native == "muls")
-    with pytest.raises(CompileError, match="audited closed actor issue packet"):
-        select_local_protocols((replace(task, packet=packet),), ())
-
-
-def test_masked_partial_recipe_reaches_real_local_protocol_selection():
-    kernel = Kernel("closed_partial_packet")
-    partials = kernel.buffer("partials", "UB", 64)
-    output = kernel.buffer("statistics", "UB", 32)
-    kernel.loop(4, symbolic=True)
-    kernel.task("init", "fill", kernel.view(partials, 64))
-    kernel.task(
-        "merge",
-        "merge_sum_packed",
-        kernel.view(partials, 12, rows=2, row_stride=32),
-        kernel.view(output, 8),
-        params=(2, 3),
+def test_native_admission_rejects_missing_or_incoming_mask_packets(monkeypatch, packet):
+    rule = native.audited_packet
+    monkeypatch.setattr(
+        native, "audited_packet", lambda name: packet if name == "muls" else rule(name)
     )
-    plan = synchronize_local(kernel.finish())
-    merge = next(task for task in plan.selection.tasks if task.native == "merge_sum_packed")
-    assert merge.packet.closed_mask and not merge.registers
-    assert merge.accesses[0].ref.segments(0) == ((0, 12), (32, 44))
-    assert not merge.implicit_completion
-    assert any(protocol.destination is merge for protocol in plan.selection.protocols)
+    with pytest.raises(CompileError, match="audited closed instruction packet"):
+        collect_native_memory(lower_native_structure(scale).module)

@@ -108,10 +108,8 @@ def test_guarded_last_id_does_not_evaluate_empty_loop_remainder():
 
 @pytest.mark.parametrize("entry", [scale, batched_matmul])
 def test_public_source_compile_uses_the_recursive_owned_path(entry, monkeypatch):
-    from tests.support.forbid_legacy import forbid_legacy_planning
     from xdsl_npu import compile
 
-    forbid_legacy_planning(monkeypatch)
     result = compile(entry, debug_verify=True)
     assert result.report["pipeline"] == "structured-regions"
     assert "npu.notification" not in result.before_ir

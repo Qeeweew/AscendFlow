@@ -289,15 +289,3 @@ def test_cross_stage_scalar_capture_is_not_silently_cloned_or_treated_as_complet
     with pytest.raises(CompileError, match="asynchronous values cannot be cloned") as error:
         lower_native_structure(source)
     assert error.value.kind == ErrorKind.UNSUPPORTED
-
-
-def test_recursive_lowering_never_calls_old_structure_dispatch(monkeypatch):
-    from xdsl_npu import lowering, region_lowering, scope_lowering
-
-    def old(*args, **kwargs):
-        pytest.fail("recursive lowering called a legacy shape-specific path")
-
-    monkeypatch.setattr(lowering, "lower_source", old)
-    monkeypatch.setattr(scope_lowering, "lower_scopes", old)
-    monkeypatch.setattr(region_lowering, "lower_regions", old)
-    lower_native_structure(N.from_source(NESTED))

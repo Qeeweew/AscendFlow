@@ -6,6 +6,7 @@ from pathlib import Path
 from statistics import median
 
 from benchmarks.artifacts import verified_source
+from benchmarks.work import read_work
 from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import profile_evidence
 
@@ -15,7 +16,7 @@ def main():
     parser.add_argument("profiles", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--build-cwd", type=Path, help="Explicit base for legacy relative compile paths"
+        "--build-cwd", type=Path, help="Explicit base for recorded relative compile paths"
     )
     args = parser.parse_args()
     trials = {"generated": [], "ascendc": []}
@@ -27,6 +28,11 @@ def main():
         device = json.loads((path.parent / "device.json").read_text())
         require(len(device["cases"]) == 1, "one fixed case per profile required")
         case = device["cases"][0]
+        work = read_work(case, required_counts=("fp32_add_operations",))
+        require(
+            work["structure_inventory"]["groups"] == device["policy"]["GROUPS"],
+            "generated source grid differs from the benchmark policy",
+        )
         require(not case["rounding_case"], "rounding counterexample is not the performance case")
         manifest = device["variants"][variant]
         command = manifest["commands"][0]
@@ -44,6 +50,7 @@ def main():
             device["hardware"]["platform_sha256"],
             manifest["compiler_version"],
             command[1 : command.index("--cce-aicore-only")],
+            work,
         )
         require(
             identity is None or identity == contract, "profile contracts/hardware/output differ"
@@ -78,40 +85,32 @@ def main():
         all(len(v) >= 3 for v in trials.values()), "three independent runs per variant required"
     )
     times = {variant: median(run["p50_us"] for run in values) for variant, values in trials.items()}
-    work = case["requested_work"]
-    gm = sum(
-        n for key, n in work["memory_requested_bytes_by_pipe_bank_mode"].items() if ":GM:" in key
-    )
-    ub = sum(
-        n for key, n in work["memory_requested_bytes_by_pipe_bank_mode"].items() if ":UB:" in key
-    )
-    ops = work["vector_requested_elements"]["add"]
+    ops = work["algorithm_work"]["counts"]["fp32_add_operations"]
     outputs = case.get("outputs", 1)
     adds_per_call = case["tiles"] + int(device["policy"].get("frame_snapshot", False))
     expected = device["policy"]["GROUPS"] * outputs * adds_per_call * device["policy"]["B"]
-    require(ops == expected, "physical add work disagrees with the ordered recurrence")
+    require(ops == expected, "algorithm add count disagrees with the ordered recurrence")
     result = {
         "policy": device["policy"],
         "outputs": outputs,
         "tiles": case["tiles"],
         "hardware": device["hardware"],
-        "legacy_build_cwd": None if args.build_cwd is None else str(args.build_cwd.resolve()),
+        "build_cwd": str(args.build_cwd.resolve())
+        if args.build_cwd is not None
+        else "not supplied",
         "trials": trials,
         "median_of_run_medians_us": times,
         "generated_over_reference": times["generated"] / times["ascendc"],
         "work": work,
-        "theory_inputs": {
+        "algorithm_rates": {
             "fp32_add_operations": ops,
-            "gm_requested_bytes": gm,
-            "ub_operand_requested_bytes": ub,
-            "ops_per_gm_request_byte": ops / gm,
-            "gm_requested_GBps": gm / (times["generated"] * 1000),
-            "declared_working_set_over_l2": work["declared_gm_working_set_bytes"]
-            / device["hardware"]["l2_bytes"],
-            "sustained_hbm_GBps": None,
-            "sustained_vector_add_ops_s": None,
-            "lower_bound": "max(GM/HBM actual bytes / measured ceiling, UB port demand / ceiling, FP32 adds / ceiling, dependency critical path)",
-            "limits": "GM request bytes are not HBM transactions; active ratios overlap. No numeric hardware roofline without measured bandwidth and Vector clock/rate.",
+            "fp32_add_ops_s": ops / (times["generated"] * 1e-6),
+            "scope": "ordered problem additions per measured time; not Vector instruction throughput",
+        },
+        "runtime_request_analysis": work["runtime_requests"],
+        "hardware_roofline": {
+            "status": "unavailable",
+            "reason": "runtime GM/UB requests and sustained memory/Vector ceilings are not established",
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +119,12 @@ def main():
         json.dumps(
             {
                 key: result[key]
-                for key in ("median_of_run_medians_us", "generated_over_reference", "theory_inputs")
+                for key in (
+                    "median_of_run_medians_us",
+                    "generated_over_reference",
+                    "algorithm_rates",
+                    "runtime_request_analysis",
+                )
             },
             indent=2,
         )

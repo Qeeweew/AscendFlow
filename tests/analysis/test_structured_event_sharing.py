@@ -6,8 +6,8 @@ from functools import partial
 import pytest
 
 from examples.vector.scale import scale
-from tests.analysis.test_structured_resources import prepared, selection
-from tests.sync.test_notification_selection import actual_dispatch
+from tests.models.structured_domains import actual_dispatch
+from tests.support.structured import prepared, selection
 from xdsl_npu.analysis.event_lifetimes import bridge
 from xdsl_npu.analysis.structured_event_sharing import (
     EventSharingContext,

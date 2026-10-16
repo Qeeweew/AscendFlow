@@ -9,11 +9,12 @@ from pathlib import Path
 from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from benchmarks.validation.gemm import inputs_and_oracle
+from benchmarks.work import structure_inventory, work_record
 from examples.gemm.hierarchical import hierarchical_gemm
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import hardware_snapshot, runtime_work
+from xdsl_npu.performance import hardware_snapshot
 
 
 def reference_source(policy):
@@ -81,6 +82,7 @@ def main():
         timeout_s=args.timeout,
     )
     result = read_artifact(generated_check)
+    inventory = structure_inventory(result.plan)
     sources = {"generated": (result.name, result.asc)}
     manifests = {}
     for variant in variants:
@@ -187,13 +189,25 @@ def main():
                     "cache_policy": "same panel-major allocations reused, no flush",
                     "input_sha256": [hashlib.sha256(a).hexdigest(), hashlib.sha256(b).hexdigest()],
                     "output_sha256": hashlib.sha256(raw).hexdigest(),
-                    "requested_work": runtime_work(
-                        result.plan, {"outputs": outputs, "panels": panels}
+                    "work": work_record(
+                        inventory,
+                        algorithm_counts={
+                            "fma_flops": 2
+                            * args.groups
+                            * outputs
+                            * panels
+                            * args.m
+                            * args.n
+                            * args.bk,
+                            "logical_input_bytes": len(a) + len(b) - 2 * len(guard),
+                            "logical_output_bytes": expected.nbytes,
+                        },
+                        algorithm_scope="independent output GEMMs, two FLOPs per scalar FMA; empty outputs/panels write nothing",
                     ),
                 }
                 records.append(record)
                 print(
-                    json.dumps({k: v for k, v in record.items() if k != "requested_work"}),
+                    json.dumps({k: v for k, v in record.items() if k != "work"}),
                     flush=True,
                 )
             for outputs, panels in [(-1, 1), (1, -1), (1 << 40, 1 << 40)]:

@@ -307,7 +307,7 @@ def matmul_dimensions(op: MatmulOp) -> tuple[int, int, int]:
 def lower_matmul(
     op: MatmulOp, context: RecipeContext, *, initialization: Initialization
 ) -> RecipeResult:
-    """The explicit L0 recipe; legacy L1 expansion stays with its old caller."""
+    """The explicit L0 recipe; operand packing is expressed by separate copies."""
     require(
         (op.a.type.memory.data, op.b.type.memory.data, op.accumulator.type.memory.data)
         == ("L0A", "L0B", "L0C"),

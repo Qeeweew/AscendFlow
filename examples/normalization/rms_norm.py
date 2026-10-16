@@ -1,7 +1,6 @@
 """Explicit FP32 RMS normalization primitive, without affine gamma/bias.
 
-This is not a replacement for the legacy full RMSNorm operator. The source
-prescribes R64 partials, merge, mean, epsilon, sqrt, reciprocal and scale. No
+The source prescribes R64 partials, merge, mean, epsilon, sqrt, reciprocal and scale. No
 Rsqrt substitution, reassociation or implicit state/buffer copies are allowed.
 """
 

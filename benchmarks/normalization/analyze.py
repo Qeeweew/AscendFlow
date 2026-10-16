@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import median
 
 from benchmarks.artifacts import verified_source
+from benchmarks.work import read_work
 from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import profile_evidence
 
@@ -15,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profiles", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--build-cwd", type=Path, help="Base for legacy relative compile paths")
+    parser.add_argument("--build-cwd", type=Path, help="Base for recorded relative compile paths")
     parser.add_argument(
         "--variants",
         nargs="+",
@@ -38,6 +39,11 @@ def main():
         device = json.loads((summary_path.parent / "device.json").read_text())
         require(len(device["cases"]) == 1, "one fixed case per profiling process required")
         case = device["cases"][0]
+        work = read_work(
+            case,
+            required_counts=("add_mul_operations", "logical_input_bytes", "logical_output_bytes"),
+        )
+        groups = work["structure_inventory"]["groups"]
         manifest = device["variants"][variant]
         binary_identity = (
             manifest.get("source_sha256"),
@@ -77,9 +83,10 @@ def main():
             device["health"]["physical_device"],
             device["hardware"]["platform_sha256"],
             case["rows_per_group"],
-            case["requested_work"]["groups"],
+            groups,
             case.get("operator", "rms"),
             case["dtype"],
+            work,
         )
         require(
             len(summary["operators"]) == 1, "this comparison requires one device kernel per launch"
@@ -89,7 +96,7 @@ def main():
             variant == "aclnn" or kernel == case["kernel"], "profile kernel differs from source"
         )
         require(
-            variant == "aclnn" or operator["blocks"] == [case["requested_work"]["groups"]],
+            variant == "aclnn" or operator["blocks"] == [groups],
             "profile block count differs from the fixed launch grid",
         )
         require(
@@ -135,16 +142,10 @@ def main():
     rows, cols = identity[0]
     require(rows > 0 and cols > 0, "performance comparison requires nonempty shapes")
     is_softmax = case.get("operator") == "softmax"
-    work = case["requested_work"]
-    gm = sum(
-        value
-        for key, value in work["memory_requested_bytes_by_pipe_bank_mode"].items()
-        if ":GM:" in key
-    )
-    ub = sum(
-        value
-        for key, value in work["memory_requested_bytes_by_pipe_bank_mode"].items()
-        if ":UB:" in key
+    counts = work["algorithm_work"]["counts"]
+    require(
+        counts["add_mul_operations"] == rows * (2 * cols - 1 if is_softmax else 3 * cols + 1),
+        "algorithm operation convention differs from the normalization problem",
     )
     result = {
         "shape": identity[0],
@@ -154,29 +155,18 @@ def main():
         "trials": trials,
         "median_of_run_medians_us": medians,
         "generated_over_reference": medians["generated"] / medians["ascendc"],
-        "work_from_generated_ir": work,
-        "theory_inputs": {
-            "gm_requested_bytes": gm,
-            "ub_operand_requested_bytes": ub,
-            "add_mul_operations": rows * (2 * cols - 1) if is_softmax else rows * (3 * cols + 1),
-            "max_comparisons": rows * (cols - 1) if is_softmax else 0,
-            "exp_elements": rows * cols if is_softmax else 0,
-            "sqrt_elements": 0 if is_softmax else rows,
-            "div_elements": rows * cols if is_softmax else rows,
-            "cube_flops": 0,
-            "add_mul_per_gm_request_byte": rows
-            * (2 * cols - 1 if is_softmax else 3 * cols + 1)
-            / gm,
-            "gm_effective_GBps": gm / (medians["generated"] * 1000),
-            "ub_requested_effective_GBps": ub / (medians["generated"] * 1000),
-            "hbm_bytes": None,
-            "sustained_hbm_GBps": None,
-            "sustained_ub_GBps": None,
-            "lower_bound": "max(resource work / its sustained ceiling, dependency critical path); shared Vector work needs a mixed-instruction rate",
-            "limits": "GM requests can hit L2; operand UB bytes can share physical reads. AIV clock/rates and HBM traffic are unmeasured, so no numeric hardware roofline is claimed",
-            "working_set_bytes": rows * cols * 4 * 2,
-            "working_set_over_l2": rows * cols * 8 / first_device["hardware"]["l2_bytes"],
-            "used_aiv_fraction": work["groups"] / first_device["hardware"]["aiv_cores"],
+        "work": work,
+        "algorithm_rates": {
+            "add_mul_ops_s": counts["add_mul_operations"] / (medians["generated"] * 1e-6),
+            "elements_s": rows * cols / (medians["generated"] * 1e-6),
+            "scope": "scalar problem convention per measured time; not Vector recipe throughput",
+        },
+        "problem_io_bytes_over_l2": (counts["logical_input_bytes"] + counts["logical_output_bytes"])
+        / first_device["hardware"]["l2_bytes"],
+        "runtime_request_analysis": work["runtime_requests"],
+        "hardware_roofline": {
+            "status": "unavailable",
+            "reason": "runtime GM/UB requests, HBM traffic, and sustained Vector/memory ceilings are not established",
         },
     }
     result["generated_over_variant"] = {
@@ -189,7 +179,8 @@ def main():
             {
                 "median_us": medians,
                 "generated_over_reference": result["generated_over_reference"],
-                "theory_inputs": result["theory_inputs"],
+                "algorithm_rates": result["algorithm_rates"],
+                "runtime_request_analysis": result["runtime_request_analysis"],
             },
             indent=2,
         )

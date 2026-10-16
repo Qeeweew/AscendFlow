@@ -1,21 +1,15 @@
 """Native recipes bind real SSA and insertion blocks without a stream adapter."""
 
-from dataclasses import replace
-
-import pytest
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType, IntAttr, ModuleOp, StringAttr, f32
 from xdsl.ir import Block
 
 from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.physical import BufferOp, TaskOp, ViewOp, task_attrs
+from xdsl_npu.dialects.physical import BufferOp, TaskOp, task_attrs
 from xdsl_npu.dialects.source import ElementOp, ReduceOp, ScalarReadOp, ScaleOp
+from xdsl_npu.dialects.structured import AddressOp
 from xdsl_npu.dialects.types import TaskType, ref_type
-from xdsl_npu.lowering import lower_source
-from xdsl_npu.passes import native_recipes
 from xdsl_npu.passes.native_recipes import (
-    NativeRead,
     RecipeContext,
     lower_element,
     lower_reduce,
@@ -56,28 +50,28 @@ class Insertion:
         return self.bindings[value]
 
     def subview(self, source, nbytes, *, offset=0, rows=1, row_stride=0):
-        view = ViewOp.create(
-            operands=[source, self.block.args[0]],
+        owner = source.owner
+        if isinstance(owner, AddressOp):
+            offset += owner.offset.owner.value.value.data
+            source = owner.source
+        byte_offset = arith.ConstantOp.from_int_and_width(offset, IndexType())
+        view = AddressOp.build(
+            operands=[source, byte_offset.result, [], []],
             result_types=[source.type],
             attributes={
-                "offset": IntAttr(offset),
-                "stride": IntAttr(0),
-                "modulus": IntAttr(0),
                 "nbytes": IntAttr(nbytes),
-                "tail_nbytes": IntAttr(0),
                 "rows": IntAttr(rows),
                 "row_stride": IntAttr(row_stride),
             },
         )
-        self.block.add_op(view)
+        self.block.add_ops((byte_offset, view))
         return view.ref
 
     def emit(self, suffix, native, *refs, params=(), scalar=0.0, order_delta=0):
         task = TaskOp.create(
             operands=refs,
             result_types=[TaskType(), f32] if native == "scalar_load" else [TaskType()],
-            attributes=task_attrs(f"native{len(self.tasks)}{suffix}", native, 0, params, scalar)
-            | {"issue_order": IntAttr(len(self.tasks))},
+            attributes=task_attrs(f"native{len(self.tasks)}{suffix}", native, 0, params, scalar),
         )
         self.block.add_op(task)
         self.tasks.append(task)
@@ -140,9 +134,24 @@ def test_block8_result_keeps_disjoint_workspace_planes_and_original_input_reader
     result = lower_reduce(op, target.context)
     partial, compact, merge = result.tasks
     first, second = partial.refs[1].owner, compact.refs[1].owner
-    assert first.source is second.source is workspace
-    assert (first.offset.data, first.nbytes.data, first.rows.data) == (0, 512, 8)
-    assert (second.offset.data, second.nbytes.data, second.rows.data) == (4096, 64, 8)
+    assert isinstance(first, AddressOp) and isinstance(second, AddressOp)
+    assert first.source is second.source is workspace.owner.source
+    assert isinstance(first.source.owner, BufferOp)
+    assert first.source.owner.nbytes.data == 4608
+
+    def bytes_in(address):
+        offset = address.offset.owner
+        assert isinstance(offset, arith.ConstantOp)
+        return {
+            offset.value.value.data + row * address.row_stride.data + byte
+            for row in range(address.rows.data)
+            for byte in range(address.nbytes.data)
+        }
+
+    assert (first.nbytes.data, first.rows.data, first.row_stride.data) == (512, 8, 512)
+    assert (second.nbytes.data, second.rows.data, second.row_stride.data) == (64, 8, 64)
+    assert bytes_in(first) == set(range(4096))
+    assert bytes_in(second) == set(range(4096, 4608))
     assert partial.refs[0] is value and compact.refs[0] is first.ref
     assert tuple(merge.refs) == (second.ref, destination)
     assert result.definition is merge and result.definition_ref == 1
@@ -176,35 +185,3 @@ def test_scalar_result_is_the_actual_ssa_operand_of_its_consumer():
     assert result.readers[0].operation is result.definition
     assert result.readers[0].ref_index == 0
     target.finish()
-
-
-@pytest.mark.parametrize("symbolic", [False, True])
-def test_every_native_reader_of_one_logical_input_is_checked(monkeypatch, symbolic):
-    source = N.from_source("""
-        def readers():
-            with N.Kernel():
-                x=N.alloc_ub((64,))
-                y=N.alloc_ub((64,))
-                for i in N.Pipelined(2,stages=1):
-                    value=N.fill(x,1.0)
-                    N.add(value,1.0,out=y)
-    """).to_ir()
-    original = native_recipes.lower_element
-
-    def overwritten_second_read(op, context):
-        result = original(op, context)
-        if op.kind.data != "add_scalar":
-            return result
-        source, destination = result.definition.refs
-        overwrite = context.emit("_overwrite", "fill", source, scalar=0.0, order_delta=1)
-        late = context.emit("_late", "adds", source, destination, scalar=1.0, order_delta=2)
-        return replace(
-            result,
-            tasks=(*result.tasks, overwrite, late),
-            definition=late,
-            readers=(*result.readers, NativeRead(0, late, 0)),
-        )
-
-    monkeypatch.setattr(native_recipes, "lower_element", overwritten_second_read)
-    with pytest.raises(CompileError, match="overwritten before.*late"):
-        lower_source(source, symbolic=symbolic)

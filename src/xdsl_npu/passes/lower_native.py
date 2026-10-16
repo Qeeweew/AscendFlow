@@ -511,7 +511,7 @@ def lower_native_structure(source) -> NativeStructure:
     """Own a source module and retain its actual recursive control and natives.
 
     Explicit intermediate entry while the recursive access and synchronization
-    consumers are being connected. It never falls back to the old lowerer.
+    consumers establish their own access and completion contracts.
     """
     from ..frontend import PrimFunction
 

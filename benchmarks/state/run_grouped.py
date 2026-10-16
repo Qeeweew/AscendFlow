@@ -9,13 +9,14 @@ from pathlib import Path
 from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from benchmarks.validation.state import inputs_and_oracle
+from benchmarks.work import structure_inventory, work_record
 from examples.state.frame_snapshot import frame_state_sum
 from examples.state.grouped import grouped_state_sum
 from examples.state.shared_inputs import shared_state_sum
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import hardware_snapshot, runtime_work
+from xdsl_npu.performance import hardware_snapshot
 
 
 def reference_source(tile, groups, *, shared_inputs=False, frame_snapshot=False):
@@ -97,6 +98,7 @@ def main():
         timeout_s=args.timeout,
     )
     artifact = read_artifact(generated_check)
+    inventory = structure_inventory(artifact.plan)
     sources = {"generated": (artifact.name, artifact.asc)}
     manifests = {}
     for variant in variants:
@@ -230,13 +232,20 @@ def main():
                     ),
                     "input_sha256": [hashlib.sha256(v).hexdigest() for v in (initial, x)],
                     "output_sha256": hashlib.sha256(raw).hexdigest(),
-                    "requested_work": runtime_work(
-                        artifact.plan, {"outputs": calls, "tiles": tiles}
+                    "work": work_record(
+                        inventory,
+                        algorithm_counts={
+                            "fp32_add_operations": args.groups
+                            * calls
+                            * (tiles + int(args.frame_snapshot))
+                            * args.tile,
+                        },
+                        algorithm_scope="ordered FP32 recurrence per output plus the optional original-frame add; no native count",
                     ),
                 }
                 records.append(record)
                 print(
-                    json.dumps({k: v for k, v in record.items() if k != "requested_work"}),
+                    json.dumps({k: v for k, v in record.items() if k != "work"}),
                     flush=True,
                 )
             for p, n in [(-1, 1), (1, -1), (1 << 40, 1 << 40)]:

@@ -16,16 +16,13 @@ from xdsl.utils.exceptions import VerifyException
 
 from examples.state.grouped import grouped_state_sum
 from examples.vector.scale import scale
-from tests.fixtures.cv import cv_source
-from tests.report_contract import semantic_report
+from tests.fixtures.source_programs import cv_source
 from xdsl_npu import compile
 from xdsl_npu import language as T
-from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.dialects.io import parse
 from xdsl_npu.dialects.physical import RuntimeSizeOp
 from xdsl_npu.dialects.source import SizeOp
 from xdsl_npu.frontend import FrontendError
-from xdsl_npu.sync import verify_plan
 
 
 def contract_source(*, minimum=1, multiple=4):
@@ -71,34 +68,6 @@ def sequence():
         ).replace("tiles: T.int64", "tiles: T.int64(minimum=0,multiple_of=3)"),
     ).specialize(B=64, GROUPS=2)
     return compile(definition)
-
-
-@pytest.fixture(scope="module")
-def mixed():
-    source = cv_source(T.dynamic("n"))
-    size = next(op for op in source.walk() if isinstance(op, SizeOp))
-    size.attributes.update(minimum=IntAttr(1), multiple=IntAttr(2))
-    return compile(source)
-
-
-@pytest.mark.parametrize(
-    "fixture,expected",
-    [
-        ("local", {"n": (3, 4)}),
-        ("sequence", {"outputs": (1, 2), "tiles": (0, 3)}),
-        ("mixed", {"n": (1, 2)}),
-    ],
-)
-def test_contract_survives_every_ir_snapshot_and_final_check(request, fixture, expected):
-    artifact = request.getfixturevalue(fixture)
-    assert contracts(parse(artifact.source_ir), SizeOp) == expected
-    assert contracts(parse(artifact.before_ir), RuntimeSizeOp) == expected
-    plan = parse(artifact.plan_ir)
-    assert contracts(plan, RuntimeSizeOp) == expected
-    assert semantic_report(verify_plan(plan)) == semantic_report(artifact.report)
-    for name, (minimum, multiple) in expected.items():
-        check = rf"if \(npu_size_{name} < {minimum} \|\| .*npu_size_{name} % {multiple} != 0\) return -1;"
-        assert re.search(check, artifact.asc)
 
 
 def test_plain_int64_and_explicit_default_contract_have_identical_code():
@@ -184,22 +153,6 @@ def test_forged_contract_is_rejected_by_ir_verification(local, kind, field, valu
         module.verify()
 
 
-@pytest.mark.parametrize("field", ["minimum", "multiple"])
-def test_mixed_actor_contracts_must_agree(monkeypatch, field):
-    from xdsl_npu import mixed as implementation
-
-    original = implementation.compose
-
-    def mismatched(name, cube, vector0, vector1, **kwargs):
-        size = next(op for op in vector0.walk() if isinstance(op, RuntimeSizeOp))
-        size.attributes[field] = IntAttr(size.attributes[field].data + 1)
-        return original(name, cube, vector0, vector1, **kwargs)
-
-    monkeypatch.setattr(implementation, "compose", mismatched)
-    with pytest.raises(CompileError, match="same uniform count contract"):
-        compile(cv_source(T.dynamic("n")))
-
-
 def host_launcher(artifact, directory):
     """Compile actual generated guards, replacing only the device launch line."""
     marker = f'extern "C" int launch_{artifact.name}('
@@ -280,3 +233,11 @@ def test_positive_input_contract_does_not_require_nonempty_kernel_work(tmp_path)
     assert library.dispatches() == 0
     assert launch(1) == 0
     assert library.dispatches() == 1
+
+
+@pytest.fixture(scope="module")
+def mixed():
+    source = cv_source(T.dynamic("n"))
+    size = next(op for op in source.walk() if isinstance(op, SizeOp))
+    size.attributes.update(minimum=IntAttr(1), multiple=IntAttr(2))
+    return compile(source)

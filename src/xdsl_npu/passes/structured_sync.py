@@ -89,7 +89,7 @@ def synchronize_structure(source) -> StructuredSynchronization:
     """Establish each stage's facts once and materialize the selected program.
 
     Imported physical snapshots are not accepted by this source entry. It
-    never invokes a legacy Stream/query solver or falls back on failure.
+    reports an unsupported contract when a required fact cannot be established.
     """
     from ..analysis.structured_resources import allocate_structured_events
     from .select_notifications import select_notifications

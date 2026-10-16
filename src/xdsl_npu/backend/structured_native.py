@@ -1,9 +1,8 @@
 """Pure native formatting with actual structured SSA address bindings.
 
-The operand adapter carries no legacy Ref, generation terms, or alias proof.
-Only the existing native formatter is reused; every pointer comes directly
-from the actual AddressOp offset SSA in its recursive scope. Retained facts
-supply admitted geometry only; their proof expressions never execute.
+Every pointer comes from the actual AddressOp offset SSA in its recursive
+scope. Retained facts supply admitted geometry only; their proof expressions
+never execute.
 """
 
 from dataclasses import dataclass
@@ -55,14 +54,6 @@ class PrintOperand:
     def contiguous(self):
         return self.geometry.contiguous
 
-    @property
-    def prefix_extent(self):
-        return self.geometry.prefix_extent
-
-    @property
-    def tail_nbytes(self):
-        return self.geometry.tail_nbytes
-
 
 @dataclass(frozen=True, slots=True)
 class PrintTask:
@@ -75,16 +66,7 @@ class PrintTask:
 
 
 def format_native(template, *, render, roots, task_names, generation):
-    require(
-        all(
-            access.address.geometry.prefix_extent is None
-            and not access.address.geometry.tail_nbytes
-            for access in template.accesses
-        ),
-        "structured native geometry must carry its complete static footprint",
-    )
-
-    def pointer(ref, g="g", *, core="0", extra="", scalar=None):
+    def pointer(ref, *, extra=""):
         operation = ref.operation
         offset = render(operation.offset)
         if extra:
@@ -116,4 +98,4 @@ def format_native(template, *, render, roots, task_names, generation):
         task_names[template.operation],
         None if scalar_source is None else task_names[scalar_source],
     )
-    return native_line(task, "npu_unused_count", pointer_renderer=pointer, generation=generation)
+    return native_line(task, pointer_renderer=pointer, generation=generation)

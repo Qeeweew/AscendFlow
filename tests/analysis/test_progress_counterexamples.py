@@ -4,7 +4,8 @@ from dataclasses import replace
 
 import pytest
 
-from tests.sync.test_notification_selection import actual_dispatch, selected
+from tests.models.structured_domains import actual_dispatch
+from tests.support.structured import selected
 from xdsl_npu.analysis.access_frontier import AccessEndpoint
 from xdsl_npu.analysis.event_contracts import ResourceWork
 from xdsl_npu.analysis.event_domains import EventDomains

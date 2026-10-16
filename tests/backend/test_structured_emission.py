@@ -21,7 +21,6 @@ from examples.vector.scale import scale
 from tests.control.test_recursive_native import NESTED, dispatch
 from tests.control.test_shared_aiv import SHARED
 from tests.fixtures.nested import nested_cv
-from tests.support.forbid_legacy import forbid_legacy_planning
 from xdsl_npu import language as N
 from xdsl_npu.analysis.structured_memory import collect_native_memory
 from xdsl_npu.analysis.structured_schedule import (
@@ -62,14 +61,12 @@ def memory(source):
 
 
 def forbid_analysis(monkeypatch):
-    forbid_legacy_planning(monkeypatch)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("formatting must consume the existing owned facts")
 
     targets = (
         ("xdsl_npu.target.native", ("native_contract",)),
-        ("xdsl_npu.analysis.native", ("native_contract",)),
         ("xdsl_npu.passes.lower_native", ("lower_native_structure",)),
         ("xdsl_npu.analysis.structured_memory", ("collect_native_memory",)),
         ("xdsl_npu.analysis.structured_bounds", ("admit_memory_bounds",)),

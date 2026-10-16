@@ -7,34 +7,14 @@ import pytest
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy, nested_cv
-from xdsl_npu import language as N
-from xdsl_npu.analysis.event_contracts import CROSS_BACKLOG, LeaseKind, ResourceWork
-from xdsl_npu.analysis.event_domains import EventDomains
+from tests.support.structured import prepared, selection
+from xdsl_npu.analysis.event_contracts import CROSS_BACKLOG, LeaseKind
 from xdsl_npu.analysis.event_lifetimes import reentry
-from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
-from xdsl_npu.analysis.structured_dispatch import bind_structured_dispatch
-from xdsl_npu.analysis.structured_memory import collect_native_memory
 from xdsl_npu.analysis.structured_protocols import NotificationKind
 from xdsl_npu.analysis.structured_resources import allocate_structured_events
 from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.select_notifications import select_notifications
 from xdsl_npu.scalar import expression, literal
 from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
-
-
-def selection(source):
-    source = N.from_source(source) if isinstance(source, str) else source
-    memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = build_structured_dependencies(memory)
-    dependencies.require_closed()
-    result = select_notifications(dependencies, bind_structured_dispatch(memory))
-    result.require_closed()
-    return result
-
-
-def prepared(selected):
-    return EventDomains(selected, ResourceWork(notifications=len(selected.notifications)))
 
 
 @pytest.fixture(scope="module")

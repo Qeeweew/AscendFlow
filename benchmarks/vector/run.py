@@ -12,10 +12,10 @@ import json
 from pathlib import Path
 
 from benchmarks.artifacts import read_artifact
+from benchmarks.work import structure_inventory, work_record
 from xdsl_npu.build import build_file
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import runtime_work
 
 
 def run(result, library, output, physical, counts, repeats, *, grouped=False, warmup=5):
@@ -37,7 +37,9 @@ def run(result, library, output, physical, counts, repeats, *, grouped=False, wa
     health = health_snapshot(physical, output)
     runtime = ACL()
     records = []
-    groups = result.report["groups"]
+    inventory = structure_inventory(result.plan)
+    groups = inventory["groups"]
+    require(len(inventory["runtime_parameters"]) == 1, "Vector runner needs one runtime parameter")
     if grouped:
         require(
             result.name == "grouped_scale" and groups == 20,
@@ -109,10 +111,15 @@ def run(result, library, output, physical, counts, repeats, *, grouped=False, wa
                 "stream_interval_us_per_launch": elapsed.value * 1000 / repeats,
                 "timing_scope": "ACL event stream interval, including submission gaps; not kernel-only",
                 "input_sha256": hashlib.sha256(raw_input).hexdigest(),
-                "requested_work": runtime_work(
-                    result.plan, {result.report["runtime_parameters"][0]: count}
+                "work": work_record(
+                    inventory,
+                    algorithm_counts={
+                        "fp32_multiply_operations": values.size,
+                        "logical_input_bytes": values.nbytes,
+                        "logical_output_bytes": values.nbytes,
+                    },
+                    algorithm_scope="elementwise FP32 scale problem; no native or traffic inference",
                 ),
-                "work_basis": "generated IR requests; not measured HBM transactions",
             }
             records.append(record)
             print(json.dumps(record), flush=True)

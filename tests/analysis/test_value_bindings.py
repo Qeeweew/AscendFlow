@@ -13,7 +13,6 @@ from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp
 from xdsl.ir import Block, Region
 
 from xdsl_npu import language as N
-from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.analysis import value_bindings
 from xdsl_npu.analysis.value_bindings import (
     LastTile,
@@ -23,9 +22,10 @@ from xdsl_npu.analysis.value_bindings import (
 )
 from xdsl_npu.diagnostics import CompileError, ErrorKind
 from xdsl_npu.dialects.loops import LoopScheduleAttr
-from xdsl_npu.dialects.physical import EndOp
+from xdsl_npu.dialects.physical import BufferOp, EndOp, TaskOp, task_attrs
 from xdsl_npu.dialects.source import CopyOp, DomainOp, ElementOp, PipelineOp, StageOp
 from xdsl_npu.dialects.structured import PipelineLoopOp
+from xdsl_npu.dialects.types import TaskType, ref_type
 from xdsl_npu.passes.native_recipes import NativeRead, RecipeResult
 
 STAGED = """
@@ -46,20 +46,36 @@ def source(text):
 
 def anchors(module):
     """Mock recipe results have real writer/reader TaskOp and ref positions."""
-    kernel = Kernel("provenance_anchors")
-    buffers = tuple(kernel.buffer(f"b{i}", "UB", 256) for i in range(3))
-    kernel.loop(1)
-    views = tuple(kernel.view(buffer, 256) for buffer in buffers)
+    from xdsl.dialects.builtin import StringAttr
+
+    buffers = tuple(
+        BufferOp.create(
+            result_types=[ref_type("UB", "f32")],
+            attributes={
+                "sym_name": StringAttr(f"b{i}"),
+                "nbytes": IntAttr(256),
+                "external": IntAttr(0),
+                "initialized": IntAttr(1),
+            },
+        )
+        for i in range(3)
+    )
+    native_module = ModuleOp(buffers)
+    views = tuple(buffer.ref for buffer in buffers)
     recipes = {}
     for operation in module.walk():
         if not isinstance(operation, (CopyOp, ElementOp)):
             continue
-        task = kernel.add(f"anchor_{len(recipes)}", *views)
+        task = TaskOp.create(
+            operands=views,
+            result_types=[TaskType()],
+            attributes=task_attrs(f"anchor_{len(recipes)}", "add", 0),
+        )
+        native_module.body.block.add_op(task)
         count = 1 if isinstance(operation, CopyOp) else len(operation.inputs)
         recipes[operation] = RecipeResult(
             (task,), task, 2, tuple(NativeRead(i, task, i) for i in range(count))
         )
-    kernel.finish()
     loops = {}
     for operation in module.walk():
         if not isinstance(operation, PipelineOp):

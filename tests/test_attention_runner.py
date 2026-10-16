@@ -41,6 +41,27 @@ def generated_source(order=GENERATED_ORDER):
     )
 
 
+def test_runner_uses_the_actual_compiler_launcher_parameter_names():
+    from xdsl_npu import compile
+    from xdsl_npu import language as N
+
+    parameters = ",".join(f"{name}:N.Tensor((64,),N.f32)" for name in GENERATED_ORDER)
+    source = N.from_source(f"""
+def attention_target({parameters},Sq:N.int64,Sk:N.int64):
+    with N.Kernel():
+        x=N.alloc_ub((64,))
+        N.fill(x,1.0)
+""")
+    artifact = compile(source)
+    abi = run.launcher_abi(artifact.asc, run.ENTRY, generated=True)
+    assert abi.names == (
+        "stream",
+        *("arg_" + name for name in GENERATED_ORDER),
+        "npu_size_Sq",
+        "npu_size_Sk",
+    )
+
+
 def metadata_ir(policy=run.DEFAULT_POLICY):
     physical = [
         f'%sq = "npu.runtime_size"() {{sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<{policy.query_tile}>}} : () -> index',
@@ -95,7 +116,6 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
         "soft_broadcast",
         "out_broadcast",
     )
-    local = {"aic": [], "aiv0": [], "aiv1": []}
     for name, (shape, dtype, memory, layout) in zip(names, policy.local_footprints, strict=True):
         dimensions = ", ".join(f"#builtin.int<{n}>" for n in shape)
         logical.append(
@@ -103,19 +123,16 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
             f'access="local", ring=#builtin.int<0>, dynamic_axes=[]}} : () -> '
             f'!npu_source.tensor<[{dimensions}], "{dtype}", "{memory}", "{layout}">'
         )
-        for actor in ("aiv0", "aiv1") if memory == "UB" else ("aic",):
-            nbytes = math.prod(shape) * (4 if dtype == "f32" else 2)
-            local[actor].append(
-                f'%{actor}_{name} = "npu.buffer"() {{sym_name="{name}", nbytes=#builtin.int<{nbytes}>, '
-                "external=#builtin.int<0>, initialized=#builtin.int<0>, count_scale=#builtin.int<0>} "
-                f': () -> !npu.ref<"{memory}", "{dtype}", "{layout}">'
-            )
-    for actor, buffers in local.items():
+        nbytes = math.prod(shape) * (4 if dtype == "f32" else 2)
         physical.append(
-            '"npu.kernel"() ({\n'
-            + "\n".join(buffers)
-            + f'\n"npu.end"() : () -> ()\n}}) {{sym_name="{actor}", core="{actor[:3]}", '
-            'target="dav-2201", blocks=#builtin.int<20>, disjoint_external=#builtin.int<1>} : () -> ()'
+            f'%{name} = "npu.buffer"() {{sym_name="{name}", nbytes=#builtin.int<{nbytes}>, '
+            "external=#builtin.int<0>, initialized=#builtin.int<0>} "
+            f': () -> !npu.ref<"{memory}", "{dtype}", "{layout}">'
+        )
+    for family in ("cube", "vector"):
+        physical.append(
+            f'"npu.actor_domain"() ({{\n^bb0(%{family}_sid: index):\n'
+            f'"npu.end"() : () -> ()\n}}) {{kind="{family}"}} : () -> ()'
         )
     score_type = '!npu_source.tensor<[#builtin.int<8>, #builtin.int<1024>], "f32", "UB", "linear">'
     if policy.query_tile == 256:
@@ -534,7 +551,7 @@ def test_each_selected_policy_matches_actual_ir_and_reaches_public_specialize(
     assert result["requested_cases"][0]["allocation_bytes"] == policy.allocation_bytes(
         policy.query_tile, 1024
     )
-    assert result["artifact"]["contract"]["local_bytes_by_kernel"] == {
+    assert result["artifact"]["contract"]["local_bytes_by_actor"] == {
         "aic": {
             "core": "aic",
             "bytes": {
@@ -581,12 +598,12 @@ def test_bq256_local_geometry_keeps_native_rows_and_reuses_score_storage():
 
 @pytest.mark.parametrize(
     "field",
-    ("q1", "p1", "l0c", "source-sq", "physical-sq", "physical-size", "missing-aiv", "ub-size"),
+    ("q1", "p1", "l0c", "source-sq", "physical-sq", "physical-size", "missing-vector", "ub-size"),
 )
 def test_bq256_rejects_stale_source_or_physical_local_storage(tmp_path, field):
     policy = AttentionPolicy(query_tile=256)
     artifact = publish(tmp_path / "bq256", policy=policy)
-    physical = field in {"physical-sq", "physical-size", "missing-aiv", "ub-size"}
+    physical = field in {"physical-sq", "physical-size", "missing-vector", "ub-size"}
     path = artifact / ("before.xdsl" if physical else "source.xdsl")
     original = path.read_text()
     lines = original.splitlines()
@@ -603,11 +620,11 @@ def test_bq256_rejects_stale_source_or_physical_local_storage(tmp_path, field):
             line.replace("multiple=#builtin.int<256>", "multiple=#builtin.int<128>")
             for line in lines
         ]
-    elif field == "missing-aiv":
-        lines = [line for line in lines if not line.startswith("%aiv1_o_state =")]
+    elif field == "missing-vector":
+        lines = [line.replace('kind="vector"', 'kind="cube"') for line in lines]
     else:
         prefix, old, new = (
-            ("%aic_q1 =", 65536, 32768) if field == "physical-size" else ("%aiv0_m =", 512, 256)
+            ("%q1 =", 65536, 32768) if field == "physical-size" else ("%m =", 512, 256)
         )
         lines = [
             line.replace(f"nbytes=#builtin.int<{old}>", f"nbytes=#builtin.int<{new}>")
@@ -618,7 +635,10 @@ def test_bq256_rejects_stale_source_or_physical_local_storage(tmp_path, field):
     changed = "\n".join(lines)
     assert changed != original.rstrip("\n")
     path.write_text(changed)
-    with pytest.raises(CompileError, match="policy differs|extent/type differs|tile contracts"):
+    with pytest.raises(
+        CompileError,
+        match="policy differs|extent/type differs|tile contracts|shared Cube/Vector domains",
+    ):
         run.load_backend(artifact, "generated", policy=policy)
 
 

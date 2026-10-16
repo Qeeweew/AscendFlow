@@ -384,7 +384,7 @@ def positive(expr, facts):
 def uniform(expr, names_or_facts):
     """Validate the nonnegative grammar in a declared uniform-input scope.
 
-    A legacy set of names supplies no positivity information. A facts mapping
+    A set of names supplies no positivity information. A facts mapping
     additionally permits dynamic divisors proven positive by their ranges.
     """
     return infer(expr, names_or_facts) is not None

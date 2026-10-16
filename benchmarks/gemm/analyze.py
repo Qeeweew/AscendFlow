@@ -6,8 +6,9 @@ from pathlib import Path
 from statistics import median
 
 from benchmarks.artifacts import verified_source
+from benchmarks.work import read_work
 from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import profile_evidence, theoretical_metrics
+from xdsl_npu.performance import profile_evidence
 
 
 def main():
@@ -18,7 +19,7 @@ def main():
         "--reduction", action="store_true", help="runtime K panels and one terminal output"
     )
     parser.add_argument("--hierarchical", action="store_true", help="runtime outputs and K panels")
-    parser.add_argument("--build-cwd", type=Path, help="Base for legacy relative compile paths")
+    parser.add_argument("--build-cwd", type=Path, help="Base for recorded relative compile paths")
     args = parser.parse_args()
     reduction = args.reduction or args.hierarchical
     trials = {"generated": [], "ascendc": []}
@@ -30,6 +31,11 @@ def main():
         device = json.loads((summary_path.parent / "device.json").read_text())
         require(len(device["cases"]) == 1, "one case per profiling process required")
         case = device["cases"][0]
+        work = read_work(case, required_counts=("fma_flops",))
+        require(
+            work["structure_inventory"]["groups"] == device["policy"]["GROUPS"],
+            "generated source grid differs from the benchmark policy",
+        )
         manifest = device["variants"][variant]
         command = manifest["commands"][0]
         source = verified_source(manifest, args.build_cwd)
@@ -46,6 +52,7 @@ def main():
             device["hardware"]["platform_sha256"],
             manifest["compiler_version"],
             command[1 : command.index("--cce-aicore-only")],
+            work,
         )
         require(
             identity is None or identity == contract, "profile contracts/hardware/output differ"
@@ -81,35 +88,16 @@ def main():
         "at least three independent runs per variant required",
     )
     medians = {v: median(t["p50_us"] for t in ts) for v, ts in trials.items()}
-    policy, requested = device["policy"], case["requested_work"]
+    policy = device["policy"]
     count_key = "panels" if reduction else "tiles_per_group"
     outputs = case["outputs"] if args.hierarchical else 1
     products = case[count_key] * policy["GROUPS"] * outputs
-    mads = products if reduction else products * (2 if policy["ACCUMULATE"] else 1)
+    products *= 1 if reduction else 2 if policy["ACCUMULATE"] else 1
+    flops = 2 * products * policy["M"] * policy["N"] * policy["BK" if reduction else "K"]
     require(
-        requested["native_invocations"]["mad_first" if reduction else "mad"] == mads,
-        "physical MAD count differs from policy",
+        work["algorithm_work"]["counts"]["fma_flops"] == flops,
+        "algorithm FMA convention differs from the benchmark problem",
     )
-    if reduction:
-        require(
-            requested["native_invocations"]["fix"]
-            == policy["GROUPS"] * outputs * int(case["panels"] > 0),
-            "terminal output count differs",
-        )
-    flops = 2 * mads * policy["M"] * policy["N"] * policy["BK" if reduction else "K"]
-    gm = sum(
-        value
-        for key, value in requested["memory_requested_bytes_by_pipe_bank_mode"].items()
-        if ":GM:" in key
-    )
-    work = {
-        "native_cube_flops": flops,
-        "useful_cube_flops": flops,
-        "gm_instruction_request_bytes": gm,
-        "unique_gm_io_allocation_bytes": requested["declared_gm_working_set_bytes"],
-        "gm_allocation_bytes": requested["declared_gm_working_set_bytes"],
-    }
-    theory = theoretical_metrics(work, device["hardware"], medians["generated"])
     result = {
         "policy": policy,
         count_key: case[count_key],
@@ -123,16 +111,29 @@ def main():
         "trials": trials,
         "median_of_run_medians_us": medians,
         "generated_over_reference": medians["generated"] / medians["ascendc"],
-        "requested_work": requested,
-        "theory": theory,
+        "work": work,
+        "algorithm_rates": {
+            "fma_tflops": flops / medians["generated"] / 1e6,
+            "scope": "problem-size FLOPs per measured time; not native Cube throughput",
+        },
+        "runtime_request_analysis": work["runtime_requests"],
+        "native_roofline": {
+            "status": "unavailable",
+            "reason": "runtime native Cube work and GM requests have not been established",
+        },
         "reference_setup": "CANN9.1 TPipe seeds/drains M_MTE1 IDs0/1/2; explicit L0 ring uses3/4. Generated ASC has no TPipe",
-        "limits": "fixed policy only; no full GEMM/FA performance claim; GM requests are not HBM traffic; pipe ratios overlap",
+        "limits": "fixed policy only; algorithm FLOPs are not a native instruction count; runtime traffic is unavailable; pipe ratios overlap",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(
         json.dumps(
-            {"median_us": medians, "ratio": result["generated_over_reference"], "theory": theory},
+            {
+                "median_us": medians,
+                "ratio": result["generated_over_reference"],
+                "algorithm_rates": result["algorithm_rates"],
+                "runtime_request_analysis": result["runtime_request_analysis"],
+            },
             indent=2,
         )
     )

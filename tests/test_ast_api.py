@@ -73,7 +73,7 @@ def test_supported_ast_still_compiles_through_physical_tasks_and_final_check(def
     assert any(isinstance(op, TaskOp) for op in parse(result.plan_ir).walk())
     assert "npu_source.program" in result.source_ir
     assert result.report["native_templates"] > 0
-    assert "asc_sync_pipe(PIPE_ALL)" in result.asc
+    assert "PIPE_ALL" not in result.asc
 
 
 def test_actor_local_allocation_cannot_escape_to_another_source_region():

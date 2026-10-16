@@ -6,7 +6,8 @@ import pytest
 
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy
-from tests.sync.test_notification_selection import actual_dispatch, need_cases, selected
+from tests.models.structured_domains import actual_dispatch, need_cases
+from tests.support.structured import selected
 from xdsl_npu.analysis.access_frontier import AccessEndpoint
 from xdsl_npu.analysis.structured_protocols import (
     BoundPlacement,

@@ -6,16 +6,11 @@ programs, enumerate finite instances, or plan synchronization.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 from ..diagnostics import CompileError, require
-
-if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
-
-    from ..model import Ref, Task
-
 
 CAPACITY = {
     "UB": 192 * 1024,
@@ -33,8 +28,8 @@ ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2}
 class NativeGeometry:
     """Static native footprint, without addresses or completion knowledge.
 
-    ``nbytes`` is the width of each row. Prefix extent is retained as opaque
-    metadata, never evaluated here. Bounds, owners, aliasing and retirement
+    ``nbytes`` is the complete static width of each row. Bounds, owners,
+    aliasing and retirement
     require actual address/effect facts supplied by the consuming analysis.
     Rows have positive widths and counts, and do not overlap each other.
     """
@@ -45,8 +40,6 @@ class NativeGeometry:
     nbytes: int
     rows: int = 1
     row_stride: int = 0
-    tail_nbytes: int = 0
-    prefix_extent: object | None = None
 
     def __post_init__(self):
         require(
@@ -67,21 +60,14 @@ class NativeGeometry:
         return self.nbytes * self.rows
 
 
-def _geometry(ref: Ref | NativeGeometry) -> NativeGeometry:
-    if isinstance(ref, NativeGeometry):
-        return ref
-    # Legacy callers supply already decoded references. Adapt only their
-    # static fields, without importing the consuming program model.
-    return NativeGeometry(
-        ref.storage.bank,
-        ref.dtype,
-        ref.layout,
-        ref.nbytes,
-        ref.rows,
-        ref.row_stride,
-        ref.tail_nbytes,
-        ref.prefix_extent,
-    )
+class NativeInstruction(Protocol):
+    """Instruction fields consumed by the target's completion rule."""
+
+    native: str
+    params: tuple[int, ...]
+
+    @property
+    def pipe(self) -> str: ...
 
 
 IMPLICIT_COMPLETION = {"S"}
@@ -92,7 +78,7 @@ IMPLICIT_COMPLETION = {"S"}
 MAX_MAD_CYCLE = 4096
 
 
-def implicit_completion(task: Task) -> bool:
+def implicit_completion(task: NativeInstruction) -> bool:
     if task.pipe in IMPLICIT_COMPLETION:
         return True
     if task.pipe != "M":
@@ -103,59 +89,9 @@ def implicit_completion(task: Task) -> bool:
     return (m // 16) * (n // 16) >= 10
 
 
-def check_load3d(tasks: Iterable[Task], config: tuple[int, int] | None):
-    """Only the explicit root initializer may write the Load3D register state.
-
-    All other admitted natives preserve it; opaque/external calls are rejected
-    by native_contract. The initializer's local S->MTE1 pair is fully consumed
-    before stream dispatch, so event ID0 has no lifetime inside any loop.
-    """
-    for task in tasks:
-        if task.native in {"load3d_a", "load3d_b_nn"}:
-            index = 0 if task.native == "load3d_a" else 1
-            require(
-                config is not None and config[index] == task.params[0],
-                "Load3D needs a preceding matching invariant FMATRIX configuration",
-            )
-
-
-def _disjoint_ub_copy(source: Ref, destination: Ref):
-    """Prove disjoint contiguous operands without a memmove assumption.
-
-    Different physical UB allocations are separate. For two views of one
-    allocation, equal translations leave a constant relative displacement;
-    this remains valid for every generation, owner and runtime count. Other
-    aliases require a stronger native overlap contract and are rejected.
-    """
-    if source.storage != destination.storage:
-        return True
-
-    def translation(ref):
-        generation, core = {}, {}
-        for _, stride, modulus, divisor in ref.terms:
-            key = modulus, divisor
-            generation[key] = generation.get(key, 0) + stride
-        for stride, divisor, modulus in ref.core_terms:
-            key = modulus, divisor
-            core[key] = core.get(key, 0) + stride
-        return (
-            {key: stride for key, stride in generation.items() if stride},
-            {key: stride for key, stride in core.items() if stride},
-            ref.count_offset,
-            ref.count_core_stride,
-        )
-
-    displacement = sum(term[0] for term in destination.terms) - sum(
-        term[0] for term in source.terms
-    )
-    return (
-        translation(source) == translation(destination) and abs(displacement) >= source.total_nbytes
-    )
-
-
 def native_contract(
     native: str,
-    refs: tuple[Ref | NativeGeometry, ...],
+    refs: tuple[NativeGeometry, ...],
     params: tuple[int, ...],
     *,
     disjoint: Callable[[], bool] | None = None,
@@ -164,9 +100,12 @@ def native_contract(
 
     Bounds, ownership, and completion coverage remain obligations of the
     consuming analysis; an admitted native does not supply those proofs.
-    UB copy needs an explicit disjointness premise for geometry-only inputs.
-    A legacy Ref caller without that premise retains the original alias rule.
+    UB copy needs an explicit disjointness premise from the consuming analysis.
     """
+    require(
+        all(isinstance(ref, NativeGeometry) for ref in refs),
+        "native contract needs static NativeGeometry operands",
+    )
     if native in {"load3d_a", "load3d_b_nn"}:
         # Complete b16 matrix, unit filters/strides, zero padding. Layout and
         # byte footprints are identical to the corresponding audited Load2D.
@@ -176,8 +115,6 @@ def native_contract(
             params,
             disjoint=disjoint,
         )
-    original_refs = refs
-    refs = tuple(_geometry(ref) for ref in original_refs)
     banks = tuple(r.bank for r in refs)
     dtypes = tuple(r.dtype for r in refs)
     lengths = tuple(r.total_nbytes for r in refs)
@@ -214,19 +151,12 @@ def native_contract(
             # CANN 9.1/2201 asc_copy_ub2ub uses copy_ubuf_to_ubuf on PIPE_V.
             # Its size is bytes, divided by 32 into a uint16_t burst length.
             require(
-                all(ref.prefix_extent is None and not ref.tail_nbytes for ref in refs),
-                "UB-to-UB copy requires fixed complete 32-byte blocks",
+                disjoint is not None,
+                "UB-to-UB copy requires provably disjoint source and destination ranges; "
+                "geometry inputs need an explicit alias proof",
             )
-            if disjoint is None:
-                require(
-                    all(not isinstance(ref, NativeGeometry) for ref in original_refs),
-                    "UB-to-UB copy requires provably disjoint source and destination ranges; "
-                    "geometry inputs need an explicit alias proof",
-                )
-                separated = _disjoint_ub_copy(*original_refs)
-            else:
-                require(callable(disjoint), "UB-copy disjointness premise must be callable")
-                separated = disjoint()
+            require(callable(disjoint), "UB-copy disjointness premise must be callable")
+            separated = disjoint()
             require(
                 separated is True,
                 "UB-to-UB copy requires provably disjoint source and destination ranges; "
@@ -245,7 +175,6 @@ def native_contract(
             and refs[0].nbytes % 32 == 0
             and 0 < refs[0].nbytes <= 65535 * 32
             and all(r.row_stride % 32 == 0 for r in refs)
-            and not any(r.tail_nbytes for r in refs)
             and all(r.rows == 1 or 0 <= (r.row_stride - r.nbytes) // 32 <= 65535 for r in refs)
             and not params,
             "row DMA requires equal, aligned physical rows in GM and UB",
@@ -256,7 +185,7 @@ def native_contract(
             len(refs) == 2
             and banks == ("UB", "UB")
             and layouts == ("linear", "linear")
-            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and all(r.contiguous for r in refs)
             and not params
             and lengths[0] // ITEMSIZE[dtypes[0]] == lengths[1] // ITEMSIZE[dtypes[1]] > 0
             and (
@@ -377,7 +306,7 @@ def native_contract(
             and banks == ("UB",) * 3
             and dtypes == ("f32",) * 3
             and layouts == ("linear",) * 3
-            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and all(r.contiguous for r in refs)
             and lengths == (rows * 256, 256, rows * 256),
             "column operation requires complete contiguous f32 rows of 64 elements",
         )
@@ -391,7 +320,7 @@ def native_contract(
             and banks == ("UB", "UB")
             and dtypes == ("f32", "f32")
             and layouts == ("linear", "linear")
-            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and all(r.contiguous for r in refs)
             and lengths == (rows * 256, rows * 4),
             "packed reduction requires f32 rows of 64 and one contiguous result per row",
         )
@@ -406,7 +335,7 @@ def native_contract(
             and banks == ("UB", "UB")
             and dtypes == ("f32", "f32")
             and layouts == ("linear", "linear")
-            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and all(r.contiguous for r in refs)
             and lengths == (rows * 4, rows * 32),
             "BRCB replicates each of a multiple of eight f32 words to one 32-byte block",
         )
@@ -420,7 +349,7 @@ def native_contract(
             and banks == ("UB", "UB")
             and dtypes == ("f32", "f32")
             and layouts == ("linear", "linear")
-            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and all(r.contiguous for r in refs)
             and lengths == (rows * 32, rows * 256),
             "row broadcast copies each 32-byte block to a complete f32 row of 64",
         )

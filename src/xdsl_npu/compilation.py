@@ -1,7 +1,7 @@
 """One owned source pipeline and immutable public compilation artifacts.
 
 External physical snapshots are inspection output, not proof-carrying input.
-Normal compilation never selects an alternate legacy solver by input shape.
+Source programs follow one region-based synchronization pipeline.
 """
 
 import json

@@ -7,6 +7,7 @@ from examples.normalization.softmax import softmax
 from xdsl_npu import compile
 from xdsl_npu import language as T
 from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import RuntimeSizeOp
 from xdsl_npu.dialects.source import ElementOp
 
 
@@ -16,8 +17,9 @@ def artifact():
 
 
 def test_packed_softmax_keeps_vector_statistics_and_runtime_pipeline(artifact):
-    native = artifact.report
-    assert native["runtime_length"] == "tiles"
+    assert {op.sym_name.data for op in artifact.plan.walk() if isinstance(op, RuntimeSizeOp)} == {
+        "tiles"
+    }
     assert "GetValue" not in artifact.asc and "npu_value_" not in artifact.asc
     assert "asc_brcb" in artifact.asc
     assert "asc_sub(" in artifact.asc and "asc_div(" in artifact.asc
@@ -92,7 +94,9 @@ def test_broadcast_result_keeps_the_destination_as_its_logical_producer():
 
 def test_small_columns_preserve_partial_row_alignment():
     artifact = compile(softmax.specialize(D=64))
-    assert artifact.report["runtime_length"] == "tiles"
+    assert {op.sym_name.data for op in artifact.plan.walk() if isinstance(op, RuntimeSizeOp)} == {
+        "tiles"
+    }
     # Without physical row padding the packed native merge must refuse it.
     source = softmax.source.replace("((D // 64 + 7) // 8) * 8", "D // 64")
     assert source != softmax.source

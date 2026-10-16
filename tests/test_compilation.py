@@ -5,7 +5,6 @@ from dataclasses import FrozenInstanceError
 import pytest
 from xdsl.dialects.builtin import ModuleOp
 
-from tests.support.forbid_legacy import forbid_legacy_planning
 from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.compilation import Compilation
@@ -29,7 +28,6 @@ def artifact():
 
 
 def test_public_source_owns_and_preserves_its_input(monkeypatch):
-    forbid_legacy_planning(monkeypatch)
     source = N.from_source(SOURCE, disjoint_external=True).to_ir()
     before = dump(source)
     result = compile(source)
@@ -76,7 +74,6 @@ def test_physical_exports_are_not_proof_carrying_public_inputs(artifact):
 
 
 def test_debug_is_explicit_structural_verification_not_a_second_solver(artifact, monkeypatch):
-    forbid_legacy_planning(monkeypatch)
     deep = compile(N.from_source(SOURCE, disjoint_external=True), debug_verify=True)
     assert not artifact.report["debug_structural_verification"]
     assert deep.report["debug_structural_verification"]
@@ -86,7 +83,6 @@ def test_debug_is_explicit_structural_verification_not_a_second_solver(artifact,
 
 
 def test_writing_artifacts_uses_only_frozen_snapshots(artifact, tmp_path, monkeypatch):
-    forbid_legacy_planning(monkeypatch)
     artifact.write(tmp_path, diagnostics=True)
     assert (tmp_path / "after.xdsl").read_text() == artifact.plan_ir
     assert (tmp_path / "before.xdsl").read_text() == artifact.before_ir

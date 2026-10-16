@@ -22,6 +22,7 @@ from ..dialects.structured import PipelineStageOp
 from ..dialects.types import RefType
 from ..target import native
 from ..target.ascend910b import Actor, Engine, supports_engine
+from ..target.packets import audited_packet
 from ..target.scalars import round_f32
 from .native import AccessMode, NativeContract
 from .structured_addresses import AddressFacts, StructuredAddresses
@@ -75,21 +76,6 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             continue
         frame = control.frames[operation]
         require(frame.participants, "mixed native lacks an actual execution domain")
-        require(
-            all(
-                getattr(operation, name) is None
-                for name in (
-                    "lower",
-                    "upper",
-                    "period",
-                    "phase",
-                    "phase_width",
-                    "logical_phase",
-                    "issue_order",
-                )
-            ),
-            "structured natives use actual regions, not legacy task activation attributes",
-        )
         current, stage = frame, 0
         while current is not None:
             if isinstance(current.operation, PipelineStageOp):
@@ -152,7 +138,9 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             scalar_values[operation.value] = operation
         contract = NativeContract(operation.native.data, engine, modes, params, scalar)
         require(
-            contract.packet is not None and contract.packet.closed_mask,
+            contract.packet is not None
+            and contract.packet is audited_packet(contract.native)
+            and contract.packet.closed_mask,
             "native requires an audited closed instruction packet",
             phase="structured-memory",
             location=str(operation.location),

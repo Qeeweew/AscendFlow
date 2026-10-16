@@ -8,16 +8,14 @@ from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
+from tests.models.structured_domains import expression_value, guard_active, occurrence_key
 from xdsl_npu import language as N
-from xdsl_npu.analysis.access_frontier import LoopResidueSelection
 from xdsl_npu.analysis.hazards import HazardKind
 from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
 from xdsl_npu.analysis.structured_memory import collect_native_memory
 from xdsl_npu.analysis.structured_regions import (
     AccessOccurrence,
-    BranchGuard,
     DependencyIssueKind,
-    LoopCountGuard,
 )
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.passes.lower_native import lower_native_structure
@@ -29,37 +27,6 @@ def dependencies(source):
     structure = lower_native_structure(N.from_source(source) if isinstance(source, str) else source)
     memory = collect_native_memory(structure.module)
     return build_structured_dependencies(memory)
-
-
-def expression_value(value, values):
-    return value if type(value) is int else value.evaluate(values)
-
-
-def guard_active(guard, values, memory):
-    if isinstance(guard, LoopCountGuard):
-        return guard.evaluate(values)
-    assert isinstance(guard, BranchGuard)
-    compare = guard.operation.cond.owner
-    lhs, rhs = (memory.control.environment.expression(v).evaluate(values) for v in compare.operands)
-    predicate = compare.predicate.value.data
-    assert predicate in {0, 1}
-    truth = lhs == rhs if predicate == 0 else lhs != rhs
-    return truth == (guard.branch == 0)
-
-
-def occurrence_key(occurrence, values, memory):
-    bound = []
-    for binding in occurrence.bindings:
-        logical = memory.control.loops[binding.loop]
-        ordinal = binding.ordinal
-        if isinstance(ordinal, LoopResidueSelection):
-            ordinal = ordinal.evaluate(logical.count.evaluate(values), values)
-        else:
-            ordinal = ordinal.evaluate(values)
-        assert ordinal is not None
-        assert 0 <= ordinal < logical.count.evaluate(values)
-        bound.append((binding.loop, ordinal))
-    return occurrence.operation, occurrence.participant, tuple(bound)
 
 
 def materialized_edges(result, values):

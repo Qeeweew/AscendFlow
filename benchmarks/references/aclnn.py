@@ -1,16 +1,9 @@
-"""Small direct ACLNN baseline adapter; no Torch or foreign workspace needed."""
+"""Direct ACLNN references called by runners with explicit tensors and shapes."""
 
 import ctypes as ct
-import hashlib
-import json
-import struct
-from pathlib import Path
 
-from benchmarks.validation.operators import operator_inputs
 from xdsl_npu.backend.cann import CANN
-from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.diagnostics import require
-from xdsl_npu.model import extract
 
 
 class OperatorReference:
@@ -187,102 +180,3 @@ class GemmBiasSiluReference:
     def close(self):
         for op in reversed(self.calls):
             op.close()
-
-
-def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_case="standard"):
-    from xdsl_npu.dialects.physical import MixedOp
-
-    mixed = isinstance(plan.body.block.first_op, MixedOp)
-    if mixed:
-        from types import SimpleNamespace
-
-        p = SimpleNamespace(name=plan.body.block.first_op.sym_name.data)
-    else:
-        p = extract(plan)
-    require(
-        p.name in {"rms_norm", "softmax", "gemm_nt", "gemm_bias_silu"},
-        "reference adapter implements RMSNorm, Softmax, GEMM and GEMM+bias+SiLU",
-    )
-    require(repeats > 0 and warmup > 0, "correctness and timing require positive launch counts")
-    health = health_snapshot(physical, output)
-    if mixed:
-        from benchmarks.validation.operators import mixed_inputs
-
-        require(data_case == "standard", "mixed baseline requires standard inputs")
-        contents, expected, tolerance, shape = mixed_inputs(plan)
-    else:
-        contents, expected, tolerance, shape = operator_inputs(p, data_case=data_case)
-    runtime = ACL()
-    baseline = None
-    try:
-        pointers = [runtime.allocate(data) for data in contents]
-        y = pointers[-1]
-        if p.name == "rms_norm":
-            rstd = runtime.allocate_uninitialized(shape[0] * 4)
-            epsilon = next(t.scalar for t in p.tasks if t.uid == "epsilon")
-            baseline = RmsNormReference(runtime, *pointers, rstd, *shape, epsilon)
-        elif p.name == "softmax":
-            epsilon = None
-            baseline = SoftmaxReference(runtime, *pointers, *shape)
-        elif p.name == "gemm_bias_silu":
-            epsilon = None
-            # The generated workspace is not part of the ACLNN algorithm.
-            # Keep its bytes/hash in the common argument manifest for comparison.
-            baseline = GemmBiasSiluReference(
-                runtime, pointers[0], pointers[1], pointers[3], pointers[4], *shape
-            )
-        else:
-            epsilon = None
-            baseline = GemmReference(runtime, *pointers, *shape)
-        for _ in range(warmup):
-            baseline()
-        runtime.synchronize()
-        raw = runtime.read(y, len(expected) * 4)
-        actual = struct.unpack(f"<{len(expected)}f", raw)
-        error = max((abs(a - b) for a, b in zip(actual, expected)), default=0)
-        require(
-            all(
-                abs(a - b) <= tolerance[1] + tolerance[0] * abs(b) for a, b in zip(actual, expected)
-            ),
-            f"ACLNN reference mismatch: max_abs_error={error}",
-        )
-        (output / "reference-output.bin").write_bytes(raw)
-        first, last = runtime.event(), runtime.event()
-        runtime.record(first)
-        for _ in range(repeats):
-            baseline()
-        runtime.record(last)
-        runtime.synchronize()
-        ms = ct.c_float()
-        runtime.call(
-            "aclrtEventElapsedTime",
-            [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-            ct.byref(ms),
-            first,
-            last,
-        )
-        record = {
-            "health": health,
-            "shape": shape,
-            "data_case": data_case,
-            "argument_sha256": [hashlib.sha256(data).hexdigest() for data in contents],
-            "dtype": "f16 operands/f32 output"
-            if p.name in {"gemm_nt", "gemm_bias_silu"}
-            else "f32",
-            "epsilon": epsilon,
-            "warmup": warmup,
-            "repeats": repeats,
-            "max_abs_error": error,
-            "stream_interval_us_per_launch": ms.value * 1000 / repeats,
-            "timing_scope": "ACL stream interval including submission gaps",
-            "interface": baseline.interface,
-            "library": str(CANN / "lib64/libopapi.so"),
-            "library_sha256": hashlib.sha256((CANN / "lib64/libopapi.so").read_bytes()).hexdigest(),
-            "workspace_bytes": baseline.workspace_size.value,
-        }
-        (output / "reference.json").write_text(json.dumps(record, indent=2) + "\n")
-        return record
-    finally:
-        if baseline is not None:
-            baseline.close()
-        runtime.close()

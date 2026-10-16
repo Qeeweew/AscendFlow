@@ -1,4 +1,4 @@
-"""Independent fixed-policy AscendC FA; no compiler/legacy operator construction."""
+"""Independent fixed-policy AscendC FA reference."""
 
 import argparse
 import ctypes as ct

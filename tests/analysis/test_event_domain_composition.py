@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from tests.analysis.test_structured_resources import prepared, selection
+from tests.support.structured import prepared, selection
 
 NESTED = """
 def nested(X:N.Tensor((n,2,64),N.f32),n:N.int64):

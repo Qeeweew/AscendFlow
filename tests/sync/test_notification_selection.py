@@ -9,40 +9,19 @@ from dataclasses import replace
 from importlib import import_module
 
 import pytest
-from xdsl.dialects import arith, scf
 
 from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
-from tests.analysis.test_structured_dependencies import (
-    expression_value,
-    guard_active,
-    occurrence_key,
-)
 from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
-from xdsl_npu import language as N
-from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
-from xdsl_npu.analysis.structured_dispatch import bind_structured_dispatch
-from xdsl_npu.analysis.structured_memory import collect_native_memory
+from tests.models.structured_domains import actual_dispatch, need_cases, occurrence_key, point_key
+from tests.support.structured import selected
 from xdsl_npu.analysis.structured_protocols import NotificationKind
 from xdsl_npu.analysis.structured_regions import AccessOccurrence
 from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.physical import TaskOp
-from xdsl_npu.dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from xdsl_npu.indexing import arguments
-from xdsl_npu.passes.lower_native import lower_native_structure
 from xdsl_npu.passes.select_notifications import select_notifications
 from xdsl_npu.target.ascend910b import Actor, Engine
-
-
-def selected(source):
-    structure = lower_native_structure(N.from_source(source) if isinstance(source, str) else source)
-    memory = collect_native_memory(structure.module)
-    dependencies = build_structured_dependencies(memory)
-    dispatch = bind_structured_dispatch(memory)
-    result = select_notifications(dependencies, dispatch)
-    result.require_closed()
-    return result
 
 
 @pytest.fixture(
@@ -58,110 +37,6 @@ def selected(source):
 )
 def actual_selection(request):
     return selected(request.param)
-
-
-def actual_dispatch(selection, uniform, actor):
-    """Independent lexical/physical-step interpreter; no production rank helper."""
-    memory, events = selection.dependencies.memory, []
-    environment = memory.control.environment
-    family = "cube" if actor is Actor.AIC else "vector"
-    base = uniform | {"$sid": int(actor is Actor.AIV1)}
-
-    def scalar(value, context):
-        return environment.expression(value).evaluate(context)
-
-    def visit(block, context, coordinates):
-        for operation in block.ops:
-            if isinstance(operation, ActorDomainOp):
-                if operation.kind.data == family:
-                    visit(operation.body.block, context, coordinates)
-            elif isinstance(operation, PipelineLoopOp):
-                iterations = range(*(scalar(value, context) for value in operation.operands))
-                stages = [op for op in operation.body.block.ops if isinstance(op, PipelineStageOp)]
-                if operation.issue_order is not None and family in operation.issue_order.data:
-                    by_name = {stage.label.data: stage for stage in stages}
-                    stages = [by_name[label.data] for label in operation.issue_order.data[family]]
-                symbol = memory.control.loops[operation].ordinal.args[0]
-                for clock in range(len(iterations) + operation.schedule.horizon.data):
-                    for stage in stages:
-                        ordinal = clock - stage.offset.data
-                        if 0 <= ordinal < len(iterations):
-                            visit(
-                                stage.body.block,
-                                context | {symbol: ordinal},
-                                coordinates + ((operation, ordinal),),
-                            )
-            elif isinstance(operation, scf.ForOp):
-                symbol = memory.control.loops[operation].ordinal.args[0]
-                for ordinal, _ in enumerate(
-                    range(
-                        *(
-                            scalar(v, context)
-                            for v in (
-                                operation.lb,
-                                operation.ub,
-                                operation.step,
-                            )
-                        )
-                    )
-                ):
-                    visit(
-                        operation.body.block,
-                        context | {symbol: ordinal},
-                        coordinates + ((operation, ordinal),),
-                    )
-            elif isinstance(operation, scf.IfOp):
-                comparison = operation.cond.owner
-                assert isinstance(comparison, arith.CmpiOp)
-                a, b = (scalar(value, context) for value in comparison.operands)
-                truth = {0: a == b, 1: a != b, 2: a < b, 3: a <= b, 4: a > b, 5: a >= b}[
-                    comparison.predicate.value.data
-                ]
-                region = operation.true_region if truth else operation.false_region
-                if region.blocks:
-                    visit(region.block, context, coordinates)
-            elif isinstance(operation, TaskOp) and (operation, actor) in selection.dispatch.tasks:
-                events.append(((operation, actor, coordinates), dict(context)))
-
-    visit(memory.module.body.block.first_op.body.block, base, ())
-    return events
-
-
-def need_cases(need, uniform, memory):
-    domains = need.domains + need.source.families + need.consumer.families
-    loops = [
-        loop for op, loop in memory.control.loops.items() if any(d.loop is op for d in domains)
-    ]
-
-    def visit(index, context):
-        if index == len(loops):
-            if all(guard_active(g, context, memory) for g in need.guards):
-                yield context
-            return
-        logical = loops[index]
-        current = [d for d in domains if d.loop is logical.operation]
-        limit = max(d.count.evaluate(context) for d in current)
-        for ordinal in range(limit):
-            child = context | {logical.ordinal.args[0]: ordinal}
-            if all(
-                max(d.distance, d.first) <= ordinal < d.count.evaluate(child)
-                and ordinal % d.period == expression_value(d.residue, child)
-                for d in current
-            ):
-                yield from visit(index + 1, child)
-
-    yield from visit(0, uniform)
-
-
-def point_key(point, context, memory):
-    coordinates = tuple((loop, value.evaluate(context)) for loop, value in point.coordinates)
-    actual = (
-        context
-        | {memory.control.loops[loop].ordinal.args[0]: value for loop, value in coordinates}
-        | {"$sid": int(point.actor is Actor.AIV1)}
-    )
-    assert point.guard.evaluate(actual)
-    return point.operation, point.actor, coordinates
 
 
 def test_one_selection_covers_every_actual_required_relation(actual_selection):
@@ -300,28 +175,6 @@ def test_first_count_and_dynamic_residues_are_not_replaced_by_unbounded_activati
     assert any(n.distance is None for n in result.notifications)
 
 
-def test_selection_never_invokes_old_local_adapters_or_rebuilds_memory(monkeypatch):
-    result = selected(nested_cv)
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("unified selection called a discarded local/infinite-model adapter")
-
-    targets = [
-        ("tests.legacy.passes.local_sync", "select_local_protocols"),
-        ("xdsl_npu.analysis.hazards", "Activation"),
-        ("tests.legacy.analysis.resources", "allocate_local_events"),
-        ("xdsl_npu.analysis.structured_memory", "collect_native_memory"),
-        ("xdsl_npu.analysis.structured_dependencies", "build_structured_dependencies"),
-        ("xdsl_npu.target.native", "native_contract"),
-    ]
-    modules = [(import_module(name), attribute) for name, attribute in targets]
-    for module, attribute in modules:
-        monkeypatch.setattr(module, attribute, forbidden)
-    again = select_notifications(result.dependencies, result.dispatch)
-    again.require_closed()
-    assert again == result
-
-
 def test_incomplete_mode2_quorum_stays_explicitly_unresolved():
     result = selected(nested_cv)
     broken = replace(
@@ -350,3 +203,22 @@ def test_unordered_same_engine_dependency_cannot_be_repaired_by_a_fence():
                     with N.Stage(0,name="later"):
                         N.mul(x[t%2,:],2.0,out=x[t%2,:])
         """)
+
+
+def test_selection_reuses_owned_memory_dependency_and_native_facts(monkeypatch):
+    result = selected(nested_cv)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("selection rebuilt an owned analysis input")
+
+    targets = [
+        ("xdsl_npu.analysis.structured_memory", "collect_native_memory"),
+        ("xdsl_npu.analysis.structured_dependencies", "build_structured_dependencies"),
+        ("xdsl_npu.target.native", "native_contract"),
+    ]
+    modules = [(import_module(name), attribute) for name, attribute in targets]
+    for module, attribute in modules:
+        monkeypatch.setattr(module, attribute, forbidden)
+    again = select_notifications(result.dependencies, result.dispatch)
+    again.require_closed()
+    assert again == result

@@ -492,9 +492,15 @@ def _launcher(emitter, host_expressions):
     # Defined below the recursive printer so host checks cannot participate in
     # address/control admission or change selected instruction placement.
     root = emitter.root
-    signature = ["void* stream"] + [f"void* arg_{i}" for i in range(len(emitter.externals))]
+    buffer_names = [buffer.sym_name.data for buffer in emitter.externals]
+    require(
+        all(name.isascii() and name.isidentifier() for name in buffer_names)
+        and len(set(buffer_names)) == len(buffer_names),
+        "launcher buffer names must be unique C identifiers",
+    )
+    signature = ["void* stream"] + [f"void* arg_{name}" for name in buffer_names]
     signature += [f"int64_t npu_size_{op.sym_name.data}" for op in emitter.parameters]
-    arguments = [f"(uint8_t*)arg_{i}" for i in range(len(emitter.externals))]
+    arguments = [f"(uint8_t*)arg_{name}" for name in buffer_names]
     arguments += [f"npu_size_{op.sym_name.data}" for op in emitter.parameters]
     lines = ["", f'extern "C" int launch_{root.sym_name.data}({", ".join(signature)}) {{']
     names = {}
@@ -544,7 +550,7 @@ def _launcher(emitter, host_expressions):
         nbytes = checked(size)
         lines += [
             f"  const uint64_t npu_bytes_{index} = uint64_t({nbytes});",
-            f"  const uintptr_t npu_ptr_{index} = (uintptr_t)arg_{index};",
+            f"  const uintptr_t npu_ptr_{index} = (uintptr_t)arg_{buffer_names[index]};",
             f"  if (npu_bytes_{index} && (!npu_ptr_{index} || npu_ptr_{index} % 32 || npu_ptr_{index} > UINTPTR_MAX - npu_bytes_{index})) return -1;",
         ]
     if root.disjoint_external.data:

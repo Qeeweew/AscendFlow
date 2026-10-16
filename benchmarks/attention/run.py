@@ -32,6 +32,7 @@ from xdsl_npu.diagnostics import require
 from xdsl_npu.dialects.io import parse
 from xdsl_npu.dialects.physical import BufferOp, KernelOp, MixedOp, RuntimeSizeOp
 from xdsl_npu.dialects.source import AllocationOp, ElementOp, ProgramOp, SizeOp
+from xdsl_npu.dialects.structured import ActorDomainOp
 from xdsl_npu.performance import hardware_snapshot
 
 ENTRY = "attention_target"
@@ -182,56 +183,43 @@ def local_contract(program, root, policy):
         ),
         "compiled attention local tensor policy differs",
     )
-    kernels = [op for op in root.body.block.ops if isinstance(op, KernelOp)]
     require(
-        Counter(kernel.core.data for kernel in kernels) == {"aic": 1, "aiv": 2}
-        and len({kernel.sym_name.data for kernel in kernels}) == len(kernels)
-        and all(
-            kernel.target.data == "dav-2201"
-            and kernel.blocks is not None
-            and kernel.blocks.data == policy.groups
-            for kernel in kernels
-        )
-        and all(
-            op.parent_op() in kernels
-            for op in root.walk()
-            if isinstance(op, BufferOp) and not op.external.data
-        ),
-        "compiled attention local physical actor policy differs",
+        not any(isinstance(op, KernelOp) for op in root.walk())
+        and {op.kind.data for op in root.walk() if isinstance(op, ActorDomainOp)}
+        == {"cube", "vector"},
+        "compiled attention requires shared Cube/Vector domains in one mixed body",
     )
-    byte_totals = {}
-    for kernel in kernels:
-        expected = {
-            op.sym_name.data: op
-            for op in local
-            if (op.ref.type.memory.data == "UB") == (kernel.core.data == "aiv")
-        }
-        physical = [
-            op for op in kernel.body.block.ops if isinstance(op, BufferOp) and not op.external.data
-        ]
+    physical = [op for op in root.walk() if isinstance(op, BufferOp) and not op.external.data]
+    expected = {op.sym_name.data: op for op in local}
+    require(
+        len(physical) == len(expected)
+        and {op.sym_name.data for op in physical} == expected.keys()
+        and all(op.parent_op() is root for op in physical),
+        "compiled attention local physical allocation policy differs",
+    )
+    totals = {"cube": {}, "vector": {}}
+    for buffer in physical:
+        tensor = expected[buffer.sym_name.data].ref.type
+        bank, dtype, layout = tensor.memory.data, tensor.dtype.data, tensor.layout.data
+        nbytes = math.prod(n.data for n in tensor.shape) * (4 if dtype == "f32" else 2)
         require(
-            len(physical) == len(expected)
-            and {op.sym_name.data for op in physical} == expected.keys(),
-            "compiled attention local physical allocation policy differs",
+            buffer.ref.type.bank.data == bank
+            and buffer.ref.type.dtype.data == dtype
+            and buffer.ref.type.layout.data == layout
+            and buffer.nbytes.data == nbytes
+            and buffer.extent_count is None
+            and (buffer.count_scale is None or buffer.count_scale.data == 0)
+            and buffer.initialized.data == 0,
+            f"compiled attention local physical extent/type differs for {buffer.sym_name.data}",
         )
-        totals = {}
-        for buffer in physical:
-            allocation = expected[buffer.sym_name.data]
-            tensor = allocation.ref.type
-            bank, dtype, layout = tensor.memory.data, tensor.dtype.data, tensor.layout.data
-            nbytes = math.prod(n.data for n in tensor.shape) * (4 if dtype == "f32" else 2)
-            require(
-                buffer.ref.type.bank.data == bank
-                and buffer.ref.type.dtype.data == dtype
-                and buffer.ref.type.layout.data == layout
-                and buffer.nbytes.data == nbytes
-                and buffer.extent_count is None
-                and (buffer.count_scale is None or buffer.count_scale.data == 0)
-                and buffer.initialized.data == 0,
-                f"compiled attention local physical extent/type differs for {buffer.sym_name.data}",
-            )
-            totals[bank] = totals.get(bank, 0) + nbytes
-        byte_totals[kernel.sym_name.data] = {"core": kernel.core.data, "bytes": totals}
+        family = totals["vector" if bank == "UB" else "cube"]
+        family[bank] = family.get(bank, 0) + nbytes
+    # Storage is private per participant; the shared Vector body is not copied.
+    byte_totals = {
+        "aic": {"core": "aic", "bytes": totals["cube"]},
+        "aiv0": {"core": "aiv", "bytes": totals["vector"]},
+        "aiv1": {"core": "aiv", "bytes": totals["vector"]},
+    }
     return byte_totals
 
 
@@ -342,7 +330,7 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
         "before_ir_sha256": sha256(before),
         "source_ir_sha256": sha256(source),
         "buffers": contracts,
-        "local_bytes_by_kernel": local_bytes,
+        "local_bytes_by_actor": local_bytes,
     }
 
 

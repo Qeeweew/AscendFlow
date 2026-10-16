@@ -19,7 +19,7 @@
 2. 读取生产native topology再独立BFS的有限差分，只独立检查求解器；不能发现双方共享的错误拓扑前提。
 3. full/compact共享转移函数的表示差分，只验证表示等价；不能称独立语义oracle。
 
-当前 `tests/models/finite_query_native.py` 属于第2类。文档和测试名称须说明复用边界，不能把测试总数当形式化证明。
+当前保留 `tests/models/structured_events.py` 的实际 IR 有限模型；旧 topology/query 求解器对照已经删除。`tests/support/structured.py` 是生产输入构造 helper，不能算独立 oracle。不能把测试总数当形式化证明。
 
 ## 2. 最小反例矩阵
 
@@ -62,7 +62,7 @@ PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/exam
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 5 --timeout 300 --output runs/structured-loops/fa-cold
 ```
 
-冻结源码、编译器Git加未提交diff身份、constexpr政策、版本、ASC SHA、命令及原始JSON。单次probe和带采样诊断不作为五次p50；normal/deep的成本分开。无需清空OS文件cache，不允许跨编译结果缓存。
+冻结源码、编译器Git加未提交diff身份、constexpr政策、版本、ASC SHA、命令及原始JSON。单次probe和带采样诊断不作为五次p50；normal与额外结构验证的成本分开。无需清空OS文件cache，不允许跨编译结果缓存。
 
 ## 5. ASC与设备性能
 

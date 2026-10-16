@@ -689,9 +689,9 @@ class MatmulOp(IRDLOperation):
             self.b.type.memory.data,
             self.accumulator.type.memory.data,
         )
-        if banks not in {("L1", "L1", "L0C"), ("L0A", "L0B", "L0C")}:
-            raise VerifyException("matmul requires L0A/L0B/L0C or explicit legacy L1 operands")
-        if banks[0] == "L0A" and self.transpose_b.data:
+        if banks != ("L0A", "L0B", "L0C"):
+            raise VerifyException("matmul requires explicit L0A/L0B/L0C operands")
+        if self.transpose_b.data:
             raise VerifyException("L0B is already packed for matmul; transpose its L1 copy")
         if self.transpose_b.data not in {0, 1}:
             raise VerifyException("matmul transpose policy must be boolean")

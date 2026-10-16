@@ -13,13 +13,14 @@ from pathlib import Path
 
 from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
+from benchmarks.work import structure_inventory, work_record
 from examples.normalization.rms_norm import rms_normalize
 from examples.normalization.softmax import softmax
 from xdsl_npu.backend.cann import CANN
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import hardware_snapshot, runtime_work
+from xdsl_npu.performance import hardware_snapshot
 from xdsl_npu.target.scalars import round_f32
 
 
@@ -121,6 +122,7 @@ def main():
         timeout_s=args.timeout,
     )
     result = read_artifact(generated_check)
+    inventory = structure_inventory(result.plan)
     sources = {"generated": (result.name, result.asc)}
 
     def reference_source():
@@ -263,10 +265,22 @@ def main():
                     "cache_policy": "same input/output allocations reused; no flush",
                     "input_sha256": hashlib.sha256(raw).hexdigest(),
                     "output_sha256": hashlib.sha256(actual).hexdigest(),
-                    "requested_work": runtime_work(
-                        result.plan, {"tiles" if is_softmax else "rows": count}
+                    "work": work_record(
+                        inventory,
+                        algorithm_counts={
+                            "add_mul_operations": len(values)
+                            * (2 * args.columns - 1 if is_softmax else 3 * args.columns + 1),
+                            "max_comparisons": len(values) * (args.columns - 1)
+                            if is_softmax
+                            else 0,
+                            "exp_elements": values.size if is_softmax else 0,
+                            "sqrt_elements": 0 if is_softmax else len(values),
+                            "div_elements": values.size if is_softmax else len(values),
+                            "logical_input_bytes": values.nbytes,
+                            "logical_output_bytes": expected.nbytes,
+                        },
+                        algorithm_scope="scalar normalization/softmax problem convention; not Vector recipe work or memory requests",
                     ),
-                    "work_basis": "generated physical IR only; reference/ACLNN native work is not inferred from it",
                 }
                 if is_softmax:
                     record["max_row_sum_error"] = (
@@ -279,9 +293,7 @@ def main():
                     reference.close()
                 records.append(record)
                 print(
-                    json.dumps(
-                        {key: value for key, value in record.items() if key != "requested_work"}
-                    ),
+                    json.dumps({key: value for key, value in record.items() if key != "work"}),
                     flush=True,
                 )
     finally:

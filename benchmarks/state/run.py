@@ -9,11 +9,12 @@ from pathlib import Path
 from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from benchmarks.validation.state import inputs_and_oracle
+from benchmarks.work import structure_inventory, work_record
 from examples.state.recurrence import state_sum
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import hardware_snapshot, runtime_work
+from xdsl_npu.performance import hardware_snapshot
 
 
 def reference_source(tile, groups):
@@ -62,6 +63,7 @@ def main():
         timeout_s=args.timeout,
     )
     artifact = read_artifact(generated_check)
+    inventory = structure_inventory(artifact.plan)
     sources = {"generated": (artifact.name, artifact.asc)}
     manifests = {}
     for variant in variants:
@@ -159,11 +161,15 @@ def main():
                     "cache_policy": "same allocations reused, no flush",
                     "input_sha256": [hashlib.sha256(v).hexdigest() for v in (initial, x)],
                     "output_sha256": hashlib.sha256(raw).hexdigest(),
-                    "requested_work": runtime_work(artifact.plan, {"tiles": count}),
+                    "work": work_record(
+                        inventory,
+                        algorithm_counts={"fp32_add_operations": args.groups * count * args.tile},
+                        algorithm_scope="ordered FP32 state recurrence; no native or operand-byte count",
+                    ),
                 }
                 records.append(record)
                 print(
-                    json.dumps({k: v for k, v in record.items() if k != "requested_work"}),
+                    json.dumps({k: v for k, v in record.items() if k != "work"}),
                     flush=True,
                 )
             for bad in (-1, 1 << 62):

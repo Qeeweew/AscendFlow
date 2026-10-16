@@ -5,28 +5,6 @@ import pytest
 from examples.vector.scale import scale
 from xdsl_npu import budget, compile
 from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.loop_planning import DirectCompletion
-
-
-def test_cancellation_during_direct_synthesis_leaves_input_usable(monkeypatch):
-    stopped = False
-    original = DirectCompletion.insert
-
-    def stop(self, *args, **kwargs):
-        nonlocal stopped
-        stopped = bool(self.selected)
-        return original(self, *args, **kwargs)
-
-    source = scale.to_ir()
-    monkeypatch.setattr(DirectCompletion, "insert", stop)
-    with pytest.raises(
-        CompileError, match=r"cancelled at direct protocol insertion.*selected=1"
-    ) as caught:
-        compile(source, cancel=lambda: stopped)
-    assert caught.value.kind is ErrorKind.ANALYSIS_LIMIT
-    assert budget._active.get() is None
-    # The cancelled context and its partly mutated owned clone do not leak.
-    assert compile(source).report["native_templates"] == 3
 
 
 def test_deadline_includes_phase_and_structure(monkeypatch):

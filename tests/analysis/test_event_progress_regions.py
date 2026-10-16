@@ -5,7 +5,8 @@ from dataclasses import replace
 import pytest
 
 from tests.analysis.test_structured_resource_contracts import finite_ports
-from tests.sync.test_notification_selection import selected
+from tests.models.structured_domains import actual_dispatch
+from tests.support.structured import selected
 from xdsl_npu.analysis.access_frontier import AccessEndpoint
 from xdsl_npu.analysis.event_contracts import ResourceWork
 from xdsl_npu.analysis.event_domains import EventDomains
@@ -162,11 +163,13 @@ def test_single_loop_ready_release_keeps_one_real_clock_certificate():
     (root,) = (plan.region,)
     assert not root.ports and not root.relations
     (child,) = root.children
-    assert child.clock is child.operation and child.rank
-    assert not child.interface
-    for edge in child.relations:
+    stream = child.stream
+    assert stream is not None and stream.operation is child.operation and stream.rank
+    assert not child.ports and not child.relations
+    for edge in stream.relations:
         assert (
-            child.rank[edge.source] + 1 <= child.stride * edge.steps + child.rank[edge.destination]
+            stream.rank[edge.source] + 1
+            <= stream.stride * edge.steps + stream.rank[edge.destination]
         )
 
 
@@ -264,6 +267,8 @@ def test_inactive_minimum_shift_does_not_drop_later_residue_gates():
     composer = _Composer(domains)
     wait = ProgressPort(notifications[0], notifications[0].consumers[0], "wait")
     source = ProgressPort(notifications[1], notifications[1].sources[0], "set")
+    invocation = composer._invocation_guard(loop.operation, wait, source)
+    assert invocation is not None and not invocation.comparisons
     shift, guard, exact = composer._gate_step(wait, source, loop.operation)
     assert shift == 0 and not exact
     assert guard.evaluate({"n": 3})
@@ -357,3 +362,101 @@ def test_closed_children_do_not_hide_opposite_controller_entry_orders():
     assert all(actor.value in " ".join(failure.value.witness) for actor in Actor)
     accepted = progress(collective_children(reverse_vector=False))
     assert accepted.region.children[0].controller_entries
+
+
+def prologue_stream_epilogue(*, cyclic=False):
+    selection = selected("""
+    def boundary(X:N.Tensor((n,64),N.f32),Y:N.Tensor((64,),N.f32,access="write"),n:N.int64):
+        with N.Kernel():
+            p,a,b=N.alloc_ub((64,)),N.alloc_ub((64,)),N.alloc_ub((64,))
+            N.fill(p,1.0)
+            for i in N.Pipelined(n,stages=1):
+                N.copy(X[i,:],a)
+                N.mul(a,2.0,out=b)
+            N.copy(p,Y[:])
+            N.fill(p,2.0)
+    """)
+    memory = selection.dependencies.memory
+    loop = next(iter(memory.control.loops.values()))
+    prologue, load, compute, epilogue, after = memory.templates
+    activation = (Comparison(loop.count, ">", literal(0)),)
+
+    def endpoint(template, *, source, coordinate=None):
+        return port(
+            selection,
+            template,
+            source=source,
+            coordinates=() if coordinate is None else ((loop.operation, coordinate),),
+            activation=activation,
+        )
+
+    notifications = (
+        notification(
+            "startup",
+            endpoint(after if cyclic else prologue, source=True),
+            endpoint(load, source=False, coordinate=literal(0)),
+            Engine.V,
+            Engine.MTE2,
+        ),
+        notification(
+            "body",
+            endpoint(load, source=True, coordinate=loop.ordinal),
+            endpoint(compute, source=False, coordinate=loop.ordinal),
+            Engine.MTE2,
+            Engine.V,
+        ),
+        notification(
+            "finish",
+            endpoint(compute, source=True, coordinate=expression("sub", loop.count, literal(1))),
+            endpoint(epilogue, source=False),
+            Engine.V,
+            Engine.MTE3,
+        ),
+    )
+    return isolated(selection, notifications)
+
+
+def test_prologue_stream_epilogue_keeps_two_separate_progress_certificates():
+    plan = progress(prologue_stream_epilogue())
+    (child,) = plan.region.children
+    stream = child.stream
+    assert stream is not None
+    assert {point.notification.name for point in stream.ports} == {"body"}
+    assert {point.notification.name for point in child.ports} == {"startup", "finish"}
+    assert len(stream.ports) == len(child.ports) == 2
+    for edge in stream.relations:
+        assert (
+            stream.rank[edge.source] + 1
+            <= stream.stride * edge.steps + stream.rank[edge.destination]
+        )
+    (bridge,) = child.relations
+    assert child.ports[bridge.source].notification.name == "startup"
+    assert child.ports[bridge.destination].notification.name == "finish"
+    assert not bridge.guard.evaluate({"n": 0, "$group": 0, "$sid": 0})
+    for count in (1, 2, 5):
+        assert bridge.guard.evaluate({"n": count, "$group": 0, "$sid": 0})
+
+
+def test_finite_startup_cannot_wait_for_publication_blocked_by_the_owned_stream():
+    selection = prologue_stream_epilogue(cyclic=True)
+    loop = next(iter(selection.dependencies.memory.control.loops.values()))
+    uniform = {"n": 1, "$group": 0, "$sid": 0, loop.ordinal.args[0]: 0}
+    positions = {
+        key: position
+        for position, (key, _) in enumerate(actual_dispatch(selection, uniform, Actor.AIV0))
+    }
+
+    def position(point):
+        coordinates = tuple((owner, value.evaluate(uniform)) for owner, value in point.coordinates)
+        return positions[point.operation, point.actor, coordinates], int(
+            point.placement is Placement.AFTER
+        )
+
+    startup, body, _ = selection.notifications
+    # Two selected matching arcs and these two actual FIFO gates form a cycle.
+    assert startup.destination_engine is body.source_engine is Engine.MTE2
+    assert body.destination_engine is startup.source_engine is Engine.V
+    assert position(startup.consumers[0]) < position(body.sources[0])
+    assert position(body.consumers[0]) < position(startup.sources[0])
+    with pytest.raises(CompileError, match="blocking cycle|projected exactly"):
+        progress(selection)

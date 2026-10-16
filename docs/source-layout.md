@@ -1,6 +1,6 @@
 # 源码职责与所有权
 
-当前主线按下表组织。实际功能资格见[状态页](refactor-progress.md)，阶段保证见[编译不变量](compilation-invariants.md)。旧模块还未全部退场，不能将新目录存在等同于重构完成。
+当前主线按下表组织。实际功能资格见[状态页](refactor-progress.md)，阶段保证见[编译不变量](compilation-invariants.md)。被替代的模块直接删除；目录与入口收敛不等同于完整功能资格。
 
 ## 唯一 source 编译链路
 
@@ -44,15 +44,13 @@ runtime     → process / diagnostics
 
 一份 owned invocation 只建立一次前提。新增通知不改变 native、地址和循环身份，因此可以沿用这些事实；改变访问、排步或激活域时，必须重新建立受影响合同。不能把可伪造的 `verified=True` 当授权。
 
-## 尚待退出的旧职责
+## 删除边界与工具职责
 
-以下不是新的普通 source 编译路径：
-
-- 根目录的 `scope_*`、`loop_*`、`sequence_*` 和旧 `sync.py/codegen.py`：旧 completion/query/物理输入体系。
-- M2 单循环过渡实现的 7 个模块已经移出 `src`，保存在 `tests/legacy/`，不提供兼容 wrapper。
-- `Compilation._build` 和旧公共 `autosync/verify_plan/emit_asc` 已删除；公共编译只接受 DSL/source IR。物理快照是检查产物，不能重新导入充当已证明的输入。
-- 构建工具的旧交错检查入口已删除；独立最终 IR 模型留在测试。`performance.py` 的旧物理计数及两个 benchmark 解码器仍待迁移，尚阻止剩余旧闭包整体退出产品。
-
-清退时保留硬件反例的语义，并将用例迁至新链路或独立有限模型。不得通过删测试、默认跳过失败、保留第二套普通 source 编译器来宣称完成。历史模型可以作为明确标识的测试 oracle，不能从公共编译入口调用。
+- `scope_*`、`loop_*`、`sequence_*`、旧 `sync.py/codegen.py/model.py` 及过渡解码器已经删除。
+- 不在 `tests/` 保存旧求解器或 emitter，不提供兼容 wrapper；旧 API 专属测试退出，有价值的硬件语义由当前 IR 与独立模型覆盖。未覆盖的资格必须明示。
+- 物理 dialect 只注册当前 native、配置、地址、参与者、结构化循环和通知；不注册 QueryChannel、InvocationChannel、ScopeChannel 等旧协议。
+- 原语格式化只接受实际 SSA 指针渲染；目标合同只接受 `NativeGeometry`，不再隐式适配旧 Ref。
+- 公共编译只接受 DSL/source IR。物理快照是检查产物，不能重新导入充当已证明的输入。
+- 基准工具从当前产物提取 ABI、结构 inventory 和显式算法 work。未建立的运行期 native/搬运请求计数必须标明不可得，不能调用旧求解器、填零或冒充设备流量。
 
 算子及分块政策在 `examples/`；数值 oracle、手写 AscendC/ACLNN、profiling 在 `benchmarks/`；独立有限执行语义在 `tests/models/`。参考资料和运行数据留外层，不进入产品包。

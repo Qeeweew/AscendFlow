@@ -1,67 +1,42 @@
-# 测试入口与迁移原则
+# 测试入口与验证边界
 
-从工作区 `/workspace/xdsl-910b` 使用独立 `.venv`。本目录同时包含当前 source 链路测试、显式历史 oracle 和仍待整理的旧回归；文件存在或 collection 成功不代表用例通过。
+使用工作区独立 `.venv`。当前产品只有 `compile` / `Compilation` 这一条 source 链路：实际控制与地址、内存 admission、依赖、通知选择、事件资源、progress，再生成最终物理 IR 与 ASC。导出的物理快照不能作为已证明的 source 编译输入。
 
-当前完整 generated pipeline 仍受 resources 的配对、事件复用与进展契约未闭合阻塞。已有手工最终 IR 模型和后端筛选子集的通过记录，不能据此外推完整 source 链路已通过；最近 M2 迁移只完成 lint、import 和相关测试 collection，未执行测试体。完整算子构建、FA、CANN、设备和性能验证仍处于停止状态。
+旧 planner、scope/query/sequence 求解器专属测试、旧局部同步实现和对应 IR 解释器已删除。测试目录不保留这些实现或兼容入口。删除旧 API 测试不等于当前完整链路获得资格；collection 成功也不表示测试体通过。
 
-## 当前 source 测试入口
+## 当前职责
 
-下表说明测试的目标范围，不表示这些文件已全部通过。当前 source 入口为 `compile` / `Compilation`，沿 `structured_sync` 建立事实并生成最终物理 IR；外部 physical snapshot 仅用于检查，不能授权 source 编译。
-
-| 范围 | 路径/文件 | 检查内容 |
+| 范围 | 入口 | 主要检查 |
 |---|---|---|
-| Source 所有权与控制 | `test_compilation.py`、`control/test_structured_physical.py`、`control/test_recursive_native.py` | 单一 source 路径、实际循环/Stage/actor、原始 SSA 与原生操作身份 |
-| 地址与内存 admission | `analysis/test_structured_control.py`、`test_structured_addresses.py`、`test_structured_memory.py`、`test_structured_bounds.py`、`test_structured_admission.py` | 实际地址、精确 footprint、bounds、别名、owner、Tile 值与寄存器配置 |
-| 依赖与通知选择 | `analysis/test_access_frontier.py`、`test_structured_dependencies.py`、`sync/test_notification_selection.py` | 最后读取、写入与退休义务，实际捕获/获取端点和代次 |
-| 资源、共享与进展 | `analysis/test_structured_resources.py`、`test_structured_resource_contracts.py`、`test_structured_event_sharing.py` | 配对、每个参与者的消费、ID lifetime、真实阻塞边；当前仍需闭合 |
-| 最终 IR 与 ASC | `backend/test_structured_emission.py` | 实际 Notification/SCF/Address SSA 决定执行，打印消费既有事实；部分用例仍依赖完整资源阶段 |
-| Source 集成 | `sync/test_structured_pipeline.py`、`sync/test_structured_event_semantics.py` 中的 `generated` 用例 | 从 source 到最终通知 IR；完整 generated 验证尚未恢复 |
-| 独立有限事件模型 | `models/structured_events.py`、`sync/test_structured_event_semantics.py` 中的手工用例 | 实际 IR 的队列、事件、字节版本及 RAW/WAR/WAW 反例 |
+| Source 与控制 | `test_frontend.py`、`control/`、`loops/`、`test_compilation.py` | 显式控制、Stage/actor、原始 SSA、source 所有权与不可变产物 |
+| Native 与内存 | `analysis/test_native_geometry.py`、`test_native_packets.py`、`test_native_anchors.py`、`test_structured_*.py` | 静态 native 规则、issue packet、真实地址/footprint、bounds、owner、SPR、初始化和数值生产者 |
+| 依赖与同步选择 | `analysis/test_access_frontier.py`、`test_structured_dependencies.py`、`sync/test_notification_selection.py` | 实际读写/退休义务、捕获/获取端点、实际代次与完整 CV quorum |
+| 资源与进展 | `analysis/test_event_*.py`、`test_progress_*.py`、`test_structured_resources.py`、`test_structured_resource_contracts.py`、`test_structured_event_sharing.py` | 精确激活、空/短循环、窗口投影、ID lease、最后消费、真实阻塞路径和 region 接口 |
+| 最终 IR 与 ASC | `backend/test_structured_emission.py`、`sync/test_structured_pipeline.py` | 后端消费既有事实、实际 Notification/SCF/Address SSA 与生成调用 |
+| 数学、ABI 和测量记录 | `test_attention_math.py`、`test_runtime_contract.py`、`test_attention_runner.py`、`test_performance.py`、`test_work_inventory.py` | 数学参考、host guards、命名 ABI、证据身份、静态工作量与显式分析假设 |
 
-`analysis/test_native_effects.py`、`test_native_packets.py` 和 `control/test_recursive_native.py` 含有共享基础层或历史比较用例，不能整文件归入新 source 资格。目录迁移和当前边界见[源码布局](../docs/source-layout.md)与[重构进度](../docs/refactor-progress.md)。
+旧硬件反例按职责保留在当前表示中：`sync/test_structured_event_semantics.py` 和 `models/structured_events.py` 包含 native end 非 FIFO、RAW/WAR/WAW、删 Wait、错 ID、过早 Set、跨 body 二元事件复用、Scalar controller 阻塞、双 AIV mode2 quorum、未消费容量与跨队列阻塞环。共享 GM 输入的有限字节检查使用同一 structured 模型。几何、packet 和 native cut 合同直接使用当前静态对象或实际 SSA。旧求解器的节点数量、缓存、路径搜索与旧 IR 布局断言不再作为产品合同。
 
-## 历史 oracle 与旧回归
+这些覆盖说明测试职责，不代表所有旧场景都已在新编译器获得证明。当前 mixed region、祖先 invocation 和完整 source 集成必须分别满足现有同步契约；未证明的关系应明确拒绝。FA、CANN、设备和性能资格不能由目录清理或小合同通过推导。
 
-`legacy/` 保存已移出产品的 M2 局部同步实现：`passes/insert_sync.py`、`passes/local_sync.py`、`backend/local.py` 和 `analysis/{contracts,protocols,progress,resources}.py`。其导入显式使用 `tests.legacy`，原产品路径已删除，没有兼容 wrapper，详见 [legacy/README.md](legacy/README.md)。
+## Helper 与模型的独立性
 
-`analysis/test_local_resources.py`、`test_native_contracts.py`、`sync/test_owned_local_source.py`、`test_structured_local_sync.py` 直接测试此历史实现。它们保留旧契约和反例，不代表当前 source 的 selection、resources、progress 或 emitter 通过验证。`native_packets` 中调用 M2 的用例同样如此。
+`support/structured.py` 直接调用生产 frontend、native admission、依赖、通知选择和 EventDomains，只负责构造输入。它没有 pytest fixture，也不提供独立的正确性预期。
 
-其他旧 planner、scope/query/sequence 回归与 fixtures 尚未全部迁移。它们通过明确旧入口保留语义检查；旧硬件反例仍需保留，但固定旧节点数、缓存命中或内部模块名的断言不能成为新链路的资格依据。
+`models/structured_domains.py` 复用已收集的 ControlFacts、Expr/LoopResidueSelection 求值、需求域/guard 描述与实际任务集合，直接解释有限控制和 issue order。它不从生产 order、rank、lifetime 或 progress 查询取得预期边。
 
-构建期限测试 `test_compile_watchdog.py` 检查期限、子进程清理和产物身份；`test_attention_math.py` 与 `benchmarks.validation` 提供数学参考。两类检查均不能代替生成代码的数值或设备验证。
+`models/structured_events.py` 读取实际最终 IR，复用已审计的 native footprint 和 target 规则，自行建立逻辑字节版本以及物理 actor/queue/event 执行关系。它不读取 selector、allocator 或 progress 的证明结果。给定参数和有限 body 调用次数的枚举不能代替任意 N 的符号证明。
 
-## 验证独立性
-
-`models/structured_events.py` 读取实际最终 IR，并使用已承认的 native footprint 与 target 规则解释指令。它自行建立逻辑读写版本和物理 actor/queue 执行关系，不从生产 selector、allocator 或 progress 结果取得预期边。手工用例包括删 Wait、错 ID、过早 Set、跨 body 复用、mode2 quorum 与阻塞环反例。
-
-此模型只检查给定参数和有限 body 调用次数；后端 C++ shim 也只记录控制、调用和地址，不执行 tensor 数学。二者都不构成任意 N 证明、数值验证或设备完成关系证明。
-
-`models/finite_query_native.py` 复用生产 native topology，只能独立检查求解器路径；full/compact 共享转移函数的对照主要检查表示，不能与实际 IR 模型的独立性混为一谈。
-
-最小反例矩阵和各层口径见 [validation.md](../docs/validation.md)，变换保持见[不变量](../docs/compilation-invariants.md)。
+后端 C++ shim 仅执行 scalar 控制并记录调用与地址，不执行 tensor 数学、CANN 指令或异步设备队列。
 
 ## 运行纪律
 
-当前可先收集相关入口，collection 不执行测试体：
+先执行小规模 Python/IR 检查，再考虑 ASC/CANN 离线编译。本轮测试清退以 lint、import 与 collection 为主，另定向检查了极小的 native recipe 合同；没有执行完整测试集、完整算子构建或性能测量。可从工作区检查当前入口：
 
 ```bash
-.venv/bin/python -m pytest --collect-only -q \
-  compiler/tests/sync/test_structured_pipeline.py \
-  compiler/tests/sync/test_structured_event_semantics.py \
-  compiler/tests/backend/test_structured_emission.py
+.venv/bin/python -m pytest --collect-only -q compiler/tests
 ```
 
-已有通过记录的手工/后端筛选命令如下；该记录早于本次 M2 迁移，迁移后仅做了 collection。此筛选排除了 generated、owned、foreign 和 launcher 用例，不表示被排除的组已通过：
+collection 不执行 fixture 和测试体。完整 generated pipeline 用例仍需在资源及进展契约闭合后单独验证；现有手工 IR 模型和后端筛选结果不能外推完整 source 资格。
 
-```bash
-.venv/bin/python -m pytest -q \
-  compiler/tests/sync/test_structured_event_semantics.py \
-  compiler/tests/backend/test_structured_emission.py \
-  -k 'not generated and not owned and not foreign and not launcher'
-```
-
-待资源契约闭合并恢复构建验证后，按变更选择相关小组，再运行必要的集成回归。`pytest compiler/tests` 会同时覆盖当前与历史测试，不能把整体 collection 或历史通过记录当作当前完整验证。修改 IR 的测试各取独立副本；成本输入和冷编译不复用 cache。
-
-单个算子构建 ≤300s；失败停止后续候选并清理所属子进程。设备 runner 在 `tests/support` 中只负责小规模资格，不能作为大算子性能证据；设备运行规则见 [benchmark 入口](../benchmarks/README.md)。
-
-本检查点新增 `analysis/test_event_windows.py`、`test_event_window_counterexamples.py` 与 `test_event_domain_composition.py` 检查精确membership、固定宽度运算及内向外存在投影；`test_event_progress_regions.py` 和 `test_progress_counterexamples.py` 检查实际区域组合与孙循环漏边。最后一轮相关小合同集成30项通过，生成完整循环用例未在本批恢复。它们不替代完整FA/CANN或设备资格。
+单个进程/算子构建不超过 300 秒；失败停止后续候选并清理所属子进程。设备 runner 位于 `support/`，其运行须遵守工作区卡健康、进程、显存、利用率和显式物理映射要求。

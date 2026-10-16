@@ -13,12 +13,13 @@ from pathlib import Path
 
 from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
+from benchmarks.work import structure_inventory, work_record
 from examples.gemm.batched import batched_matmul
 from xdsl_npu import language as N
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import hardware_snapshot, runtime_work
+from xdsl_npu.performance import hardware_snapshot
 
 
 def reference_source(policy):
@@ -118,6 +119,7 @@ def main():
         timeout_s=args.timeout,
     )
     result = read_artifact(generated_check)
+    inventory = structure_inventory(result.plan)
     sources = {"generated": (result.name, result.asc)}
     manifests = {}
     for variant in variants:
@@ -218,13 +220,25 @@ def main():
                     "cache_policy": "same allocations reused; no cache flush",
                     "input_sha256": [hashlib.sha256(a).hexdigest(), hashlib.sha256(b).hexdigest()],
                     "output_sha256": hashlib.sha256(raw).hexdigest(),
-                    "requested_work": runtime_work(result.plan, {"tiles": tiles}),
+                    "work": work_record(
+                        inventory,
+                        algorithm_counts={
+                            "fma_flops": 2
+                            * args.groups
+                            * tiles
+                            * args.m
+                            * args.n
+                            * args.k
+                            * (2 if args.accumulate else 1),
+                            "logical_input_bytes": len(a) + len(b) - 2 * len(guard),
+                            "logical_output_bytes": expected.nbytes,
+                        },
+                        algorithm_scope="GEMM problem with two FLOPs per scalar FMA; no native instruction count",
+                    ),
                 }
                 records.append(record)
                 print(
-                    json.dumps(
-                        {key: value for key, value in record.items() if key != "requested_work"}
-                    ),
+                    json.dumps({key: value for key, value in record.items() if key != "work"}),
                     flush=True,
                 )
             require(launch(runtime.stream, ap, bp, cp, -1) == -1, "negative size was accepted")
