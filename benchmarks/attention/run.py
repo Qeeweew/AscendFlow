@@ -1,4 +1,4 @@
-"""Run the fixed FA example or independent ACLNN/AscendC baselines.
+"""Run declared specializations of the FA example or independent baselines.
 
 Reusing a compiled artifact never invokes the compiler. Numerical sampling is
 explicit, and ACL event intervals include stream submission gaps. Set the
@@ -19,6 +19,7 @@ from pathlib import Path
 from xdsl.dialects.builtin import f32
 
 import benchmarks.validation.attention as attention_validation
+from benchmarks.attention.contract import DEFAULT_POLICY, AttentionPolicy
 from benchmarks.references.attention import NAME as REFERENCE_NAME
 from benchmarks.references.attention import reference_source
 from benchmarks.references.attention_aclnn import FlashAttentionReference
@@ -28,36 +29,14 @@ from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.ir import BufferOp, MixedOp, RuntimeSizeOp, parse
 from xdsl_npu.model import require
 from xdsl_npu.performance import hardware_snapshot
-from xdsl_npu.source_ir import AllocationOp, ElementOp, ProgramOp
+from xdsl_npu.source_ir import AllocationOp, ElementOp, ProgramOp, SizeOp
 from xdsl_npu.toolchain import CANN
 
 ENTRY = "attention_target"
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples/flash_attention/attention.py"
-POLICY = {"batch": 1, "heads": 8, "kv_heads": 8, "dim": 128, "groups": 20, "dtype": "f16"}
-CONSTANTS = {
-    "B": 1,
-    "HQ": 8,
-    "HKV": 8,
-    "D": 128,
-    "BQ": 128,
-    "BK": 1024,
-    "CK": 128,
-    "VR": 8,
-    "GROUPS": 20,
-    "DTYPE": "f16",
-    "SCALE": 0.08838834764831845,
-}
-SCALE = struct.unpack("<f", struct.pack("<f", CONSTANTS["SCALE"]))[0]
-BUFFER_NAMES = {"Q": "q", "K": "k", "V": "v", "O": "o", "Score": "score", "P": "p", "PV": "pv"}
-SHAPES = {
-    "Q": ((1, 8, -1, 128), "f16", "Sq"),
-    "K": ((1, 8, -1, 128), "f16", "Sk"),
-    "V": ((1, 8, -1, 128), "f16", "Sk"),
-    "O": ((1, 8, -1, 128), "f16", "Sq"),
-    "Score": ((20, 2, 128, 1024), "f32", None),
-    "P": ((20, 2, 128, 1024), "f16", None),
-    "PV": ((20, 2, 128, 128), "f32", None),
-}
+CONSTANTS = DEFAULT_POLICY.parameters()
+SCALE = DEFAULT_POLICY.scale
+BUFFER_NAMES = {tensor.name: tensor.key for tensor in DEFAULT_POLICY.tensors}
 GUARD = b"\x5a" * 512
 TIMING_SCOPE = "ACL stream event interval including host submission gaps; not kernel-only"
 
@@ -77,7 +56,7 @@ def read_json(path):
 
 
 def example_policy(path=EXAMPLE):
-    """Check the actual example defaults without importing or compiling it."""
+    """Check base defaults before public specialization, without compiling."""
     source = read_bytes(path)
     functions = [
         node
@@ -103,7 +82,7 @@ def example_policy(path=EXAMPLE):
             default.attr if isinstance(default, ast.Attribute) else ast.literal_eval(default)
         )
     require(
-        defaults == CONSTANTS, "attention example policy differs from the validated fixed policy"
+        defaults == CONSTANTS, "attention example policy differs from the declared default policy"
     )
     return {
         "path": str(Path(path).resolve()),
@@ -174,7 +153,7 @@ def launcher_abi(source, name, *, generated):
     return LauncherABI(signatures[0][0], tuple(names), tuple(keys))
 
 
-def generated_contract(directory):
+def generated_contract(directory, policy=DEFAULT_POLICY):
     """Read actual source shapes and physical GM extents; do not replan IR."""
     directory = Path(directory)
     before = read_bytes(directory / "before.xdsl")
@@ -185,17 +164,17 @@ def generated_contract(directory):
         isinstance(root, MixedOp)
         and root.sym_name.data == ENTRY
         and root.target.data == "dav-2201"
-        and root.blocks.data == 20
+        and root.blocks.data == policy.groups
         and root.disjoint_external.data == 1,
-        "compiled attention physical policy differs from B1/H8/D128/groups20/f16",
+        "compiled attention physical policy differs from the selected runner policy",
     )
     require(
         isinstance(program, ProgramOp)
         and program.sym_name.data == ENTRY
         and program.kind.data == "mixed"
-        and program.groups.data == 20
+        and program.groups.data == policy.groups
         and program.disjoint_external.data == 1,
-        "compiled attention source policy differs from the validated example",
+        "compiled attention source policy differs from the selected runner policy",
     )
     footprints = {
         (tuple(n.data for n in op.ref.type.shape), op.ref.type.dtype.data, op.ref.type.memory.data)
@@ -204,7 +183,7 @@ def generated_contract(directory):
     }
     require(
         {
-            ((2, 128, 128), "f16", "L1"),
+            ((2, 128, 128), policy.dtype, "L1"),
             ((2, 8, 1024), "f32", "UB"),
             ((8, 1024), "f32", "UB"),
         }
@@ -223,7 +202,7 @@ def generated_contract(directory):
         scale_operations
         and all(op.scalar.type == f32 for op in scale_operations)
         and {struct.pack("<f", op.scalar.value.data) for op in scale_operations}
-        == {struct.pack("<f", SCALE)},
+        == {struct.pack("<f", policy.scale)},
         "compiled attention F32 softmax scale differs",
     )
     allocations = {
@@ -236,21 +215,25 @@ def generated_contract(directory):
         for op in physical.walk()
         if isinstance(op, BufferOp) and op.external.data
     }
+    tensors = {tensor.name: tensor for tensor in policy.tensors}
     require(
-        allocations.keys() == buffers.keys() == SHAPES.keys(),
+        allocations.keys() == buffers.keys() == tensors.keys(),
         "compiled attention external allocation names differ",
     )
     sizes = {op.sym_name.data: op for op in root.body.block.ops if isinstance(op, RuntimeSizeOp)}
+    source_sizes = {op.sym_name.data: op for op in program.body.block.ops if isinstance(op, SizeOp)}
     require(
-        sizes.keys() == {"Sq", "Sk"}
+        sizes.keys() == source_sizes.keys() == {"Sq", "Sk"}
         and all(
-            sizes[name].minimum.data == 1 and sizes[name].multiple.data == multiple
+            dimension[name].minimum.data == 1 and dimension[name].multiple.data == multiple
+            for dimension in (sizes, source_sizes)
             for name, multiple in (("Sq", 128), ("Sk", 1024))
         ),
         "compiled attention runtime tile contracts differ",
     )
     contracts = {}
-    for name, (shape, dtype, extent) in SHAPES.items():
+    for name, tensor in tensors.items():
+        shape, dtype, extent = tensor.shape, tensor.dtype, tensor.extent
         allocation, buffer = allocations[name], buffers[name]
         require(
             tuple(n.data for n in allocation.ref.type.shape) == shape
@@ -265,36 +248,28 @@ def generated_contract(directory):
             and allocation.access.data == ("read" if name in {"Q", "K", "V"} else "write"),
             f"compiled attention access contract differs for {name}",
         )
-        dimensions = tuple(
-            value.owner.attributes.get("sym_name") for value in allocation.dimensions
-        )
         require(
-            len(dimensions) == int(extent is not None)
-            and all(value is not None for value in dimensions)
-            and tuple(value.data for value in dimensions) == (() if extent is None else (extent,)),
+            tuple(allocation.dimensions)
+            == (() if extent is None else (source_sizes[extent].value,))
+            and tuple(axis.data for axis in allocation.dynamic_axes or ())
+            == (() if extent is None else (2,)),
             f"compiled attention source extent differs for {name}",
         )
-        nbytes = 0 if extent else math.prod(shape) * (4 if dtype == "f32" else 2)
-        scale = 2048 if extent else 0
         require(
             buffer.parent_op() is root
             and buffer.ref.type.bank.data == "GM"
             and buffer.ref.type.dtype.data == dtype
-            and buffer.nbytes.data == nbytes
+            and buffer.nbytes.data == tensor.fixed_bytes
             and buffer.count_scale is not None
-            and buffer.count_scale.data == scale
+            and buffer.count_scale.data == tensor.bytes_per_extent
             and buffer.initialized.data == int(name in {"Q", "K", "V"})
             and buffer.extent_count is (None if extent is None else sizes[extent].value),
             f"compiled attention physical extent/type differs for {name}",
         )
-        contracts[BUFFER_NAMES[name]] = {
-            "shape": shape,
-            "dtype": dtype,
-            "extent": extent,
-            "fixed_bytes": nbytes,
-            "bytes_per_extent": scale,
-        }
+        contracts[tensor.key] = tensor.metadata()
     return {
+        "policy": policy.as_dict(),
+        "specialization": policy.parameters(),
         "before_ir_sha256": sha256(before),
         "source_ir_sha256": sha256(source),
         "buffers": contracts,
@@ -309,7 +284,7 @@ class Backend:
     abi: LauncherABI | None = None
 
 
-def load_backend(output, backend, *, reference_output=None):
+def load_backend(output, backend, *, reference_output=None, policy=DEFAULT_POLICY):
     """Validate only the selected backend's real binaries and provenance."""
     if backend == "aclnn":
         files = {name: CANN / "lib64" / name for name in ("libopapi.so", "libnnopbase.so")}
@@ -327,6 +302,7 @@ def load_backend(output, backend, *, reference_output=None):
                 "library": str(library),
                 "shared_sha256": identities["libopapi.so"]["sha256"],
                 "libraries": identities,
+                "runtime_policy": policy.as_dict(),
                 "adapter_sha256": sha256(
                     read_bytes(Path(__file__).parents[1] / "references/attention_aclnn.py")
                 ),
@@ -363,13 +339,13 @@ def load_backend(output, backend, *, reference_output=None):
             and report["query_verification"].get("resources", {}).get("verified") is True,
             "generated attention artifact lacks its completed query proof report",
         )
-        contract = generated_contract(directory)
+        contract = generated_contract(directory, policy)
     else:
         require(
-            source == reference_source(),
-            "AscendC artifact differs from the validated fixed reference policy",
+            source == reference_source(**policy.reference_parameters()),
+            "AscendC artifact differs from the selected reference policy",
         )
-        contract = {"reference_policy": POLICY}
+        contract = {"reference_policy": policy.as_dict()}
     abi = launcher_abi(source, name, generated=backend == "generated")
     return Backend(
         backend,
@@ -395,7 +371,7 @@ def case_shape(value):
     if match is None:
         raise argparse.ArgumentTypeError("cases must be positive Sq:Sk")
     sq, sk = map(int, match.groups())
-    if sq % 128 or sk % 1024 or max(sq, sk) > (2**63 - 1) // 2048:
+    if sq % 128 or sk % 1024 or max(sq, sk) > 2**63 - 1:
         raise argparse.ArgumentTypeError(
             "cases require complete BQ128/BK1024 tiles within int64 extents"
         )
@@ -421,7 +397,7 @@ def parse_args(argv=None):
     parser.add_argument("--record", type=Path)
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--timeout", type=float, default=300)
-    for key, value in POLICY.items():
+    for key, value in DEFAULT_POLICY.as_dict().items():
         parser.add_argument(
             "--" + key.replace("_", "-"), type=str if key == "dtype" else int, default=value
         )
@@ -432,10 +408,9 @@ def parse_args(argv=None):
         math.isfinite(args.timeout) and 0 < args.timeout <= 300,
         "one build must finish within 300 seconds",
     )
-    require(
-        {key: getattr(args, key) for key in POLICY} == POLICY,
-        "runner supports only the validated fixed attention policy; variants are not qualified",
-    )
+    args.policy = AttentionPolicy(**{key: getattr(args, key) for key in DEFAULT_POLICY.as_dict()})
+    for sq, sk in args.cases:
+        args.policy.validate_case(sq, sk)
     require(
         args.backend != "ascendc" or args.reference_output is not None,
         "AscendC requires --reference-output",
@@ -450,16 +425,8 @@ def parse_args(argv=None):
     return args
 
 
-def expected_bytes(sq, sk):
-    return {
-        "q": sq * 2048,
-        "k": sk * 2048,
-        "v": sk * 2048,
-        "o": sq * 2048,
-        "score": 20971520,
-        "p": 10485760,
-        "pv": 2621440,
-    }
+def expected_bytes(sq, sk, policy=DEFAULT_POLICY):
+    return policy.allocation_bytes(sq, sk)
 
 
 def write_record(path, value):
@@ -468,10 +435,20 @@ def write_record(path, value):
 
 
 def run(args):
-    policy = example_policy()
+    policy = args.policy
+    example = example_policy()
     if args.build:
-        build_file(EXAMPLE, args.output, entry=ENTRY, shared=True, timeout_s=args.timeout)
-    backend = load_backend(args.output, args.backend, reference_output=args.reference_output)
+        build_file(
+            EXAMPLE,
+            args.output,
+            entry=ENTRY,
+            parameters=policy.parameters(),
+            shared=True,
+            timeout_s=args.timeout,
+        )
+    backend = load_backend(
+        args.output, args.backend, reference_output=args.reference_output, policy=policy
+    )
     record_path = args.record or args.output / (
         "device-" + args.backend + "-" + args.data_case + ".json"
     )
@@ -479,13 +456,23 @@ def run(args):
         "status": "artifact_validated",
         "backend": args.backend,
         "artifact": backend.identity,
-        "policy": POLICY,
-        "example": policy,
+        "policy": policy.as_dict(),
+        "specialization": policy.parameters(),
+        "buffer_contracts": {tensor.key: tensor.metadata() for tensor in policy.tensors},
+        "requested_cases": [
+            {
+                "shape_b_hq_hkv_sq_sk_d": policy.shape(sq, sk),
+                "allocation_bytes": policy.allocation_bytes(sq, sk),
+            }
+            for sq, sk in args.cases
+        ],
+        "example": example,
         "cases": [],
         "runner_sha256": sha256(read_bytes(__file__)),
+        "contract_sha256": sha256(read_bytes(Path(__file__).with_name("contract.py"))),
         "oracle_sha256": sha256(read_bytes(attention_validation.__file__)),
         "timing_scope": TIMING_SCOPE,
-        "comparison_scope": "fixed dense noncausal BNSD f16 policy; sampled checks remain sampled; no variant or kernel-only performance claim",
+        "comparison_scope": "declared dense noncausal BNSD policy; artifact validation grants no device qualification; sampled checks remain sampled; device results apply only to this selected policy and artifacts",
     }
     if args.physical is None:
         if args.record is not None:
@@ -497,10 +484,10 @@ def run(args):
     prepared = []
     for sq, sk in args.cases:
         raw, expected, selected, oracle_s = inputs_and_oracle(
-            POLICY, sq, sk, scope=args.scope, data_case=args.data_case
+            policy.as_dict(), sq, sk, scope=args.scope, data_case=args.data_case
         )
         require(
-            {name: len(data) for name, data in raw.items()} == expected_bytes(sq, sk),
+            {name: len(data) for name, data in raw.items()} == policy.allocation_bytes(sq, sk),
             "attention oracle allocation contract differs from this compiled policy",
         )
         prepared.append((sq, sk, raw, expected, selected, oracle_s))
@@ -526,9 +513,9 @@ def run(args):
                     pointers["k"],
                     pointers["v"],
                     pointers["o"],
-                    (1, 8, 8, sq, sk, 128),
-                    "f16",
-                    SCALE,
+                    policy.shape(sq, sk),
+                    policy.dtype,
+                    policy.scale,
                 )
 
             arguments = (
@@ -556,11 +543,13 @@ def run(args):
             runtime.record(stop)
             runtime.synchronize()
             output = runtime.read(pointers["o"], len(raw["o"]) + len(GUARD))
-            actual = decode(output[: len(raw["o"])], "f16", (1, 8, sq, 128))
+            actual = decode(
+                output[: len(raw["o"])], policy.dtype, (policy.batch, policy.heads, sq, policy.dim)
+            )
             require(np.isfinite(actual).all(), "nonfinite or unwritten attention output")
             checked = actual[:, :, selected]
             error = float(np.max(np.abs(checked - expected)))
-            rtol, atol = 0.002, 0.0002
+            rtol, atol = policy.tolerances
             if not np.allclose(checked, expected, rtol=rtol, atol=atol):
                 record_path.parent.mkdir(parents=True, exist_ok=True)
                 (record_path.parent / f"mismatch-{args.backend}-{sq}-{sk}.bin").write_bytes(output)
@@ -594,11 +583,11 @@ def run(args):
                 "compiled_source_sha256": backend.identity.get("compiled_source_sha256"),
                 "sq": sq,
                 "sk": sk,
-                "shape_b_hq_hkv_sq_sk_d": [1, 8, 8, sq, sk, 128],
-                "dtype": "f16",
+                "shape_b_hq_hkv_sq_sk_d": policy.shape(sq, sk),
+                "dtype": policy.dtype,
                 "layout": "BNSD",
-                "softmax_scale_f32": SCALE,
-                "softmax_scale_f32_bits": struct.pack("<f", SCALE).hex(),
+                "softmax_scale_f32": policy.scale,
+                "softmax_scale_f32_bits": struct.pack("<f", policy.scale).hex(),
                 "causal": False,
                 "query_start": 0,
                 "data_case": args.data_case,
@@ -616,9 +605,11 @@ def run(args):
                 "timing_scope": TIMING_SCOPE,
                 "cache_policy": "same allocations and inputs reused within the case; no cache flush",
                 "input_contract": {
-                    "allocation_bytes": expected_bytes(sq, sk),
-                    "example_groups": 20,
-                    "example_tile_bq_bk_ck_vr": [128, 1024, 128, 8],
+                    "allocation_bytes": policy.allocation_bytes(sq, sk),
+                    "example_groups": policy.groups,
+                    "example_tile_bq_bk_ck_vr": [
+                        policy.parameters()[key] for key in ("BQ", "BK", "CK", "VR")
+                    ],
                     "backend_buffer_arguments": ["q", "k", "v", "o"]
                     if args.backend == "aclnn"
                     else [key for key in backend.abi.keys if key not in {"stream", "sq", "sk"}],
