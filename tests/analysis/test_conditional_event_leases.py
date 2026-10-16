@@ -40,7 +40,20 @@ class _Occurrence:
     participant: Actor = Actor.AIV0
 
 
-def _notification(name, coordinates=(), guard=None):
+@dataclass(frozen=True)
+class _Scope:
+    operation: Operation
+    parent: "_Scope | None"
+    parent_stage: int
+
+
+@dataclass(frozen=True)
+class _Task:
+    scope: _Scope
+    stage: int
+
+
+def _notification(name, coordinates=(), guard=None, *, destination_engine=Engine.V):
     def point(placement):
         return BoundPlacement(
             occurrence=_Occurrence(arith.ConstantOp.from_int_and_width(0, 64)),
@@ -57,7 +70,7 @@ def _notification(name, coordinates=(), guard=None):
         (point(Placement.AFTER),),
         (point(Placement.BEFORE),),
         Engine.MTE2,
-        Engine.V,
+        destination_engine,
         NotificationKind.LOCAL_EVENT,
         (),
         coordinates[0][0] if coordinates else None,
@@ -103,7 +116,7 @@ def _case(mode, windows=(), *, empty=False):
 
 
 class _Domains:
-    """The established-domain protocol, with explicit test queue relations."""
+    """The established-domain protocol, with explicit test ordering relations."""
 
     def __init__(self, cases, following=lambda *args: ()):
         self.cases = cases
@@ -118,6 +131,18 @@ class _Domains:
                 for window in case.windows
             }
         )
+        tasks = {}
+        for notification in self.notifications:
+            for point in notification.sources + notification.consumers:
+                scope = None
+                # These mathematical graphs have stage-zero task anchors
+                # and stage-zero entry into each explicit enclosing clock.
+                for loop, _ in point.coordinates:
+                    scope = _Scope(loop, scope, 0)
+                if scope is None:
+                    scope = _Scope(point.operation, None, 0)
+                tasks[point.operation, point.actor] = _Task(scope, 0)
+        self.dispatch = SimpleNamespace(tasks=tasks)
         self.arithmetic = IntegerFacts({})
         self.following = following
         self.pair_checks = []
@@ -152,7 +177,7 @@ class _Domains:
         return self.following(current, consume, following, source)
 
     def _gate(self, notification):
-        return False
+        return notification.destination_engine is Engine.S
 
     def _paired_id(self, assignment, bound, event, *, case):
         self.pair_checks.append((assignment, bound, event, case))
@@ -248,6 +273,7 @@ def test_peer_paths_must_cover_the_entire_target_domain(prove):
         return (ActionGuard(),) if current is peer or following is peer else ()
 
     domains = _Domains({target: (broad_target,), peer: (nonzero_case,)}, following)
+    assert not domains._gate(target) and not domains._gate(peer)
     assert prove(domains, target, broad_target, window, 1) is None
     domains.cases[peer] = (nonzero_case, zero_case)
     witnesses = prove(domains, target, broad_target, window, 1)
@@ -276,7 +302,7 @@ def test_peer_paths_must_cover_the_entire_target_domain(prove):
 def test_sparse_reuse_checks_the_nearest_actual_same_id_in_every_phase(prove):
     loop = arith.ConstantOp.from_int_and_width(0, 64)
     window = _window(loop, G, literal(20), period=5, residues=(0, 2))
-    notification = _notification("sparse", ((loop, G),))
+    notification = _notification("sparse", ((loop, G),), destination_engine=Engine.S)
     case = _case(0, (window,))
     arithmetic = IntegerFacts({})
 
@@ -299,7 +325,7 @@ def test_sparse_reuse_checks_the_nearest_actual_same_id_in_every_phase(prove):
 
 
 def test_finite_sharing_accepts_one_case_and_rejects_multiple_cases():
-    left, right = _notification("left"), _notification("right")
+    left, right = (_notification(name, destination_engine=Engine.S) for name in ("left", "right"))
     finite = _case(0)
     domains = _Domains(
         {left: (finite,), right: (finite,)}, following=lambda *args: (ActionGuard(),)
@@ -334,7 +360,7 @@ def test_finite_sharing_accepts_one_case_and_rejects_multiple_cases():
 
 
 def test_complementary_direct_paths_finish_before_candidate_construction():
-    target = _notification("target")
+    target = _notification("target", destination_engine=Engine.S)
     conditions = tuple(
         ActionGuard((Comparison(MODE, relation, literal(0)),)) for relation in ("==", "!=")
     )
@@ -353,7 +379,7 @@ def test_complementary_direct_paths_finish_before_candidate_construction():
 
 
 def test_partial_direct_path_keeps_the_peer_path_for_its_uncovered_domain():
-    target = _notification("target")
+    target = _notification("target", destination_engine=Engine.S)
     peer = replace(_notification("peer"), source_engine=Engine.V, destination_engine=Engine.MTE2)
 
     def following(current, consume, next_notification, source):
@@ -363,6 +389,7 @@ def test_partial_direct_path_keeps_the_peer_path_for_its_uncovered_domain():
         return (ActionGuard((Comparison(MODE, predicate, literal(0)),)),)
 
     domains = _Domains({target: (_case(0),), peer: (_case(0),)}, following)
+    assert domains._gate(target) and not domains._gate(peer)
     proof = prove_event_path_cover(
         domains,
         target,

@@ -14,13 +14,14 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from xdsl.dialects import arith
-from xdsl.ir import Operation, SSAValue
+from xdsl.ir import SSAValue
 
 from ..diagnostics import ErrorKind, require
 from ..dialects.physical import FixConfigOp, Load3DConfigOp, TaskOp
 from ..indexing import arguments, equivalent, interval, nonnegative, normalize, polynomial
 from ..scalar import Expr, expression, literal, substitute
 from ..target.ascend910b import Actor
+from .native import ConditionalRead
 from .structured_bounds import MemoryBoundsFacts
 from .structured_control import LogicalLoop
 from .structured_host import build_host_expressions
@@ -45,7 +46,7 @@ class ReadAdmission:
     participant: Actor
     writers: tuple[TaskOp, ...]
     external: bool = False
-    first_clear: Operation | None = None
+    initialization: ConditionalRead | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +402,45 @@ def _selected_values(structure, memory, templates, facts):
     return result
 
 
+def _conditional_initialization(access, template, memory):
+    """Prove that this instruction's reset initializes every conditional read.
+
+    For an invariant footprint and activation, an executing later ordinal has
+    the same instruction at ordinal zero, and each intervening instance writes
+    that complete footprint. Nested loop counts must be invariant too: a child
+    that is empty at zero cannot establish initialization for a later read.
+    This is numerical induction, never an asynchronous retirement statement.
+    """
+    condition = access.read_condition
+    if condition is None:
+        return None
+    control, facts = memory.control, memory.control.environment.facts
+    if equivalent(condition.kill.lhs, condition.kill.rhs, facts):
+        # A reset at every ordinal has no old-value read, even for a ring view.
+        return condition
+    if not control.invariant_over(access.address.offset, condition.loop):
+        return None
+    inside = False
+    for scope in template.frame.ancestors():
+        if scope.operation is condition.loop:
+            inside = True
+            continue
+        if not inside:
+            continue
+        if scope.loop is not None and not control.invariant_over(scope.loop.count, condition.loop):
+            return None
+        if scope.branch is not None:
+            comparison = scope.operation.cond.owner
+            if not isinstance(comparison, arith.CmpiOp):
+                return None
+            if not all(
+                control.invariant_over(control.environment.expression(value), condition.loop)
+                for value in comparison.operands
+            ):
+                return None
+    return condition if inside else None
+
+
 def admit_structured_memory(
     structure: NativeStructure, memory: NativeMemoryFacts, bounds: MemoryBoundsFacts
 ) -> StructuredAdmission:
@@ -457,15 +497,13 @@ def admit_structured_memory(
                 if access.address.root.owner.initialized.data:
                     reads.append(ReadAdmission(template, access, actor, (), external=True))
                     continue
-                if template.contract.native == "mad_first" and access.operand_index == 2:
-                    loop = next(reversed(template.frame.loops()), None)
-                    if loop is not None and loop.ordinal.args[0] not in arguments(
-                        access.address.offset
-                    ):
-                        reads.append(
-                            ReadAdmission(template, access, actor, (), first_clear=loop.operation)
-                        )
-                        continue
+                if (
+                    initialization := _conditional_initialization(access, template, memory)
+                ) is not None:
+                    reads.append(
+                        ReadAdmission(template, access, actor, (), initialization=initialization)
+                    )
+                    continue
                 candidates = []
                 writers = []
                 for writer, output, participant in prior.get(partition, ()):

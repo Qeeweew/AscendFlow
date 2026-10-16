@@ -9,11 +9,13 @@ from dataclasses import replace
 
 import pytest
 
+from tests.analysis.test_conditional_accesses import _retarget, _structure
 from xdsl_npu import language as N
 from xdsl_npu.analysis.access_frontier import AccessEndpoint, LoopResidueSelection, ResiduePosition
 from xdsl_npu.analysis.event_contracts import ResourceWork
 from xdsl_npu.analysis.event_domains import EventDomains
 from xdsl_npu.analysis.event_windows import _Builder
+from xdsl_npu.analysis.hazards import HazardKind
 from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
 from xdsl_npu.analysis.structured_dispatch import bind_structured_dispatch
 from xdsl_npu.analysis.structured_memory import collect_native_memory
@@ -22,11 +24,18 @@ from xdsl_npu.analysis.structured_protocols import (
     NotificationKind,
     SynchronizationSelection,
 )
-from xdsl_npu.analysis.structured_regions import AccessOccurrence, LoopBinding, LoopDomain
+from xdsl_npu.analysis.structured_regions import (
+    AccessOccurrence,
+    LoopBinding,
+    LoopDomain,
+    LoopOrdinalGuard,
+    StorageCell,
+    StructuredNeed,
+)
 from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.select_notifications import _bind_endpoint
+from xdsl_npu.passes.select_notifications import _bind_endpoint, _IssueOrder
 from xdsl_npu.scalar import expression, literal
 from xdsl_npu.target.ascend910b import Actor, Engine
 
@@ -174,3 +183,65 @@ def test_a_late_action_guard_cannot_authorize_selected_last(selected_context, fa
     bound, parent, _ = bound_coordinate(selected_context, family=family, source=True)
     with pytest.raises(CompileError, match="ordered activation prefix"):
         definedness(domains, replace(bound, coordinate_guards=()), parent)
+
+
+@pytest.mark.parametrize("period,distance", ((None, 0), (3, 1)))
+def test_native_conditional_read_guard_uses_the_consumers_actual_ordinal(period, distance):
+    structure = _structure(
+        "N.matmul(aa,bb,accum=c0,initialize=True)\nN.matmul(aa,bb,accum=c0,initialize=(k==0))"
+        if distance == 0
+        else None
+    )
+    if period is not None:
+        _retarget(structure, period)
+    memory = collect_native_memory(structure.module)
+    consumer = next(template for template in memory.templates if template.contract.read_resets)
+    writer = (
+        next(template for template in memory.templates if template.contract.native == "mad")
+        if distance == 0
+        else consumer
+    )
+    accumulator = consumer.accesses[2]
+    condition = accumulator.read_condition
+    assert condition is not None
+    logical = memory.control.loops[condition.loop]
+
+    def occurrence(template, ordinal):
+        return AccessOccurrence(
+            AccessEndpoint.from_template(template, Actor.AIC),
+            (LoopBinding(logical.operation, ordinal),),
+        )
+
+    need = StructuredNeed(
+        StorageCell(
+            accumulator.address.root,
+            Actor.AIC,
+            literal(0),
+            0,
+            accumulator.address.geometry.nbytes,
+        ),
+        HazardKind.RAW,
+        occurrence(writer, expression("sub", logical.ordinal, literal(distance))),
+        occurrence(consumer, logical.ordinal),
+        logical.operation,
+        domains=(LoopDomain(logical.operation, logical.count, distance=distance),),
+        guards=(LoopOrdinalGuard(logical.operation, condition.read),),
+        loop=logical.operation,
+        distance=distance,
+    )
+    source = _bind_endpoint(need, need.source, memory, source=True)
+    destination = _bind_endpoint(need, need.consumer, memory, source=False)
+    premises = ActionGuard(_IssueOrder(bind_structured_dispatch(memory)).premises(need))
+
+    def active(ordinal, count):
+        reset = ordinal == 0 if period is None else ordinal % period == 0
+        return distance <= ordinal < count and not reset
+
+    for count in (0, 1, 2, 3, 4, 7):
+        for ordinal in range(max(count, 1)):
+            values = {"n": count, "$group": 0, "$sid": 0, logical.ordinal.args[0]: ordinal}
+            assert destination.guard.evaluate(values) == active(ordinal, count)
+            assert premises.evaluate(values) == active(ordinal, count)
+            # The source runs at g-d: its predicate must test consumer g,
+            # including a later native reset that suppresses the old-value read.
+            assert source.guard.evaluate(values) == active(ordinal + distance, count)

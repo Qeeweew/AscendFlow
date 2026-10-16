@@ -29,6 +29,10 @@ def dependencies(source):
     return build_structured_dependencies(memory)
 
 
+def dependency_issues(result):
+    return result.values.unresolved + result.storage.unresolved
+
+
 def materialized_edges(result, values):
     """Small independent interpreter for quantified obligations, never production."""
     edges = set()
@@ -122,7 +126,9 @@ def test_real_cube_nested_and_cv_sources_close_without_old_completion_graph(sour
     result = dependencies(source)
     result.require_closed()
     operations = {template.operation for template in result.memory.templates}
-    assert result.loop_carries
+    assert any(
+        n.loop is not None and n.distance is not None and n.distance > 0 for n in result.needs
+    )
     assert all(
         n.source.operation in operations and n.consumer.operation in operations
         for n in result.needs
@@ -169,7 +175,19 @@ def test_read_only_child_requires_every_reader_before_parent_overwrite():
     assert (
         release.source.families[-1].count == next(iter(result.memory.control.loops.values())).count
     )
-    assert all(c.raw.source == c.waw.source for c in result.read_carries)
+    before, reader, after = (t.operation for t in result.memory.templates)
+    loop = next(iter(result.memory.control.loops.values()))
+    initial = before, Actor.AIV0, ()
+    overwrite = after, Actor.AIV0, ()
+    for count in range(5):
+        readers = {(reader, Actor.AIV0, ((loop.operation, ordinal),)) for ordinal in range(count)}
+        edges = materialized_edges(result, {"n": count, "$group": 0, "$sid": 0})
+        assert {edge for edge in edges if edge[0] is HazardKind.RAW} == {
+            (HazardKind.RAW, initial, endpoint) for endpoint in readers
+        }
+        assert {edge for edge in edges if edge[0] is HazardKind.WAR} == {
+            (HazardKind.WAR, endpoint, overwrite) for endpoint in readers
+        }
 
 
 def test_rmw_same_task_next_generation_is_a_real_dependency():
@@ -276,7 +294,7 @@ def test_default_flash_attention_closes_in_compact_actual_fragment_families():
     assert result.work.needs < 1500
     assert any(isinstance(n.residue, Expr) for n in result.needs)
     assert any(domain.first > 0 for n in result.needs for domain in n.domains)
-    assert any(e.all_members for e in result.exits)
+    assert any(e.all_members for e in result.storage.exits)
 
 
 def test_strided_native_rows_stay_exact_compressed_rectangles():
@@ -291,7 +309,7 @@ def test_strided_native_rows_stay_exact_compressed_rectangles():
                     N.copy(Scratch[0:8,0:128],x)
     """)
     result.require_closed()
-    gm = {cell for cell in result.root.cells if cell.root.type.bank.data == "GM"}
+    gm = {cell for cell in result.values.root.cells if cell.root.type.bank.data == "GM"}
     assert len(gm) == 2
     assert {cell.rows for cell in gm} == {8, 120}
     assert all(cell.stop - cell.start == 512 and cell.row_stride == 4096 for cell in gm)
@@ -334,7 +352,8 @@ def test_nonzero_serial_start_and_step_use_actual_last_induction(last, closed):
     assert result.closed is closed
     if not closed:
         assert any(
-            issue.kind is DependencyIssueKind.PARENT_ACTIVATION for issue in result.unresolved
+            issue.kind is DependencyIssueKind.PARENT_ACTIVATION
+            for issue in dependency_issues(result)
         )
 
 
@@ -351,7 +370,9 @@ def test_parent_dependent_possibly_empty_child_does_not_invent_last_writer():
                     N.mul(x,3.0,out=y)
     """)
     assert not result.closed
-    assert any(issue.kind is DependencyIssueKind.PARENT_ACTIVATION for issue in result.unresolved)
+    assert any(
+        issue.kind is DependencyIssueKind.PARENT_ACTIVATION for issue in dependency_issues(result)
+    )
     with pytest.raises(CompileError, match="activation"):
         result.require_closed()
 
@@ -367,7 +388,9 @@ def test_contracted_family_cannot_erase_shifted_or_invariant_aliases(reader):
                     N.mul(x[{reader},:],2.0,out=y)
     """)
     assert not result.closed
-    assert any(issue.kind is DependencyIssueKind.NONPERIODIC_REUSE for issue in result.unresolved)
+    assert any(
+        issue.kind is DependencyIssueKind.NONPERIODIC_REUSE for issue in dependency_issues(result)
+    )
 
 
 def test_unknown_symbolic_alias_fails_closed_instead_of_disjoint_fallback():
@@ -379,7 +402,9 @@ def test_unknown_symbolic_alias_fails_closed_instead_of_disjoint_fallback():
                 N.fill(x[b*32:b*32+32],2.0)
     """)
     assert not result.closed
-    assert any(issue.kind is DependencyIssueKind.SYMBOLIC_ALIAS for issue in result.unresolved)
+    assert any(
+        issue.kind is DependencyIssueKind.SYMBOLIC_ALIAS for issue in dependency_issues(result)
+    )
     with pytest.raises(CompileError, match="coordinate"):
         result.require_closed()
 
@@ -400,4 +425,6 @@ def test_unknown_scalar_carry_is_not_a_loop_invariant_branch():
     # The two branches can execute on successive iterations. An unknown
     # carried scalar cannot justify their lifetime-long mutual exclusion.
     assert not result.closed
-    assert any(issue.kind is DependencyIssueKind.PARENT_ACTIVATION for issue in result.unresolved)
+    assert any(
+        issue.kind is DependencyIssueKind.PARENT_ACTIVATION for issue in dependency_issues(result)
+    )

@@ -10,7 +10,8 @@
 |---|---|---|
 | Source 与控制 | `test_frontend.py`、`control/`、`loops/`、`test_compilation.py` | 显式控制、Stage/actor、原始 SSA、source 所有权与不可变产物 |
 | Native 与内存 | `analysis/test_native_geometry.py`、`test_native_packets.py`、`test_structured_*.py` | 静态 native 规则、issue packet、真实地址/footprint、bounds、owner、SPR、初始化和数值生产者 |
-| 依赖与同步选择 | `analysis/test_access_frontier.py`、`test_structured_dependencies.py`、`sync/test_notification_selection.py` | 实际读写/退休义务、捕获/获取端点、实际代次与完整 CV quorum |
+| 值版本与生命周期 | `analysis/test_logical_valueflow.py`、`test_conditional_accesses.py`、`test_storage_word.py`、`test_storage_lifetimes.py` | 条件 clear/RMW、读版本、PLE 邻接和实际 IR 值保持 |
+| 依赖与同步选择 | `analysis/test_dependency_retirement_frontiers.py`、`test_structured_dependencies.py`、`sync/test_notification_selection.py` | 最后真实 reader、捕获/获取端点、实际代次与完整 CV quorum |
 | 资源与进展 | `analysis/test_event_*.py`、`test_progress_*.py`、`test_structured_resources.py`、`test_structured_resource_contracts.py`、`test_structured_event_sharing.py` | 精确激活、空/短循环、窗口投影、ID lease、最后消费、真实阻塞路径和 region 接口 |
 | 最终 IR 与 ASC | `backend/test_structured_emission.py`、`sync/test_structured_pipeline.py` | 后端消费既有事实、实际 Notification/SCF/Address SSA 与生成调用 |
 | 数学、ABI 和测量记录 | `test_attention_math.py`、`test_runtime_contract.py`、`test_attention_runner.py`、`test_performance.py`、`test_work_inventory.py` | 数学参考、host guards、命名 ABI、证据身份、静态工作量与显式分析假设 |
@@ -31,7 +32,7 @@
 
 ## 运行纪律
 
-先执行小规模 Python/IR 检查，再考虑 ASC/CANN 离线编译。本轮测试清退以 lint、import 与 collection 为主，另定向检查了极小的 native recipe 合同；没有执行完整测试集、完整算子构建或性能测量。可从工作区检查当前入口：
+先执行小规模 Python/IR 检查，再考虑 ASC/CANN 离线编译。运行结果按实际提交及产物记录在 `docs/refactor-progress.md`，不把 collection 当作通过。可从工作区检查当前入口：
 
 ```bash
 .venv/bin/python -m pytest --collect-only -q compiler/tests

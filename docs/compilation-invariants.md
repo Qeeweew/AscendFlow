@@ -13,7 +13,8 @@ normal 不反复重建整个同步图，也不依赖外部可伪造的 verified 
 | 输入合法 | 前端/admission：类型、runtime合同、坐标、constexpr | launcher 检查需要运行时成立的前提；后续不重新解析源码 |
 | effects 完整 | native lowering + 目标原语合同 | 访问包含 scratch、padding、SPR、读写及退休点 |
 | alias/owner | 物理访问分析 | root、view、范围、owner 与 slot/generation 不能丢失 |
-| 值与依赖 | 依赖分析 | read 的定义、RAW/WAR/WAW 与全部相关旧 reader |
+| 数值版本 | logical valueflow | read 的精确定义、条件 KILL/UPDATE、代次和未绑定的输入 |
+| 物理复用 | storage lifetimes | 同一实际 cell 的相邻覆盖及全部末 reader；不得重绑数值版本 |
 | 排步固定 | pipeline lowering | actor-local step、logical generation、stage、issue order |
 | 循环等价 | PLE 构造与边界组合 | 实例和词法次序不重不漏；零次 identity；回边正确 |
 | 完成与可见性 | typed 协议构造 | 只消费已取得的 ready/release/capture 事实 |
@@ -42,9 +43,13 @@ IRDL verifier 负责结构和类型，不能替代异步正确性。有限模型
 ## 3. 完成与同步的关键限制
 
 - source SSA use-def 不证明异步完成；issue/queue/native end/累计退休/通知消费不同。
-- read→writer的数值版本关系与物理buffer的退休/复用关系是两类义务。实际dispatch不能把读改绑到最近writer；同样，source中的临时写入次序不能未经生命周期证明就被当作所有物理覆盖的唯一顺序。当前实现尚未完成二者拆分，默认FA的具体反例和迁移步骤见状态页与计划。
+- read→writer的数值版本关系与物理buffer的退休/复用关系是两类义务。实际dispatch不能把读改绑到最近writer；同样，source中的临时写入次序不能未经生命周期证明就被当作所有物理覆盖的唯一顺序。实现已拆分为 logical valueflow 与 storage lifetimes；完整嵌套资格仍见状态页。
 - 完整kill、条件首clear和RMW必须各自保留访问语义。允许已证明独立的private scratch生命周期按既定dispatch排列，不自动授权改变外部可见写、累加递推或状态更新；actor-private、buffer名字不同或一条已有admission成功都不足以证明这种独立性。
 - 只在目标原语允许的累计前缀内比较进度；多个流水或参与者不可仅取一个最大序号。
+- `mad_first` / `mad_cycle` 的条件读绑定其真实 Stage 所在循环的逻辑 ordinal；首 clear 是完整覆盖，其余代次保留输入值。完整 operand 写入并不自动覆盖 contracted family envelope。
+- 独立 packet 必须为精确 private cell（当前不含 streaming envelope），内部所有读已有定义，没有跨 packet/跨代 RAW，阶段同 offset 且在实际派发中连续，内部源码次序不变。头部无旧值输入才能证明从完整 kill 开始；只凭 private 或 tensor 名字不够。
+- packet 的外层接口必须保持实际首末边界。当前仅 root-private、无外部访问、无外层循环的 scratch 允许改变边界，并重建物理退出义务；其余需要保持边界或拒绝该独立性证书。
+- PLE 邻接按 `(generation + offset, lexical)` 建立，允许负逻辑 distance。长循环使用静态 prologue/epilogue 和符号 steady family；短循环只按静态 stage span 分区，不按 runtime count 展开。静态 span/packet/work 超预算诊断失败，无 barrier fallback。
 - Set 采集合法 source capture 的事实；Set 自身的效果不使后续源操作自动退休。
 - Wait 只在其真实 admission 后传递已消费通知的事实。CV controller Wait 的派发阻塞单独建模。
 - release 捕获目标存储的全部相关最后 reader；GM import 完成可以释放 GM，即使 Vector 仍处理 UB。L1→L0 最后读取可以释放 L1，即使 MAD/FIX 未完成。
@@ -125,3 +130,9 @@ IRDL verifier 负责结构和类型，不能替代异步正确性。有限模型
 函数atom的数学身份由同一多项式实现自底向上建立：add/mul使用规范多项式，其他函数以kind和实参的规范身份区分；min/max保留交换律，div/rem不得交换实参。键构造将unsigned函数视为未解释函数，不借全局positive事实替代实际有序前缀。声明可整除的动态商产生分数系数时，也不能因无法重建整数Expr而失去实参同余。
 
 `AtomIdentity`只保存不可变数学key，不保存跨查询raw代表。每次查询从自己的原式选择代表；`normalize`和`bounded`共用本次IntegerFacts的key环境及同一多项式操作。公共多项式的atom和返回表达式仍为Expr，不泄漏typed key或伪造的argument。键、共享DAG与多项式工作受原有预算约束；bounded前处理也按唯一节点遍历。原始有序定义性检查始终读取raw guard，因此数学同值不授予原式求值权，也不授权重写source/emitted DAG。
+
+## 条件事件路径的工作量
+
+同一复用查询使用一份条件端点图。反向拓扑可达性只提供必要条件，不能把未知激活删掉；最终证明仍要求路径条件覆盖完整 assumptions，且每步持有真实 queue/controller gate 与已选通知效果。一个实际端点上的不同 guard 保留；只有条件包含或完整覆盖可吸收。
+
+`path_states` 计图节点，`path_guard_states` 计接受的条件状态，`path_edges` 计实际条件边，`path_edge_queries` 计唯一候选边查询。两类状态都受256限制，实际边8192、候选4096、输出路径/长度128。新计数语义不与旧重复扫描数作直接倍率比较。候选范围以实际 parent dispatch step 为准，使用直接 parent stage，不能使用子循环内部 stage 或假定 logical distance 非负。

@@ -143,6 +143,8 @@ class ResourceWork:
     witness_steps: int = 0
     path_states: int = 0
     path_edges: int = 0
+    path_edge_queries: int = 0
+    path_guard_states: int = 0
     path_covers: int = 0
     cover_nodes: int = 0
     cover_queries: int = 0

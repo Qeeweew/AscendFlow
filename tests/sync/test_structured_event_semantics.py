@@ -13,6 +13,7 @@ from xdsl.dialects.builtin import ArrayAttr, IndexType, StringAttr
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.analysis.test_event_parameter_cases import nested_slot_source
+from tests.fixtures.nested import shared_l0c_qk_pv
 from tests.models.structured_events import EventModelError, check_structured_events
 from xdsl_npu import compile
 from xdsl_npu import language as N
@@ -20,6 +21,18 @@ from xdsl_npu.analysis.structured_memory import collect_native_memory
 from xdsl_npu.dialects.structured import ActorDomainOp, NotificationOp
 from xdsl_npu.passes.lower_native import lower_native_structure
 from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
+
+
+def test_shared_l0c_packet_reuse_keeps_actual_read_versions_through_loop_boundaries():
+    from xdsl_npu.budget import limit
+    from xdsl_npu.passes.structured_sync import synchronize_structure
+
+    # One symbolic compilation, shared by empty, singleton and steady cases.
+    with limit(300):
+        result = synchronize_structure(shared_l0c_qk_pv)
+    for count in range(4):
+        execution = check_structured_events(result.memory, {"n": count})
+        assert len(execution.natives) == 73 * count
 
 
 def memory(source):

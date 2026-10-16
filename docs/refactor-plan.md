@@ -8,7 +8,7 @@
 DSL/source
   → retained native结构与SSA地址
   → 物理访问、ownership、值与输入合同
-  → sequence / branch / loop依赖
+  → 精确逻辑值流 + 已绑定dispatch上的物理生命周期
   → 逻辑通知
   → 事件域 → 生命周期与进展 → bank/ID
   → 最终物理IR
@@ -19,25 +19,32 @@ DSL/source
 
 测试和基准消费者统一迁至当前产物。公共入口切换与代码删除本身不代表新路径已获得全部功能资格。
 
-## 2. 当前重点：分开值依赖与物理复用
+## 2. 值、存储和循环接口的重构
 
-参数case、多余数窗口、条件路径覆盖、统一queue-order和函数实参同余已经接通。真实双runtime循环/双slot及嵌套CV通过了对应层验证。当前默认FA的拒绝已定位到更早的**依赖构造合同**：`structured_dependencies`按source顺序固定全部RAW/WAR/WAW，`structured_sync`随后才绑定dispatch。实际派发重排独立临时值时，source的物理反依赖会产生不必要的顺序约束；不能通过关闭progress或删一个event解决。
+源码顺序混合固定 RAW/WAR/WAW 的旧递归构造器已删除。当前分工是：
 
-具体证据：共享L0C plane0在稳态的实际发射为`QK(j) → PV(j−1) → QK(j+1)`；当前依赖却要求`PV(j−1) FIX → QK(j) MAD`。这条WAR选成n15后，与同一QK的M→FIX RAW形成真实等待环。n15还合并了plane1的必要WAR，不能整条省略。有限实例及原始端点见[状态页](refactor-progress.md)。这证明当前选中同步不可进展，不证明FA数学算法或给定排步本身不可行。
+1. `logical_valueflow` 一次建立精确 read→writer、代次、条件 KILL/UPDATE。未绑定输入仍是 Boundary，不由同步补成初始化。`mad_first` 的首 clear 与后续 RMW 使用原语条件访问合同。
+2. `storage_packets` 从这些值证明中识别闭合 private 生命周期；`storage_word` 只推导给定排步的 PLE 相邻关系；`storage_lifetimes` 连接实际最后 reader 与下一覆盖。不是生成源码 WAR 后选择性删除，也不把读改绑到 dispatch 最近的 writer。
+3. PLE 的每条关系共用实际循环的 consumer ordinal `j`，source 为 `j-distance`，入口/出口以 membership guard 表达。静态边界不另造脱离该循环的有限时钟；distance 可负。运行期长度不展开。
+4. `structured_dependencies` 只编排两个阶段，后续 selection / EventDomains / progress / lease / ID 共用一条链。旧 `access_frontier` 有限求解器、carrier 类型和专属测试已直接删除；端点/FIRST/LAST 类型及硬件反例留在当前表示。
 
-按以下顺序重构，不再建设另一条同步路径：
+资格边界：目前只对精确 private cell、无跨 packet/跨代 RAW、同 offset 连续 stage、完整初始覆盖的 packet 授权独立重排。不将 streaming envelope 当作单次完整覆盖；外部可见状态和递推仍保留真实顺序约束。外层接口必须保持，只有无外部访问且无重复父循环的 root-private scratch 允许更换首末接口。更广的条件/动态 ownership 需要新的证明，不能凭 private 放宽。
 
-1. **明确每个读取得的值。** 从现有source访问与准入事实保留精确read→reaching writer、范围、条件和代次；显式Tile与raw view都要有合同。当前ReadAdmission只保存若干writer操作，不能当作完整版本/生命周期证书。不能把读改绑到dispatch中最近的writer。
-2. **区分完整覆盖与递推更新。** 完整kill建立新值生命周期；RMW保留其旧值输入、累加次序及条件。`mad_first`的首clear事实目前只用于admission，依赖阶段尚未消费；须用原语的条件读写合同表达首clear和后续RMW，不能按算子名字补特判或删除后续累加RAW。
-3. **在已有排步上确定物理复用。** 将上述值实例映射到实际dispatch，对相同root/owner/byte cell推导相邻生命周期、全部最后reader和下一覆盖者。只有证明完整且独立的private scratch生命周期才允许改变source中的存储反依赖；actor-private本身不够。外部可见写入、递推状态和未证明别名保持其必要顺序或明确拒绝。
-4. **循环仍按接口合成。** 由真实prologue/loop/epilogue的值和存储接口建立边界、回边及generation，不按runtime长度展开。不能把所有反向边统一改distance，也不能把子循环出口当异步退休。plane0与plane1分别建立实际复用链，随后才允许累计capture合并。
-5. **共用后续同步合同。** 新的RAW值义务与physical WAR/WAW义务仍进入现有selection、事件域、路径覆盖、progress与分配器。替换被混用的source-order职责，不保留旧求解器作为fallback，不修改FA算法、缓冲、issue_order或最小输入规避问题。
+通用反例已覆盖完整临时值换序、同 Vector 的值覆盖拒绝、真实 release 删除后的 WAR、首次 clear/后续 RMW，以及短循环/负 distance。共享 L0C 子循环已完成事件复用、有限最终IR和CANN资格；默认 FA 完整构建仍超时，先做有界资源阶段诊断。
 
-先验收通用反例：独立完整覆盖的private值允许既定重排；读版本被覆盖、别名未知、外部写顺序和RMW递推不能因此放宽。`shared_l0c_qk_pv`目前只测了依赖/选择，必须补实际同步与有限队列验收，不能把已有局部通过称完整支持。保持数值/slot/参与者与通知资源检查后，再恢复默认FA完整资格。
+## 3. 当前事件接口收尾
 
-事件层继续保持已建立的不变量：case必须覆盖实际membership；原始端点分别检查定义性与配对；consume→reuse必须有完整条件路径；parent只消费child接口；queue cut只表达阻塞，不提供完成；bank找不到方案不是硬件容量下界。具体合同集中在[编译不变量](compilation-invariants.md)，不在此复制第二份算法。
+共享 L0C 的存储接线已改为实际 `QK(j) → PV(j−1) → QK(j+1)`，读版本不变；旧错误的 `PV(j−1) → QK(j)` 不再产生。当前小例已完成 progress 和跨父调用的 consume→reuse 证明。
 
-## 3. 收尾产品组织和功能资格
+事件候选必须以实际 dispatch step 为范围，按端点的逻辑坐标加直接 parent stage offset 转换；内层 stage 不能挪用为外层 offset。旧的只向前候选会漏掉 PV(j−1)。此外，width=1 在 prologue 可能没有返回路径：应该由有限条件图得出该宽度未成立，再按原资源规则考察下一宽度，而不是反复枚举无关未来路径直至预算耗尽。
+
+路径证明内部已替换为一份 owned 条件端点图，节点保留完整坐标和参与者、边保留真实 queue/controller 条件与已选事件效果。必要的反向可达性只排除图上无路径的节点，不能把条件未知当成不成立；最终仍需路径条件覆盖整个复用域。旧前向搜索实现已删除，不保留第二套 fallback，不提高预算，不跳过配对或原式定义性。
+
+默认 FA 完整构建仍在300秒被停止；source 到 EventDomains 的单独有界提取约23秒，后续诊断确认进入 progress。下一步按实际 region 的接口节点、关系与消元工作定位并重构 progress 组合，不能继续盲跑完整 FA、提高预算或把端点条件丢掉。异步栈采样本次异常退出，不作为根因证据。
+
+原 progress 对固定 finite 端点和 stream 的联合投影仍有保守支持边界；不能将逐边存在投影相乘视为共享同一 ordinal 的联合证明。当前 PLE 统一时钟避免拆散本就属于一个循环的关系，不宣称实现了任意联合投影。
+
+## 4. 收尾产品组织和功能资格
 
 - 直接删除被替代的planner闭包及旧API专属测试。原语合同只接收几何，ASC只读取最终SSA；硬件反例迁至当前IR与独立模型，不保存旧实现。
 - 基准消费者读取当前产物；结构模板数、算法工作量、实际运行期请求和设备流量分别标识，缺失计数明确报告。
@@ -48,7 +55,7 @@ DSL/source
 
 当前主干代码组织、单一路径和旧职责退场已经落实；在该结构上处理重复整数证明和端点绑定后，嵌套CV已恢复完整构建。默认FA及设备资格仍需独立完成，不以小例或历史产物替代。
 
-## 4. 结构改造落地后分析编译性能
+## 5. 结构改造落地后分析编译性能
 
 固定当前源码、选项和输入；对成功产物记录IR/ASC，对未完成构建先记录实际停止阶段和有界诊断。测量各阶段工作量和耗时。分别考察native模板、物理分区、region边界、逻辑通知及资源关系数；runtime长度作为变量，不按执行次数展开。
 

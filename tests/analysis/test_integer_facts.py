@@ -20,6 +20,21 @@ X, Y, D = (Expr("argument", (name,)) for name in ("x", "y", "d"))
 PREDICATES = {"==": eq, "!=": ne, "<": lt, "<=": le, ">": gt, ">=": ge}
 
 
+@pytest.mark.parametrize("predicate", ("==", "!="))
+def test_relation_premise_and_query_share_clamp_and_division_normalization(predicate):
+    queries = IntegerFacts({"y": Fact()})
+    count = expression("ceildiv", expression("max", Y, literal(0)), literal(1))
+    end = expression("sub", count, literal(1))
+    shifted = expression("add", expression("sub", X, literal(1)), literal(1))
+    source = Comparison(shifted, predicate, end)
+    consumer = Comparison(X, predicate, end)
+    assert queries.prove(source, (consumer,))
+    assert queries.prove(consumer, (source,))
+    assert not queries.prove(Comparison(X, predicate, count), (source,))
+    for x, y in product(range(5), repeat=2):
+        assert source.evaluate({"x": x, "y": y}) == consumer.evaluate({"x": x, "y": y})
+
+
 @pytest.mark.parametrize("period", (2, 3, 7))
 def test_whole_period_translation_keeps_the_inner_unsigned_domain(period):
     queries = IntegerFacts({})

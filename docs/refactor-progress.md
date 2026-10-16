@@ -1,90 +1,72 @@
 # 当前重构状态
 
-**重构尚未完成；旧实现与兼容路径继续直接删除。** 真实双runtime循环/双slot已完成条件生命周期、最终IR有限模型与CANN闭环；默认FA的整数规约缺口已修复，当前阻塞是source顺序的物理反依赖与实际排步的关系。算子调优未恢复，本轮没有设备结果，编译耗时未达标。
+**重构尚未完成；不保留被替代的实现或兼容路径。** 本轮已拆开源码值版本与物理存储生命周期，通用 PLE 复用通过实际 IR 小例。共享 L0C 子循环已经通过最终 IR 有限模型和 CANN 离线编译；默认 FA 的本次完整构建仍触及300秒硬上限。没有恢复算子调优或设备工作；没有当前 FA 成功构建或性能达标结论。
 
-算法合同见[编译不变量](compilation-invariants.md)，职责见[源码组织](source-layout.md)，剩余步骤见[重构计划](refactor-plan.md)。历史状态由产品Git及外层runs追溯，不作为当前资格。
+合同见[编译不变量](compilation-invariants.md)，模块职责见[源码组织](source-layout.md)，下一阶段见[重构计划](refactor-plan.md)。历史由产品 Git 和外层 runs 追溯，不再在此维护多轮流水账。
 
-## 唯一编译链路
+## 本轮实现
 
-```text
-DSL/source → 保留控制与地址SSA的native IR
-  → 物理访问/准入/ownership → region依赖 → 逻辑通知
-  → 精确事件域 → 进展/生命周期/资源分配
-  → 实际同步IR → 通用纯整数化简 → ASC → CANN
-```
+- `structured_dependencies.py` 的旧递归 `_Builder` 已删除，入口只编排值流、dispatch 和存储义务。`access_frontier.py` 删除未使用的有限求解器，仅保留实际端点及 FIRST/LAST 选择类型。没有将旧实现移入 tests，也没有兼容 alias。
+- `logical_valueflow.py` 只建立精确 RAW、条件 KILL/UPDATE 和源码区域接口；`CellEffect` 保留各 operand 的真实访问。`mad_first` / `mad_cycle` 的读条件来自原语合同，首 clear 不再取得虚构的旧值；周期大于 1 的 reset 在通用循环值闭包尚未建立时明确拒绝。
+- `region_coordinates.py` 统一条件、绑定和域构造。`storage_packets.py` 证明闭合的精确 private 生命周期，`storage_word.py` 建立静态 prologue / 符号 loop / 静态 epilogue 邻接，`storage_lifetimes.py` 产生最后 reader→下一覆盖的 WAR/WAW。源码读版本不变。
+- 边界和稳态共用 consumer `j`，source 为 `j-distance`；singleton 用 membership guard 表达，负 distance 合法。没有运行期迭代展开。两端等式比较的 premise/query 统一执行相同整数规约，原始 unsigned 定义域检查仍独立保留。
+- 后续 selection、配对、progress、lease、分配和 ASC 沿用唯一链路。算法仍在 examples；两个 AIV 的共享 body/runtime sid 模型未改变。
 
-- 被替代的planner、旧物理IR、解码器与兼容入口已删除，不移入tests保存。算法留在examples。两个AIV共用body，以runtime sid区分地址和角色，分析保留各自ownership和贡献。
-- 参数域直接使用`EventDomains.cases`，多余数窗口保留实际membership、rank和首末成员。各case使用自己的编号模数，一个通知只预留一次最大宽度。没有全程序case产品或runtime迭代展开。
-- 同一`IntegerFacts`持有本次编译的完整有序前提；原始端点的算术定义性早于交集和空域裁剪。父region消费child接口，不把控制退出当异步完成。
+## 当前测试证据
 
-## 本轮完成的重构
+各组有重叠，不相加作为独立总数；未跑完整 suite。
 
-1. `event_paths.py`统一消费到复用的真实路径。每条路径保留activation及队列顺序条件，`guard_cover.py`证明这些条件覆盖整项义务。内层复用、外层重入和有限ID共享使用同一合同；旧bridge、单steps字段和布尔顺序包装已删除。
-2. `EventDomains`以实际`coordinate+stage/lexical/phase`构造条件顺序。生命周期与progress共同消费；progress不再另写一份native顺序推导。child queue cut、stream步长下界仍为各自保守阻塞包络，不提供buffer退休证明。
-3. `modular.py`只处理证明中的相关多项式余数；整数三分和余数mask都不成为运行期case或排步。`(p*m+g)%2`整体关联保留。大小比较先求原余数范围内的mask，不能以模等价代替大小关系。
-4. 路径搜索逐层判断完整覆盖，覆盖后停止扩展。相同端点仍保留不同条件，部分direct路径不能遮掉其他相位所需的间接路径。候选按需构造；状态、边、offset和证明节点/谓词工作均有预算，失败查询也计数。
-5. Attention runner删除旧`cross_query_verified/query_verification`报告合同及测试fixture，只读取当前source构建产物。build状态、manifest及计时文件一致性属于来源检查，不冒充独立同步证明。`Compilation.source_ir`不再可选，source/schedule始终写出。
+| 检查 | 结果与边界 |
+|---|---|
+| 条件访问、native geometry/packet、admission | 99 passed，4 个 real DSL 项未执行 |
+| 逻辑值版本 | 14 passed；首次 clear、RMW、空循环、reader families、shared L0C 的独立逐字节读版本 |
+| 纯 PLE 邻接 | 41 passed；offset/lexical 排列、短循环、负 distance、静态预算及大 runtime count 不展开 |
+| PLE 实际依赖绑定 | 48 passed；n=0..4 的 RAW/WAR/WAW 与独立实际 native 访问轨迹一致 |
+| 原依赖回归 | 19 passed，默认 FA 未执行 |
+| 条件端点与小型通知选择 | 27 passed，7 deselected；未包含 FA/shared L0C 完整生成 |
+| 整数关系与生命周期小例 | 108 passed；包含6个实际同步/拒绝/破坏回归 |
+| 本地 Vector/Cube 最终同步 IR | 22 passed，见 [日志](../../runs/lifetime-refactor/local-pipeline-tests.log) |
+| 条件端点图 | 7 passed；部分直接路径、互补 guard、缺 peer、无返回的未来分支 |
+| 候选实际坐标 / 条件 lease | 分别3项 / 9项通过；测试协议显式区分 Scalar controller 与普通队列 |
+| 原事件资源集成 | 16 passed，24.49秒；含真实parent重入、缺失返回路径、mixed与fence合同 |
 
-## 真实双slot闭环
+`tests/analysis/test_storage_lifetimes.py` 包含：独立 scratch 生命周期换序、交错 MTE3 copy、offset 0/1 的 fill/drain 流水（最终 IR 模型 n=0..4）；同 Vector 错误覆盖拒绝；删除实际 MTE3→V release 后独立模型发现 WAR。有限模型不代表任意规模或设备数值证明。
 
-源码为`tests.analysis.test_event_parameter_cases.nested_slot_source(2)`，外层p和内层g均为runtime循环，物理slot为`(p*m+g)%2`。连续RAW流的下一同ID复用需经两条不同slot的WAR通知；m=4时g=0与g=1不能任选一个peer。现已保存完整条件路径覆盖，删除任一peer的回归仍拒绝。
+`tests/analysis/test_storage_word_binding.py` 检查实际依赖，不依赖生产 PLE helper 产生预期。`tests/models/structured_events.py` 保持独立逻辑字节版本与硬件队列语义，没有改成消费生产 conditional-read 谓词。
 
-- [公共CLI/CANN构建](../../runs/lease-cover/slots-build/build-result.json)通过：总60.00秒，Python57.38秒、CANN2.41秒；这是功能构建记录，期间有短CPU回归，不是独占性能基准。
-- [同步前IR](../../runs/lease-cover/slots-build/before.xdsl)、[最终IR](../../runs/lease-cover/slots-build/after.xdsl)、[ASC](../../runs/lease-cover/slots-build/slots.asc)可直接查看。2个native模板仍只打印2次，12条通知、29条同步指令，未增加搬运或更改buffer/排步。
-- 最终IR独立事件/字节模型覆盖n=0..3、m=0..5共24项：包含空父/空子、短循环、奇偶长度和跨父slot复用。n=3,m=5有30个native实例、30次通知消费，读写各7680字节；见[模型记录](../../runs/lease-cover/slots-final-model.log)。这是有限实例，不是任意N证明或设备数值结果。
-- 产品模型回归只完整编译一次，24项共享最终产物。逐层覆盖即停、失败工作计数和顺序接口清退后，同次编译的IR/ASC仍与上述CANN产物逐字一致；见[回归及hash记录](../../runs/lease-cover/slots-sync-regression.log)。末次progress改动仅更换顺序证明消费者，相关正负回归另行通过，不改变物化方案。
+## 共享 L0C 的现状
 
-本轮受影响分析集成261项通过，见[日志](../../runs/lease-cover/integrated-tests.log)。最后progress统一消费者后6模块38项通过（5.29秒）；Attention runner与小型source产物组78项通过（3.39秒）。各组有重叠，不相加称独立总数；未跑全套suite。全局Ruff与diff检查通过。
+基线 `dbcef70` 的 FA 失败来源已保存于 [旧队列证据](../../runs/atom-identity/progress-gap/evidence.md)：源码顺序产生 `PV(j−1) FIX → QK(j) MAD`，与真实 `QK(j) → PV(j−1) → QK(j+1)` 排步冲突。新物理阶段只对已证明独立的 plane0 packet 重建相邻关系；plane1 和 PV 累加 RAW 继续保留。
 
-此前`c1d4465`上的嵌套CV曾通过CANN和n=0/1/2、groups=0/1、双AIV的最终IR模型，见[构建](../../runs/refactor-cases/nested-cv/build-result.json)。这是基线资格，不替代当前完整算子验收。
+小型 `shared_l0c_qk_pv` 的值、全部实际 storage hazards、选择与 EventDomains 已通过对应检查。旧有限边界表示暴露了 progress 提前存在投影丢掉共享 ordinal 的保守拒绝；统一 PLE 时钟后已越过该阶段。
 
-## 本轮整数表示与fence职责修复
+事件路径已替换为一份条件端点图：候选只生成一次，必要的反向可达性排除无法到达目标的端点，然后保留完整路径 guard 做覆盖。节点/条件状态预算均256，边8192，路径/长度128，候选4096，均未提高；图节点、条件状态、实际边和查询分别计数，不能与旧的重复扫描计数直接作倍率比较。旧前向搜索代码未保留。
 
-- `indexing.py`现在由一个有界多项式实现同时承担完整索引规约和保留函数的ring规约。typed函数key规范化实参，raw代表按查询选择；`IntegerFacts.normalize/bounded`共用同一身份环境。删除原`$resource_atom_N`伪参数；公共输出仍为Expr。完整unsigned前缀检查继续读取原表达式。
-- 声明可整除动态商进入rem/floor/ceil/min/max时，嵌套同义索引现已可判等。独立标量/索引/窗口集成159项通过（3.21秒），见[日志](../../runs/atom-identity/scalar-window-tests.log)。之后补充的跨查询raw代表隔离与共享DAG回归也通过；此前后置前提、数学零掩盖非法运算等负例保留。
-- 同流水fence保留选择阶段的capture与全部端点准入，直接按原consumer guard物化一次，不再构造无消费者的binary事件case/window/lease。7个零/短/奇偶循环最终IR模型实例和非法端点负例通过。资源、准入、实际同步与域的集成136项通过，见[日志](../../runs/atom-identity/integrated-tests.log)。全局Ruff与diff检查通过，未运行全套suite。
-- 当前嵌套CV再次通过公共CLI/CANN，总24.09秒，见[构建](../../runs/atom-identity/nested-cv/build-result.json)。最终IR/ASC与先前合格产物逐字相同，直接复用n=0/1/2、groups=0/1、双AIV的有限证据，不重跑未改变产物；见[hash/模型记录](../../runs/atom-identity/nested-cv/finite-model.log)。8个native模板各打印一次，AIV native body仍只有一份。这是功能构建，不能称编译性能达标。
+n6 的跨父调用 lease 现已通过（事件环宽度4）：单项含 setup 3.35 秒，105个累计图节点、473条实际条件边、26个条件状态、2510次条件边查询，见 [记录](../../runs/lifetime-refactor/lease-graph.log)。该数字是功能诊断，不是冷编译基准。
 
-## 默认FA的当前拒绝与下一步
+完整 `shared_l0c_qk_pv` 同步生成29.32秒，最终 IR 独立模型 n=0..3 全部通过，见 [日志](../../runs/lifetime-refactor/shared-graph.log)。公共 CLI/CANN 构建通过，总31.66秒、CANN2.33秒；[同步前IR](../../runs/lifetime-refactor/shared-build/before.xdsl)、[最终IR](../../runs/lifetime-refactor/shared-build/after.xdsl)、[ASC](../../runs/lifetime-refactor/shared-build/shared_l0c_qk_pv.asc)已保存。两份IR与前述有限模型产物逐字相同，直接复用证据，见 [身份记录](../../runs/lifetime-refactor/shared-build/finite-model.json)。ASC仍是10个native模板各一份；双plane及各层双buffer、算法和issue order未改变，没有增加搬运或全局 barrier。
 
-修复后默认DSL的公共CLI/CANN构建请求已越过全部事件域，在146.05秒被`structured-event-progress`拒绝，尚未产生成功ASC/CANN产物，见[状态](../../runs/atom-identity/fa-default/build-result.json)。失败耗时不是成功编译性能。
+这使通用共享 L0C 小例闭环，但不替代 FA、设备数值或性能资格。默认 FA 的公共 CLI/CANN 构建在300秒硬期限终止，worker 返回-9，清理及记录耗时后总300.14秒；没有成功 ASC/CANN。见 [状态](../../runs/lifetime-refactor/fa-default/build-result.json)。这是失败构建，不是编译性能资格。没有启动下一算子候选或延长上限。
 
-一次60秒上限的只读提取在24.93秒完成source→EventDomains（不运行progress/lease/分配）：44个native、473条依赖、213条通知、138个参数case、245个窗口。记录了原始源码/编译器hash、IR、端点及派发轨迹，见[分段记录](../../runs/atom-identity/progress-gap/checkpoint.json)。这是诊断时间，不能和完整构建各阶段直接相减当精确性能归因。
+随后一次60秒上限的只读阶段提取在22.87秒完成：lower0.42秒，memory0.07秒，bounds1.49秒，admission5.42秒，dispatch0.01秒，值/存储1.70秒，selection3.90秒，EventDomains9.87秒。44个native、726条逻辑/存储义务、221条通知、142个参数case，1个private packet重排分区；见 [记录](../../runs/lifetime-refactor/fa-stages.log)。这是单独诊断，不能与300秒失败耗时相减作为精确阶段归因；进一步定位资源阶段，暂不继续完整FA构建。 第二次60秒上限的阶段诊断确认22.69秒进入 `progress`，45秒定时栈采样时诊断进程发生SIGSEGV（139），只取得不完整的scalar栈；不能把该栈当作根因。见 [诊断日志](../../runs/lifetime-refactor/fa-progress-diagnostic.log)。后续使用同步阶段/region计数定位progress接口组合，不再依赖该异步采样；没有继续完整FA候选。
 
-`Sq=128,Sk=2048,group=0,query=0`下存在明确队列环：
+## 明确边界
 
-```text
-n15 Wait(FIX→M)，QK(kv1,chunk0)前，native前缀38
-  → QK M不能完成，n21 Set(M→FIX)不能完成
-  → n21 Wait，QK FIX前，前缀43，阻塞FIX队列
-  → PV(kv0) FIX及n15 Set位于同FIX队列后面，前缀106
-  → n15 Wait无法满足
-```
-
-只使用这两对真实通知、两个directed bank的fresh token，省略其余同步/implicit completion的148-native有限模型仍报告死锁；n21两端原始activation各6项均为真。见[证据](../../runs/atom-identity/progress-gap/evidence.md)与[有限队列记录](../../runs/atom-identity/progress-gap/finite-cycle.log)。这排除了本次环只是opaque child cut误报的解释，但不证明FA算法或固定issue_order本身非法。
-
-当前`structured_dependencies`明确以source顺序合成全部RAW/WAR/WAW，随后才绑定dispatch。n15由source回边的PV(kv−1)最后读取→QK(kv)覆盖产生，而实际private L0C的稳态发射为QK(j)→PV(j−1)→QK(j+1)。模型尚未保留足够的值版本/完整kill生命周期事实来判断这类独立临时值能否换序。**下一步重构值依赖与物理存储复用的接线**，保留read→writer、RMW递推和外部可见顺序，再由实际dispatch推导最后读取→下一覆盖；不能直接删除n15（它还保护plane1）、改用dispatch最近writer或修改FA排步。
-
-其他明确边界：
-
-- 同类五slot源码仍在更早的memory frontier拒绝`multiple activation residues`；证明模块支持period5不等于整个五slot源码已支持。
-- 条件路径搜索和进展图组合最坏仍会增长，不能声称同步算法整体线性。此前双native小例约一分钟，当前尚无完整FA资格；必须在结构和依赖合同稳定后按阶段与工作量分析，性能问题没有解决。
-- event ID及ASC里仍有多余min/max、除一和取模。通用标量pass已接入，但可读性未达标；没有做新的算子性能调优。
-- FA变体、设备正确性及ACLNN/profiling/理论硬件性能对比没有当前资格，不能用历史旧路径结果替代。
+- 独立重排只授权精确 private cell、完整首写、内部读版本闭合、同 offset 且实际连续的 packet。streaming envelope、跨代递推、未证明的条件 packet 不取得该证书。
+- 改变父接口需要传播实际首末 reader。当前仅 root-private、无外部访问且无重复父调用的 scratch 允许更换首末接口；其余保持接口或不授予独立重排。
+- progress 尚未实现任意 finite/stream 的联合存在投影。统一 PLE 时钟解决当前表示问题，不能扩大为通用能力声明。
+- 五 slot 复合映射、部分周期 reset、动态 ownership 等仍有明确拒绝。未知关系不能被当作安全。
+- 编译性能分析在结构收尾之后进行。ASC 可读性、FA 变体、设备正确性、ACLNN/profiling/理论硬件性能尚无本轮资格。
+- 双 AIV 嵌套 CV 最近资格仍为 `dbcef70` 基线的24.09秒构建；本轮共享 L0C 是单AIC小例，不能替代双AIV或设备资格。
 
 ## 复现
 
-工作区根目录执行：
+在 `compiler/` 执行：
 
 ```bash
-# 当前参数路径、删除peer反例与整数覆盖
-cd compiler
-../.venv/bin/python -m pytest -q tests/analysis/test_event_path_cover.py tests/analysis/test_guard_cover.py tests/analysis/test_conditional_queue_order.py
-# 只编译一次，24个最终IR模型实例共用
-../.venv/bin/python -m pytest -q tests/sync/test_structured_event_semantics.py -k nested_slots
-cd ..
-# 默认FA：目前会按上述合同明确拒绝，单次完整构建最多300秒
-.venv/bin/python -m xdsl_npu.cli --input compiler/examples/flash_attention/attention.py --entry attention_target --compile --timeout 300 --output runs/reproduce/fa-default
+../.venv/bin/python -m pytest -q tests/analysis/test_logical_valueflow.py tests/analysis/test_storage_word.py tests/analysis/test_storage_word_binding.py
+# 实际最终 IR 正/负/删 release 反例
+timeout --kill-after=5s 300s ../.venv/bin/python -m pytest -q tests/analysis/test_storage_lifetimes.py
 ```
 
-产品文件仅提交compiler Git，运行证据留外层runs；不推送或发布。
+每个完整算子构建最多300秒，超时清理进程组并停止该批候选。产品文件只提交 compiler Git，运行证据留外层 runs；没有打包、发布、推送或设备运行。

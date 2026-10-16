@@ -24,7 +24,13 @@ MAX_INTERFACE_OFFSETS = 256
 
 
 def _candidates(domains, loop, first, stop, *, needs_clock):
-    """Construct only a requested finite interface horizon, never runtime trips."""
+    """Project an actual dispatch-step horizon onto each peer's logical clock.
+
+    A parent stage at offset s executes generation j-s at physical step j.
+    Child-local stage offsets belong to their own clock and cannot displace
+    the parent interval. This is bounded candidate discovery, not a claim
+    that absence from this horizon establishes a safe event lifetime.
+    """
     require(
         stop - first <= MAX_INTERFACE_OFFSETS,
         f"event interface offset horizon exceeds analysis budget {MAX_INTERFACE_OFFSETS}",
@@ -34,6 +40,33 @@ def _candidates(domains, loop, first, stop, *, needs_clock):
     for peer in domains.notifications:
         if peer.mechanism is NotificationKind.PIPE_FENCE:
             continue
+        shifts = []
+        for bound in peer.sources + peer.consumers:
+            coordinate = dict(bound.coordinates).get(loop)
+            if coordinate is None:
+                continue
+            task = domains.dispatch.tasks[bound.operation, bound.actor]
+            scope, stage = task.scope, task.stage
+            while scope.operation is not loop and scope.parent is not None:
+                stage, scope = scope.parent_stage, scope.parent
+            if scope.operation is not loop:
+                continue
+            shift = domains.arithmetic.normalize(
+                expression(
+                    "sub",
+                    expression("add", coordinate, literal(stage)),
+                    domains.control.loops[loop].ordinal,
+                )
+            ).constant
+            if shift is not None:
+                shifts.append(shift)
+        begin, end = first - max(shifts, default=0), stop - min(shifts, default=0)
+        require(
+            end - begin <= MAX_INTERFACE_OFFSETS,
+            f"translated event interface horizon exceeds analysis budget {MAX_INTERFACE_OFFSETS}",
+            kind=ErrorKind.ANALYSIS_LIMIT,
+            phase="event-path-cover",
+        )
         for peer_case in domains.cases[peer]:
             if (
                 peer_case.empty
@@ -41,8 +74,8 @@ def _candidates(domains, loop, first, stop, *, needs_clock):
                 and not any(w.loop is loop for w in peer_case.windows)
             ):
                 continue
-            for offset in range(first, stop):
-                poll("event reuse candidates", offset=offset, horizon=stop - first)
+            for offset in range(begin, end):
+                poll("event reuse candidates", offset=offset, horizon=end - begin)
                 for sources, consumers in domains._instances(peer, peer_case, loop, offset):
                     yield peer, sources, consumers
 
@@ -81,7 +114,7 @@ def roundtrip(domains, notification, case, window, width):
                     old,
                     goal,
                     assumptions,
-                    _candidates(domains, loop, -min(8, delta), delta + 1, needs_clock=True),
+                    _candidates(domains, loop, 0, delta + 1, needs_clock=True),
                 )
                 if path_cover is None:
                     return None
@@ -107,9 +140,6 @@ def reentry(domains, notification, case, window, width=1):
     loop = window.loop
     witnesses = []
     for phase, delta in window.reuse_phases(width):
-        horizon = delta + max(
-            (abs(peer.distance or 0) for peer in domains.notifications), default=0
-        )
         old_sources, old_consumers = list(domains._instances(notification, case, loop, 0))[-1]
         next_sources, next_consumers = next(domains._instances(notification, case, loop, delta))
         condition = ActionGuard(
@@ -133,7 +163,7 @@ def reentry(domains, notification, case, window, width=1):
                     old,
                     goal,
                     assumptions,
-                    _candidates(domains, loop, 0, horizon + 1, needs_clock=False),
+                    _candidates(domains, loop, 0, delta + 1, needs_clock=False),
                 )
                 if path_cover is None:
                     return None

@@ -14,7 +14,11 @@
 | 准入 | `analysis/structured_bounds.py`、`structured_admission.py` | 范围、值初始化、alias、配置与原语输入合同 |
 | ownership 与 host 合同 | `analysis/structured_ownership.py`、`structured_host.py` | group/sid 写入分区、host 参数和整数范围；不选择同步 |
 | 访问分区 | `analysis/structured_access.py` | 按实际物理范围、stride/slot/代次分区；不构造 event |
-| region 合成 | `analysis/access_frontier.py`、`structured_regions.py`、`structured_dependencies.py` | sequence/branch/loop 的 RAW/WAR/WAW、首末访问和回边 |
+| 端点和接口类型 | `analysis/access_frontier.py`、`structured_regions.py` | 实际端点、FIRST/LAST、读版本、条件写、区域接口；无求解器 |
+| 逻辑值流 | `analysis/logical_valueflow.py` | 只建立源码 read→writer/代次、KILL/UPDATE 和区域拼接事实 |
+| 坐标合成 | `analysis/region_coordinates.py` | 两阶段共用的 guard、绑定、读族和域构造；不选择 writer 或生成同步 |
+| 物理生命周期 | `analysis/storage_packets.py`、`storage_word.py`、`storage_lifetimes.py` | 证明闭合 private 生命周期，按实际排步连接 PLE 相邻覆盖与最后 reader |
+| 依赖编排 | `analysis/structured_dependencies.py` | 合并不可变 RAW 与物理 WAR/WAW，交给唯一通知路径；不递归重求值流 |
 | 排步绑定 | `analysis/structured_dispatch.py` | 固定 Stage 与 issue order 到实际 native 的映射 |
 | 通知选择 | `passes/select_notifications.py`、`analysis/structured_protocols.py` | 完整激活域中的 capture/acquire 与 coverage；不分配 ID |
 | 事件域 | `analysis/event_domains.py`、`event_families.py`、`event_windows.py` | 实际配对、整条时钟链的参数分区、精确 membership/首末/存在投影；不分配 ID |
@@ -32,7 +36,9 @@
 | ASC | `backend/structured.py`、`structured_native.py`、`native.py` | 读取最终 IR；不得另用动作表重建执行，不插隐藏同步 |
 | CANN 与构建 | `backend/cann.py`、`build.py`、`runtime/process.py` | 一个算子一次进程组期限、离线工具调用、成功产物发布 |
 
-`structured_regions.py` 存共享关系类型；`structured_access.py` 负责范围投影；`structured_dependencies.py` 负责递归合成。这三者不能各自重新解释一次地址、slot 或循环有效域。
+`structured_access.py` 保留每个 operand 的物理访问与条件读，不能把首 clear 的不读分支压成无条件 RMW。`logical_valueflow.py` 只递归一次来绑定数值版本。`storage_lifetimes.py` 消费这些接口和已绑定的 dispatch，不能把读改绑到派发中最近的 writer。
+
+闭合 packet 的资格、单时钟 PLE 邻接与 WAR/WAW 构造分属三个小模块。未证明独立的状态仍保留真实值/外部顺序约束；不是先生成全套源码反依赖再删除。`structured_dependencies.py` 仅编排，旧 `_Builder` 和旧有限 access-frontier solver 已删除。
 
 资源阶段拆开事实、生命周期、进展和分配，共享一次建立的 `EventDomains`。实际端点的条件队列顺序也由它建立，lease和sharing不重新解释stage/词法位置。`event_paths`依赖纯数学的`guard_cover`，反向依赖禁止。进展区分内部 stream rank 与对外 queue/阻塞接口；子层 native 留在本地 witness，完整嵌套功能资格仍见状态页。
 

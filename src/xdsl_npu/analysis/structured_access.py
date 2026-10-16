@@ -35,11 +35,34 @@ from .structured_regions import (
 
 
 @dataclass(frozen=True)
+class CellEffect:
+    """One actual instruction's operands covering an exact storage cell.
+
+    The union is a physical footprint. Conditional numerical reads remain on
+    each operand, so an initialization cannot acquire a fictitious old value.
+    """
+
+    template: MemoryTemplate
+    participant: Actor
+    accesses: tuple[MemoryAccess, ...]
+
+    @property
+    def mode(self):
+        reads = any(access.mode.reads for access in self.accesses)
+        writes = any(access.mode.writes for access in self.accesses)
+        return (
+            AccessMode.READ_WRITE
+            if reads and writes
+            else AccessMode.READ
+            if reads
+            else AccessMode.WRITE
+        )
+
+
+@dataclass(frozen=True)
 class PartitionedAccesses:
     memory: NativeMemoryFacts
-    effects: Mapping[
-        TaskOp, Mapping[StorageCell, tuple[tuple[MemoryTemplate, Actor, AccessMode], ...]]
-    ]
+    effects: Mapping[TaskOp, Mapping[StorageCell, tuple[CellEffect, ...]]]
     patterns: Mapping[tuple[StorageCell, Operation], frozenset[tuple[int, int | Expr]]]
     issues: tuple[DependencyIssue, ...]
     work: DependencyWork
@@ -447,20 +470,8 @@ class _Partitioner:
                 natives = {}
                 for projection in covered:
                     key = (projection.template.operation, projection.participant)
-                    if key in natives:
-                        prior = natives[key]
-                        reads = prior[0].reads or projection.access.mode.reads
-                        writes = prior[0].writes or projection.access.mode.writes
-                        mode = (
-                            AccessMode.READ_WRITE
-                            if reads and writes
-                            else AccessMode.READ
-                            if reads
-                            else AccessMode.WRITE
-                        )
-                        natives[key] = (mode, projection)
-                    else:
-                        natives[key] = (projection.access.mode, projection)
+                    template, accesses = natives.setdefault(key, (projection.template, {}))
+                    accesses[projection.access.operand_index] = projection.access
                     for logical in projection.template.frame.loops():
                         domain = next(
                             (d for d in projection.slots if d.loop is logical.operation),
@@ -469,9 +480,9 @@ class _Partitioner:
                         self.patterns.setdefault((cell, logical.operation), set()).add(
                             (domain.period, domain.residue)
                         )
-                for (operation, participant), (mode, projection) in natives.items():
+                for (operation, participant), (template, accesses) in natives.items():
                     self.effects.setdefault(operation, {}).setdefault(cell, []).append(
-                        (projection.template, participant, mode)
+                        CellEffect(template, participant, tuple(accesses.values()))
                     )
 
     def _cell_regions(self, projections):

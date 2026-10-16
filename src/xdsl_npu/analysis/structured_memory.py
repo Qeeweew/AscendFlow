@@ -18,15 +18,17 @@ from xdsl.ir import SSAValue
 
 from ..diagnostics import require
 from ..dialects.physical import TaskOp
-from ..dialects.structured import PipelineStageOp
+from ..dialects.structured import PipelineLoopOp, PipelineStageOp
 from ..dialects.types import RefType
+from ..scalar import expression, literal
 from ..target import native
 from ..target.ascend910b import Actor, Engine, supports_engine
 from ..target.packets import audited_packet
 from ..target.scalars import round_f32
-from .native import AccessMode, NativeContract
+from .native import AccessMode, ConditionalRead, NativeContract
 from .structured_addresses import AddressFacts, StructuredAddresses
 from .structured_control import ControlFacts, ControlFrame, build_control_facts
+from .structured_schedule import Comparison
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +37,7 @@ class MemoryAccess:
     operand_index: int
     address: AddressFacts
     mode: AccessMode
+    read_condition: ConditionalRead | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,33 @@ class NativeMemoryFacts:
     templates: tuple[MemoryTemplate, ...]
     addresses: Mapping[SSAValue, AddressFacts]
     native_contract_calls: int
+
+
+def _conditional_reads(operation, contract, control):
+    if not contract.read_resets:
+        return {}
+    stage = operation.parent_op()
+    while stage is not None and not isinstance(stage, PipelineStageOp):
+        stage = stage.parent_op()
+    require(stage is not None, "native reset needs its actual pipeline stage ordinal")
+    loop = stage.parent_op()
+    require(
+        isinstance(loop, PipelineLoopOp) and loop in control.loops,
+        "native reset lost its actual pipeline clock",
+    )
+    ordinal = control.loops[loop].ordinal
+    result = {}
+    for reset in contract.read_resets:
+        value = (
+            ordinal if reset.period is None else expression("rem", ordinal, literal(reset.period))
+        )
+        result[reset.operand] = ConditionalRead(
+            loop,
+            ordinal,
+            Comparison(value, "!=", literal(0)),
+            Comparison(value, "==", literal(0)),
+        )
+    return result
 
 
 def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = None):
@@ -145,8 +175,9 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             phase="structured-memory",
             location=str(operation.location),
         )
+        conditions = _conditional_reads(operation, contract, control)
         accesses = tuple(
-            MemoryAccess(operand, index, ref, AccessMode(mode))
+            MemoryAccess(operand, index, ref, AccessMode(mode), conditions.get(index))
             for index, (operand, ref, mode) in enumerate(zip(operands, refs, modes, strict=True))
         )
         templates.append(MemoryTemplate(operation, frame, contract, accesses, scalar_source))

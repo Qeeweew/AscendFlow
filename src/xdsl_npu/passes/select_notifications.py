@@ -32,6 +32,7 @@ from ..analysis.structured_regions import (
     AccessOccurrence,
     BranchGuard,
     LoopCountGuard,
+    LoopOrdinalGuard,
 )
 from ..analysis.structured_schedule import ActionGuard, Comparison, Placement
 from ..diagnostics import CompileError, ErrorKind, require
@@ -72,6 +73,18 @@ def _branch_test(operation, branch, environment):
     return Comparison(
         environment.expression(comparison.lhs), op, environment.expression(comparison.rhs)
     )
+
+
+def _case_tests(guards, environment):
+    """Retain effect predicates in the requirement's consumer coordinates."""
+    for guard in guards:
+        if isinstance(guard, LoopCountGuard):
+            yield Comparison(guard.count, guard.relation.value, _integer(guard.threshold))
+        elif isinstance(guard, LoopOrdinalGuard):
+            yield guard.comparison
+        else:
+            assert isinstance(guard, BranchGuard)
+            yield _branch_test(guard.operation, guard.branch, environment)
 
 
 def _guard(tests):
@@ -266,12 +279,7 @@ def _bind_endpoint(need, occurrence, memory, *, source):
         else:
             first, _ = _selected(domain.count, domain.period, domain.residue, lower)
             tests.append(Comparison(domain.count, ">", first))
-    for guard in _effective_guards(need, memory):
-        if isinstance(guard, LoopCountGuard):
-            tests.append(Comparison(guard.count, guard.relation.value, _integer(guard.threshold)))
-        else:
-            assert isinstance(guard, BranchGuard)
-            tests.append(_branch_test(guard.operation, guard.branch, environment))
+    tests.extend(_case_tests(_effective_guards(need, memory), environment))
 
     # Selector equalities compare the current actual ordinal, whereas every
     # other test is phrased in the requirement's logical consumer coordinates.
@@ -347,12 +355,7 @@ class _IssueOrder:
     def premises(self, need):
         if need not in self._premises:
             control = self.dispatch.memory.control
-            tests = [
-                Comparison(guard.count, guard.relation.value, _integer(guard.threshold))
-                if isinstance(guard, LoopCountGuard)
-                else _branch_test(guard.operation, guard.branch, control.environment)
-                for guard in need.guards
-            ]
+            tests = list(_case_tests(need.guards, control.environment))
             for domain in sorted(need.domains, key=lambda item: self._loop_order[item.loop]):
                 ordinal = control.loops[domain.loop].ordinal
                 tests.extend(

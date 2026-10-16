@@ -272,7 +272,11 @@ class IntegerFacts:
                 if (
                     prior.predicate == test.predicate
                     and self.normalize(
-                        expression("sub", expression("sub", prior.lhs, prior.rhs), difference)
+                        expression(
+                            "sub",
+                            self.bounded(expression("sub", prior.lhs, prior.rhs)),
+                            difference,
+                        )
                     ).constant
                     == 0
                 ):

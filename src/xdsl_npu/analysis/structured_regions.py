@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from xdsl.dialects import scf
 from xdsl.ir import Operation, SSAValue
@@ -17,6 +18,10 @@ from ..scalar import Expr
 from ..target.ascend910b import Actor
 from .access_frontier import AccessCut, AccessEndpoint, LoopResidueSelection
 from .hazards import HazardKind
+from .structured_schedule import Comparison
+
+if TYPE_CHECKING:
+    from .structured_memory import MemoryAccess
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +71,18 @@ class BranchGuard:
     branch: int
 
 
-Guard = LoopCountGuard | BranchGuard
+@dataclass(frozen=True, slots=True)
+class LoopOrdinalGuard:
+    """An effect predicate in one actual loop's canonical coordinates."""
+
+    loop: Operation
+    comparison: Comparison
+
+    def evaluate(self, values: Mapping[str, int]):
+        return self.comparison.evaluate(values)
+
+
+Guard = LoopCountGuard | BranchGuard | LoopOrdinalGuard
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,15 +128,9 @@ class StorageCell:
         return self.private
 
 
-class BoundaryKind(str, Enum):
-    WRITER = "writer"
-    READERS = "readers"
-
-
 @dataclass(frozen=True, slots=True)
 class BoundaryPort:
     cell: StorageCell
-    kind: BoundaryKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,45 +165,60 @@ class StructuredNeed:
         return AccessCut(self.consumer.endpoint, Milestone.ADMISSION)
 
 
-@dataclass(frozen=True, slots=True)
-class StructuredReadCarry:
-    waw: StructuredNeed
-    raw: StructuredNeed
-    war: StructuredNeed | None
+class LogicalWriteKind(str, Enum):
+    KILL = "kill"
+    UPDATE = "update"
 
 
 @dataclass(frozen=True, slots=True)
-class LoopCarry:
-    loop: Operation
-    count: Expr
-    period: int
-    residue: int | Expr
-    need: StructuredNeed
+class LogicalWrite:
+    """One definition on retained native write footprints and activation.
 
+    A kill does not read the overwritten fragment's old value. A contracted
+    cell can denote a family image; ``accesses`` retains each actual operand
+    footprint needed to prove per-occurrence coverage. An update retains its
+    separately bound RAW input. Neither kind proves independent ownership.
+    """
 
-@dataclass(frozen=True, slots=True)
-class PendingReader:
-    reader: AccessOccurrence
-    writer: AccessOccurrence | BoundaryPort
-    raw: StructuredNeed
+    cell: StorageCell
+    occurrence: AccessOccurrence
+    kind: LogicalWriteKind
+    guards: tuple[Guard, ...]
+    domains: tuple[LoopDomain, ...] = ()
+    accesses: tuple[MemoryAccess, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class CellSummary:
     cell: StorageCell
-    head_reads: tuple[PendingReader, ...] = ()
+    head_reads: tuple[StructuredNeed, ...] = ()
     first_write: AccessOccurrence | None = None
     last_write: AccessOccurrence | None = None
-    tail_reads: tuple[PendingReader, ...] = ()
-    entry_carries: tuple[StructuredReadCarry, ...] = ()
+    tail_reads: tuple[StructuredNeed, ...] = ()
 
     @property
     def writer(self):
-        return self.last_write or BoundaryPort(self.cell, BoundaryKind.WRITER)
+        return self.last_write or BoundaryPort(self.cell)
 
     @property
     def identity(self):
         return self.first_write is None and not self.head_reads and not self.tail_reads
+
+
+@dataclass(frozen=True, slots=True)
+class RegionConnection:
+    """One exact source frontier splice, before choosing storage lifetimes."""
+
+    scope: Operation
+    left: CellSummary
+    right: CellSummary
+    guards: tuple[Guard, ...]
+    loop: Operation | None = None
+    distance: int | None = None
+    period: int | None = None
+    residue: int | Expr | None = None
+    first: int = 0
+    limit: Expr | None = None
 
 
 @dataclass(frozen=True, slots=True)

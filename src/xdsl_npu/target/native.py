@@ -78,6 +78,40 @@ IMPLICIT_COMPLETION = {"S"}
 MAX_MAD_CYCLE = 4096
 
 
+@dataclass(frozen=True, slots=True)
+class NativeReadReset:
+    """An operand's old value is ignored at an instruction-ordinal reset.
+
+    ``period=None`` resets only at ordinal zero. A positive period resets at
+    every zero residue. The instruction still writes its complete admitted
+    operand footprint; this rule does not narrow its physical access modes.
+    """
+
+    operand: int
+    period: int | None
+
+    def __post_init__(self):
+        require(type(self.operand) is int and self.operand >= 0, "invalid native reset operand")
+        require(
+            self.period is None or type(self.period) is int and self.period > 0,
+            "native reset period must be positive",
+        )
+
+
+def native_read_resets(native: str, params: tuple[int, ...]) -> tuple[NativeReadReset, ...]:
+    """Conditional numerical reads of admitted primitives, before loop binding."""
+    if native == "mad_first":
+        require(len(params) == 3, "MAD first reset requires exact dimensions")
+        return (NativeReadReset(2, None),)
+    if native == "mad_cycle":
+        require(
+            len(params) == 4 and 1 <= params[3] <= MAX_MAD_CYCLE,
+            "MAD cycle reset requires a supported positive period",
+        )
+        return (NativeReadReset(2, params[3]),)
+    return ()
+
+
 def implicit_completion(task: NativeInstruction) -> bool:
     if task.pipe in IMPLICIT_COMPLETION:
         return True
