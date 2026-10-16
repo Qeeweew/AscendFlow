@@ -8,7 +8,7 @@ from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy, nested_cv
 from tests.support.structured import prepared, selection
-from xdsl_npu.analysis.event_contracts import CROSS_BACKLOG, LeaseKind
+from xdsl_npu.analysis.event_contracts import CROSS_BACKLOG, LeaseKind, _Order
 from xdsl_npu.analysis.event_lifetimes import reentry
 from xdsl_npu.analysis.structured_protocols import NotificationKind
 from xdsl_npu.analysis.structured_resources import allocate_structured_events
@@ -51,6 +51,12 @@ def test_two_finite_uses_get_two_ids_without_selecting_reverse_events(finite):
     assert all(
         case.inside[0].kind is LeaseKind.FINITE for lease in finite.leases for case in lease.cases
     )
+    assert all(
+        witness.path_cover is None
+        for lease in finite.leases
+        for case in lease.cases
+        for witness in case.inside
+    )
     assert all(not case.reentries for lease in finite.leases for case in lease.cases)
     assert {
         (item.notification.source_engine, item.notification.destination_engine)
@@ -80,18 +86,25 @@ def test_real_parent_reentry_has_its_own_consumption_witness(repeated):
         if witness.kind is LeaseKind.INVOCATION
     ]
     assert invocations and any(witness.delta == 2 for witness in invocations)
-    assert all(witness.steps for witness in invocations)
+    assert all(witness.path_cover is not None for witness in invocations)
+    assert any(witness.path_cover.paths for witness in invocations)
     for lease in repeated.leases:
         for case in lease.cases:
             for witness in case.inside + case.reentries:
-                current = lease.notification
-                for step in witness.steps:
-                    assert step.controller == (
-                        current.mechanism is NotificationKind.CROSS_EVENT
-                        or current.destination_engine is Engine.S
-                    )
-                    if step.notification is not None:
-                        current = step.notification
+                if witness.kind is LeaseKind.FINITE:
+                    assert witness.path_cover is None
+                    continue
+                assert witness.path_cover is not None
+                for path in witness.path_cover.paths:
+                    current = lease.notification
+                    assert path.steps
+                    for step in path.steps:
+                        assert step.controller == (
+                            current.mechanism is NotificationKind.CROSS_EVENT
+                            or current.destination_engine is Engine.S
+                        )
+                        if step.notification is not None:
+                            current = step.notification
 
 
 def test_missing_real_return_path_does_not_become_child_exit_completion(repeated):
@@ -133,12 +146,13 @@ def test_non_scalar_wait_only_gates_its_real_destination_queue():
     source = allocator._instance(
         forward.sources[0], {ordinal: expression("add", ordinal, literal(4))}, case=forward_case
     )
-    assert allocator._order(wait, source, ())
-    assert not allocator._follows(forward, wait, forward, source, ())
+    assert not allocator._following_conditions(forward, wait, forward, source)
+    assert allocator._may_follow(forward, wait, forward, source, ()) is _Order.IMPOSSIBLE
     source = allocator._instance(
         reverse.sources[0], {ordinal: expression("add", ordinal, literal(4))}, case=reverse_case
     )
-    assert allocator._follows(forward, wait, reverse, source, ())
+    assert allocator._following_conditions(forward, wait, reverse, source)
+    assert allocator._may_follow(forward, wait, reverse, source, ()) is _Order.PROVED
     assert not allocator._gate(forward)
 
 

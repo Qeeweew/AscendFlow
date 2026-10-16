@@ -20,7 +20,7 @@ from .dialects.source import ProgramOp
 @dataclass(frozen=True, slots=True, init=False)
 class Compilation:
     asc: str
-    source_ir: str | None
+    source_ir: str
     before_ir: str
     plan_ir: str
     name: str
@@ -172,9 +172,8 @@ class Compilation:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "before.xdsl").write_text(self.before_ir)
         (directory / "after.xdsl").write_text(self.plan_ir)
-        if self.source_ir is not None:
-            (directory / "source.xdsl").write_text(self.source_ir)
-            (directory / "schedule.json").write_text(self._schedule_json + "\n")
+        (directory / "source.xdsl").write_text(self.source_ir)
+        (directory / "schedule.json").write_text(self._schedule_json + "\n")
         (directory / f"{self.name}.asc").write_text(self.asc)
         (directory / "verification.json").write_text(self._report_json + "\n")
         (directory / "compilation.json").write_text(self._timings_json + "\n")

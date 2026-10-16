@@ -292,7 +292,7 @@ class IntegerFacts:
                     if remainder.constant >= 0:
                         return True
                     continue
-                bound, _ = self.bounds(remainder)
+                bound, _ = self.bounds(remainder, assumptions)
                 if bound is not None and bound >= 0:
                     return True
         lower, _ = self.bounds(term, assumptions)

@@ -343,7 +343,7 @@ class Backend:
 
 
 def load_backend(output, backend, *, reference_output=None, policy=DEFAULT_POLICY):
-    """Validate only the selected backend's real binaries and provenance."""
+    """Check published build state and provenance, without revalidating synchronization."""
     if backend == "aclnn":
         files = {name: CANN / "lib64" / name for name in ("libopapi.so", "libnnopbase.so")}
         identities = {
@@ -392,11 +392,34 @@ def load_backend(output, backend, *, reference_output=None, policy=DEFAULT_POLIC
     )
     if backend == "generated":
         require(
-            report.get("cross_query_verified") is True
-            and report.get("query_verification", {}).get("verified") is True
-            and report["query_verification"].get("resources", {}).get("verified") is True,
-            "generated attention artifact lacks its completed query proof report",
+            report.get("pipeline") == "structured-regions"
+            and report.get("verification_mode") == "owned-construction",
+            "generated attention artifact is not a current source compilation",
         )
+        build_result = read_json(directory / "build-result.json")
+        require(
+            build_result.get("status") == "passed"
+            and build_result.get("returncode") == 0
+            and build_result.get("error") is None,
+            "generated attention artifact has no completed source build",
+        )
+        compilation = read_json(directory / "compilation.json")
+        require(
+            report.get("cann") == manifest
+            and isinstance(compilation, dict)
+            and report.get("compilation") == compilation,
+            "generated attention build records differ from its published artifacts",
+        )
+        # These fields describe the producing build, not an independent safety
+        # certificate. The runner neither replans nor revalidates synchronization.
+        source_build = {
+            "pipeline": report["pipeline"],
+            "verification_mode": report["verification_mode"],
+            "status": build_result["status"],
+            "verification_report_sha256": sha256(read_bytes(directory / "verification.json")),
+            "compilation_report_sha256": sha256(read_bytes(directory / "compilation.json")),
+            "build_result_sha256": sha256(read_bytes(directory / "build-result.json")),
+        }
         contract = generated_contract(directory, policy)
     else:
         require(
@@ -424,6 +447,7 @@ def load_backend(output, backend, *, reference_output=None, policy=DEFAULT_POLIC
             "launcher_symbol": abi.symbol,
             "launcher_parameters": abi.names,
             "contract": contract,
+            **({"source_build": source_build} if backend == "generated" else {}),
         },
         abi,
     )
@@ -537,7 +561,7 @@ def run(args):
         "contract_sha256": sha256(read_bytes(Path(__file__).with_name("contract.py"))),
         "oracle_sha256": sha256(read_bytes(attention_validation.__file__)),
         "timing_scope": TIMING_SCOPE,
-        "comparison_scope": "declared dense noncausal BNSD policy; artifact validation grants no device qualification; sampled checks remain sampled; device results apply only to this selected policy and artifacts",
+        "comparison_scope": "declared dense noncausal BNSD policy; artifact validation checks published build provenance without independently validating synchronization and grants no device qualification; sampled checks remain sampled; device results apply only to this selected policy and artifacts",
     }
     if args.physical is None:
         if args.record is not None:

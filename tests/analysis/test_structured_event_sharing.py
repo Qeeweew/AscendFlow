@@ -9,7 +9,7 @@ from examples.vector.scale import scale
 from tests.models.structured_domains import actual_dispatch
 from tests.support.structured import prepared, selection
 from xdsl_npu.analysis.event_domains import EventCase
-from xdsl_npu.analysis.event_lifetimes import bridge
+from xdsl_npu.analysis.event_paths import prove_event_path_cover
 from xdsl_npu.analysis.structured_event_sharing import (
     EventSharingContext,
     prove_finite_event_sharing,
@@ -44,7 +44,7 @@ def sharing_context(selected):
     )
     allocator = prepared(selected)
     return EventSharingContext(
-        selected, allocator.cases, allocator._instance, partial(bridge, allocator)
+        selected, allocator.cases, allocator._instance, partial(prove_event_path_cover, allocator)
     )
 
 
@@ -67,16 +67,18 @@ def assert_actual_return_path(witness, selected):
             tuple((loop, value.evaluate({})) for loop, value in point.coordinates),
         ]
 
-    current = witness.earlier
-    assert witness.steps and witness.steps[-1].notification is None
-    for step in witness.steps:
-        following = witness.later if step.notification is None else step.notification
-        assert not step.controller
-        assert current.destination_engine is following.source_engine
-        assert step.consume.actor is step.source.actor
-        assert position(step.consume) <= position(step.source)
-        if step.notification is not None:
-            current = step.notification
+    assert witness.path_cover.paths
+    for path in witness.path_cover.paths:
+        current = witness.earlier
+        assert path.steps and path.steps[-1].notification is None
+        for step in path.steps:
+            following = witness.later if step.notification is None else step.notification
+            assert not step.controller
+            assert current.destination_engine is following.source_engine
+            assert step.consume.actor is step.source.actor
+            assert position(step.consume) <= position(step.source)
+            if step.notification is not None:
+                current = step.notification
 
 
 @pytest.mark.parametrize("source", [Engine.MTE2, Engine.V])
@@ -143,15 +145,15 @@ def test_finite_case_does_not_erase_repeated_actual_scopes():
     context = sharing_context(selected)
     clone = replace(forward, name="another_repeated_channel")
 
-    def forbidden_bridge(*args):
-        pytest.fail("a repeated invocation reached the finite sharing bridge")
+    def forbidden_path_cover(*args):
+        pytest.fail("a repeated invocation reached the finite sharing path proof")
 
     context = replace(
         context,
         cases={
             n: (EventCase(ActionGuard(), (), (), ()),) for n in (*selected.notifications, clone)
         },
-        bridge=forbidden_bridge,
+        prove_path_cover=forbidden_path_cover,
     )
     assert prove_finite_event_sharing(forward, clone, context=context) is None
 

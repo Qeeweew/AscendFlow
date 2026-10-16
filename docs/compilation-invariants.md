@@ -95,6 +95,12 @@ IRDL verifier 负责结构和类型，不能替代异步正确性。有限模型
 - 多residue的相邻活跃成员不一定间隔一个周期。生命周期按当前residue和ring宽度得到精确下一同ID使用；例如period=5、residues={0,3}不能统一使用`width*5`作为复用距离。
 - 参数分区只处理实际未决周期比较，具有明确静态工作预算；不按runtime循环次数枚举，不对不同通知做全局参数笛卡尔积。不能证明的动态系数/ownership仍明确拒绝。
 - lifetime只使用真正的Wait消费、后续queue/controller admission以及选中通知；Set效果不门控未来source native。有限child出口不会自动产生全体完成。
+- 一项复用义务记为A，真实路径的成立条件记为H_i。必须取得每条`H_i ⇒ consume先于next Set`的实际接口链，再证明`A ⇒ OR(H_i)`；某条路径可能存在不能代替完整覆盖。条件包含端点activation和真实队列顺序，不能仅检查peer存在。
+- 队列顺序使用共同祖先上的实际`(coordinate+stage, lexical, phase)`。外层严格更晚或同代继续比较内层；同一native的Wait admission早于Set-after-native。每对端点至多产生O(depth)条条件，不按迭代次数展开。local Wait仅建立目标queue顺序，controller gate与actor身份分别保留。
+- 复用与有限ID共享共用`EventPathCover`，保存所有覆盖路径及整数划分证据，不保留旧单bridge/steps合同。每层先判断现有路径是否完整覆盖，再扩展下一层；未覆盖的条件direct路径不能阻止寻找所需的间接路径。访问过的实际端点必须同时保留条件，不能用无条件visited丢掉另一slot相位。
+- 数学划分只属于当前证明。uniform参数与loop-varying余数都可参与，但后者不能变成调用内不变的`EventCase`。例如`(p*m+g)%2`作为一个相关多项式处理，不能独立枚举p、m、g后拼接互不兼容的事实。大小比较先在原余数范围求mask，不能用模等价替代整数大小关系。
+- 原始有序算术前提先通过定义性检查，再做模规约或空域裁剪。路径构造只接受本次EventDomains拥有的canonical端点；不声称可校验任意外部伪造端点。缺失证明返回未覆盖，非法定义性与预算耗尽分别诊断，不能降级成任意barrier。
+- 路径与覆盖各有显式静态预算；一项义务的多次覆盖查询共用节点/谓词预算，失败也计入工作量。候选offset是有限接口搜索范围，不是runtime循环展开，也不是硬件容量证明。不能把整个分析声称为线性：条件路径和整数划分最坏会组合增长，当前通过局部作用域、完整覆盖即停和明确上限约束。
 - progress用必须/可能/不可能三种顺序关系。必须边用于建立reuse证据；可能阻塞不能漏掉，其成立条件也不能在parent合并时丢失。已由同一循环覆盖的义务不在root重新投影再证明。
 - region进展摘要只导出尚未在本层配对的实际通知端口，以及本region的queue输入和queue/controller阻塞输出。内部native与子层接口消去后留在本地witness；父层不重新导入它们。该摘要只用于可能阻塞与进展，不能给lifetime、memory或buffer复用提供完成证据。
 - 非Scalar的局部Wait只阻塞目标queue；Scalar/cross Wait才门控实际controller。两个AIV的接口保持独立，不能以一个Vector族节点替代两个贡献。跨调用坐标的平移作用于整条关系及其guard；不同父代不能在child拼成零步边。

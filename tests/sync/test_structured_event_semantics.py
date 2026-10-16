@@ -12,7 +12,9 @@ from xdsl.dialects.builtin import ArrayAttr, IndexType, StringAttr
 
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
+from tests.analysis.test_event_parameter_cases import nested_slot_source
 from tests.models.structured_events import EventModelError, check_structured_events
+from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.analysis.structured_memory import collect_native_memory
 from xdsl_npu.dialects.structured import ActorDomainOp, NotificationOp
@@ -361,6 +363,22 @@ def test_generated_final_ir_preserves_finite_access_versions_and_event_consumpti
     assert result.consumptions
     if count:
         assert result.bytes_read and result.bytes_written and result.hazards
+
+
+@pytest.fixture(scope="module")
+def nested_slots_memory():
+    artifact = compile(N.from_source(nested_slot_source(2)), timeout_s=300)
+    return collect_native_memory(artifact.plan)
+
+
+@pytest.mark.parametrize("n", range(4))
+@pytest.mark.parametrize("m", range(6))
+def test_nested_slots_final_ir_preserves_event_consumption_and_byte_versions(
+    nested_slots_memory, n, m
+):
+    result = check_structured_events(nested_slots_memory, {"n": n, "m": m}, max_commands=2048)
+    assert len(result.natives) == 2 * n * m
+    assert result.bytes_read == result.bytes_written == 2 * n * m * 64 * 4
 
 
 @pytest.mark.parametrize("mutation", ["delete_wait", "wrong_id", "early_set"])

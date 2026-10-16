@@ -119,6 +119,29 @@ def test_changed_or_reordered_premises_get_their_own_query(monkeypatch):
     assert queries.prove(positive, premises)
 
 
+@pytest.mark.parametrize("fixed", (3, 7))
+@pytest.mark.parametrize("predicate,offset", (("<", 2), ("<=", 2), (">", -2), (">=", -2)))
+def test_an_affine_prior_relation_keeps_its_parameter_premise(fixed, predicate, offset):
+    queries = IntegerFacts({"y": Fact()})
+    relation = Comparison(expression("add", X, literal(offset)), predicate, Y)
+    equality = Comparison(Y, "==", literal(fixed))
+    premises = (equality, relation)
+    target = Comparison(X, predicate, literal(fixed - offset))
+    direction = -1 if predicate in {"<", "<="} else 1
+    stronger = Comparison(X, predicate, literal(fixed - offset + direction))
+    changed = (Comparison(Y, "==", literal(fixed - direction)), relation)
+    assert queries.prove(target, premises)
+    assert not queries.prove(target, (relation,))
+    assert not queries.prove(target, changed)
+    assert not queries.prove(stronger, premises)
+    assert queries.prove(target, premises)
+    active = [
+        {"x": x, "y": fixed} for x in range(-16, 17) if PREDICATES[predicate](x + offset, fixed)
+    ]
+    assert active and all(target.evaluate(context) for context in active)
+    assert any(not stronger.evaluate(context) for context in active)
+
+
 def test_unknown_relations_and_false_predicates_never_become_proofs():
     queries = IntegerFacts({})
     equality = Comparison(X, "==", Y)

@@ -10,7 +10,7 @@ unknown sparse or correlated activation is diagnosed at its actual boundary.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
 from xdsl.dialects import arith
@@ -88,6 +88,7 @@ class EventDomains:
     work: ResourceWork
     tests: Mapping[LogicalNotification, tuple[Comparison, ...]]
     cases: Mapping[LogicalNotification, tuple[EventCase, ...]]
+    _order_facts: dict[tuple, tuple[ActionGuard, ...]] = field(compare=False, repr=False)
 
     def __init__(self, selection: SynchronizationSelection, work: ResourceWork):
         memory = selection.dependencies.memory
@@ -102,6 +103,7 @@ class EventDomains:
             ("work", work),
             ("tests", {}),
             ("cases", {}),
+            ("_order_facts", {}),
         ):
             object.__setattr__(self, name, value)
         self.work.notifications = len(self.notifications)
@@ -384,13 +386,6 @@ class EventDomains:
             ),
         )
 
-    def _exists(self, placements, assumptions):
-        return all(
-            self.arithmetic.prove(test, assumptions)
-            for placement in placements
-            for test in placement.guard.comparisons
-        )
-
     def _clocks(self, notification):
         placements = notification.sources + notification.consumers
         common = None
@@ -410,22 +405,55 @@ class EventDomains:
             scope = scope.parent
         return tuple(reversed(result))
 
-    def _order(self, before, after, assumptions):
-        return self._order_relation(before, after, assumptions) is _Order.PROVED
+    def _order_conditions(self, before, after):
+        """Exact queue order under both endpoints' established activation.
 
-    def _order_relation(self, before, after, assumptions):
+        The first endpoint is a Wait admission, and the second is the native
+        position after a Set. These roles retain their phase even if the two
+        endpoints name the same native operation. Conditions prove ordering,
+        never the existence or definedness of a selected coordinate.
+        """
         if before.actor is not after.actor:
-            return _Order.IMPOSSIBLE
-        a = self.dispatch.tasks[before.operation, before.actor]
-        b = self.dispatch.tasks[after.operation, after.actor]
+            return ()
+        if any(
+            test.lhs.constant is not None
+            and test.rhs.constant is not None
+            and not test.evaluate({})
+            for bound in (before, after)
+            for test in bound.guard.comparisons
+        ):
+            return ()
+        key = (
+            before.operation,
+            before.actor,
+            before.placement,
+            before.coordinates,
+            after.operation,
+            after.actor,
+            after.placement,
+            after.coordinates,
+        )
+        if key in self._order_facts:
+            return self._order_facts[key]
+        a = self.dispatch.tasks.get((before.operation, before.actor))
+        b = self.dispatch.tasks.get((after.operation, after.actor))
+        if a is None or b is None:
+            return ()
         ap, bp = self._path(a), self._path(b)
+        ac, bc = dict(before.coordinates), dict(after.coordinates)
+        if any(
+            scope.operation in self.control.loops and scope.operation not in coordinates
+            for path, coordinates in ((ap, ac), (bp, bc))
+            for scope in path
+        ):
+            return ()
         common = 0
         while common < min(len(ap), len(bp)) and ap[common] is bp[common]:
             common += 1
 
-        def position(task, path, bound, native, index):
+        def position(task, path, coordinates, native, index):
             owner = path[index]
-            coordinate = dict(bound.coordinates).get(owner.operation, literal(0))
+            coordinate = coordinates.get(owner.operation, literal(0))
             if task.scope is owner:
                 stage, lexical = task.stage, task.lexical
                 phase = 1 if native else 0
@@ -434,36 +462,52 @@ class EventDomains:
                 stage, lexical, phase = child.parent_stage, child.parent_lexical, 1
             return expression("add", coordinate, literal(stage)), (lexical, phase)
 
-        # A later outer invocation contains every instruction in its child,
-        # even when the child's coordinate resets to FIRST. Compare those
-        # real common ancestors before comparing the deepest native clock.
+        conditions, prefix = [], ()
+
+        def append(tests, test):
+            if test.lhs.constant is not None and test.rhs.constant is not None:
+                return tests if test.evaluate({}) else None
+            return tests + (test,)
+
+        # Earlier clocks dominate every descendant. At equal outer clocks
+        # both endpoints enter the same child, so compare the next clock.
+        # Only the final common scope can have distinct lexical/phase ranks.
         for index in range(common):
-            ag, ar = position(a, ap, before, False, index)
-            bg, br = position(b, bp, after, True, index)
-            difference = self.arithmetic.normalize(expression("sub", bg, ag))
-            if difference.constant == 0:
-                if index + 1 < common:
-                    continue
-                return _Order.PROVED if br >= ar else _Order.IMPOSSIBLE
-            if difference.constant is not None:
-                return _Order.PROVED if difference.constant > 0 else _Order.IMPOSSIBLE
-            if self.arithmetic.prove(Comparison(difference, ">", literal(0)), assumptions):
+            ag, ar = position(a, ap, ac, False, index)
+            bg, br = position(b, bp, bc, True, index)
+            difference = self.arithmetic.bounded(expression("sub", bg, ag))
+            final = index + 1 == common
+            clause = append(
+                prefix,
+                Comparison(difference, ">=" if final and br >= ar else ">", literal(0)),
+            )
+            if clause is not None:
+                conditions.append(ActionGuard(clause))
+            if final:
+                break
+            prefix = append(prefix, Comparison(difference, "==", literal(0)))
+            if prefix is None:
+                break
+        result = tuple(conditions)
+        self._order_facts[key] = result
+        return result
+
+    def _conditions_relation(self, conditions, assumptions):
+        possible = False
+        opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
+        for condition in conditions:
+            tests = condition.comparisons
+            if all(self.arithmetic.prove(test, assumptions) for test in tests):
                 return _Order.PROVED
-            if self.arithmetic.prove(Comparison(difference, "<", literal(0)), assumptions):
-                return _Order.IMPOSSIBLE
-            if index + 1 == common:
-                if br >= ar and self.arithmetic.prove(
-                    Comparison(difference, ">=", literal(0)), assumptions
-                ):
-                    return _Order.PROVED
-                if br < ar and self.arithmetic.prove(
-                    Comparison(difference, "<=", literal(0)), assumptions
-                ):
-                    return _Order.IMPOSSIBLE
-                return _Order.POSSIBLE
-            if not self.arithmetic.prove(Comparison(difference, "==", literal(0)), assumptions):
-                return _Order.POSSIBLE
-        return _Order.IMPOSSIBLE
+            if not any(
+                self.arithmetic.prove(
+                    Comparison(test.lhs, opposite[test.predicate], test.rhs),
+                    assumptions + tests[:index] + tests[index + 1 :],
+                )
+                for index, test in enumerate(tests)
+            ):
+                possible = True
+        return _Order.POSSIBLE if possible else _Order.IMPOSSIBLE
 
     def _gate(self, notification):
         return (
@@ -471,26 +515,22 @@ class EventDomains:
             or notification.destination_engine is Engine.S
         )
 
-    def _follows(self, consume_notification, consume, source_notification, source, assumptions):
+    def _following_conditions(self, consume_notification, consume, source_notification, source):
         self.work.lifetime_interfaces += 1
         if consume.actor is not source.actor:
-            return False
+            return ()
         if (
             not self._gate(consume_notification)
             and consume_notification.destination_engine is not source_notification.source_engine
         ):
-            return False
-        return self._order(consume, source, assumptions)
+            return ()
+        return self._order_conditions(consume, source)
 
     def _may_follow(self, consume_notification, consume, source_notification, source, assumptions):
-        if consume.actor is not source.actor:
-            return _Order.IMPOSSIBLE
-        if (
-            not self._gate(consume_notification)
-            and consume_notification.destination_engine is not source_notification.source_engine
-        ):
-            return _Order.IMPOSSIBLE
-        return self._order_relation(consume, source, assumptions)
+        return self._conditions_relation(
+            self._following_conditions(consume_notification, consume, source_notification, source),
+            assumptions,
+        )
 
     def _first_last(self, window):
         return window.first_last()

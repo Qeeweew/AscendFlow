@@ -22,7 +22,8 @@ from .event_contracts import (
     StructuredEventPlan,
 )
 from .event_domains import EventDomains
-from .event_lifetimes import bridge, establish_lease
+from .event_lifetimes import establish_lease
+from .event_paths import prove_event_path_cover
 from .event_progress import prove_progress
 from .structured_event_sharing import EventSharingContext, prove_finite_event_sharing
 from .structured_protocols import NotificationKind, SynchronizationSelection
@@ -48,7 +49,10 @@ class _EventBanks:
         self.actions, self.assignments, self.reservations, self.sharing = [], [], [], []
         self.occupied, self.cross_occupied = {}, {}
         self.sharing_context = EventSharingContext(
-            domains.selection, domains.cases, domains._instance, partial(bridge, domains)
+            domains.selection,
+            domains.cases,
+            domains._instance,
+            partial(prove_event_path_cover, domains),
         )
 
     def allocate(self, lifetimes, progress):

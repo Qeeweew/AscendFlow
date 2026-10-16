@@ -499,47 +499,23 @@ class _Composer:
         child = path[owner + 1]
         return child.parent_stage, (child.parent_lexical, 1)
 
-    def _order_condition(self, wait, source):
-        """Necessary order condition; exact whenever one unresolved rank remains."""
+    def _order_conditions(self, wait, source):
+        """Actual native order alternatives, or one opaque call envelope."""
         if isinstance(wait, QueueCut) or isinstance(source, QueueCut):
-            return self._cut_order(wait, source)
+            condition = self._cut_order(wait, source)
+            return () if condition is None else (condition,)
         before, after = self._instance(wait), self._instance(source)
         assumptions = before.guard.comparisons + after.guard.comparisons
-        relation = self.domains._may_follow(
-            wait.notification,
-            before,
-            source.notification,
-            after,
-            assumptions,
-        )
-        if relation is _Order.IMPOSSIBLE:
-            return None
-        if relation is _Order.PROVED:
-            return _guard(assumptions), True, True
-        a = self.dispatch.tasks[wait.bound.operation, wait.actor]
-        b = self.dispatch.tasks[source.bound.operation, source.actor]
-        ap, bp = self.domains._path(a), self.domains._path(b)
-        common = 0
-        while common < min(len(ap), len(bp)) and ap[common] is bp[common]:
-            common += 1
-        equal = []
-        for index in range(common):
-            region = ap[index].operation
-            ag, ar = self._position(wait, region)
-            bg, br = self._position(source, region)
-            av = dict(before.coordinates).get(region, literal(0))
-            bv = dict(after.coordinates).get(region, literal(0))
-            delta = self.domains.arithmetic.normalize(
-                expression(
-                    "sub", expression("add", bv, literal(bg)), expression("add", av, literal(ag))
-                ),
-            )
-            if delta.constant == 0:
-                continue
-            predicate = ">=" if index + 1 < common or br >= ar else ">"
-            test = Comparison(delta, predicate, literal(0))
-            return _guard(assumptions + tuple(equal) + (test,)), index + 1 == common, False
-        return _guard(assumptions), False, False
+        conditions = []
+        for clause in self.domains._following_conditions(
+            wait.notification, before, source.notification, after
+        ):
+            guard = _guard(assumptions + clause.comparisons)
+            # Unknown alternatives remain blocking possibilities. Only a
+            # refuted conjunction can be removed from the exact order union.
+            if not self._impossible(guard.comparisons):
+                conditions.append((guard, True))
+        return tuple(conditions)
 
     def _cut_order(self, wait, source):
         """Call-level envelope; it makes no claim about hidden native order."""
@@ -555,7 +531,7 @@ class _Composer:
             ):
                 if isinstance(wait, QueueCut) and isinstance(source, QueueCut):
                     return None
-                return _guard(assumptions), False, False
+                return _guard(assumptions), False
             ag, ar = self._position(wait, region)
             bg, br = self._position(source, region)
             av = dict(self._coordinates(wait)).get(region, literal(0))
@@ -568,12 +544,12 @@ class _Composer:
             if delta.constant == 0:
                 if index + 1 < common:
                     continue
-                return (_guard(assumptions), False, False) if br >= ar else None
+                return (_guard(assumptions), False) if br >= ar else None
             predicate = ">=" if index + 1 < common or br >= ar else ">"
             test = Comparison(delta, predicate, literal(0))
             guard = _guard(assumptions + (test,))
-            return None if self._impossible(guard.comparisons) else (guard, False, False)
-        return _guard(assumptions), False, False
+            return None if self._impossible(guard.comparisons) else (guard, False)
+        return _guard(assumptions), False
 
     def _stream_offset(self, port, loop):
         value = dict(self._coordinates(port)).get(loop)
@@ -904,22 +880,21 @@ class _Composer:
                     self._stream_offset(node, region) is not None for node in (wait, item)
                 ):
                     steps, guard, exact = self._gate_step(wait, item, region)
+                    conditions = ((guard, exact),)
                 else:
-                    condition = self._order_condition(wait, item)
-                    if condition is None:
-                        continue
-                    guard, exact = condition[:2]
                     steps = 0
-                graph_arcs.append(
-                    GuardedTransfer(
-                        wi,
-                        si,
-                        steps,
-                        _guard(guard.comparisons + invocation.comparisons),
-                        "actual region interface admission gate",
-                        exact,
+                    conditions = self._order_conditions(wait, item)
+                for guard, exact in conditions:
+                    graph_arcs.append(
+                        GuardedTransfer(
+                            wi,
+                            si,
+                            steps,
+                            _guard(guard.comparisons + invocation.comparisons),
+                            "actual region interface admission gate",
+                            exact,
+                        )
                     )
-                )
         # These cuts expose only the region's queues. They are sources/sinks
         # of blocking implications, never events, tasks or completion fences.
         coordinates = tuple(
@@ -1251,26 +1226,25 @@ class _Composer:
                     continue
                 if stream:
                     steps, guard, exact = self._gate_step(wait, item, region)
+                    conditions = ((guard, exact),)
                 else:
-                    condition = self._order_condition(wait, item)
-                    if condition is None:
-                        continue
-                    guard, exact = condition[:2]
                     steps = 0
-                guard = _guard(guard.comparisons + invocation.comparisons)
-                if not self._impossible(guard.comparisons):
-                    arcs.append(
-                        GuardedTransfer(
-                            wi,
-                            si,
-                            steps,
-                            guard,
-                            "actual controller admission gate"
-                            if self._controller(wait)
-                            else f"actual {wait.engine.value} queue admission gate",
-                            exact,
+                    conditions = self._order_conditions(wait, item)
+                for guard, exact in conditions:
+                    guard = _guard(guard.comparisons + invocation.comparisons)
+                    if not self._impossible(guard.comparisons):
+                        arcs.append(
+                            GuardedTransfer(
+                                wi,
+                                si,
+                                steps,
+                                guard,
+                                "actual controller admission gate"
+                                if self._controller(wait)
+                                else f"actual {wait.engine.value} queue admission gate",
+                                exact,
+                            )
                         )
-                    )
         return self._unique_arcs(arcs)
 
     @staticmethod

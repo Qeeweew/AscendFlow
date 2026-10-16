@@ -5,51 +5,46 @@ allocate IDs, generate actions, or change native dispatch. Unknown lifetime
 relations remain unsupported; bounded interface search is not runtime unrolling.
 """
 
-from collections import deque
-
+from ..budget import poll
+from ..diagnostics import ErrorKind, require
 from ..scalar import expression, literal
 from .event_contracts import (
     CROSS_BACKLOG,
     LOCAL_CAPACITY,
     CaseLease,
     LeaseKind,
-    LeaseStep,
     LeaseWitness,
     StructuredEventLease,
 )
+from .event_paths import prove_event_path_cover
 from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard
 
-MAX_INTERFACE_STEPS = 128
+MAX_INTERFACE_OFFSETS = 256
 
 
-def bridge(domains, notification, old, goal, loop, delta, assumptions, candidates):
-    domains.work.lease_searches += 1
-    queue = deque([(notification, old, ())])
-    visited = set()
-    while queue:
-        current, consume, steps = queue.popleft()
-        key = (id(current), consume.actor, consume.coordinates)
-        if key in visited:
+def _candidates(domains, loop, first, stop, *, needs_clock):
+    """Construct only a requested finite interface horizon, never runtime trips."""
+    require(
+        stop - first <= MAX_INTERFACE_OFFSETS,
+        f"event interface offset horizon exceeds analysis budget {MAX_INTERFACE_OFFSETS}",
+        kind=ErrorKind.ANALYSIS_LIMIT,
+        phase="event-path-cover",
+    )
+    for peer in domains.notifications:
+        if peer.mechanism is NotificationKind.PIPE_FENCE:
             continue
-        visited.add(key)
-        if domains._follows(current, consume, notification, goal, assumptions):
-            final = LeaseStep(consume, goal, None, domains._gate(current))
-            chain = steps + (final,)
-            domains.work.witness_steps += len(chain)
-            return chain
-        if len(steps) >= MAX_INTERFACE_STEPS:
-            continue
-        for peer, sources, consumers in candidates:
-            if peer is notification:
+        for peer_case in domains.cases[peer]:
+            if (
+                peer_case.empty
+                or needs_clock
+                and not any(w.loop is loop for w in peer_case.windows)
+            ):
                 continue
-            for source in sources:
-                if domains._follows(
-                    current, consume, peer, source, assumptions
-                ) and domains._exists(sources + consumers, assumptions):
-                    step = LeaseStep(consume, source, peer, domains._gate(current))
-                    queue.extend((peer, destination, steps + (step,)) for destination in consumers)
-    return None
+            for offset in range(first, stop):
+                poll("event reuse candidates", offset=offset, horizon=stop - first)
+                for sources, consumers in domains._instances(peer, peer_case, loop, offset):
+                    yield peer, sources, consumers
 
 
 def roundtrip(domains, notification, case, window, width):
@@ -78,32 +73,29 @@ def roundtrip(domains, notification, case, window, width):
                 )
             )
         )
-        candidates = []
-        for peer in domains.notifications:
-            if peer.mechanism is NotificationKind.PIPE_FENCE:
-                continue
-            for peer_case in domains.cases[peer]:
-                if peer_case.empty or not any(w.loop is loop for w in peer_case.windows):
-                    continue
-                # A bounded event/slot-distance search, never a loop-count scan.
-                for offset in range(-min(8, delta), delta + 1):
-                    for sources, consumers in domains._instances(peer, peer_case, loop, offset):
-                        candidates.append((peer, sources, consumers))
         for old in old_consumers:
             for goal in next_sources:
-                chain = bridge(
-                    domains, notification, old, goal, loop, delta, assumptions, candidates
+                path_cover = prove_event_path_cover(
+                    domains,
+                    notification,
+                    old,
+                    goal,
+                    assumptions,
+                    _candidates(domains, loop, -min(8, delta), delta + 1, needs_clock=True),
                 )
-                if chain is None:
+                if path_cover is None:
                     return None
+                # A vacuous cover has no active reuse and also satisfies this
+                # universal classification; its empty proof remains explicit.
+                direct = all(len(path.steps) == 1 for path in path_cover.paths)
                 witnesses.append(
                     LeaseWitness(
-                        LeaseKind.CONTROLLER if not chain[:-1] else LeaseKind.QUEUE_ROUNDTRIP,
+                        LeaseKind.CONTROLLER if direct else LeaseKind.QUEUE_ROUNDTRIP,
                         loop,
                         delta,
                         old,
                         goal,
-                        chain,
+                        path_cover,
                         condition=condition,
                     )
                 )
@@ -115,19 +107,9 @@ def reentry(domains, notification, case, window, width=1):
     loop = window.loop
     witnesses = []
     for phase, delta in window.reuse_phases(width):
-        candidates = []
         horizon = delta + max(
             (abs(peer.distance or 0) for peer in domains.notifications), default=0
         )
-        for peer in domains.notifications:
-            if peer.mechanism is NotificationKind.PIPE_FENCE:
-                continue
-            for peer_case in domains.cases[peer]:
-                if peer_case.empty:
-                    continue
-                for offset in range(horizon + 1):
-                    for sources, consumers in domains._instances(peer, peer_case, loop, offset):
-                        candidates.append((peer, sources, consumers))
         old_sources, old_consumers = list(domains._instances(notification, case, loop, 0))[-1]
         next_sources, next_consumers = next(domains._instances(notification, case, loop, delta))
         condition = ActionGuard(
@@ -145,10 +127,15 @@ def reentry(domains, notification, case, window, width=1):
         )
         for old in old_consumers:
             for goal in next_sources:
-                chain = bridge(
-                    domains, notification, old, goal, loop, delta, assumptions, candidates
+                path_cover = prove_event_path_cover(
+                    domains,
+                    notification,
+                    old,
+                    goal,
+                    assumptions,
+                    _candidates(domains, loop, 0, horizon + 1, needs_clock=False),
                 )
-                if chain is None:
+                if path_cover is None:
                     return None
                 witnesses.append(
                     LeaseWitness(
@@ -157,7 +144,7 @@ def reentry(domains, notification, case, window, width=1):
                         delta,
                         old,
                         goal,
-                        chain,
+                        path_cover,
                         condition=condition,
                     )
                 )

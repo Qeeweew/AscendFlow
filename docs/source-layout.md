@@ -19,7 +19,10 @@
 | 通知选择 | `passes/select_notifications.py`、`analysis/structured_protocols.py` | 完整激活域中的 capture/acquire 与 coverage；不分配 ID |
 | 事件域 | `analysis/event_domains.py`、`event_families.py`、`event_windows.py` | 实际配对、整条时钟链的参数分区、精确 membership/首末/存在投影；不分配 ID |
 | 有限周期 | `analysis/periodic.py` | 结构周期及数学相位求值；不证明原程序的无符号算术定义性 |
+| 模条件 | `analysis/modular.py` | 相关多项式整体的余数及比较mask；只用于证明，不生成运行期表达式 |
 | 整数关系事实 | `analysis/integer_facts.py` | 固定输入范围及完整有序前提下的规约、范围和比较；同一事实只建立一次，不提供异步完成证明 |
+| 局部条件覆盖 | `analysis/guard_cover.py` | 在一项义务内证明条件OR覆盖；有序定义性、整数三分和余数集合，不持有通知或排步 |
+| 实际消费路径 | `analysis/event_paths.py` | 组合真实队列/controller接口和路径条件，完整覆盖即停止；生命周期与有限ID共享共用 |
 | 事件生命周期 | `analysis/event_lifetimes.py`、`structured_event_sharing.py` | 消费到复用、有限子循环再次调用和有证据的 ID 共享 |
 | 派发进展 | `analysis/event_progress.py` | 实际阻塞接口及循环组合；不读取分配 ID |
 | 事件分配 | `analysis/structured_resources.py`、`event_contracts.py` | 连接资源阶段、bank/ID 台账、配置预留与最终 drain |
@@ -30,7 +33,7 @@
 
 `structured_regions.py` 存共享关系类型；`structured_access.py` 负责范围投影；`structured_dependencies.py` 负责递归合成。这三者不能各自重新解释一次地址、slot 或循环有效域。
 
-资源阶段拆开事实、生命周期、进展和分配，共享一次建立的 `EventDomains`。进展区分内部 stream rank 与对外 queue/阻塞接口；子层 native 留在本地 witness，完整嵌套功能资格仍见状态页。
+资源阶段拆开事实、生命周期、进展和分配，共享一次建立的 `EventDomains`。实际端点的条件队列顺序也由它建立，lease和sharing不重新解释stage/词法位置。`event_paths`依赖纯数学的`guard_cover`，反向依赖禁止。进展区分内部 stream rank 与对外 queue/阻塞接口；子层 native 留在本地 witness，完整嵌套功能资格仍见状态页。
 
 ## 必须保持的依赖方向
 

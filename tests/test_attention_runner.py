@@ -188,9 +188,25 @@ def publish(directory, *, backend="generated", source=None, policy=run.DEFAULT_P
     (directory / (name + ".compile.json")).write_text(json.dumps(manifest))
     report = {"kernel": name}
     if backend == "generated":
+        compilation = {"assembly_s": 0.01, "emission_s": 0.01, "snapshot_s": 0.01, "total_s": 0.03}
         report.update(
-            cross_query_verified=True,
-            query_verification={"verified": True, "resources": {"verified": True}},
+            pipeline="structured-regions",
+            verification_mode="owned-construction",
+            debug_structural_verification=False,
+            compilation=compilation,
+            cann=manifest,
+        )
+        (directory / "compilation.json").write_text(json.dumps(compilation))
+        (directory / "build-result.json").write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "returncode": 0,
+                    "error": None,
+                    "seconds": 0.03,
+                    "deadline_s": 300,
+                }
+            )
         )
         before, logical = metadata_ir(policy)
         (directory / "before.xdsl").write_text(before)
@@ -316,6 +332,14 @@ def test_reusing_generated_artifact_never_builds_and_records_its_own_identity(ar
     assert identity["shared_sha256"] == run.sha256((artifact / "attention_target.so").read_bytes())
     assert identity["launcher_parameters"][3:5] == ("arg_Score", "arg_P")
     assert identity["contract"]["buffers"]["score"]["fixed_bytes"] == 20971520
+    origin = identity["source_build"]
+    assert origin["pipeline"] == "structured-regions"
+    assert origin["verification_mode"] == "owned-construction"
+    assert origin["status"] == "passed"
+    assert origin["verification_report_sha256"] == run.sha256(
+        (artifact / "verification.json").read_bytes()
+    )
+    assert "without independently validating synchronization" in result["comparison_scope"]
     assert json.loads(record.read_text())["artifact"]["library"] == identity["library"]
     assert "not kernel-only" in result["timing_scope"]
 
@@ -340,12 +364,66 @@ def test_changed_source_or_shared_object_is_rejected_before_any_device_initializ
 
 @pytest.mark.parametrize(
     "filename",
-    ("attention_target.so", "attention_target.compile.json", "before.xdsl", "source.xdsl"),
+    (
+        "attention_target.so",
+        "attention_target.compile.json",
+        "before.xdsl",
+        "source.xdsl",
+        "compilation.json",
+        "build-result.json",
+    ),
 )
 def test_incomplete_generated_artifact_cannot_trigger_a_silent_rebuild(artifact, filename):
     (artifact / filename).unlink()
     with pytest.raises(CompileError, match="missing attention artifact"):
         run.main(["--output", str(artifact)])
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("pipeline", "physical-import"),
+        ("verification_mode", "external-verified"),
+        ("verification_mode", None),
+    ],
+)
+def test_generated_artifact_requires_current_source_report(artifact, field, value):
+    path = artifact / "verification.json"
+    report = json.loads(path.read_text())
+    report[field] = value
+    path.write_text(json.dumps(report))
+    with pytest.raises(CompileError, match="current source compilation"):
+        run.main(["--output", str(artifact), "--physical", "0"])
+
+
+@pytest.mark.parametrize(
+    "status,returncode,error",
+    [
+        ("failed", 1, "source failure"),
+        ("timeout", None, "deadline"),
+        ("passed", 1, None),
+        ("passed", 0, "incomplete publication"),
+    ],
+)
+def test_report_mode_cannot_authorize_an_unfinished_source_build(
+    artifact, status, returncode, error
+):
+    path = artifact / "build-result.json"
+    record = json.loads(path.read_text())
+    record.update(status=status, returncode=returncode, error=error)
+    path.write_text(json.dumps(record))
+    with pytest.raises(CompileError, match="completed source build"):
+        run.main(["--output", str(artifact), "--physical", "0"])
+
+
+@pytest.mark.parametrize("field", ["cann", "compilation"])
+def test_current_source_report_must_match_its_published_build_records(artifact, field):
+    path = artifact / "verification.json"
+    report = json.loads(path.read_text())
+    report[field] = {}
+    path.write_text(json.dumps(report))
+    with pytest.raises(CompileError, match="build records differ"):
+        run.main(["--output", str(artifact), "--physical", "0"])
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,7 @@ from .structured_schedule import ActionGuard, SyncAction
 
 if TYPE_CHECKING:
     from .event_domains import EventCase
+    from .event_paths import EventPathCover
     from .event_progress import GuardedTransfer, RegionProgress
     from .event_windows import EventWindow
     from .structured_event_sharing import EventSharingWitness
@@ -61,7 +62,7 @@ class LeaseWitness:
     delta: int
     consume: BoundPlacement
     next_set: BoundPlacement
-    steps: tuple[LeaseStep, ...] = ()
+    path_cover: EventPathCover | None = None
     upper_uses: int | None = None
     condition: ActionGuard = field(kw_only=True)
 
@@ -140,6 +141,11 @@ class ResourceWork:
     lifetime_interfaces: int = 0
     lease_searches: int = 0
     witness_steps: int = 0
+    path_states: int = 0
+    path_edges: int = 0
+    path_covers: int = 0
+    cover_nodes: int = 0
+    cover_queries: int = 0
     assigned_local_ids: int = 0
     assigned_cross_ids: int = 0
     progress_points: int = 0

@@ -1,15 +1,25 @@
 """Exact endpoint and invocation facts belong to one progress composition."""
 
 from dataclasses import replace
+from itertools import product
 
 import pytest
 
 from tests.analysis.test_progress_parent_interfaces import PARENT_REUSE
+from tests.models.structured_domains import actual_dispatch
 from tests.support.structured import prepared, selected
+from xdsl_npu.analysis.access_frontier import AccessEndpoint
 from xdsl_npu.analysis.event_domains import EventDomains
 from xdsl_npu.analysis.event_progress import ProgressPort, _Composer
+from xdsl_npu.analysis.structured_protocols import (
+    BoundPlacement,
+    LogicalNotification,
+    NotificationKind,
+)
+from xdsl_npu.analysis.structured_regions import AccessOccurrence, LoopBinding
 from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison, Placement
-from xdsl_npu.scalar import expression, literal
+from xdsl_npu.scalar import Expr, expression, literal
+from xdsl_npu.target.ascend910b import Actor
 
 
 @pytest.fixture(scope="module")
@@ -131,3 +141,118 @@ def test_bound_facts_do_not_outlive_the_composer(domains, monkeypatch):
     calls = count_instances(monkeypatch)
     assert first._instance(source) is not second._instance(source)
     assert len(calls) == 2
+
+
+@pytest.fixture(scope="module")
+def conditional_order_domains():
+    """Two finite selected coordinates; no allocation or operator compile."""
+    selection = selected("""
+    def coordinates(X:N.Tensor((64,),N.f32),n:N.int64,m:N.int64,
+                    p:N.int64,q:N.int64,i:N.int64,j:N.int64):
+        with N.Kernel():
+            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
+            N.copy(X[:],x)
+            for a in N.Pipelined(n,stages=1):
+                for b in N.Pipelined(m,stages=1):
+                    N.copy(X[:],x)
+                    N.fill(y,1.0)
+            N.copy(X[:],x)
+    """)
+    memory = selection.dependencies.memory
+    outer, inner = memory.control.loops.values()
+    arguments = {name: Expr("argument", (name,)) for name in ("p", "q", "i", "j")}
+    before = ((outer.operation, arguments["p"]), (inner.operation, arguments["i"]))
+    after = ((outer.operation, arguments["q"]), (inner.operation, arguments["j"]))
+
+    def channel(name, source_index, source_coordinates, consumer_index, consumer_coordinates):
+        activation = ActionGuard(
+            tuple(
+                test
+                for loop, value in source_coordinates + consumer_coordinates
+                for test in (
+                    Comparison(value, ">=", literal(0)),
+                    Comparison(memory.control.loops[loop].count, ">", value),
+                )
+            )
+        )
+
+        def bound(index, coordinates, placement):
+            return BoundPlacement(
+                AccessOccurrence(
+                    AccessEndpoint.from_template(memory.templates[index], Actor.AIV0),
+                    tuple(LoopBinding(*coordinate) for coordinate in coordinates),
+                ),
+                placement,
+                activation,
+                (),
+                (),
+                (),
+                coordinates,
+            )
+
+        return LogicalNotification(
+            name,
+            (bound(source_index, source_coordinates, Placement.AFTER),),
+            (bound(consumer_index, consumer_coordinates, Placement.BEFORE),),
+            memory.templates[source_index].contract.engine,
+            memory.templates[consumer_index].contract.engine,
+            NotificationKind.LOCAL_EVENT,
+            (),
+            None,
+            literal(0),
+            1,
+            None,
+        )
+
+    return prepared(
+        replace(
+            selection,
+            dependencies=replace(selection.dependencies, required=()),
+            notifications=(
+                channel("incoming", 0, (), 2, before),
+                channel("outgoing", 2, after, 3, ()),
+            ),
+            coverage=(),
+        )
+    )
+
+
+@pytest.mark.parametrize("interface", (False, True))
+def test_progress_retains_each_unknown_native_order_clause(conditional_order_domains, interface):
+    domains = conditional_order_domains
+    composer = _Composer(domains)
+    incoming, outgoing = domains.notifications
+    (wait_case,), (source_case,) = (domains.cases[n] for n in domains.notifications)
+    wait = ProgressPort(incoming, incoming.consumers[0], "wait", wait_case)
+    source = ProgressPort(outgoing, outgoing.sources[0], "set", source_case)
+    outer, inner = domains.control.loops
+    if interface:
+        # An actual child interface binds one outer invocation. Its parent
+        # must also retain gates from earlier invocations of that child.
+        child = composer.compose(inner).interface
+        graph, _ = composer._graph(outer, (wait,), None, (), (child,))
+        arcs = tuple(
+            arc for arc in graph.relations if arc.reason == "actual region interface admission gate"
+        )
+    else:
+        arcs = composer._local_arcs(composer.root, (wait, source), (), (), stream=False)
+    assert len(arcs) == 2
+    assert all(arc.exact and arc.steps == 0 for arc in arcs)
+
+    native = domains.memory.templates[2].operation
+    for p, q, i, j in product(range(2), repeat=4):
+        context = {"n": 2, "m": 2, "p": p, "q": q, "i": i, "j": j, "$group": 0}
+        positions = {
+            key: index
+            for index, (key, _) in enumerate(
+                actual_dispatch(domains.selection, context, Actor.AIV0)
+            )
+        }
+        before = native, Actor.AIV0, ((outer, p), (inner, i))
+        after = native, Actor.AIV0, ((outer, q), (inner, j))
+        assert sum(arc.guard.evaluate(context) for arc in arcs) == int(
+            positions[before] <= positions[after]
+        )
+    assert all(
+        not arc.guard.evaluate({"n": 0, "m": 2, "p": 0, "q": 0, "i": 0, "j": 0}) for arc in arcs
+    )

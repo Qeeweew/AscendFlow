@@ -1,6 +1,7 @@
 """Case-local lease proofs and one physical allocation per notification."""
 
 from dataclasses import dataclass, replace
+from functools import partial
 from itertools import product
 from types import SimpleNamespace
 
@@ -8,9 +9,10 @@ import pytest
 from xdsl.dialects import arith
 from xdsl.ir import Operation
 
-from xdsl_npu.analysis.event_contracts import LeaseKind, LeaseStep, ResourceWork
+from xdsl_npu.analysis.event_contracts import LeaseKind, ResourceWork
 from xdsl_npu.analysis.event_domains import EventCase
 from xdsl_npu.analysis.event_lifetimes import establish_lease, reentry, roundtrip
+from xdsl_npu.analysis.event_paths import prove_event_path_cover
 from xdsl_npu.analysis.event_windows import EventWindow
 from xdsl_npu.analysis.integer_facts import IntegerFacts
 from xdsl_npu.analysis.structured_event_sharing import (
@@ -103,7 +105,7 @@ def _case(mode, windows=(), *, empty=False):
 class _Domains:
     """The established-domain protocol, with explicit test queue relations."""
 
-    def __init__(self, cases, follows=lambda *args: False):
+    def __init__(self, cases, following=lambda *args: ()):
         self.cases = cases
         self.notifications = tuple(cases)
         self.selection = SimpleNamespace(notifications=self.notifications)
@@ -117,7 +119,7 @@ class _Domains:
             }
         )
         self.arithmetic = IntegerFacts({})
-        self.follows = follows
+        self.following = following
         self.pair_checks = []
 
     def _instance(self, placement, bindings, *, case):
@@ -145,16 +147,9 @@ class _Domains:
             tuple(self._instance(point, bindings, case=case) for point in notification.consumers),
         )
 
-    def _follows(self, current, consume, following, source, assumptions):
+    def _following_conditions(self, current, consume, following, source):
         self.work.lifetime_interfaces += 1
-        return self.follows(current, consume, following, source, assumptions)
-
-    def _exists(self, placements, assumptions):
-        return all(
-            self.arithmetic.prove(test, assumptions)
-            for placement in placements
-            for test in placement.guard.comparisons
-        )
+        return self.following(current, consume, following, source)
 
     def _gate(self, notification):
         return False
@@ -231,28 +226,46 @@ def test_all_empty_cases_have_no_ids_or_actions():
 
 
 @pytest.mark.parametrize("prove", [roundtrip, reentry])
-def test_peer_cases_require_an_established_condition_and_search_every_case(prove):
+def test_peer_paths_must_cover_the_entire_target_domain(prove):
     loop = arith.ConstantOp.from_int_and_width(0, 64)
     window = _window(loop, G, literal(20))
     target = _notification("target", ((loop, G),))
-    peer = _notification("peer", ((loop, G),))
+    peer = replace(
+        _notification("peer", ((loop, G),)),
+        source_engine=Engine.V,
+        destination_engine=Engine.MTE2,
+    )
     target_case = _case(0, (window,))
     broad_target = replace(target_case, condition=ActionGuard(), substitutions=())
-    unavailable = replace(
+    nonzero_case = replace(
         target_case,
         condition=ActionGuard((Comparison(MODE, "!=", literal(0)),)),
         substitutions=(),
     )
-    available = _case(0, (window,))
+    zero_case = _case(0, (window,))
 
-    def follows(current, consume, following, source, assumptions):
-        return current is peer or following is peer
+    def following(current, consume, following, source):
+        return (ActionGuard(),) if current is peer or following is peer else ()
 
-    domains = _Domains({target: (broad_target,), peer: (unavailable, available)}, follows)
+    domains = _Domains({target: (broad_target,), peer: (nonzero_case,)}, following)
     assert prove(domains, target, broad_target, window, 1) is None
+    domains.cases[peer] = (nonzero_case, zero_case)
+    witnesses = prove(domains, target, broad_target, window, 1)
+    assert witnesses and all(witness.path_cover is not None for witness in witnesses)
+    for witness in witnesses:
+        for mode in (0, 1):
+            active = [
+                path
+                for path in witness.path_cover.paths
+                if path.condition.evaluate({"mode": mode, "g": 0})
+            ]
+            assert active and all(path.steps[0].notification is peer for path in active)
+    domains.cases[peer] = (nonzero_case,)
     domains.cases[target] = (target_case,)
+    assert prove(domains, target, target_case, window, 1) is None
+    domains.cases[peer] = (nonzero_case, zero_case)
     witnesses = prove(domains, target, target_case, window, 1)
-    assert witnesses and all(witness.steps[0].notification is peer for witness in witnesses)
+    assert witnesses and all(witness.path_cover is not None for witness in witnesses)
     assert all(
         target_case.condition.comparisons[0] in witness.condition.comparisons
         for witness in witnesses
@@ -267,12 +280,12 @@ def test_sparse_reuse_checks_the_nearest_actual_same_id_in_every_phase(prove):
     case = _case(0, (window,))
     arithmetic = IntegerFacts({})
 
-    def follows(current, consume, following, source, assumptions):
+    def following(current, consume, following, source):
         old, new = dict(consume.coordinates)[loop], dict(source.coordinates)[loop]
         distance = arithmetic.normalize(expression("sub", new, old)).constant
-        return distance is not None and distance >= 3
+        return (ActionGuard(),) if distance is not None and distance >= 3 else ()
 
-    domains = _Domains({notification: (case,)}, follows)
+    domains = _Domains({notification: (case,)}, following)
     # Members 0 and 2 are consecutive. A period-5 jump misses the unsafe reuse.
     assert prove(domains, notification, case, window, 1) is None
     witnesses = prove(domains, notification, case, window, 2)
@@ -288,7 +301,9 @@ def test_sparse_reuse_checks_the_nearest_actual_same_id_in_every_phase(prove):
 def test_finite_sharing_accepts_one_case_and_rejects_multiple_cases():
     left, right = _notification("left"), _notification("right")
     finite = _case(0)
-    domains = _Domains({left: (finite,), right: (finite,)})
+    domains = _Domains(
+        {left: (finite,), right: (finite,)}, following=lambda *args: (ActionGuard(),)
+    )
     root = arith.ConstantOp.from_int_and_width(0, 64)
     control = SimpleNamespace(
         module=SimpleNamespace(body=SimpleNamespace(block=SimpleNamespace(first_op=root))),
@@ -301,17 +316,62 @@ def test_finite_sharing_accepts_one_case_and_rejects_multiple_cases():
     )
     domains.selection.dependencies = SimpleNamespace(memory=SimpleNamespace(control=control))
 
-    def finite_bridge(notification, consume, goal, loop, delta, assumptions, candidates):
-        return (LeaseStep(consume, goal, None, False),)
-
     context = EventSharingContext(
-        domains.selection, domains.cases, domains._instance, finite_bridge
+        domains.selection,
+        domains.cases,
+        domains._instance,
+        partial(prove_event_path_cover, domains),
     )
-    assert prove_finite_event_sharing(left, right, context=context) is not None
+    witness = prove_finite_event_sharing(left, right, context=context)
+    assert witness is not None and witness.path_cover.paths
     domains.cases[right] = (finite, _case(1, empty=True))
 
-    def forbidden_bridge(*args):
-        pytest.fail("multiple cases reached the finite sharing bridge")
+    def forbidden_path_cover(*args):
+        pytest.fail("multiple cases reached the finite sharing path proof")
 
-    context = replace(context, bridge=forbidden_bridge)
+    context = replace(context, prove_path_cover=forbidden_path_cover)
     assert prove_finite_event_sharing(left, right, context=context) is None
+
+
+def test_complementary_direct_paths_finish_before_candidate_construction():
+    target = _notification("target")
+    conditions = tuple(
+        ActionGuard((Comparison(MODE, relation, literal(0)),)) for relation in ("==", "!=")
+    )
+    domains = _Domains({target: (_case(0),)}, following=lambda *args: conditions)
+
+    def unused_candidates():
+        pytest.fail("complete direct coverage must not enumerate unrelated interfaces")
+        yield
+
+    proof = prove_event_path_cover(
+        domains, target, target.consumers[0], target.sources[0], (), unused_candidates()
+    )
+    assert proof is not None and len(proof.paths) == 2
+    assert domains.work.path_states == 1 and domains.work.path_edges == 0
+    assert all(len(path.steps) == 1 for path in proof.paths)
+
+
+def test_partial_direct_path_keeps_the_peer_path_for_its_uncovered_domain():
+    target = _notification("target")
+    peer = replace(_notification("peer"), source_engine=Engine.V, destination_engine=Engine.MTE2)
+
+    def following(current, consume, next_notification, source):
+        if current is peer:
+            return (ActionGuard(),)
+        predicate = "==" if next_notification is target else "!="
+        return (ActionGuard((Comparison(MODE, predicate, literal(0)),)),)
+
+    domains = _Domains({target: (_case(0),), peer: (_case(0),)}, following)
+    proof = prove_event_path_cover(
+        domains,
+        target,
+        target.consumers[0],
+        target.sources[0],
+        (),
+        ((peer, peer.sources, peer.consumers),),
+    )
+    assert proof is not None
+    for mode in (0, 1):
+        active = [path for path in proof.paths if path.condition.evaluate({"mode": mode})]
+        assert active and all(len(path.steps) == mode + 1 for path in active)

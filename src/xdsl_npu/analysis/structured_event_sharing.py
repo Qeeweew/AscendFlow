@@ -1,20 +1,19 @@
 """Share finite channels only through existing consume-to-next-Set evidence.
 
-This module consumes the resource stage's canonical placements and bridge
-proofs. It introduces no synchronization, schedule or memory analysis. A
+This module consumes canonical placements and complete path-cover proofs.
+It introduces no synchronization, schedule or memory analysis. A
 repeated invocation requires a per-ID proof beyond this finite contract.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from xdsl.ir import Operation
-
 from ..scalar import Expr
 from ..target.ascend910b import Actor, Engine
+from .event_paths import EventPathCandidate, EventPathCover
 from .structured_protocols import (
     BoundPlacement,
     LogicalNotification,
@@ -26,33 +25,16 @@ from .structured_schedule import Comparison
 if TYPE_CHECKING:
     from .event_domains import EventCase
 
-
-class SharingStep(Protocol):
-    """The existing resource bridge step; no reverse resource import."""
-
-    consume: BoundPlacement
-    source: BoundPlacement
-    notification: LogicalNotification | None
-    controller: bool
-
-
-SharingCandidate = tuple[
-    LogicalNotification, tuple[BoundPlacement, ...], tuple[BoundPlacement, ...]
+PathCoverProof = Callable[
+    [
+        LogicalNotification,
+        BoundPlacement,
+        BoundPlacement,
+        tuple[Comparison, ...],
+        tuple[EventPathCandidate, ...],
+    ],
+    EventPathCover | None,
 ]
-
-
-class SharingBridge(Protocol):
-    def __call__(
-        self,
-        notification: LogicalNotification,
-        consume: BoundPlacement,
-        goal: BoundPlacement,
-        loop: Operation | None,
-        delta: int,
-        assumptions: tuple[Comparison, ...],
-        candidates: tuple[SharingCandidate, ...],
-        /,
-    ) -> tuple[SharingStep, ...] | None: ...
 
 
 class CaseCanonicalizer(Protocol):
@@ -70,7 +52,7 @@ class EventSharingContext:
     selection: SynchronizationSelection
     cases: Mapping[LogicalNotification, tuple[EventCase, ...]]
     canonicalize: CaseCanonicalizer
-    bridge: SharingBridge
+    prove_path_cover: PathCoverProof
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,8 +62,7 @@ class EventSharingWitness:
     later: LogicalNotification
     consume: BoundPlacement
     next_set: BoundPlacement
-    steps: tuple[SharingStep, ...]
-    assumptions: tuple[Comparison, ...]
+    path_cover: EventPathCover
 
 
 def _single_occurrence(notification, context):
@@ -171,9 +152,9 @@ def prove_finite_event_sharing(
     ):
         consume = context.canonicalize(earlier.consumers[0], {}, case=earlier_case)
         next_set = context.canonicalize(later.sources[0], {}, case=later_case)
-        # Both channels use the same actual bank, so the resource bridge's
+        # Both channels use the same actual bank, so the path proof's
         # goal source route is also the later channel's actual source route.
-        steps = context.bridge(earlier, consume, next_set, None, 0, assumptions, candidates)
-        if steps is not None:
-            return EventSharingWitness(bank, earlier, later, consume, next_set, steps, assumptions)
+        path_cover = context.prove_path_cover(earlier, consume, next_set, assumptions, candidates)
+        if path_cover is not None:
+            return EventSharingWitness(bank, earlier, later, consume, next_set, path_cover)
     return None
