@@ -81,11 +81,15 @@ print(emit_local(plan))
 
 `passes/native_addresses.py`用原Buffer root和完整SSA byte offset表达地址，保留所有祖先坐标、源axis及subview displacement。同root不同基址不再被合并到单capture。`analysis/value_bindings.py`保留实际writer、所有native reader以及PipelineLast有限DAG；Stage/Domain只转发，SCF carry保持零次初值。Task scope按真实循环/Stage/分支共享父链接，不复制访问历史。source除法检查只为实际存在的除法收集祖先范围，仍检查未使用的原除法，不强迫无关scalar carry化成旧access公式。
 
-当前只完成单actor结构/原语构造，返回`NativeStructure`而不是可执行计划。**动态bounds、ownership、原语/SPR接纳、stale Tile及LastTile非空使用条件、递归边界同步还没有接通；不能直接生成ASC。** 跨Stage Scalar引用、SCF Tile carry/merge、valid prefix、动态native row pitch和partial fractal明确拒绝；不是静默选择旧路径。现有局部同步入口仍消费旧lower_source的物理表示，下一步必须把这两部分接在一起。
+递归结构基线已提交为`d561378`；后续接入单Mixed控制树、参数化ActorDomain和按family保存的issue_order，仍返回`NativeStructure`而不是可执行计划。**动态bounds、ownership、原语/SPR接纳、stale Tile及LastTile非空使用条件、递归边界同步还没有接通；不能直接生成ASC。** 跨Stage Scalar引用、SCF Tile carry/merge、valid prefix、动态native row pitch和partial fractal明确拒绝；不是静默选择旧路径。现有局部同步入口仍消费旧lower_source的物理表示，下一步必须把这两部分接在一起。
 
-相关集成和index组59项通过（2.52s）；随后补充未使用除法/无关carry反例，iteration组9项通过（0.56s）。新物理IR45项、地址26项、值绑定13项分别通过；各组不合计成全量结果。真实Scale派发/地址、Cube排步与writer/reader、嵌套前后work、零/短循环有有限轨迹对照。固定N=2^10与2^20保持相同native/loop模板及构造工作量。未跑FA新路径、CANN或设备，不给出整编译加速结论。
+相关集成和index组59项通过（2.52s）；随后补充未使用除法/无关carry反例，iteration组9项通过（0.56s）。新物理IR45项、地址26项、值绑定13项分别通过；各组不合计成全量结果。真实Scale派发/地址、Cube排步与writer/reader、嵌套前后work、零/短循环有有限轨迹对照。固定N=2^10与2^20保持相同native/loop模板及构造工作量。该阶段未运行FA同步/ASC、CANN或设备，不给出整编译加速结论。
 
-用户已明确下一步的CV代码形态：AIC:AIV=1:2时两个AIV共用一份body，通过runtime sid区分地址/角色。同步分析仍区分两参与者的私有UB、ownership和quorum，不以复制AIV IR来区分身份。目前正在核对并接入此表示，旧mixed生成器尚未切换。
+用户已明确下一步的CV代码形态：AIC:AIV=1:2时两个AIV共用一份body，通过runtime sid区分地址/角色。同步分析仍区分两参与者的私有UB、ownership和quorum，不以复制AIV IR来区分身份。新结构降级已落实：每个source Vector域只生成一个带sid参数的physical域，不生成aiv0/aiv1副本。GM root跨域保持同一SSA，UB实例需由(root,participant)区分，不能把sid自动加到UB基址。共享loop的物理step由各actor控制器独立推进，不含全局锁步。旧mixed生成器尚未切换。
+
+新增shared AIV与递归集成26项通过（2.21s），物理结构组65项通过（0.97s）；均非设备验证。真实默认FA也已通过新结构降级：6个loop模板、44个native模板、2个Cube域和2个Vector域（softmax/update各一份），Sq/Sk保持runtime，迭代展开0。单次构造到native结构约0.492s，含IR快照/源码清单约0.674s，**不包含同步或ASC，不是≤5s编译资格**。源码和IR身份、源码清单、复现脚本在[中间结构证据](../../runs/structured-loops/m3-native/attention/result.json)。源码仍是原默认FA，未改变算法或调参。
+
+CANN契约核对：当前ASC C API的`asc_get_block_idx()`为group id，`asc_get_sub_block_id()`为sid；C++ `AscendC::GetBlockIdx()`在AIV是group*ratio+sid，不能混用两套公式。共享AIV代码不改变mode2通知的两个实际参与者贡献，不能因单body减少quorum，也不能默认给flag加sid。下一步是实际native/地址接纳与递归边界同步，随后统一资源和后端。
 
 ## 2. 编译耗时：明确未达标
 

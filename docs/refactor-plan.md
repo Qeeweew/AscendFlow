@@ -61,6 +61,7 @@
 ### M3：嵌套组合、CV 与统一事件资源
 
 - 同一边界组合处理 serial 输出块、KV流水、native child；移除“serial 内必须只有一个 KV pipeline”的结构限制。
+- AIC:AIV=1:2保留单Mixed控制树与一份参数化AIV代码，sid是runtime坐标；分析按实际participant区分私有UB、访问和quorum，禁止为身份区分复制AIV body。
 - CV FIX→GM→AIV ready、双AIV release、反向 credit、控制器 Wait 的进展接入目标合同。
 - 逻辑 lease 在同一资源分配入口处理，不再先 child 再 parent 再 query 分别重新求证。入口内部可按不相交 bank/约束分量分解。
 - 保留既有 event borrowing、FIRST/LAST、跨片段未消费状态和最终收尾。不足时精确诊断；不加全循环等待回避资源问题。

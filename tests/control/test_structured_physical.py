@@ -2,7 +2,15 @@
 
 import pytest
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp, StringAttr, i32
+from xdsl.dialects.builtin import (
+    ArrayAttr,
+    DictionaryAttr,
+    IndexType,
+    IntAttr,
+    ModuleOp,
+    StringAttr,
+    i32,
+)
 from xdsl.ir import Block, Region
 from xdsl.traits import Pure, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
@@ -11,13 +19,15 @@ from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.loops import LoopScheduleAttr
 from xdsl_npu.dialects.physical import (
     BufferOp,
+    CoreIdOp,
     EndOp,
     KernelOp,
+    MixedOp,
     RuntimeSizeOp,
     TaskOp,
     task_attrs,
 )
-from xdsl_npu.dialects.structured import AddressOp, PipelineLoopOp, PipelineStageOp
+from xdsl_npu.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
 from xdsl_npu.dialects.types import AsyncEffects, TaskType, ref_type
 
 
@@ -39,7 +49,7 @@ def stage(offset=1, *, arg_types=None):
     )
 
 
-def program(*, stages=None, lower=2, upper=11, step=3, horizon=2):
+def program(*, stages=None, lower=2, upper=11, step=3, horizon=2, mixed=False):
     lower, upper, step = index(lower), index(upper), index(step)
     root = BufferOp.build(
         operands=[None],
@@ -57,17 +67,26 @@ def program(*, stages=None, lower=2, upper=11, step=3, horizon=2):
         attributes={"schedule": LoopScheduleAttr(IntAttr(horizon))},
         regions=[Region(Block([*stages, EndOp()]))],
     )
-    kernel = KernelOp.build(
+    kernel = (MixedOp if mixed else KernelOp).build(
         attributes={
             "sym_name": StringAttr("structured"),
             "target": StringAttr("dav-2201"),
-            "core": StringAttr("aiv"),
+            **({} if mixed else {"core": StringAttr("aiv")}),
             "disjoint_external": IntAttr(1),
             "blocks": IntAttr(1),
         },
         regions=[Region(Block([root, lower, upper, step, loop, EndOp()]))],
     )
     return ModuleOp([kernel]), loop, stages[0] if stages else None, root
+
+
+def actor_domain(kind="vector", *, arg_types=None):
+    return ActorDomainOp.build(
+        attributes={"kind": StringAttr(kind)},
+        regions=[
+            Region(Block([EndOp()], arg_types=[IndexType()] if arg_types is None else arg_types))
+        ],
+    )
 
 
 def address(
@@ -432,3 +451,201 @@ def test_control_never_marks_async_work_pure_or_returns_completion_handles():
     assert not view.has_trait(AsyncEffects)
     assert all(not op.has_trait(Pure) for op in (loop, work, view, fill))
     assert not loop.results and not work.results
+
+
+def test_mixed_tree_retains_one_vector_body_and_real_runtime_sid_addresses():
+    module, loop, work, private = program(mixed=True)
+    mixed = module.body.block.first_op
+    shared = BufferOp.build(
+        operands=[None],
+        attributes={
+            "sym_name": StringAttr("shared"),
+            "nbytes": IntAttr(4096),
+            "external": IntAttr(1),
+            "initialized": IntAttr(1),
+        },
+        result_types=[ref_type("GM", "f32")],
+    )
+    group = CoreIdOp.build(result_types=[IndexType()])
+    group_stride, lane_stride, zero = index(128), index(64), index(0)
+    group_offset = arith.MuliOp(group.value, group_stride.result)
+    mixed.body.block.insert_ops_before(
+        [shared, group, group_stride, lane_stride, zero, group_offset], loop
+    )
+    cube, vector = actor_domain("cube"), actor_domain("vector")
+    lane_offset = arith.MuliOp(vector.body.block.args[0], lane_stride.result)
+    offset = arith.AddiOp(group_offset.result, lane_offset.result)
+    imported = address(shared.ref, offset.result)
+    local = address(private.ref, zero.result)
+    copy = TaskOp.create(
+        operands=[imported.ref, local.ref],
+        result_types=[TaskType()],
+        attributes=task_attrs("import", "copy", 1),
+    )
+    vector.body.block.insert_ops_before(
+        [lane_offset, offset, imported, local, copy], vector.body.block.last_op
+    )
+    published = address(shared.ref, group_offset.result, nbytes=128)
+    cube.body.block.insert_op_before(published, cube.body.block.last_op)
+    work.body.block.insert_ops_before([cube, vector], work.body.block.last_op)
+    before = tuple(module.walk())
+    module.verify()
+    assert tuple(module.walk()) == before
+    assert published.source is imported.source is shared.ref
+    assert local.source is private.ref and local.offset is zero.result
+    assert copy.refs[0] is imported.ref and copy.refs[1] is local.ref
+    assert sum(isinstance(op, PipelineLoopOp) for op in module.walk()) == 1
+    assert sum(isinstance(op, TaskOp) for op in module.walk()) == 1
+    assert (
+        sum(isinstance(op, ActorDomainOp) and op.kind.data == "vector" for op in module.walk()) == 1
+    )
+    assert not any(isinstance(op, KernelOp) for op in module.walk())
+
+    def evaluate(value, bindings):
+        if value in bindings:
+            return bindings[value]
+        operation = value.owner
+        if isinstance(operation, arith.ConstantOp):
+            return operation.value.value.data
+        left, right = (evaluate(operand, bindings) for operand in operation.operands)
+        assert isinstance(operation, (arith.AddiOp, arith.MuliOp))
+        return left + right if isinstance(operation, arith.AddiOp) else left * right
+
+    ranges = []
+    for group_id in range(2):
+        for sid in (0, 1):
+            start = evaluate(
+                imported.offset, {group.value: group_id, vector.body.block.args[0]: sid}
+            )
+            assert start == group_id * 128 + sid * 64
+            ranges.append(set(range(start, start + imported.nbytes.data)))
+    assert set.union(*ranges) == set(range(256))
+    assert all(not first & second for i, first in enumerate(ranges) for second in ranges[i + 1 :])
+    restored = parse(dump(module))
+    assert dump(restored) == dump(module)
+    restored_vector = next(
+        op for op in restored.walk() if isinstance(op, ActorDomainOp) and op.kind.data == "vector"
+    )
+    restored_import = next(
+        op
+        for op in restored_vector.walk()
+        if isinstance(op, AddressOp) and op.source.type.bank.data == "GM"
+    )
+    assert restored_import.offset.owner.rhs.owner.lhs is restored_vector.body.block.args[0]
+
+
+@pytest.mark.parametrize("kind", ["cube", "vector"])
+def test_actor_domain_keeps_async_effects_without_results_or_completion(kind):
+    module, _, work, _ = program(mixed=True)
+    domain = actor_domain(kind)
+    work.body.block.insert_op_before(domain, work.body.block.last_op)
+    module.verify()
+    assert domain.has_trait(RecursiveMemoryEffect)
+    assert not domain.has_trait(Pure)
+    assert not domain.results
+    assert len(domain.body.block.args) == 1
+
+
+@pytest.mark.parametrize("kind", ["aic", "aiv", "aiv0", "other"])
+def test_actor_domain_requires_a_cube_or_vector_family(kind):
+    module, _, work, _ = program(mixed=True)
+    work.body.block.insert_op_before(actor_domain(kind), work.body.block.last_op)
+    with pytest.raises(VerifyException, match="cube or vector"):
+        module.verify()
+
+
+def test_actor_domain_requires_mixed_ancestry_and_cannot_nest():
+    module, _, work, _ = program()
+    work.body.block.insert_op_before(actor_domain(), work.body.block.last_op)
+    with pytest.raises(VerifyException, match="MixedOp ancestor"):
+        module.verify()
+    module, _, work, _ = program(mixed=True)
+    outer, inner = actor_domain("cube"), actor_domain("vector")
+    outer.body.block.insert_op_before(inner, outer.body.block.last_op)
+    work.body.block.insert_op_before(outer, work.body.block.last_op)
+    with pytest.raises(VerifyException, match="cannot nest"):
+        module.verify()
+
+
+def test_intervening_mixed_container_cannot_hide_nested_actor_domains():
+    module, _, work, _ = program(mixed=True)
+    outer, inner = actor_domain("cube"), actor_domain("vector")
+    mixed = MixedOp.build(
+        attributes=module.body.block.first_op.attributes.copy(),
+        regions=[Region(Block([inner, EndOp()]))],
+    )
+    outer.body.block.insert_op_before(mixed, outer.body.block.last_op)
+    work.body.block.insert_op_before(outer, work.body.block.last_op)
+    with pytest.raises(VerifyException, match="cannot nest"):
+        module.verify()
+
+
+@pytest.mark.parametrize("arg_types", [(), (i32,), (IndexType(), IndexType())])
+def test_actor_domain_has_one_index_owner_coordinate(arg_types):
+    module, _, work, _ = program(mixed=True)
+    work.body.block.insert_op_before(actor_domain(arg_types=arg_types), work.body.block.last_op)
+    with pytest.raises(VerifyException, match="one index owner"):
+        module.verify()
+
+
+def test_actor_domain_must_end_with_existing_end():
+    module, _, work, _ = program(mixed=True)
+    domain = actor_domain()
+    domain.body.block.erase_op(domain.body.block.last_op)
+    domain.body.block.add_op(scf.YieldOp())
+    work.body.block.insert_op_before(domain, work.body.block.last_op)
+    with pytest.raises(VerifyException):
+        module.verify()
+
+
+def test_issue_order_retains_distinct_family_projections_without_reordering_the_tree():
+    stages = tuple(stage(offset) for offset in (2, 0, 1))
+    module, loop, _, _ = program(stages=stages, mixed=True)
+    for work, families in zip(stages, [("vector",), ("cube",), ("cube", "vector")], strict=True):
+        work.body.block.insert_ops_before(
+            [actor_domain(family) for family in families], work.body.block.last_op
+        )
+    policy = DictionaryAttr(
+        {
+            "cube": ArrayAttr([StringAttr("stage1"), StringAttr("stage0")]),
+            "vector": ArrayAttr([StringAttr("stage2"), StringAttr("stage1")]),
+        }
+    )
+    loop.attributes["issue_order"] = policy
+    before = tuple(module.walk())
+    module.verify()
+    assert tuple(module.walk()) == before
+    assert loop.issue_order is policy
+    assert tuple(loop.body.block.ops) == (*stages, loop.body.block.last_op)
+    assert dump(parse(dump(module))) == dump(module)
+    # The dialect checks names; ownership-aware completeness is the lowerer's
+    # contract, so this intentionally partial family list remains representable.
+    loop.attributes["issue_order"] = DictionaryAttr({"cube": ArrayAttr([StringAttr("stage1")])})
+    module.verify()
+
+
+@pytest.mark.parametrize(
+    "policy,diagnostic",
+    [
+        (DictionaryAttr({"aiv0": ArrayAttr([StringAttr("stage1")])}), "family stage-label arrays"),
+        (DictionaryAttr({"vector": StringAttr("stage1")}), "family stage-label arrays"),
+        (DictionaryAttr({"vector": ArrayAttr([IntAttr(1)])}), "family stage-label arrays"),
+        (DictionaryAttr({"vector": ArrayAttr([StringAttr("missing")])}), "existing unambiguous"),
+        (
+            DictionaryAttr({"vector": ArrayAttr([StringAttr("stage1"), StringAttr("stage1")])}),
+            "must not repeat",
+        ),
+    ],
+)
+def test_issue_order_rejects_unknown_family_or_invalid_stage_names(policy, diagnostic):
+    module, loop, _, _ = program(mixed=True)
+    loop.attributes["issue_order"] = policy
+    with pytest.raises(VerifyException, match=diagnostic):
+        module.verify()
+
+
+def test_issue_order_cannot_choose_between_distinct_stages_with_the_same_label():
+    module, loop, _, _ = program(stages=(stage(1), stage(1)), mixed=True)
+    loop.attributes["issue_order"] = DictionaryAttr({"cube": ArrayAttr([StringAttr("stage1")])})
+    with pytest.raises(VerifyException, match="existing unambiguous stages"):
+        module.verify()

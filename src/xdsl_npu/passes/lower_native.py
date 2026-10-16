@@ -28,6 +28,7 @@ from ..dialects.physical import (
     CoreIdOp,
     EndOp,
     KernelOp,
+    MixedOp,
     RuntimeSizeOp,
     TaskOp,
     task_attrs,
@@ -49,7 +50,7 @@ from ..dialects.source import (
     ViewOp,
     YieldOp,
 )
-from ..dialects.structured import PipelineLoopOp, PipelineStageOp
+from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ..dialects.types import TaskType, TileType, ref_type
 from ..indexing import validate_source_arithmetic
 from ..scalar import ARITHMETIC
@@ -82,6 +83,7 @@ class NativeStructure:
     module: ModuleOp
     recipes: Mapping[Operation, recipes.RecipeResult]
     loops: Mapping[Operation, Operation]
+    domains: Mapping[DomainOp, ActorDomainOp]
     values: Mapping[SSAValue, TileDefinition | LastTile]
     uses: tuple[TileUse, ...]
     task_scopes: Mapping[TaskOp, ValueScope]
@@ -101,9 +103,18 @@ class _Scope:
     pure: dict[SSAValue, SSAValue] = field(default_factory=dict)
     stage: int = 0
     pipeline: PipelineOp | None = None
+    family: str | None = None
 
     def child(
-        self, block, bindings=(), *, stage=None, pipeline=_INHERIT, control=None, branch=None
+        self,
+        block,
+        bindings=(),
+        *,
+        stage=None,
+        pipeline=_INHERIT,
+        family=_INHERIT,
+        control=None,
+        branch=None,
     ):
         return _Scope(
             block,
@@ -111,6 +122,7 @@ class _Scope:
             self.execution if control is None else ValueScope(self.execution, control, branch),
             stage=self.stage if stage is None else stage,
             pipeline=self.pipeline if pipeline is _INHERIT else pipeline,
+            family=self.family if family is _INHERIT else family,
         )
 
     def constant(self, value):
@@ -125,6 +137,8 @@ class _Lowerer:
         self.roots = {}
         self.results = {}
         self.loops = {}
+        self.domains = {}
+        self.family_work = Counter()
         self.task_scopes = {}
         self.work = Counter(source_operations=0, native_templates=0, expanded_iterations=0)
 
@@ -216,6 +230,11 @@ class _Lowerer:
         self.roots[op] = buffer.ref
 
     def primitive(self, op, scope):
+        _unsupported(
+            scope.family is not None,
+            "mixed native work needs an explicit Cube or Vector domain",
+            op,
+        )
         number = len(self.results)
 
         def emit(suffix, native, *refs, params=(), scalar=0.0, order_delta=0):
@@ -230,6 +249,7 @@ class _Lowerer:
             scope.block.add_op(task)
             self.task_scopes[task] = scope.execution
             self.work["native_templates"] += 1
+            self.family_work[scope.family] += 1
             return task
 
         def view(value, *, matrix=False):
@@ -311,14 +331,29 @@ class _Lowerer:
         elif isinstance(op, scf.IfOp):
             self.conditional(op, scope)
         elif isinstance(op, DomainOp):
-            _unsupported(
-                op.kind == self.program.kind,
-                "mixed actor domains need collective ownership admission",
-                op,
-            )
-            # A single family has one lane; the launch group is a different coordinate.
-            nested = scope.child(scope.block, [(op.body.block.args[0], scope.constant(0))])
-            self.block(op.body.block, nested)
+            if self.program.kind.data == "mixed":
+                block = Block(arg_types=[IndexType()])
+                domain = ActorDomainOp.build(attributes={"kind": op.kind}, regions=[Region(block)])
+                domain.location = op.location
+                scope.block.add_op(domain)
+                self.domains[op] = domain
+                nested = scope.child(
+                    block,
+                    [(op.body.block.args[0], block.args[0])],
+                    family=op.kind.data,
+                    control=domain,
+                )
+                self.block(op.body.block, nested)
+                block.add_op(EndOp())
+            else:
+                _unsupported(
+                    op.kind == self.program.kind,
+                    "execution domain belongs to another actor family",
+                    op,
+                )
+                # A single family has one lane; group is a different coordinate.
+                nested = scope.child(scope.block, [(op.body.block.args[0], scope.constant(0))])
+                self.block(op.body.block, nested)
         elif isinstance(op, scf.YieldOp):
             _unsupported(
                 all(not isinstance(value.type, TileType) for value in op.arguments),
@@ -400,16 +435,20 @@ class _Lowerer:
                 else scope.constant(op.count.data),
                 scope.constant(1),
             ],
-            attributes={"schedule": self.controls.by_operation[op].schedule},
+            attributes={
+                "schedule": self.controls.by_operation[op].schedule,
+                "issue_order": op.issue_order,
+            },
             regions=[Region(body)],
         )
         loop.location = op.location
         scope.block.add_op(loop)
         self.loops[op] = loop
-        stages, ordinary = [], []
+        stages, ordinary, stage_families = [], [], {}
         loop_scope = scope.child(body, control=loop)
 
         def stage(operations, offset, label):
+            before = dict(self.family_work)
             block = Block(arg_types=[IndexType(), IndexType()])
             physical = PipelineStageOp.build(
                 attributes={"offset": IntAttr(offset), "label": StringAttr(label)},
@@ -427,6 +466,11 @@ class _Lowerer:
                 self.operation(operation, nested)
             block.add_op(EndOp())
             stages.append(physical)
+            stage_families[physical] = frozenset(
+                family
+                for family, count in self.family_work.items()
+                if count > before.get(family, 0)
+            )
 
         def flush():
             if ordinary:
@@ -444,21 +488,27 @@ class _Lowerer:
             else:
                 ordinary.append(child)
         flush()
-        if (
-            op.issue_order is not None
-            and (labels := op.issue_order.data.get(self.program.kind.data)) is not None
-        ):
-            names = [label.data for label in labels]
-            actual = [s.label.data for s in stages]
-            _unsupported(
-                len(set(actual)) == len(actual) and set(names) == set(actual),
-                "issue_order must name every physical Stage exactly once",
-                op,
-            )
-            ranks = {name: rank for rank, name in enumerate(names)}
-            for physical in stages:
-                body.detach_op(physical)
-            body.add_ops(sorted(stages, key=lambda stage: ranks[stage.label.data]))
+        if op.issue_order is not None:
+            for family, labels in op.issue_order.data.items():
+                names = [label.data for label in labels]
+                actual = [s.label.data for s in stages if family in stage_families[s]]
+                _unsupported(
+                    len(set(actual)) == len(actual) and set(names) == set(actual),
+                    f"{family}: issue_order must name every participating Stage exactly once",
+                    op,
+                )
+            # A mixed loop has independent actor controllers. Keep both actor
+            # orders on one template; no global physical step lockstep exists.
+            if (
+                self.program.kind.data != "mixed"
+                and (labels := op.issue_order.data.get(self.program.kind.data)) is not None
+            ):
+                ranks = {label.data: rank for rank, label in enumerate(labels)}
+                for physical in stages:
+                    body.detach_op(physical)
+                body.add_ops(
+                    sorted(stages, key=lambda stage: ranks.get(stage.label.data, len(ranks)))
+                )
         body.add_op(EndOp())
 
 
@@ -480,29 +530,30 @@ def lower_native_structure(source) -> NativeStructure:
         isinstance(program, ProgramOp) and len(source.body.block.ops) == 1,
         "expected one typed source program",
     )
-    _unsupported(
-        program.kind.data != "mixed",
-        "mixed actor domains need collective ownership admission",
-        program,
-    )
     controls = normalize_loop_controls(source)
     validate_source_arithmetic(program)
     body = Block()
-    kernel = KernelOp.build(
-        attributes={
-            "sym_name": program.sym_name,
-            "target": StringAttr("dav-2201"),
-            "core": StringAttr("aic" if program.kind.data == "cube" else "aiv"),
-            "disjoint_external": program.disjoint_external,
-            "blocks": program.groups,
-        },
+    attrs = {
+        "sym_name": program.sym_name,
+        "target": StringAttr("dav-2201"),
+        "disjoint_external": program.disjoint_external,
+        "blocks": program.groups,
+    }
+    mixed = program.kind.data == "mixed"
+    if not mixed:
+        attrs["core"] = StringAttr("aic" if program.kind.data == "cube" else "aiv")
+    kernel = (MixedOp if mixed else KernelOp).build(
+        attributes=attrs,
         regions=[Region(body)],
     )
     module = ModuleOp([kernel])
     core = CoreIdOp.build(result_types=[IndexType()])
     body.add_op(core)
     scope = _Scope(
-        body, ChainMap({program.body.block.args[0]: core.value}), ValueScope(None, kernel)
+        body,
+        ChainMap({program.body.block.args[0]: core.value}),
+        ValueScope(None, kernel),
+        family=None if mixed else program.kind.data,
     )
     lowerer = _Lowerer(source, program, controls)
     lowerer.block(program.body.block, scope)
@@ -517,6 +568,7 @@ def lower_native_structure(source) -> NativeStructure:
         module,
         MappingProxyType(lowerer.results),
         MappingProxyType(lowerer.loops),
+        MappingProxyType(lowerer.domains),
         MappingProxyType(values),
         uses,
         MappingProxyType(lowerer.task_scopes),

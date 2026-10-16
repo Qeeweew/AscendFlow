@@ -17,7 +17,7 @@ from xdsl_npu.diagnostics import CompileError, ErrorKind
 from xdsl_npu.dialects.io import dump, parse
 from xdsl_npu.dialects.physical import BufferOp, CoreIdOp, EndOp, RuntimeSizeOp, TaskOp
 from xdsl_npu.dialects.source import CopyOp, PipelineOp
-from xdsl_npu.dialects.structured import AddressOp, PipelineLoopOp, PipelineStageOp
+from xdsl_npu.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
 from xdsl_npu.passes.lower_native import lower_native_structure
 
 
@@ -27,7 +27,7 @@ def interpret(block, values, arguments, trace):
         if isinstance(op, RuntimeSizeOp):
             result = (arguments[op.sym_name.data],)
         elif isinstance(op, CoreIdOp):
-            result = (0,)
+            result = (arguments.get("group", 0),)
         elif isinstance(op, BufferOp):
             result = (op,)
         elif isinstance(op, arith.ConstantOp):
@@ -64,6 +64,12 @@ def interpret(block, values, arguments, trace):
             lower, upper, stride = (values[value] for value in op.operands)
             iterations = list(range(lower, upper, stride))
             stages = [stage for stage in op.body.block.ops if isinstance(stage, PipelineStageOp)]
+            if (
+                op.issue_order is not None
+                and (policy := op.issue_order.data.get(arguments.get("actor"))) is not None
+            ):
+                by_name = {stage.label.data: stage for stage in stages}
+                stages = [by_name[label.data] for label in policy]
             for clock in range(len(iterations) + op.schedule.horizon.data):
                 for stage in stages:
                     g = clock - stage.offset.data
@@ -72,6 +78,11 @@ def interpret(block, values, arguments, trace):
                             zip(stage.body.block.args, (g, iterations[g]), strict=True)
                         )
                         interpret(stage.body.block, local, arguments, trace)
+            result = ()
+        elif isinstance(op, ActorDomainOp):
+            if op.kind.data == arguments.get("actor"):
+                owner = arguments.get("sid", 0) if op.kind.data == "vector" else 0
+                interpret(op.body.block, values | {op.body.block.args[0]: owner}, arguments, trace)
             result = ()
         elif isinstance(op, AddressOp):
             result = ((values[op.source].sym_name.data, values[op.offset]),)

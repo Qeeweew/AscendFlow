@@ -5,8 +5,17 @@ work. Address geometry verification does not establish dynamic bounds, native
 alignment, initialized data, buffer ownership, or asynchronous retirement.
 """
 
+from collections import Counter
+
 from xdsl.dialects import arith
-from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, IntegerAttr, StringAttr
+from xdsl.dialects.builtin import (
+    ArrayAttr,
+    DictionaryAttr,
+    IndexType,
+    IntAttr,
+    IntegerAttr,
+    StringAttr,
+)
 from xdsl.irdl import (
     AttrSizedOperandSegments,
     IRDLOperation,
@@ -27,6 +36,41 @@ from .types import RefType
 
 
 @irdl_op_definition
+class ActorDomainOp(IRDLOperation):
+    """One actor family's code inside a mixed control tree.
+
+    The owner argument is zero for Cube and the runtime sub-block ID in
+    {0, 1} for Vector on dav-2201's 1:2 launch. The Vector region is one body
+    executed by both AIV participants, each with private local-bank instances.
+    GM roots retain their shared identity. Region exit certifies no completion.
+    """
+
+    name = "npu.actor_domain"
+    kind = attr_def(StringAttr)
+    body = region_def("single_block")
+    traits = traits_def(RecursiveMemoryEffect())
+
+    def verify_(self):
+        from .physical import EndOp, MixedOp
+
+        if self.kind.data not in {"cube", "vector"}:
+            raise VerifyException("actor domain kind must be cube or vector")
+        parent, mixed = self.parent_op(), False
+        while parent is not None:
+            if isinstance(parent, ActorDomainOp):
+                raise VerifyException("actor domains cannot nest")
+            mixed |= isinstance(parent, MixedOp)
+            parent = parent.parent_op()
+        if not mixed:
+            raise VerifyException("actor domain requires a MixedOp ancestor")
+        block = self.body.block
+        if len(block.args) != 1 or not isinstance(block.args[0].type, IndexType):
+            raise VerifyException("actor domain needs one index owner block argument")
+        if not isinstance(block.last_op, EndOp):
+            raise VerifyException("actor domain body must end with npu.end")
+
+
+@irdl_op_definition
 class PipelineLoopOp(IRDLOperation):
     """One logical pipeline template, with explicit physical-step semantics.
 
@@ -34,6 +78,12 @@ class PipelineLoopOp(IRDLOperation):
     stage at offset s executes only if g = j-s satisfies 0 <= g < count.
     Its two local coordinates are (g, lower + g*step). The canonical schedule
     supplies the physical-step phases; exiting a phase or loop is no drain.
+
+    In a mixed control tree, each actor controller runs its own physical step
+    and projects its family's issue_order from this shared template. Equal j
+    does not imply global lockstep, ordering, or cross-actor completion.
+    The optional order lists existing, unambiguous stage labels per family;
+    ownership-aware completeness is checked by the lowerer.
     """
 
     name = "npu.pipeline_loop"
@@ -41,6 +91,7 @@ class PipelineLoopOp(IRDLOperation):
     upper = operand_def(IndexType)
     step = operand_def(IndexType)
     schedule = attr_def(LoopScheduleAttr)
+    issue_order = opt_attr_def(DictionaryAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
 
@@ -62,6 +113,22 @@ class PipelineLoopOp(IRDLOperation):
             raise VerifyException("pipeline loop body must end with npu.end")
         if any(not isinstance(operation, PipelineStageOp) for operation in tuple(block.ops)[:-1]):
             raise VerifyException("pipeline loop body contains only pipeline stages and npu.end")
+        if self.issue_order is not None:
+            labels = Counter(operation.label.data for operation in tuple(block.ops)[:-1])
+            for family, order in self.issue_order.data.items():
+                if (
+                    family not in {"cube", "vector"}
+                    or not isinstance(order, ArrayAttr)
+                    or any(not isinstance(label, StringAttr) for label in order)
+                ):
+                    raise VerifyException("pipeline issue_order needs family stage-label arrays")
+                names = tuple(label.data for label in order)
+                if len(set(names)) != len(names):
+                    raise VerifyException("pipeline issue_order stage labels must not repeat")
+                if any(labels[name] != 1 for name in names):
+                    raise VerifyException(
+                        "pipeline issue_order must name existing unambiguous stages"
+                    )
 
 
 @irdl_op_definition
