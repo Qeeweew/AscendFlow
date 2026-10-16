@@ -70,14 +70,21 @@ def activation_trace(queries, kv_tiles, *, continuous=False):
             "activation table requires nonnegative counts, <=64 tasks and a boolean policy"
         )
     result = {"cube": [], "vector": []}
+    # Use the example's policy; this finite dispatch model must not retain a
+    # previous issue order after a source policy experiment.
+    policy = next(
+        value
+        for node in ast.walk(ast.parse(target_source(continuous=continuous)))
+        if isinstance(node, ast.keyword) and node.arg == "issue_order"
+        if set(value := ast.literal_eval(node.value)) == {"cube", "vector"}
+    )
+    offsets = {"qk": 0, "softmax": 1, "pv": 1, "update": 2}
     lengths = [queries * kv_tiles] if continuous else [kv_tiles] * queries
     for call, count in enumerate(lengths):
         for step in range(count + 2):
-            for actor, stages in (
-                ("cube", (("qk", 0), ("pv", 1))),
-                ("vector", (("update", 2), ("softmax", 1))),
-            ):
-                for name, offset in stages:
+            for actor, names in policy.items():
+                for name in names:
+                    offset = offsets[name]
                     g = step - offset
                     if 0 <= g < count:
                         query, kv = divmod(g, kv_tiles) if continuous else (call, g)

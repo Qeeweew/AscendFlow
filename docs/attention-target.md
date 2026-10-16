@@ -24,21 +24,21 @@ ASC、CANN 9.1 / `dav-2201` 构建和下表设备数值检查。这里没有使�
 | 512 | 2048 | 3.0517578125e-5 |
 
 四点数值检查均通过 `rtol=0.002, atol=0.0002`，同时检查输入不变及所有分配的
-保护区。最新block8记录位于工作区 `runs/refactor/compile-vector/device/correctness.json`，
-构建在相邻`block8-build/`，含实际source/物理IR、ASC、最终验证和CANN产物。
+保护区。最新 softmax-first 记录位于工作区 `runs/refactor/cv-order/device/correctness.json`，
+构建在相邻`build/`，含实际source/物理IR、ASC、最终验证和CANN产物。
 同一binary还通过4K/8K采样检查（每head每query tile采样6行，非全输出oracle）；
-512×2048的uniform和sharp做全输出检查，最大绝对误差分别为0和2.4414e-4。
+旧 update-first 版本另有512×2048的uniform和sharp全输出检查；不能替代新排步的检查。
 这些数值记录不构成性能达标证据，也不扩展其他constexpr变体的验证范围。
 
-历史R64基线保留在`runs/refactor/query-boundaries/`。当前候选完整重建及设备复验，
-不沿用历史库。最终ASC与基线的搬运、MAD及带条件event语句逐字节相同，
-差异包含显式归约、scratch位置、对应Vector流水同步及capture `/1`化简。
+历史R64基线保留在`runs/refactor/query-boundaries/`，update-first block8在
+`runs/refactor/compile-vector/`。当前排步完整重建及设备复验，搬运调用多重集和MAD
+调用不变；同步序列由新派发顺序重新推导，不能称为与旧版event语句相同。
 
 ## 数学与流水政策
 
 外层保留 `serial query → Pipelined kv`，内层保留真实 child pipeline，三个 clock
-各自独立。AIC 在同一步先派发新 QK、再派发旧 PV；AIV 先派发旧 output update、
-再派发新 softmax。它们是显式源码政策，异步访问、最后读取和 event 复用仍由
+各自独立。AIC 在同一步先派发新 QK、再派发旧 PV；AIV 先派发新 softmax、
+再派发旧 output update。它们是显式源码政策，异步访问、最后读取和 event 复用仍由
 公共自动同步及最终实际 IR 检查证明。query 内不插入全局 barrier，最终 actor
 返回才结束整个 lifetime。
 
@@ -72,6 +72,16 @@ workspace 的读取必须来自真实 writer。L0C 为两个 128×128 FP32 平�
 
 ## 限制与测试设计变体
 
+同一函数正在接入 `BQ=256, BM=128` 的K/V复用政策。BQ是通信行块，BM是物理MAD
+行块；每个K/V块在L1只载入一次，供两个BM128计算使用，两AIV各处理128行。
+Q/P用显式完整fractal plane，L0A/B/C容量不变；softmax原地使用score_in双槽，
+输入槽必须等最后cast读取后才能覆盖。L1为320KiB，每AIV UB为183424B。
+该政策要求Sq整除256，pair不跨head，不能把128行尾块隐式padding进去。
+只有静态两个part使用`N.unroll`，Sq/Sk循环仍保留。
+
+默认BQ128的物理IR与已测基线逐字节一致。BQ256的源码预算为4K GM→L1请求520MiB；
+实际构建与设备资格以[状态页](refactor-progress.md)为准，不能由lowering通过推定。
+
 设备数值验证目前只按上表配置声明。bf16、GQA/MQA、其他 B/H/GROUPS 或 tile
 specialization 没有由这些记录获得设备支持标记。causal、mask、非整 tile 的 tail
 和空序列不属于本例当前合同。
@@ -81,8 +91,11 @@ continuous 仍是**不支持的测试设计 policy**：fixture 从 example 的�
 它的 runtime-cycle first/last 谓词不能当作实际 KV parent 的 first/last，lowering
 会明确拒绝。有限激活表只用于源码派发检查，不是生产执行器或硬件证明。
 
-本例不声称逐条复刻 ops-transformer 的 arch22 Matmul 实现；其 Process 中 Vec1
-先于 Vec2，与本例的 update-before-softmax 不同。独立手排参考与历史性能分析见
+continuous 还有实际状态冲突：新 query 的 softmax 会先重置单槽 `l`，旧 query 的
+最后 update 才读取它。仅修复 runtime-cycle 语法不足以支持该政策。
+
+本例不声称逐条复刻 ops-transformer 的 arch22 Matmul 实现；现在 query 内采用
+相同的 Vec1→Vec2 派发方向，但跨 query 组织和状态布局不同。独立手排参考与历史性能分析见
 [attention-reference.md](attention-reference.md)，不能代替本例的生成代码记录。
 
 ## 构建

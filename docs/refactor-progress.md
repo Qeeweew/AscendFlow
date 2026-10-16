@@ -1,102 +1,98 @@
 # 当前实现与待解决问题
 
-2026-10-16。**默认 dense f16 Flash Attention 已从公开 DSL 贯通到 CANN 和设备数值验证；编译耗时及性能仍未达标。**
-算子唯一数学主体在 [examples/flash_attention/attention.py](../examples/flash_attention/attention.py)，
-没有恢复旧 task DSL、手写 builder 或隐藏算子实现。此前记录见
-[历史快照](history/refactor-progress-before-query-20261016.md)。
+2026-10-16。默认 dense f16 Flash Attention 已从公开DSL贯通到CANN和设备；
+softmax-first排步改善了性能，但编译耗时及相对ACLNN性能仍未达标。
+唯一数学主体在[examples/flash_attention/attention.py](../examples/flash_attention/attention.py)。
+没有恢复旧task DSL、隐藏算子实现或兼容builder。
 
-## 本阶段实际完成
+## 已验证的纵向路径
 
-公开路径是 `prim_func → source xDSL → physical IR → autosync → 独立最终验证 → ASC → CANN`。
-真实 query、KV、固定 child 三个时钟均保留；Sq/Sk 是 runtime 参数。默认 FA
-保留20组AIC/双AIV、12个call，Sq/Sk不展开。最新版本为76个native模板：
-显式block8分层归约比此前R64版本增加4个模板、每AIV增加4096B scratch（总182400B）。
-最终ASC的19条搬运、MAD和完整event语句（含条件）与R64基线逐字节一致；
-没有改变CV派发、P/O舍入位置或递推更新顺序。
+路径为 `prim_func → source xDSL → physical IR → autosync → 实际IR独立终检 → ASC → CANN`。
+query、runtime KV、固定child三个时钟保留；Sq/Sk不展开。BQ128默认政策有76个native模板、
+12个call，20组AIC/双AIV。Vector现在先softmax再update；在dav-2201，跨核
+`asc_sync_block_wait`调用`wait_flag_dev`，旧顺序会让旧PV等待阻挡新softmax派发。
+改前后物理IR除AIV call issue order外相同，DMA调用多重集/MAD调用相同。
 
-跨 query 访问分析保留原allocation、byte cell、首写/末写、完整reader span及slot相位。
-N=0是无访问identity，不能凭空初始化；KV=1的双槽可在query距离2才复用。
-共享L0C采用已经过逻辑RAW配对的物理占用边界，两个plane各自保留最后FIX读取。
-相同effect序列共享一次transfer计算，但不跨孔洞合并地址，也不删除byte义务。
+二值event新增一种受限共享：只有bank容量不足时，distance1/单ID的parent通知才可借用
+固定child事件的空档。它必须证明旧child Wait→parent Set、parent Wait→新child Set，
+条件child中间缺席还须证明FIRST/LAST锚点。每个物理child ID最多一个借用者，配置event
+和任意稀疏激活不在此合同内。实际IR终检重新提取所有端点/ID；串行query另外检查全部
+mixed parent/child旧新配对。最小反例与范围见[event分配](event-allocation.md)。
 
-QueryChannel/QuerySync保存query距离、KV CountDomain/Position及真实三条SSA时钟。
-完成图从实际同步IR重建，沿用局部流水的native transition；Set effect不能进入
-native retirement前缀。旧父/子event按物理bank/ID检查，包含共享池不同channel及条件case。
-现有跨核counter要求已验证query内≤15，并证明旧query最后Wait到新query首次Set的反馈；
-找不到该充分条件就拒绝。新的query channel目前只支持同actor、不同pipe的local event。
-
-当前FA的49,271条byte义务归并为4,372个端点检查，仍只需补上一条跨query协议：
+当前默认FA有4,372个query内存端点检查、195个资源检查：parent binary30、child113、
+mixed44、跨核counter6、query event1、入口配置1。仅补一条跨query协议：
 
 ```text
-同步前：PV(q,last KV).FIX读取L0C → QK(q+1,first KV).MAD覆盖同一plane，未证明
-同步后：最后PV FIX之后 Set(FIX,M,6)；下query首次QK MAD之前 Wait(FIX,M,6)
-Set：M > 1 && q < M-1；Wait：q >= 1；固定child位置均为0
+同步前：最后PV FIX读取共享L0C → 下query首QK MAD覆盖，尚无完成证明
+同步后：最后PV FIX后 Set(FIX,M,7)；下query首QK MAD前 Wait(FIX,M,7)
+Set只在存在下query时发出；Wait只在q>=1时消费；ID7为常量
 ```
 
-Set仅在最后KV发出，Wait仅在下query首KV消费。最终检查还证明旧Wait先于该ID再次Set；
-没有query drain、额外buffer或copy。最终ASC中的ID是常量6，PIPE_ALL仅在actor返回处。
-最后验证覆盖4,372个内存检查及129个资源检查：父binary8、child binary113、
-跨核counter边界6、新query event复用1、入口configuration1。新增local waits只依赖更早query，
-与原parent进展和实际native插入位置一起构成进展检查；不按运行时query数展开。
-独立有限事件图覆盖短循环和破坏反例，不宣称这是任意程序的形式化证明。
+PIPE_ALL仅有3处actor返回；没有query drain、额外copy或新增buffer来换正确性。
+有限模型交叉检查短N与破坏反例，不宣称任意程序的形式化证明。
 
-本轮定向回归 **321项通过**，包括真实IR破坏、query资源/生成、归约footprint/alias、
-旧Vector路径及FA入口。最后query集成批次119项/62.55秒，未重复全量测试。
-普通测试不编译完整FA；下面的单次构建单独验证实际纵向路径。
+通用constexpr assert已接入AST前端，Python `-O`也不删除其检查；runtime SSA条件拒绝。
+纯整数canonicalize/CSE与公共Expr恒等式渲染已接通。符号完成事实对完全不相交origin
+跳过包含扫描，不扩大guard/domain、不添加完成边。它未解决总体编译成本。
 
-规划交还已建立的access/leaf/parent结果，去掉进入query层前的完整重复验证；
-最终verifier仍从实际IR重新提取。child event宽度适配后重建实际资源，不能使用候选池代替。
-新query event先合批检查单ID及内存关系，只有失败才扩大静态窗口一次，仍选最小可行宽度。
-两份小型query parent IR和两份nonquery ASC与改前逐字节一致。
+本阶段此前定向回归322项通过：symbolic59、frontend50、runner/math105、event91、
+attention入口17；新增配对Q政策测试另记，不能把尚未完成的端到端构建算成通过。
+普通pytest不反复编译完整FA。
 
-## 真实构建与设备结果
+## 已有构建与设备证据
 
-最新证据目录：`runs/refactor/compile-vector/`（外层，不进产品Git）；
-此前R64基线保留在`runs/refactor/query-boundaries/`。
+最新完成设备资格的产物在外层`runs/refactor/cv-order/build/`，
+ASC SHA256 `e6c0e1775b61306e1fdc82311706832a4cce6c2dafd16a6570c7cee7826a9e87`。
+CANN9.1/dav-2201/-O2；源码、IR、同步/验证报告、库及全部编译选项均保留。
 
 | 验证 | 结果 |
 |---|---|
-| 完整FA源码→ASC | 128.96秒；planning75.14秒，final verifier50.95秒；此前169.10秒 |
-| 同次源码→ASC→CANN/shared | 135.57秒；此前176.43秒；统一300秒硬期限；CANN9.1、dav-2201、-O2 |
-| 同一binary，小规模全输出对照 | Sq:Sk =128:1024、384:3072、768:1024、512:2048；每例4次launch |
-| 数值/保护 | f16、B1/H8/Hkv8/D128，max abs error≤3.0518e-5；输入及保护区完整 |
-| 设备 | 全卡健康/进程/HBM/利用率检查后，物理6→逻辑0；无reset或换卡 |
-| 大规模数值 | 4096×4096及8192×8192，同一binary；每head每query tile采样6行，全输出有限值、输入/保护区检查通过 |
-| 额外数据分布 | 512×2048全输出；uniform误差0，sharp最大绝对误差2.4414e-4，均通过rtol=0.002/atol=0.0002 |
+| 默认BQ128源码→ASC | 141.225秒，planning79.685、final58.583；旧版128.963秒，仍严重超目标 |
+| 同次完整构建含CANN/shared | 147.301秒；统一300秒硬期限 |
+| 小规模全输出 | Sq:Sk 128:1024、384:3072、768:1024、512:2048，误差≤3.052e-5 |
+| 大规模采样 | 4K/8K，同一binary，误差≤1.526e-5；全输出有限、输入/保护区通过 |
+| 三批4K设备task中位时间 | 当前605.780µs，旧排步822.660，独立AscendC1191.220，ACLNN512.152 |
+| 性能资格 | 比旧排步降26.4%，仍慢于ACLNN18.3%，未通过≤5%目标 |
+| bf16 GQA Hq8/Hkv2 | 同一DSL政策CANN/shared构建148.596秒通过；尚未设备验证 |
 
-源/IR/ASC/库及完整选项在 `block8-build/`；ASC SHA256：
-`be2ecac39b1182f48f443367611c8db18af61f66265a574dd1162a4015a58389`。
-当前runner按实际launcher绑定`Q,K,Score,P,V,PV,O,Sq,Sk`。
-物理launcher参数顺序可能不同于DSL函数形式参数，不能让runner猜测；统一ABI元数据仍需改善。
+runner现在按显式dtype/head合同核对实际source/physical IR与launcher ABI，拒绝用f16库
+冒充bf16或GQA。原runner六政策工具资格不能替代设备资格。各进程设备前检查全部卡；
+本轮物理6→逻辑0，无reset/换卡规避错误。
 
-最小纯Vector跨query示例源码→ASC单次约1.06秒；它不能替代FA编译耗时。
-该例按等价端点及完整CountDomain合并短循环条件后只生成两条释放协议、两个常量ID。
-当前完整FA边界分析为4,519个byte cells、669个唯一transfer序列；没有展开输入长度。
+## 正在推进：GM→L1复用
 
-## 明确限制及下一步
+用户指定先解决GM→L1，不把Load2D指令数多直接当作性能瓶颈。
+`msprof op`三次计数均显示当前776MiB、ACLNN544.3125MiB；详细计数与指标口径见
+[性能分析](attention-performance.md)。
 
-- **编译耗时严重超目标**：完整FA仍需129秒Python时间，目标p50≤5秒/max≤10秒。
-  规划前重复parent验证已去掉，条件事实传播仍占较大成本。final parent阶段仍有约1024万次
-  条件记录比较；这包含不相交origin mask的比较，不等同于1024万次guard判断。
-  下一步先减少无关记录扫描，保留最终独立检查，不提高预算或靠缓存掩盖复杂度。
-- **性能仍未达标**：最新4K三批device task中位时间为generated825.44µs、
-  独立AscendC1194.27µs、ACLNN512.21µs。相对此轮重测R64的1143.70µs降低27.8%，
-  但仍是ACLNN的1.612倍。Vector活动降至380.45µs（此前698.11µs），ACLNN约325.87µs。
-  详见[设备结果](attention-performance.md)，下一步必须结合CV重叠继续归因。
-- 当前设备验证仅覆盖默认dense f16政策。bf16/GQA/MQA/cross/tails/causal等不能因前端可表达就宣称支持。
-  continuous的runtime-cycle首末条件仍明确拒绝；paged/sparse/persistent及动态ownership未完成。
-- 新query channel暂不新增跨AIC/AIV通知、同pipe barrier或共享event池。
-  小型mixed recurrence目前会因AIC MTE1→MTE2没有空闲ID而拒绝；不加buffer或全局barrier掩盖资源冲突。
-- 自动排步尚未实现。现有专家Stage/issue policy经过相同访问、同步、event和最终验证。
-- 通用纯整数canonicalize/CSE已在现有路径中使用；公共Expr渲染现已消除capture的`/1`，
-  保留原证明DAG、unsigned合法域及溢出检查。其他表达式冗余继续按公共规则处理。
+同一example新增BQ256/BM128政策：每通信块包含两个独立native128行块，共用一次K/V
+L1载入；两AIV各处理128行，Sq要求整除256，pair不跨head。Q/P保留显式独立plane。
+softmax在原双缓冲输入槽上计算，省下独立32KiB scratch以容纳输出状态；L1=320KiB，
+每AIV UB=183424B，L0容量不变。源码预算GM→L1降为520MiB，尚不能称设备收益。
 
-可复现构建从工作区根目录执行（不会安装或打包）：
+前端/物理lowering已通过；首次完整构建22.697秒在序列边界分析被静态工作预算拒绝。
+诊断为8,968个物理interval重复组合1,296种完整访问pattern，共120,156个输入cell。
+现已共享相同transfer，保留逐字节义务和原预算，37项关系/有限历史回归通过。
+第二次构建22.184秒推进到child投影，1042个实际端点加10个port的平方预估超过1M，
+仍在CANN之前拒绝，未超时。下一步直接生成闭包等价的稀疏投影关系，不先建立完整关系表。
+配对政策结构/访问回归27项、runner158项通过；它们不替代完整同步验证。
+候选证据保存在`runs/refactor/l1-reuse/`。
+
+## 仍未解决
+
+- 完整FA编译仍需约141秒，目标p50≤5秒/max≤10秒。不存在按Sq/Sk展开；成本来自静态
+  物理片段/条件事实重复处理。每个算子构建仍受统一300秒硬期限，超时停止候选序列。
+- BQ256复用、bf16/GQA/MQA、causal/tails/decode等资格须逐项取得；目前设备资格只覆盖
+  默认dense f16完整tile及独立Sq/Sk矩形输入。paged/sparse/persistent未完成。
+- continuous仍拒绝runtime-cycle首末；softmax-first直接跨query还会提前重置单槽`l`，
+  必须先解决状态代次，不能仅放开语法或依赖SSA use-def。
+- 新query event目前只支持local跨pipe。动态ownership、任意稀疏激活及自动排步未完成。
+- 公共结构化ABI元数据仍需改善。加载器目前检查实际launcher名/参数/IR/源和库hash。
+
+复现默认已验证政策（不会安装或打包）：
 
 ```bash
-PYTHONPATH=compiler .venv/bin/python -m xdsl_npu.cli --input compiler/examples/flash_attention/attention.py --entry attention_target --output runs/fa-reproduce --shared --timeout 300
-.venv/bin/python -m pytest -q compiler/tests/test_scope_query_planning.py compiler/tests/test_scope_query_protocols.py compiler/tests/test_scope_query_resources.py compiler/tests/test_scope_query_transitions.py compiler/tests/test_scope_query_codegen.py
+PYTHONPATH=compiler .venv/bin/python -m xdsl_npu.cli --input compiler/examples/flash_attention/attention.py --entry attention_target --output runs/fa-reproduce --compile --shared --timeout 300
 ```
 
-设备复现使用`python -m benchmarks.attention.run`，三个后端均已真实运行；命令见[工具说明](../benchmarks/README.md)。
-性能/变体后续顺序见[执行计划](refactor-plan.md)。
+阶段执行顺序见[计划](refactor-plan.md)，设备命令见[benchmarks](../benchmarks/README.md)。

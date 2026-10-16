@@ -93,7 +93,7 @@ prologue/steady/epilogue 是激活域的边界；N=0 必须正确配对或不产
 ```python
 for kv in T.Pipelined(
     kv_tiles, stages=3,
-    issue_order={"cube": ("qk", "pv"), "vector": ("update", "softmax")},
+    issue_order={"cube": ("qk", "pv"), "vector": ("softmax", "update")},
 ):
     with T.Stage(0, name="qk"), T.Cube():
         qk_export(kv, Q, K, Score, qk_scratch)
@@ -109,16 +109,18 @@ for kv in T.Pipelined(
 |---|---|---|
 | 0 | QK[0] | 无 |
 | 1 | QK[1]，PV[0] | Softmax[0] |
-| 2 | QK[2]，PV[1] | Update[0]，Softmax[1] |
-| 3 | PV[2] | Update[1]，Softmax[2] |
+| 2 | QK[2]，PV[1] | Softmax[1]，Update[0] |
+| 3 | PV[2] | Softmax[2]，Update[1] |
 | 4 | 无 | Update[2] |
 
 这是派发顺序，实际重叠由硬件和同步决定。Score 必须在对应 FIX 写完成后读取；
 PV 等待两个 AIV 的完整 P 贡献；三个 GM 环分别等待自己的最后 reader 释放。
 不能用单个 task-done 替代这些里程碑，不能把通知 ack 当作存储 release。
 
-CV 必须能够表达不同专家政策。当前 update-before-softmax 政策与所审查的
-ops-transformer arch22 Vec1-before-Vec2 不同；每种政策的状态分配都需重新验证。
+CV 必须能够表达不同专家政策。当前 serial-query 示例采用与 ops-transformer arch22
+相同的 Vec1-before-Vec2 顺序，但没有照搬它的状态分配或跨 query 连续派发。
+在 dav-2201 上，跨核 `asc_sync_block_wait` 实际调用 `wait_flag_dev`，会阻塞控制器
+后续派发；先等待旧 PV 会延后新 softmax。实际收益见设备报告，不能由排步图直接推断。
 
 ## Stage 内的流水与跨 query 连续流
 
@@ -145,6 +147,10 @@ query 状态、task 交接环、child 原生环的 generation 不可混同。新
 runtime 参数乘积和商余现已保留为SSA，连续流的多时钟/跨query状态尚未支持，
 不能靠枚举 K、隐式展开或改成constexpr接通。空 K 的输出由算法显式定义；
 当前 FA 目标限定正 Sk。
+
+当前 softmax-first 顺序不能直接移到 continuous：`Softmax(q+1,0)` 会先于
+`Update(q,last)` 重置单槽 denominator `l`。双槽 alpha 并不能解决这个最后读取
+冲突。测试保留此最小反例；必须先明确状态代次与复用合同，不能仅放开前端拒绝。
 
 ## 借用、数值和拒绝边界
 

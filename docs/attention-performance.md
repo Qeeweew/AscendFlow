@@ -1,79 +1,87 @@
-# 新 DSL FA：block8归约的设备结果与剩余差距
+# Flash Attention：当前性能与 GM→L1 差距
 
-2026-10-16。默认 dense f16 已贯通源码→IR→ASC→CANN→设备，但**性能验收失败**。
-本页记录当前基线，不把独立参考或旧FA结果算成新编译器成绩。
+2026-10-16。当前已完成设备验证的政策为 BNSD、B1/Hq8/Hkv8、Sq=Sk4096、
+D128/f16，BQ128/BK1024/CK128/VR8，20组AIC/双AIV。真实公开DSL源码位于
+[attention.py](../examples/flash_attention/attention.py)。性能尚未通过相对ACLNN≤1.05的目标。
 
-## 测量合同
+## 三批设备计时
 
-BNSD，B1/H8/Hkv8/Sq=Sk4096/D128/f16，BQ128/BK1024/CK128，VR8，20组。
-物理6映射逻辑0；每个进程先检查所有卡的健康、进程、HBM和利用率。
-旧R64、新block8、ACLNN和独立AscendC交替运行三批，每批5次warmup、30次计时。
-下表是msprof的device task时间，
-排除host提交间隙。所有后端使用相同Q/K/V字节、scale和数值阈值；每head每query tile
-抽样6行对照CPU oracle，并检查全输出有限、输入不变和全部保护区。该大例不是全输出oracle。
+每个后端交替运行三批，每批5次warmup、30次device task计时；排除host提交间隙。
+物理6→逻辑0，每个进程先检查全部卡的健康、占用、显存和利用率。
+相同Q/K/V字节、scale、误差合同；每head每query tile采样6行，另检查全输出有限、
+输入不变和保护区。复用相同allocation、不flush；64.5MiB工作集小于192MiB L2。
 
-复用相同allocation、不flush。实际IO+workspace约64.5MiB，小于本卡192MiB L2；
-不能因为序列长度4096就称为HBM带宽测试。小例的全输出证据另见[状态页](refactor-progress.md)。
+| 后端 | 三批p50，µs | 三批中位数，µs |
+|---|---|---:|
+| 当前DSL，softmax→update | 606.220 / 605.780 / 605.692 | 605.780 |
+| 此前DSL，update→softmax | 822.950 / 822.660 / 821.910 | 822.660 |
+| 独立固定政策AscendC | 1191.320 / 1191.220 / 1190.810 | 1191.220 |
+| 安装版ACLNN | 512.530 / 512.152 / 510.790 | 512.152 |
 
-| 后端 | 三批p50，µs | 结论 |
-|---|---|---|
-| 当前DSL block8 | 826.132 / 825.440 / 824.870 | 相对ACLNN为1.612倍，仍未通过≤1.05目标 |
-| 此前DSL R64库，本轮重测 | 1141.090 / 1143.700 / 1144.388 | block8降低27.8%延迟 |
-| 固定政策独立AscendC | 1194.272 / 1196.048 / 1194.250 | 当前生成代码约为其0.691倍；不代表达到专家最佳政策 |
-| 安装版ACLNN | 512.210 / 511.990 / 513.140 | `aclnnFlashAttentionScore`，BNSD、keepProb1、innerPrecise0、sparseMode0 |
+改排步使延迟降低26.4%，但仍慢于ACLNN **18.3%**。实际ASC的DMA调用多重集、
+MAD调用与旧版一致，未改变算术或缓冲；同步按新顺序重新生成。普通msprof中，
+AIV Vector活动380.181µs（旧版380.455），AIC MAC261.279µs（旧版261.689），
+支持收益来自重叠改善，而不是算术工作减少。
 
-证据：外层`runs/refactor/compile-vector/performance.json`和`profiles/trial-{0,1,2}/`，
-包含实际ASC/库hash、编译选项、输入hash、CSV及CSV hash、硬件配置/频率快照。
-CANN为9.1，dav-2201，-O2。当前generated ASC SHA为
-`be2ecac39b1182f48f443367611c8db18af61f66265a574dd1162a4015a58389`；
-独立AscendC SHA为`497af23387f1a44196e314d9e6e50882dcd9eac8ad80ebdfe7fceaf9651e03fa`。
-ACLNN记录安装libopapi身份；源码checkout不等于该二进制的构建提交。
+证据位于外层 `runs/refactor/cv-order/performance.json`、`profiles/`、`asc-audit.json`。
+当前ASC SHA256为`e6c0e1775b61306e1fdc82311706832a4cce6c2dafd16a6570c7cee7826a9e87`，
+CANN9.1、dav-2201、-O2；源码/IR/库/选项均保存在`build/`。旧block8和R64证据分别在
+`runs/refactor/compile-vector/`、`runs/refactor/query-boundaries/`。
 
-本轮无设备错误或reset。历史R64首次测试及一次健康preflight拒绝保留在
-`runs/refactor/query-boundaries/`，不混入当前三批结果。8K同一binary采样正确性通过；
-其约3167µs ACL stream间隔只是探索性记录，不构成8K三批device task性能结论。
+## msprof op 的其他指标
 
-本次唯一算子变化是通用typed `block8_then_packed_merge`顺序：8×1024先到8×128，
-再到8×16，最后packed merge。CANN9.1的2201 `softmax_flashv2_block_reduce_impl.h`
-同样使用分层block归约，本实现使用独立scratch平面，未照搬其收缩原地写法。
-显式scratch从512B增至4608B，每AIV总UB由178304B增至182400B。
-最终ASC的搬运、MAD及完整event语句（包含条件）与旧版逐字节相同；
-FP32归约树改变，P/O舍入、状态更新、CV排步及GM请求不变。捕获地址`/1`也已化简。
+另用MindStudio op profiler 26.1.0，`--aic-metrics=Default --replay-mode=kernel`，
+5次应用warmup后采集3次launch。以下冲突比例是每次全AIV中位数再取中位数，
+搬运字节与指令是全核总和；三个launch的整数计数完全一致。这些replay数据用于归因，
+不替换上面的三批30次普通task计时。
 
-## 硬件指标与源码定位
+| 指标 | 当前DSL | ACLNN |
+|---|---:|---:|
+| Vector bank+bank-group冲突比例 | 13.714% | 8.032% |
+| 其中bank冲突 | 7.755% | 3.548% |
+| 其中bank-group冲突 | 5.959% | 4.484% |
+| GM→L1请求 | 776MiB | 544.3125MiB |
+| AIC MTE2指令 | 24,852 | 17,508 |
+| AIC MTE1指令 | 141,332 | 57,464 |
+| AIV MTE2指令 | 32,808 | 20,560 |
+| AIC L2读命中率，核中位数 | 97.71% | 95.41% |
+| AIV L2读命中率，核中位数 | 100% | 99.29% |
+| 全核Cube指令 | 16,384 | 16,384 |
 
-各批pipe活动中位数再取中位数，单位µs。这些活动可以重叠，**不能相加为kernel时长**。
+冲突数据支持继续优化UB访问；GM→L1请求多42.6%则直接暴露K/V重复载入。
+当前源码预算可精确复现PMU的776MiB：256个query tile，Q只在首KV载入，合计8MiB；
+每query的K、V、P各有4个KV×8个CK×32KiB，即各256MiB。
+安装版实际选中的`...18324677680_mix_aic`元数据启用了L1 reuse。安装arch22源码把
+同一AIC的两个AIV绑定到相邻query；K/V基址不随query变化，Matmul缓存仅在GM基址变化时
+失效，完整tile命中后直接取L1，不重发GM读取。
 
-| 指标 | block8 | R64重测 | 固定AscendC | ACLNN |
-|---|---:|---:|---:|---:|
-| AIC MAC | 261.689 | 261.689 | 261.689 | 247.573 |
-| AIV Vector | 380.455 | 698.106 | 770.473 | 325.871 |
-| AIV Scalar | 147.866 | 209.877 | 295.876 | 181.621 |
-| AIC MTE2 | 322.294 | 318.734 | 315.075 | 248.382 |
-| AIV MTE2 | 172.241 | 165.548 | 178.118 | 171.847 |
+用户指定下一步先解决GM→L1。对应政策是每个通信块含两个BM128原生行块，K/V每个CK
+只搬一次，分别供两个QK/PV MAD读；Q/P各自保留。源码请求预算为
+`Q8 + K128 + V128 + P256 = 520MiB`。它不是ACLNN的实际tiling反推，也不是已测结果。
+候选BQ256/BM128的最新构建/设备状态见[状态页](refactor-progress.md)。
 
-Vector活动下降约45.5%，而Cube活动不变，与这次变换的范围一致。剩余整体延迟差距
-仍约313µs，不能把各pipe差值相加归因，也不能仅凭Scalar活动下降声称指令数减少。
-下一步需要检查CV时间线、ready等待与输出更新排步；当前没有证据支持继续调整GEMM块。
+L1→L0的8次Load2D展开可解释141,312条源码搬运与PMU141,332的接近，但指令数多
+本身不足以证明它是端到端瓶颈，本轮不把Load3D列为优先优化。
 
-本卡Ascend910B3有20 AIC/40 AIV、最高AIC频率1800MHz。按“每core每cycle完成
-一个16×16×16 b16 FMA fractal、FMA计2 FLOP”的**条件模型**，Cube峰值294.912TFLOP/s。
-此shape的QK+PV工作为68.719GFLOP，对应Cube单独理想下界233.017µs；生成代码整体
-约83.25TFLOP/s、条件峰值的28.2%。该下界忽略Vector、DMA、启动与等待，不能当延迟预测。
-频率快照不是运行期持续频率；平台配置中的未标明单位带宽值不当作实测GB/s。
+原始op CSV、raw PMU、源码/库hash和命令位于`runs/refactor/cv-order/op-metrics/`，
+三次汇总为`repeated-comparison.json`。解释这些指标时须保留以下口径：
 
-源码计算的GM请求总量约2.299GB；其请求速率约2785GB/s包含L2命中，不能称为HBM流量。
-因此下一步优先减少Vector工作/等待并改善CV重叠，再通过带宽计数判断是否有内存瓶颈。
+- op冲突比例分母是截断到整微秒的task duration×频率，不是Vector活跃周期；
+  Default各PMU组分别replay，不可把冲突、pipe或wait时长相加分解18.3%的差距。
+- Memory的GB/s列实为GiB/s，KB列按KiB换算；分母是完整task duration。
+  GM请求含L2命中，不是HBM流量。
+- op Cube FOPS在这两个kernel中等于指令数×8192，比实际矩阵FLOP少512倍。
+  普通msprof实际采用PipeUtilizationExct，其MAC时间也不能与op Cube时间直接混比。
+- 两份kernel的event ID语义不同，不能用某个wait_id在ACLNN中为0证明它没有CV等待。
 
-上游依据是ops-transformer `4bbfb3b2bccceb2a1b80828d04eee915169a2b2e`，
-`attention/flash_attention_score/op_kernel/arch22/flash_attention_score_s1s2_bn2gs1.h`：
+## 硬件与源码边界
 
-- 1058附近的Vec2行块、1967附近的SoftmaxFlashV2、2344附近的Div：D128输出更新按64行，
-  历史统计量每行8份；当前显式block8/packed merge/BRCB，输出按8行及reciprocal→mul。
-- 855附近的Process：Vec1先于Vec2且taskId跨query连续；当前update先于softmax、query为serial。
-  当前query派发尾部没有PIPE_ALL，不能把它称为硬件drain。
-- 411附近的f16 ND Score/P地址复用、2254附近的O中间态GM写回：当前三个workspace独立、O驻UB。
-  上游Matmul内部同步不能仅凭API名称认为与当前显式ready/release逐条等价。
+本卡910B3有20 AIC/40 AIV，采集时1800MHz。按每core每cycle一个完整b16 FMA fractal、
+FMA计2 FLOP的条件模型，峰值294.912TFLOP/s；两次矩阵乘工作68.719GFLOP，Cube单独
+理想下界233.017µs。当前整体113.44TFLOP/s，为条件峰值38.5%；下界忽略Vector、DMA
+和等待，不是延迟预测。
 
-下一步按[计划](refactor-plan.md)一次验证一个通用Vector配方或明确example政策。
-FP32 sum顺序允许改变；P舍入、状态更新与最终输出数值合同仍保留。不按FA名称、shape或ASC字符串特判。
+参考ops-transformer HEAD为`4bbfb3b2bccceb2a1b80828d04eee915169a2b2e`。
+安装版kernel模板家族可由安装元数据确认，但安装header与上游checkout不同，不能宣称同提交。
+当前Vec2每次8行、上游D128按64行，以及统计量布局/首KV计算仍有差异；先处理GM→L1
+并复测，再决定UB和Vector改动，不做无界参数搜索。

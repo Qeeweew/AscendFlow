@@ -2,7 +2,8 @@
 
 import ctypes as ct
 import json
-from dataclasses import FrozenInstanceError
+import math
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 
 import pytest
@@ -13,11 +14,23 @@ from benchmarks.attention.contract import AttentionPolicy
 from xdsl_npu.model import CompileError
 
 GENERATED_ORDER = ("Q", "K", "Score", "P", "V", "PV", "O")
-POLICIES = tuple(AttentionPolicy(kv_heads=h, dtype=d) for h in (8, 2, 1) for d in ("f16", "bf16"))
+POLICIES = tuple(
+    AttentionPolicy(kv_heads=h, dtype=d, query_tile=bq)
+    for bq in (128, 256)
+    for h in (8, 2, 1)
+    for d in ("f16", "bf16")
+)
 
 
 def policy_arguments(policy):
-    return ["--kv-heads", str(policy.kv_heads), "--dtype", policy.dtype]
+    return [
+        "--kv-heads",
+        str(policy.kv_heads),
+        "--dtype",
+        policy.dtype,
+        "--query-tile",
+        str(policy.query_tile),
+    ]
 
 
 def generated_source(order=GENERATED_ORDER):
@@ -30,11 +43,11 @@ def generated_source(order=GENERATED_ORDER):
 
 def metadata_ir(policy=run.DEFAULT_POLICY):
     physical = [
-        '%sq = "npu.runtime_size"() {sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<128>} : () -> index',
+        f'%sq = "npu.runtime_size"() {{sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<{policy.query_tile}>}} : () -> index',
         '%sk = "npu.runtime_size"() {sym_name="Sk", minimum=#builtin.int<1>, multiple=#builtin.int<1024>} : () -> index',
     ]
     logical = [
-        '%sq = "npu_source.size"() {sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<128>} : () -> index',
+        f'%sq = "npu_source.size"() {{sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<{policy.query_tile}>}} : () -> index',
         '%sk = "npu_source.size"() {sym_name="Sk", minimum=#builtin.int<1>, multiple=#builtin.int<1024>} : () -> index',
     ]
     for tensor in policy.tensors:
@@ -55,18 +68,69 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
             f'access="{access}", ring=#builtin.int<0>, dynamic_axes=[{axes}]}} : ({types}) -> '
             f'!npu_source.tensor<[{dimensions}], "{dtype}", "GM", "linear">'
         )
-    for name, shape, dtype, memory, layout in (
-        ("chunk", (2, 128, 128), policy.dtype, "L1", "NZ"),
-        ("score_in", (2, 8, 1024), "f32", "UB", "linear"),
-        ("score_work", (8, 1024), "f32", "UB", "linear"),
-    ):
+    names = (
+        "q1",
+        "chunk",
+        "p1",
+        "v1",
+        "qa",
+        "pa",
+        "kb",
+        "vb",
+        "c0",
+        "score_in",
+        *(("score_work",) if policy.query_tile == 128 else ()),
+        "p_out",
+        "pv_in",
+        "o_out",
+        "m",
+        "l",
+        "o_state",
+        "alpha",
+        "partial",
+        "next_m",
+        "row_sum",
+        "ones",
+        "inverse",
+        "soft_broadcast",
+        "out_broadcast",
+    )
+    local = {"aic": [], "aiv0": [], "aiv1": []}
+    for name, (shape, dtype, memory, layout) in zip(names, policy.local_footprints, strict=True):
         dimensions = ", ".join(f"#builtin.int<{n}>" for n in shape)
         logical.append(
             f'%{name} = "npu_source.alloc"() {{sym_name="{name}", versions=#builtin.int<1>, '
             f'access="local", ring=#builtin.int<0>, dynamic_axes=[]}} : () -> '
             f'!npu_source.tensor<[{dimensions}], "{dtype}", "{memory}", "{layout}">'
         )
+        for actor in ("aiv0", "aiv1") if memory == "UB" else ("aic",):
+            nbytes = math.prod(shape) * (4 if dtype == "f32" else 2)
+            local[actor].append(
+                f'%{actor}_{name} = "npu.buffer"() {{sym_name="{name}", nbytes=#builtin.int<{nbytes}>, '
+                "external=#builtin.int<0>, initialized=#builtin.int<0>, count_scale=#builtin.int<0>} "
+                f': () -> !npu.ref<"{memory}", "{dtype}", "{layout}">'
+            )
+    for actor, buffers in local.items():
+        physical.append(
+            '"npu.kernel"() ({\n'
+            + "\n".join(buffers)
+            + f'\n"npu.end"() : () -> ()\n}}) {{sym_name="{actor}", core="{actor[:3]}", '
+            'target="dav-2201", blocks=#builtin.int<20>, disjoint_external=#builtin.int<1>} : () -> ()'
+        )
     score_type = '!npu_source.tensor<[#builtin.int<8>, #builtin.int<1024>], "f32", "UB", "linear">'
+    if policy.query_tile == 256:
+        input_type = '!npu_source.tensor<[#builtin.int<2>, #builtin.int<8>, #builtin.int<1024>], "f32", "UB", "linear">'
+        logical.extend(
+            (
+                '%zero = "arith.constant"() {value=0 : index} : () -> index',
+                (
+                    '%score_work = "npu_source.view"(%score_in, %zero, %zero, %zero) '
+                    "{widths=[#builtin.int<1>, #builtin.int<8>, #builtin.int<1024>], "
+                    "axes=[#builtin.int<1>, #builtin.int<2>], operandSegmentSizes=array<i32: 1, 3, 0>} "
+                    f": ({input_type}, index, index, index) -> {score_type}"
+                ),
+            )
+        )
     logical.append(
         f'%scaled = "npu_source.element"(%score_work, %score_work) {{kind="mul_scalar", '
         f"dependency_inputs=[], scalar={run.SCALE} : f32, operandSegmentSizes=array<i32: 1, 1, 0, 0>}} "
@@ -201,6 +265,9 @@ def test_invalid_shape_is_rejected_before_loading_any_artifact(tmp_path, case):
         (("--dtype", "f32"), "fixed attention policy"),
         (("--kv-heads", "3"), "HQ divisible by HKV"),
         (("--kv-heads", "4"), "fixed attention policy"),
+        (("--query-tile", "64"), "fixed attention policy"),
+        (("--query-tile", "512"), "fixed attention policy"),
+        (("--query-tile", "256", "--cases", "128:1024"), "BQ256"),
         (("--backend", "ascendc"), "reference-output"),
         (("--backend", "aclnn", "--build"), "only the generated"),
         (("--reference-output", "/unused"), "only to the AscendC"),
@@ -234,6 +301,14 @@ def test_reusing_generated_artifact_never_builds_and_records_its_own_identity(ar
     assert identity["contract"]["buffers"]["score"]["fixed_bytes"] == 20971520
     assert json.loads(record.read_text())["artifact"]["library"] == identity["library"]
     assert "not kernel-only" in result["timing_scope"]
+
+
+def test_bq128_artifact_without_a_bm_symbol_remains_loadable(artifact):
+    # Saved source IR describes tensors, not the current Python constexpr list.
+    assert "BM" not in (artifact / "source.xdsl").read_text()
+    contract = run.generated_contract(artifact)
+    assert contract["specialization"]["BQ"] == contract["specialization"]["BM"] == 128
+    assert contract["buffers"]["score"]["fixed_bytes"] == 20971520
 
 
 @pytest.mark.parametrize("name", ("attention_target.asc", "attention_target.so"))
@@ -363,27 +438,32 @@ def test_explicit_build_uses_the_new_example_and_one_total_deadline(artifact, mo
 
 @pytest.mark.parametrize("policy", POLICIES)
 def test_immutable_policy_drives_seven_shapes_bytes_and_reference_parameters(policy):
-    assert len(policy.parameters()) == 11
+    assert len(policy.parameters()) == 12
     assert policy.parameters() == {
         **run.CONSTANTS,
         "HKV": policy.kv_heads,
         "DTYPE": policy.dtype,
+        "BQ": policy.query_tile,
     }
-    assert policy.allocation_bytes(384, 2048) == {
-        "q": 384 * 2048,
+    assert policy.parameters()["BM"] == 128
+    sq, factor = 3 * policy.query_tile, policy.query_tile // 128
+    assert policy.allocation_bytes(sq, 2048) == {
+        "q": sq * 2048,
         "k": 2048 * {8: 2048, 2: 512, 1: 256}[policy.kv_heads],
         "v": 2048 * {8: 2048, 2: 512, 1: 256}[policy.kv_heads],
-        "o": 384 * 2048,
-        "score": 20971520,
-        "p": 10485760,
-        "pv": 2621440,
+        "o": sq * 2048,
+        "score": 20971520 * factor,
+        "p": 10485760 * factor,
+        "pv": 2621440 * factor,
     }
     tensors = {tensor.key: tensor for tensor in policy.tensors}
-    assert tensors["k"].runtime_shape(384, 2048) == (1, policy.kv_heads, 2048, 128)
-    assert tensors["q"].runtime_shape(384, 2048) == (1, 8, 384, 128)
+    assert tensors["k"].runtime_shape(sq, 2048) == (1, policy.kv_heads, 2048, 128)
+    assert tensors["q"].runtime_shape(sq, 2048) == (1, 8, sq, 128)
+    assert tensors["score"].shape == tensors["p"].shape == (20, 2, policy.query_tile, 1024)
+    assert tensors["pv"].shape == (20, 2, policy.query_tile, 128)
     assert tensors["p"].dtype == policy.dtype
     assert tensors["score"].dtype == tensors["pv"].dtype == "f32"
-    assert policy.shape(384, 2048) == (1, 8, policy.kv_heads, 384, 2048, 128)
+    assert policy.shape(sq, 2048) == (1, 8, policy.kv_heads, sq, 2048, 128)
     assert policy.tolerances == ((0.002, 0.0002) if policy.dtype == "f16" else (0.01, 0.001))
     assert policy.reference_parameters() == {
         "batch": 1,
@@ -394,6 +474,8 @@ def test_immutable_policy_drives_seven_shapes_bytes_and_reference_parameters(pol
     }
     with pytest.raises(FrozenInstanceError):
         policy.kv_heads = 4
+    with pytest.raises(FrozenInstanceError):
+        policy.query_tile = 256
     with pytest.raises(FrozenInstanceError):
         tensors["k"].shape = (1, 8, -1, 128)
 
@@ -413,6 +495,11 @@ def test_immutable_policy_drives_seven_shapes_bytes_and_reference_parameters(pol
         {"dim": 64},
         {"groups": 19},
         {"dtype": "f32"},
+        {"query_tile": True},
+        {"query_tile": 256.0},
+        {"query_tile": 0},
+        {"query_tile": 64},
+        {"query_tile": 512},
     ),
 )
 def test_undeclared_or_noninteger_policy_is_rejected(changes):
@@ -444,8 +531,95 @@ def test_each_selected_policy_matches_actual_ir_and_reaches_public_specialize(
     assert result["specialization"] == policy.parameters()
     assert result["buffer_contracts"]["k"]["bytes_per_extent"] == 256 * policy.kv_heads
     assert result["buffer_contracts"]["p"]["dtype"] == policy.dtype
-    assert result["requested_cases"][0]["allocation_bytes"] == policy.allocation_bytes(128, 1024)
+    assert result["requested_cases"][0]["allocation_bytes"] == policy.allocation_bytes(
+        policy.query_tile, 1024
+    )
+    assert result["artifact"]["contract"]["local_bytes_by_kernel"] == {
+        "aic": {
+            "core": "aic",
+            "bytes": {
+                "L1": 229376 if policy.query_tile == 128 else 327680,
+                "L0A": 65536,
+                "L0B": 65536,
+                "L0C": 131072,
+            },
+        },
+        **{
+            name: {
+                "core": "aiv",
+                "bytes": {"UB": 182400 if policy.query_tile == 128 else 183424},
+            }
+            for name in ("aiv0", "aiv1")
+        },
+    }
     assert "no device qualification" in result["comparison_scope"]
+
+
+@pytest.mark.parametrize("bq", (128, 256))
+def test_query_tile_controls_default_cases_without_rounding_explicit_cases(tmp_path, bq):
+    args = run.parse_args(["--output", str(tmp_path), "--query-tile", str(bq)])
+    assert args.cases == [(bq, 1024), (3 * bq, 3072), (6 * bq, 1024), (4 * bq, 2048)]
+    explicit = run.parse_args(
+        ["--output", str(tmp_path), "--query-tile", str(bq), "--cases", "768:2048"]
+    )
+    assert explicit.cases == [(768, 2048)]
+    if bq == 256:
+        with pytest.raises(CompileError, match="BQ256"):
+            run.parse_args(
+                ["--output", str(tmp_path), "--query-tile", "256", "--cases", "384:1024"]
+            )
+
+
+def test_bq256_local_geometry_keeps_native_rows_and_reuses_score_storage():
+    footprints = AttentionPolicy(query_tile=256).local_footprints
+    assert footprints[0] == ((2, 128, 128), "f16", "L1", "NZ")
+    assert footprints[2] == ((2, 2, 128, 128), "f16", "L1", "NZ")
+    assert footprints[4:6] == (((128, 128), "f16", "L0A", "ZZ"),) * 2
+    assert footprints[8] == ((2, 128, 128), "f32", "L0C", "NZ")
+    assert ((8, 1024), "f32", "UB", "linear") not in footprints
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("q1", "p1", "l0c", "source-sq", "physical-sq", "physical-size", "missing-aiv", "ub-size"),
+)
+def test_bq256_rejects_stale_source_or_physical_local_storage(tmp_path, field):
+    policy = AttentionPolicy(query_tile=256)
+    artifact = publish(tmp_path / "bq256", policy=policy)
+    physical = field in {"physical-sq", "physical-size", "missing-aiv", "ub-size"}
+    path = artifact / ("before.xdsl" if physical else "source.xdsl")
+    original = path.read_text()
+    lines = original.splitlines()
+    if field in {"q1", "p1", "l0c"}:
+        prefix = "%" + {"q1": "q1", "p1": "p1", "l0c": "c0"}[field] + " ="
+        lines = [
+            line.replace("#builtin.int<128>", "#builtin.int<256>", 1)
+            if line.startswith(prefix)
+            else line
+            for line in lines
+        ]
+    elif field in {"source-sq", "physical-sq"}:
+        lines = [
+            line.replace("multiple=#builtin.int<256>", "multiple=#builtin.int<128>")
+            for line in lines
+        ]
+    elif field == "missing-aiv":
+        lines = [line for line in lines if not line.startswith("%aiv1_o_state =")]
+    else:
+        prefix, old, new = (
+            ("%aic_q1 =", 65536, 32768) if field == "physical-size" else ("%aiv0_m =", 512, 256)
+        )
+        lines = [
+            line.replace(f"nbytes=#builtin.int<{old}>", f"nbytes=#builtin.int<{new}>")
+            if line.startswith(prefix)
+            else line
+            for line in lines
+        ]
+    changed = "\n".join(lines)
+    assert changed != original.rstrip("\n")
+    path.write_text(changed)
+    with pytest.raises(CompileError, match="policy differs|extent/type differs|tile contracts"):
+        run.load_backend(artifact, "generated", policy=policy)
 
 
 @pytest.mark.parametrize("policy", POLICIES[1:])
@@ -496,7 +670,11 @@ def test_selected_variant_rechecks_source_and_physical_contracts(tmp_path, field
 def test_ascendc_artifact_matches_its_own_selected_policy_source(tmp_path, policy):
     reference = publish(tmp_path / "reference", backend="ascendc", policy=policy)
     backend = run.load_backend(tmp_path, "ascendc", reference_output=reference, policy=policy)
-    assert backend.identity["contract"]["reference_policy"] == policy.as_dict()
+    contract = backend.identity["contract"]
+    assert contract["reference_policy"] == replace(policy, query_tile=128).as_dict()
+    assert contract["selected_policy"] == policy.as_dict()
+    assert contract["template_policy_differs_from_selected"] is (policy.query_tile != 128)
+    assert "independent AscendC BQ128 template" in contract["comparison_scope"]
     other = AttentionPolicy(kv_heads=1 if policy.kv_heads != 1 else 2, dtype=policy.dtype)
     with pytest.raises(CompileError, match="selected reference policy"):
         run.load_backend(tmp_path, "ascendc", reference_output=reference, policy=other)
@@ -518,14 +696,18 @@ def mock_execution(monkeypatch, policy, *, actual_value=1.25, expected_value=1.2
     np = pytest.importorskip("numpy")
     encode = run.attention_validation.encode
     original_decode = run.decode
-    output = encode(np.full((1, 8, 128, 128), actual_value, dtype=np.float32), policy.dtype)
-    selected = np.array([0, 127], dtype=np.int64)
+    sq = policy.query_tile
+    output = encode(np.full((1, 8, sq, 128), actual_value, dtype=np.float32), policy.dtype)
+    selected = np.array([0, sq - 1], dtype=np.int64)
     expected = np.full((1, 8, len(selected), 128), expected_value, dtype=np.float32)
-    state = {"oracle": [], "decode": [], "reference": [], "runtimes": []}
+    state = {"oracle": [], "decode": [], "reference": [], "runtimes": [], "allocation_bytes": []}
 
     def oracle(selected_policy, sq, sk, **options):
         state["oracle"].append((selected_policy, sq, sk, options))
-        raw = {key: b"\xcd" * size for key, size in policy.allocation_bytes(sq, sk).items()}
+        raw = {
+            key: b"\xcd" * size
+            for key, size in replace(policy, query_tile=128).allocation_bytes(sq, sk).items()
+        }
         raw["o"] = b"\xff\x7f" * (len(output) // 2)
         return raw, expected, selected, 0.0
 
@@ -542,6 +724,7 @@ def mock_execution(monkeypatch, policy, *, actual_value=1.25, expected_value=1.2
             state["runtimes"].append(self)
 
         def allocate(self, data):
+            state["allocation_bytes"].append(len(data) - len(run.GUARD))
             pointer = (len(self.memory) + 1) * 512
             self.memory[pointer] = data
             return pointer
@@ -635,32 +818,37 @@ def test_selected_policy_reaches_oracle_decode_aclnn_and_reports(tmp_path, monke
             "--physical",
             "0",
             "--cases",
-            "128:1024",
+            f"{policy.query_tile}:1024",
             "--scope",
             "sampled",
             *policy_arguments(policy),
         ]
     )
     assert state["oracle"] == [
-        (policy.as_dict(), 128, 1024, {"scope": "sampled", "data_case": "standard"})
+        (policy.as_dict(), policy.query_tile, 1024, {"scope": "sampled", "data_case": "standard"})
     ]
-    assert state["decode"] == [(policy.dtype, (1, 8, 128, 128))]
-    assert state["reference"] == [(policy.shape(128, 1024), policy.dtype, policy.scale)]
+    sq = policy.query_tile
+    assert state["decode"] == [(policy.dtype, (1, 8, sq, 128))]
+    assert state["reference"] == [(policy.shape(sq, 1024), policy.dtype, policy.scale)]
+    assert state["allocation_bytes"] == list(policy.allocation_bytes(sq, 1024).values())
     assert report["artifact"]["runtime_policy"] == policy.as_dict()
     row = report["cases"][0]
     assert report["status"] == "passed" and row["dtype"] == policy.dtype
     assert (row["rtol"], row["atol"]) == policy.tolerances
-    assert row["shape_b_hq_hkv_sq_sk_d"] == policy.shape(128, 1024)
-    assert row["input_contract"]["allocation_bytes"] == policy.allocation_bytes(128, 1024)
+    assert row["shape_b_hq_hkv_sq_sk_d"] == policy.shape(sq, 1024)
+    assert row["input_contract"]["allocation_bytes"] == policy.allocation_bytes(sq, 1024)
+    assert row["input_contract"]["example_tile_bq_bk_ck_vr"] == [sq, 1024, 128, 8]
+    assert row["input_contract"]["example_native_query_tile_bm"] == 128
     assert row["guards_checked"] is True and row["inputs_unchanged"] is True
     assert state["runtimes"][0].closed
 
 
 @pytest.mark.parametrize("backend", ("generated", "ascendc"))
+@pytest.mark.parametrize("bq", (128, 256))
 def test_selected_policy_uses_named_launcher_with_the_same_runtime_contract(
-    tmp_path, monkeypatch, backend
+    tmp_path, monkeypatch, backend, bq
 ):
-    policy = AttentionPolicy(kv_heads=2, dtype="bf16")
+    policy = AttentionPolicy(kv_heads=2, dtype="bf16", query_tile=bq)
     state = mock_execution(monkeypatch, policy)
     artifact = publish(tmp_path / "artifact", backend=backend, policy=policy)
     arguments = ["--output", str(artifact), "--backend", backend]
@@ -672,7 +860,7 @@ def test_selected_policy_uses_named_launcher_with_the_same_runtime_contract(
             "--physical",
             "0",
             "--cases",
-            "128:1024",
+            f"{bq}:1024",
             "--scope",
             "sampled",
             *policy_arguments(policy),
@@ -680,7 +868,7 @@ def test_selected_policy_uses_named_launcher_with_the_same_runtime_contract(
     )
     assert report["status"] == "passed" and not state["reference"]
     assert state["oracle"][0][0] == policy.as_dict()
-    assert state["decode"] == [("bf16", (1, 8, 128, 128))]
+    assert state["decode"] == [("bf16", (1, 8, bq, 128))]
 
 
 @pytest.mark.parametrize("dtype", ("f16", "bf16"))
@@ -723,5 +911,38 @@ def test_wrong_oracle_allocation_is_rejected_before_health_or_acl(tmp_path, monk
                 "--cases",
                 "128:1024",
                 *policy_arguments(policy),
+            ]
+        )
+
+
+@pytest.mark.parametrize("name", ("q", "k", "v", "o", "score", "p", "pv"))
+def test_bq256_workspace_adaptation_cannot_hide_a_bad_oracle_allocation(
+    tmp_path, monkeypatch, name
+):
+    policy = AttentionPolicy(query_tile=256)
+    mock_execution(monkeypatch, policy)
+    original = run.inputs_and_oracle
+
+    def broken_oracle(*args, **kwargs):
+        raw, expected, selected, seconds = original(*args, **kwargs)
+        raw[name] = raw[name][:-1]
+        return raw, expected, selected, seconds
+
+    monkeypatch.setattr(run, "inputs_and_oracle", broken_oracle)
+    monkeypatch.setattr(run, "health_snapshot", no_device)
+    artifact = publish(tmp_path / "artifact", policy=policy)
+    with pytest.raises(CompileError, match="oracle allocation contract differs"):
+        run.main(
+            [
+                "--output",
+                str(artifact),
+                "--physical",
+                "0",
+                "--query-tile",
+                "256",
+                "--cases",
+                "256:1024",
+                "--scope",
+                "sampled",
             ]
         )

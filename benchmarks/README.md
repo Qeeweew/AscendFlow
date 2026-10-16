@@ -28,9 +28,16 @@
 
 ## 新DSL Flash Attention
 
-唯一数学主体在`examples/flash_attention/attention.py`。当前runner固定已验证的dense
-B1/H8/Hkv8/D128/f16政策；不会把其他constexpr当成已验变体。`--build`才编译，
-复用产物时按实际launcher ABI绑定参数并检查源/库hash。ACLNN记录其独立库身份。
+唯一数学主体在`examples/flash_attention/attention.py`。runner目前接受dense
+B1/Hq8/D128/groups20、Hkv=8/2/1、dtype=f16/bf16、query tile=128/256的显式政策。
+不可变合同统一驱动实际specialization、七个buffer的shape/字节数、数值参考、
+ACLNN及独立AscendC；加载产物时核对实际source/physical IR与指定政策。
+这只是工具支持范围，真实构建、数值及性能资格以[状态页](../docs/refactor-progress.md)为准。
+`--build`才编译，复用产物时按实际launcher ABI绑定参数并检查源/库hash。
+ACLNN记录其独立库身份，不能用默认库测试另一个dtype/head政策。
+`--query-tile 256`选择同一example的BQ256/BM128 K/V复用政策，Sq须整除256，
+Score/P/PV workspace随BQ改变。独立AscendC仍是BQ128模板，只作相同数学合同的参考；
+runner明确记录这一区别，不把两种排步称为相同。
 
 ```bash
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run --output runs/fa --build

@@ -13,7 +13,8 @@ import json
 import math
 import re
 import struct
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from xdsl.dialects.builtin import f32
@@ -26,7 +27,7 @@ from benchmarks.references.attention_aclnn import FlashAttentionReference
 from benchmarks.validation.attention import decode, inputs_and_oracle
 from xdsl_npu.build import build_file
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.ir import BufferOp, MixedOp, RuntimeSizeOp, parse
+from xdsl_npu.ir import BufferOp, KernelOp, MixedOp, RuntimeSizeOp, parse
 from xdsl_npu.model import require
 from xdsl_npu.performance import hardware_snapshot
 from xdsl_npu.source_ir import AllocationOp, ElementOp, ProgramOp, SizeOp
@@ -153,8 +154,88 @@ def launcher_abi(source, name, *, generated):
     return LauncherABI(signatures[0][0], tuple(names), tuple(keys))
 
 
+def local_contract(program, root, policy):
+    """Check complete source footprints and each actor's physical storage."""
+    local = [
+        op for op in program.walk() if isinstance(op, AllocationOp) and op.access.data == "local"
+    ]
+    footprints = Counter(
+        (
+            tuple(n.data for n in op.ref.type.shape),
+            op.ref.type.dtype.data,
+            op.ref.type.memory.data,
+            op.ref.type.layout.data,
+        )
+        for op in local
+    )
+    require(
+        footprints == Counter(policy.local_footprints)
+        and len({op.sym_name.data for op in local}) == len(local)
+        and all(
+            op.parent_op() is program
+            and op.versions.data == 1
+            and op.ring.data == 0
+            and not op.dimensions
+            and not op.dynamic_axes
+            for op in local
+        ),
+        "compiled attention local tensor policy differs",
+    )
+    kernels = [op for op in root.body.block.ops if isinstance(op, KernelOp)]
+    require(
+        Counter(kernel.core.data for kernel in kernels) == {"aic": 1, "aiv": 2}
+        and len({kernel.sym_name.data for kernel in kernels}) == len(kernels)
+        and all(
+            kernel.target.data == "dav-2201"
+            and kernel.blocks is not None
+            and kernel.blocks.data == policy.groups
+            for kernel in kernels
+        )
+        and all(
+            op.parent_op() in kernels
+            for op in root.walk()
+            if isinstance(op, BufferOp) and not op.external.data
+        ),
+        "compiled attention local physical actor policy differs",
+    )
+    byte_totals = {}
+    for kernel in kernels:
+        expected = {
+            op.sym_name.data: op
+            for op in local
+            if (op.ref.type.memory.data == "UB") == (kernel.core.data == "aiv")
+        }
+        physical = [
+            op for op in kernel.body.block.ops if isinstance(op, BufferOp) and not op.external.data
+        ]
+        require(
+            len(physical) == len(expected)
+            and {op.sym_name.data for op in physical} == expected.keys(),
+            "compiled attention local physical allocation policy differs",
+        )
+        totals = {}
+        for buffer in physical:
+            allocation = expected[buffer.sym_name.data]
+            tensor = allocation.ref.type
+            bank, dtype, layout = tensor.memory.data, tensor.dtype.data, tensor.layout.data
+            nbytes = math.prod(n.data for n in tensor.shape) * (4 if dtype == "f32" else 2)
+            require(
+                buffer.ref.type.bank.data == bank
+                and buffer.ref.type.dtype.data == dtype
+                and buffer.ref.type.layout.data == layout
+                and buffer.nbytes.data == nbytes
+                and buffer.extent_count is None
+                and (buffer.count_scale is None or buffer.count_scale.data == 0)
+                and buffer.initialized.data == 0,
+                f"compiled attention local physical extent/type differs for {buffer.sym_name.data}",
+            )
+            totals[bank] = totals.get(bank, 0) + nbytes
+        byte_totals[kernel.sym_name.data] = {"core": kernel.core.data, "bytes": totals}
+    return byte_totals
+
+
 def generated_contract(directory, policy=DEFAULT_POLICY):
-    """Read actual source shapes and physical GM extents; do not replan IR."""
+    """Read actual source shapes and physical extents; do not replan IR."""
     directory = Path(directory)
     before = read_bytes(directory / "before.xdsl")
     source = read_bytes(directory / "source.xdsl")
@@ -176,20 +257,7 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
         and program.disjoint_external.data == 1,
         "compiled attention source policy differs from the selected runner policy",
     )
-    footprints = {
-        (tuple(n.data for n in op.ref.type.shape), op.ref.type.dtype.data, op.ref.type.memory.data)
-        for op in program.body.block.ops
-        if isinstance(op, AllocationOp) and op.access.data == "local"
-    }
-    require(
-        {
-            ((2, 128, 128), policy.dtype, "L1"),
-            ((2, 8, 1024), "f32", "UB"),
-            ((8, 1024), "f32", "UB"),
-        }
-        <= footprints,
-        "compiled attention CK/VR local tensor policy differs",
-    )
+    local_bytes = local_contract(program, root, policy)
     scale_operations = [
         op
         for op in logical.walk()
@@ -227,7 +295,7 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
         and all(
             dimension[name].minimum.data == 1 and dimension[name].multiple.data == multiple
             for dimension in (sizes, source_sizes)
-            for name, multiple in (("Sq", 128), ("Sk", 1024))
+            for name, multiple in (("Sq", policy.query_tile), ("Sk", 1024))
         ),
         "compiled attention runtime tile contracts differ",
     )
@@ -273,6 +341,7 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
         "before_ir_sha256": sha256(before),
         "source_ir_sha256": sha256(source),
         "buffers": contracts,
+        "local_bytes_by_kernel": local_bytes,
     }
 
 
@@ -345,7 +414,12 @@ def load_backend(output, backend, *, reference_output=None, policy=DEFAULT_POLIC
             source == reference_source(**policy.reference_parameters()),
             "AscendC artifact differs from the selected reference policy",
         )
-        contract = {"reference_policy": policy.as_dict()}
+        contract = {
+            "reference_policy": replace(policy, query_tile=128).as_dict(),
+            "selected_policy": policy.as_dict(),
+            "template_policy_differs_from_selected": policy.query_tile != 128,
+            "comparison_scope": "same mathematical attention; independent AscendC BQ128 template",
+        }
     abi = launcher_abi(source, name, generated=backend == "generated")
     return Backend(
         backend,
@@ -388,7 +462,6 @@ def parse_args(argv=None):
         "--cases",
         type=case_shape,
         nargs="+",
-        default=[(128, 1024), (384, 3072), (768, 1024), (512, 2048)],
     )
     parser.add_argument("--scope", choices=("full", "sampled"), default="full")
     parser.add_argument("--data-case", choices=("standard", "uniform", "sharp"), default="standard")
@@ -409,6 +482,9 @@ def parse_args(argv=None):
         "one build must finish within 300 seconds",
     )
     args.policy = AttentionPolicy(**{key: getattr(args, key) for key in DEFAULT_POLICY.as_dict()})
+    if args.cases is None:
+        bq = args.policy.query_tile
+        args.cases = [(bq, 1024), (3 * bq, 3072), (6 * bq, 1024), (4 * bq, 2048)]
     for sq, sk in args.cases:
         args.policy.validate_case(sq, sk)
     require(
@@ -482,10 +558,23 @@ def run(args):
     import numpy as np
 
     prepared = []
+    oracle_storage_policy = replace(policy, query_tile=128)
     for sq, sk in args.cases:
         raw, expected, selected, oracle_s = inputs_and_oracle(
             policy.as_dict(), sq, sk, scope=args.scope, data_case=args.data_case
         )
+        require(
+            {name: len(data) for name, data in raw.items()}
+            == oracle_storage_policy.allocation_bytes(sq, sk),
+            "attention oracle allocation contract differs from its BQ128 workspace contract",
+        )
+        # The independent numerical oracle uses BQ128 workspace sentinels.
+        # Its Q/K/V/O and sampled mathematical rows apply to either query tile.
+        # Validate all seven original allocations before adapting only scratch.
+        if policy.query_tile != 128:
+            allocations = policy.allocation_bytes(sq, sk)
+            for name in ("score", "p", "pv"):
+                raw[name] = b"\xcd" * allocations[name]
         require(
             {name: len(data) for name, data in raw.items()} == policy.allocation_bytes(sq, sk),
             "attention oracle allocation contract differs from this compiled policy",
@@ -610,6 +699,7 @@ def run(args):
                     "example_tile_bq_bk_ck_vr": [
                         policy.parameters()[key] for key in ("BQ", "BK", "CK", "VR")
                     ],
+                    "example_native_query_tile_bm": policy.parameters()["BM"],
                     "backend_buffer_arguments": ["q", "k", "v", "o"]
                     if args.backend == "aclnn"
                     else [key for key in backend.abi.keys if key not in {"stream", "sq", "sk"}],

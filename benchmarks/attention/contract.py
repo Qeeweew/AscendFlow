@@ -55,18 +55,27 @@ class AttentionPolicy:
     dim: int = 128
     groups: int = 20
     dtype: str = "f16"
+    query_tile: int = 128
 
     def __post_init__(self):
         require(
             all(
                 type(v) is int and v > 0
-                for v in (self.batch, self.heads, self.kv_heads, self.dim, self.groups)
+                for v in (
+                    self.batch,
+                    self.heads,
+                    self.kv_heads,
+                    self.dim,
+                    self.groups,
+                    self.query_tile,
+                )
             ),
             "attention policy requires positive integer dimensions, not bool",
         )
-        declared = "runner requires the declared fixed attention policy B1/HQ8/D128/groups20, HKV8/2/1 and f16/bf16"
+        declared = "runner requires the declared fixed attention policy B1/HQ8/D128/groups20, HKV8/2/1, BQ128/256 and f16/bf16"
         require(
             (self.batch, self.heads, self.dim, self.groups) == (1, 8, 128, 20)
+            and self.query_tile in {128, 256}
             and type(self.dtype) is str
             and self.dtype in {"f16", "bf16"},
             declared,
@@ -83,7 +92,8 @@ class AttentionPolicy:
             "HQ": self.heads,
             "HKV": self.kv_heads,
             "D": self.dim,
-            "BQ": 128,
+            "BQ": self.query_tile,
+            "BM": 128,
             "BK": 1024,
             "CK": 128,
             "VR": 8,
@@ -107,9 +117,37 @@ class AttentionPolicy:
             TensorContract("K", "k", (self.batch, self.kv_heads, -1, self.dim), self.dtype, "Sk"),
             TensorContract("V", "v", (self.batch, self.kv_heads, -1, self.dim), self.dtype, "Sk"),
             TensorContract("O", "o", (self.batch, self.heads, -1, self.dim), self.dtype, "Sq"),
-            TensorContract("Score", "score", (self.groups, 2, 128, 1024), "f32"),
-            TensorContract("P", "p", (self.groups, 2, 128, 1024), self.dtype),
-            TensorContract("PV", "pv", (self.groups, 2, 128, self.dim), "f32"),
+            TensorContract("Score", "score", (self.groups, 2, self.query_tile, 1024), "f32"),
+            TensorContract("P", "p", (self.groups, 2, self.query_tile, 1024), self.dtype),
+            TensorContract("PV", "pv", (self.groups, 2, self.query_tile, self.dim), "f32"),
+        )
+
+    @property
+    def local_footprints(self):
+        """Declared source allocations; UB storage is private to each AIV."""
+        bq, bm, dtype = self.query_tile, 128, self.dtype
+        return (
+            ((bm, 128) if bq == bm else (bq // bm, bm, 128), dtype, "L1", "NZ"),
+            ((2, 128, 128), dtype, "L1", "NZ"),
+            ((2, bq, 128) if bq == bm else (2, bq // bm, bm, 128), dtype, "L1", "NZ"),
+            ((2, 128, 128), dtype, "L1", "NZ"),
+            ((bm, 128), dtype, "L0A", "ZZ"),
+            ((bm, 128), dtype, "L0A", "ZZ"),
+            ((128, 128), dtype, "L0B", "ZN"),
+            ((128, 128), dtype, "L0B", "ZN"),
+            ((2, bm, 128), "f32", "L0C", "NZ"),
+            ((2, 8, 1024), "f32", "UB", "linear"),
+            *((((8, 1024), "f32", "UB", "linear"),) if bq == bm else ()),
+            ((2, 8, 1024), dtype, "UB", "linear"),
+            ((2, 8, 128), "f32", "UB", "linear"),
+            ((2, 8, 128), dtype, "UB", "linear"),
+            ((bq // 2,), "f32", "UB", "linear"),
+            ((bq // 2,), "f32", "UB", "linear"),
+            ((bq // 2, 128), "f32", "UB", "linear"),
+            ((2, bq // 2), "f32", "UB", "linear"),
+            ((1152,), "f32", "UB", "linear"),
+            *(((8,), "f32", "UB", "linear"),) * 4,
+            *(((8, 8), "f32", "UB", "linear"),) * 2,
         )
 
     def validate_case(self, sq, sk):
@@ -118,8 +156,8 @@ class AttentionPolicy:
             and type(sk) is int
             and sq > 0
             and sk > 0
-            and sq % 128 == sk % 1024 == 0,
-            "attention cases require positive complete BQ128/BK1024 tiles",
+            and sq % self.query_tile == sk % 1024 == 0,
+            f"attention cases require positive complete BQ{self.query_tile}/BK1024 tiles",
         )
         require(
             all(tensor.nbytes(sq, sk) <= 2**63 - 1 for tensor in self.tensors),
@@ -135,7 +173,9 @@ class AttentionPolicy:
         return self.batch, self.heads, self.kv_heads, sq, sk, self.dim
 
     def reference_parameters(self):
-        return {key: value for key, value in self.as_dict().items() if key != "dim"}
+        return {
+            key: value for key, value in self.as_dict().items() if key not in {"dim", "query_tile"}
+        }
 
 
 DEFAULT_POLICY = AttentionPolicy()
