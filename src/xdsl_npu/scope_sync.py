@@ -85,7 +85,7 @@ class ParentCompletion:
         extra_protocols=(),
         boundary_sites=(),
     ):
-        self.program, self.access = program, access
+        self.program, self.analyses, self.access = program, analyses, access
         self.events, self.protocols = {}, []
         self.node_activations, self._guarded, self._anchored = {}, None, None
         marks = defaultdict(set)
@@ -1019,6 +1019,7 @@ def _read_protocols(program, access, analyses):
     channels, expected = {}, {}
     expected_order, actual_order = defaultdict(list), defaultdict(list)
     reserved = _leaf_banks(program, analyses)
+    borrow_slots = None
     used = defaultdict(set, {key: set(ids) for key, ids in reserved.items()})
     cross_ids = set()
     for op in program.module.walk():
@@ -1067,10 +1068,22 @@ def _read_protocols(program, access, analyses):
                 "parent local event needs two distinct pipes in one actor",
             )
             key = sources[0][0], tasks[sources[0]].pipe, tasks[destinations[0]].pipe
-            require(
-                not reserved[key].intersection(ids),
-                "parent event overlaps a child/configuration resource",
-            )
+            if reserved[key].intersection(ids):
+                # Full lifetime checking needs the actual parent transitions.
+                # Only a real child owner can defer an overlap to that proof;
+                # kernel-entry configuration resources never enter this path.
+                if borrow_slots is None:
+                    from .scope_event_borrow import child_slots
+
+                    borrow_slots = child_slots(program, analyses)
+                require(
+                    all(
+                        (key, event_id) in borrow_slots
+                        for event_id in ids
+                        if event_id in reserved[key]
+                    ),
+                    "parent event overlaps a child/configuration resource without an actual child owner",
+                )
             used[key].update(ids)
         else:
             require(

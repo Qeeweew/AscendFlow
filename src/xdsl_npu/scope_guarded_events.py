@@ -11,6 +11,7 @@ from dataclasses import replace
 from .budget import poll
 from .model import require
 from .scope_domains import Activation, affine, position, validate_activation
+from .scope_event_borrow import ParentEventBankExhausted
 from .symbolic_completion import add, le, meet
 
 
@@ -27,11 +28,12 @@ def _bank(protocol, proof):
     return (actor, send.task.pipe, wait.task.pipe), send, wait
 
 
-def self_reuse(protocol, proof, width):
+def self_reuse_queries(protocol, proof, width):
     """Last Wait precedes the following Set using that exact ordinal ID."""
     value = validate_activation(protocol.activation, distance=protocol.distance)
     _, send, wait = _bank(protocol, proof)
     active = tuple(r for r in range(proof.graph.period) if r % value.period in value.residues)
+    queries = []
     for rank, residue in enumerate(active):
         poll("conditional parent event reuse", channel=protocol.name, width=width)
         cycles, index = divmod(rank + width, len(active))
@@ -48,9 +50,12 @@ def self_reuse(protocol, proof, width):
             proof.graph.period,
             ((residue + distance) % proof.graph.period,),
         )
-        if not proof.guarded().covered(wait, send, step - distance, required):
-            return False
-    return True
+        queries.append((wait, send, step - distance, required))
+    return tuple(queries)
+
+
+def self_reuse(protocol, proof, width):
+    return all(proof.guarded().covered_many(self_reuse_queries(protocol, proof, width)))
 
 
 def allocate(protocols, proof, used_banks, *, verify=False, statistics=None):
@@ -87,7 +92,8 @@ def allocate(protocols, proof, used_banks, *, verify=False, statistics=None):
                 width is not None, f"{bank}: no conditional parent event width <=8 proves reuse"
             )
             free = [i for i in range(8) if i not in used[bank]]
-            require(len(free) >= width, f"{bank}: conditional parent event bank exhausted")
+            if len(free) < width:
+                raise ParentEventBankExhausted(bank, width, len(free), conditional=True)
             ids = tuple(free[:width])
         used[bank].update(ids)
         result.append(replace(protocol, ids=ids))

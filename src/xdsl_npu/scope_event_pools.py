@@ -11,6 +11,11 @@ from itertools import combinations
 
 from .budget import bounded, poll
 from .model import require
+from .scope_event_borrow import (
+    ParentEventBankExhausted,
+    allocate_borrows,
+    verify_actual_borrows,
+)
 
 MAX_POOL_QUERIES = 1_000_000
 MAX_POOL_MERGE_WORK = 1_000_000
@@ -241,6 +246,33 @@ class _MergeWork:
 
 @bounded
 def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
+    """Keep private pools when they fit; borrow only after typed exhaustion."""
+    protocols = tuple(protocols)
+    pending, borrowed, attempted = protocols, {}, set()
+    while True:
+        try:
+            assigned, used = _allocate_private_pools(
+                pending, proof, used_banks, statistics=statistics
+            )
+            by_name = {p.name: p for p in assigned}
+            by_name.update(
+                (p.name, replace(p, ids=(borrowed[p.name],)))
+                for p in protocols
+                if p.name in borrowed
+            )
+            return tuple(by_name[p.name] for p in protocols), used
+        except ParentEventBankExhausted as failure:
+            if failure.bank in attempted:
+                raise
+            attempted.add(failure.bank)
+            choices = allocate_borrows(pending, proof, failure.bank, statistics=statistics)
+            if not choices:
+                raise
+            borrowed.update(choices)
+            pending = tuple(p for p in pending if p.name not in borrowed)
+
+
+def _allocate_private_pools(protocols, proof, used_banks, *, statistics=None):
     """Pack local parent channels deterministically, without claiming optimality.
 
     Start with each channel's minimum self-reuse width. A bank that already
@@ -255,7 +287,7 @@ def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
         conditional = tuple(p for p in protocols if p.activation is not None)
         ordinary = tuple(p for p in protocols if p.activation is None)
         checked, reserved = allocate(conditional, proof, used_banks, statistics=statistics)
-        checked_ordinary, used = allocate_parent_pools(
+        checked_ordinary, used = _allocate_private_pools(
             ordinary, proof, reserved, statistics=statistics
         )
         assigned = {p.name: p for p in (*checked, *checked_ordinary)}
@@ -310,10 +342,8 @@ def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
                 pools = [pool for k, pool in enumerate(pools) if k not in (i, j)] + [(group, width)]
                 pools.sort(key=lambda pool: pool[0])
                 merges += 1
-        require(
-            cost <= len(free),
-            f"{bank}: proved parent pool packing needs {cost} IDs, only {len(free)} free",
-        )
+        if cost > len(free):
+            raise ParentEventBankExhausted(bank, cost, len(free))
         offset = 0
         for group, width in pools:
             ids = tuple(free[offset : offset + width])
@@ -331,6 +361,18 @@ def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
 
 @bounded
 def verify_parent_pools(protocols, proof, used_banks, *, statistics=None):
+    """Reconstruct actual borrowing, then check the remaining private pools."""
+    protocols = tuple(protocols)
+    borrowed = verify_actual_borrows(protocols, proof, used_banks, statistics=statistics)
+    return _verify_private_pools(
+        tuple(p for p in protocols if p.name not in borrowed),
+        proof,
+        used_banks,
+        statistics=statistics,
+    )
+
+
+def _verify_private_pools(protocols, proof, used_banks, *, statistics=None):
     """Independently verify actual complete ID tuples and all lifetime paths.
 
     Every source activation is a prefix of the same ordinal stream. When one
@@ -345,7 +387,7 @@ def verify_parent_pools(protocols, proof, used_banks, *, statistics=None):
         conditional = tuple(p for p in protocols if p.activation is not None)
         ordinary = tuple(p for p in protocols if p.activation is None)
         _, reserved = allocate(conditional, proof, used_banks, verify=True, statistics=statistics)
-        return verify_parent_pools(ordinary, proof, reserved, statistics=statistics)
+        return _verify_private_pools(ordinary, proof, reserved, statistics=statistics)
     locals_ = _locals(protocols, proof)
     used, checks, pools = _reserved(used_banks), _Proofs(proof, statistics), defaultdict(list)
     for local in locals_:

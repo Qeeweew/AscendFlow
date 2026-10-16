@@ -2,6 +2,38 @@
 
 > 本页保留对应保存点的合同与验证记录，复现路径已随目录清理更新。最新支持状态见[状态页](refactor-progress.md)，后续工作以[当前计划](refactor-plan.md)为准。
 
+## runtime父子边界的ID借用
+
+固定child最后一次读取后的释放，可能落在该child原有event的空档内。
+例如双槽child已有`Set(row=0)→Wait(row=2)`；parent要补的是
+`Set(row=2,parent=g)→Wait(row=0,parent=g+1)`。为每条逻辑channel独占ID
+会把一条连续生命周期拆成多个物理flag，进而拒绝本可执行的排步。
+
+`scope_event_borrow.py`只在原有分配发生明确bank容量不足后尝试以下受限合同：
+
+- parent必须是同actor、不同pipe的local二值event，distance=1、单ID，且自身复用已证明。
+- child保持实际ID和native位置，每个物理`(actor,source pipe,destination pipe,ID)`
+  最多有一个parent借用者；configuration、跨核counter和child-child共享不进入该规则。
+- 证明`child最后Wait(g)→parent Set(g)`以及
+  `parent Wait(g+1)→child首次Set(g+1)`；这些是消费和Set effect，不能用native完成代替。
+- 条件child仅允许现有single/first/middle/last分区。若中间invocation缺席，还要证明
+  `child Wait(FIRST)→parent Set(g)`和`parent Wait(g+1)→child Set(LAST)`。
+  仅检查相邻代次会把缺席端点当作vacuous成功；这两条anchor分别有独立负反例。
+  任意稀疏、周期或动态child激活不能据此获得支持。
+
+所有候选共用现有guarded/anchored完成分析，合批检查后做有限二部图匹配；不添加完成边、
+buffer、barrier或搬运，不改变已选Set/Wait及其等待范围。普通空闲pool已足够时保持原分配。
+最终verifier从实际IR和ID重建child ownership、自复用与借用检查，拒绝双借用者、
+错误slot、未消费重发及configuration冲突。串行query另保留同物理ID的所有old/new
+parent、child及mixed配对检查；query派发结束仍不等于硬件drain。
+
+最小源码反例只有两个nested Vector child、4行×16元素。
+`update→produce`可用，而`produce→update`在独占分配下需要6个child ID加4个条件释放ID，
+超出8个。借用检查的有限模型覆盖短N并能发现故意制造的binary event overwrite；
+有限结果只作交叉检查，生产合法性来自上面的符号关系，不能冒充任意程序形式化证明。
+
+## 历史局部有限流水分配
+
 逻辑 channel 的数量不等于物理 flag 的数量。局部 AutoSync 保留原本可验证的
 连续 rotating ring；该方案不能放入每个有向 bank 的八 ID 时，改用同一组
 真实命令的有限生命周期分配。不改变 task、issue order、stage、buffer、同步

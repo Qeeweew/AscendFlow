@@ -238,10 +238,8 @@ def prepare_binary_resources(checked, parent) -> QueryBinaryResources:
                 require(work <= MAX_BINARY_PAIR_WORK, "query binary pool pair budget exceeded")
                 if work % 128 == 0:
                     poll("query binary pool pairs", work=work, checks=len(pending))
-                require(
-                    source.kind == target.kind,
-                    "query binary parent/child ID sharing needs an actual mixed-pool contract",
-                )
+                # verify_parent_pools independently proved each actual child
+                # borrower above. Keep all mixed old/new boundary pairs too.
                 domain = meet(source.domain, target.domain)
                 if domain is None:
                     continue
@@ -252,7 +250,7 @@ def prepare_binary_resources(checked, parent) -> QueryBinaryResources:
                     event_id,
                     source.owner,
                     target.owner,
-                    source.kind,
+                    source.kind if source.kind == target.kind else "mixed",
                 )
                 pending[key].append(domain)
                 require(len(pending) <= MAX_BINARY_CHECKS, "query binary check budget exceeded")
@@ -282,7 +280,7 @@ def check_binary_resources(prepared, query_completion) -> tuple[bool, ...]:
         isinstance(prepared, QueryBinaryResources)
         and all(
             isinstance(check, QueryBinaryCheck)
-            and check.kind in {"parent", "child"}
+            and check.kind in {"parent", "child", "mixed"}
             and isinstance(check.source, (QueryEvent, QuerySite))
             and isinstance(check.target, (QueryEvent, QuerySite))
             and check.source.query == 0
@@ -544,6 +542,7 @@ def verify_query_resources(checked, parent, query_completion) -> dict:
         "required_checks": len(checks),
         "parent_binary_checks": sum(row["kind"] == "parent_binary" for row in rows),
         "child_binary_checks": sum(row["kind"] == "child_binary" for row in rows),
+        "mixed_binary_checks": sum(row["kind"] == "mixed_binary" for row in rows),
         "cross_counter_boundary_checks": sum(
             row["kind"] == "cross_counter_boundary" for row in rows
         ),
