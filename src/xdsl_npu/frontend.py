@@ -323,6 +323,21 @@ class _Parser:
             self.loop(node)
         elif isinstance(node, ast.If):
             self.branch(node)
+        elif isinstance(node, ast.Assert):
+            # Interpret the captured AST, never a Python assert statement:
+            # host optimization must not remove a DSL compile-time contract.
+            condition = self.expr(node.test)
+            if type(condition) is not bool:
+                self.fail(
+                    node.test,
+                    "assert requires a constexpr bool; runtime assertions are unsupported",
+                )
+            message = None if node.msg is None else self.expr(node.msg)
+            if node.msg is not None and type(message) is not str:
+                self.fail(node.msg, "assert message must be a constexpr str")
+            if not condition:
+                detail = "" if message is None else f": {message}"
+                self.fail(node, f"compile-time assertion failed{detail}")
         else:
             self.fail(node, f"unsupported device statement {type(node).__name__}")
 

@@ -1,6 +1,6 @@
 # DSL：运行时循环与多级流水
 
-2026-10-15。本文区分**可运行子集**与**下一部分的语言合同**。
+2026-10-16。本文区分**可运行子集**与**下一部分的语言合同**。
 实际后端支持见[状态页](refactor-progress.md)，统一同步设计见[设计](design.md)。
 
 ## 前端选择
@@ -16,6 +16,7 @@ xDSL；不执行设备函数体来 tracing 运行次数，不使用 `cube.task/v
 | `T.Tensor(...), n: T.int64` | 外部引用及运行时参数；长度不是 constexpr |
 | `n: T.int64(minimum=1, multiple_of=B)` | 可检查的 runtime 输入合同，B 可引用后置 constexpr |
 | `B: T.constexpr` | tile 容量、layout/dtype、固定政策等显式特化值 |
+| `assert B % 64 == 0, "tile must be aligned"` | 编译期合同；条件必须是 constexpr bool，消息必须是静态 str |
 | `T.Kernel(groups, kind=...)` | launch 域；mixed 每组一个 AIC 和两个 AIV |
 | `T.Cube()`、`T.Vector() as lane` | actor 作用域；engine 由原生操作决定 |
 | `T.serial(N)` | 保留循环与源顺序，退出没有隐式 drain |
@@ -30,8 +31,14 @@ xDSL；不执行设备函数体来 tracing 运行次数，不使用 `cube.task/v
 任务寻址，具体边界见[runtime索引](runtime-indexing.md)。allocation须在
 全部使用者的共同源码scope声明，跨region逃逸会在前端明确拒绝。
 
-语法被前端识别不表示所有组合均可编译。AST 嵌套 pipeline、一般 mixed 层次、
-多层 runtime 商余时钟及宏尚未贯通。显式 unroll 受预算限制；普通常量界不授权展开。
+`assert`由AST前端处理，不依赖Python断言执行，在`python -O`下仍生效。
+条件为False时报告源码位置与消息；为True时不生成IR、设备guard或编译器假设。
+runtime SSA条件明确拒绝，不能用它来声明未经检查的运行时事实。
+当前constexpr表达式可用整数算术及单个比较；多项前置条件写成多条assert。
+
+语法被前端识别不表示所有组合均可编译。serial query、runtime KV与固定child的
+多级CV已贯通；一般动态child、多层任意商余时钟及宏仍有未支持的组合。
+显式unroll受预算限制；普通常量界不授权展开。
 
 ## 可运行：三阶段双缓冲
 
@@ -77,10 +84,11 @@ ready 和 input/output release 由实际访问推导。输入最后 Vector reade
 不同 actor 的 step 不是同一个墙钟，两个相同偏移 Stage 也没有共同完成点。
 prologue/steady/epilogue 是激活域的边界；N=0 必须正确配对或不产生通知。
 
-## 目标：CV 的四个阶段
+## CV 的四个阶段
 
-下列为下一部分合同，函数名代表**待接通的 examples 数学块**，不是现有 opaque
-算子或已实现宏。完整展开数学见 [FA 算子源码](../examples/flash_attention/attention.py)。
+下列概括已接通的结构；函数名仅代表数学块，不是opaque算子API或已实现宏。
+实际数学由 [FA 算子源码](../examples/flash_attention/attention.py)中的typed操作展开。
+具体已验证政策与性能见[状态页](refactor-progress.md)。
 
 ```python
 for kv in T.Pipelined(
@@ -180,8 +188,9 @@ f32 UB scratch，lowering生成BRCB和行算术两个有真实effects的操作�
 还需满足每AIV的192KiB容量。`T.maximum(a,b,out=c)` 已接通相同shape的f32
 Vector max。`from_source` 同时识别 `T` 和 `N` 两个DSL命名空间。
 
-这些基元不会自动接通完整online FA：runtime BNSD地址、多时钟和一般nested
-CV仍受前述边界限制。性能与复现见[Vector算子验证](vector-row-performance.md)。
+默认dense f16 online FA已在同一DSL路径接通，包括runtime BNSD地址、三层时钟和
+nested CV；这不代表任意nested政策或Attention变体均支持。
+性能与复现见[Vector算子验证](vector-row-performance.md)及[FA结果](attention-performance.md)。
 
 报错要区分非法、不支持和预算未决，并带源位置、两端代次、字节范围与分析阶段。
 新 AST 不静默 fallback 到 legacy、裸 ASC 或整算子 CANN 调用。
