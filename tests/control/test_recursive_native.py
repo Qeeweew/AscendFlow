@@ -100,7 +100,10 @@ def interpret(block, values, arguments, trace):
 
 def dispatch(plan, **arguments):
     values, trace = {}, []
-    interpret(plan.module.body.block.first_op.body.block, values, arguments, trace)
+    root = plan.module.body.block.first_op
+    if "actor" not in arguments and hasattr(root, "core"):
+        arguments["actor"] = "cube" if root.core.data == "aic" else "vector"
+    interpret(root.body.block, values, arguments, trace)
     return values, trace
 
 
@@ -199,12 +202,32 @@ def test_cube_keeps_expert_issue_order_and_actual_tile_writers_readers():
     loop = next(op for op in plan.module.walk() if isinstance(op, PipelineLoopOp))
     assert [
         stage.label.data for stage in loop.body.block.ops if isinstance(stage, PipelineStageOp)
-    ] == ["export", "load", "operands", "compute"]
+    ] == ["load", "operands", "compute", "export"]
+    assert [name.data for name in loop.issue_order.data["cube"]] == [
+        "export",
+        "load",
+        "operands",
+        "compute",
+    ]
     assert len(plan.recipes) == 6
     assert all(use.expected.operation in tuple(plan.module.walk()) for use in plan.uses)
     assert all(isinstance(use.expected, TileDefinition) for use in plan.uses)
     assert len(plan.uses) == 5
     assert not any(op.name.startswith("npu_source.") for op in plan.module.walk())
+    _, trace = dispatch(plan, tiles=5)
+    instructions = (
+        (0, 1, ("nd2nz", "nd2nz")),
+        (1, 2, ("load2d_a", "load2d_b_nt")),
+        (2, 3, ("mad",)),
+        (3, 0, ("fix",)),
+    )
+    expected = sorted(
+        (g + stage, order, inside, name)
+        for g in range(5)
+        for stage, order, names in instructions
+        for inside, name in enumerate(names)
+    )
+    assert [item[0] for item in trace] == [item[3] for item in expected]
 
 
 def test_empty_pipeline_exports_last_selection_without_inventing_completion():

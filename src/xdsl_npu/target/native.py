@@ -1,17 +1,18 @@
 """Trusted dav-2201 native footprints and machine resource contracts.
 
-The contracts consume physical reference descriptions. They do not extract
+The contracts consume static footprint descriptions. They do not extract
 programs, enumerate finite instances, or plan synchronization.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..diagnostics import CompileError, require
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from ..model import Ref, Task
 
@@ -26,6 +27,61 @@ CAPACITY = {
 
 
 ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2}
+
+
+@dataclass(frozen=True, slots=True)
+class NativeGeometry:
+    """Static native footprint, without addresses or completion knowledge.
+
+    ``nbytes`` is the width of each row. Prefix extent is retained as opaque
+    metadata, never evaluated here. Bounds, owners, aliasing and retirement
+    require actual address/effect facts supplied by the consuming analysis.
+    Rows have positive widths and counts, and do not overlap each other.
+    """
+
+    bank: str
+    dtype: str
+    layout: str
+    nbytes: int
+    rows: int = 1
+    row_stride: int = 0
+    tail_nbytes: int = 0
+    prefix_extent: object | None = None
+
+    def __post_init__(self):
+        require(
+            self.nbytes > 0 and self.rows > 0,
+            "native geometry requires positive row widths and row counts",
+        )
+        require(
+            self.row_stride >= 0 and (self.rows == 1 or self.row_stride >= self.nbytes),
+            "native geometry requires nonnegative, non-overlapping row strides",
+        )
+
+    @property
+    def contiguous(self) -> bool:
+        return self.rows == 1 or self.row_stride == self.nbytes
+
+    @property
+    def total_nbytes(self) -> int:
+        return self.nbytes * self.rows
+
+
+def _geometry(ref: Ref | NativeGeometry) -> NativeGeometry:
+    if isinstance(ref, NativeGeometry):
+        return ref
+    # Legacy callers supply already decoded references. Adapt only their
+    # static fields, without importing the consuming program model.
+    return NativeGeometry(
+        ref.storage.bank,
+        ref.dtype,
+        ref.layout,
+        ref.nbytes,
+        ref.rows,
+        ref.row_stride,
+        ref.tail_nbytes,
+        ref.prefix_extent,
+    )
 
 
 IMPLICIT_COMPLETION = {"S"}
@@ -98,18 +154,31 @@ def _disjoint_ub_copy(source: Ref, destination: Ref):
 
 
 def native_contract(
-    native: str, refs: tuple[Ref, ...], params: tuple[int, ...]
+    native: str,
+    refs: tuple[Ref | NativeGeometry, ...],
+    params: tuple[int, ...],
+    *,
+    disjoint: Callable[[], bool] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """Validate a physical native footprint and return its engine and access modes.
 
     Bounds, ownership, and completion coverage remain obligations of the
     consuming analysis; an admitted native does not supply those proofs.
+    UB copy needs an explicit disjointness premise for geometry-only inputs.
+    A legacy Ref caller without that premise retains the original alias rule.
     """
     if native in {"load3d_a", "load3d_b_nn"}:
         # Complete b16 matrix, unit filters/strides, zero padding. Layout and
         # byte footprints are identical to the corresponding audited Load2D.
-        return native_contract("load2d_a" if native == "load3d_a" else "load2d_b_nn", refs, params)
-    banks = tuple(r.storage.bank for r in refs)
+        return native_contract(
+            "load2d_a" if native == "load3d_a" else "load2d_b_nn",
+            refs,
+            params,
+            disjoint=disjoint,
+        )
+    original_refs = refs
+    refs = tuple(_geometry(ref) for ref in original_refs)
+    banks = tuple(r.bank for r in refs)
     dtypes = tuple(r.dtype for r in refs)
     lengths = tuple(r.total_nbytes for r in refs)
     layouts = tuple(r.layout for r in refs)
@@ -148,8 +217,18 @@ def native_contract(
                 all(ref.prefix_extent is None and not ref.tail_nbytes for ref in refs),
                 "UB-to-UB copy requires fixed complete 32-byte blocks",
             )
+            if disjoint is None:
+                require(
+                    all(not isinstance(ref, NativeGeometry) for ref in original_refs),
+                    "UB-to-UB copy requires provably disjoint source and destination ranges; "
+                    "geometry inputs need an explicit alias proof",
+                )
+                separated = _disjoint_ub_copy(*original_refs)
+            else:
+                require(callable(disjoint), "UB-copy disjointness premise must be callable")
+                separated = disjoint()
             require(
-                _disjoint_ub_copy(*refs),
+                separated is True,
                 "UB-to-UB copy requires provably disjoint source and destination ranges; "
                 "overlapping or changing aliases are unsupported",
             )

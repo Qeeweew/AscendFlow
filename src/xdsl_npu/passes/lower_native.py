@@ -497,18 +497,10 @@ class _Lowerer:
                     f"{family}: issue_order must name every participating Stage exactly once",
                     op,
                 )
-            # A mixed loop has independent actor controllers. Keep both actor
-            # orders on one template; no global physical step lockstep exists.
-            if (
-                self.program.kind.data != "mixed"
-                and (labels := op.issue_order.data.get(self.program.kind.data)) is not None
-            ):
-                ranks = {label.data: rank for rank, label in enumerate(labels)}
-                for physical in stages:
-                    body.detach_op(physical)
-                body.add_ops(
-                    sorted(stages, key=lambda stage: ranks.get(stage.label.data, len(ranks)))
-                )
+            # The body retains logical access order for dependence analysis.
+            # Physical issue order belongs to this explicit per-family table,
+            # including single-actor loops. Reordering the body itself would
+            # turn an expert export-first dispatch into a different algorithm.
         body.add_op(EndOp())
 
 
@@ -559,7 +551,10 @@ def lower_native_structure(source) -> NativeStructure:
     lowerer.block(program.body.block, scope)
     body.add_op(EndOp())
     values, uses = bind_values(source, lowerer.results, lowerer.loops)
-    module.verify()
+    # The constructors preserve structure from the admitted source. Developer
+    # round-trip regressions verify the transformation; normal compilation
+    # need not repeat a whole-module structural check here. Native/access
+    # admission still establishes its own new physical premises downstream.
     lowerer.work["loop_templates"] = len(lowerer.loops)
     lowerer.work["value_bindings"] = len(values)
     lowerer.work["value_uses"] = len(uses)

@@ -91,6 +91,14 @@ print(emit_local(plan))
 
 CANN契约核对：当前ASC C API的`asc_get_block_idx()`为group id，`asc_get_sub_block_id()`为sid；C++ `AscendC::GetBlockIdx()`在AIV是group*ratio+sid，不能混用两套公式。共享AIV代码不改变mode2通知的两个实际参与者贡献，不能因单body减少quorum，也不能默认给flag加sid。下一步是实际native/地址接纳与递归边界同步，随后统一资源和后端。
 
+### 递归物理访问事实与集成切换
+
+新结构现已直接建立实际ControlFrame、完整SSA地址、每native唯一目标合同、原始axis/byte/subview/alignment及local容量事实；逻辑访问顺序保留在body中，物理派发只读取issue_order。默认FA的44个native模板、88个实际地址通过数学范围准入；两个AIV共享模板，私有存储按participant区分。完整ownership、初始化/Tile、递归依赖、事件生命周期和后端仍待集成，不能据此执行设备。
+
+新增access frontier支持单cell有限无条件序列的writer/reader边界组合与直接ReadCarry。它本身不代表已实现loop closure；重复未绑定occurrence明确拒绝。循环地址范围增加通用整除商与联合坐标规则，保留完整tile的严格上界，不依靠输入长度枚举。相关新结构/内存/边界/目标合同回归162项通过（3.81s），非全套回归。
+
+按用户要求停止仅围绕局部组件交付：并行接通完整准入、递归依赖、共享ASC后端，主Agent统一同步动作、事件资源和公共入口。下一项交付以真实DSL Scale/GEMM/FA完整路径为准；公共compile尚未切换，不宣称FA编译达标。算子调优继续停止。
+
 ## 2. 编译耗时：明确未达标
 
 固定默认FA政策：B1/Hq8/Hkv8/D128、f16、BQ128/BK1024/CK128/VR8、groups20，Sq/Sk保持runtime。目标为五个独立进程source→ASC p50≤5s、max≤10s。

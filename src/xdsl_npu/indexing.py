@@ -240,7 +240,8 @@ def _joint_affine_interval(expr, domains, facts):
     candidates = [
         (coordinate, lower, upper)
         for coordinate, lower, upper in domains
-        if len({name for name in arguments(coordinate) if name.startswith("$")}) > 1
+        if coordinate.kind in {"add", "mul"}
+        and any(name.startswith("$") for name in arguments(coordinate))
     ]
     if not candidates or expr.kind not in {"add", "mul"}:
         return None
