@@ -291,3 +291,96 @@ def test_cumulative_budget_limits_repeated_small_normal_forms(monkeypatch):
     monkeypatch.setattr(indexing, "MAX_WORK", 16)
     with pytest.raises(CompileError, match="index algebra.*work.*budget"):
         polynomial(value, {})
+
+
+def _congruent_quotient_products():
+    task, size = argument("$g"), argument("size")
+    quotient = expression("floordiv", size, literal(4))
+    first = expression("sub", task, literal(1))
+    second = expression("sub", expression("add", first, literal(1)), literal(1))
+    return (
+        {"size": Fact(minimum=1, multiple=4)},
+        expression("mul", first, quotient),
+        expression("mul", second, quotient),
+    )
+
+
+@pytest.mark.parametrize("kind", ("rem", "floordiv", "ceildiv", "min", "max"))
+def test_function_atoms_share_integer_argument_identity_without_emitting_fractions(kind):
+    facts, first, second = _congruent_quotient_products()
+    lhs, rhs = (expression(kind, value, literal(2)) for value in (first, second))
+    for g, size in ((1, 4), (2, 4), (3, 12), (4, 8), (8, 28)):
+        value = (g - 1) * (size // 4)
+        expected = {
+            "rem": value % 2,
+            "floordiv": value // 2,
+            "ceildiv": (value + 1) // 2,
+            "min": min(value, 2),
+            "max": max(value, 2),
+        }[kind]
+        assert lhs.evaluate({"$g": g, "size": size}) == expected
+        assert rhs.evaluate({"$g": g, "size": size}) == expected
+    assert equivalent(lhs, rhs, facts)
+    assert indexing.normalize(expression("sub", lhs, rhs), facts).constant == 0
+
+
+@pytest.mark.parametrize("kind", ("min", "max"))
+def test_commutative_atom_identity_survives_raw_argument_order_changes(kind):
+    z, a = argument("z"), argument("a")
+    same_z = expression("sub", expression("add", z, literal(1)), literal(1))
+    lhs, rhs = expression(kind, z, a), expression(kind, same_z, a)
+    assert lhs.args[0] == a and rhs.args[0] == same_z
+    for zv, av in ((-2, 3), (0, 0), (5, 1)):
+        expected = min(zv, av) if kind == "min" else max(zv, av)
+        assert lhs.evaluate({"z": zv, "a": av}) == rhs.evaluate({"z": zv, "a": av}) == expected
+    assert equivalent(lhs, rhs, {})
+    assert indexing.normalize(expression("sub", lhs, rhs), {}).constant == 0
+
+
+@pytest.mark.parametrize("difference", ("numerator", "divisor", "kind"))
+def test_function_atom_identity_preserves_every_actual_argument_and_operation(difference):
+    facts, value, _ = _congruent_quotient_products()
+    if difference == "kind":
+        lhs = expression("floordiv", value, literal(2))
+        rhs = expression("ceildiv", value, literal(2))
+        g = 2
+    else:
+        lhs = expression("rem", value, literal(2))
+        rhs = expression(
+            "rem",
+            expression("add", value, literal(1)) if difference == "numerator" else value,
+            literal(3 if difference == "divisor" else 2),
+        )
+        g = 3 if difference == "divisor" else 2
+    values = {"$g": g, "size": 4}
+    assert lhs.evaluate(values) != rhs.evaluate(values)
+    assert not equivalent(lhs, rhs, facts)
+
+
+def test_function_atom_keys_remain_scoped_to_the_declared_divisibility_facts():
+    size = argument("size")
+    rounded = expression("mul", expression("floordiv", size, literal(4)), literal(4))
+    lhs, rhs = (expression("rem", value, literal(2)) for value in (rounded, size))
+    aligned, unaligned = {"size": Fact(minimum=4, multiple=4)}, {"size": Fact(minimum=4)}
+    assert equivalent(lhs, rhs, aligned)
+    assert lhs.evaluate({"size": 5}) != rhs.evaluate({"size": 5})
+    assert not equivalent(lhs, rhs, unaligned)
+    assert equivalent(lhs, rhs, aligned)
+
+
+@pytest.mark.parametrize("wrapper", ("zero_product", "remainder_one"))
+def test_axis_checks_raw_unsigned_atoms_before_their_mathematical_zero(wrapper):
+    facts, numerator, _ = _congruent_quotient_products()
+    task = argument("$g")
+    inner = expression("rem", numerator, literal(2))
+    origin = (
+        Expr("mul", (literal(0), inner))
+        if wrapper == "zero_product"
+        else expression("rem", inner, literal(1))
+    )
+    assert equivalent(origin, literal(0), facts)
+    with pytest.raises(CompileError, match="nonnegative dividend|unproven sign"):
+        check_axis(origin, 1, literal(1), [(task, literal(0), literal(3))], facts)
+    with pytest.raises(CompileError, match="nonnegative numerator"):
+        origin.evaluate({"$g": 0, "size": 4})
+    check_axis(origin, 1, literal(1), [(task, literal(1), literal(3))], facts)

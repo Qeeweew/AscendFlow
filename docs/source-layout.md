@@ -21,6 +21,7 @@
 | 有限周期 | `analysis/periodic.py` | 结构周期及数学相位求值；不证明原程序的无符号算术定义性 |
 | 模条件 | `analysis/modular.py` | 相关多项式整体的余数及比较mask；只用于证明，不生成运行期表达式 |
 | 整数关系事实 | `analysis/integer_facts.py` | 固定输入范围及完整有序前提下的规约、范围和比较；同一事实只建立一次，不提供异步完成证明 |
+| 整数代数与atom身份 | `indexing.py` | 一个有界多项式实现；函数实参的规范key与当前查询raw代表分开，供普通索引与保留函数的整数关系共用 |
 | 局部条件覆盖 | `analysis/guard_cover.py` | 在一项义务内证明条件OR覆盖；有序定义性、整数三分和余数集合，不持有通知或排步 |
 | 实际消费路径 | `analysis/event_paths.py` | 组合真实队列/controller接口和路径条件，完整覆盖即停止；生命周期与有限ID共享共用 |
 | 事件生命周期 | `analysis/event_lifetimes.py`、`structured_event_sharing.py` | 消费到复用、有限子循环再次调用和有证据的 ID 共享 |
@@ -34,6 +35,8 @@
 `structured_regions.py` 存共享关系类型；`structured_access.py` 负责范围投影；`structured_dependencies.py` 负责递归合成。这三者不能各自重新解释一次地址、slot 或循环有效域。
 
 资源阶段拆开事实、生命周期、进展和分配，共享一次建立的 `EventDomains`。实际端点的条件队列顺序也由它建立，lease和sharing不重新解释stage/词法位置。`event_paths`依赖纯数学的`guard_cover`，反向依赖禁止。进展区分内部 stream rank 与对外 queue/阻塞接口；子层 native 留在本地 witness，完整嵌套功能资格仍见状态页。
+
+同流水fence只保留选择阶段建立的capture覆盖及端点准入，不进入binary event的case/window/lease构造。分配器按它的原consumer guard发射；该职责拆分不增加或移除实际需要执行的fence。
 
 ## 必须保持的依赖方向
 

@@ -16,6 +16,74 @@ from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.scalar import expression, literal
 from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
 
+SAME_QUEUE = """
+def same_queue(n:N.int64,m:N.int64):
+    with N.Kernel():
+        x,y=N.alloc_ub((2,8)),N.alloc_ub((2,8))
+        for p in N.serial(n):
+            for g in N.Pipelined(m,stages=2):
+                slot=(p*m+g)%2
+                with N.Stage(0):
+                    N.fill(x[slot,:],1.0)
+                with N.Stage(1):
+                    N.mul(x[slot,:],2.0,out=y[slot,:])
+"""
+
+
+@pytest.fixture(scope="module")
+def same_queue():
+    from xdsl_npu import language as N
+    from xdsl_npu.budget import limit
+    from xdsl_npu.passes.structured_sync import synchronize_structure
+
+    with limit(30):
+        return synchronize_structure(N.from_source(SAME_QUEUE))
+
+
+@pytest.mark.parametrize("n,m", ((0, 3), (3, 0), (3, 1), (3, 2), (3, 3), (3, 4), (3, 5)))
+def test_same_queue_fences_keep_byte_hazards_without_binary_event_domains(same_queue, n, m):
+    from tests.models.structured_events import check_structured_events
+
+    plan = same_queue.resources
+    assert plan.selection.notifications
+    assert all(
+        notification.mechanism is NotificationKind.PIPE_FENCE
+        for notification in plan.selection.notifications
+    )
+    assert not plan.assignments and not plan.leases
+    assert plan.work.parameter_cases == 0 and plan.work.window_constructions == 0
+    for action in (action for action in plan.actions if action.kind is SyncKind.FENCE):
+        notification = next(n for n in plan.selection.notifications if n.name == action.protocol)
+        assert any(action.guard == bound.guard for bound in notification.consumers)
+        assert action.event is None
+    execution = check_structured_events(same_queue.memory, {"n": n, "m": m}, max_commands=2048)
+    assert len(execution.natives) == 2 * n * m
+    assert execution.bytes_read == 32 * n * m
+    assert execution.bytes_written == 64 * n * m
+
+
+def test_fence_endpoint_still_requires_its_raw_unsigned_domain():
+    from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison
+    from xdsl_npu.scalar import Expr
+
+    selected = selection(SAME_QUEUE)
+    fence = selected.notifications[0]
+    assert fence.mechanism is NotificationKind.PIPE_FENCE
+    unsafe = expression("rem", expression("sub", literal(0), Expr("argument", ("m",))), literal(2))
+    consumer = replace(
+        fence.consumers[0], guard=ActionGuard((Comparison(unsafe, "==", literal(0)),))
+    )
+    forged = replace(fence, sources=(consumer,), consumers=(consumer,), requirements=(), domains=())
+    selected = replace(
+        selected,
+        dependencies=replace(selected.dependencies, required=()),
+        notifications=(forged,),
+        coverage=(),
+    )
+    with pytest.raises(CompileError, match="ordered activation prefix proof") as error:
+        prepared(selected)
+    assert error.value.phase == "structured-event-pairing"
+
 
 @pytest.fixture(scope="module")
 def finite():

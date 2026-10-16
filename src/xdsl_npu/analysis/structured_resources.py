@@ -165,22 +165,19 @@ class _EventBanks:
         fence = notification.mechanism is NotificationKind.PIPE_FENCE
         cross = notification.mechanism is NotificationKind.CROSS_EVENT
         if fence:
-            for case in self.domains.cases[notification]:
-                if case.empty:
-                    continue
-                for bound in notification.consumers:
-                    self.actions.append(
-                        SyncAction(
-                            bound.operation,
-                            bound.placement,
-                            (bound.actor,),
-                            SyncKind.FENCE,
-                            notification.source_engine,
-                            notification.destination_engine,
-                            guard=ActionGuard(case.condition.comparisons + bound.guard.comparisons),
-                            protocol=notification.name,
-                        )
+            for bound in notification.consumers:
+                self.actions.append(
+                    SyncAction(
+                        bound.operation,
+                        bound.placement,
+                        (bound.actor,),
+                        SyncKind.FENCE,
+                        notification.source_engine,
+                        notification.destination_engine,
+                        guard=bound.guard,
+                        protocol=notification.name,
                     )
+                )
             return
         require(assignment is not None, "notification needs its allocated event")
         for lease in assignment.cases:

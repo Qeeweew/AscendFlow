@@ -111,7 +111,7 @@ def worker(path, *, entry, parameters, mode, metadata, deadline, artifacts=None)
         "input_sha256": _sha(source),
         "source_sha256": _sha(source),
         "package_tree_sha256": package_sha,
-        "source_ir_sha256": None if result.source_ir is None else _sha(result.source_ir.encode()),
+        "source_ir_sha256": _sha(result.source_ir.encode()),
         "before_ir_sha256": _sha(result.before_ir.encode()),
         "plan_ir_sha256": _sha(result.plan_ir.encode()),
         "asc_sha256": _sha(result.asc.encode()),

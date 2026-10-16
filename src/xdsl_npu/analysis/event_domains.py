@@ -188,6 +188,12 @@ class EventDomains:
             self.tests[notification] = tuple(
                 dict.fromkeys(test for tests in endpoints for test in tests)
             )
+            # A selected same-queue fence has one execution point and no
+            # Set/Wait identity or reuse ordinal. Selection owns its real
+            # capture coverage; retain endpoint admission without inventing
+            # a binary event domain that no resource consumer needs.
+            if notification.mechanism is NotificationKind.PIPE_FENCE:
+                continue
             self.cases[notification] = self._family(notification)
             self._pair(notification)
 
@@ -198,8 +204,6 @@ class EventDomains:
 
     def _pair(self, notification):
         """Every real endpoint exists in exactly the same canonical domain."""
-        if notification.mechanism is NotificationKind.PIPE_FENCE:
-            return
         for case in self.cases[notification]:
             first = self._instance(notification.sources[0], {}, case=case)
             reference = first.guard.comparisons

@@ -157,13 +157,19 @@ def test_unknown_relations_and_false_predicates_never_become_proofs():
 
 def test_exact_repeated_queries_reuse_normalization_including_false_answers(monkeypatch):
     normalize = integer_facts.normalize
+    retained = integer_facts.AtomIdentity.retained
     calls = []
 
-    def observed(value, facts):
+    def observed(value, facts, *, identity=None):
         calls.append(value)
-        return normalize(value, facts)
+        return normalize(value, facts, identity=identity)
+
+    def observed_retained(identity, value):
+        calls.append(value)
+        return retained(identity, value)
 
     monkeypatch.setattr(integer_facts, "normalize", observed)
+    monkeypatch.setattr(integer_facts.AtomIdentity, "retained", observed_retained)
     queries = IntegerFacts({"x": Fact(maximum=8)})
     value = expression("add", X, literal(3))
     premises = (Comparison(X, ">=", literal(2)), Comparison(X, "<=", literal(5)))
@@ -691,3 +697,182 @@ def test_small_integer_enumeration_checks_every_returned_bound_and_proof(
                 elif not holds:
                     counterexamples += 1
     assert proved and counterexamples
+
+
+def _quotient_atom_arguments():
+    p, s = (Expr("argument", (name,)) for name in ("p", "s"))
+    quotient = expression("floordiv", s, literal(4))
+    first = expression("sub", p, literal(1))
+    second = expression("sub", expression("add", first, literal(1)), literal(1))
+    return (
+        {"s": Fact(minimum=1, multiple=4)},
+        (Comparison(p, ">=", literal(1)),),
+        expression("mul", first, quotient),
+        expression("mul", second, quotient),
+        quotient,
+    )
+
+
+def _atom_value(kind, numerator, divisor):
+    return {
+        "rem": numerator % divisor,
+        "floordiv": numerator // divisor,
+        "ceildiv": (numerator + divisor - 1) // divisor,
+        "min": min(numerator, divisor),
+        "max": max(numerator, divisor),
+    }[kind]
+
+
+def _assert_congruent_atom_queries(queries, lhs, rhs, premises):
+    assert queries.ordered_definedness((*premises, Comparison(lhs, "==", rhs))) is None
+    difference = expression("sub", lhs, rhs)
+    assert queries.normalize(difference).constant == 0
+    assert queries.bounded(difference).constant == 0
+    for predicate in PREDICATES:
+        assert queries.prove(Comparison(lhs, predicate, rhs), premises) is (
+            predicate in {"==", "<=", ">="}
+        )
+
+
+@pytest.mark.parametrize("kind", ("rem", "floordiv", "ceildiv", "min", "max"))
+def test_atom_identity_uses_congruent_arguments_with_a_declared_multiple_quotient(kind):
+    facts, premises, first, second, _ = _quotient_atom_arguments()
+    lhs, rhs = (expression(kind, value, literal(2)) for value in (first, second))
+    for p, s in product(range(1, 9), range(4, 33, 4)):
+        context = {"p": p, "s": s}
+        expected = _atom_value(kind, (p - 1) * (s // 4), 2)
+        assert lhs.evaluate(context) == rhs.evaluate(context) == expected
+    _assert_congruent_atom_queries(IntegerFacts(facts), lhs, rhs, premises)
+
+
+def test_nested_atom_identities_keep_each_unsigned_operation_and_clamp():
+    facts, premises, first, second, _ = _quotient_atom_arguments()
+
+    def nested(value):
+        capped = expression("min", value, literal(17))
+        divided = expression("floordiv", capped, literal(3))
+        bounded = expression("max", divided, literal(2))
+        rounded = expression("ceildiv", bounded, literal(3))
+        return expression("rem", rounded, literal(2))
+
+    lhs, rhs = nested(first), nested(second)
+    actual = set()
+    for p, s in product(range(1, 9), range(4, 33, 4)):
+        value = (p - 1) * (s // 4)
+        expected = ((max(min(value, 17) // 3, 2) + 2) // 3) % 2
+        assert lhs.evaluate({"p": p, "s": s}) == rhs.evaluate({"p": p, "s": s}) == expected
+        actual.add(expected)
+    assert actual == {0, 1}
+    _assert_congruent_atom_queries(IntegerFacts(facts), lhs, rhs, premises)
+
+
+def test_atom_identity_uses_both_congruent_dynamic_arguments():
+    facts, premises, first, second, quotient = _quotient_atom_arguments()
+    facts["d"] = Fact(minimum=1)
+    left_divisor = expression("mul", quotient, expression("add", D, literal(1)))
+    right_divisor = expression("add", expression("mul", quotient, D), quotient)
+    queries = IntegerFacts(facts)
+    for kind in ("rem", "floordiv", "ceildiv"):
+        lhs = expression(kind, first, left_divisor)
+        rhs = expression(kind, second, right_divisor)
+        for p, s, d in product(range(1, 5), range(4, 17, 4), range(1, 4)):
+            value, divisor = (p - 1) * (s // 4), (s // 4) * (d + 1)
+            expected = _atom_value(kind, value, divisor)
+            context = {"p": p, "s": s, "d": d}
+            assert lhs.evaluate(context) == rhs.evaluate(context) == expected
+        _assert_congruent_atom_queries(queries, lhs, rhs, premises)
+
+
+@pytest.mark.parametrize("difference", ("numerator", "divisor", "kind"))
+def test_distinct_atom_arguments_or_kinds_keep_a_finite_counterexample(difference):
+    facts, premises, value, _, _ = _quotient_atom_arguments()
+    if difference == "kind":
+        lhs = expression("floordiv", value, literal(2))
+        rhs = expression("ceildiv", value, literal(2))
+        p = 2
+    else:
+        lhs = expression("rem", value, literal(2))
+        rhs = expression(
+            "rem",
+            expression("add", value, literal(1)) if difference == "numerator" else value,
+            literal(3 if difference == "divisor" else 2),
+        )
+        p = 3 if difference == "divisor" else 2
+    context = {"p": p, "s": 4}
+    assert lhs.evaluate(context) != rhs.evaluate(context)
+    queries = IntegerFacts(facts)
+    assert queries.ordered_definedness((*premises, Comparison(lhs, "==", rhs))) is None
+    for predicate, compare in PREDICATES.items():
+        if not compare(lhs.evaluate(context), rhs.evaluate(context)):
+            assert not queries.prove(Comparison(lhs, predicate, rhs), premises)
+
+
+def test_atom_identity_cannot_borrow_another_environments_declared_multiple():
+    s = Expr("argument", ("s",))
+    rounded = expression("mul", expression("floordiv", s, literal(4)), literal(4))
+    lhs, rhs = (expression("rem", value, literal(2)) for value in (rounded, s))
+    equality = Comparison(lhs, "==", rhs)
+    aligned = IntegerFacts({"s": Fact(minimum=4, multiple=4)})
+    unaligned = IntegerFacts({"s": Fact(minimum=4)})
+    assert aligned.prove(equality, ())
+    assert lhs.evaluate({"s": 5}) != rhs.evaluate({"s": 5})
+    assert not unaligned.prove(equality, ())
+    assert aligned.prove(equality, ())
+
+
+@pytest.mark.parametrize("wrapper", ("zero_product", "remainder_one"))
+@pytest.mark.parametrize("predicate", ("==", "!="))
+def test_raw_atom_domain_survives_mathematical_zero_and_false_comparisons(wrapper, predicate):
+    facts, premises, numerator, _, _ = _quotient_atom_arguments()
+    facts["p"] = Fact()
+    queries = IntegerFacts(facts)
+    inner = expression("rem", numerator, literal(2))
+    value = (
+        Expr("mul", (literal(0), inner))
+        if wrapper == "zero_product"
+        else expression("rem", inner, literal(1))
+    )
+    use = Comparison(value, predicate, literal(0))
+    missing = Comparison(numerator, ">=", literal(0))
+    false = Comparison(literal(0), "==", literal(1))
+    assert queries.prove(Comparison(value, "==", literal(0)), ())
+    assert queries.ordered_definedness((use,)) == (missing, ())
+    assert queries.ordered_definedness((use, *premises)) == (missing, ())
+    assert queries.ordered_definedness((use, false)) == (missing, ())
+    assert queries.ordered_definedness((false, use)) is None
+    assert queries.ordered_definedness((*premises, use)) is None
+    with pytest.raises(CompileError, match="nonnegative numerator"):
+        use.evaluate({"p": 0, "s": 4})
+
+
+def test_a_congruent_atom_false_prefix_can_skip_only_its_later_undefined_tail():
+    facts, premises, first, second, _ = _quotient_atom_arguments()
+    facts["d"] = Fact()
+    lhs, rhs = (expression("rem", value, literal(2)) for value in (first, second))
+    false = Comparison(lhs, "!=", rhs)
+    numerator = expression("sub", D, literal(1))
+    tail = Comparison(expression("rem", numerator, literal(1)), "==", literal(0))
+    queries = IntegerFacts(facts)
+    assert queries.ordered_definedness((*premises, false, tail)) is None
+    assert queries.ordered_definedness((*premises, tail, false)) == (
+        Comparison(numerator, ">=", literal(0)),
+        premises,
+    )
+
+
+def test_shared_function_identity_never_borrows_another_queries_raw_domain():
+    numerator = expression("sub", X, literal(1))
+    undefined = expression("rem", numerator, literal(1))
+    bad = Expr("rem", (Expr("mul", (literal(0), undefined)), literal(2)))
+    good = Expr("rem", (literal(0), literal(2)))
+    queries = IntegerFacts({"x": Fact()})
+    assert queries.bounded(expression("sub", bad, good)).constant == 0
+    for original in (bad, good, bad):
+        assert queries.bounded(original) is original
+    assert queries.ordered_definedness((Comparison(good, "==", literal(0)),)) is None
+    assert queries.ordered_definedness((Comparison(bad, "==", literal(0)),)) == (
+        Comparison(numerator, ">=", literal(0)),
+        (),
+    )
+    with pytest.raises(CompileError, match="nonnegative numerator"):
+        queries.bounded(bad).evaluate({"x": 0})

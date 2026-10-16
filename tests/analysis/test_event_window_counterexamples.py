@@ -1,4 +1,4 @@
-"""Pure-expression event-window counterexamples, without source compilation.
+"""Event-window arithmetic counterexamples, without operator compilation.
 
 Expectations come from the original integer predicates and fixed-width scalar
 semantics. The production predicate queries only establish the builder's
@@ -9,11 +9,14 @@ Explicit unsupported arithmetic is allowed instead of an unsafe certificate.
 import pytest
 from xdsl.dialects.builtin import ModuleOp
 
+from xdsl_npu import language as N
 from xdsl_npu.analysis.event_windows import build_event_window
 from xdsl_npu.analysis.integer_facts import IntegerFacts
+from xdsl_npu.analysis.structured_control import build_control_facts
 from xdsl_npu.analysis.structured_protocols import LogicalNotification, NotificationKind
 from xdsl_npu.analysis.structured_schedule import Comparison
 from xdsl_npu.diagnostics import CompileError, ErrorKind
+from xdsl_npu.passes.lower_native import lower_native_structure
 from xdsl_npu.scalar import INT64_MAX, Expr, Fact, expression, literal
 from xdsl_npu.target.ascend910b import Engine
 
@@ -231,3 +234,114 @@ def test_dense_multi_residue_first_last_and_reuse_remain_defined_near_i64_limit(
                     == members[index + width]
                 )
                 assert g + phases[0] == members[index + width]
+
+
+@pytest.fixture(scope="module")
+def selected_last_identity():
+    source = N.from_source("""
+    def clocks(extent:N.int64(multiple_of=8)):
+        with N.Kernel():
+            for p in N.Pipelined(extent//8,stages=1):
+                pass
+    """)
+    control = build_control_facts(lower_native_structure(source).module)
+    (loop,) = control.loops.values()
+    queries = IntegerFacts(control.environment.facts)
+    tiles = expression("floordiv", Expr("argument", ("extent",)), literal(8))
+    previous = expression("sub", loop.ordinal, literal(1))
+    restored = expression("sub", expression("add", previous, literal(1)), literal(1))
+    end = expression("sub", loop.count, literal(1))
+
+    def last(index):
+        phase = expression(
+            "rem",
+            expression(
+                "sub",
+                literal(2),
+                expression("rem", expression("mul", index, tiles), literal(2)),
+            ),
+            literal(2),
+        )
+        return expression("sub", end, expression("rem", expression("sub", end, phase), literal(2)))
+
+    prefix = (
+        Comparison(loop.count, ">", literal(1)),
+        Comparison(loop.ordinal, ">=", literal(1)),
+        Comparison(loop.ordinal, "<", loop.count),
+    )
+    return control, loop, queries, prefix, Comparison(last(previous), "==", last(restored))
+
+
+def _selected_last_window(control, loop, queries, guards):
+    notification = LogicalNotification(
+        "selected_last_identity",
+        (),
+        (),
+        Engine.MTE2,
+        Engine.V,
+        NotificationKind.LOCAL_EVENT,
+        (),
+        loop.operation,
+        loop.ordinal,
+        1,
+        0,
+    )
+    return build_event_window(
+        notification,
+        loop.operation,
+        ordinal=loop.ordinal,
+        count=loop.count,
+        guards=guards,
+        facts=queries.facts,
+        proves=queries.prove,
+        bounds=queries.bounds,
+        ordered_definedness=queries.ordered_definedness,
+        invariant=lambda value: control.invariant_over(value, loop.operation),
+    )
+
+
+def test_equivalent_selected_last_coordinates_need_no_parameter_partition(selected_last_identity):
+    control, loop, queries, prefix, equality = selected_last_identity
+    assert equality.lhs != equality.rhs
+    guards = prefix + (equality,)
+    assert queries.ordered_definedness(guards) is None
+    # A failed identity proof would request a uniform parameter split. The
+    # runtime quotient and full raw endpoint expressions remain in this input.
+    window = _selected_last_window(control, loop, queries, guards)
+    assert window.period == 1
+    for extent in (0, 8, 16, 24, 32, 56, 80):
+        context = {"extent": extent}
+        count = extent // 8
+        members = list(range(1, count))
+        observed = []
+        for p in range(-1, count + 2):
+            actual = context | {loop.ordinal.args[0]: p}
+            active = _guard(window.membership, actual, checked=True)
+            assert window.interval.evaluate(actual) == active
+            if active:
+                observed.append(p)
+        assert observed == members
+        assert _guard(window.nonempty, context, checked=True) == bool(members)
+        if not members:
+            continue
+        first, last = window.first_last()
+        assert _evaluate(first, context, checked=True) == members[0]
+        assert _evaluate(last, context, checked=True) == members[-1]
+        for p in members:
+            actual = context | {loop.ordinal.args[0]: p}
+            phase = (2 - ((p - 1) * count) % 2) % 2
+            selected = count - 1 - (count - 1 - phase) % 2
+            assert _evaluate(equality.lhs, actual, checked=True) == selected
+            assert _evaluate(equality.rhs, actual, checked=True) == selected
+
+
+def test_selected_last_identity_keeps_its_original_unsigned_prefix(selected_last_identity):
+    control, loop, queries, prefix, equality = selected_last_identity
+    guards = (prefix[0], prefix[2], equality)
+    assert queries.ordered_definedness(guards) is not None
+    with pytest.raises(
+        CompileError, match="unsigned arithmetic lacks an ordered activation prefix"
+    ) as failure:
+        _selected_last_window(control, loop, queries, guards)
+    assert failure.value.kind is ErrorKind.UNSUPPORTED
+    assert failure.value.phase == "event-window-membership"

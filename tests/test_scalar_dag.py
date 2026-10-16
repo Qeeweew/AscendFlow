@@ -114,6 +114,26 @@ def test_argument_collection_visits_shared_nodes_once(monkeypatch):
     assert set(reads.values()) == {1}
 
 
+def test_retained_integer_normalization_bounds_work_by_shared_ring_nodes(monkeypatch):
+    from xdsl_npu.analysis import integer_facts
+
+    depth = 10
+    root = _doubled(_argument("n"), depth)
+    original = integer_facts.expression
+    calls = []
+
+    def observed(kind, left, right):
+        calls.append(kind)
+        return original(kind, left, right)
+
+    monkeypatch.setattr(integer_facts, "expression", observed)
+    result = integer_facts.IntegerFacts({}).bounded(root)
+    assert len(calls) <= 2 * depth
+    assert root.weight == 2 ** (depth + 1) - 1
+    for n in (-3, 0, 7):
+        assert result.evaluate({"n": n}) == n * 2**depth
+
+
 def test_shared_graphs_still_obey_expanded_weight_and_depth_budgets():
     root = _doubled(_argument("n"), 11)
     assert root.weight == 4095

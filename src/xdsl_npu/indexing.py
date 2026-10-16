@@ -7,6 +7,7 @@ relations fail closed. A fixed term budget bounds distributive expansion.
 """
 
 from collections import Counter
+from dataclasses import dataclass, field
 from fractions import Fraction
 from itertools import product
 
@@ -15,6 +16,11 @@ from .scalar import Expr, expression, literal
 
 MAX_TERMS = 256
 MAX_WORK = 16384
+
+
+def _charge(work, amount):
+    work[0] += amount
+    require(work[0] <= MAX_WORK, "index algebra cumulative work budget exceeded")
 
 
 def _sum(a, b):
@@ -71,109 +77,221 @@ def _to_expr(polynomial):
     return result
 
 
-def polynomial(expr, facts, *, periodic=False, _memo=None, _work=None):
-    """Exact rational polynomial over integer atoms, under explicit facts."""
-    from .scalar import positive
+@dataclass(frozen=True)
+class _PolynomialKey:
+    terms: tuple
+    order_key: tuple = field(init=False, compare=False, repr=False)
+    _hash: int = field(init=False, compare=False, repr=False)
 
-    memo = {} if _memo is None else _memo
-    work = [0] if _work is None else _work
-
-    def charge(amount):
-        work[0] += amount
-        require(work[0] <= MAX_WORK, "index algebra cumulative work budget exceeded")
-
-    charge(1)
-    if expr in memo:
-        return memo[expr]
-    if expr.kind == "constant":
-        result = {(): Fraction(expr.constant)} if expr.constant else {}
-    elif expr.kind in {"add", "mul"}:
-        a, b = (
-            polynomial(arg, facts, _memo=memo, _work=work, periodic=periodic) for arg in expr.args
+    def __post_init__(self):
+        object.__setattr__(self, "_hash", hash(self.terms))
+        object.__setattr__(
+            self,
+            "order_key",
+            tuple(
+                (
+                    tuple(atom.order_key for atom in term),
+                    coefficient.numerator,
+                    coefficient.denominator,
+                )
+                for term, coefficient in self.terms
+            ),
         )
-        charge(
-            len(a) + len(b)
-            if expr.kind == "add"
-            else (len(b) * sum(1 + len(term) for term in a) + len(a) * sum(len(term) for term in b))
+
+    def __hash__(self):
+        return self._hash
+
+
+@dataclass(frozen=True)
+class _FunctionKey:
+    kind: str
+    operands: tuple[_PolynomialKey, ...]
+    order_key: tuple = field(init=False, compare=False, repr=False)
+    _hash: int = field(init=False, compare=False, repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "_hash", hash((self.kind, self.operands)))
+        object.__setattr__(
+            self, "order_key", (self.kind, tuple(arg.order_key for arg in self.operands))
         )
-        result = _sum(a, b) if expr.kind == "add" else _product(a, b)
-    elif expr.kind in {"floordiv", "rem"}:
-        numerator, divisor = expr.args
-        require(positive(divisor, facts), "index divisor must be provably positive and uniform")
-        coordinate = numerator
-        if coordinate.kind == "floordiv" and coordinate.args[1].constant is not None:
-            coordinate = coordinate.args[0]
-        if (
-            periodic
-            and expr.kind == "rem"
-            and divisor.constant is not None
-            and coordinate.kind == "argument"
-            and coordinate.args[0].startswith("$")
-        ):
-            result = {(expr,): Fraction(1)}
-        elif expr.kind == "rem":
-            quotient = polynomial(
-                expression("floordiv", numerator, divisor),
-                facts,
-                _memo=memo,
-                _work=work,
-                periodic=periodic,
+
+    def __hash__(self):
+        return self._hash
+
+
+class AtomIdentity:
+    """Scoped function congruence keys, with no stored raw representative.
+
+    Only integer-ring operations enter an operand's key. Unsigned operations
+    remain uninterpreted functions here, so a prefix-only divisor needs no
+    global positivity fact. Keys say nothing about an original DAG's domain.
+    """
+
+    def __init__(self):
+        self._polynomials, self._keys, self._atoms = {}, {}, {}
+        self._polynomial_keys, self._function_keys = {}, {}
+
+    def key(self, value, work):
+        _charge(work, 1)
+        if value not in self._keys:
+            polynomial = _PolynomialQuery(
+                {}, identity=self, retained=True, keys=True, memo=self._polynomials, work=work
+            ).visit(value)
+            _charge(work, sum(1 + len(term) for term in polynomial))
+            key = _PolynomialKey(
+                tuple(
+                    sorted(
+                        polynomial.items(),
+                        key=lambda item: tuple(atom.order_key for atom in item[0]),
+                    )
+                )
             )
-            result = _sum(
-                polynomial(numerator, facts, _memo=memo, _work=work, periodic=periodic),
-                _scale(
-                    _product(
-                        quotient,
-                        polynomial(divisor, facts, _memo=memo, _work=work, periodic=periodic),
-                    ),
-                    -1,
+            self._keys[value] = self._polynomial_keys.setdefault(key, key)
+        return self._keys[value]
+
+    def atom(self, value, work):
+        _charge(work, 1)
+        if value.kind == "argument":
+            return value
+        if value not in self._atoms:
+            operands = tuple(self.key(arg, work) for arg in value.args)
+            if value.kind in {"min", "max"}:
+                operands = tuple(sorted(operands, key=lambda arg: arg.order_key))
+            key = _FunctionKey(value.kind, operands)
+            self._atoms[value] = self._function_keys.setdefault(key, key)
+        return self._atoms[value]
+
+    def retained(self, value):
+        """Cancel ring terms using this query's original function operands."""
+        return _to_expr(_PolynomialQuery({}, identity=self, retained=True).visit(value))
+
+
+class _PolynomialQuery:
+    """One bounded polynomial query and its local raw atom representatives."""
+
+    def __init__(
+        self,
+        facts,
+        *,
+        periodic=False,
+        identity=None,
+        retained=False,
+        keys=False,
+        memo=None,
+        work=None,
+    ):
+        self.facts, self.periodic = facts, periodic
+        self.identity = AtomIdentity() if identity is None else identity
+        self.retained, self.keys = retained, keys
+        self.memo = {} if memo is None else memo
+        self.work = [0] if work is None else work
+        self.representatives = {}
+
+    def atom(self, value):
+        key = self.identity.atom(value, self.work)
+        if self.keys:
+            return key
+        # Equal mathematical operands need not have the same definedness.
+        # Never borrow a raw expression from an earlier query's guard/domain.
+        return self.representatives.setdefault(key, value)
+
+    def visit(self, expr):
+        from .scalar import positive
+
+        _charge(self.work, 1)
+        if expr in self.memo:
+            return self.memo[expr]
+        if expr.kind == "constant":
+            result = {(): Fraction(expr.constant)} if expr.constant else {}
+        elif expr.kind in {"add", "mul"}:
+            a, b = (self.visit(arg) for arg in expr.args)
+            _charge(
+                self.work,
+                len(a) + len(b)
+                if expr.kind == "add"
+                else (
+                    len(b) * sum(1 + len(term) for term in a)
+                    + len(a) * sum(len(term) for term in b)
                 ),
             )
-        else:
-            # floor(floor(x/a)/b) == floor(x/(a*b)) for positive integer a,b.
-            if numerator.kind == "floordiv":
-                numerator, inner = numerator.args
-                divisor = expression("mul", inner, divisor)
-            top = polynomial(numerator, facts, _memo=memo, _work=work, periodic=periodic)
-            bottom = polynomial(divisor, facts, _memo=memo, _work=work, periodic=periodic)
-            quotient, remainder = {}, dict(top)
-            charge(sum(1 + len(term) for term in top))
-            if len(bottom) == 1:
-                ((dt, dc),) = bottom.items()
-                for term, coefficient in top.items():
-                    counts = Counter(term)
-                    needed = Counter(dt)
-                    if needed <= counts:
-                        remaining = tuple(
-                            sorted((counts - needed).elements(), key=lambda atom: atom.order_key)
-                        )
-                        candidate = {remaining: coefficient / dc}
-                        if _integral(candidate, facts):
-                            quotient = _sum(quotient, candidate)
-                            del remainder[term]
-            if not remainder:
-                result = quotient
-            elif remainder == {(): Fraction(-1)} and quotient:
-                result = _sum(quotient, {(): Fraction(-1)})
+            result = _sum(a, b) if expr.kind == "add" else _product(a, b)
+        elif self.retained:
+            result = {(self.atom(expr),): Fraction(1)}
+        elif expr.kind in {"floordiv", "rem"}:
+            numerator, divisor = expr.args
+            require(
+                positive(divisor, self.facts), "index divisor must be provably positive and uniform"
+            )
+            coordinate = numerator
+            if coordinate.kind == "floordiv" and coordinate.args[1].constant is not None:
+                coordinate = coordinate.args[0]
+            if (
+                self.periodic
+                and expr.kind == "rem"
+                and divisor.constant is not None
+                and coordinate.kind == "argument"
+                and coordinate.args[0].startswith("$")
+            ):
+                result = {(self.atom(expr),): Fraction(1)}
+            elif expr.kind == "rem":
+                quotient = self.visit(expression("floordiv", numerator, divisor))
+                result = _sum(
+                    self.visit(numerator),
+                    _scale(_product(quotient, self.visit(divisor)), -1),
+                )
             else:
-                # Canonicalize atom operands where integral coefficients allow it.
-                if all(c.denominator == 1 for p in (top, bottom) for c in p.values()):
-                    numerator = _to_expr(top)
-                    divisor = _to_expr(bottom)
-                atom = expression("floordiv", numerator, divisor)
-                result = {(atom,): Fraction(1)}
-    else:
-        result = {(expr,): Fraction(1)}
-    memo[expr] = result
-    return result
+                # floor(floor(x/a)/b) == floor(x/(a*b)) for positive integer a,b.
+                if numerator.kind == "floordiv":
+                    numerator, inner = numerator.args
+                    divisor = expression("mul", inner, divisor)
+                top, bottom = self.visit(numerator), self.visit(divisor)
+                quotient, remainder = {}, dict(top)
+                _charge(self.work, sum(1 + len(term) for term in top))
+                if len(bottom) == 1:
+                    ((dt, dc),) = bottom.items()
+                    for term, coefficient in top.items():
+                        counts = Counter(term)
+                        needed = Counter(dt)
+                        if needed <= counts:
+                            remaining = tuple(
+                                sorted(
+                                    (counts - needed).elements(), key=lambda atom: atom.order_key
+                                )
+                            )
+                            candidate = {remaining: coefficient / dc}
+                            if _integral(candidate, self.facts):
+                                quotient = _sum(quotient, candidate)
+                                del remainder[term]
+                if not remainder:
+                    result = quotient
+                elif remainder == {(): Fraction(-1)} and quotient:
+                    result = _sum(quotient, {(): Fraction(-1)})
+                else:
+                    # Keep integral operand reconstruction for existing index
+                    # identities. Congruence no longer depends on this spelling.
+                    if all(c.denominator == 1 for p in (top, bottom) for c in p.values()):
+                        numerator = _to_expr(top)
+                        divisor = _to_expr(bottom)
+                    atom = expression("floordiv", numerator, divisor)
+                    result = {(self.atom(atom),): Fraction(1)}
+        else:
+            result = {(self.atom(expr),): Fraction(1)}
+        self.memo[expr] = result
+        return result
+
+
+def polynomial(expr, facts, *, periodic=False):
+    """Exact rational polynomial whose public term atoms remain raw Exprs."""
+    return _PolynomialQuery(facts, periodic=periodic).visit(expr)
 
 
 def equivalent(a, b, facts):
-    return polynomial(a, facts) == polynomial(b, facts)
+    query = _PolynomialQuery(facts)
+    return query.visit(a) == query.visit(b)
 
 
-def normalize(expr, facts):
-    return _to_expr(polynomial(expr, facts))
+def normalize(expr, facts, *, identity=None):
+    return _to_expr(_PolynomialQuery(facts, identity=identity).visit(expr))
 
 
 def arguments(expr):
@@ -206,7 +324,8 @@ def physical_terms(expr, facts):
 
 
 def constant_ratio(a, b, facts):
-    left, right = polynomial(a, facts), polynomial(b, facts)
+    query = _PolynomialQuery(facts)
+    left, right = query.visit(a), query.visit(b)
     if not right or left.keys() != right.keys():
         return None
     ratios = {left[term] / value for term, value in right.items()}
@@ -266,12 +385,13 @@ def _joint_affine_interval(expr, domains, facts):
             if any(name.startswith("$") for atom in term for name in arguments(atom))
         }
 
-    top = polynomial(expr, facts)
+    query = _PolynomialQuery(facts)
+    top = query.visit(expr)
     left = varying(top)
     if not left:
         return None
     for coordinate, lower, upper in candidates:
-        bottom = polynomial(coordinate, facts)
+        bottom = query.visit(coordinate)
         right = varying(bottom)
         if not right or left.keys() != right.keys():
             continue

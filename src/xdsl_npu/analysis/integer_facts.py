@@ -6,12 +6,12 @@ queries consume a guard's relations; no query establishes completion or ownershi
 Tables die with this analysis, never live in process-global memoized methods.
 """
 
-from functools import wraps
+from functools import cache, wraps
 from types import MappingProxyType
 
 from ..diagnostics import CompileError
-from ..indexing import normalize
-from ..scalar import DIVISION, Expr, expression, infer, literal, substitute
+from ..indexing import AtomIdentity, normalize
+from ..scalar import DIVISION, Expr, expression, infer, literal
 from .structured_schedule import Comparison
 
 _OPPOSITE = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
@@ -30,9 +30,9 @@ def _query(method):
     return query
 
 
-def normalize_integer(value, facts):
+def normalize_integer(value, facts, *, identity):
     try:
-        return normalize(value, facts)
+        return normalize(value, facts, identity=identity)
     except CompileError as error:
         if error.message != "runtime address retains a fractional coefficient":
             raise
@@ -55,6 +55,7 @@ class IntegerFacts:
     def __init__(self, facts):
         self._facts = MappingProxyType(dict(facts))
         self._answers = {}
+        self._atom_identity = AtomIdentity()
 
     @property
     def facts(self):
@@ -62,7 +63,7 @@ class IntegerFacts:
 
     @_query
     def normalize(self, value):
-        return normalize_integer(value, self.facts)
+        return normalize_integer(value, self.facts, identity=self._atom_identity)
 
     @_query
     def infer(self, value):
@@ -118,11 +119,11 @@ class IntegerFacts:
         """Normalize integer ring arithmetic while retaining division atoms.
 
         Quotient expansion is useful for equality, but loses the actual remainder
-        interval needed by inequalities. These temporary names are local algebra
-        variables only; none enters an event expression or emitted program.
+        interval needed by inequalities. Congruence keys identify functions
+        without rebuilding the factors or unsigned domains of their operands.
         """
-        atoms, replacements = {}, {}
 
+        @cache
         def encode(current):
             if current.kind in {"constant", "argument"}:
                 return current
@@ -157,13 +158,9 @@ class IntegerFacts:
                         return encode(atom.args[0 if atom.kind == "min" else 1])
                     if b.maximum is not None and a.minimum is not None and b.maximum <= a.minimum:
                         return encode(atom.args[1 if atom.kind == "min" else 0])
-            if atom not in atoms:
-                symbol = Expr("argument", (f"$resource_atom_{len(atoms)}",))
-                atoms[atom], replacements[symbol] = symbol, atom
-            return atoms[atom]
+            return atom
 
-        encoded = encode(value)
-        return substitute(normalize(encoded, {}), replacements)
+        return self._atom_identity.retained(encode(value))
 
     @_query
     def bounds(self, value, assumptions=()):
@@ -259,12 +256,15 @@ class IntegerFacts:
     def prove(self, test, assumptions):
         if test in assumptions:
             return True
+        difference = self.bounded(expression("sub", test.lhs, test.rhs))
+        if difference.constant is not None:
+            return Comparison(difference, test.predicate, literal(0)).evaluate({})
         constraint = _term(test)
         if constraint is not None:
             lower, _ = self.bounds(constraint, assumptions)
             if lower is not None and lower >= 0:
                 return True
-        difference = self.normalize(self.bounded(expression("sub", test.lhs, test.rhs)))
+        difference = self.normalize(difference)
         if difference.constant is not None:
             return Comparison(difference, test.predicate, literal(0)).evaluate({})
         if test.predicate in {"==", "!="}:

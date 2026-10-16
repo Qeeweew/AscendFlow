@@ -42,6 +42,8 @@ IRDL verifier 负责结构和类型，不能替代异步正确性。有限模型
 ## 3. 完成与同步的关键限制
 
 - source SSA use-def 不证明异步完成；issue/queue/native end/累计退休/通知消费不同。
+- read→writer的数值版本关系与物理buffer的退休/复用关系是两类义务。实际dispatch不能把读改绑到最近writer；同样，source中的临时写入次序不能未经生命周期证明就被当作所有物理覆盖的唯一顺序。当前实现尚未完成二者拆分，默认FA的具体反例和迁移步骤见状态页与计划。
+- 完整kill、条件首clear和RMW必须各自保留访问语义。允许已证明独立的private scratch生命周期按既定dispatch排列，不自动授权改变外部可见写、累加递推或状态更新；actor-private、buffer名字不同或一条已有admission成功都不足以证明这种独立性。
 - 只在目标原语允许的累计前缀内比较进度；多个流水或参与者不可仅取一个最大序号。
 - Set 采集合法 source capture 的事实；Set 自身的效果不使后续源操作自动退休。
 - Wait 只在其真实 admission 后传递已消费通知的事实。CV controller Wait 的派发阻塞单独建模。
@@ -89,6 +91,7 @@ IRDL verifier 负责结构和类型，不能替代异步正确性。有限模型
 ## 7. 事件资源阶段的独立合同
 
 - `EventDomains` 建立实际端点/队列/参与者与配对。两个端点的条件合取不代表两者各自均存在；必须双向证明各自激活域相同。
+- 同流水fence没有Set/Wait配对、event ID或复用序号。通知选择已建立其真实source-before-consumer和累计capture覆盖；资源阶段保留所有端点归属、route与原始有序算术检查，然后只按原consumer guard物化一次。不为fence构造binary事件参数case、窗口或lease，也不借这些case的空交集过滤执行。
 - `EventWindow` 必须等价于实际membership；`first`/`last`仅在非空条件内使用，stride必须对应下一次同ID的活跃使用。未知稀疏guard不能被区间摘要吞掉。child到parent的存在条件由已证窗口显式投影，保留代次关联。
 - 同一逻辑通知的参数分区覆盖整个时钟链；分区条件必须在本执行组的整个kernel调用内固定（group可用，sid在实际端点已绑定），不能随父循环重入改变。互斥与覆盖来自整数区间的完整划分，不通过采样推断。空分支也保留，并单独检查两端确实都不激活，不能用两端条件的空交集隐藏不配对。
 - 每个分区保留自己的窗口、rank、ring宽度和ordinal。物理bank仅为该通知预留一次最大宽度；实际event编号使用当前分区自己的模数，不能把最大预留宽度当成所有分区的编号周期。条件之间没有调用内切换，跨调用仍需真实drain。
@@ -118,3 +121,7 @@ IRDL verifier 负责结构和类型，不能替代异步正确性。有限模型
 选中子循环坐标的生效条件随该绑定一起保存。父代次平移、选中FIRST/LAST及其条件必须位于同一坐标系；进入选中子循环的词法条件前，先建立该选择非空。例如count=1、period=2、residue=1时该选择为空，`count-1-residue`为负，不能先计算LAST的unsigned remainder再检查非空。编译器应保留这个拒绝或按已有非空条件正确短路，不能补一个错误的“非负证明”。
 
 区间推导保留原表达式的因子和clamp；例如已知`g-1>=0、k>0`时直接推导`(g-1)*k>=0`，不能先展开为`g*k-k`再丢失因子相关性。代数规约用于等价与常量差匹配。min/max允许有依据的单侧界；无符号floor/ceil/rem区间必须先获得分子非负、分母正的同域前提。两种表示分别用于自己的证明规则，不以区间推导未知取消输入定义性检查。
+
+函数atom的数学身份由同一多项式实现自底向上建立：add/mul使用规范多项式，其他函数以kind和实参的规范身份区分；min/max保留交换律，div/rem不得交换实参。键构造将unsigned函数视为未解释函数，不借全局positive事实替代实际有序前缀。声明可整除的动态商产生分数系数时，也不能因无法重建整数Expr而失去实参同余。
+
+`AtomIdentity`只保存不可变数学key，不保存跨查询raw代表。每次查询从自己的原式选择代表；`normalize`和`bounded`共用本次IntegerFacts的key环境及同一多项式操作。公共多项式的atom和返回表达式仍为Expr，不泄漏typed key或伪造的argument。键、共享DAG与多项式工作受原有预算约束；bounded前处理也按唯一节点遍历。原始有序定义性检查始终读取raw guard，因此数学同值不授予原式求值权，也不授权重写source/emitted DAG。
