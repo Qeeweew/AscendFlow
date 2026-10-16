@@ -13,7 +13,8 @@ from tests.models.structured_domains import actual_dispatch
 from tests.models.structured_events import Command, EventModelError, Occurrence, _causality
 from tests.support.structured import prepared, selected
 from xdsl_npu.analysis.access_frontier import AccessEndpoint
-from xdsl_npu.analysis.event_progress import ProgressPort, QueueCut, prove_progress
+from xdsl_npu.analysis.event_progress import prove_progress
+from xdsl_npu.analysis.progress_regions import ProgressPort, QueueCut
 from xdsl_npu.analysis.structured_protocols import (
     BoundPlacement,
     LogicalNotification,

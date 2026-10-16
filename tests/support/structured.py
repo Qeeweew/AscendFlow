@@ -1,8 +1,9 @@
-"""Shared construction of production structured-analysis inputs for tests.
+"""Shared setup for notification-selection and event-domain tests.
 
-These helpers run the real frontend, native admission, dependency analysis,
-notification selection and event-domain construction. They are setup helpers,
-not independent correctness oracles; importing this module creates no fixture.
+Runs the real frontend/native lowering, memory collection, dependency analysis
+and notification selection; prepared additionally constructs event domains.
+These helpers run neither complete memory admission nor executable compilation
+and are not independent correctness oracles. Importing creates no fixture.
 """
 
 from xdsl_npu import language as N
@@ -18,16 +19,6 @@ def selected(source):
     structure = lower_native_structure(N.from_source(source) if isinstance(source, str) else source)
     memory = collect_native_memory(structure.module)
     dependencies = build_structured_dependencies(memory)
-    result = select_notifications(dependencies, dependencies.dispatch)
-    result.require_closed()
-    return result
-
-
-def selection(source):
-    source = N.from_source(source) if isinstance(source, str) else source
-    memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = build_structured_dependencies(memory)
-    dependencies.require_closed()
     result = select_notifications(dependencies, dependencies.dispatch)
     result.require_closed()
     return result

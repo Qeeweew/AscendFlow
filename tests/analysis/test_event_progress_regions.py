@@ -10,7 +10,8 @@ from tests.support.structured import selected
 from xdsl_npu.analysis.access_frontier import AccessEndpoint
 from xdsl_npu.analysis.event_contracts import ResourceWork
 from xdsl_npu.analysis.event_domains import EventDomains
-from xdsl_npu.analysis.event_progress import ProgressPort, _Composer, prove_progress
+from xdsl_npu.analysis.event_progress import _Composer, prove_progress
+from xdsl_npu.analysis.progress_regions import ProgressPort
 from xdsl_npu.analysis.structured_protocols import (
     BoundPlacement,
     LogicalNotification,
@@ -276,9 +277,9 @@ def test_inactive_minimum_shift_does_not_drop_later_residue_gates():
     (wait_case,), (source_case,) = (domains.cases[n] for n in notifications)
     wait = ProgressPort(notifications[0], notifications[0].consumers[0], "wait", wait_case)
     source = ProgressPort(notifications[1], notifications[1].sources[0], "set", source_case)
-    invocation = composer._invocation_guard(loop.operation, wait, source)
+    invocation = composer.endpoints.invocation_guard(loop.operation, wait, source)
     assert invocation is not None and not invocation.comparisons
-    shift, guard, exact = composer._gate_step(wait, source, loop.operation)
+    shift, guard, exact = composer.endpoints.gate_step(wait, source, loop.operation)
     assert shift == 0 and not exact
     assert guard.evaluate({"n": 3})
     # This conservative envelope cannot yet prove the alternating schedule;

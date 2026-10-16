@@ -323,19 +323,6 @@ def physical_terms(expr, facts):
     return {coordinate: _to_expr(coefficient) for coordinate, coefficient in grouped.items()}
 
 
-def constant_ratio(a, b, facts):
-    query = _PolynomialQuery(facts)
-    left, right = query.visit(a), query.visit(b)
-    if not right or left.keys() != right.keys():
-        return None
-    ratios = {left[term] / value for term, value in right.items()}
-    if len(ratios) == 1:
-        ratio = next(iter(ratios))
-        if ratio.denominator == 1:
-            return int(ratio)
-    return None
-
-
 def nonnegative(expr, facts):
     """Sufficient algebraic sign proof; no parameter sampling."""
     from .scalar import infer

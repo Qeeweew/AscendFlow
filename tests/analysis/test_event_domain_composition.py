@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from tests.support.structured import prepared, selection
+from tests.support.structured import prepared, selected
 
 NESTED = """
 def nested(X:N.Tensor((n,2,64),N.f32),n:N.int64):
@@ -21,7 +21,7 @@ def nested(X:N.Tensor((n,2,64),N.f32),n:N.int64):
 
 @pytest.fixture(scope="module")
 def domains():
-    return prepared(selection(NESTED))
+    return prepared(selected(NESTED))
 
 
 def test_child_membership_is_projected_once_before_parent_window(domains):

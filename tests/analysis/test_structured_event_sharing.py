@@ -7,7 +7,7 @@ import pytest
 
 from examples.vector.scale import scale
 from tests.models.structured_domains import actual_dispatch
-from tests.support.structured import prepared, selection
+from tests.support.structured import prepared, selected
 from xdsl_npu.analysis.event_domains import EventCase
 from xdsl_npu.analysis.event_paths import prove_event_path_cover
 from xdsl_npu.analysis.structured_event_sharing import (
@@ -33,7 +33,7 @@ def finite():
                 "        N.mul(x[:],2.0,out=x[:])",
             )
         )
-    return selection("\n".join(source))
+    return selected("\n".join(source))
 
 
 def sharing_context(selected):
@@ -140,9 +140,9 @@ def test_sharing_proof_is_bound_to_one_actual_directed_bank(finite):
 
 
 def test_finite_case_does_not_erase_repeated_actual_scopes():
-    selected = selection(scale)
-    forward = route(selected, Engine.MTE2)[0]
-    context = sharing_context(selected)
+    selected_ir = selected(scale)
+    forward = route(selected_ir, Engine.MTE2)[0]
+    context = sharing_context(selected_ir)
     clone = replace(forward, name="another_repeated_channel")
 
     def forbidden_path_cover(*args):
@@ -151,7 +151,7 @@ def test_finite_case_does_not_erase_repeated_actual_scopes():
     context = replace(
         context,
         cases={
-            n: (EventCase(ActionGuard(), (), (), ()),) for n in (*selected.notifications, clone)
+            n: (EventCase(ActionGuard(), (), (), ()),) for n in (*selected_ir.notifications, clone)
         },
         prove_path_cover=forbidden_path_cover,
     )

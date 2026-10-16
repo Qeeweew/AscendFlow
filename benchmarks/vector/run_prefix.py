@@ -6,9 +6,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from examples.vector.prefix import scale_prefix
-from xdsl_npu import compile
-from xdsl_npu.backend.cann import offline_compile
+from benchmarks.artifacts import read_artifact
+from xdsl_npu.build import build_file
 from xdsl_npu.device import ACL, health_snapshot
 from xdsl_npu.diagnostics import require
 
@@ -19,12 +18,19 @@ def main():
     parser.add_argument("--shared", action="store_true")
     parser.add_argument("--physical", type=int)
     parser.add_argument("--library", type=Path)
+    parser.add_argument("--timeout", type=float, default=300)
     args = parser.parse_args()
-    result = compile(scale_prefix)
-    result.write(args.output)
+    build_output = args.output if args.library is None else args.output / "source-check"
+    build_file(
+        Path(__file__).resolve().parents[2] / "examples/vector/prefix.py",
+        build_output,
+        entry="scale_prefix",
+        shared=args.library is None and (args.shared or args.physical is not None),
+        timeout_s=args.timeout,
+    )
+    result = read_artifact(build_output)
     library = args.library
     if library is None and (args.shared or args.physical is not None):
-        offline_compile(result.asc, args.output.resolve(), result.name, shared=True)
         library = args.output / f"{result.name}.so"
     if args.physical is None:
         print(json.dumps({"verification": result.report, "compilation": result.timings}))

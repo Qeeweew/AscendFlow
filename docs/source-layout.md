@@ -29,7 +29,12 @@
 | 局部条件覆盖 | `analysis/guard_cover.py` | 在一项义务内证明条件OR覆盖；有序定义性、整数三分和余数集合，不持有通知或排步 |
 | 实际消费路径 | `analysis/event_paths.py` | 组合真实队列/controller接口和路径条件，完整覆盖即停止；生命周期与有限ID共享共用 |
 | 事件生命周期 | `analysis/event_lifetimes.py`、`structured_event_sharing.py` | 消费到复用、有限子循环再次调用和有证据的 ID 共享 |
-| 派发进展 | `analysis/event_progress.py` | 实际阻塞接口及循环组合；不读取分配 ID |
+| 区域进展合同 | `analysis/progress_regions.py` | 端口、绑定、queue cut 和带条件关系；不执行证明 |
+| 条件事实 | `analysis/progress_conditions.py` | 一次进展分析内的数学合取与矛盾答案；不改变有序执行 guard |
+| 端点与顺序事实 | `analysis/progress_endpoints.py` | 完整端点绑定、父调用身份、实际队列关系与stream步长下界；不组合区域图 |
+| 区域连通关系 | `analysis/progress_connectivity.py` | 稀疏的有条件路径组合与内部节点消去；不解释执行引擎或循环时钟 |
+| 循环进展证明 | `analysis/progress_ranks.py` | stream rank、独立 SCC 条件分支与有限环排除；消费共享条件事实 |
+| 派发进展编排 | `analysis/event_progress.py` | 绑定实际阻塞端口，组合子区域与边界；不读取分配 ID |
 | 事件分配 | `analysis/structured_resources.py`、`event_contracts.py` | 连接资源阶段、bank/ID 台账、配置预留与最终 drain |
 | 物化 | `passes/materialize_structure.py`、`analysis/structured_schedule.py` | 将已确定指令写成真实 SCF 条件、event SSA 和 NotificationOp |
 | 标量化简 | `passes/simplify_scalars.py` | 对最终 IR 的纯整数/index arith 根应用 xDSL 通用规则；不移动或重写控制与异步操作 |
@@ -42,13 +47,15 @@
 
 资源阶段拆开事实、生命周期、进展和分配，共享一次建立的 `EventDomains`。实际端点的条件队列顺序也由它建立，lease和sharing不重新解释stage/词法位置。`event_paths`依赖纯数学的`guard_cover`，反向依赖禁止。进展区分内部 stream rank 与对外 queue/阻塞接口；子层 native 留在本地 witness，完整嵌套功能资格仍见状态页。
 
+进展编排为一次调用持有一个 `ProgressConditions`；端点、rank 与区域组合共用它。`ProgressEndpoints` 拥有原端点绑定和父调用事实，其接口返回真实条件或保守步长下界；编排器只消费这些关系。数学谓词集合与原始有序 `ActionGuard` 分开，不能用集合排序改写执行短路顺序。连通容器只存实际关系，消去节点时只组合仍活跃的前驱与后继，随后删除该节点及入出边。原 dense 矩阵、`_Composer` 中的端点/rank 实现和旧类型出口已经删除，测试直接使用各职责模块，不保留转发 alias。
+
 同流水fence只保留选择阶段建立的capture覆盖及端点准入，不进入binary event的case/window/lease构造。分配器按它的原consumer guard发射；该职责拆分不增加或移除实际需要执行的fence。
 
 ## 必须保持的依赖方向
 
 ```text
 compilation → frontend / passes / backend
-frontend    → dialects / diagnostics
+frontend    → dialects / diagnostics / target scalars
 passes      → analysis / dialects / target
 analysis    → dialects / target / scalar facts
 backend     → 最终 IR + 未改变的 native 合同 / target

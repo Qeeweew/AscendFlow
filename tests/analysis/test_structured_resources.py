@@ -7,7 +7,7 @@ import pytest
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy, nested_cv
-from tests.support.structured import prepared, selection
+from tests.support.structured import prepared, selected
 from xdsl_npu.analysis.event_contracts import CROSS_BACKLOG, LeaseKind, _Order
 from xdsl_npu.analysis.event_lifetimes import reentry
 from xdsl_npu.analysis.structured_protocols import NotificationKind
@@ -66,29 +66,29 @@ def test_fence_endpoint_still_requires_its_raw_unsigned_domain():
     from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison
     from xdsl_npu.scalar import Expr
 
-    selected = selection(SAME_QUEUE)
-    fence = selected.notifications[0]
+    selected_ir = selected(SAME_QUEUE)
+    fence = selected_ir.notifications[0]
     assert fence.mechanism is NotificationKind.PIPE_FENCE
     unsafe = expression("rem", expression("sub", literal(0), Expr("argument", ("m",))), literal(2))
     consumer = replace(
         fence.consumers[0], guard=ActionGuard((Comparison(unsafe, "==", literal(0)),))
     )
     forged = replace(fence, sources=(consumer,), consumers=(consumer,), requirements=(), domains=())
-    selected = replace(
-        selected,
-        dependencies=replace(selected.dependencies, required=()),
+    selected_ir = replace(
+        selected_ir,
+        dependencies=replace(selected_ir.dependencies, required=()),
         notifications=(forged,),
         coverage=(),
     )
     with pytest.raises(CompileError, match="ordered activation prefix proof") as error:
-        prepared(selected)
+        prepared(selected_ir)
     assert error.value.phase == "structured-event-pairing"
 
 
 @pytest.fixture(scope="module")
 def finite():
     return allocate_structured_events(
-        selection("""
+        selected("""
         def finite(X:N.Tensor((2,64),N.f32),O:N.Tensor((2,64),N.f32,access="write")):
             with N.Kernel():
                 x,y=N.alloc_ub((2,64)),N.alloc_ub((2,64))
@@ -105,12 +105,12 @@ def finite():
 
 @pytest.fixture(scope="module")
 def repeated():
-    return allocate_structured_events(selection(nested_copy))
+    return allocate_structured_events(selected(nested_copy))
 
 
 @pytest.fixture(scope="module")
 def mixed():
-    return allocate_structured_events(selection(nested_cv))
+    return allocate_structured_events(selected(nested_cv))
 
 
 def test_two_finite_uses_get_two_ids_without_selecting_reverse_events(finite):
@@ -198,12 +198,12 @@ def test_missing_real_return_path_does_not_become_child_exit_completion(repeated
 
 
 def test_non_scalar_wait_only_gates_its_real_destination_queue():
-    selected = selection(scale)
-    allocator = prepared(selected)
-    forward = next(n for n in selected.notifications if n.source_engine is Engine.MTE2)
+    selected_ir = selected(scale)
+    allocator = prepared(selected_ir)
+    forward = next(n for n in selected_ir.notifications if n.source_engine is Engine.MTE2)
     reverse = next(
         n
-        for n in selected.notifications
+        for n in selected_ir.notifications
         if n.source_engine is Engine.V and n.destination_engine is Engine.MTE2
     )
     (forward_case,) = allocator.cases[forward]
@@ -254,7 +254,7 @@ def test_mode2_keeps_every_real_contributor_receiver_and_bounds_backlog(mixed):
 
 
 def test_configuration_and_final_drain_ids_are_in_the_same_bank_ledger():
-    plan = allocate_structured_events(selection(batched_matmul))
+    plan = allocate_structured_events(selected(batched_matmul))
     assert any(
         reservation.bank == (Actor.AIC, Engine.S, Engine.FIX)
         and reservation.event == 0
@@ -304,13 +304,13 @@ def test_each_region_certifies_stream_ranks_and_guarded_interfaces(repeated):
 
 
 def test_conditional_lifetime_does_not_certify_a_zero_distance_deadlock():
-    selected = selection(scale)
+    selected_ir = selected(scale)
     release = next(
         n
-        for n in selected.notifications
+        for n in selected_ir.notifications
         if n.source_engine is Engine.V and n.destination_engine is Engine.MTE2
     )
-    ready = next(n for n in selected.notifications if n.source_engine is Engine.MTE2)
+    ready = next(n for n in selected_ir.notifications if n.source_engine is Engine.MTE2)
     wrong = replace(
         release,
         sources=(
@@ -327,14 +327,14 @@ def test_conditional_lifetime_does_not_certify_a_zero_distance_deadlock():
         distance=0,
         domains=ready.domains,
     )
-    selected = replace(
-        selected,
-        notifications=tuple(wrong if n is release else n for n in selected.notifications),
+    selected_ir = replace(
+        selected_ir,
+        notifications=tuple(wrong if n is release else n for n in selected_ir.notifications),
         coverage=tuple(
             replace(item, notification=wrong) if item.notification is release else item
-            for item in selected.coverage
+            for item in selected_ir.coverage
         ),
     )
     with pytest.raises(CompileError, match="no increasing blocking-interface rank") as failure:
-        allocate_structured_events(selected)
+        allocate_structured_events(selected_ir)
     assert failure.value.phase == "structured-event-progress" and failure.value.witness

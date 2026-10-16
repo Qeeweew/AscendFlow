@@ -20,8 +20,8 @@ from .structured_schedule import ActionGuard, SyncAction
 if TYPE_CHECKING:
     from .event_domains import EventCase
     from .event_paths import EventPathCover
-    from .event_progress import GuardedTransfer, RegionProgress
     from .event_windows import EventWindow
+    from .progress_regions import GuardedTransfer, RegionProgress
     from .structured_event_sharing import EventSharingWitness
 
 LocalBank = tuple[Actor, Engine, Engine]
@@ -155,6 +155,9 @@ class ResourceWork:
     progress_path_combinations: int = 0
     progress_path_alternatives: int = 0
     progress_case_branches: int = 0
+    progress_condition_sets: int = 0
+    progress_condition_queries: int = 0
+    progress_condition_hits: int = 0
 
 
 @dataclass(frozen=True)
