@@ -1,7 +1,7 @@
 """Sufficient local rank and cycle-exclusion proofs for progress regions.
 
 The caller establishes endpoints and relations. One invocation shares its
-existing condition owner with this rank evaluator; numeric rank attempts,
+activation owner with this rank evaluator; numeric rank attempts,
 uniform SCC branches and finite exclusions do not remap endpoint identity.
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 from ..budget import poll
 from ..diagnostics import CompileError, ErrorKind
 from .guard_cover import opposite
-from .progress_conditions import ProgressConditions
+from .progress_activations import ProgressActivations
 from .progress_regions import ExcludedCycle, GuardedRank, port_label
 from .structured_schedule import ActionGuard
 
@@ -22,9 +22,9 @@ def _guard(tests):
 class ProgressRanks:
     MAX_CONDITIONAL_RANKS = 64
 
-    def __init__(self, domains, conditions: ProgressConditions):
+    def __init__(self, domains, activations: ProgressActivations):
         self.domains = domains
-        self.conditions = conditions
+        self.activations = activations
         self.control = domains.control
         self.root = domains.memory.module.body.block.first_op
 
@@ -111,7 +111,8 @@ class ProgressRanks:
         rank, cycle = self._rank_attempt(count, indexed, stride)
         if not cycle:
             return stride, rank, (), ()
-        uniform = tuple(self._uniform_guard(arc.guard) for arc in arcs)
+        scope = self.activations.region(region)
+        uniform = scope.map_guards(tuple(arc.activation for arc in arcs), self._uniform_guard)
         certificates, excluded = [], []
 
         def internal(group, candidates):
@@ -137,11 +138,10 @@ class ProgressRanks:
                     for node in group
                 ):
                     return None
-                activation = _guard(
-                    condition.comparisons
-                    + tuple(test for _, arc in edges for test in arc.guard.comparisons)
-                )
-                if not self.conditions.impossible(activation.comparisons):
+                activation = scope.guard(condition)
+                for _, arc in edges:
+                    activation = scope.all_of(activation, arc.activation)
+                if not scope.refuted(activation):
                     return None
                 result.append(ExcludedCycle(tuple(index for index, _ in edges), activation))
             return result
@@ -160,6 +160,7 @@ class ProgressRanks:
                     relations=len(edges),
                     branches=work,
                 )
+                scope.charge("conditional progress rank branch")
                 work += 1
                 self.domains.work.progress_case_branches += 1
                 if work > self.MAX_CONDITIONAL_RANKS:
@@ -168,14 +169,12 @@ class ProgressRanks:
                         "uniform-case SCC progress exceeds its explicit branch budget",
                         kind=ErrorKind.ANALYSIS_LIMIT,
                     )
-                if self.conditions.impossible(condition.comparisons):
+                if scope.refuted(scope.true, condition):
                     return
                 active = tuple(
                     (index, arc)
                     for index, arc in edges
-                    if not self.conditions.impossible(
-                        condition.comparisons + uniform[index].comparisons
-                    )
+                    if not scope.refuted(uniform[index], condition)
                 )
                 local_rank, local_cycle = self._rank_attempt(count, active, stride)
                 if not local_cycle:
@@ -197,12 +196,7 @@ class ProgressRanks:
                 # have already been established on this proof branch.
                 split = None
                 for index in local_cycle:
-                    for test in uniform[index].comparisons:
-                        if self.domains.arithmetic.prove(test, condition.comparisons):
-                            continue
-                        if not self.domains.arithmetic.prove(opposite(test), condition.comparisons):
-                            split = test
-                        break
+                    split = scope.split(uniform[index], condition)
                     if split is not None:
                         break
                 if split is not None:

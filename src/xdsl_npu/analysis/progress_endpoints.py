@@ -13,7 +13,7 @@ from ..diagnostics import CompileError, ErrorKind
 from ..scalar import expression, literal, substitute
 from . import progress_regions as regions
 from .event_contracts import _Order
-from .progress_conditions import ProgressConditions
+from .progress_activations import ProgressActivations
 from .progress_regions import binding_key
 from .structured_schedule import ActionGuard, Comparison
 
@@ -26,9 +26,10 @@ _UNESTABLISHED = object()
 
 
 class ProgressEndpoints:
-    def __init__(self, domains, conditions: ProgressConditions):
+    def __init__(self, domains, activations: ProgressActivations):
         self.domains = domains
-        self.conditions = conditions
+        self.activations = activations
+        self.conditions = activations.conditions
         self.root = domains.memory.module.body.block.first_op
         self.control = domains.control
         self.dispatch = domains.dispatch
@@ -159,8 +160,8 @@ class ProgressEndpoints:
             )
         )
 
-    def _import_transfer(self, region, relation, streams):
-        """Bind a whole child transfer once into the containing proof frame."""
+    def _transfer_binding(self, region, relation, streams):
+        """Establish one common substitution for the entire child relation."""
         endpoints = tuple(
             self.stream_port(node, region)
             if isinstance(node, regions.ProgressPort) and node.notification in streams
@@ -177,25 +178,41 @@ class ProgressEndpoints:
                 region,
                 "child interface transfer needs a shared actual ancestor parameter binding",
             )
-        bindings = dict(first)
-        return replace(
-            relation,
-            source=endpoints[0],
-            destination=endpoints[1],
-            guard=_guard(
-                tuple(
-                    Comparison(
-                        substitute(test.lhs, bindings),
-                        test.predicate,
-                        substitute(test.rhs, bindings),
-                    )
-                    for test in relation.guard.comparisons
-                )
-            ),
-        )
+        return replace(relation, source=endpoints[0], destination=endpoints[1]), first
 
     def import_interface(self, region, interface, streams):
-        """One immutable ancestor-binding fact shared by both local proofs."""
+        """Rebind each shared subformula once per established ancestor binding."""
+        relations, groups = [], {}
+        for relation in interface.relations:
+            established = self._transfer_binding(region, relation, streams)
+            if established is None:
+                continue
+            imported, bindings = established
+            index = len(relations)
+            relations.append(imported)
+            if bindings:
+                groups.setdefault(bindings, []).append(index)
+        scope = self.activations.region(region)
+        for bindings, indices in groups.items():
+            replacements = dict(bindings)
+
+            def transform(guard, replacements=replacements):
+                return _guard(
+                    tuple(
+                        Comparison(
+                            substitute(test.lhs, replacements),
+                            test.predicate,
+                            substitute(test.rhs, replacements),
+                        )
+                        for test in guard.comparisons
+                    )
+                )
+
+            mapped = scope.map_guards(
+                tuple(relations[index].activation for index in indices), transform
+            )
+            for index, activation in zip(indices, mapped, strict=True):
+                relations[index] = replace(relations[index], activation=activation)
         return regions.RegionInterface(
             interface.operation,
             tuple(
@@ -209,11 +226,7 @@ class ProgressEndpoints:
                 is not None
             ),
             interface.cuts,
-            tuple(
-                imported
-                for relation in interface.relations
-                if (imported := self._import_transfer(region, relation, streams)) is not None
-            ),
+            tuple(relations),
         )
 
     def route(self, wait, source):

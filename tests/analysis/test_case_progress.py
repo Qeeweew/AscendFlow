@@ -55,8 +55,9 @@ def nodes(composer, count):
     )
 
 
-def edge(source, destination, *tests):
-    return GuardedTransfer(source, destination, 0, ActionGuard(tests), "test queue relation")
+def edge(composer, source, destination, *tests):
+    activation = composer.activations.region(composer.root).guard(ActionGuard(tests))
+    return GuardedTransfer(source, destination, 0, activation, "test queue relation")
 
 
 def alternatives():
@@ -76,7 +77,7 @@ def assert_certificate_cover(certificates, arcs, node_group, contexts):
             for index, arc in enumerate(arcs):
                 if arc.source not in rank or arc.destination not in rank:
                     continue
-                if arc.guard.evaluate(context):
+                if arc.activation.evaluate(context):
                     assert index in certificate.relations
             for index in certificate.relations:
                 arc = arcs[index]
@@ -90,34 +91,41 @@ def test_alternative_routes_are_or_and_keep_each_ordered_witness(composer):
     graph = ChannelProjection(
         composer.root,
         nodes(composer, 4),
-        (edge(0, 1, a), edge(1, 3), edge(0, 2, b), edge(2, 3)),
+        (
+            edge(composer, 0, 1, a),
+            edge(composer, 1, 3),
+            edge(composer, 0, 2, b),
+            edge(composer, 2, 3),
+        ),
         (),
     )
     paths, _ = composer._paths(graph)
     paths.eliminate((1, 2))
-    guards = paths.alternatives(0, 3)
-    assert len(guards) == 2
-    assert {guard.comparisons for guard in guards} == {(a,), (b,)}
+    activation = paths.relation(0, 3)
+    assert activation.kind == "or"
+    assert {node.guard.comparisons for node in activation.operands} == {(a,), (b,)}
     for mode in range(4):
-        assert sum(guard.evaluate({"mode": mode}) for guard in guards) == 1
+        assert activation.evaluate({"mode": mode})
 
     prefix = Comparison(N, ">", literal(0))
     residue = Comparison(
         expression("rem", expression("sub", N, literal(1)), literal(2)), "==", literal(0)
     )
-    ordered = replace(graph, relations=(edge(0, 1, prefix, residue), edge(1, 3)))
+    ordered = replace(
+        graph, relations=(edge(composer, 0, 1, prefix, residue), edge(composer, 1, 3))
+    )
     paths, _ = composer._paths(ordered)
     paths.eliminate((1,))
-    (guard,) = paths.alternatives(0, 3)
-    assert guard.comparisons == (prefix, residue)
+    activation = paths.relation(0, 3)
+    assert activation.guard.comparisons == (prefix, residue)
     for count in range(5):
-        assert guard.evaluate({"n": count}) == (count > 0 and (count - 1) % 2 == 0)
+        assert activation.evaluate({"n": count}) == (count > 0 and (count - 1) % 2 == 0)
 
 
 def test_exclusive_uniform_cycle_has_conditional_stream_and_finite_certificates(composer):
     a, b = alternatives()
     ports = nodes(composer, 2)
-    arcs = (edge(0, 1, a), edge(1, 0, b))
+    arcs = (edge(composer, 0, 1, a), edge(composer, 1, 0, b))
     _, rank, certificates = composer.ranks.stream(composer.root, ports, arcs)
     assert not rank and len(certificates) == 2
     contexts = [{"mode": mode} for mode in range(4)]
@@ -125,7 +133,12 @@ def test_exclusive_uniform_cycle_has_conditional_stream_and_finite_certificates(
     excluded, finite = composer.ranks.finite(composer.root, ports, arcs)
     assert excluded and not finite
     assert all(not item.condition.evaluate(context) for item in excluded for context in contexts)
-    branched = (edge(0, 1, a), edge(1, 0, b), edge(0, 2, b), edge(2, 0, a))
+    branched = (
+        edge(composer, 0, 1, a),
+        edge(composer, 1, 0, b),
+        edge(composer, 0, 2, b),
+        edge(composer, 2, 0, a),
+    )
     excluded, finite = composer.ranks.finite(composer.root, nodes(composer, 3), branched)
     assert not excluded
     assert_certificate_cover(finite, branched, (0, 1, 2), contexts)
@@ -134,10 +147,10 @@ def test_exclusive_uniform_cycle_has_conditional_stream_and_finite_certificates(
 def test_a_real_cycle_in_one_uniform_alternative_is_not_anded_with_another(composer):
     a, b = alternatives()
     ports = nodes(composer, 2)
-    arcs = (edge(0, 1, a), edge(1, 0, b), edge(1, 0, a))
+    arcs = (edge(composer, 0, 1, a), edge(composer, 1, 0, b), edge(composer, 1, 0, a))
     # mode=0 has both directed edges; mode=1 alone does not. Requiring all
     # alternatives simultaneously would incorrectly erase the real cycle.
-    assert arcs[0].guard.evaluate({"mode": 0}) and arcs[2].guard.evaluate({"mode": 0})
+    assert arcs[0].activation.evaluate({"mode": 0}) and arcs[2].activation.evaluate({"mode": 0})
     with pytest.raises(CompileError, match="increasing blocking-interface rank"):
         composer.ranks.stream(composer.root, ports, arcs)
     with pytest.raises(CompileError, match="blocking cycle"):
@@ -147,8 +160,8 @@ def test_a_real_cycle_in_one_uniform_alternative_is_not_anded_with_another(compo
 def test_iteration_predicates_do_not_become_uniform_stream_cases(composer):
     loop = next(iter(composer.control.loops.values()))
     arcs = (
-        edge(0, 1, Comparison(loop.ordinal, "==", literal(0))),
-        edge(1, 0, Comparison(loop.ordinal, "!=", literal(0))),
+        edge(composer, 0, 1, Comparison(loop.ordinal, "==", literal(0))),
+        edge(composer, 1, 0, Comparison(loop.ordinal, "!=", literal(0))),
     )
     ports = nodes(composer, 2)
     with pytest.raises(CompileError, match="increasing blocking-interface rank"):
@@ -160,7 +173,12 @@ def test_iteration_predicates_do_not_become_uniform_stream_cases(composer):
 def test_independent_sccs_keep_local_cases_without_a_global_case_product(composer):
     a, b = alternatives()
     c, d = Comparison(N, "==", literal(0)), Comparison(N, "!=", literal(0))
-    arcs = (edge(0, 1, a), edge(1, 0, b), edge(2, 3, c), edge(3, 2, d))
+    arcs = (
+        edge(composer, 0, 1, a),
+        edge(composer, 1, 0, b),
+        edge(composer, 2, 3, c),
+        edge(composer, 3, 2, d),
+    )
     _, rank, certificates = composer.ranks.stream(composer.root, nodes(composer, 4), arcs)
     assert not rank and len(certificates) == 4
     contexts = [{"mode": mode, "n": n} for mode in range(3) for n in range(3)]
@@ -168,23 +186,31 @@ def test_independent_sccs_keep_local_cases_without_a_global_case_product(compose
         assert_certificate_cover(certificates, arcs, group, contexts)
 
 
-def test_explicit_alternative_and_branch_budgets_reject_at_the_proof_boundary(composer):
+def test_explicit_region_and_branch_budgets_reject_at_the_proof_boundary(composer):
     a, b = alternatives()
     graph = ChannelProjection(
         composer.root,
         nodes(composer, 4),
-        (edge(0, 1, a), edge(1, 3), edge(0, 2, b), edge(2, 3)),
+        (
+            edge(composer, 0, 1, a),
+            edge(composer, 1, 3),
+            edge(composer, 0, 2, b),
+            edge(composer, 2, 3),
+        ),
         (),
     )
-    composer.MAX_PATH_ALTERNATIVES = 1
     paths, _ = composer._paths(graph)
-    with pytest.raises(CompileError, match="OR alternatives.*budget") as failure:
+    composer.activations.MAX_REGION_WORK = composer.domains.work.progress_formula_work
+    with pytest.raises(CompileError, match="region activation work.*budget") as failure:
         paths.eliminate((1, 2))
     assert failure.value.phase == "structured-event-progress"
     assert failure.value.kind is ErrorKind.ANALYSIS_LIMIT
+    composer.activations.MAX_REGION_WORK = 100_000
     composer.ranks.MAX_CONDITIONAL_RANKS = 1
     with pytest.raises(CompileError, match="branch budget"):
-        composer.ranks.stream(composer.root, nodes(composer, 2), (edge(0, 1, a), edge(1, 0, b)))
+        composer.ranks.stream(
+            composer.root, nodes(composer, 2), (edge(composer, 0, 1, a), edge(composer, 1, 0, b))
+        )
 
 
 def test_real_stream_keeps_case_identity_in_ports_pairing_and_bound_facts(monkeypatch):

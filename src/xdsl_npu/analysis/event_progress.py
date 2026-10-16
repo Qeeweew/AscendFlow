@@ -18,6 +18,7 @@ from ..diagnostics import CompileError, ErrorKind
 from ..target.ascend910b import Actor
 from . import progress_regions as regions
 from .event_contracts import ProgressPoint, StructuredProgress
+from .progress_activations import ProgressActivations
 from .progress_conditions import ProgressConditions
 from .progress_connectivity import RegionConnectivity
 from .progress_endpoints import ProgressEndpoints
@@ -32,17 +33,14 @@ def _guard(tests):
 
 
 class _Composer:
-    MAX_PATH_ALTERNATIVES = 64
-    MAX_PATH_COMBINATIONS = 100_000
-
     def __init__(self, domains):
         self.domains = domains
         self.conditions = ProgressConditions(domains.arithmetic)
-        self.endpoints = ProgressEndpoints(domains, self.conditions)
-        self.ranks = ProgressRanks(domains, self.conditions)
+        self.activations = ProgressActivations(self.conditions, domains.work)
+        self.endpoints = ProgressEndpoints(domains, self.activations)
+        self.ranks = ProgressRanks(domains, self.activations)
         self.control = domains.control
         self.dispatch = domains.dispatch
-        self._path_work = {}
         self.root = domains.memory.module.body.block.first_op
         self.events = tuple(
             n for n in domains.notifications if n.mechanism is not NotificationKind.PIPE_FENCE
@@ -120,6 +118,7 @@ class _Composer:
 
     def _graph(self, region, ports, stream, arcs, interfaces):
         """Import child interfaces; their native witnesses remain opaque."""
+        scope = self.activations.region(region)
         stream_nodes = () if stream is None else stream.nodes
         graph_ports = list(ports + stream_nodes)
         graph_arcs = list(arcs)
@@ -146,7 +145,7 @@ class _Composer:
                         endpoint(relation.source),
                         endpoint(relation.destination),
                         0,
-                        relation.guard,
+                        relation.activation,
                         "actual child queue interface",
                         relation.exact,
                         relation.projections,
@@ -185,7 +184,7 @@ class _Composer:
                             wi,
                             si,
                             steps,
-                            _guard(guard.comparisons + invocation.comparisons),
+                            scope.guard(_guard(guard.comparisons + invocation.comparisons)),
                             "actual region interface admission gate",
                             exact,
                         )
@@ -253,7 +252,7 @@ class _Composer:
                         ci if cut.phase == "input" else ni,
                         ni if cut.phase == "input" else ci,
                         0,
-                        _guard(self.endpoints.ambient(node) + invocation.comparisons),
+                        scope.guard(_guard(self.endpoints.ambient(node) + invocation.comparisons)),
                         "region queue admission input"
                         if cut.phase == "input"
                         else "region queue/controller blocking output",
@@ -277,16 +276,14 @@ class _Composer:
         return graph, cuts
 
     def _paths(self, graph):
-        """Bounded ordered conjunctions, with OR across alternative routes."""
+        """Compose shared Boolean activations without enumerating path choices."""
         ports, region = graph.ports, graph.operation
-        paths = RegionConnectivity(
-            len(ports), lambda alternatives, guard: self._add_path(region, alternatives, guard)
-        )
-        direct = {}
-        self._path_work[region] = 0
+        scope = self.activations.region(region)
+        paths = RegionConnectivity(len(ports), scope)
+        raw = []
         for arc in graph.relations:
             a, b = ports[arc.source], ports[arc.destination]
-            guard, projections = arc.guard, arc.projections
+            activation, projections = arc.activation, arc.projections
             if (
                 isinstance(a, regions.ProgressPort)
                 and isinstance(b, regions.ProgressPort)
@@ -296,70 +293,52 @@ class _Composer:
                 and a.case is b.case
                 and region in self.domains._clocks(a.notification)
             ):
-                guard = self.endpoints.window_guard(a, region)
+                activation = scope.guard(self.endpoints.window_guard(a, region))
                 projections = a.case.projections
-            exported = self.endpoints.export_guard(guard, region)
+            raw.append(replace(arc, activation=activation, projections=projections))
+        exported = scope.map_guards(
+            tuple(arc.activation for arc in raw),
+            lambda guard: self.endpoints.export_guard(guard, region),
+        )
+        direct = {}
+        for arc, activation in zip(raw, exported, strict=True):
             witness = replace(
-                arc,
-                guard=exported,
-                exact=arc.exact and exported == guard,
-                projections=projections,
+                arc, activation=activation, exact=arc.exact and activation is arc.activation
             )
-            paths.add(arc.source, arc.destination, exported)
+            paths.add(arc.source, arc.destination, activation)
             direct.setdefault((arc.source, arc.destination), []).append(witness)
         return paths, direct
 
-    def _add_path(self, region, alternatives, guard):
-        poll("progress interface composition", combinations=self._path_work[region])
-        self._path_work[region] += 1
-        self.domains.work.progress_path_combinations += 1
-        if self._path_work[region] > self.MAX_PATH_COMBINATIONS:
-            self.fail(
-                region,
-                "ordered region-interface alternative composition exceeds its budget",
-                kind=ErrorKind.ANALYSIS_LIMIT,
-            )
-        condition = self.conditions.intern(guard.comparisons)
-        tests = condition.members
-        if any(prior <= tests for prior in alternatives) or self.conditions.impossible(condition):
-            return
-        for prior in tuple(alternatives):
-            if tests < prior:
-                del alternatives[prior]
-        # Keep the actual ordered witness, never sort predicates. A weaker
-        # existing conjunction absorbs a stronger alternative by Boolean OR.
-        alternatives[tests] = guard
-        self.domains.work.progress_path_alternatives += 1
-        if len(alternatives) > self.MAX_PATH_ALTERNATIVES:
-            self.fail(
-                region,
-                "region-interface OR alternatives exceed their explicit budget",
-                kind=ErrorKind.ANALYSIS_LIMIT,
-            )
+    @staticmethod
+    def _exact_witness(direct, source, destination, activation):
+        # One existing direct witness must cover the entire relation. A
+        # composed OR cannot acquire exactness from just one of its choices.
+        return next(
+            (
+                arc
+                for arc in direct.get((source, destination), ())
+                if arc.exact and arc.activation is activation
+            ),
+            None,
+        )
 
     def _boundary(self, graph, paths, direct, count):
         result = []
-        for i, j, guard in paths.retained(range(count)):
-            conditions = self.conditions.intern(guard.comparisons).members
-            witnesses = tuple(
-                arc
-                for arc in direct.get((i, j), ())
-                if self.conditions.intern(arc.guard.comparisons).members == conditions
-            )
-            if witnesses:
-                result.extend(witnesses)
-            else:
-                result.append(
-                    regions.GuardedTransfer(
-                        i,
-                        j,
-                        0,
-                        guard,
-                        "projected actual region blocking/publication interface",
-                        False,
-                        (graph,),
-                    )
+        for i, j, activation in paths.retained(range(count)):
+            witness = self._exact_witness(direct, i, j, activation)
+            result.append(
+                witness
+                if witness is not None
+                else regions.GuardedTransfer(
+                    i,
+                    j,
+                    0,
+                    activation,
+                    "projected actual region blocking/publication interface",
+                    False,
+                    (graph,),
                 )
+            )
         return self._unique_arcs(result)
 
     def _interface(self, graph, paths, direct, ports, cuts):
@@ -367,22 +346,13 @@ class _Composer:
         index = {port_key(node): i for i, node in enumerate(graph.ports)}
         retained = tuple(index[port_key(node)] for node in ports + cuts)
         result = []
-        for i, j, guard in paths.retained(retained):
-            conditions = self.conditions.intern(guard.comparisons).members
-            witness = next(
-                (
-                    arc
-                    for arc in direct.get((i, j), ())
-                    if arc.exact
-                    and self.conditions.intern(arc.guard.comparisons).members == conditions
-                ),
-                None,
-            )
+        for i, j, activation in paths.retained(retained):
+            witness = self._exact_witness(direct, i, j, activation)
             result.append(
                 regions.InterfaceTransfer(
                     graph.ports[i],
                     graph.ports[j],
-                    guard,
+                    activation,
                     witness is not None,
                     witness.projections if witness is not None else (graph,),
                 )
@@ -450,6 +420,7 @@ class _Composer:
         return tuple(entries)
 
     def _local_arcs(self, region, ports, own, interfaces, *, stream):
+        scope = self.activations.region(region)
         index = {port_key(port): i for i, port in enumerate(ports)}
         arcs = []
         for notification in own:
@@ -482,7 +453,11 @@ class _Composer:
                     if not self.conditions.impossible(guard.comparisons):
                         arcs.append(
                             regions.GuardedTransfer(
-                                a, b, 0, guard, "selected effect before its matching actual Wait"
+                                a,
+                                b,
+                                0,
+                                scope.guard(guard),
+                                "selected effect before its matching actual Wait",
                             )
                         )
         for interface in interfaces:
@@ -499,7 +474,7 @@ class _Composer:
                             index[port_key(a)],
                             index[port_key(b)],
                             0,
-                            relation.guard,
+                            relation.activation,
                             "actual child queue interface",
                             relation.exact,
                             relation.projections,
@@ -529,7 +504,7 @@ class _Composer:
                                 wi,
                                 si,
                                 steps,
-                                guard,
+                                scope.guard(guard),
                                 "actual controller admission gate"
                                 if self.endpoints.controller(wait)
                                 else f"actual {wait.engine.value} queue admission gate",
@@ -540,10 +515,18 @@ class _Composer:
 
     @staticmethod
     def _unique_arcs(arcs):
-        # Equal actual relations are one structural edge, not distinct paths.
+        # Keep distinct proof provenance even when the may-edge is equal.
         unique = {}
         for arc in arcs:
-            unique.setdefault((arc.source, arc.destination, arc.steps, arc.guard), arc)
+            key = (
+                arc.source,
+                arc.destination,
+                arc.steps,
+                arc.activation,
+                arc.exact,
+                tuple(id(projection) for projection in arc.projections),
+            )
+            unique.setdefault(key, arc)
         return tuple(unique.values())
 
     def compose(self, region):

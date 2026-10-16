@@ -8,6 +8,7 @@ records and identity helpers perform no composition, rank or condition proof.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from xdsl.ir import Operation
 
@@ -16,6 +17,9 @@ from ..target.ascend910b import Actor, Engine
 from .event_domains import EventCase
 from .structured_protocols import BoundPlacement, LogicalNotification
 from .structured_schedule import ActionGuard
+
+if TYPE_CHECKING:
+    from .progress_activations import Activation
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +48,7 @@ class GuardedTransfer:
     source: int
     destination: int
     steps: int
-    guard: ActionGuard
+    activation: Activation
     reason: str
     exact: bool = True
     projections: tuple = ()
@@ -53,7 +57,7 @@ class GuardedTransfer:
 @dataclass(frozen=True, slots=True)
 class ExcludedCycle:
     relations: tuple[int, ...]
-    condition: ActionGuard
+    condition: Activation
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +75,7 @@ class QueueCut:
 class InterfaceTransfer:
     source: ProgressPort | QueueCut
     destination: ProgressPort | QueueCut
-    guard: ActionGuard
+    activation: Activation
     exact: bool
     projections: tuple
 

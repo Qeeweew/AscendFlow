@@ -152,8 +152,12 @@ class ResourceWork:
     assigned_cross_ids: int = 0
     progress_points: int = 0
     progress_arcs: int = 0
-    progress_path_combinations: int = 0
-    progress_path_alternatives: int = 0
+    progress_formula_nodes: int = 0
+    progress_formula_operations: int = 0
+    progress_formula_work: int = 0
+    progress_formula_queries: int = 0
+    progress_formula_query_states: int = 0
+    progress_formula_query_hits: int = 0
     progress_case_branches: int = 0
     progress_condition_sets: int = 0
     progress_condition_queries: int = 0

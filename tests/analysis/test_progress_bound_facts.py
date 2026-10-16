@@ -253,9 +253,10 @@ def test_progress_retains_each_unknown_native_order_clause(conditional_order_dom
         }
         before = native, Actor.AIV0, ((outer, p), (inner, i))
         after = native, Actor.AIV0, ((outer, q), (inner, j))
-        assert sum(arc.guard.evaluate(context) for arc in arcs) == int(
+        assert sum(arc.activation.evaluate(context) for arc in arcs) == int(
             positions[before] <= positions[after]
         )
     assert all(
-        not arc.guard.evaluate({"n": 0, "m": 2, "p": 0, "q": 0, "i": 0, "j": 0}) for arc in arcs
+        not arc.activation.evaluate({"n": 0, "m": 2, "p": 0, "q": 0, "i": 0, "j": 0})
+        for arc in arcs
     )

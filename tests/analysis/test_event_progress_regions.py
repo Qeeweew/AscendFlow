@@ -449,9 +449,9 @@ def test_prologue_stream_epilogue_keeps_two_separate_progress_certificates():
     (bridge,) = child.relations
     assert child.ports[bridge.source].notification.name == "startup"
     assert child.ports[bridge.destination].notification.name == "finish"
-    assert not bridge.guard.evaluate({"n": 0, "$group": 0, "$sid": 0})
+    assert not bridge.activation.evaluate({"n": 0, "$group": 0, "$sid": 0})
     for count in (1, 2, 5):
-        assert bridge.guard.evaluate({"n": count, "$group": 0, "$sid": 0})
+        assert bridge.activation.evaluate({"n": count, "$group": 0, "$sid": 0})
 
 
 def test_finite_startup_cannot_wait_for_publication_blocked_by_the_owned_stream():

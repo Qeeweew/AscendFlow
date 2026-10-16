@@ -1,35 +1,32 @@
-"""Sparse Boolean path composition for one owned progress region.
+"""Sparse factored Boolean paths for one owned progress region.
 
-The caller owns alternative absorption, condition proofs and their budgets.
-This container only joins ordered conjunctions at a shared graph node. It
-does not project clocks or change any progress step/exactness contract.
+The activation scope owns formula composition, mathematical proofs and budgets.
+This container charges its graph visits to that same scope. It does not project
+clocks or change any progress step/exactness contract.
 """
 
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 
-from .structured_schedule import ActionGuard, Comparison
-
-GuardAlternatives = dict[frozenset[Comparison], ActionGuard]
-AlternativeOwner = Callable[[GuardAlternatives, ActionGuard], None]
+from .progress_activations import Activation, ActivationScope
 
 
 class RegionConnectivity:
     """Nonempty directed paths whose internal nodes have been eliminated.
 
     There is no implicit zero-length relation, including on the diagonal.
-    Neighbor and output traversal follows node index order. The owner callback
-    receives every insertion or path combination, including a duplicate which
-    it may absorb, and retains the ordered witnesses in each alternatives map.
+    Neighbor and output traversal follows node index order. Each endpoint pair
+    stores one activation root; joining a path never distributes AND over OR.
     """
 
-    def __init__(self, size: int, add_alternative: AlternativeOwner):
+    def __init__(self, size: int, scope: ActivationScope):
         if type(size) is not int or size < 0:
             raise ValueError("region connectivity size must be a nonnegative integer")
         self._size = size
         self._active = set(range(size))
-        self._outgoing: dict[int, dict[int, GuardAlternatives]] = {}
+        self._outgoing: dict[int, dict[int, Activation]] = {}
         self._incoming: dict[int, set[int]] = {}
-        self._add_alternative = add_alternative
+        self._scope = scope
+        self._false = scope.false
 
     @property
     def active(self) -> frozenset[int]:
@@ -45,6 +42,7 @@ class RegionConnectivity:
             raise ValueError("region connectivity node has been eliminated")
 
     def _disconnect(self, source: int, destination: int):
+        self._scope.charge("progress relation removal")
         outgoing = self._outgoing[source]
         del outgoing[destination]
         if not outgoing:
@@ -54,26 +52,23 @@ class RegionConnectivity:
         if not incoming:
             del self._incoming[destination]
 
-    def add(self, source: int, destination: int, guard: ActionGuard):
+    def add(self, source: int, destination: int, activation: Activation):
         self._active_node(source)
         self._active_node(destination)
-        alternatives = self._outgoing.get(source, {}).get(destination)
-        if alternatives is None:
-            alternatives = {}
-            self._add_alternative(alternatives, guard)
-            if alternatives:
-                self._outgoing.setdefault(source, {})[destination] = alternatives
-                self._incoming.setdefault(destination, set()).add(source)
-        else:
-            self._add_alternative(alternatives, guard)
-            if not alternatives:
-                self._disconnect(source, destination)
+        self._scope.charge("progress relation insertion")
+        previous = self._outgoing.get(source, {}).get(destination, self._false)
+        combined = self._scope.any_of(previous, activation)
+        if combined is self._false:
+            return
+        self._outgoing.setdefault(source, {})[destination] = combined
+        self._incoming.setdefault(destination, set()).add(source)
 
-    def alternatives(self, source: int, destination: int) -> tuple[ActionGuard, ...]:
-        """Return ordered witnesses; an eliminated endpoint has no relation."""
+    def relation(self, source: int, destination: int) -> Activation:
+        """Return false when the pair is absent or an endpoint was eliminated."""
         self._node(source)
         self._node(destination)
-        return tuple(self._outgoing.get(source, {}).get(destination, {}).values())
+        self._scope.charge("progress relation lookup")
+        return self._outgoing.get(source, {}).get(destination, self._false)
 
     def eliminate(self, nodes: Iterable[int]):
         """Remove nodes after composing only their active predecessors/successors.
@@ -89,41 +84,41 @@ class RegionConnectivity:
         for node in selected:
             if node not in self._active:
                 continue
+            self._scope.charge("progress vertex elimination")
+            incoming = self._incoming.get(node, ())
+            outgoing = self._outgoing.get(node, {})
+            if incoming:
+                self._scope.charge("progress predecessor snapshot", len(incoming))
+            if outgoing:
+                self._scope.charge("progress successor snapshot", len(outgoing))
             predecessors = tuple(
-                (source, self.alternatives(source, node))
-                for source in sorted(self._incoming.get(node, ()))
+                (source, self._outgoing[source][node])
+                for source in sorted(incoming)
                 if source != node
             )
             successors = tuple(
-                (destination, self.alternatives(node, destination))
-                for destination in sorted(self._outgoing.get(node, ()))
+                (destination, outgoing[destination])
+                for destination in sorted(outgoing)
                 if destination != node
             )
             for source, left in predecessors:
                 for destination, right in successors:
-                    for before in left:
-                        for after in right:
-                            self.add(
-                                source,
-                                destination,
-                                ActionGuard(
-                                    tuple(dict.fromkeys(before.comparisons + after.comparisons))
-                                ),
-                            )
+                    self.add(source, destination, self._scope.all_of(left, right))
             for source in sorted(self._incoming.get(node, ())):
                 self._disconnect(source, node)
             for destination in sorted(self._outgoing.get(node, ())):
                 self._disconnect(node, destination)
             self._active.remove(node)
 
-    def retained(self, boundary: Iterable[int]) -> Iterator[tuple[int, int, ActionGuard]]:
+    def retained(self, boundary: Iterable[int]) -> Iterator[tuple[int, int, Activation]]:
         """Yield only stored relations between the requested active nodes."""
         selected = sorted(set(boundary))
         for node in selected:
             self._active_node(node)
         members = set(selected)
         for source in selected:
+            self._scope.charge("progress boundary source traversal")
             for destination in sorted(self._outgoing.get(source, ())):
+                self._scope.charge("progress boundary relation traversal")
                 if destination in members:
-                    for guard in self.alternatives(source, destination):
-                        yield source, destination, guard
+                    yield source, destination, self._outgoing[source][destination]

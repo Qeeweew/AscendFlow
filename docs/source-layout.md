@@ -31,6 +31,7 @@
 | 事件生命周期 | `analysis/event_lifetimes.py`、`structured_event_sharing.py` | 消费到复用、有限子循环再次调用和有证据的 ID 共享 |
 | 区域进展合同 | `analysis/progress_regions.py` | 端口、绑定、queue cut 和带条件关系；不执行证明 |
 | 条件事实 | `analysis/progress_conditions.py` | 一次进展分析内的数学合取与矛盾答案；不改变有序执行 guard |
+| 激活公式 | `analysis/progress_activations.py` | 共享固定二元 AND/OR、保序 guard 叶子、按需反驳与分支、统一 region 工作预算 |
 | 端点与顺序事实 | `analysis/progress_endpoints.py` | 完整端点绑定、父调用身份、实际队列关系与stream步长下界；不组合区域图 |
 | 区域连通关系 | `analysis/progress_connectivity.py` | 稀疏的有条件路径组合与内部节点消去；不解释执行引擎或循环时钟 |
 | 循环进展证明 | `analysis/progress_ranks.py` | stream rank、独立 SCC 条件分支与有限环排除；消费共享条件事实 |
@@ -47,7 +48,7 @@
 
 资源阶段拆开事实、生命周期、进展和分配，共享一次建立的 `EventDomains`。实际端点的条件队列顺序也由它建立，lease和sharing不重新解释stage/词法位置。`event_paths`依赖纯数学的`guard_cover`，反向依赖禁止。进展区分内部 stream rank 与对外 queue/阻塞接口；子层 native 留在本地 witness，完整嵌套功能资格仍见状态页。
 
-进展编排为一次调用持有一个 `ProgressConditions`；端点、rank 与区域组合共用它。`ProgressEndpoints` 拥有原端点绑定和父调用事实，其接口返回真实条件或保守步长下界；编排器只消费这些关系。数学谓词集合与原始有序 `ActionGuard` 分开，不能用集合排序改写执行短路顺序。连通容器只存实际关系，消去节点时只组合仍活跃的前驱与后继，随后删除该节点及入出边。原 dense 矩阵、`_Composer` 中的端点/rank 实现和旧类型出口已经删除，测试直接使用各职责模块，不保留转发 alias。
+进展编排为一次调用持有 `ProgressConditions` 与 `ProgressActivations`；端点、rank 与区域组合共用这些事实。`ProgressEndpoints` 拥有原端点绑定和父调用事实，其接口返回真实条件或保守步长下界；编排器只消费这些关系。数学谓词集合与原始有序 `ActionGuard` 分开，不能用集合排序改写执行短路顺序。连通容器每对端点只存一个共享 AND/OR 根，消去节点时只组合仍活跃的前驱与后继，随后删除该节点及入出边。旧 DNF 条件列表、笛卡尔积、组合回调及旧计数已直接删除；公式的实际 guard 叶子随两端一起重绑定，exact/projection 证据独立保留。原 dense 矩阵、`_Composer` 中的端点/rank 实现和旧类型出口已经删除，测试直接使用各职责模块，不保留转发 alias。
 
 同流水fence只保留选择阶段建立的capture覆盖及端点准入，不进入binary event的case/window/lease构造。分配器按它的原consumer guard发射；该职责拆分不增加或移除实际需要执行的fence。
 

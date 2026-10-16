@@ -142,13 +142,17 @@ def test_ordinary_vector_wait_does_not_block_the_outer_mte3_publication():
         and (relation.destination.phase, relation.destination.engine) == ("output", Engine.V)
     ]
     assert routes and all(not relation.exact for relation in routes)
-    assert any(relation.guard.evaluate({"n": 1, "$group": 0, "$sid": 0}) for relation in routes)
-    assert all(not relation.guard.evaluate({"n": 0, "$group": 0, "$sid": 0}) for relation in routes)
+    assert any(
+        relation.activation.evaluate({"n": 1, "$group": 0, "$sid": 0}) for relation in routes
+    )
+    assert all(
+        not relation.activation.evaluate({"n": 0, "$group": 0, "$sid": 0}) for relation in routes
+    )
     assert all(
         not (
             isinstance(relation.destination, QueueCut)
             and relation.destination.engine is None
-            and relation.guard.evaluate({"n": 1, "$group": 0, "$sid": 0})
+            and relation.activation.evaluate({"n": 1, "$group": 0, "$sid": 0})
         )
         for relation in interface.relations
     )
@@ -208,7 +212,7 @@ def test_mode2_interface_keeps_each_actual_vector_participant(reverse):
         and relation.source.phase == "input"
         and relation.destination.phase == "output"
         and relation.destination.engine is None
-        and relation.guard.evaluate({"n": 1, "$group": 0, "$sid": 0})
+        and relation.activation.evaluate({"n": 1, "$group": 0, "$sid": 0})
     ]
     actual_routes = {
         (relation.source.actor, relation.source.engine, relation.destination.actor)
@@ -222,7 +226,7 @@ def test_mode2_interface_keeps_each_actual_vector_participant(reverse):
     assert expected <= actual_routes
     assert all(not relation.exact for relation in relations)
     assert all(
-        not relation.guard.evaluate({"n": 0, "$group": 0, "$sid": 0}) for relation in relations
+        not relation.activation.evaluate({"n": 0, "$group": 0, "$sid": 0}) for relation in relations
     )
 
 
@@ -241,7 +245,7 @@ def test_child_interface_cannot_identify_two_distinct_parent_invocations():
         context = {"n": 3, "$group": 0, "$sid": 0, ordinal.args[0]: invocation}
         assert consumer.evaluate(context) - source.evaluate(context) == 1
         assert all(
-            not relation.guard.evaluate(context)
+            not relation.activation.evaluate(context)
             for relation in child.interface.relations
             if isinstance(relation.source, ProgressPort)
             and isinstance(relation.destination, ProgressPort)
