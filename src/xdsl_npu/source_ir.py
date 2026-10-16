@@ -572,6 +572,26 @@ class ElementOp(IRDLOperation):
             raise VerifyException("arithmetic currently requires explicit f32 operands")
 
 
+def block8_reduction_widths(columns: int) -> tuple[int, ...]:
+    """Exact packed planes for block8 stages followed by one native merge.
+
+    Each existing block8 native consumes complete 64-element repeats. Its
+    output rows must remain 32-byte aligned for the next stage and merge;
+    padding or a different reduction tree must be selected explicitly.
+    """
+    widths = []
+    while True:
+        if columns < 64 or columns > 4096 or columns % 64:
+            raise VerifyException(
+                "block8 reduction stages require whole 64-element repeats "
+                "and 32-byte aligned partial rows"
+            )
+        columns //= 8
+        widths.append(columns)
+        if columns <= 64:
+            return tuple(widths)
+
+
 @irdl_op_definition
 class ReduceOp(IRDLOperation):
     name = "npu_source.reduce"
@@ -595,22 +615,29 @@ class ReduceOp(IRDLOperation):
         cols = shape[-1]
         if cols < 64 or cols > 4096 or cols % 64:
             raise VerifyException("reduction needs 64-aligned columns in [64,4096]")
-        packed = self.order.data == "r64_then_packed_merge"
+        if self.kind.data not in {"sum", "max"} or self.order.data not in {
+            "r64_then_native_merge",
+            "r64_then_packed_merge",
+            "block8_then_packed_merge",
+        }:
+            raise VerifyException("reduction requires an explicit supported order")
+        block8 = self.order.data == "block8_then_packed_merge"
+        packed = block8 or self.order.data == "r64_then_packed_merge"
         result_shape = shape[:-1] if packed else (*shape[:-1], 1)
         if packed and len(shape) != 2:
             raise VerifyException("packed reduction requires a matrix")
+        scratch_shape = (
+            (shape[0] * sum(block8_reduction_widths(cols)),)
+            if block8
+            else (*shape[:-1], cols // 64)
+        )
         if (
-            tuple(n.data for n in self.scratch.type.shape) != (*shape[:-1], cols // 64)
+            tuple(n.data for n in self.scratch.type.shape) != scratch_shape
             or tuple(n.data for n in self.destination.type.shape) != result_shape
         ):
             raise VerifyException(
                 "reduction scratch/result must expose exact partial/statistic shapes"
             )
-        if self.kind.data not in {"sum", "max"} or self.order.data not in {
-            "r64_then_native_merge",
-            "r64_then_packed_merge",
-        }:
-            raise VerifyException("reduction requires an explicit supported order")
         if any(
             v.type.memory.data != "UB" or v.type.dtype.data != "f32"
             for v in (self.source, self.scratch, self.destination)

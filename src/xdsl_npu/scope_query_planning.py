@@ -79,6 +79,43 @@ def _candidates(checks):
     return result
 
 
+def _query_width(parent, copies, candidate, maximum_width, memory_queries):
+    """Try one actual ID before enlarging its static reuse proof window."""
+    # The last represented query's outgoing Set is real under the outer
+    # existence guard, even if its consumer is outside the proof window.
+    proof = QueryCompletion(parent, copies=max(copies, candidate.target.query + 1))
+    actor = candidate.source.site.task[0]
+    source = QueryEvent(
+        candidate.target.query, actor, candidate.name, "wait", candidate.target.parent
+    )
+
+    def reuse_query(width):
+        return (
+            source,
+            QueryEvent(width, actor, candidate.name, "set", candidate.source.parent),
+            candidate.domain,
+        )
+
+    # check_memory already validated every prepared allocation identity.
+    # Keep its exact request order, registering all origins in one batch.
+    single, *answers = proof.covered_many((reuse_query(1), *memory_queries))
+    if single:
+        return 1, answers, 1
+    require(
+        maximum_width > 1,
+        f"{candidate.name}: available event widths cannot prove old Wait before re-Set",
+    )
+    if proof.copies < maximum_width + 1:
+        proof = QueryCompletion(parent, copies=maximum_width + 1)
+    resources = tuple(reuse_query(width) for width in range(2, maximum_width + 1))
+    covered = proof.covered_many(resources)
+    require(
+        any(covered),
+        f"{candidate.name}: available event widths cannot prove old Wait before re-Set",
+    )
+    return covered.index(True) + 2, answers, maximum_width
+
+
 @bounded
 def plan_query_memory(checked, parent) -> QueryMemoryPlan:
     """Materialize actual local protocols, then prove the new ID rotation.
@@ -102,6 +139,7 @@ def plan_query_memory(checked, parent) -> QueryMemoryPlan:
     copies = len(checked.query_summary.parts)
     initial = QueryCompletion(parent, copies=copies)
     answers = check_memory(checks, initial)
+    memory_queries = tuple((check.source, check.target, check.domain) for check in checks)
     validity = {
         (check.source, check.target, check.domain): valid
         for check, valid in zip(checks, answers, strict=True)
@@ -152,30 +190,10 @@ def plan_query_memory(checked, parent) -> QueryMemoryPlan:
         require(free, f"{resource}: query release has no free binary event ID")
         candidate = replace(candidate, ids=(free[0],))
         install_query_protocols(checked.program, checked.access, (candidate,))
-        # The last represented query's outgoing Set is real under the outer
-        # existence guard, even if its consumer is outside the proof window.
-        proof = QueryCompletion(
-            parent, copies=max(copies, candidate.target.query + 1, len(free) + 1)
+        width, answers, attempted = _query_width(
+            parent, copies, candidate, len(free), memory_queries
         )
-        actor = candidate.source.site.task[0]
-        source = QueryEvent(
-            candidate.target.query, actor, candidate.name, "wait", candidate.target.parent
-        )
-        resources = tuple(
-            (
-                source,
-                QueryEvent(width, actor, candidate.name, "set", candidate.source.parent),
-                candidate.domain,
-            )
-            for width in range(1, len(free) + 1)
-        )
-        covered = proof.covered_many(resources)
-        reuse_checks += len(resources)
-        require(
-            any(covered),
-            f"{candidate.name}: available event widths cannot prove old Wait before re-Set",
-        )
-        width = covered.index(True) + 1
+        reuse_checks += attempted
         candidate = replace(candidate, ids=free[:width])
         declaration = next(
             op
@@ -185,10 +203,9 @@ def plan_query_memory(checked, parent) -> QueryMemoryPlan:
         declaration.attributes["event_ids"] = ArrayAttr(IntAttr(i) for i in candidate.ids)
         selected.append(candidate)
         used[resource].update(candidate.ids)
-        # Batch all remaining memory origins after a real graph change, never
-        # rebuild/propagate merely to skip another already-covered candidate.
-        current = QueryCompletion(parent, copies=copies)
-        answers = check_memory(checks, current)
+        # ID rotation adds no completion edges. The small-window memory
+        # answers survive this ID-only update; do not use its stale snapshot.
+        # Final verification independently rebuilds the actual resource proof.
         validity = {
             (check.source, check.target, check.domain): valid
             for check, valid in zip(checks, answers, strict=True)

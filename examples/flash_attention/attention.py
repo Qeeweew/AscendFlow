@@ -59,7 +59,8 @@ def attention_target(
         l = N.alloc_ub((BQ // 2,), N.f32)
         o = N.alloc_ub((BQ // 2, D), N.f32)
         alpha = N.alloc_ub((2, BQ // 2), N.f32)
-        partial = N.alloc_ub((VR, BK // 64), N.f32)
+        # Independent block8 planes; the final packed merge reads the last one.
+        partial = N.alloc_ub((VR * (BK // 8 + (BK // 64 if BK > 512 else 0)),), N.f32)
         next_m = N.alloc_ub((VR,), N.f32)
         row_sum = N.alloc_ub((VR,), N.f32)
         ones = N.alloc_ub((VR,), N.f32)
@@ -122,7 +123,7 @@ def attention_target(
                                 axis=1,
                                 out=next_m,
                                 scratch=partial,
-                                order="r64_then_packed_merge",
+                                order="block8_then_packed_merge",
                             )
                             N.maximum(m[r : r + VR], next_m, out=next_m)
                             N.sub(m[r : r + VR], next_m, out=alpha[s, r : r + VR])
@@ -136,7 +137,7 @@ def attention_target(
                                 axis=1,
                                 out=row_sum,
                                 scratch=partial,
-                                order="r64_then_packed_merge",
+                                order="block8_then_packed_merge",
                             )
                             N.mul(l[r : r + VR], alpha[s, r : r + VR], out=l[r : r + VR])
                             N.add(l[r : r + VR], row_sum, out=l[r : r + VR])

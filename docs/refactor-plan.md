@@ -6,14 +6,17 @@
 
 ## 1. 先降低真实编译成本
 
-本次完整FA源码到ASC为169.10秒，其中规划111.71秒、最终独立检查54.51秒。
-这不是Python按Sq/Sk展开：运行时长度仍为SSA变量，72个native模板、12个call固定。
-主要成本来自父子投影、条件完成事实与规划期间重复建立parent proof。
+最新完整FA源码到ASC为128.96秒，其中规划75.14秒、最终独立检查50.95秒；
+此前为169.10秒。运行时Sq/Sk仍为SSA变量，当前76个native模板、12个call固定。
+规划前重复parent验证已删除，新query单ID检查也不再直接建立最大窗口。
+最终独立检查保留，当前主要剩余成本是静态条件完成事实的传播与包含扫描。
 
 下一步按以下顺序修改，逐项保留同步指令、物理访问和buffer布局等价证据：
 
-1. 让规划阶段交还已经建立的访问/leaf/协议结果，避免为了进入query层完整执行一遍
-   `_verify_scope_parent`。最终verifier仍从实际IR独立重建，规划缓存不作安全凭据。
+1. 在单个flow/node保存已接受origin bits的并集；全新且完全不相交的bits无需扫描
+   其他记录的包含关系。有交集仍走原算法，不能合并domain或扩大coverage。
+   先测独立origin在不同静态位置汇入同一node的反例：当前比较m(m-1)，目标消除
+   这类无关扫描；保留大整数bitset字长成本。此项目前仅有方案，FA实际收益待测。
 2. 合并同次分析中完全相同的静态工作：本次boundary transfer已由4503个cells共享667个
    唯一effect序列；继续检查projection及condition事实表示，不跨不同domain合并路径。
 3. 按源/目标实际端点批量登记查询，不逐byte传播；每次真正插入协议后才更新完成关系。
@@ -27,12 +30,14 @@
 
 起点固定B1/H8/Hkv8/Sq=Sk4096/D128/f16。必须保留实际DSL/IR/ASC/库hash、CANN选项、
 设备及输入、计时与缓存口径，三批generated/独立AscendC/ACLNN交替profiling。
-初测stream间隔约1143/1195/516µs，不用它替代device task时间或宣称无性能损失。
+block8分层归约已接通真实DSL并完成三批验证：device task中位时间为
+825.44/1194.27/512.21µs，较旧R64降低27.8%，仍慢于ACLNN61.2%。
+Vector活动已由698.11降至380.45µs；继续优化前要核对CV时间线，不仅比较指令数。
 
 源码依据为ops-transformer `4bbfb3b2bccceb2a1b80828d04eee915169a2b2e` 的arch22，
 不是950路径或安装版ACLNN的已知构建提交。已确认的差异包括：
 
-- 当前显式R64→packed merge/BRCB/8行输出更新；上游SoftmaxFlashV2历史量每行8份，
+- 当前显式block8→packed merge/BRCB/8行输出更新；上游SoftmaxFlashV2历史量每行8份，
   D128 Vec2按64行、直接Div。先检查Vector活动与生成指令，按UB容量和真实读写寿命选块。
 - 当前AIV update→softmax、serial query；上游Vec1→Vec2、taskId跨query连续。
   派发尾部不等于硬件drain，需时间线判定重叠损失。
@@ -45,6 +50,10 @@ P/O舍入边界及递推状态更新顺序仍须保留。不得按算子名、sh
 条件峰值/理想下界单列，pipe活动不能相加，GM请求量不是实测HBM流量。
 超过ACLNN 5%仍为失败/继续调查线；三批波动交叠则记未决。
 
+下一候选先审查example的Vector issue顺序：上游先Vec1再Vec2，而本例先update再softmax。
+通过时间线判断旧PV等待是否阻碍新softmax/P就绪，再决定是否改源码政策；
+不得绕过alpha双槽和最后读取、增添buffer、或直接复制一张手工event表。
+
 ## 3. 继续完善通用同步与ASC表达
 
 - 已接通query内存/已有parent-child事件/跨核counter强边界反馈。新query协议当前仅local；
@@ -53,8 +62,8 @@ P/O舍入边界及递推状态更新顺序仍须保留。不得按算子名、sh
   先证明通知寿命的可共享区间或连续ordinal，再改分配；不添全局barrier、buffer或drain。
 - 专家排步和自动生成继续共用实际IR verifier。逻辑RAW、物理alias、异步完成、最后reader、
   event消费及退休分别保留；Scope/Query/child三种同步在实际native旁统一按IR顺序检查和输出。
-- 通用纯整数canonicalize/CSE已接入；query短count case现按端点等价证明合并，FA新增ID为常量6。
-  仍有capture `/1`等表达冗余，后续在公共表达式IR/范围规则处理，不改ASC字符串。
+- 通用纯整数canonicalize/CSE已接入；query短count case按端点等价证明合并，FA新增ID为常量6。
+  capture `/1`已在Expr结构渲染中消除且保留合法域证明；其他冗余继续按公共规则处理。
 - 统一编译产物的结构化ABI元数据，避免launcher物理参数顺序与DSL形式参数不同导致调用者猜测。
 
 ## 4. Attention变体按真实合同逐项接入

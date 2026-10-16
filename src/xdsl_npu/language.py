@@ -1064,10 +1064,18 @@ def _reduce(kind, source, *, axis, out, scratch, order):
 
 
 def reduce_sum(source, *, axis, out, scratch, order):
+    """Reduce f32 rows using an explicit tree and caller-owned scratch.
+
+    ``block8_then_packed_merge`` uses a one-dimensional workspace containing
+    consecutive, disjoint block8 output planes, then writes compact row sums.
+    Every stage requires complete 64-element repeats and aligned partial rows.
+    This order changes the FP32 sum tree; it does not promise a speedup.
+    """
     return _reduce("sum", source, axis=axis, out=out, scratch=scratch, order=order)
 
 
 def reduce_max(source, *, axis, out, scratch, order):
+    """Reduce f32 rows with the same explicit scratch/tree contract as reduce_sum."""
     return _reduce("max", source, axis=axis, out=out, scratch=scratch, order=order)
 
 

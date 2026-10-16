@@ -36,6 +36,29 @@ partial行的32字节对齐padding由例子显式分配，再传精确view。D64
 R是8的倍数、D是64的倍数且≤1024，还要满足UB容量。tail、一般广播和完整
 nested CV不在本轮支持范围。
 
+## 显式 block8 分层归约
+
+`N.reduce_sum/max(x, axis=1, out=statistic, scratch=workspace,
+order="block8_then_packed_merge")` 是独立可选顺序，输出仍为紧凑的 `(R,)`
+统计量。`workspace` 必须是显式一维 f32 UB view；每级的列宽为上一级的八分之一，
+直到列宽不超过64，再进行一次 packed merge。每级输入必须满足现有 native 的
+完整64元素 repeat 合同，结果行必须32字节对齐。不满足整除和对齐条件的宽度
+直接拒绝，不隐式padding或切回R64顺序。
+
+workspace 按级依次保存完整连续平面，大小恰为 `R * sum(level_widths)` 个f32。
+例如8×1024的级宽为128、16，需要1152个f32：前4096B保存8×128，后512B保存
+8×16；最后读512B并写32B统计量。各级读写区域独立，不放宽收缩原地别名约束，
+也不隐藏分配、复制或额外GM访问。与原512B partial相比，此例scratch增加4096B。
+输入最后reader为第一级，结果producer为最终merge；内部RAW、跨代scratch复用
+以及borrowed value检查均经过原有同步与最终验证。
+
+该候选根据CANN9.1/2201的分层BlockReduce实现选择八元素归约；它改变FP32 sum树。
+以8×1024为例，两个block8阶段各覆盖128、16次repeat，再接8次whole merge，
+不能按ASC调用数宣称更快。通用宽度的Python/IR反例已覆盖sum/max、精确scratch、
+输入最后reader、别名和删除必要同步；默认FA已接入并单独完成CANN及设备验证，
+具体证据见[Attention性能](attention-performance.md)。本页下面的历史normalization数据
+不属于新block8顺序，其他宽度也没有由FA的设备结果取得性能结论。
+
 ## 测量结果
 
 Ascend910B3/dav-2201，物理1→逻辑0，每进程检查全部八卡的健康、进程、HBM、

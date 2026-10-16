@@ -24,14 +24,15 @@ ASC、CANN 9.1 / `dav-2201` 构建和下表设备数值检查。这里没有使�
 | 512 | 2048 | 3.0517578125e-5 |
 
 四点数值检查均通过 `rtol=0.002, atol=0.0002`，同时检查输入不变及所有分配的
-保护区。记录位于工作区 `runs/refactor/query-boundaries/fa-build/device/correctness.json`；
-相邻目录保留 source/物理 IR、ASC、验证报告及 CANN 产物。
-这些记录不构成设备性能达标证据，也不据此扩展其他长度或 constexpr 变体的验证范围。
+保护区。最新block8记录位于工作区 `runs/refactor/compile-vector/device/correctness.json`，
+构建在相邻`block8-build/`，含实际source/物理IR、ASC、最终验证和CANN产物。
+同一binary还通过4K/8K采样检查（每head每query tile采样6行，非全输出oracle）；
+512×2048的uniform和sharp做全输出检查，最大绝对误差分别为0和2.4414e-4。
+这些数值记录不构成性能达标证据，也不扩展其他constexpr变体的验证范围。
 
-迁入 example 后，仅重新运行 frontend/lowering 与保存产物比较：source IR 和
-`fa-build/before.xdsl` 均逐字节相同。物理 IR 为 169421 字节，SHA256：
-`969513f3a632a8a0aa612468dd1d94dd95d73bf91cc1ebd7a94f8b35d04a3b66`。
-迁移没有重新规划或重新运行 CANN。
+历史R64基线保留在`runs/refactor/query-boundaries/`。当前候选完整重建及设备复验，
+不沿用历史库。最终ASC与基线的搬运、MAD及带条件event语句逐字节相同，
+差异包含显式归约、scratch位置、对应Vector流水同步及capture `/1`化简。
 
 ## 数学与流水政策
 
@@ -44,8 +45,10 @@ ASC、CANN 9.1 / `dav-2201` 构建和下表设备数值检查。这里没有使�
 每个逻辑 BK 的 QK 输出为 FP32，经过 scale、行最大值与在线 max/sum 更新。
 denominator 使用未舍入的 p32；P 显式 RN 到 f16，再按 CK128 顺序累计 PV。
 O 在 FP32 中独立 rescale/add，最后执行 `1/l`、乘 O、RN 到 f16。
-现有例子采用 R64 partial 后 packed merge，广播 scratch 明确可见。这里不要求
-FP32 归约与 BLAS 位级相同，也没有将 softmax 缩小到每个 CK。
+现有例子采用显式 `block8_then_packed_merge`：默认8×1024依次归约为8×128、
+8×16及紧凑8个统计量。两级平面在同一显式scratch的独立区间，共4608B；
+每AIV总UB为182400B。广播scratch也明确可见。FP32归约不要求与BLAS位级相同，
+P/O舍入位置及在线更新顺序不变，也没有将softmax缩小到每个CK。
 
 QK child 的实际派发顺序为 load/MAD/operand/FIX，PV child 为
 load/MAD/operand；后者循环外只做一次 FIX。这保持现有 L0 operand 槽位与

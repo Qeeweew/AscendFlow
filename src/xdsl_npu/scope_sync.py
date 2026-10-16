@@ -54,6 +54,17 @@ class CheckedScopes:
     query_report: dict | None = None
 
 
+@dataclass(frozen=True)
+class PlanningScopes:
+    """Owned planning inputs, without a final memory/resource/progress gate."""
+
+    program: object
+    analyses: dict
+    access: object
+    channels: dict[str, ScopeProtocol]
+    query_summary: object | None = None
+
+
 def _ints(values):
     return ArrayAttr(IntAttr(value) for value in values)
 
@@ -605,6 +616,15 @@ def _scope_access(program):
     return access
 
 
+def _query_boundary_summary(program, access):
+    if not program.invocations:
+        return None, ()
+    from .scope_query_summary import query_native_sites, summarize_queries
+
+    summary = summarize_queries(program, access)
+    return summary, query_native_sites(summary, access)
+
+
 def _scope_requirements(access):
     """Keep conditional retirement clauses separate from ordinary protocols."""
     ordinary, guarded = [], {}
@@ -835,16 +855,15 @@ def autosync_scopes(module, *, _capture=None):
         "nested AutoSync requires unsynchronized physical calls",
     )
     program = extract_scopes(result)
-    _plan_scope_parent(program)
+    planning, parent = _plan_scope_parent(program)
     if program.invocations:
         from .scope_query_planning import plan_query_memory
 
-        _, checked, parent = _verify_scope_parent(extract_scopes(result))
-        plan_query_memory(checked, parent)
+        plan_query_memory(planning, parent)
     return _finish(result, _capture=_capture)
 
 
-def _plan_scope_parent(program):
+def _plan_scope_parent(program) -> tuple[PlanningScopes, ParentCompletion]:
     """Install child/parent protocols in an owned actual program.
 
     This composes one invocation only. Query normalization retains the outer
@@ -885,9 +904,10 @@ def _plan_scope_parent(program):
     program = extract_scopes(result)
     access = _scope_access(program)
     _, analyses = _analyses(program)
+    query_summary, boundary_sites = _query_boundary_summary(program, access)
     candidates = _scope_requirements(access)
     period = _scope_period(access, (p for p, _ in candidates))
-    proof = ParentCompletion(program, analyses, access, period)
+    proof = ParentCompletion(program, analyses, access, period, boundary_sites=boundary_sites)
     # For one acquire, try the required latest producer capture before earlier
     # ones; only the already selected actual protocols establish coverage.
     tasks = {(a, t.uid): t for a, d in access.loop.actors.items() for t in d.program.tasks}
@@ -936,6 +956,7 @@ def _plan_scope_parent(program):
                 "first/last native protocols do not cover the complete access span",
             )
     proof.graph.potential()
+    selected_proof = proof
     proof, used = _allocate_child_resources(program, analyses, access, proof, selected)
     from .scope_event_pools import allocate_parent_pools
 
@@ -952,7 +973,42 @@ def _plan_scope_parent(program):
         else:
             ids = p.ids
         allocated.append(replace(p, ids=ids))
+    require(
+        len(proof.protocols) == len(allocated)
+        and all(
+            replace(before, ids=after.ids) == after
+            for before, after in zip(proof.protocols, allocated, strict=True)
+        ),
+        "parent allocation changed a planned protocol beyond its event IDs",
+    )
     _install(program, access, allocated)
+    if proof is not selected_proof:
+        # Width adaptation projected every locally legal resource candidate.
+        # Query composition needs only the newly installed actual ID rotation,
+        # including freshly extracted leaf descriptors and actual SSA roots.
+        program = extract_scopes(result)
+        access = _scope_access(program)
+        _, analyses = _analyses(program)
+        query_summary, boundary_sites = _query_boundary_summary(program, access)
+        proof = ParentCompletion(
+            program,
+            analyses,
+            access,
+            period,
+            extra_protocols=allocated,
+            boundary_sites=boundary_sites,
+        )
+        for protocol in allocated:
+            proof.insert(protocol)
+    else:
+        # Parent allocation changes ID tuples only. Native commands and graph
+        # edges are unchanged, but query counter/resource readers need the
+        # actual assigned protocols rather than the pre-allocation proposals.
+        proof.protocols[:] = allocated
+    planning = PlanningScopes(
+        program, analyses, access, {p.name: p for p in allocated}, query_summary
+    )
+    return planning, proof
 
 
 def _read_protocols(program, access, analyses):
@@ -1150,13 +1206,10 @@ def _verify_scope_parent(program):
     reports, analyses = _analyses(program)
     channels, banks = _read_protocols(program, access, analyses)
     period = _scope_period(access, channels.values())
-    query_summary, boundary_sites = None, ()
+    query_summary, boundary_sites = _query_boundary_summary(program, access)
     if program.invocations:
         from .scope_query_protocols import read_query_protocols
-        from .scope_query_summary import query_native_sites, summarize_queries
 
-        query_summary = summarize_queries(program, access)
-        boundary_sites = query_native_sites(query_summary, access)
         boundary_sites += tuple(
             (endpoint.call, _point(endpoint.site, point))
             for protocol in read_query_protocols(program, access)

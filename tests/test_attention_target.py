@@ -1,7 +1,6 @@
 """The shared FA example and its explicitly unsupported continuous policy."""
 
 import ast
-import operator
 from collections import Counter
 
 import pytest
@@ -9,6 +8,7 @@ import pytest
 from tests.fixtures.attention_target import activation_trace, attention_target, target_source
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.model import CompileError
+from xdsl_npu.source_ir import AllocationOp
 
 
 def tree(mode):
@@ -53,41 +53,19 @@ def test_continuous_source_rejects_its_actual_unsupported_runtime_cycle():
         lower_source(attention_target(continuous=True))
 
 
-def static(expr, parameters):
-    if isinstance(expr, ast.Constant):
-        return expr.value
-    if isinstance(expr, ast.Name):
-        return parameters[expr.id]
-    if isinstance(expr, ast.Tuple):
-        return tuple(static(item, parameters) for item in expr.elts)
-    if isinstance(expr, ast.BinOp):
-        return {ast.Mult: operator.mul, ast.FloorDiv: operator.floordiv}[type(expr.op)](
-            static(expr.left, parameters), static(expr.right, parameters)
-        )
-    raise AssertionError(ast.dump(expr))
-
-
 def test_declared_default_physical_allocations_fit_per_actor_not_combined_ub():
     import math
 
     function = tree(False).body[0]
-    parameters = {}
-    for arg, default in zip(
-        function.args.args[-len(function.args.defaults) :], function.args.defaults
-    ):
-        if isinstance(default, ast.Constant):
-            parameters[arg.arg] = default.value
+    source = attention_target().to_ir()
     memory = Counter()
-    for node in ast.walk(function):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+    for allocation in source.walk():
+        if not isinstance(allocation, AllocationOp) or allocation.access.data != "local":
             continue
-        name = node.func.attr
-        if name.startswith("alloc_"):
-            size = (
-                4 if isinstance(node.args[1], ast.Attribute) and node.args[1].attr == "f32" else 2
-            )
-            nbytes = math.prod(static(node.args[0], parameters)) * size
-            memory[name.removeprefix("alloc_")] += (nbytes + 31) // 32 * 32
+        tensor = allocation.ref.type
+        size = 4 if tensor.dtype.data == "f32" else 2
+        nbytes = math.prod(dim.data for dim in tensor.shape) * size
+        memory[tensor.memory.data.lower()] += (nbytes + 31) // 32 * 32
     assert memory["l1"] == 224 * 1024
     assert memory["l0a"] == memory["l0b"] == 64 * 1024
     assert memory["l0c"] == 128 * 1024

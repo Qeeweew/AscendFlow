@@ -34,6 +34,7 @@ from .source_ir import (
     StageOp,
     ViewOp,
     YieldOp,
+    block8_reduction_widths,
 )
 from .source_scopes import Context
 
@@ -889,22 +890,46 @@ class _Actor:
                     self.view(value, record, matrix=True)
                     for value in (op.source, op.scratch, op.destination)
                 )
-                task(
-                    "_partial",
-                    "reduce_" + op.kind.data + "64",
-                    source,
-                    temporary,
-                    params=(rows, cols),
-                )
+                block8 = op.order.data == "block8_then_packed_merge"
+                if block8:
+                    workspace, byte_offset = temporary, 0
+                    widths = block8_reduction_widths(cols)
+                    for level, columns in enumerate(widths):
+                        temporary = self.kernel.view(
+                            workspace,
+                            columns * 4,
+                            offset=byte_offset,
+                            rows=rows,
+                            row_stride=columns * 4,
+                        )
+                        task(
+                            "_partial" if level == 0 else f"_block8_{level}",
+                            "reduce_" + op.kind.data + "8",
+                            source,
+                            temporary,
+                            order_delta=level,
+                        )
+                        source = temporary
+                        byte_offset += rows * columns * 4
+                    partials, merge_order = widths[-1], len(widths)
+                else:
+                    task(
+                        "_partial",
+                        "reduce_" + op.kind.data + "64",
+                        source,
+                        temporary,
+                        params=(rows, cols),
+                    )
+                    partials, merge_order = cols // 64, 1
                 task(
                     "_merge",
                     "merge_"
                     + op.kind.data
-                    + ("_packed" if op.order.data == "r64_then_packed_merge" else ""),
+                    + ("_packed" if block8 or op.order.data == "r64_then_packed_merge" else ""),
                     temporary,
                     destination,
-                    params=(rows, cols // 64),
-                    order_delta=1,
+                    params=(rows, partials),
+                    order_delta=merge_order,
                 )
             elif isinstance(op, ScalarReadOp):
                 captured = task("_capture", "scalar_load", self.view(op.source, record))

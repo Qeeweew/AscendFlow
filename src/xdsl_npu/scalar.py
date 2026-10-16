@@ -167,6 +167,11 @@ class Expr:
             return f"({a} {'+' if self.kind == 'add' else '*'} {b})"
         if self.kind in {"min", "max"}:
             return f"({a} {'<' if self.kind == 'min' else '>'} {b} ? {a} : {b})"
+        if self.kind in {"floordiv", "ceildiv"} and self.args[1].constant == 1:
+            # Keep the division in the proof DAG: its unsigned numerator still
+            # needs validation. Rendering its identity preserves every checked
+            # numerator operation without importing i64 wrapping arithmetic.
+            return a
         if self.kind == "floordiv":
             return f"({a} / {b})"
         if self.kind == "rem":
