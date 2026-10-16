@@ -317,6 +317,17 @@ class GuardedCompletion:
         required = meet(required, le((0, lo), (1, -1 - gap)))
         if required is None:
             return ()
+        # A singleton endpoint fixes the only possible source coordinate.
+        # The ordinary point query intersects both endpoint guards, including
+        # their count/residue constraints and a second singleton's equality.
+        if source_family.last is not None:
+            return self._point_case(
+                source, target, source_family.last, distance, activation, required
+            )
+        if target_family.last is not None:
+            return self._point_case(
+                source, target, add(target_family.last, -distance), distance, activation, required
+            )
         head, tail = self._bounds(source, target, distance, boundary, *potential)
         cases = []
         residue, period = self.graph.nodes[source].residue, self.graph.period
@@ -345,9 +356,6 @@ class GuardedCompletion:
                     )
                 )
             gap = max(gap, tail + 1)
-        # Singleton endpoints have no remaining active interior translations.
-        if source_family.last is not None or target_family.last is not None:
-            return tuple(cases)
         generation = lo + (residue - lo) % period
         extent = generation + gap + 1
         needed = meet(required, CountDomain(1, 0, minimum=max(0, extent)))
