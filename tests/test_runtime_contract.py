@@ -17,6 +17,7 @@ from xdsl.utils.exceptions import VerifyException
 from examples.state.grouped import grouped_state_sum
 from examples.vector.scale import scale
 from tests.fixtures.cv import cv_source
+from tests.report_contract import semantic_report
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as T
 from xdsl_npu.frontend import FrontendError
@@ -92,7 +93,7 @@ def test_contract_survives_every_ir_snapshot_and_final_check(request, fixture, e
     assert contracts(parse(artifact.before_ir), RuntimeSizeOp) == expected
     plan = parse(artifact.plan_ir)
     assert contracts(plan, RuntimeSizeOp) == expected
-    assert verify_plan(plan) == artifact.report
+    assert semantic_report(verify_plan(plan)) == semantic_report(artifact.report)
     for name, (minimum, multiple) in expected.items():
         check = rf"if \(npu_size_{name} < {minimum} \|\| .*npu_size_{name} % {multiple} != 0\) return -1;"
         assert re.search(check, artifact.asc)

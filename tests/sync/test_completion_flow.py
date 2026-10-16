@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import pytest
 
+from tests.report_contract import semantic_report
 from xdsl_npu.completion import CountDomain
 from xdsl_npu.completion_flow import ALL, CompletionFlow
 
@@ -61,4 +62,5 @@ def test_frame_planning_and_verification_do_not_call_pairwise_leaf_oracle(monkey
     assert artifact.report["invocation_path_visits"] == 0
     assert artifact.asc.count("for (int64_t") == 2
     # Both selection and final-IR re-extraction use facts, not the old oracle.
-    assert verify_plan(artifact.plan) == artifact.report
+    assert semantic_report(verify_plan(artifact.plan)) == semantic_report(artifact.report)
+    assert artifact.report["verification_mode"] == "normal"

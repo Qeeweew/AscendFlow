@@ -1,8 +1,8 @@
 """Owned compilation snapshots; ordinary reuse never rechecks a mutable IR.
 
-The constructor runs the final physical checker. Only immutable strings leave
-this invocation; a requested xDSL plan is parsed into a fresh mutable module.
-Passing that module to verification/emission performs a new complete check.
+Owned transformations establish and preserve physical contracts. Explicit
+``debug_verify`` independently reconstructs the final IR; imported synchronized
+IR always enters that checker. Only immutable strings leave this invocation.
 """
 
 import json
@@ -39,15 +39,28 @@ class Compilation:
         timeout_s=60.0,
         cancel=None,
         load3d=False,
+        debug_verify=False,
     ):
-        with limit(timeout_s, cancel):
-            self._build(module, synchronize=synchronize, host_launcher=host_launcher, load3d=load3d)
+        from .completion import completion_math
 
-    def _build(self, module, *, synchronize, host_launcher, load3d):
+        with limit(timeout_s, cancel), completion_math(isolated=True):
+            self._build(
+                module,
+                synchronize=synchronize,
+                host_launcher=host_launcher,
+                load3d=load3d,
+                debug_verify=debug_verify,
+            )
+
+    def _build(self, module, *, synchronize, host_launcher, load3d, debug_verify):
         started = perf_counter()
         poll("frontend")
         require(type(synchronize) is bool, "synchronize must be an explicit boolean policy")
+        from .compilation_facts import PhysicalFacts
         from .frontend import PrimFunction
+
+        require(type(debug_verify) is bool, "debug_verify must be an explicit boolean policy")
+        facts = PhysicalFacts()
 
         if isinstance(module, PrimFunction):
             module = module.to_ir()
@@ -59,7 +72,7 @@ class Compilation:
         poll("native lowering")
         if source:
             require(synchronize, "source regions must lower through automatic synchronization")
-            physical = lower_source(module)
+            physical = lower_source(module, _facts=facts)
         else:
             physical = module
         require(
@@ -71,10 +84,16 @@ class Compilation:
 
             physical = select_load3d(physical)
         lowered = perf_counter()
+        # Synchronization consumes the private physical program in place. Keep
+        # the pre-sync artifact once, before that controlled transformation.
+        # Serialize only after admission succeeds: a forged external literal
+        # may be unprintable, and must receive the native-contract diagnostic.
+        physical_before = physical.clone()
+        early_snapshot_s = perf_counter() - lowered
         poll("synchronization planning")
         checked = []
         if synchronize:
-            plan = autosync(physical, _capture=checked.append)
+            plan = autosync(physical, _capture=checked.append, _facts=facts)
         else:
             # Expert physical synchronization uses the same independent checker.
             plan = physical.clone()
@@ -83,9 +102,20 @@ class Compilation:
             checked.append((report, analysis, perf_counter() - checking))
         planned = perf_counter()
         report, analysis, final_check_s = checked[0]
+        from .completion import completion_math_statistics
+
+        report = {**report, "analysis_work": facts.statistics()}
+        debug_check_s = 0.0
+        if debug_verify and synchronize:
+            checking = perf_counter()
+            deep_report, analysis = verify_plan(plan, _details=True)
+            debug_check_s = perf_counter() - checking
+            report["debug_verification"] = deep_report
+        report["verification_mode"] = "deep" if debug_verify or not synchronize else "normal"
         poll("ASC emission")
         code = _emit_checked(plan, analysis, host_launcher=host_launcher)
         emitted = perf_counter()
+        report["completion_math"] = completion_math_statistics()
         poll("IR snapshots")
         schedule = {}
         for kernel in plan.walk():
@@ -114,7 +144,7 @@ class Compilation:
             "asc": code,
             "name": plan.body.block.first_op.sym_name.data,
             "source_ir": dump(module) if source else None,
-            "before_ir": dump(physical),
+            "before_ir": dump(physical_before),
             "plan_ir": dump(plan),
             "_report_json": json.dumps(report),
             "_schedule_json": json.dumps(schedule),
@@ -126,11 +156,12 @@ class Compilation:
                 "frontend_s": frontend - started,
                 "own_input_s": owned - frontend,
                 "lowering_s": lowered - owned,
-                "planning_and_final_check_s": planned - lowered,
-                "planning_s": planned - lowered - final_check_s,
+                "planning_and_final_check_s": planned - lowered - early_snapshot_s,
+                "planning_s": planned - lowered - early_snapshot_s - final_check_s,
                 "final_check_s": final_check_s,
-                "emission_s": emitted - planned,
-                "snapshot_s": frozen - emitted,
+                "debug_check_s": debug_check_s,
+                "emission_s": emitted - planned - debug_check_s,
+                "snapshot_s": frozen - emitted + early_snapshot_s,
                 "total_s": frozen - started,
             }
         )
@@ -174,7 +205,14 @@ class Compilation:
 
 
 def compile(
-    module, *, synchronize=True, host_launcher=True, timeout_s=60.0, cancel=None, load3d=False
+    module,
+    *,
+    synchronize=True,
+    host_launcher=True,
+    timeout_s=60.0,
+    cancel=None,
+    load3d=False,
+    debug_verify=False,
 ):
     """Typed source or physical IR -> frozen code, proof summary, and IR snapshots."""
     return Compilation(
@@ -184,4 +222,5 @@ def compile(
         timeout_s=timeout_s,
         cancel=cancel,
         load3d=load3d,
+        debug_verify=debug_verify,
     )

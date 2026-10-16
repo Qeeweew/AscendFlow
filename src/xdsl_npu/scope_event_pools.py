@@ -117,15 +117,21 @@ class _Proofs:
     def __init__(self, proof, statistics):
         self.proof, self.facts = proof, {}
         self.queries = 0
+        self._merge_work = None
         self.statistics = {} if statistics is None else statistics
         for kind in ("self", "sharing"):
             for metric in ("queries", "batches"):
                 self.statistics.setdefault(kind + "_" + metric, 0)
 
-    def _batch(self, groups, kind):
+    def _batch(self, groups, kind, *, completion=None):
+        self.statistics.setdefault(kind + "_queries", 0)
+        self.statistics.setdefault(kind + "_batches", 0)
         queries, spans = [], {}
         for key, group in groups:
             if key in self.facts:
+                continue
+            if not group:
+                self.facts[key] = True  # No source epoch can reuse this slot.
                 continue
             if len(spans) % 128 == 0:
                 poll("parent event pool " + kind, groups=len(spans), queries=len(queries))
@@ -139,24 +145,45 @@ class _Proofs:
         if not spans:
             return
         answers = (
-            self.proof.covered_many(queries)
-            if hasattr(self.proof, "covered_many")
-            else self.proof.graph.covered_many(queries)
-        )
+            (self.proof if hasattr(self.proof, "covered_many") else self.proof.graph)
+            if completion is None
+            else completion
+        ).covered_many(queries)
         self.queries += len(queries)
         self.statistics[kind + "_queries"] += len(queries)
         self.statistics[kind + "_batches"] += 1
         self.facts.update((key, all(answers[first:last])) for key, (first, last) in spans.items())
+
+    def conditional_self(self, protocol, width):
+        from .scope_guarded_events import self_reuse_queries
+
+        key = "conditional_self", protocol.name, width
+        if key not in self.facts:
+            self._batch(
+                ((key, self_reuse_queries(protocol, self.proof, width)),),
+                "conditional_self",
+                completion=self.proof.guarded(),
+            )
+        return self.facts[key]
+
+    def merge_work(self):
+        if self._merge_work is None:
+            self._merge_work = _MergeWork(self.statistics)
+        return self._merge_work
 
     def selfs(self, locals_, widths):
         self.self_assignments((local, width) for local in locals_ for width in widths)
 
     def self_assignments(self, assignments):
         period = self.proof.graph.period
-        self._batch(
-            (
-                (
-                    ("self", local.protocol.name, width),
+
+        def groups():
+            for local, width in assignments:
+                key = "self", local.protocol.name, width
+                if key in self.facts:
+                    continue
+                yield (
+                    key,
                     tuple(
                         (
                             local.destination,
@@ -167,10 +194,8 @@ class _Proofs:
                         for rank, r in enumerate(local.active)
                     ),
                 )
-                for local, width in assignments
-            ),
-            "self",
-        )
+
+        self._batch(groups(), "self")
 
     def self_ok(self, local, width):
         return self.facts["self", local.protocol.name, width]
@@ -186,8 +211,11 @@ class _Proofs:
                     if not self.self_ok(a, width) or not self.self_ok(b, width):
                         continue
                     for orientation, (first, last) in enumerate(((a, b), (b, a))):
+                        key = "pair", a.protocol.name, b.protocol.name, width, orientation
+                        if key in self.facts:
+                            continue
                         yield (
-                            ("pair", a.protocol.name, b.protocol.name, width, orientation),
+                            key,
                             tuple(
                                 query
                                 for rank, r in enumerate(first.active)
@@ -245,14 +273,16 @@ class _MergeWork:
 
 
 @bounded
-def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
+def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None, _capture=None):
     """Keep private pools when they fit; borrow only after typed exhaustion."""
+    statistics = {} if statistics is None else statistics
     protocols = tuple(protocols)
+    checks = _Proofs(proof, statistics)
     pending, borrowed, attempted = protocols, {}, set()
     while True:
         try:
             assigned, used = _allocate_private_pools(
-                pending, proof, used_banks, statistics=statistics
+                pending, proof, used_banks, statistics=statistics, _proofs=checks
             )
             by_name = {p.name: p for p in assigned}
             by_name.update(
@@ -260,7 +290,12 @@ def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
                 for p in protocols
                 if p.name in borrowed
             )
-            return tuple(by_name[p.name] for p in protocols), used
+            assigned = tuple(by_name[p.name] for p in protocols)
+            if _capture is not None:
+                from .scope_resources import capture_parent_pools
+
+                _capture(capture_parent_pools(proof, assigned, used, statistics))
+            return assigned, used
         except ParentEventBankExhausted as failure:
             if failure.bank in attempted:
                 raise
@@ -272,7 +307,7 @@ def allocate_parent_pools(protocols, proof, used_banks, *, statistics=None):
             pending = tuple(p for p in pending if p.name not in borrowed)
 
 
-def _allocate_private_pools(protocols, proof, used_banks, *, statistics=None):
+def _allocate_private_pools(protocols, proof, used_banks, *, statistics=None, _proofs=None):
     """Pack local parent channels deterministically, without claiming optimality.
 
     Start with each channel's minimum self-reuse width. A bank that already
@@ -281,27 +316,35 @@ def _allocate_private_pools(protocols, proof, used_banks, *, statistics=None):
     Nonlocal protocols and the input resource map remain unchanged.
     """
     protocols = tuple(protocols)
+    checks = _Proofs(proof, statistics) if _proofs is None else _proofs
+    require(checks.proof is proof, "parent allocation cannot reuse another completion owner")
     if any(p.activation is not None for p in protocols):
         from .scope_guarded_events import allocate
 
         conditional = tuple(p for p in protocols if p.activation is not None)
         ordinary = tuple(p for p in protocols if p.activation is None)
-        checked, reserved = allocate(conditional, proof, used_banks, statistics=statistics)
+        checked, reserved = allocate(
+            conditional, proof, used_banks, statistics=statistics, _proofs=checks
+        )
         checked_ordinary, used = _allocate_private_pools(
-            ordinary, proof, reserved, statistics=statistics
+            ordinary, proof, reserved, statistics=statistics, _proofs=checks
         )
         assigned = {p.name: p for p in (*checked, *checked_ordinary)}
         return tuple(assigned[p.name] for p in protocols), used
     locals_ = _locals(protocols, proof)
-    used, checks, assigned = _reserved(used_banks), _Proofs(proof, statistics), {}
-    merge_work = _MergeWork(checks.statistics)
+    used, assigned = _reserved(used_banks), {}
+    merge_work = checks.merge_work()
     banks = defaultdict(list)
     for local in locals_:
         banks[local.bank].append(local)
     # Banks share a completion topology even though their IDs are independent.
     # Register each required width across banks in one fact propagation; the
     # minimum widths and subsequent deterministic allocation stay unchanged.
-    pending, minimum = list(locals_), {}
+    # A nonempty private pool needs at least one physical ID, regardless of
+    # its lifetime paths or sharing order. Zero-free banks cannot benefit from
+    # any width/pair search; retain bank order when reporting typed exhaustion.
+    free_ids = {bank: tuple(i for i in range(8) if i not in used[bank]) for bank in banks}
+    pending, minimum = [local for local in locals_ if free_ids[local.bank]], {}
     for width in range(1, 9):
         checks.selfs(pending, (width,))
         for local in pending:
@@ -316,8 +359,13 @@ def _allocate_private_pools(protocols, proof, used_banks, *, statistics=None):
     )
     merges, shared, allocated = 0, 0, 0
     for bank, members in banks.items():
+        free = free_ids[bank]
+        if not free:
+            checks.statistics["zero_free_bank_rejections"] = (
+                checks.statistics.get("zero_free_bank_rejections", 0) + 1
+            )
+            raise ParentEventBankExhausted(bank, 1, 0)
         pools = [((index,), minimum[local.protocol.name]) for index, local in enumerate(members)]
-        free = [i for i in range(8) if i not in used[bank]]
         cost = sum(width for _, width in pools)
         if cost > len(free):
             checks.selfs(members, range(1, 9))
@@ -360,16 +408,22 @@ def _allocate_private_pools(protocols, proof, used_banks, *, statistics=None):
 
 
 @bounded
-def verify_parent_pools(protocols, proof, used_banks, *, statistics=None):
+def verify_parent_pools(protocols, proof, used_banks, *, statistics=None, _capture=None):
     """Reconstruct actual borrowing, then check the remaining private pools."""
+    statistics = {} if statistics is None else statistics
     protocols = tuple(protocols)
     borrowed = verify_actual_borrows(protocols, proof, used_banks, statistics=statistics)
-    return _verify_private_pools(
+    used = _verify_private_pools(
         tuple(p for p in protocols if p.name not in borrowed),
         proof,
         used_banks,
         statistics=statistics,
     )
+    if _capture is not None:
+        from .scope_resources import capture_parent_pools
+
+        _capture(capture_parent_pools(proof, protocols, used, statistics))
+    return used
 
 
 def _verify_private_pools(protocols, proof, used_banks, *, statistics=None):

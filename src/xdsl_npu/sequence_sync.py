@@ -8,7 +8,7 @@ activation and has a distinct bank/ID lifetime in this initial allocator.
 """
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
@@ -29,7 +29,14 @@ from .region_completion import (
 )
 from .region_summary import CountDomain, Position, allocation
 from .sequence_model import extract_sequence
-from .sequence_plan import Bridge, Candidate, domain_row, select_bridges
+from .sequence_plan import (
+    Bridge,
+    BridgeSelection,
+    Candidate,
+    domain_row,
+    materialization_snapshot,
+    select_bridges,
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,22 @@ class CheckedSequence:
     sequence: object
     analyses: dict
     bridges: tuple[Bridge, ...]
+    boundary_plan: object | None = None
+
+
+@dataclass(frozen=True)
+class SequenceBoundaryPlan:
+    selection: BridgeSelection
+    queries: tuple
+    call_requirements: object | None
+
+    @property
+    def proof(self):
+        return self.selection.proof
+
+    @property
+    def bridges(self):
+        return self.selection.bridges
 
 
 def _requirements(sequence):
@@ -58,7 +81,13 @@ def _requirements(sequence):
 def _plan_boundaries(sequence, analyses, banks):
     requirements = _requirements(sequence)
     queries = tuple(memory_requirement(sequence, *r) for r in requirements)
-    proof = RegionCompletion(sequence.regions, analyses, queries, calls=(0,))
+    from .sequence_calls import prepare_call_requirements
+
+    calls = prepare_call_requirements(sequence, queries)
+    combined = queries if calls is None else queries + calls.memory + calls.events + calls.reserved
+    proof = RegionCompletion(
+        sequence.regions, analyses, combined, calls=(0,) if calls is None else (0, 1)
+    )
     # Select actual releases before ready edges targeting the same region.
     # Earlier destination regions establish the context for later transfers.
     # Only already selected protocols may justify coverage: no circular
@@ -107,7 +136,7 @@ def _plan_boundaries(sequence, analyses, banks):
         )
         for source, destination, domain, obligation in ordered
     ]
-    return select_bridges(sequence, proof, candidates, banks)
+    return SequenceBoundaryPlan(select_bridges(sequence, proof, candidates, banks), queries, calls)
 
 
 def _install(sequence, bridges):
@@ -151,6 +180,14 @@ def _install(sequence, bridges):
                 task.parent.insert_op_after(operation, task)
             else:
                 task.parent.insert_op_before(operation, task)
+
+
+def _encoded_domain(domain):
+    row = domain_row(domain)
+    period, residue, exact, minimum = row[:4]
+    return CountDomain(
+        period, residue, None if exact == -1 else exact, minimum, row[4] if len(row) > 4 else None
+    )
 
 
 def _read_bridges(sequence, analyses):
@@ -326,9 +363,22 @@ def verify_sequence(module, *, _details=False):
             f"missing sequence {obligation.hazard}: {source} -> {destination}, "
             f"{allocation(obligation.storage).sym_name.data}[{obligation.start}:{obligation.stop}]",
         )
+    call_report = {}
+    if sequence.invocation is not None:
+        from .sequence_calls import verify_calls
+
+        call_report = verify_calls(sequence, analyses, bridges)
+    report = _sequence_report(
+        sequence, reports, analyses, bridges, banks, proof, inherited, call_report
+    )
+    checked = CheckedSequence(sequence, analyses, bridges)
+    return (report, checked) if _details else report
+
+
+def _sequence_report(sequence, reports, analyses, bridges, banks, proof, inherited, call_report):
     local_statistics = [analysis[3].completion_statistics() for analysis in analyses.values()]
     report = {
-        "kernel": module.body.block.first_op.sym_name.data,
+        "kernel": sequence.module.body.block.first_op.sym_name.data,
         "verification": "conditional leaf proofs plus exact sequential byte frontiers and native completion/event boundaries",
         "regions": reports,
         "native_templates": sum(r["native_templates"] for r in reports.values()),
@@ -356,41 +406,66 @@ def verify_sequence(module, *, _details=False):
         ],
         "terminal_drain": "one kernel drain; region exits preserve actual outstanding native work",
     }
-    if sequence.invocation is not None:
-        from .sequence_calls import verify_calls
-
-        report.update(verify_calls(sequence, analyses, bridges))
-        local_statistics = [analysis[3].completion_statistics() for analysis in analyses.values()]
-        report["completion_statistics"] = {
-            key: sum(counts[key] for counts in local_statistics) for key in local_statistics[0]
-        }
-        report["proof_path_queries"] = sum(a[3].path_queries for a in analyses.values())
-    checked = CheckedSequence(sequence, analyses, bridges)
-    return (report, checked) if _details else report
+    report.update(call_report)
+    return report
 
 
-def autosync_sequence(module, *, _capture=None):
-    from .sync import _finish
-
-    result = module.clone()
+def autosync_sequence(module, *, _capture=None, _facts=None):
+    result = module.clone() if _facts is None else module
     require(
         not any(isinstance(op, (RegionChannelOp, RegionSyncOp)) for op in result.walk()),
         "AutoSync requires unsynchronized region boundaries",
     )
-    sequence = extract_sequence(result)
+    sequence = extract_sequence(result) if _facts is None else _facts.extract_sequence(result)
     banks = defaultdict(int)
+    reports, analyses = {}, {}
     for name, loop in sequence.regions.items():
-        _plan_leaf(loop, live_in=sequence.live_in[name], banks=banks)
-    analyses = {
-        name: _verify_leaf(loop, live_in=sequence.live_in[name], _details=True)[1]
-        for name, loop in sequence.regions.items()
-    }
+        reports[name], analyses[name] = _plan_leaf(
+            loop, live_in=sequence.live_in[name], banks=banks, _facts=_facts
+        )
     forward = _plan_boundaries(sequence, analyses, banks)
     if sequence.invocation is not None:
         from .sequence_calls import plan_calls
 
-        carried = plan_calls(sequence, analyses, forward, banks)
+        carried = plan_calls(
+            sequence,
+            analyses,
+            forward.bridges,
+            banks,
+            proof=forward.proof,
+            requirements=forward.call_requirements,
+        )
     else:
-        carried = []
-    _install(sequence, [*forward, *carried])
-    return _finish(result, _capture=_capture)
+        carried = None
+    bridges = (*forward.bridges, *(carried.bridges if carried is not None else ()))
+    ignored = RegionChannelOp, RegionSyncOp
+    snapshot = materialization_snapshot(result, ignored)
+    _install(sequence, bridges)
+    actual, used = _read_bridges(sequence, analyses)
+    encoded = tuple(
+        replace(
+            bridge,
+            domains=tuple(_encoded_domain(domain) for domain in bridge.domains),
+        )
+        for bridge in bridges
+    )
+    require(actual == encoded, "materialized sequence protocols changed their owned plan")
+    require(
+        materialization_snapshot(result, ignored) == snapshot,
+        "sequence materialization changed an admitted native, clock, guard or address",
+    )
+    report = _sequence_report(
+        sequence,
+        reports,
+        analyses,
+        actual,
+        used,
+        forward.proof,
+        sum(forward.proof.inherited(request) for request in forward.queries),
+        {} if carried is None else carried.report(),
+    )
+    report["verification_origin"] = "composed owned sequence transformation contracts"
+    checked = CheckedSequence(sequence, analyses, actual, forward)
+    if _capture is not None:
+        _capture((report, checked, 0.0))
+    return result

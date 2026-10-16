@@ -9,9 +9,10 @@ prefix cycle supplies that induction. Ordinary task/Set completion does not.
 from collections import defaultdict
 from dataclasses import dataclass
 from heapq import heappop, heappush
+from itertools import islice
 
 from .budget import poll
-from .completion import CountDomain, _first, canonical, intersection
+from .completion import _first, canonical, count_domain, intersection
 from .completion_flow import ALL, _includes
 from .model import require
 
@@ -21,8 +22,12 @@ FACT_STATISTICS = (
     "peak_condition_facts",
     "fact_attempts",
     "fact_comparisons",
+    "fact_index_steps",
+    "fact_interval_joins",
     "fact_updates",
     "fact_transfers",
+    "pending_frontier_steps",
+    "pending_interval_joins",
     "coverage_batches",
     "coverage_requests",
     "coverage_fact_scans",
@@ -35,11 +40,13 @@ def add(value, delta):
 
 
 def meet(a, b):
+    if a is b:
+        return a
     if a is None or b is None:
         return None
-    if a == ALL:
+    if a is ALL or a == ALL:
         return b
-    if b == ALL or a == b:
+    if b is ALL or b == ALL or a == b:
         return a
     return intersection(a, b)
 
@@ -48,9 +55,9 @@ def ge(a, b):
     if a == 0:
         return ALL if b >= 0 else None
     if a == 1:
-        return CountDomain(1, 0, minimum=max(0, -b))
+        return ALL if b >= 0 else count_domain(1, 0, minimum=-b)
     require(a == -1, "symbolic completion needs a single uniform count")
-    return CountDomain(1, 0, minimum=0, maximum=b) if b >= 0 else None
+    return count_domain(1, 0, minimum=0, maximum=b) if b >= 0 else None
 
 
 def le(a, b):
@@ -89,6 +96,216 @@ def choice(a, b, guard, *, maximum):
         yield b, other
 
 
+class _OriginBranch:
+    """A dyadic range of origin positions; a record occupies one branch only."""
+
+    __slots__ = ("bits", "children", "level", "lower", "records")
+
+    def __init__(self, lower, level):
+        self.bits, self.lower, self.level = 0, lower, level
+        self.records, self.children = {}, {}
+
+
+class _OriginIndex:
+    """Find records sharing origins without expanding masks into single bits.
+
+    Records crossing a split stay at its parent. Dense masks therefore use
+    one entry, while a sparse single-origin query skips unrelated branches.
+    Branch unions are monotone hints; actual record masks decide membership.
+    """
+
+    def __init__(self, records):
+        self.root, self.locations = None, {}
+        self.steps = 0
+        for key, bits in records.items():
+            self.put(key, bits)
+
+    def put(self, key, bits):
+        if previous := self.locations.pop(key, None):
+            del previous.records[key]
+        if not bits:
+            return
+        first, last = (bits & -bits).bit_length() - 1, bits.bit_length() - 1
+        level = last.bit_length()
+        if self.root is None:
+            self.root = _OriginBranch(0, level)
+        while self.root.level < level:
+            self.steps += 1
+            parent = _OriginBranch(0, self.root.level + 1)
+            parent.bits = self.root.bits
+            parent.children[0] = self.root
+            self.root = parent
+        branch = self.root
+        while True:
+            self.steps += 1
+            branch.bits |= bits
+            if branch.level == 0:
+                break
+            middle = branch.lower + (1 << (branch.level - 1))
+            if first < middle <= last:
+                break
+            side = int(first >= middle)
+            if side not in branch.children:
+                branch.children[side] = _OriginBranch(
+                    middle if side else branch.lower, branch.level - 1
+                )
+            branch = branch.children[side]
+        branch.records[key] = bits
+        self.locations[key] = branch
+
+    def candidates(self, bits):
+        pending = [self.root] if self.root is not None else []
+        while pending:
+            branch = pending.pop()
+            self.steps += 1
+            if not branch.bits & bits:
+                continue
+            for key, mask in branch.records.items():
+                self.steps += 1
+                if mask & bits:
+                    yield key, mask
+            pending.extend(branch.children.values())
+
+
+def _joined_interval(lo, hi, left, right, guard):
+    """One exact union on the entire guard, never a hull across a hole."""
+    if not (holds(lo, add(right, 1), guard) and holds(left, add(hi, 1), guard)):
+        return None
+    if holds(lo, left, guard):
+        lower = lo
+    elif holds(left, lo, guard):
+        lower = left
+    else:
+        return None
+    if holds(hi, right, guard):
+        upper = right
+    elif holds(right, hi, guard):
+        upper = hi
+    else:
+        return None
+    return lower, upper
+
+
+class _ConditionalFrontier:
+    """Origin-labelled interval unions with a count-conditioned antichain.
+
+    A join moves only the shared origin bits. The other bits keep their old
+    interval and guard. It creates no new count predicates and never splits a
+    mask into individual origins. Exact edits also normalize pending deltas.
+    """
+
+    def __init__(self, records):
+        self.records, self.bits, self.index = records, 0, None
+        self.origin_count, self.index_probe_size = 0, 0
+        self.retired_index_steps = 0
+        self.joins = 0
+
+    def _candidates(self, bits, *, snapshot=True):
+        # Python's direct scan is cheaper for a small bucket or a mask naming
+        # much of its origin set. An index cannot skip that dense work.
+        sparse = bits.bit_count() * 4 < self.origin_count
+        if (
+            sparse
+            and self.index is None
+            and len(self.records) >= max(64, 2 * self.index_probe_size)
+        ):
+            self.index_probe_size = len(self.records)
+            middle = 1 << ((self.bits.bit_length() - 1).bit_length() - 1)
+            sample = tuple(islice(self.records.values(), 8))
+            self.retired_index_steps += len(sample)
+            spanning = sum(
+                (mask & -mask).bit_length() - 1 < middle <= mask.bit_length() - 1 for mask in sample
+            )
+            if spanning * 2 < len(sample):
+                self.index = _OriginIndex(self.records)
+        candidates = (
+            self.index.candidates(bits)
+            if sparse and self.index is not None
+            else self.records.items()
+        )
+        return tuple(candidates) if snapshot else candidates
+
+    def _put(self, key, bits):
+        if bits:
+            self.records[key] = bits
+        else:
+            del self.records[key]
+        if self.index is not None:
+            self.index.put(key, bits)
+            if len(self.index.root.records) * 2 >= len(self.records):
+                # Masks growing across the root split make this index dense.
+                # Reconsider only after the frontier grows, amortizing probes.
+                self.index_probe_size = len(self.records)
+                self.retired_index_steps += self.index.steps
+                self.index = None
+
+    def insert(self, lo, hi, guard, bits):
+        key = lo, hi, guard
+        bits &= ~self.records.get(key, 0)
+        if not bits:
+            return 0, 0, 0, ()
+        comparisons = updates = 0
+        candidates = self._candidates(bits, snapshot=False) if bits & self.bits else ()
+        for (left, right, prior), mask in candidates:
+            comparisons += 1
+            if (
+                bits & mask
+                and (prior == guard or _includes(prior, guard))
+                and holds(left, lo, guard)
+                and holds(hi, right, guard)
+            ):
+                bits &= ~mask
+                if not bits:
+                    return 0, comparisons, 0, ()
+        fresh = bits
+        edits = []
+        work = [(lo, hi, bits)]
+        while work:
+            lo, hi, bits = work.pop()
+            key = lo, hi, guard
+            bits &= ~self.records.get(key, 0)
+            if not bits:
+                continue
+            joined = False
+            candidates = self._candidates(bits) if bits & self.bits else ()
+            for prior_key, mask in candidates:
+                comparisons += 1
+                left, right, prior = prior_key
+                shared = bits & mask
+                if not shared:
+                    continue
+                if (
+                    (guard == prior or _includes(guard, prior))
+                    and holds(lo, left, prior)
+                    and holds(right, hi, prior)
+                ):
+                    self._put(prior_key, mask & ~shared)
+                    updates += 1
+                    edits.append((key, prior_key, key, shared))
+                    continue
+                interval = _joined_interval(lo, hi, left, right, guard) if prior == guard else None
+                # Two partial masks would turn two compact rectangles into
+                # three. Keep that already compact representation instead.
+                if interval is None or shared != bits and shared != mask:
+                    continue
+                self._put(prior_key, mask & ~shared)
+                updates += 1
+                self.joins += 1
+                edits.append((key, prior_key, (*interval, guard), shared))
+                if remaining := bits & ~shared:
+                    work.append((lo, hi, remaining))
+                work.append((*interval, shared))
+                joined = True
+                break
+            if not joined:
+                self._put(key, self.records.get(key, 0) | bits)
+                if novel := bits & ~self.bits:
+                    self.bits |= novel
+                    self.origin_count += novel.bit_count()
+                updates += 1
+        return fresh, comparisons, updates, edits
+
+
 @dataclass(frozen=True)
 class Family:
     lower: int
@@ -103,7 +320,9 @@ class Family:
         if not a:
             return ALL if b % self.period == self.residue else None
         require(a == 1, "unsupported symbolic generation expression")
-        return CountDomain(self.period, (self.residue - b) % self.period, minimum=0)
+        if self.period == 1:
+            return ALL
+        return count_domain(self.period, (self.residue - b) % self.period, minimum=0)
 
 
 def native_family(meta, period, count=(1, 0)):
@@ -157,6 +376,8 @@ class SymbolicCompletion:
         # A domain allocates facts only at reached nodes, not V empty maps.
         self.facts = defaultdict(dict)
         self._node_bits = {}
+        self._frontiers = {}
+        self._pending_frontier_steps = self._pending_interval_joins = 0
         self.count, self.terminal = count, terminal
         # Bind immutable family bounds once, only when a fact touches a node.
         # This is domain-local activation, not another copy of the topology.
@@ -183,58 +404,57 @@ class SymbolicCompletion:
             lo = 0, lo[0] * guard.exact + lo[1]
             hi = 0, hi[0] * guard.exact + hi[1]
         known = self.facts[node]
-        key = lo, hi, guard
-        present = known.get(key, 0)
-        bits &= ~present
+        if node not in self._frontiers:
+            self._frontiers[node] = _ConditionalFrontier(known)
+        frontier = self._frontiers[node]
+        frontier.records = known
+        before = len(known)
+        bits, comparisons, updates, edits = frontier.insert(lo, hi, guard, bits)
+        self.fact_comparisons += comparisons
         if not bits:
             return
-        removals, updates = 0, 1
-        node_bits = self._node_bits.get(node, 0)
-        # Both containment scans require a shared origin bit. Supersession
-        # moves bits between records, so their node-local union is monotone.
-        if bits & node_bits:
-            comparisons = 0
-            for (left, right, prior), mask in known.items():
-                comparisons += 1
-                if (
-                    bits & mask
-                    and (prior == guard or _includes(prior, guard))
-                    and holds(left, lo, guard)
-                    and holds(hi, right, guard)
-                ):
-                    bits &= ~mask
-                    if not bits:
-                        self.fact_comparisons += comparisons
-                        return
-            records = tuple(known.items())
-            self.fact_comparisons += comparisons + len(records)
-            for prior_key, mask in records:
-                left, right, prior = prior_key
-                if (
-                    bits & mask
-                    and (guard == prior or _includes(guard, prior))
-                    and holds(lo, left, prior)
-                    and holds(right, hi, prior)
-                ):
-                    if remaining := mask & ~bits:
-                        known[prior_key] = remaining
-                    else:
-                        del known[prior_key]
-                        removals += 1
-                    updates += 1
-        # Incoming bits exclude `present`, so supersession cannot change this
-        # exact key. Reuse its first lookup instead of hashing the guard again.
-        self.fact_records += (not present) - removals
-        known[key] = present | bits
-        self._node_bits[node] = node_bits | bits
+        self.fact_records += len(known) - before
+        self._node_bits[node] = frontier.bits
         self.fact_updates += updates
         if self.fact_records > self.peak_fact_records:  # noqa: PLR1730 - avoid a call per fact update
             self.peak_fact_records = self.fact_records
         if node not in self.delta:
             self.delta[node] = {}
             heappush(self.pending, node)
+        # Enqueue the incoming support, not its potentially much wider joined
+        # frontier. Existing coverage that already travelled is not replayed.
         pending = self.delta[node]
+        key = lo, hi, guard
         pending[key] = pending.get(key, 0) | bits
+        for incoming, prior, result, mask in edits:
+            self._pending_frontier_steps += 1
+            if incoming == result:
+                # A dominating interval is already represented by sent or
+                # pending incoming support (possibly several joined pieces).
+                # The dominated record contributes no unique queued coverage.
+                selected = mask & pending.get(prior, 0)
+                if selected:
+                    if remaining := pending[prior] & ~selected:
+                        pending[prior] = remaining
+                    else:
+                        del pending[prior]
+                continue
+            # The retained frontier can include work already propagated. An
+            # edit applies to the delta only for origins with BOTH supports
+            # still pending at these exact intervals and full count guards.
+            selected = mask & pending.get(incoming, 0) & pending.get(prior, 0)
+            if not selected:
+                continue
+            self._pending_interval_joins += 1
+            if remaining := pending[incoming] & ~selected:
+                pending[incoming] = remaining
+            else:
+                del pending[incoming]
+            if remaining := pending[prior] & ~selected:
+                pending[prior] = remaining
+            else:
+                del pending[prior]
+            pending[result] = pending.get(result, 0) | selected
 
     def add_fact(self, node, lo, hi, guard, bits):
         if guard is None or not bits:
@@ -328,9 +548,8 @@ class SymbolicCompletion:
         while self.pending:
             source = heappop(self.pending)
             for (lo, hi, domain), bits in self.delta.pop(source).items():
-                bits &= self.facts[source].get((lo, hi, domain), 0)
-                if not bits:
-                    continue
+                # A delta remains valid when its key disappears into a wider
+                # retained interval. Both frontiers represent monotone unions.
                 for edge in self.edges[source]:
                     self._transfer(*edge, lo, hi, domain, bits)
 
@@ -396,8 +615,16 @@ class SymbolicCompletion:
             "peak_condition_facts": self.peak_fact_records,
             "fact_attempts": self.fact_attempts,
             "fact_comparisons": self.fact_comparisons,
+            "fact_index_steps": sum(
+                frontier.retired_index_steps
+                + (0 if frontier.index is None else frontier.index.steps)
+                for frontier in self._frontiers.values()
+            ),
+            "fact_interval_joins": sum(frontier.joins for frontier in self._frontiers.values()),
             "fact_updates": self.fact_updates,
             "fact_transfers": self.transfers,
+            "pending_frontier_steps": self._pending_frontier_steps,
+            "pending_interval_joins": self._pending_interval_joins,
             "coverage_batches": self.coverage_batches,
             "coverage_requests": self.coverage_requests,
             "coverage_fact_scans": self.coverage_fact_scans,

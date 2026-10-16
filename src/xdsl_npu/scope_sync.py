@@ -10,7 +10,7 @@ from .budget import bounded, poll
 from .child_completion import ChildPort, project_fixed_child
 from .ir import LoopChannelOp, QueryChannelOp, QuerySyncOp, ScopeChannelOp, ScopeSyncOp, TaskOp
 from .loop_graph import Command
-from .loop_sync import _lifetime, _plan_leaf, _requirements
+from .loop_sync import _plan_leaf, _requirements, establishes_directly
 from .model import require
 from .native_order import instruction_points, prefix_inputs
 from .periodic import bounded_period, project
@@ -52,6 +52,7 @@ class CheckedScopes:
     channels: dict[str, ScopeProtocol]
     query_summary: object | None = None
     query_report: dict | None = None
+    resource_proof: object | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,8 @@ class PlanningScopes:
     access: object
     channels: dict[str, ScopeProtocol]
     query_summary: object | None = None
+    resource_proof: object | None = None
+    child_reports: object | None = None
 
 
 def _ints(values):
@@ -87,7 +90,9 @@ class ParentCompletion:
     ):
         self.program, self.analyses, self.access = program, analyses, access
         self.events, self.protocols = {}, []
-        self.node_activations, self._guarded, self._anchored = {}, None, None
+        from .scope_guarded_completion import NodeActivations
+
+        self.node_activations, self._guarded, self._anchored = NodeActivations(), None, None
         marks = defaultdict(set)
         if any(leaf.cases for leaf in program.leaves.values()) or any(
             isinstance(o, ScopedDependence) for o in access.obligations
@@ -781,12 +786,13 @@ def _allocate_child_resources(program, analyses, access, proof, selected):
     fails, all locally legal widths share one enlarged parent projection; no
     native or synchronization instruction is added, moved, or removed.
     """
-    valid = all(
-        proof.resource_covered_many(
-            (uid, consumed, republished) for uid, consumed, republished, _ in proof.resource_pairs
-        )
+    from .scope_resources import capture_child_resources
+
+    answers = proof.resource_covered_many(
+        (uid, consumed, republished) for uid, consumed, republished, _ in proof.resource_pairs
     )
-    if valid:
+    if all(answers):
+        proof.child_resources = capture_child_resources(proof, answers)
         return proof, _leaf_banks(program, analyses)
     require(
         not any(leaf.cases for leaf in program.leaves.values()),
@@ -805,6 +811,7 @@ def _allocate_child_resources(program, analyses, access, proof, selected):
         proof.insert(protocol)
     proof.graph.potential()
     used = _configuration_banks(program, analyses)
+    established = set()
     for (uid, name), choice in choices.items():
         poll("parent-aware child event allocation", call=uid, channel=name)
         option = next(
@@ -836,15 +843,36 @@ def _allocate_child_resources(program, analyses, access, proof, selected):
             if isinstance(op, LoopChannelOp) and op.sym_name.data == name
         )
         declaration.attributes["event_ids"] = _ints(ids)
+        loop, channel_map, sequence, graph, potential = analyses[uid]
+        for op in loop.protocol_scope.walk():
+            if isinstance(op, LoopChannelOp) and op.sym_name.data == name:
+                op.attributes["event_ids"] = _ints(ids)
+        channel_map = dict(channel_map)
+        channel_map[name] = replace(channel_map[name], ids=ids)
+        analyses[uid] = loop, channel_map, sequence, graph, potential
+        established.update(
+            (uid, *resource_sites(uid, choice.bank[0], choice.count, resource))
+            for resource in option.resources
+        )
         used[choice.bank].update(ids)
+    pairs = []
+    for uid, analysis in analyses.items():
+        leaf = program.leaves[uid]
+        for resource in summarize_local_events(analysis[0]):
+            if resource.domain.contains(analysis[0].constant_count):
+                sites = resource_sites(uid, leaf.actor, leaf.loop.constant_count, resource)
+                require(
+                    (uid, *sites) in established, "assigned child rotation lost its lifetime proof"
+                )
+                pairs.append((uid, *sites, resource))
+    proof.resource_pairs = list(dict.fromkeys(pairs))
+    proof.child_resources = capture_child_resources(proof, (True for _ in proof.resource_pairs))
     return proof, used
 
 
 @bounded
-def autosync_scopes(module, *, _capture=None):
-    from .sync import _finish
-
-    result = module.clone()
+def autosync_scopes(module, *, _capture=None, _facts=None):
+    result = module.clone() if _facts is None else module
     require(
         not any(
             isinstance(
@@ -854,25 +882,32 @@ def autosync_scopes(module, *, _capture=None):
         ),
         "nested AutoSync requires unsynchronized physical calls",
     )
-    program = extract_scopes(result)
-    planning, parent = _plan_scope_parent(program)
+    program = extract_scopes(result) if _facts is None else _facts.extract_scopes(result)
+    planning, parent = _plan_scope_parent(program, _facts=_facts)
+    query_plan = None
     if program.invocations:
         from .scope_query_planning import plan_query_memory
 
-        plan_query_memory(planning, parent)
-    return _finish(result, _capture=_capture)
+        query_plan = plan_query_memory(planning, parent)
+    report, checked = _complete_scope_plan(planning, parent, query_plan)
+    if _capture is not None:
+        _capture((report, checked, 0.0))
+    return result
 
 
-def _plan_scope_parent(program) -> tuple[PlanningScopes, ParentCompletion]:
+def _plan_scope_parent(program, *, _facts=None) -> tuple[PlanningScopes, ParentCompletion]:
     """Install child/parent protocols in an owned actual program.
 
     This composes one invocation only. Query normalization retains the outer
     lifetime contracts, but does not discharge them. The public entry point
     must separately prove those contracts before returning an executable plan.
     """
-    result = program.module
+    from .loop_graph import channels, commands
+    from .scope_analysis import ScopeAnalyses
+
     banks = defaultdict(lambda: defaultdict(int))
-    for leaf in program.leaves.values():
+    analyses, reports, leaves = ScopeAnalyses(), {}, {}
+    for uid, leaf in program.leaves.items():
         poll("child synchronization planning")
         loop = leaf.loop
         roots = {
@@ -888,22 +923,53 @@ def _plan_scope_parent(program) -> tuple[PlanningScopes, ParentCompletion]:
         if leaf.cases:
             from .scope_variants import plan_child_variants
 
-            plan_child_variants(
+            variants = plan_child_variants(
                 leaf.stream,
                 leaf.call,
                 {label: case.loop for label, case in leaf.cases.items()},
                 live_in=roots,
                 banks=banks[leaf.actor],
+                _facts=_facts,
             )
+            # The union descriptor is emission-only; each guarded case keeps
+            # the completed native analysis under its original activation.
+            from .scope_variants import describe_child
+
+            values = dict(leaf.value_map)
+            union = describe_child(leaf.stream, leaf.call, value_mapper=values)
+            data.stream.parent.insert_op_before(union, data.stream)
+            data.stream.parent.erase_op(data.stream)
+            operations = {op.uid.data: op for op in union.walk() if isinstance(op, TaskOp)}
+            local_actor = next(iter(loop.actors))
+            loop = replace(
+                loop,
+                region=union,
+                actors={local_actor: replace(data, stream=union, operations=operations)},
+            )
+            channel_map = channels(loop)
+            sequences, _, _ = commands(loop, channel_map)
+            analyses[uid] = loop, channel_map, sequences, None, None
+            current = {}
+            for label, (report, analysis) in variants.plans.items():
+                current[label] = report
+                analyses.cases[uid, label] = analysis
+            reports[uid] = {"native_templates": len(data.program.tasks), "cases": current}
+            leaves[uid] = replace(leaf, loop=loop, value_map=values)
             continue
-        _plan_leaf(loop, live_in=roots, banks=banks[leaf.actor])
+        reports[uid], analyses[uid] = _plan_leaf(
+            loop, live_in=roots, banks=banks[leaf.actor], _facts=_facts
+        )
         aliases = {leaf.value_map[c.op.ref]: c.op.ref for c in leaf.captures}
         replacement = data.stream.clone(value_mapper=aliases)
         leaf.call.body.block.insert_op_before(replacement, leaf.stream)
         leaf.call.body.block.erase_op(leaf.stream)
-    program = extract_scopes(result)
+        leaves[uid] = replace(
+            leaf,
+            stream=replacement,
+            value_map={actual: normalized for normalized, actual in aliases.items()},
+        )
+    program = replace(program, leaves=leaves)
     access = _scope_access(program)
-    _, analyses = _analyses(program)
     query_summary, boundary_sites = _query_boundary_summary(program, access)
     candidates = _scope_requirements(access)
     period = _scope_period(access, (p for p, _ in candidates))
@@ -943,8 +1009,9 @@ def _plan_scope_parent(program) -> tuple[PlanningScopes, ParentCompletion]:
             activation=getattr(candidate, "activation", None),
         )
         proof.insert(p)
+        remaining = tuple(o for o in obligations if not establishes_directly(p, o))
         require(
-            all(proof.covered_obligations(obligations)),
+            not remaining or all(proof.covered_obligations(remaining)),
             "parent protocol cannot cover its actual child access obligation",
         )
         selected.append(p)
@@ -956,11 +1023,25 @@ def _plan_scope_parent(program) -> tuple[PlanningScopes, ParentCompletion]:
                 "first/last native protocols do not cover the complete access span",
             )
     proof.graph.potential()
-    selected_proof = proof
     proof, used = _allocate_child_resources(program, analyses, access, proof, selected)
+    # Resource substitutions preserve the leaf proof but not its old report's
+    # concrete ID tuples. Derive only those fields from the assigned map.
+    for uid, analysis in analyses.items():
+        if program.leaves[uid].cases:
+            continue
+        loop, channel_map, _, _, _ = analysis
+        tasks = {(a, t.uid): t for a, d in loop.actors.items() for t in d.program.tasks}
+        assigned = defaultdict(set)
+        for channel in channel_map.values():
+            if channel.kind == "local":
+                source, destination = channel.sources[0], channel.destinations[0]
+                bank = f"{source[0]}:{tasks[source].pipe}:{tasks[destination].pipe}"
+                assigned[bank].update(channel.ids)
+        reports[uid]["event_ids"] = {bank: sorted(ids) for bank, ids in assigned.items()}
     from .scope_event_pools import allocate_parent_pools
 
-    selected, _ = allocate_parent_pools(selected, proof, used)
+    pool_results = []
+    selected, _ = allocate_parent_pools(selected, proof, used, _capture=pool_results.append)
     cross_id = 0
     allocated = []
     for p in selected:
@@ -982,32 +1063,26 @@ def _plan_scope_parent(program) -> tuple[PlanningScopes, ParentCompletion]:
         "parent allocation changed a planned protocol beyond its event IDs",
     )
     _install(program, access, allocated)
-    if proof is not selected_proof:
-        # Width adaptation projected every locally legal resource candidate.
-        # Query composition needs only the newly installed actual ID rotation,
-        # including freshly extracted leaf descriptors and actual SSA roots.
-        program = extract_scopes(result)
-        access = _scope_access(program)
-        _, analyses = _analyses(program)
-        query_summary, boundary_sites = _query_boundary_summary(program, access)
-        proof = ParentCompletion(
-            program,
-            analyses,
-            access,
-            period,
-            extra_protocols=allocated,
-            boundary_sites=boundary_sites,
-        )
-        for protocol in allocated:
-            proof.insert(protocol)
-    else:
-        # Parent allocation changes ID tuples only. Native commands and graph
-        # edges are unchanged, but query counter/resource readers need the
-        # actual assigned protocols rather than the pre-allocation proposals.
-        proof.protocols[:] = allocated
+    # IDs do not change completion topology, native effects, or the selected
+    # child cuts. Even width adaptation retains its exact candidate projection;
+    # resource_pairs below contains only the actually assigned rotations.
+    proof.protocols[:] = allocated
     planning = PlanningScopes(
-        program, analyses, access, {p.name: p for p in allocated}, query_summary
+        program,
+        analyses,
+        access,
+        {p.name: p for p in allocated},
+        query_summary,
+        child_reports=reports,
     )
+    from .scope_resources import establish_invocation_resources
+
+    actual, _ = _read_protocols(program, access, analyses)
+    require(actual == planning.channels, "materialized parent protocols changed their plan")
+    resources = establish_invocation_resources(
+        planning, proof, children=proof.child_resources, pools=pool_results[0]
+    )
+    planning = replace(planning, resource_proof=resources)
     return planning, proof
 
 
@@ -1217,7 +1292,7 @@ def _verify_scope_parent(program):
     """
     access = _scope_access(program)
     reports, analyses = _analyses(program)
-    channels, banks = _read_protocols(program, access, analyses)
+    channels, _ = _read_protocols(program, access, analyses)
     period = _scope_period(access, channels.values())
     query_summary, boundary_sites = _query_boundary_summary(program, access)
     if program.invocations:
@@ -1258,20 +1333,23 @@ def _verify_scope_parent(program):
             f"missing scoped {obligation.hazard}: {obligation.source} -> {obligation.destination}, "
             f"distance {getattr(obligation, 'distance', 'anchored')} on {obligation.storage}[{obligation.start}:{obligation.stop}]",
         )
-    child_lifetimes = proof.check_child_resources()
-    from .scope_event_pools import verify_parent_pools
+    checked = CheckedScopes(program, analyses, access, channels, query_summary)
+    from .scope_resources import establish_invocation_resources
 
-    pool_statistics = {}
-    banks = verify_parent_pools(
-        channels.values(), proof, _leaf_banks(program, analyses), statistics=pool_statistics
+    resources = establish_invocation_resources(checked, proof)
+    checked = replace(checked, resource_proof=resources)
+    report = _scope_report(
+        program, access, reports, analyses, channels, proof, query_summary, resources, potential
     )
-    _, counters, _ = _lifetime(
-        access.loop,
-        channels,
-        proof if proof.node_activations else proof.graph,
-        proof.events,
-        local=False,
-    )
+    return report, checked, proof
+
+
+def _scope_report(
+    program, access, reports, analyses, channels, proof, query_summary, resources, potential
+):
+    child_lifetimes = resources.child_lifetime_queries
+    pool_statistics = dict(resources.pool_statistics)
+    banks, counters = resources.used_banks, resources.cross_counter_ids
     report = {
         "kernel": program.root.sym_name.data,
         "verification": "actual retained child proofs, parent physical frontiers, guarded completion, and event lifetimes",
@@ -1288,6 +1366,7 @@ def _verify_scope_parent(program):
             if proof.node_activations
             else proof.graph.completion_statistics()
         ),
+        "potential_work": dict(proof.graph.potential_work),
         "scope_anchored_facts": None if proof._anchored is None else proof._anchored.statistics(),
         "parent_memory_obligations": len(access.obligations),
         "parent_access_visits": access.visits,
@@ -1308,5 +1387,50 @@ def _verify_scope_parent(program):
         )
         report["cross_query_verified"] = False
         report["query_memory_summary"] = query_summary.statistics
-    checked = CheckedScopes(program, analyses, access, channels, query_summary)
-    return report, checked, proof
+    return report
+
+
+def _complete_scope_plan(planning, parent, query_plan):
+    """Consume established child/parent facts and discharge only query deltas.
+
+    Linear instruction correspondence checks the materializer, without rebuilding
+    accesses, completion graphs or any already established resource obligation.
+    """
+    channels, _ = _read_protocols(planning.program, planning.access, planning.analyses)
+    require(channels == planning.channels, "materialized parent protocols changed their plan")
+    resources = planning.resource_proof
+    if not planning.program.invocations:
+        resources.check(planning, parent)
+    checked = CheckedScopes(
+        planning.program,
+        planning.analyses,
+        planning.access,
+        channels,
+        planning.query_summary,
+        resource_proof=resources,
+    )
+    report = _scope_report(
+        planning.program,
+        planning.access,
+        planning.child_reports,
+        planning.analyses,
+        channels,
+        parent,
+        planning.query_summary,
+        resources,
+        parent.graph.potential(),
+    )
+    if planning.program.invocations:
+        from .scope_query_verification import verify_query_invocations
+
+        query_report = verify_query_invocations(
+            checked, parent, resources=resources, query_plan=query_plan
+        )
+        checked = replace(checked, query_report=query_report)
+        report.update(
+            cross_query_verified=True,
+            verification="actual child, parent and serial query memory/event/progress proofs",
+            query_verification=query_report,
+        )
+    report["verification_origin"] = "composed owned transformation contracts"
+    return report, checked

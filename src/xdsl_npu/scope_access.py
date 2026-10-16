@@ -6,6 +6,7 @@ Only the child's exact boundary word is projected; captures remain aliases of
 the original BufferOp, including private buffers shared by sibling calls.
 """
 
+from bisect import bisect_right
 from dataclasses import dataclass, replace
 from math import lcm
 from typing import TYPE_CHECKING
@@ -26,7 +27,13 @@ from .loop_model import (
 )
 from .model import ITEMSIZE, Ref, Task, require
 from .periodic import bounded_period
-from .region_summary import Access, CellSummary, RegionSummary, summarize_fixed_storage
+from .region_summary import (
+    Access,
+    CellSummary,
+    RegionSummary,
+    select_fixed_storage,
+    summarize_fixed_storage,
+)
 from .scalar import facts_from_sizes, from_ssa
 from .scope_model import ScopedProgram
 
@@ -35,6 +42,9 @@ if TYPE_CHECKING:
 
 MAX_SCOPE_ACCESS_SEGMENTS = 1_000_000
 MAX_SCOPE_ACCESS_VISITS = 1_000_000
+
+_ACQUIRE, _RELEASE, _PREFIX = 1, 2, 4
+_READ = _ACQUIRE | _RELEASE
 
 
 @dataclass(frozen=True)
@@ -142,6 +152,25 @@ def _cut_cost(loop):
     return cost
 
 
+def _reader_cells(refs, generation, frame):
+    """Index overlapping read roles once per actual parent residue."""
+    changes = {}
+    for ref, role in refs:
+        for lo, hi in ref.segments(generation):
+            changes.setdefault(lo - generation * frame, []).append((role, 1))
+            changes.setdefault(hi - generation * frame, []).append((role, -1))
+    counts = {_ACQUIRE: 0, _RELEASE: 0, _PREFIX: 0}
+    points, intervals = sorted(changes), []
+    for index, point in enumerate(points[:-1]):
+        for role, delta in changes[point]:
+            for flag in counts:
+                if role & flag:
+                    counts[flag] += delta
+        mask = sum(flag for flag, count in counts.items() if count)
+        intervals.append((point, points[index + 1], mask))
+    return points[:-1], intervals
+
+
 def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeAccess:
     """Build parent byte obligations; the caller separately verifies each leaf.
 
@@ -169,7 +198,6 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
         for index, op in enumerate(parent.body.block.ops)
     }
     storages = {}
-    fragments = 0
     for uid, leaf in program.leaves.items():
         require(len(leaf.loop.actors) == 1, "scope boundary leaf needs one actual actor")
         normalized, data = next(iter(leaf.loop.actors.items()))
@@ -208,17 +236,6 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
                 if stride and modulus:
                     period = bounded_period(lcm(period, modulus * divisor), f"scope storage {name}")
             periods[name] = period
-        for task in data.program.tasks:
-            for ref in task.refs:
-                fragments += (
-                    leaf.loop.constant_count
-                    * ref.rows
-                    * (program.groups if ref.storage.external else 1)
-                )
-    require(
-        fragments <= MAX_SCOPE_ACCESS_SEGMENTS, "scope fixed-child fragment/group budget exceeded"
-    )
-    poll("scope child boundaries", fragments=fragments, calls=len(program.leaves))
     # Definition occupancy is needed only when independent local writers can
     # cross logical generations. Keep ordinary boundary projections unchanged.
     writers = {}
@@ -237,28 +254,62 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
         if len(set(calls.values())) > 1
         and all(not any(offset[1:]) for (uid, root), offset in by_root.items() if root == name)
     )
+    selections, fragments = {}, 0
+    for uid, leaf in program.leaves.items():
+        needed = {alias for alias in aliases[uid] if captures[uid, alias][0] in definition_roots}
+        selection = selections[uid] = select_fixed_storage(
+            leaf.loop,
+            aliases[uid],
+            definitions_needed=needed,
+            allow_read_spans=not program.invocations,
+        )
+        fragments += selection.segments
+    require(
+        fragments <= MAX_SCOPE_ACCESS_SEGMENTS, "scope fixed-child fragment/group budget exceeded"
+    )
+    poll("scope child boundaries", fragments=fragments, calls=len(program.leaves))
     summaries, groups = {}, {}
     visits = fragments
     for uid, leaf in program.leaves.items():
         normalized, data = next(iter(leaf.loop.actors.items()))
-        summary = summaries[uid] = summarize_fixed_storage(leaf.loop, aliases[uid])
+        selection = selections[uid]
+        summary = summaries[uid] = summarize_fixed_storage(
+            leaf.loop,
+            aliases[uid],
+            definitions_needed=selection.definitions,
+            allow_read_spans=not program.invocations,
+            _selection=selection,
+        )
         visits += summary.visits + summary.definition_visits
         require(
             visits <= MAX_SCOPE_ACCESS_VISITS, "scope fixed-child summary visit budget exceeded"
         )
         native = {task.uid: (index, task) for index, task in enumerate(data.program.tasks)}
         for cell in summary.cells:
-            effects = {}
+            effects, read_roles = {}, {}
             name = captures[uid, cell.storage][0]
             for access in (cell.first_write, cell.last_write):
                 if access is not None:
                     effects.setdefault(access, set()).add("W")
             for span in (*cell.reads_before_write, *cell.pending_reads):
-                require(
-                    span.first == span.last,
-                    "fixed scope boundary needs exact inner reader positions",
+                first, last = (
+                    span.first.evaluate(summary.constant_count),
+                    span.last.evaluate(summary.constant_count),
                 )
-                effects.setdefault(Access(span.task, span.first), set()).add("R")
+                if first == last:
+                    readers = ((Access(span.task, span.first), _READ),)
+                else:
+                    # One native template's FIFO-begin chain forwards the
+                    # first acquire to all later instances. Its real tail
+                    # retirement prefix includes every earlier reader end;
+                    # the last task.end alone does not supply that fact.
+                    readers = (
+                        (Access(span.task, span.first), _ACQUIRE),
+                        (Access(span.task, span.last), _RELEASE | _PREFIX),
+                    )
+                for reader, role in readers:
+                    effects.setdefault(reader, set()).add("R")
+                    read_roles[reader] = read_roles.get(reader, 0) | role
             if name in definition_roots:
                 for run in cell.definitions:
                     for access in (run.entry, run.last_write):
@@ -266,17 +317,21 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
                             effects.setdefault(access, set()).add("W")
                     for binding in run.read_bindings:
                         effects.setdefault(binding.reader, set()).add("R")
+                        read_roles[binding.reader] = _READ
                         if binding.writer is not None:
                             effects.setdefault(binding.writer, set()).add("W")
                     for span in run.pending_reads:
                         require(span.first == span.last, "scope definition needs exact readers")
-                        effects.setdefault(Access(span.task, span.first), set()).add("R")
+                        reader = Access(span.task, span.first)
+                        effects.setdefault(reader, set()).add("R")
+                        read_roles[reader] = _READ
             for access, modes in effects.items():
                 generation = access.position.evaluate(summary.constant_count)
                 index, task = native[access.task[1]]
                 key = uid, task.uid, generation
                 group = groups.setdefault(
-                    key, {"leaf": leaf, "task": task, "index": index, "parts": {}}
+                    key,
+                    {"leaf": leaf, "task": task, "index": index, "parts": {}, "read_roles": {}},
                 )
                 dtype = min(
                     (
@@ -288,6 +343,9 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
                 )
                 part = name, cell.start, cell.stop, dtype
                 group["parts"].setdefault(part, set()).update(modes)
+                group["read_roles"][part] = group["read_roles"].get(part, 0) | read_roles.get(
+                    access, 0
+                )
     # Bounds include every repeated parent residue and actual physical GM group.
     parent_fragments = sum(
         periods[name] * (program.groups if storages[group["leaf"].actor, name].external else 1)
@@ -334,6 +392,7 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
         )
     }
     tasks, endpoints = {actor: [] for actor in program.kernels}, {}
+    reader_roles, special_readers = {}, set()
     for (uid, _, generation), group in groups.items():
         leaf, task, index = group["leaf"], group["task"], group["index"]
         refs, modes = [], []
@@ -355,6 +414,13 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
             modes.append("".join(sorted(mode)))
         local = _local_uid(leaf, task, generation)
         endpoint = leaf.actor, local
+        reader_roles[endpoint] = tuple(
+            (ref, group["read_roles"][part])
+            for ref, part in zip(refs, sorted(group["parts"]), strict=True)
+            if "R" in group["parts"][part]
+        )
+        if any(role != _READ for _, role in reader_roles[endpoint]):
+            special_readers.add(endpoint)
         require(endpoint not in endpoints, "duplicate scope boundary endpoint identity")
         endpoints[endpoint] = (
             uid,
@@ -422,7 +488,7 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
     verify_access_ownership(loop)
     visits += _cut_cost(loop)
     require(visits <= MAX_SCOPE_ACCESS_VISITS, "scope access cumulative visit budget exceeded")
-    obligations = []
+    obligations, role_cells = [], {}
     for dependency in loop_dependencies(loop):
         if (
             dependency.distance == 0
@@ -439,7 +505,42 @@ def analyze_scope_access(program: ScopedProgram, *, definitions=False) -> ScopeA
             if not residues:
                 continue
             dependency = replace(dependency, residues=residues)
-        obligations.append(dependency)
+        reader = dependency.destination if dependency.hazard == "RAW" else dependency.source
+        if dependency.hazard not in {"RAW", "WAR"} or reader not in special_readers:
+            obligations.append(dependency)
+            continue
+        families = {}
+        for residue in dependency.residues:
+            generation = (
+                residue if dependency.hazard == "RAW" else residue - dependency.distance
+            ) % dependency.period
+            key = reader, dependency.storage, generation
+            if key not in role_cells:
+                refs = [
+                    (ref, role)
+                    for ref, role in reader_roles[reader]
+                    if loop.root(reader[0], ref) == dependency.storage
+                ]
+                # Two endpoints, one sweep and role bits per fragment, before
+                # allocating the residue index. Queries below are logarithmic.
+                visits += 5 * len(refs)
+                require(
+                    visits <= MAX_SCOPE_ACCESS_VISITS, "scope reader frontier visit budget exceeded"
+                )
+                frame = loop.frames.get(dependency.storage, 0)
+                role_cells[key] = _reader_cells(refs, generation, frame)
+            starts, intervals = role_cells[key]
+            index = bisect_right(starts, dependency.start) - 1
+            role = (
+                intervals[index][2] if index >= 0 and dependency.stop <= intervals[index][1] else 0
+            )
+            if role & (_ACQUIRE if dependency.hazard == "RAW" else _RELEASE):
+                prefix = dependency.prefix or dependency.hazard == "WAR" and bool(role & _PREFIX)
+                families.setdefault(prefix, []).append(residue)
+        obligations.extend(
+            replace(dependency, residues=tuple(residues), prefix=prefix)
+            for prefix, residues in families.items()
+        )
     return ScopeAccess(
         loop,
         endpoints,

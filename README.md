@@ -5,8 +5,13 @@
 用户表达计算、物理存储和多阶段排步，编译器负责异步访问及缓冲复用的同步。
 
 公开 AST DSL 已贯通默认 dense f16 Flash Attention 的 CANN 和设备验证，但编译耗时
-和相对 ACLNN 性能仍未达标；其他变体的资格见状态页。**算子优化已停止，当前转为
-编译流程重构方案：控制静态分析规模、整理变换不变量、消除重复证明。新流程尚未实现。**
+和相对 ACLNN 性能仍未达标；其他变体的资格见状态页。**本轮重构已接通分析结果所有权、
+增量同步和资源结果复用，以及 normal/deep 分离。算子政策保持不变，测量及剩余复杂度
+见[当前状态](docs/refactor-progress.md)。**
+
+本轮冷测：FA编译117.35s→53.00s（下降54.8%；旧版1次、当前5次中位数），
+GEMM/softmax/RMSNorm下降约13–14%。五类算子的ASC均与基线相同。
+FA仍未达到≤5s目标，父层/query条件传播仍需进一步压缩。
 
 旧 `cube.task/vector.task`、公开 physical builder、Python tracer 与旧 FA 入口
 已删除，不保留兼容层。内部 Task IR 和硬件反例继续用于编译器验证。
@@ -44,6 +49,9 @@ from examples.vector.scale import scale
 
 artifact = compile(scale.specialize(B=64))
 print(artifact.asc)
+# 开发时可显式从最终 IR 独立重建检查；普通编译消费已建立的变换合同。
+checked = compile(scale.specialize(B=64), debug_verify=True)
+assert checked.asc == artifact.asc
 ```
 
 `tiles` 是运行时参数；该例只特化 tile 容量 B，不按输入长度构造 Python 任务。

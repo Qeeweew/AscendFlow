@@ -5,16 +5,16 @@ event resources, cross-counter backlog and full progress remain separate.
 It never changes buffers, native instructions, or source scheduling policy.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
 from .budget import bounded, poll
-from .completion import coalesce
+from .completion import CountDomain, coalesce, covers
 from .ir import QueryChannelOp
 from .model import require
 from .scope_domains import affine
-from .scope_query_checks import check_memory, prepare_memory_checks
+from .scope_query_checks import QueryMemoryCheck, check_memory, prepare_memory_checks
 from .scope_query_completion import QueryCompletion, QueryEvent
 from .scope_query_protocols import (
     QueryProtocol,
@@ -22,15 +22,87 @@ from .scope_query_protocols import (
     read_query_protocols,
     validate_query_protocol,
 )
+from .scope_resources import invocation_resources, invocation_snapshot
 from .symbolic_completion import holds, meet
+
+_AUTHORITY = object()
+
+
+@dataclass(frozen=True)
+class QueryEventReuseProof:
+    protocol: QueryProtocol
+    completion: QueryCompletion
+    request: tuple[QueryEvent, QueryEvent, CountDomain]
+    _authority: object = field(repr=False, compare=False)
+
+    def check(self, parent, protocol, protocols):
+        """Preserve a completed path when later protocols only add edges."""
+        required = self.completion._required(protocol.domain)
+        require(
+            self._authority is _AUTHORITY
+            and self.completion.parent is parent
+            and self.protocol == protocol
+            and all(p in protocols for p in self.completion.query_protocols.values())
+            and required is not None
+            and covers(required, self.completion.answers.get(self.request, ())),
+            f"{protocol.name}: query allocation result does not prove its actual ID rotation",
+        )
 
 
 @dataclass(frozen=True)
 class QueryMemoryPlan:
+    """Completed memory and new-ID results, without invocation progress claims."""
+
     protocols: tuple[QueryProtocol, ...]
     memory_checks: int
     initially_missing: int
     new_event_reuse_checks: int
+    completion: QueryCompletion
+    checks: tuple[QueryMemoryCheck, ...]
+    answers: tuple[bool, ...]
+    reuse_proofs: tuple[QueryEventReuseProof, ...]
+    _snapshot: tuple = field(repr=False)
+    _authority: object = field(repr=False, compare=False)
+
+    def check(self, checked, parent):
+        """Consume actual completed results without repeating memory queries."""
+        return self._check(checked, parent, invocation_snapshot(checked.program))
+
+    def _check_owned(self, checked, parent, resources):
+        """Use the invocation snapshot already checked by this entry point."""
+        require(
+            resources.parent is parent
+            and resources.program is checked.program
+            and resources.access is checked.access,
+            "query memory plan needs its actual invocation resource owner",
+        )
+        return self._check(checked, parent, resources._snapshot)
+
+    def _check(self, checked, parent, snapshot):
+        require(
+            self._authority is _AUTHORITY
+            and checked.program is parent.program
+            and checked.access is parent.access
+            and self.completion.parent is parent
+            and self.protocols == read_query_protocols(checked.program, checked.access)
+            and self._snapshot == snapshot
+            and self.memory_checks == len(self.checks) == len(self.answers)
+            and all(isinstance(check, QueryMemoryCheck) for check in self.checks),
+            "query memory plan snapshot changed; establish memory from actual IR",
+        )
+        self.completion._check_snapshot()
+        for check, answer in zip(self.checks, self.answers, strict=True):
+            required = self.completion._required(check.domain)
+            require(
+                answer is True
+                and required is not None
+                and covers(
+                    required,
+                    self.completion.answers.get((check.source, check.target, check.domain), ()),
+                ),
+                "query memory plan lacks its actual completed memory result",
+            )
+        return self
 
 
 def _candidates(checks):
@@ -79,11 +151,21 @@ def _candidates(checks):
     return result
 
 
-def _query_width(parent, copies, candidate, maximum_width, memory_queries):
+def _query_width(parent, copies, candidate, maximum_width, memory_queries, *, completion=None):
     """Try one actual ID before enlarging its static reuse proof window."""
     # The last represented query's outgoing Set is real under the outer
     # existence guard, even if its consumer is outside the proof window.
-    proof = QueryCompletion(parent, copies=max(copies, candidate.target.query + 1))
+    needed_copies = max(copies, candidate.target.query + 1)
+    if completion is None:
+        proof = QueryCompletion(parent, copies=needed_copies)
+    else:
+        require(completion.parent is parent, "query width needs the actual completion owner")
+        if completion.copies < needed_copies:
+            completion._append_snapshot()
+            proof = QueryCompletion(parent, copies=needed_copies)
+        else:
+            proof = completion
+            proof.append_protocols()
     actor = candidate.source.site.task[0]
     source = QueryEvent(
         candidate.target.query, actor, candidate.name, "wait", candidate.target.parent
@@ -97,27 +179,34 @@ def _query_width(parent, copies, candidate, maximum_width, memory_queries):
         )
 
     # check_memory already validated every prepared allocation identity.
-    # Keep its exact request order, registering all origins in one batch.
+    # Keep its exact request order. Complete answers reuse their paths; only
+    # incomplete old cases and the new reuse origin read propagated facts.
     single, *answers = proof.covered_many((reuse_query(1), *memory_queries))
     if single:
-        return 1, answers, 1
+        return 1, tuple(answers), 1, proof, reuse_query(1)
     require(
         maximum_width > 1,
         f"{candidate.name}: available event widths cannot prove old Wait before re-Set",
     )
-    if proof.copies < maximum_width + 1:
+    enlarged = proof.copies < maximum_width + 1
+    if enlarged:
         proof = QueryCompletion(parent, copies=maximum_width + 1)
     resources = tuple(reuse_query(width) for width in range(2, maximum_width + 1))
-    covered = proof.covered_many(resources)
+    # A larger topology needs its own completed memory result. If the first
+    # topology already suffices, keep that result and ask only new reuse facts.
+    covered = proof.covered_many((*resources, *memory_queries) if enlarged else resources)
+    if enlarged:
+        covered, answers = covered[: len(resources)], covered[len(resources) :]
     require(
         any(covered),
         f"{candidate.name}: available event widths cannot prove old Wait before re-Set",
     )
-    return covered.index(True) + 2, answers, maximum_width
+    width = covered.index(True) + 2
+    return width, tuple(answers), maximum_width, proof, reuse_query(width)
 
 
 @bounded
-def plan_query_memory(checked, parent) -> QueryMemoryPlan:
+def plan_query_memory(checked, parent, *, resources=None) -> QueryMemoryPlan:
     """Materialize actual local protocols, then prove the new ID rotation.
 
     Selection queries completion first; already-covered memory creates no
@@ -125,8 +214,6 @@ def plan_query_memory(checked, parent) -> QueryMemoryPlan:
     A finite search of widths 1..8 concerns hardware resources only, never
     runtime query/KV counts. Unsupported kinds or resource conflicts reject.
     """
-    from .scope_sync import _leaf_banks
-
     require(
         checked.program is parent.program and checked.access is parent.access,
         "query planner needs the actual checked invocation proof",
@@ -135,10 +222,11 @@ def plan_query_memory(checked, parent) -> QueryMemoryPlan:
         not read_query_protocols(checked.program, checked.access),
         "query memory planning requires no pre-existing query channels",
     )
+    resources = invocation_resources(checked, parent, resources)
     checks = prepare_memory_checks(checked, parent)
     copies = len(checked.query_summary.parts)
     initial = QueryCompletion(parent, copies=copies)
-    answers = check_memory(checks, initial)
+    answers = tuple(check_memory(checks, initial))
     memory_queries = tuple((check.source, check.target, check.domain) for check in checks)
     validity = {
         (check.source, check.target, check.domain): valid
@@ -173,12 +261,8 @@ def plan_query_memory(checked, parent) -> QueryMemoryPlan:
             item[0].target.query,
         ),
     )
-    used = _leaf_banks(checked.program, checked.analyses)
-    for protocol in checked.channels.values():
-        if protocol.kind == "local":
-            source, target = protocol.sources[0], protocol.destinations[0]
-            used[source[0], tasks[source].pipe, tasks[target].pipe].update(protocol.ids)
-    selected, reuse_checks = [], 0
+    used = resources.copy_used_banks()
+    selected, reuse_checks, reuse_proofs, completion = [], 0, [], initial
     for candidate, members in candidates:
         poll("query memory protocol selection", channel=candidate.name)
         # Earlier selected actual protocols may have covered this obligation.
@@ -190,8 +274,8 @@ def plan_query_memory(checked, parent) -> QueryMemoryPlan:
         require(free, f"{resource}: query release has no free binary event ID")
         candidate = replace(candidate, ids=(free[0],))
         install_query_protocols(checked.program, checked.access, (candidate,))
-        width, answers, attempted = _query_width(
-            parent, copies, candidate, len(free), memory_queries
+        width, answers, attempted, completion, request = _query_width(
+            parent, copies, candidate, len(free), memory_queries, completion=completion
         )
         reuse_checks += attempted
         candidate = replace(candidate, ids=free[:width])
@@ -200,15 +284,38 @@ def plan_query_memory(checked, parent) -> QueryMemoryPlan:
             for op in checked.program.root.body.block.ops
             if isinstance(op, QueryChannelOp) and op.sym_name.data == candidate.name
         )
+        completion._check_snapshot()
+        before = tuple(completion.query_protocols.values())
         declaration.attributes["event_ids"] = ArrayAttr(IntAttr(i) for i in candidate.ids)
+        actual = read_query_protocols(checked.program, checked.access)
+        require(
+            tuple(replace(p, ids=()) for p in before) == tuple(replace(p, ids=()) for p in actual),
+            "query ID allocation changed a planned protocol beyond its event IDs",
+        )
+        # Query transitions and completed paths do not depend on physical IDs.
+        # Rebind only this controlled ID assignment; no graph is reconstructed.
+        completion.query_protocols = {p.name: p for p in actual}
+        completion.version = completion._version()
+        reuse_proofs.append(QueryEventReuseProof(candidate, completion, request, _AUTHORITY))
         selected.append(candidate)
         used[resource].update(candidate.ids)
         # ID rotation adds no completion edges. The small-window memory
-        # answers survive this ID-only update; do not use its stale snapshot.
-        # Final verification independently rebuilds the actual resource proof.
+        # answers survive this controlled ID-only update. The independent
+        # verifier still reconstructs resources from imported actual IR.
         validity = {
             (check.source, check.target, check.domain): valid
             for check, valid in zip(checks, answers, strict=True)
         }
     require(all(answers), "actual query protocols leave memory hazards")
-    return QueryMemoryPlan(tuple(selected), len(checks), len(missing), reuse_checks)
+    return QueryMemoryPlan(
+        tuple(selected),
+        len(checks),
+        len(missing),
+        reuse_checks,
+        completion,
+        checks,
+        answers,
+        tuple(reuse_proofs),
+        resources._snapshot,
+        _AUTHORITY,
+    )

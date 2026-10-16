@@ -179,10 +179,13 @@ def summarize_queries(program, access) -> QuerySummary:
         for query in range(copies)
     )
     sequence_statistics = {}
-    sequence = summarize_sequence(parts, statistics=sequence_statistics)
-    obligations = tuple(
-        obligation for obligation in sequence.obligations if obligation.source.region == "0"
+    sequence = summarize_sequence(
+        parts,
+        materialize_cells=False,
+        obligation_source_regions=frozenset({"0"}),
+        statistics=sequence_statistics,
     )
+    obligations = sequence.obligations
     statistics.update(
         **{f"sequence_{key}": value for key, value in sequence_statistics.items()},
         query_copies=copies,

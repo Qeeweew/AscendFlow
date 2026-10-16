@@ -6,6 +6,7 @@ import pytest
 from xdsl.dialects.builtin import StringAttr
 
 from tests.fixtures.ub_copy import ub_copy
+from tests.report_contract import semantic_report
 from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
@@ -52,7 +53,7 @@ def test_public_bitwise_copy_has_one_native_template_and_real_v_effects(artifact
     assert "asc_copy_ub2ub_sync" not in code
     assert "asc_add" not in code and "asc_mul" not in code and "asc_copy(" not in code
     assert code.count("asc_sync_pipe(PIPE_ALL)") == 1
-    assert verify_plan(artifact.plan) == artifact.report
+    assert semantic_report(verify_plan(artifact.plan)) == semantic_report(artifact.report)
 
 
 def byte_conflicts(loop, count):
@@ -186,7 +187,7 @@ def test_same_root_statically_disjoint_views_pass_normal_dsl_and_final_sync():
     )
     assert task.refs[0].storage is task.refs[1].storage
     assert task.refs[1].address(0) - task.refs[0].address(0) == 64
-    assert verify_plan(artifact.plan) == artifact.report
+    assert semantic_report(verify_plan(artifact.plan)) == semantic_report(artifact.report)
     assert "asc_copy_ub2ub(" in artifact.asc
 
 

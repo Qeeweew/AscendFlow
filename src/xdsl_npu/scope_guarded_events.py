@@ -58,10 +58,16 @@ def self_reuse(protocol, proof, width):
     return all(proof.guarded().covered_many(self_reuse_queries(protocol, proof, width)))
 
 
-def allocate(protocols, proof, used_banks, *, verify=False, statistics=None):
+def allocate(protocols, proof, used_banks, *, verify=False, statistics=None, _proofs=None):
     """Reserve complete private pools; never infer ordering from ID equality."""
+    from .scope_event_pools import _Proofs
+
+    checks = _Proofs(proof, statistics) if _proofs is None else _proofs
+    require(checks.proof is proof, "conditional allocation needs its actual completion owner")
+    checks.statistics.setdefault("conditional_self_queries", 0)
+    checks.statistics.setdefault("conditional_self_batches", 0)
     used = defaultdict(set, {key: set(ids) for key, ids in used_banks.items()})
-    result, queries, allocated = [], 0, 0
+    result, allocated = [], 0
     for protocol in protocols:
         if protocol.activation is None or protocol.kind == "barrier":
             result.append(protocol)
@@ -76,28 +82,30 @@ def allocate(protocols, proof, used_banks, *, verify=False, statistics=None):
                 and not used[bank].intersection(ids),
                 "conditional parent event pool overlaps another resource or has invalid IDs",
             )
-            queries += proof.graph.period
             require(
-                self_reuse(protocol, proof, len(ids)),
+                checks.conditional_self(protocol, len(ids)),
                 f"{protocol.name}: conditional parent event re-Set can precede its old Wait",
             )
         else:
+            free = [i for i in range(8) if i not in used[bank]]
+            if not free:
+                checks.statistics["zero_free_bank_rejections"] = (
+                    checks.statistics.get("zero_free_bank_rejections", 0) + 1
+                )
+                raise ParentEventBankExhausted(bank, 1, 0, conditional=True)
             width = None
             for candidate in range(1, 9):
-                queries += proof.graph.period
-                if self_reuse(protocol, proof, candidate):
+                if checks.conditional_self(protocol, candidate):
                     width = candidate
                     break
             require(
                 width is not None, f"{bank}: no conditional parent event width <=8 proves reuse"
             )
-            free = [i for i in range(8) if i not in used[bank]]
             if len(free) < width:
                 raise ParentEventBankExhausted(bank, width, len(free), conditional=True)
             ids = tuple(free[:width])
         used[bank].update(ids)
         result.append(replace(protocol, ids=ids))
         allocated += len(ids)
-    if statistics is not None:
-        statistics.update(conditional_self_queries=queries, conditional_allocated_ids=allocated)
+    checks.statistics["conditional_allocated_ids"] = allocated
     return tuple(result), used

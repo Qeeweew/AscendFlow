@@ -4,6 +4,7 @@ import pytest
 
 from examples.state.grouped import grouped_state_sum
 from tests.models.local_sequence import finite_check
+from tests.report_contract import semantic_report
 from xdsl_npu import compile, verify_plan
 from xdsl_npu.ir import RegionChannelOp, parse
 from xdsl_npu.performance import runtime_work
@@ -21,7 +22,7 @@ def test_parent_and_child_are_retained_and_zero_child_executes_init_use(grouped_
     assert grouped_artifact.asc.count("for (int64_t") == 2
     assert grouped_artifact.asc.count("asc_sync_pipe(PIPE_ALL)") == 1
     assert "npu_invocation = 0; npu_invocation <" in grouped_artifact.asc
-    assert verify_plan(parse(grouped_artifact.plan_ir)) == grouped_artifact.report
+    assert semantic_report(verify_plan(parse(grouped_artifact.plan_ir))) == semantic_report(grouped_artifact.report)
     carried = [
         o for o in grouped_artifact.plan.walk() if isinstance(o, RegionChannelOp) and o.carried
     ]

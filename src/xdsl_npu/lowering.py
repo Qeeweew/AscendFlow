@@ -1,8 +1,8 @@
 """Lower stage/domain source regions to exact dav-2201 physical work.
 
-The AST path consumes collected lexical scopes without expanding child clocks.
-The explicit non-AST fixture path retains finite subdivisions. No events,
-completion certificates, or operator-name cases are supplied here.
+All source inputs consume collected lexical scopes without expanding child
+clocks. No events, completion certificates, or operator-name cases are supplied
+here.
 """
 
 import re
@@ -18,7 +18,7 @@ from .ir import BoundaryOp, EndOp, ScopeGuardOp
 from .lowering_context import ActorBindings
 from .mixed import extract_mixed, global_dependencies
 from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
-from .scalar import ARITHMETIC, Expr, expression, from_ssa, literal, prefix
+from .scalar import Expr, expression, from_ssa, literal, prefix
 from .source_ir import (
     AllocationOp,
     CopyOp,
@@ -33,7 +33,6 @@ from .source_ir import (
     ScaleOp,
     StageOp,
     ViewOp,
-    YieldOp,
     block8_reduction_widths,
 )
 from .source_scopes import Context
@@ -111,15 +110,13 @@ def _work(
     nested=False,
     parent_guards=None,
 ):
-    if program.attributes.get("frontend") != StringAttr("ast"):
-        return _legacy_work(program, pipeline, family, owner, operations=operations)
     require(
         scoped is not None and scope is not None,
-        "AST native records need their collected source scope",
+        "native records need their collected source scope",
     )
     require(
         operations is not None or scope.op is pipeline,
-        "AST native records changed their source pipeline",
+        "native records changed their source pipeline",
     )
     phases = {op: i for i, op in enumerate(pipeline.body.block.ops) if isinstance(op, StageOp)}
     issue_order = () if pipeline.issue_order is None else pipeline.issue_order.data.get(family, ())
@@ -182,121 +179,6 @@ def _work(
                 parent_guard,
             )
         )
-    return _check_work_order(records, program, pipeline, family, pinned, ranks)
-
-
-def _legacy_work(program, pipeline, family, owner, *, operations=None):
-    records = []
-    phases = {op: i for i, op in enumerate(pipeline.body.block.ops) if isinstance(op, StageOp)}
-    default_domain = None if program.kind.data == "mixed" else program.kind.data
-    issue_order = () if pipeline.issue_order is None else pipeline.issue_order.data.get(family, ())
-    pinned = (
-        operations is None
-        and pipeline.issue_order is not None
-        and family in pipeline.issue_order.data
-    )
-    ranks = {label.data: i for i, label in enumerate(issue_order)}
-
-    def walk(block, clock, bindings, stage, phase, label, domain, order, boundary=None):
-        for position, op in enumerate(block if isinstance(block, tuple) else block.ops):
-            path = (*order, position)
-            if isinstance(op, StageOp):
-                require(boundary is None, "place last-generation conditions inside their Stage")
-                if clock is pipeline:
-                    walk(
-                        op.body.block,
-                        clock,
-                        bindings,
-                        op.offset.data,
-                        phases[op],
-                        op.label.data,
-                        domain,
-                        (ranks.get(op.label.data, -1), *path) if ranks else path,
-                    )
-                else:
-                    # The final component identifies this inner iteration's
-                    # issue time. Stage shifts ONLY its own pipeline clock.
-                    parent = order[:-1]
-                    time = bindings[clock.body.block.args[0]] + op.offset.data
-                    walk(
-                        op.body.block,
-                        clock,
-                        bindings,
-                        stage,
-                        phase,
-                        label,
-                        domain,
-                        (*parent, time, position),
-                    )
-            elif isinstance(op, DomainOp):
-                selected = op.kind.data
-                if selected != family:
-                    continue
-                local = {**bindings, op.body.block.args[0]: owner}
-                walk(op.body.block, clock, local, stage, phase, label, selected, path, boundary)
-            elif isinstance(op, scf.IfOp):
-                require(
-                    boundary is None and clock is pipeline,
-                    "nested boundary predicates need hierarchical analysis",
-                )
-                _last_condition(op, pipeline)
-                walk(op.true_region.block, clock, bindings, stage, phase, label, domain, path, op)
-            elif isinstance(op, PipelineOp):
-                require(
-                    boundary is None,
-                    "a loop inside a boundary requires hierarchical region analysis",
-                )
-                require(op.issue_order is None, "nested issue policies need hierarchical lowering")
-                require(
-                    op.limit is None,
-                    "nested runtime pipelines need hierarchical loop synchronization; "
-                    "only static native tile subdivisions are currently supported",
-                )
-                require(
-                    op.count.data <= 64,
-                    "native tile subdivision exceeds 64 templates; "
-                    "an input-length loop must remain the outer runtime pipeline",
-                )
-                for iteration in range(op.count.data):
-                    local = {**bindings, op.body.block.args[0]: iteration}
-                    walk(op.body.block, op, local, stage, phase, label, domain, (*path, iteration))
-            elif (
-                isinstance(
-                    op,
-                    (
-                        AllocationOp,
-                        ViewOp,
-                        PredicateOp,
-                        YieldOp,
-                        arith.ConstantOp,
-                        arith.CmpiOp,
-                        scf.YieldOp,
-                    ),
-                )
-                or type(op) in ARITHMETIC
-            ):
-                continue
-            elif isinstance(op, (CopyOp, ElementOp, MatmulOp, ReduceOp, ScalarReadOp, ScaleOp)):
-                require(domain is not None, "mixed work requires a Cube or Vector execution scope")
-                require(domain == family, "source operation has incompatible execution owner")
-                records.append(
-                    Work(op, stage, phase, label, path, tuple(bindings.items()), boundary)
-                )
-            else:
-                raise TypeError(
-                    f"unsupported source operation {op.name}; effects cannot be ignored"
-                )
-
-    walk(
-        pipeline.body.block if operations is None else tuple(operations),
-        pipeline,
-        {},
-        0,
-        0,
-        "pipeline",
-        default_domain,
-        (),
-    )
     return _check_work_order(records, program, pipeline, family, pinned, ranks)
 
 
@@ -372,9 +254,9 @@ class _Actor:
         family,
         owner,
         allocations,
+        records,
         symbolic=False,
         invocation=None,
-        records=None,
         once=False,
         region_name=None,
         bindings=None,
@@ -386,7 +268,7 @@ class _Actor:
         self.invocation = invocation
         self.ambient_frames, self.capture = tuple(ambient_frames), capture
         self.parent_generation = parent_generation
-        self.records = _work(program, pipeline, family, owner) if records is None else records
+        self.records = records
         self.once, self.region_name = once, region_name
         require(
             all(
@@ -1024,7 +906,7 @@ def _tile_producer(value, outer):
     return value.owner, final_bindings
 
 
-def _check_values(physical, actors, outer):
+def _check_values(physical, actors, outer, *, _facts=None):
     """Check borrowed value identity independently of synchronization.
 
     Actual native RAW writers must be the declared numerical producer.
@@ -1033,7 +915,7 @@ def _check_values(physical, actors, outer):
     from .loop_model import is_symbolic
 
     if is_symbolic(physical):
-        return _check_loop_values(physical, actors, outer)
+        return _check_loop_values(physical, actors, outer, _facts=_facts)
     if len(actors) == 3:
         mixed = extract_mixed(physical)
         programs = mixed.programs
@@ -1113,15 +995,26 @@ def _check_values(physical, actors, outer):
                     )
 
 
-def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=()):
+def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=(), _facts=None):
     from .loop_model import extract_loop, loop_dependencies
 
-    loop = extract_loop(physical) if extracted is None else extracted
+    if extracted is None:
+        extracted = extract_loop(physical) if _facts is None else _facts.extract_loop(physical)
+    loop = extracted
     if not any(
         record.op.dependencies for lowering in actors.values() for record in lowering.records
     ):
         return
-    raw = [o for o in loop_dependencies(loop, live_in=live_in) if o.hazard == "RAW"]
+    dependencies = (
+        loop_dependencies(loop, live_in=live_in)
+        if _facts is None
+        else _facts.loop_dependencies(loop, live_in=live_in)
+    )
+    writers = {}
+    for dependency in dependencies:
+        if dependency.hazard == "RAW":
+            key = dependency.source, dependency.destination, dependency.storage
+            writers.setdefault(key, []).append(dependency)
     for actor, lowering in actors.items():
         owner = actor if len(actors) == 3 else ("aic" if actor == "cube" else "aiv0")
         tasks = {t.uid: t for t in loop.actors[owner].program.tasks}
@@ -1158,12 +1051,8 @@ def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=()):
                 for r in range(loop.storage_periods[root_name]):
                     produced = [
                         (o.start, o.stop)
-                        for o in raw
-                        if o.source == candidates[0]
-                        and o.destination == (owner, read_uid)
-                        and o.distance == 0
-                        and r % o.period in o.residues
-                        and o.storage == root_name
+                        for o in writers.get((candidates[0], (owner, read_uid), root_name), ())
+                        if o.distance == 0 and r % o.period in o.residues
                     ]
                     frame = loop.frames.get(root_name, 0)
                     needed = [(lo - r * frame, hi - r * frame) for lo, hi in ref.segments(r)]
@@ -1173,7 +1062,7 @@ def _check_loop_values(physical, actors, outer, *, extracted=None, live_in=()):
                     )
 
 
-def lower_source(module, *, symbolic=True):
+def lower_source(module, *, symbolic=True, _facts=None):
     from .frontend import PrimFunction
 
     if isinstance(module, PrimFunction):
@@ -1185,13 +1074,15 @@ def lower_source(module, *, symbolic=True):
         "expected one typed source program",
     )
     from .region_lowering import lower_regions
+    from .source_scopes import collect_source_scopes
 
-    if symbolic and program.attributes.get("frontend") == StringAttr("ast"):
+    scope = collect_source_scopes(program)
+    if symbolic:
         from .scope_lowering import has_nested_pipelines, lower_scopes
 
         if has_nested_pipelines(program) and any(
             isinstance(op, (PipelineOp, scf.ForOp)) for op in program.body.block.ops
         ):
-            return lower_scopes(program)
+            return lower_scopes(program, _scope=scope, _facts=_facts)
 
-    return lower_regions(program, symbolic=symbolic)
+    return lower_regions(program, symbolic=symbolic, _scope=scope, _facts=_facts)

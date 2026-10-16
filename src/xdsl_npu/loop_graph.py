@@ -100,6 +100,9 @@ class Graph:
         self.domains = {}
         self._completion = None
         self.potentials = None
+        self._rank_state = None
+        self._rank_edges = 0
+        self.potential_work = {"builds": 0, "new_edges": 0, "relaxations": 0, "scaled": 0}
         self._arcs = set()
         self.domain_states = 0
         self.domain_edges = 0
@@ -112,6 +115,7 @@ class Graph:
             self.ids[key] = len(self.nodes)
             self.nodes.append(Node(command, residue, point, guard))
             self.outgoing.append([])
+            self.potentials = None
             if self._completion is not None:
                 self._completion.node(self.ids[key])
         else:
@@ -127,45 +131,80 @@ class Graph:
         self._arcs.add(arc)
         self.edges.append(arc)
         self.outgoing[a].append((b, bc - ac))
+        self.potentials = None
+        self.domains.clear()
         if self._completion is not None:
             self._completion.edge(*arc)
 
     def potential(self):
+        """Extend a well-founded rank certificate across appended constraints.
+
+        An unchanged edge is never re-solved. Doubling stride and all existing
+        ranks preserves rank[b]-rank[a] >= 1-stride*delta, since the old strict
+        margin also doubles. Only appended edges and increased successors need
+        relaxation. Returned rank tuples are immutable snapshots.
+        """
         if self.potentials is not None:
             return self.potentials
-        poll("completion potential", nodes=len(self.nodes), edges=len(self.edges))
-        # Choose T larger than any simple family cycle. An interior cycle
-        # with net advance<=0 violates these difference constraints.
-        stride = len(self.nodes) + 1
-        ranks = [0] * len(self.nodes)
+        count = len(self.nodes)
+        poll("completion potential", nodes=count, edges=len(self.edges))
+        self.potential_work["builds"] += 1
+        if self._rank_state is None:
+            stride, ranks = max(2, 2 * (count + 1)), [0] * count
+            previous = 0
+        else:
+            stride, old = self._rank_state
+            require(
+                len(old) <= count and self._rank_edges <= len(self.edges),
+                "completion rank certificate requires append-only topology",
+            )
+            factor = 1
+            while stride * factor <= count:
+                factor *= 2
+            ranks = [rank * factor for rank in old] + [0] * (count - len(old))
+            stride *= factor
+            self.potential_work["scaled"] += factor != 1
+            previous = self._rank_edges
         if self.maximum == 0:
-            self.potentials = stride, ranks
+            self.potentials = stride, tuple(ranks)
+            self._rank_state, self._rank_edges = self.potentials, len(self.edges)
             return self.potentials
-        # Only successors of an increased rank can need relaxation. Keep the
-        # exact full relaxation below as the cycle diagnostic if a difficult
-        # graph exceeds the queue budget; the fast path grants no new edges.
-        pending = deque(range(len(self.nodes)))
-        queued = [True] * len(self.nodes)
-        insertions = [1] * len(self.nodes)
-        iterations = 0
+        pending, queued = deque(), set()
+        insertions = [0] * count
+        for a, b, delta in self.edges[previous:]:
+            self.potential_work["new_edges"] += 1
+            required = ranks[a] + 1 - stride * delta
+            if required > ranks[b]:
+                ranks[b] = required
+                if b not in queued:
+                    queued.add(b)
+                    pending.append(b)
         while pending:
-            iterations += 1
-            if iterations % 256 == 0:
-                poll("completion potential", nodes=len(self.nodes), relaxations=iterations)
             a = pending.popleft()
-            queued[a] = False
+            queued.remove(a)
+            self.potential_work["relaxations"] += 1
+            if self.potential_work["relaxations"] % 256 == 0:
+                poll(
+                    "incremental completion potential",
+                    nodes=count,
+                    relaxations=self.potential_work["relaxations"],
+                )
             for b, delta in self.outgoing[a]:
                 required = ranks[a] + 1 - stride * delta
                 if required <= ranks[b]:
                     continue
                 ranks[b] = required
-                if not queued[b]:
+                if b not in queued:
                     insertions[b] += 1
-                    if insertions[b] > len(self.nodes):
-                        return self._potential_full(stride)
+                    if insertions[b] > count:
+                        result = self._potential_full(stride)
+                        self.potentials = result[0], tuple(result[1])
+                        self._rank_state, self._rank_edges = self.potentials, len(self.edges)
+                        return self.potentials
                     pending.append(b)
-                    queued[b] = True
-        self.potentials = stride, ranks
+                    queued.add(b)
+        self.potentials = stride, tuple(ranks)
+        self._rank_state, self._rank_edges = self.potentials, len(self.edges)
         return self.potentials
 
     def _potential_full(self, stride):

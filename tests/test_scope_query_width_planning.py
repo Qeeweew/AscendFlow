@@ -56,13 +56,14 @@ def planned(parent_module):
     return module, checked, checks, result, windows, batches
 
 
-def test_actual_width_one_planning_uses_one_small_batch_per_graph_change(planned):
+def test_actual_width_one_planning_retains_one_graph_and_updates_missing_facts(planned):
     _, checked, checks, result, windows, batches = planned
     copies = len(checked.query_summary.parts)
     assert result.protocols and all(len(p.ids) == 1 for p in result.protocols)
     assert result.new_event_reuse_checks == len(result.protocols)
-    assert windows == [copies] * (1 + len(result.protocols))
-    assert len(batches) == len(windows)
+    assert windows == [copies]
+    assert len(batches) == 1 + len(result.protocols)
+    assert all(proof is result.completion for proof, _ in batches)
     memory = tuple((check.source, check.target, check.domain) for check in checks)
     assert batches[0][1] == memory
     for (_, queries), protocol in zip(batches[1:], result.protocols, strict=True):
@@ -145,15 +146,18 @@ def test_width_two_matches_full_window_and_literal_actual_event_oracle(
             finite = FiniteQueryTransitions(parent, count, (candidate,), copies=9)
             assert [finite.covered(*reuse(candidate, width)[:2]) for width in range(1, 9)] == full
         windows, batches = observe(monkeypatch)
-        width, answers, attempted = scope_query_planning._query_width(
+        width, answers, attempted, completion, request = scope_query_planning._query_width(
             parent, copies, candidate, 8, memory
         )
     assert width == full.index(True) + 1 == 2
-    assert answers == [True] * len(memory) and attempted == 8
+    assert answers == (True,) * len(memory) and attempted == 8
     assert tuple(windows) == expected_windows
     assert batches[0][1] == (reuse(candidate, 1), *memory)
-    assert batches[1][1] == tuple(reuse(candidate, width) for width in range(2, 9))
+    resources = tuple(reuse(candidate, width) for width in range(2, 9))
+    assert batches[1][1] == ((*resources, *memory) if len(expected_windows) > 1 else resources)
     assert (batches[0][0] is batches[1][0]) == (len(expected_windows) == 1)
+    assert completion is batches[-1][0] and request == reuse(candidate, width)
+    assert request in completion.answers and all(query in completion.answers for query in memory)
 
 
 def test_insufficient_actual_width_rejects_without_another_graph(distance_two, monkeypatch):

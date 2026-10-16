@@ -3,7 +3,7 @@
 These immutable handles refer to the original xDSL regions; they are not a
 second program or a flattened execution history. Present admission is one
 local serial parent with ordinary work and direct pipelines, or one mixed
-pipeline. The explicit legacy path alone admits finite nested subdivisions.
+pipeline. Nested calls use the same collected work and actor bindings.
 """
 
 from dataclasses import dataclass, replace
@@ -44,7 +44,7 @@ def _has_work(op):
     )
 
 
-def source_body(program, *, symbolic):
+def source_body(program, *, symbolic, _scope=None):
     """Admit the implemented control subset before lowering any native work."""
     parents = [op for op in program.body.block.ops if isinstance(op, scf.ForOp)]
     require(
@@ -102,7 +102,7 @@ def source_body(program, *, symbolic):
                 op is invocation,
                 f"{op.location}: structured scf.for synchronization needs hierarchical region analysis",
             )
-        if (ast or sequential) and isinstance(op, PipelineOp):
+        if isinstance(op, PipelineOp):
             require(
                 op.parent_op() is scope,
                 "nested AST pipelines require hierarchical synchronization; "
@@ -112,7 +112,7 @@ def source_body(program, *, symbolic):
             symbolic or not isinstance(op, scf.IfOp),
             "boundary regions require the symbolic compiler; no finite fallback",
         )
-        if ast and isinstance(op, scf.IfOp):
+        if isinstance(op, scf.IfOp):
             conditions.append(op)
     # Admit the entire control tree before interpreting a predicate in the
     # current one-clock subset. A nested clock must not lose its ancestor facts
@@ -132,40 +132,39 @@ def source_body(program, *, symbolic):
             "ordinary source work cannot borrow a child stage or boundary predicate",
         )
         _last_condition(op, parent)
-    source_scope = None
-    if ast:
-        source_scope = collect_source_scopes(program)
-        by_scope = {item.op: item for item in source_scope.walk_scopes()}
-        direct_work = {
-            op: tuple(item for item in tree.items if isinstance(item, ScopedWork))
-            for op, tree in by_scope.items()
-        }
-        owner_scope = by_scope[scope]
-        owner_ops = tuple(scope.body.block.ops)
-        prefix = len(owner_scope.context.path)
-        by_operation = {}
-        for item in direct_work[scope]:
-            op = owner_ops[item.context.path[prefix]]
-            by_operation.setdefault(op, []).append(item)
-        regions = [
-            replace(
-                region,
-                scope=by_scope[region.pipeline] if region.operations is None else owner_scope,
-                work=direct_work[region.pipeline]
-                if region.operations is None
-                else tuple(item for op in region.operations for item in by_operation.get(op, ())),
-            )
-            for region in regions
-        ]
+    source_scope = collect_source_scopes(program) if _scope is None else _scope
+    require(source_scope.op is program, "source collection belongs to another program")
+    by_scope = {item.op: item for item in source_scope.walk_scopes()}
+    direct_work = {
+        op: tuple(item for item in tree.items if isinstance(item, ScopedWork))
+        for op, tree in by_scope.items()
+    }
+    owner_scope = by_scope[scope]
+    owner_ops = tuple(scope.body.block.ops)
+    prefix = len(owner_scope.context.path)
+    by_operation = {}
+    for item in direct_work[scope]:
+        op = owner_ops[item.context.path[prefix]]
+        by_operation.setdefault(op, []).append(item)
+    regions = [
+        replace(
+            region,
+            scope=by_scope[region.pipeline] if region.operations is None else owner_scope,
+            work=direct_work[region.pipeline]
+            if region.operations is None
+            else tuple(item for op in region.operations for item in by_operation.get(op, ())),
+        )
+        for region in regions
+    ]
     return SourceBody(invocation, tuple(regions), tuple(allocations), source_scope)
 
 
-def lower_regions(program, *, symbolic):
+def lower_regions(program, *, symbolic, _scope=None, _facts=None):
     from .lowering import _Actor, _check_loop_values, _check_values, _work
     from .mixed import compose
     from .sequence_model import extract_sequence
 
-    body = source_body(program, symbolic=symbolic)
+    body = source_body(program, symbolic=symbolic, _scope=_scope)
     from .indexing import validate_source_arithmetic
 
     validate_source_arithmetic(program)
@@ -215,7 +214,9 @@ def lower_regions(program, *, symbolic):
         if multiple:
             # Existing physical representations retain their proof adapters.
             # Both use this same source admission and native construction path.
-            sequence = extract_sequence(module)
+            sequence = (
+                extract_sequence(module) if _facts is None else _facts.extract_sequence(module)
+            )
             for leaf in leaves:
                 _check_loop_values(
                     module,
@@ -223,6 +224,7 @@ def lower_regions(program, *, symbolic):
                     leaf.pipeline,
                     extracted=sequence.regions[leaf.region_name],
                     live_in=sequence.live_in[leaf.region_name],
+                    _facts=_facts,
                 )
         else:
             actors[name] = leaves[0]
@@ -235,5 +237,5 @@ def lower_regions(program, *, symbolic):
         else modules[0]
     )
     if not multiple:
-        _check_values(physical, actors, body.regions[0].pipeline)
+        _check_values(physical, actors, body.regions[0].pipeline, _facts=_facts)
     return physical

@@ -4,6 +4,7 @@ import pytest
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType, IntAttr, StringAttr
 
+from tests.report_contract import semantic_report
 from xdsl_npu import compile, verify_plan
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.ir import (
@@ -134,7 +135,7 @@ def test_dynamic_positive_radix_is_a_uniform_total_not_a_storage_period():
 def test_cyclic_ir_roundtrip_and_codegen_keep_host_uniform_and_zero_owners_empty():
     artifact = compile(cyclic_program(5))
     plan = parse(artifact.plan_ir)
-    assert verify_plan(plan) == artifact.report
+    assert semantic_report(verify_plan(plan)) == semantic_report(artifact.report)
     assert isinstance(
         next(op for op in plan.walk() if isinstance(op, CyclicCountOp)), CyclicCountOp
     )

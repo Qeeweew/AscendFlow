@@ -1,28 +1,40 @@
-"""Final serial-query verification rebuilt from the actual synchronized IR."""
+"""Compose owned query results, or independently verify imported actual IR."""
 
 from .budget import bounded
 from .model import require
 from .scope_query_checks import check_memory, prepare_memory_checks
 from .scope_query_completion import QueryCompletion
 from .scope_query_protocols import read_query_protocols
+from .scope_resources import invocation_resources
 
 
 @bounded
-def verify_query_invocations(checked, parent):
-    from .scope_query_resources import verify_query_resources
+def verify_query_invocations(checked, parent, *, resources=None, query_plan=None):
+    from .scope_query_resources import _verify_query_resources
 
     require(
         checked.program is parent.program and checked.access is parent.access,
         "query verification needs the actual checked invocation proof",
     )
+    established_here = resources is None and getattr(checked, "resource_proof", None) is None
+    resources = invocation_resources(checked, parent, resources)
     protocols = read_query_protocols(checked.program, checked.access)
-    copies = max(
-        len(checked.query_summary.parts),
-        max((max(p.target.query, len(p.ids)) + 1 for p in protocols), default=2),
-    )
-    query = QueryCompletion(parent, copies=copies)
-    checks = prepare_memory_checks(checked, parent)
-    answers = check_memory(checks, query)
+    if query_plan is None:
+        copies = max(
+            len(checked.query_summary.parts),
+            max((max(p.target.query, len(p.ids)) + 1 for p in protocols), default=2),
+        )
+        query = QueryCompletion(parent, copies=copies)
+        checks = prepare_memory_checks(checked, parent)
+        answers = check_memory(checks, query)
+    else:
+        from .scope_query_planning import QueryMemoryPlan
+
+        require(
+            isinstance(query_plan, QueryMemoryPlan), "query verification needs an owned query plan"
+        )
+        query_plan._check_owned(checked, parent, resources)
+        query, checks, answers = query_plan.completion, query_plan.checks, query_plan.answers
     for check, valid in zip(checks, answers, strict=True):
         obligation = check.obligations[0]
         roots = [
@@ -34,7 +46,11 @@ def verify_query_invocations(checked, parent):
             f"{obligation.hazard} {'/'.join(roots)}[{obligation.start}:{obligation.stop}], "
             f"{check.source} -> {check.target}, {check.domain}",
         )
-    resources = verify_query_resources(checked, parent, query)
+    resource_report = _verify_query_resources(checked, parent, query, resources, query_plan)
+    if established_here:
+        resource_report["invocation_resources"].update(
+            source="rebuilt from actual IR by this entry", new_invocation_resource_solver_calls=3
+        )
     # Parent progress was independently checked before this call. New local
     # waits only acquire from smaller query indices, at verified native cuts.
     # Query 0 has no such waits; assuming all earlier invocations finish, the
@@ -48,8 +64,10 @@ def verify_query_invocations(checked, parent):
     return {
         "verified": True,
         "memory_checks": len(checks),
+        "memory_checks_reused": len(checks) if query_plan is not None else 0,
+        "new_memory_checks": len(checks) if query_plan is None else 0,
         "protocols": len(protocols),
-        "resources": resources,
+        "resources": resource_report,
         "completion": query.statistics(),
         "progress": "parent progress plus positive-distance local query waits at actual native cuts",
         "pairing": "Set q < M-d and Wait q >= d, matching source ordinal q and q-d",

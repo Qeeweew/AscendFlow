@@ -215,7 +215,9 @@ def _transfers(entries, work):
 
 
 @bounded
-def summarize_sequence(parts, *, statistics=None):
+def summarize_sequence(
+    parts, *, materialize_cells=True, obligation_source_regions=None, statistics=None
+):
     """Return exact sequence frontiers and unresolved cross-region hazards.
 
     Empty dynamic children contribute identity; surrounding constant-count
@@ -223,10 +225,16 @@ def summarize_sequence(parts, *, statistics=None):
     without assuming their last issued read retires the previous ones.
 
     Identical entry patterns share domain selection and transfer computation
-    only within this call. Each physical interval still gets its own cells and
-    obligations, including holes and adjacent pieces. The visit budget charges
-    input signatures, unique transfers and every materialized output record.
+    only within this call. By default each physical interval gets its own cells
+    and obligations, including holes and adjacent pieces. Output projection may
+    omit cells or materialize obligations only from selected source regions.
+    It preserves all transfer computation, reader histories and domain checks;
+    omitted cells are not available for later invocation_dependencies(). The
+    visit budget charges input signatures, unique transfers and materialized
+    output records. Statistics separately count omitted output objects.
     """
+    require(type(materialize_cells) is bool, "sequence cell projection must be an explicit boolean")
+    sources = None if obligation_source_regions is None else frozenset(obligation_source_regions)
     parts = tuple(parts)
     require(
         len({part.name for part in parts}) == len(parts), "sequence region names must be unique"
@@ -293,6 +301,7 @@ def summarize_sequence(parts, *, statistics=None):
 
     output, obligations, transfers = [], [], {}
     physical_intervals = reused_intervals = transfer_visits = materialized_visits = 0
+    omitted_cells = omitted_obligations = 0
     input_pattern_visits = work.visits
     for root, events in roots.items():
         active = {}
@@ -332,26 +341,32 @@ def summarize_sequence(parts, *, statistics=None):
             before = work.visits
             for domain, frontier, hazards in transfers[signature]:
                 for hazard, source, destination in hazards:
+                    if sources is not None and source.region not in sources:
+                        omitted_obligations += 1
+                        continue
                     work.charge(1, "obligation")
                     obligations.append(
                         Obligation(root, point, stop, domain, hazard, source, destination)
                     )
-                work.charge(
-                    len(frontier.reads_before_write) + len(frontier.pending_reads) + 1,
-                    "output-piece",
-                )
-                output.append(
-                    Cell(
-                        root,
-                        point,
-                        stop,
-                        domain,
-                        frontier.reads_before_write,
-                        frontier.first_write,
-                        frontier.last_write,
-                        frontier.pending_reads,
+                if materialize_cells:
+                    work.charge(
+                        len(frontier.reads_before_write) + len(frontier.pending_reads) + 1,
+                        "output-piece",
                     )
-                )
+                    output.append(
+                        Cell(
+                            root,
+                            point,
+                            stop,
+                            domain,
+                            frontier.reads_before_write,
+                            frontier.first_write,
+                            frontier.last_write,
+                            frontier.pending_reads,
+                        )
+                    )
+                else:
+                    omitted_cells += 1
             materialized_visits += work.visits - before
     if statistics is not None:
         statistics.update(
@@ -364,6 +379,8 @@ def summarize_sequence(parts, *, statistics=None):
             transfer_visits=transfer_visits,
             materialized_cells=len(output),
             materialized_obligations=len(obligations),
+            omitted_cells=omitted_cells,
+            omitted_obligations=omitted_obligations,
             materialized_visits=materialized_visits,
             visits=work.visits,
         )

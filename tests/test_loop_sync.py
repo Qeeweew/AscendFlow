@@ -10,6 +10,7 @@ import pytest
 from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
 from tests.fixtures.cv import cv_source, segmented_cv_program, vector_source
+from tests.report_contract import semantic_report
 from xdsl_npu import compile, emit_asc, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check
@@ -193,7 +194,7 @@ def test_normal_compilation_never_instantiates_input_length(monkeypatch):
     assert len(set(sizes)) == 1
 
 
-def test_selection_builds_three_graphs_without_a_path_oracle(monkeypatch):
+def test_selection_builds_only_planning_and_materialized_graphs_without_a_path_oracle(monkeypatch):
     import xdsl_npu.loop_sync as sync
 
     original, calls = sync.completion_graph, []
@@ -211,7 +212,7 @@ def test_selection_builds_three_graphs_without_a_path_oracle(monkeypatch):
     monkeypatch.setattr(Graph, "path", forbidden)
     result = compile(cv_source(N.dynamic("tasks")))
     assert result.report["channels"] > 10
-    assert len(calls) == 3  # native insertion cuts, materialized plan, independent final graph
+    assert len(calls) == 2  # native insertion cuts and the materialized resource graph
 
 
 @pytest.mark.parametrize("width", [1, 8, 24])
@@ -264,7 +265,7 @@ def test_removed_release_and_shortened_binary_reuse_are_rejected():
 
 def test_runtime_ssa_roundtrip_and_explicit_finite_check_boundary(artifact):
     plan = parse(artifact.plan_ir)
-    assert verify_plan(plan) == artifact.report
+    assert semantic_report(verify_plan(plan)) == semantic_report(artifact.report)
     assert emit_asc(plan) == artifact.asc
     with pytest.raises(CompileError, match="explicit finite test instance"):
         bounded_check(plan)

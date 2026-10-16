@@ -1,4 +1,4 @@
-"""Reuse owned planning work; final checking still reconstructs actual IR."""
+"""Normal compilation composes owned facts; explicit deep checking rebuilds IR."""
 
 from dataclasses import replace
 
@@ -75,20 +75,15 @@ def test_planning_record_and_parent_describe_the_actual_allocated_protocols(plan
                 assert op.child_generation is leaf.stream.body.block.args[0]
 
 
-def test_child_width_adaptation_rebuilds_only_actual_resources(planned):
+def test_child_width_adaptation_preserves_physical_facts_and_updates_resources(planned):
     _, planning, parent, allocation, _ = planned
     adapted = allocation["adapted"]
     assert adapted == (planning.program.root.sym_name.data == "nested_copy")
-    if adapted:
-        assert parent is not allocation["before"] and parent is not allocation["candidates"]
-        assert planning.program is not allocation["program"]
-        assert planning.access is not allocation["access"]
-        assert planning.analyses is not allocation["analyses"]
-    else:
-        assert parent is allocation["before"]
-        assert planning.program is allocation["program"]
-        assert planning.access is allocation["access"]
-        assert planning.analyses is allocation["analyses"]
+    assert parent is allocation["candidates"]
+    assert (parent is allocation["before"]) == (not adapted)
+    assert planning.program is allocation["program"]
+    assert planning.access is allocation["access"]
+    assert planning.analyses is allocation["analyses"]
     expected = []
     for uid, leaf in planning.program.leaves.items():
         analysis = planning.analyses[uid]
@@ -127,13 +122,13 @@ def test_query_summary_sites_are_projected_before_outer_planning(planned):
     QueryCompletion(parent, copies=len(planning.query_summary.parts))
 
 
-def test_public_autosync_skips_parent_reverification_until_independent_finish(monkeypatch):
+def test_public_autosync_composes_owned_proofs_without_independent_rebuild(monkeypatch):
     planned, verified, captured = [], [], []
     original_plan = scope_sync._plan_scope_parent
     original_verify = scope_sync._verify_scope_parent
 
-    def plan(program):
-        result = original_plan(program)
+    def plan(program, **kwargs):
+        result = original_plan(program, **kwargs)
         planned.append(result)
         return result
 
@@ -148,14 +143,17 @@ def test_public_autosync_skips_parent_reverification_until_independent_finish(mo
         module = scope_sync.autosync_scopes(
             lower_source(query_state_store), _capture=captured.append
         )
-    assert len(planned) == len(verified) == len(captured) == 1
+    assert len(planned) == len(captured) == 1
+    assert not verified
     planning, parent = planned[0]
     report, checked, _ = captured[0]
     assert checked.program.module is module and isinstance(checked, CheckedScopes)
-    assert checked.program is not planning.program
-    assert checked.access is not planning.access and checked.analyses is not planning.analyses
-    assert checked.query_summary is not planning.query_summary
-    assert verified[0][2] is not parent
+    assert checked.program is planning.program
+    assert checked.access is planning.access and checked.analyses is planning.analyses
+    assert checked.query_summary is planning.query_summary
+    assert checked.resource_proof is planning.resource_proof
+    assert checked.resource_proof.parent is parent
+    assert report["verification_origin"] == "composed owned transformation contracts"
     assert checked.query_report["verified"] is True and report["cross_query_verified"] is True
 
 
@@ -179,7 +177,7 @@ def test_final_check_rejects_actual_ir_damage_after_query_planning(monkeypatch, 
         limit(15),
         pytest.raises(
             CompileError,
-            match="(missing or changes an actual native|different parent or child clock)",
+            match="(missing or changes an actual native|wrong parent/child clock)",
         ),
     ):
         scope_sync.autosync_scopes(lower_source(query_state_store))

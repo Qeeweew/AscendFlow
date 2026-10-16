@@ -1,102 +1,131 @@
-# 当前状态：停止算子优化，重构编译流程
+# 当前状态：编译流程重构与冷编译测量
 
-2026-10-16。代码审查基线 `fdff8c55b0cddc51331c637ffecc75ce0e34401f`，审查开始时产品
-工作树干净。用户要求停止算子优化，改为梳理复杂度、编译不变量和重构方案。
+2026-10-16，实施基线 `216b711`（编译器实现与 `fdff8c5` 相同）。本轮修改编译器、
+回归与计时工具；FA/其他算子的示例算法和排步政策没有变化。算子性能调优仍暂停。
 
-**本轮只完成源码审查与文档重写；没有修改编译器代码、移除检查、运行编译/测试/
-profiling/设备，也没有打包或推送。新算法尚未实现。** 三个 Agent 均仅做只读审查。
+入口：[设计](design.md)、[不变量](compilation-invariants.md)、[计划及剩余项](refactor-plan.md)。
+下面区分本轮可用改动与尚未达到的复杂度目标，不把 normal/deep 分离称作完整线性算法。
 
-入口：[设计](design.md)、[不变量](compilation-invariants.md)、[实施计划](refactor-plan.md)。
-这些文件替换旧的“继续 GM→L1 优化”顺序，专项性能页中的旧下一步不再是活动任务。
+## 已落地的编译流程
 
-随后按用户要求清理了外层`runs/`：保留`refactor/cv-order`、`query-boundaries`和
-`l1-reuse`中的近期源码/ASC、编译记录、CSV/性能摘要与失败诊断，删除旧实验、二进制、
-缓存及profiler原始trace/数据库。保留目录是历史证据，已不是可直接运行的完整build；
-库需重新构建，其他历史runs路径可能已删除。清理明细见外层`runs/README.md`。
+公开 `prim_func → source xDSL → physical IR → autosync → ASC → CANN` 路径中：
 
-## 当前代码实际支持
+- 私有 `PhysicalFacts` 在一次编译内交付实际scope/loop/sequence和依赖，不跨编译共享结果。
+  source统一scope collection，删除`_legacy_work`及旧finite source walker。
+- leaf/sequence/invocation/parent保留已建立的完成事实；精确capture/acquire构造直接
+  建立其保证，物化按实际端点/guard/clock/ID核对，不独立重建整个证明。
+- invocation的child寿命、parent池与counter结果直接交给query；ID置换保持memory
+  事实，分配重试复用同一资源结论。无空闲bank不再求解不可能容纳的私有池。
+- query新增通知追加到同一topology/flow，保留已成立的关系；未完整覆盖的请求保留
+  原cases，新增边传播后重读。width=1复用原图，仅静态证明窗口不足时重建。
+- query摘要显式投影所需输出，省去不用的sequence cells及无关来源的物理义务对象；
+  保留完整reader/domain推导，默认通用摘要仍返回完整结果。
+- 完成前沿只在相同完整guard下合并连续范围；增量传播不重建第二套pending闭包。
+  进展排名更新新增/受影响约束；不可变数学域在一次编译内共享，顶层编译互相隔离。
+- 合格stationary固定循环使用紧凑摘要，保留真实first acquire/tail retirement prefix。
+  需要历史定义、漂移/特殊footprint和query长ReadSpan的路径仍保留精确固定表示。
+- 普通结构化编译消费构造结果。`compile(..., debug_verify=True)`显式从最终IR独立
+  检查；外部同步IR通过`compile(..., synchronize=False)`或`verify_plan`独立验证。
+  不接受`verified=True`或序列化证明标记。低层legacy finite/mixed/dispatch入口仍有原检查。
 
-公开 `prim_func → source xDSL → physical IR → autosync → 实际 IR 独立终检 → ASC → CANN`
-路径已经接通默认 dense f16 Flash Attention。数学与政策只在
-[examples/flash_attention/attention.py](../examples/flash_attention/attention.py)。
-旧 `cube.task/vector.task`、公开旧 builder/tracer 和旧 FA 入口已删除，无兼容层。
+没有新增全局barrier、搬运、buffer、算子名/shape特判或预算放宽。输入的Sq/Sk仍是
+runtime参数，默认FA仍有76个native模板、12个call、20组AIC/双AIV，query/KV循环保留。
 
-Sq/Sk 是 runtime 参数，不按长度枚举；query、KV、固定 child 时钟保留。默认 BQ128
-有76个 native模板、12个call、20组AIC/双AIV。Vector先softmax再update；PIPE_ALL仅
-actor返回3处，没有query drain或额外搬运。
+## 本轮编译耗时
 
-已接通纯整数局部 canonicalize/CSE、constexpr assert、dtype/head输入合同、受限
-parent/child event ID借用。借用仍要求完整通知消费及FIRST/LAST边界，不是任意动态共享。
-当前普通编译仍执行独立完整终检，本轮没有改成新方案中的 normal 模式。
+测量机器为Kunpeng-920，Python3.11.15、xDSL0.73.0。当前版本每例5个独立冷进程；
+小算子基线同样5次，FA基线为本轮冻结旧源码的1次构建。没有跨进程编译缓存。
+下表使用双方共同的`Compilation.timings.total_s`口径：AST构造、全部分析、ASC和
+内部IR/report快照；Python文件读取/prim_func载入、import与完整进程时间另列。
 
-## 最近完整设备资格：历史 BQ128
+| 算子（固定example默认政策） | 基线中位数 s | 当前中位数 s | 下降 |
+|---|---:|---:|---:|
+| dense f16 FA，BQ128/BK1024/CK128/VR8，D128/Hq8/Hkv8 | 117.350（单次） | 53.000 | 54.8% |
+| hierarchical GEMM，M32/N64/BK64 | 0.567 | 0.492 | 13.3% |
+| softmax，R8/D1024 | 0.395 | 0.339 | 14.3% |
+| RMSNorm，D4096 | 0.395 | 0.339 | 14.0% |
+| Vector scale，B64 | 0.189 | 0.174 | 8.0% |
 
-产物：外层 `runs/refactor/cv-order/build/`；ASC SHA256：
+包含文件读取/构造的当前源码→ASC p50/max：FA **53.114/54.309s**、GEMM
+0.526/0.532s、softmax 0.369/0.414s、RMSNorm 0.369/0.372s、scale 0.212/0.214s。
+FA完整冷进程p50/max为54.488/55.803s，峰值RSS222260KiB（约217MiB）。
+当前五次FA源码→ASC为52.273、52.351、53.234、53.114、54.309s。
+
+FA规划从67.211s降到50.005s（各阶段中位数）；旧独立终检47.060s移出normal。
+其余主要阶段为lowering1.600s、emission0.787s、snapshot0.465s。收益既包括去掉重复
+终检，也包括约25.6%的规划降幅；仍未达到FA≤5s目标，不能把55%下降说成复杂度已解决。
+小算子改善约8–14%，不夸大成与FA相同的降幅。
+
+本轮还消除了query摘要中26711个无消费者Cell和44871个随后丢弃的Obligation构造，
+保留49271个实际物理义务及其4372个唯一内存检查。query追加通知复用同一图；最终仍有
+14945个query节点和84268个条件事实，表明下一步应压缩边界表示，而非继续放宽预算。
+
+冷测工具每trial使用独立Python进程，记录读取/构造、AST、全部分析、ASC、IR/report
+快照、import、完整进程时间和峰值RSS；300秒进程组硬期限，失败即停止后续trial。
+数据写入外层`runs/compiler-refactor/`，不纳入产品Git。
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile \
+  --input compiler/examples/flash_attention/attention.py --entry attention_target \
+  --mode normal --trials 5 --timeout 300 --output runs/compiler-refactor/cold-fa
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile \
+  --input compiler/examples/flash_attention/attention.py --entry attention_target \
+  --mode deep --trials 1 --timeout 300 --output runs/compiler-refactor/cold-fa-deep
+PYTHONPATH=compiler .venv/bin/python -m xdsl_npu.cli \
+  --input compiler/examples/flash_attention/attention.py --entry attention_target \
+  --compile --timeout 300 --output runs/compiler-refactor/cann-fa
+```
+
+Vector/GEMM/softmax/RMSNorm用同一工具分别指定其example和entry。runtime长度不作为
+constexpr计时参数；4K与8K使用同一编译产物，不按每个长度重编。
+
+## 回归和输出证据
+
+2831项CPU回归已分段覆盖并通过：一次广泛回归后修复失败，修复只重跑对应层；
+最后query增量改动另通过174项相关集成，摘要投影新增15项并通过55项相关回归。
+Ruff和diff检查通过。覆盖normal不重建独立证明、deep输出一致、实际IR破坏、event
+碰撞/guard孔洞、最后读取、零次/短循环、跨query资源、独立有限字节与指令模型。
+有界检查不冒充任意N形式化证明。
+
+FA独立deep检查单次101.348s，其中额外独立检查46.837s，ASC与normal完全一致。
+五类算子的全部冷测ASC也均与冻结基线逐字节相同。原始计时/源码/编译器身份及汇总
+保存在`runs/compiler-refactor/cold-*`、`comparison.json`；CPU回归日志在同目录。
+
+CANN9.1/dav-2201离线构建通过，选项为`-O2 -fPIC -std=c++20`
+和`-mllvm -cce-aicore-dcpreload-args=false`。完整文件→Python→ASC→CANN耗时：
+FA54.145s、GEMM2.824s、scale2.121s；其中CANN分别2.615/2.251/1.888s。
+每个构建共用300秒期限，全部正常退出。产物位于`runs/compiler-refactor/cann-{fa,hierarchical,scale}`；
+包含实际命令、ASC/二进制SHA和编译器版本。本轮未运行设备，不产生新的吞吐性能结论。
+
+默认FA ASC SHA256为
 `e6c0e1775b61306e1fdc82311706832a4cce6c2dafd16a6570c7cee7826a9e87`。
-CANN9.1/dav-2201/-O2。它是明确的历史产物，不等于当前HEAD已重新完成资格。
+同一源码、constexpr政策下逐字节相同，保留3个actor返回处PIPE_ALL，没有query drain。
+这证明本轮该配置的生成代码不变，不能将编译加速称作设备算子加速。
 
-| 项目 | 结果 |
-|---|---|
-| 源码→ASC | 141.225s；planning79.685s、final58.583s |
-| 同次完整构建 | 147.301s，未超300s |
-| 小规模全输出 | Sq:Sk=128:1024、384:3072、768:1024、512:2048；误差≤3.052e-5 |
-| 大规模采样 | 4K/8K同一binary；误差≤1.526e-5，全输出有限、输入/保护区通过 |
-| 4K三批device task p50的中位数 | 605.780µs；旧政策822.660；独立AscendC1191.220；ACLNN512.152 |
-| 性能资格 | 比旧政策快26.4%，仍比ACLNN慢18.3%，未达≤5%目标 |
-| bf16 GQA Hq8/Hkv2 | 同一DSL政策CANN/shared通过148.596s；没有设备资格 |
+## 剩余复杂度与能力边界
 
-原始正确性/计时记录在 `runs/refactor/cv-order/device/`、`performance.json` 等，
-指标口径及ops-transformer源码依据见[attention-performance.md](attention-performance.md)。
-硬件/profile证据不能仅由编译器架构设计替代。
+- FA≤5s p50/≤10s max仍是目标；目前不能宣称达到。默认FA的条件传播仍有大量
+  parent节点、origin、guard facts，query也仍使用有限静态窗口复制。
+- source循环不按runtime N展开，但固定child/footprint行片段/条件域仍可能放大分析。
+  同域frontier合并和输出投影不等于已经实现完整参数化region transfer。
+- child→parent→query仍分阶段分配。当前复用资源结论，尚未完成一次联合资源求解。
+  一般guard antichain、真实偏序共享与访问相交不能承诺线性复杂度。
+- 旧`cube.task/vector.task`和公开builder/tracer已删除，不恢复兼容。一般动态ownership、
+  continuous跨query状态、任意稀疏/分页/persistent task stream仍不支持。
+- 默认dense f16之外，bf16/GQA曾有CANN资格，但没有完整设备资格；causal/tails/decode、
+  MQA、paged/sparse/persistent等变体不能列为本轮已完成。
 
-## 暂停候选：BQ256/BM128 K/V复用
+## 历史设备结果及暂停候选
 
-example已有配对query政策、runner合同和小型CPU回归。其源码请求预算GM→L1为520MiB，
-对照历史默认PMU为776MiB、ACLNN为544.3125MiB。**520MiB不是设备实测收益。**
-候选没有成功生成完整ASC/shared binary，没有CANN或设备结果。
+最近完整设备证据保留在外层`runs/refactor/cv-order/`，CANN9.1/dav-2201/-O2。
+历史BQ128小规模全输出误差≤3.052e-5；4K/8K同一binary采样误差≤1.526e-5，
+全输出有限、输入和保护区通过。4K三批device task p50中位数605.780µs，ACLNN512.152µs，
+仍慢18.3%，未达≤5%目标。此为历史结果，本轮不复测或优化设备算子。
 
-五次拒绝均发生在300秒前，目录在 `runs/refactor/l1-reuse/`：
+BQ256/BM128 K/V复用候选仍暂停，尚无成功完整ASC/shared binary或设备结果。
+`runs/refactor/l1-reuse/`保留五次拒绝：22.697/22.184/59.493/89.502/99.837秒，
+分别涉及sequence endpoint、fixed child endpoint、parent guarded、child lifetime、
+parent borrowing预算。未放宽预算重跑；请求预算520MiB不是设备收益。
 
-| 构建目录 | 秒 | 拒绝位置 |
-|---|---:|---|
-| build | 22.697 | sequence endpoint预算 |
-| build-shared-sequence | 22.184 | fixed child endpoint relation预算 |
-| build-sparse | 59.493 | parent选择期间guarded case预算 |
-| build-incremental | 89.502 | child event lifetime期间guarded case预算 |
-| build-singleton | 99.837 | parent借用期间guarded case预算 |
-
-`rejected-builds.json`只列前四次；第五次以`build-singleton/build-result.json`为准。
-保留失败数据，不继续扩大预算或重跑候选。case probe只是既有只读诊断，不能称成功构建。
-
-## 已合入的通用改动与剩余问题
-
-| 提交 | 已实现内容 | 没有证明什么 |
-|---|---|---|
-| 7966bce | 受限parent通知借用fixed child event空档 | 任意条件/资源图均可共享 |
-| 743ae8c | 相同完整访问pattern共享sequence transfer | 逐物理区间/义务成本消失 |
-| 7a32407 | 固定child稀疏投影 | 父层条件/端点总量已受控 |
-| 6b6c4cf | QueryCompletion按endpoint/domain合批coverage | GuardedCompletion也全改成合批 |
-| 5cc71fa | 增边时保留完整覆盖正答案 | partial/false及新命题无需处理 |
-| fdff8c5 | singleton端点跳过无关边界枚举 | 非singleton边界成本已解决 |
-
-既有针对性测试保存在各提交中；本轮没有重跑，不把历史通过当作新重构通过。
-
-当前明确问题：
-
-- normal pipeline仍多次建立访问、child证明、父层完成关系和资源事实；甚至final内部
-  对同一未变快照重复验证。分层不变量及所有权没有贯穿。
-- 固定child计数、访问行片段、条件域、period和query静态窗口仍放大状态；不随runtime
-  长度展开并不代表规模合理。诊断出现8469节点、117189条件事实、约153万record访问。
-- 当前HEAD默认FA的冷编译分布/RSS未知；历史141秒不能冒充最新测量。
-- 一般动态ownership/task stream、continuous跨query状态、稀疏激活尚未完成。
-  causal/tails/decode、MQA、paged/sparse/persistent等变体没有完整资格。
-- 数学正确性、事件资源合法性、进展和设备性能是不同验收；不能靠一次verifier通过
-  或取消verifier解决全部问题。
-
-## 下一步开发范围
-
-按[计划R0–R6](refactor-plan.md)先建立分析所有权与不变量，再替换访问/完成表示和资源
-求解，最后切换normal流程、删除重复生产路径。不得先关闭现有final，或恢复算子调优。
-
-后续每步报告实际工作量、保持/失效的合同和有限回归；不再用“继续测试/继续优化”代替
-具体解释。算子性能问题保留，待编译流程具备可用性后按新的任务安排处理。
+外层runs清理保留了近期源码/ASC、CSV/性能摘要和失败诊断，旧二进制、缓存、profiler
+trace已删除；历史目录不是可直接运行的完整build。详见外层`runs/README.md`。

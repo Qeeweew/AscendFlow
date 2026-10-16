@@ -21,10 +21,10 @@ from .model import require
 from .periodic import bounded_period, normalize
 from .region_summary import summarize_local_events
 from .scope_domains import affine, legacy_activation, position, validate_activation
-from .scope_event_pools import verify_parent_pools
 from .scope_events import resource_sites
 from .scope_predicates import case_activation
 from .scope_query_completion import QueryEvent, QuerySite
+from .scope_resources import invocation_resources
 from .symbolic_completion import add, le, meet
 
 MAX_BINARY_BOUNDARIES = 65_536
@@ -194,7 +194,7 @@ def _child_boundaries(checked, parent):
 
 
 @bounded
-def prepare_binary_resources(checked, parent) -> QueryBinaryResources:
+def prepare_binary_resources(checked, parent, *, resources=None) -> QueryBinaryResources:
     """Reconstruct binary boundaries after the invocation-local verifier.
 
     Every active case block's tail/head is kept. Requiring all old/new blocks
@@ -202,19 +202,12 @@ def prepare_binary_resources(checked, parent) -> QueryBinaryResources:
     channel. This avoids borrowing inactive endpoints as a successful proof.
     The final verifier must reconstruct this input from actual checked IR.
     """
-    from .scope_sync import ParentCompletion, _configuration_banks, _leaf_banks
+    resources = invocation_resources(checked, parent, resources)
+    return _prepare_binary_resources(checked, parent, resources)
 
-    require(
-        isinstance(parent, ParentCompletion)
-        and parent.program is checked.program
-        and parent.access is checked.access
-        and tuple(parent.protocols) == tuple(checked.channels.values()),
-        "query binary preparation needs the actual checked parent/protocol identities",
-    )
-    verify_parent_pools(
-        checked.channels.values(), parent, _leaf_banks(checked.program, checked.analyses)
-    )
-    parent.check_child_resources()
+
+def _prepare_binary_resources(checked, parent, resources) -> QueryBinaryResources:
+    """Compose boundaries from a resource result checked at this call's entry."""
     groups, boundaries, physical = defaultdict(list), 0, defaultdict(set)
 
     def register(boundary):
@@ -238,8 +231,8 @@ def prepare_binary_resources(checked, parent) -> QueryBinaryResources:
                 require(work <= MAX_BINARY_PAIR_WORK, "query binary pool pair budget exceeded")
                 if work % 128 == 0:
                     poll("query binary pool pairs", work=work, checks=len(pending))
-                # verify_parent_pools independently proved each actual child
-                # borrower above. Keep all mixed old/new boundary pairs too.
+                # The invocation result already proved every actual child
+                # borrower. Keep all mixed old/new boundary pairs too.
                 domain = meet(source.domain, target.domain)
                 if domain is None:
                     continue
@@ -267,9 +260,7 @@ def prepare_binary_resources(checked, parent) -> QueryBinaryResources:
         len(physical["child"]),
         "complete",
         "not_checked" if any(p.kind == "cross" for p in checked.channels.values()) else "absent",
-        "reserved_not_checked"
-        if _configuration_banks(checked.program, checked.analyses)
-        else "absent",
+        "reserved_not_checked" if resources.configurations else "absent",
     )
 
 
@@ -398,7 +389,25 @@ def _query_bank(checked, protocol):
 
 
 @bounded
-def verify_query_resources(checked, parent, query_completion) -> dict:
+def verify_query_resources(
+    checked, parent, query_completion, *, resources=None, query_plan=None
+) -> dict:
+    established_here = resources is None and getattr(checked, "resource_proof", None) is None
+    resources = invocation_resources(checked, parent, resources)
+    if query_plan is not None:
+        from .scope_query_planning import QueryMemoryPlan
+
+        require(isinstance(query_plan, QueryMemoryPlan), "query resources need an owned query plan")
+        query_plan._check_owned(checked, parent, resources)
+    report = _verify_query_resources(checked, parent, query_completion, resources, query_plan)
+    if established_here:
+        report["invocation_resources"].update(
+            source="rebuilt from actual IR by this entry", new_invocation_resource_solver_calls=3
+        )
+    return report
+
+
+def _verify_query_resources(checked, parent, query_completion, resources, query_plan=None) -> dict:
     """Rebuild and discharge every supported actual query resource contract.
 
     Cross counters use a sufficient boundary theorem: each destination's last
@@ -406,10 +415,8 @@ def verify_query_resources(checked, parent, query_completion) -> dict:
     invocation-local <=15 proof, this prevents backlog accumulation at query
     boundaries. A missing feedback path is a rejection, never a new drain.
     """
-    from .loop_sync import _lifetime
     from .scope_query_completion import QueryCompletion
     from .scope_query_protocols import _actual_domains, read_query_protocols
-    from .scope_sync import _leaf_banks
 
     require(
         isinstance(query_completion, QueryCompletion) and query_completion.parent is parent,
@@ -417,24 +424,35 @@ def verify_query_resources(checked, parent, query_completion) -> dict:
     )
     _actual_domains(checked.program, checked.access)
     query_completion._check_snapshot()
-    configurations = _configuration_checks(checked)
-    prepared = prepare_binary_resources(checked, parent)
+    configurations = [dict(row) for row in resources.configurations]
+    prepared = _prepare_binary_resources(checked, parent, resources)
     protocols = read_query_protocols(checked.program, checked.access)
-    used = verify_parent_pools(
-        checked.channels.values(), parent, _leaf_banks(checked.program, checked.analyses)
-    )
+    used = resources.copy_used_banks()
     maximum = _maximum_queries(checked.program)
     adjacent = maximum is None or maximum >= 2
-    requests, rows, reasons = [], [], []
+    requests, rows, reasons, pending_rows = [], [], [], []
+    reuse = {} if query_plan is None else {p.protocol.name: p for p in query_plan.reuse_proofs}
+    require(
+        query_plan is None or len(reuse) == len(query_plan.reuse_proofs),
+        "query resource plan has duplicate event rotation results",
+    )
 
-    def register(source, target, domain, metadata, reason):
-        require(len(requests) < MAX_BINARY_CHECKS, "query resource check budget exceeded")
-        requests.append((source, target, domain))
+    def register(source, target, domain, metadata, reason, established=None):
+        require(len(rows) < MAX_BINARY_CHECKS, "query resource check budget exceeded")
         rows.append(
             metadata
             | {"source": asdict(source), "target": asdict(target), "domain": asdict(domain)}
         )
-        reasons.append(reason)
+        if established is None:
+            requests.append((source, target, domain))
+            pending_rows.append(rows[-1])
+            reasons.append(reason)
+        else:
+            require(
+                established.request == (source, target, domain),
+                "query resource allocation result changed its actual rotation endpoints",
+            )
+            rows[-1].update(covered=True, established_in="query event allocation")
 
     if adjacent:
         for check in prepared.checks:
@@ -451,13 +469,6 @@ def verify_query_resources(checked, parent, query_completion) -> dict:
                 },
                 f"{check.source_owner}/{check.target_owner}: binary event {check.event_id} re-Set can precede old Wait",
             )
-    _, counter_ids, _ = _lifetime(
-        checked.access.loop,
-        checked.channels,
-        parent if parent.node_activations else parent.graph,
-        parent.events,
-        local=False,
-    )
     if adjacent:
         for protocol in checked.channels.values():
             if protocol.kind != "cross":
@@ -507,14 +518,18 @@ def verify_query_resources(checked, parent, query_completion) -> dict:
         # publication of one ID is possible only when M > width+d.
         if maximum is not None and maximum <= width + distance:
             continue
-        require(
-            query_completion.copies >= max(distance, width) + 1,
-            f"{protocol.name}: query resource proof window omits old Wait or re-Set",
-        )
+        established = reuse.get(protocol.name)
+        if established is None:
+            require(
+                query_completion.copies >= max(distance, width) + 1,
+                f"{protocol.name}: query resource proof window omits old Wait or re-Set",
+            )
         domain = _required(parent, protocol.domain)
         if domain is None:
             continue
         actor = bank[0]
+        if established is not None:
+            established.check(parent, protocol, protocols)
         register(
             QueryEvent(distance, actor, protocol.name, "wait", protocol.target.parent),
             QueryEvent(width, actor, protocol.name, "set", protocol.source.parent),
@@ -530,9 +545,10 @@ def verify_query_resources(checked, parent, query_completion) -> dict:
                 "all_ids_by_query_translation": True,
             },
             f"{protocol.name}: query event re-Set can precede old Wait",
+            established,
         )
     answers = query_completion.covered_many(requests)
-    for row, answer, reason in zip(rows, answers, reasons, strict=True):
+    for row, answer, reason in zip(pending_rows, answers, reasons, strict=True):
         row["covered"] = answer
         require(answer, f"{reason}; domain {row['domain']}; {row['source']} -> {row['target']}")
     checks = rows + configurations
@@ -548,9 +564,18 @@ def verify_query_resources(checked, parent, query_completion) -> dict:
         ),
         "query_event_reuse_checks": sum(row["kind"] == "query_binary" for row in rows),
         "configuration_checks": len(configurations),
+        "new_completion_checks": len(requests),
+        "query_event_reuse_checks_reused": sum("established_in" in row for row in rows),
         "parent_resources": prepared.parent_resources,
         "child_resources": prepared.child_resources,
-        "cross_counter_ids": sorted(counter_ids),
+        "cross_counter_ids": sorted(resources.cross_counter_ids),
+        "invocation_resources": {
+            "source": "composed owned invocation result",
+            "child_lifetime_queries_reused": resources.child_lifetime_queries,
+            "pool_statistics_reused": dict(resources.pool_statistics),
+            "counter_backlog_reused": True,
+            "new_invocation_resource_solver_calls": 0,
+        },
         "internal_counter_backlog_limit": 15,
         "counter_boundary_rule": "last old Wait before first new Set; invocation-local backlog <=15",
         "maximum_static_queries": maximum,

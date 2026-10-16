@@ -11,6 +11,7 @@ import pytest
 from xdsl.dialects.builtin import FloatAttr, FloatData, f16, f32, f64
 from xdsl.utils.exceptions import VerifyException
 
+from tests.report_contract import semantic_report
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
@@ -91,7 +92,7 @@ def test_real_dsl_infinities_survive_ir_and_emit_valid_float_builtins(infinite_a
         assert [bits(op.scalar.value.data) for op in fills] == [0x7F800000, 0xFF800000]
         assert all(op.scalar.type == f32 for op in fills)
         assert not any(op.native.data == "fill_neg_inf" for op in tasks)
-    assert verify_plan(parse(artifact.plan_ir)) == artifact.report
+    assert semantic_report(verify_plan(parse(artifact.plan_ir))) == semantic_report(artifact.report)
     assert artifact.asc.count("__builtin_inff()") == 2
     assert "-__builtin_inff()" in artifact.asc
     assert "float(inf)" not in artifact.asc and "float(-inf)" not in artifact.asc

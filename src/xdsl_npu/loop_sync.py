@@ -1,6 +1,7 @@
 """Automatic synchronization and independent parametric loop checking."""
 
 from collections import defaultdict
+from dataclasses import replace
 from math import lcm
 
 from xdsl.dialects import scf
@@ -8,7 +9,7 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from .budget import bounded
 from .ir import InvocationChannelOp, InvocationSyncOp, KernelOp, LoopChannelOp, LoopSyncOp, StreamOp
-from .loop_graph import channels, completion_graph
+from .loop_graph import channels, commands, completion_graph
 from .loop_model import extract_loop, loop_dependencies
 from .loop_planning import DirectCompletion, Protocol
 from .model import CompileError, require
@@ -179,11 +180,56 @@ def _verify_leaf(loop, *, live_in=(), _details=False):
         "Scalar value lacks an actual capture-to-dispatch completion path",
     )
     banks, cross_ids, lifetime_queries = _lifetime(loop, channel_map, graph, endpoints)
+    result = _leaf_result(
+        loop,
+        obligations,
+        channel_map,
+        graph,
+        sequence,
+        (stride, potential),
+        live_in=live_in,
+        queries=queries,
+        scalar_queries=scalar_queries,
+        banks=banks,
+        cross_ids=cross_ids,
+        lifetime_queries=lifetime_queries,
+    )
+    return result if _details else result[0]
+
+
+def _leaf_result(
+    loop,
+    obligations,
+    channel_map,
+    graph,
+    sequence,
+    potential,
+    *,
+    live_in,
+    queries,
+    scalar_queries,
+    banks,
+    cross_ids,
+    lifetime_queries,
+    invocation_plan=None,
+):
+    """Describe facts already established by a planner or the import checker."""
+    stride, potential = potential
+    native = {
+        (command.actor, command.task.uid): command
+        for stream in sequence.values()
+        for command in stream
+        if command.kind == "task"
+    }
     invocation_report = {}
     if loop.invocation is not None and loop.region is None:
         from .invocation_sync import verify_invocation
 
-        invocation_report = verify_invocation(loop, channel_map, graph, sequence)
+        invocation_report = (
+            verify_invocation(loop, channel_map, graph, sequence)
+            if invocation_plan is None
+            else invocation_plan.complete(loop, channel_map, graph, sequence)
+        )
     report = {
         **invocation_report,
         "kernel": loop.op.sym_name.data,
@@ -251,7 +297,7 @@ def _verify_leaf(loop, *, live_in=(), _details=False):
             isinstance(op, InvocationChannelOp) for op in loop.op.walk()
         )
     analysis = loop, channel_map, sequence, graph, (stride, potential)
-    return (report, analysis) if _details else report
+    return report, analysis
 
 
 def explain_loop(module):
@@ -349,6 +395,8 @@ def _materialize(loop, protocols):
                 op.attributes["last_gap"] = IntAttr(upper)
             target = loop.actors[actor].operations[uid]
             if action == "set":
+                # commands() reads this after-list in reverse, retaining the
+                # selected issuance order in both the proof and ASC emitter.
                 target.parent.insert_op_after(op, target)
             else:
                 target.parent.insert_op_before(op, target)
@@ -453,18 +501,51 @@ def _requirements(loop, obligations):
     return result
 
 
-def autosync_loop(module, *, _capture=None):
-    from .sync import _finish
+def establishes_directly(protocol, obligation):
+    """The capture/acquire constructor's exact-endpoint invariant.
 
-    result = module.clone()
-    loop = extract_loop(result)
-    _plan_leaf(loop)
-    return _finish(result, _capture=_capture)
+    A Set after the named native captures its retirement prefix, and its
+    matching Wait admits the named consumer. This proves end AND prefix
+    obligations in the protocol's declared activation. Coalesced different
+    endpoints and same-pipe fences still need their separate inclusion fact.
+    """
+    if (
+        protocol.kind not in {"local", "cross"}
+        or obligation.source not in protocol.sources
+        or obligation.destination not in protocol.destinations
+        or obligation.distance != protocol.distance
+        or getattr(obligation, "last", False) != protocol.last
+    ):
+        return False
+    activation = getattr(obligation, "activation", None)
+    if activation is not None:
+        return activation == getattr(protocol, "activation", None)
+    return (
+        obligation.period % protocol.period == 0
+        and all(
+            (r - obligation.distance) % protocol.period in protocol.residues
+            for r in obligation.residues
+        )
+        and getattr(protocol, "activation", None) is None
+    )
 
 
-def _plan_leaf(loop, *, live_in=(), banks=None):
+def autosync_loop(module, *, _capture=None, _facts=None):
+    result = module.clone() if _facts is None else module
+    loop = extract_loop(result) if _facts is None else _facts.extract_loop(result)
+    report, analysis = _plan_leaf(loop, _facts=_facts)
+    if _capture is not None:
+        _capture((report, analysis, 0.0))
+    return result
+
+
+def _plan_leaf(loop, *, live_in=(), banks=None, _facts=None):
     """Plan an owned leaf under explicit, still-open entry assumptions."""
-    obligations = loop_dependencies(loop, live_in=live_in)
+    obligations = (
+        loop_dependencies(loop, live_in=live_in)
+        if _facts is None
+        else _facts.loop_dependencies(loop, live_in=live_in)
+    )
     require(
         not any(isinstance(op, (LoopChannelOp, LoopSyncOp)) for op in loop.protocol_scope.walk()),
         "AutoSync expects an unsynchronized symbolic loop",
@@ -509,7 +590,7 @@ def _plan_leaf(loop, *, live_in=(), banks=None):
         graph.insert(protocol, native)
         for o, q in missing:
             require(
-                graph.covered(q),
+                establishes_directly(protocol, o) or graph.covered(q),
                 f"direct {protocol.kind} capture cannot cover {o.hazard}: "
                 f"{o.source} -> {o.destination}",
             )
@@ -524,11 +605,26 @@ def _plan_leaf(loop, *, live_in=(), banks=None):
         )
     _materialize(loop, graph.selected)
     channel_map = channels(loop, virtual=True)
-    graph, _, endpoints, native = completion_graph(loop, channel_map)
-    graph.potential()
-    _coverage(loop, obligations, graph, native)
-    _lifetime(loop, channel_map, graph, endpoints, local=False)
+    graph, sequence, endpoints, native = completion_graph(loop, channel_map)
+    potential = graph.potential()
+    # _materialize preserves each selected capture/acquire, clock and guard.
+    # Memory coverage was established by direct synthesis; ID allocation does
+    # not change it. The independently reconstructed checker remains public.
+    queries = len(tuple(_coverage_queries(obligations, graph, native)))
+    scalar_queries = []
+    for actor, data in loop.actors.items():
+        for task in data.program.tasks:
+            if task.scalar_source is not None:
+                scalar_queries.extend(
+                    (native[actor, task.scalar_source], r, native[actor, task.uid], r)
+                    for r in range(graph.period)
+                )
+    require(
+        all(graph.covered_many(scalar_queries)),
+        "Scalar value lacks an actual capture-to-dispatch completion path",
+    )
     banks, cross_id = (defaultdict(int) if banks is None else banks), 0
+    used, lifetime_queries = defaultdict(set), 0
     for name, channel in channel_map.items():
         op = next(
             op
@@ -567,7 +663,80 @@ def _plan_leaf(loop, *, live_in=(), banks=None):
         )
         op.attributes["event_ids"] = _ints(range(base, base + width))
         banks[key] = base + width
+        used[key].update(range(base, base + width))
+        if not channel.last:
+            lifetime_queries += sum(
+                r % channel.period in channel.residues for r in range(graph.period)
+            )
+    invocation_plan = None
     if loop.invocation is not None and loop.region is None:
         from .invocation_sync import plan_invocation
 
-        plan_invocation(loop)
+        invocation_plan = plan_invocation(
+            loop, channel_map=channels(loop), graph=graph, streams=sequence
+        )
+
+    channel_map = channels(loop)
+    sequence, _, _ = commands(loop, channel_map)
+    return _leaf_result(
+        loop,
+        obligations,
+        channel_map,
+        graph,
+        sequence,
+        potential,
+        live_in=live_in,
+        queries=queries,
+        scalar_queries=scalar_queries,
+        banks=used,
+        cross_ids=set(range(cross_id)),
+        lifetime_queries=lifetime_queries,
+        invocation_plan=invocation_plan,
+    )
+
+
+def rename_leaf_plan(result, renaming):
+    """Apply a channel-name/ID substitution to an owned, established leaf.
+
+    Variant merging changes neither command indices, guards nor native cuts.
+    Completion topology and its propagated facts therefore remain valid.
+    """
+    report, (loop, old_channels, sequence, graph, potential) = result
+    require(set(renaming) == set(old_channels), "leaf renaming must cover its channels exactly")
+    for op in loop.protocol_scope.walk():
+        if isinstance(op, LoopChannelOp):
+            name, ids = renaming[op.sym_name.data]
+            op.attributes.update(sym_name=StringAttr(name), event_ids=_ints(ids))
+        elif isinstance(op, LoopSyncOp) and op.action.data != "barrier":
+            op.attributes["channel"] = StringAttr(renaming[op.channel.data][0])
+    current = channels(loop)
+    require(
+        len(current) == len(old_channels)
+        and all(
+            replace(old, name=renaming[name][0], ids=renaming[name][1])
+            == current[renaming[name][0]]
+            for name, old in old_channels.items()
+        ),
+        "leaf resource substitution changed notification semantics",
+    )
+    replacements = {
+        command.index: replace(command, channel=renaming[command.channel][0])
+        for stream in sequence.values()
+        for command in stream
+        if command.channel in renaming
+    }
+    graph.nodes[:] = [
+        replace(node, command=replacements.get(node.command.index, node.command))
+        for node in graph.nodes
+    ]
+    sequence = {
+        actor: tuple(replacements.get(c.index, c) for c in stream)
+        for actor, stream in sequence.items()
+    }
+    used = defaultdict(set)
+    tasks = {(a, t.uid): t for a, d in loop.actors.items() for t in d.program.tasks}
+    for channel in current.values():
+        a, b = channel.sources[0], channel.destinations[0]
+        used[f"{a[0]}:{tasks[a].pipe}:{tasks[b].pipe}"].update(channel.ids)
+    report = {**report, "event_ids": {bank: sorted(ids) for bank, ids in used.items()}}
+    return report, (loop, current, sequence, graph, potential)

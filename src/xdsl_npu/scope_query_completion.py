@@ -46,7 +46,7 @@ class QueryEvent:
 
 
 class QueryCompletion:
-    """Read-only snapshot of a completed parent proof, with exact endpoints.
+    """Completed parent snapshot with append-only actual query transitions.
 
     ``Site.position`` remains the native's inner position; ``parent`` is its
     independent KV position. The query slot is identity, never another count.
@@ -72,6 +72,9 @@ class QueryCompletion:
         self.guarded._sync()
         parent.graph.potential()
         self.version = self._version()
+        from .scope_resources import invocation_snapshot
+
+        self._native_snapshot = invocation_snapshot(parent.program)
         self.size = len(self.guarded.topology.families)
         require(
             copies * self.size <= MAX_QUERY_NODES,
@@ -106,6 +109,7 @@ class QueryCompletion:
         self._carry_cross_counters()
         self.counter_edges = self.topology.edge_count - before
         self.origins, self.bindings, self.answers = {}, {}, {}
+        self._incomplete = {}
         self.queries = self.cases = 0
         from .scope_query_transitions import install_query_transitions
 
@@ -135,7 +139,47 @@ class QueryCompletion:
             self.topology.edge_count <= MAX_QUERY_ARCS,
             "query completion topology arc budget exceeded",
         )
+        if edge is not None and (flow := getattr(self, "flow", None)) is not None:
+            flow.replay(source, edge)
         return edge
+
+    def _append_snapshot(self):
+        """Reconstruct an actual suffix without accepting edits to old inputs."""
+        from .scope_resources import invocation_snapshot
+
+        self.guarded._sync()
+        current = self._version()
+        previous = tuple(self.query_protocols.values())
+        require(
+            current[:-1] == self.version[:-1]
+            and self.version[-1] == previous
+            and current[-1][: len(previous)] == previous
+            and self._native_snapshot == invocation_snapshot(self.parent.program),
+            "query append changed the native snapshot or an existing protocol prefix",
+        )
+        return current, current[-1][len(previous) :]
+
+    @bounded
+    def append_protocols(self):
+        """Import only newly installed actual protocols into this same flow.
+
+        New arcs replay the existing source facts. A complete old answer is
+        monotone; partial answers keep their exact cases and must be read again
+        after the new deltas propagate. No origin or native topology is rebuilt.
+        """
+        from .scope_query_transitions import append_query_transitions
+
+        current, additions = self._append_snapshot()
+        require(
+            all(protocol.target.query < self.copies for protocol in additions),
+            "query proof window omits a protocol consumer",
+        )
+        if additions:
+            append_query_transitions(self, additions)
+            for key in self._incomplete:
+                self.answers.pop(key, None)
+        self.version = current
+        return additions
 
     def _carry_prefixes(self):
         completion = self.parent.completion
@@ -366,7 +410,8 @@ class QueryCompletion:
             required = meet(required, CountDomain(1, 0, exact=self.parent.graph.maximum))
         return required
 
-    def _bindings(self, endpoint):
+    def _validate_identity(self, endpoint):
+        """Validate scalar types before equality can hit an already checked key."""
         require(
             isinstance(endpoint, (QuerySite, QueryEvent))
             and type(endpoint.query) is int
@@ -384,6 +429,20 @@ class QueryCompletion:
                 and endpoint.action in {"set", "wait"},
                 "query completion needs a Set/Wait QueryEvent identity",
             )
+        else:
+            require(
+                isinstance(endpoint.call, str)
+                and isinstance(endpoint.site, Site)
+                and isinstance(endpoint.site.position, Position)
+                and type(endpoint.site.position.end) is bool
+                and type(endpoint.site.position.offset) is int
+                and type(endpoint.site.call) is int,
+                "query completion needs a full QuerySite identity",
+            )
+
+    def _bindings(self, endpoint):
+        self._validate_identity(endpoint)
+        if isinstance(endpoint, QueryEvent):
             if endpoint.channel in self.query_protocols:
                 from .scope_query_transitions import query_event_bindings
 
@@ -391,10 +450,6 @@ class QueryCompletion:
             commands = (self._event_command(endpoint),)
             event_point = "end" if endpoint.action == "set" else "begin"
         else:
-            require(
-                isinstance(endpoint.call, str) and isinstance(endpoint.site, Site),
-                "query completion needs a full QuerySite identity",
-            )
             require(endpoint.call in self.parent.program.leaves, "unknown query completion call")
             require(
                 endpoint.site.task[0] == self.parent.program.leaves[endpoint.call].actor,
@@ -435,10 +490,15 @@ class QueryCompletion:
 
     def _register(self, source, destination, domain, prepared):
         required = self._required(domain)
-        sources, targets = self._bindings(source), self._bindings(destination)
+        self._validate_identity(source)
+        self._validate_identity(destination)
         key = source, destination, domain
         if key in self.answers or key in prepared:
             return key
+        if key in self._incomplete:
+            prepared[key] = self._incomplete[key]
+            return key
+        sources, targets = self._bindings(source), self._bindings(destination)
         self.queries += 1
         require(self.queries <= MAX_QUERY_CASES, "query completion query budget exceeded")
         cases = []
@@ -452,7 +512,7 @@ class QueryCompletion:
                 if needed is not None:
                     bit = self._origin(first, point, source_guard)
                     cases.append((last, target_point, bit, needed))
-        prepared[key] = cases
+        prepared[key] = required, cases
         return key
 
     def _complete(self, cases, coverage):
@@ -469,6 +529,10 @@ class QueryCompletion:
     def coverage_many(self, queries):
         """Cover ordered (source, destination, domain) triples in one propagation."""
         self._check_snapshot()
+        # Some low-level coverage fixtures construct this adapter around an
+        # existing flow. The case ledger belongs to its first completed batch.
+        if not hasattr(self, "_incomplete"):
+            self._incomplete = {}
         prepared, ordered = {}, []
         for source, destination, domain in queries:
             if len(ordered) % 128 == 0:
@@ -477,7 +541,7 @@ class QueryCompletion:
         self._check_snapshot()
         self.flow.propagate()
         groups = {}
-        for cases in prepared.values():
+        for _, cases in prepared.values():
             for node, point, bit, needed in cases:
                 # Node identity includes the static query copy. Keep the full
                 # count domain; equal residue alone does not mean equal need.
@@ -488,8 +552,12 @@ class QueryCompletion:
                 poll("query completion coverage", groups=len(coverage))
             results = self.flow.coverage_many(node, point, origins, needed)
             coverage[node, point, needed] = dict(zip(origins, results, strict=True))
-        for key, cases in prepared.items():
-            self.answers[key] = self._complete(cases, coverage)
+        for key, (required, cases) in prepared.items():
+            result = self.answers[key] = self._complete(cases, coverage)
+            if required is not None and covers(required, result):
+                self._incomplete.pop(key, None)
+            else:
+                self._incomplete[key] = required, cases
         return [self.answers[key] for key in ordered]
 
     @bounded

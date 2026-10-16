@@ -7,6 +7,7 @@ from xdsl.dialects import arith
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr
 
 from examples.gemm.batched import batched_matmul
+from tests.report_contract import semantic_report
 from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
@@ -44,7 +45,7 @@ def test_explicit_operands_are_not_allocated_or_copied_implicitly(artifact):
     }
     assert artifact.report["storage_periods"]["aic/a1"] == 3
     assert artifact.report["storage_periods"]["aic/a0"] == 2
-    assert verify_plan(parse(artifact.plan_ir)) == artifact.report
+    assert semantic_report(verify_plan(parse(artifact.plan_ir))) == semantic_report(artifact.report)
     assert artifact.asc.count("asc_sync_pipe(PIPE_ALL)") == 1
     assert artifact.asc.count("asc_mmad(") == 1
 

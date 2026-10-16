@@ -7,7 +7,7 @@ channel declarations and synchronization operations beside those natives.
 
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from xdsl.dialects import scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
@@ -342,6 +342,7 @@ class VariantPlan:
     channel_count: int
     sync_count: int
     banks: tuple[tuple[tuple[str, str, str], int], ...]
+    plans: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 def _attributes(op, excluded=()):
@@ -373,7 +374,7 @@ def _placements(stream):
 
 
 @bounded
-def plan_child_variants(stream, call, loops, *, live_in=(), banks=None):
+def plan_child_variants(stream, call, loops, *, live_in=(), banks=None, _facts=None):
     """Plan normalized nonempty cases and install only their selected syncs.
 
     ``loops`` maps effective parent labels to normalized one-actor Loops;
@@ -386,7 +387,7 @@ def plan_child_variants(stream, call, loops, *, live_in=(), banks=None):
     ``banks`` is the caller's actor-specific next-ID map, as for _plan_leaf.
     Source natives are neither replaced nor cloned into the actual stream.
     """
-    from .loop_sync import _plan_leaf
+    from .loop_sync import _plan_leaf, rename_leaf_plan
 
     validate_child_scopes(stream, call)
     require(
@@ -418,6 +419,7 @@ def plan_child_variants(stream, call, loops, *, live_in=(), banks=None):
         live_in = tuple(live_in)
     actual = {op.uid.data: op for op, _ in scope_operations(stream) if isinstance(op, TaskOp)}
     groups, selected, empty = {}, [], []
+    plans, original_names = {}, {}
     for case in PARENT_CASES:
         if case not in loops:
             continue
@@ -448,10 +450,11 @@ def plan_child_variants(stream, call, loops, *, live_in=(), banks=None):
             baseline[actor, "S", "MTE1"] = max(baseline[actor, "S", "MTE1"], 1)
         temporary = defaultdict(int, baseline)
         poll("native parent-case planning", case=case)
-        _plan_leaf(
+        plans[case] = _plan_leaf(
             loop,
             live_in=live_in[case] if isinstance(live_in, Mapping) else live_in,
             banks=temporary,
+            _facts=_facts,
         )
         selected.append(case)
         placements = _placements(data.stream)
@@ -473,6 +476,7 @@ def plan_child_variants(stream, call, loops, *, live_in=(), banks=None):
                     for uid, side, index, op in positioned
                 ),
             )
+            original_names[case, descriptor] = name
             if descriptor not in groups:
                 (source,), (destination,) = (
                     declaration.sources.data,
@@ -495,7 +499,8 @@ def plan_child_variants(stream, call, loops, *, live_in=(), banks=None):
             groups[descriptor][-1].append(case)
 
     assignments, channel_count = [], 0
-    for declaration, positioned, bank, width, cases in groups.values():
+    renamings = {case: {} for case in plans}
+    for descriptor, (declaration, positioned, bank, width, cases) in groups.items():
         name, ids = "", ()
         if declaration is not None:
             name = f"case_c{channel_count}"
@@ -507,6 +512,8 @@ def plan_child_variants(stream, call, loops, *, live_in=(), banks=None):
             )
             baseline[bank] = base + width
             ids = tuple(range(base, base + width))
+            for case in cases:
+                renamings[case][original_names[case, descriptor]] = name, ids
         assignments.append((declaration, positioned, cases, name, ids))
 
     declarations, locations = [], defaultdict(list)
@@ -546,4 +553,5 @@ def plan_child_variants(stream, call, loops, *, live_in=(), banks=None):
         len(declarations),
         sum(len(operations) for operations in locations.values()),
         tuple(sorted(baseline.items())),
+        {case: rename_leaf_plan(plan, renamings[case]) for case, plan in plans.items()},
     )

@@ -4,6 +4,7 @@ import pytest
 
 from examples.state.recurrence import state_sum
 from tests.models.local_sequence import finite_check, physical_regions
+from tests.report_contract import semantic_report
 from xdsl_npu import autosync, compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
@@ -27,7 +28,7 @@ def test_entry_capture_zero_exit_and_single_drain_are_explicit(state_artifact):
     assert state_artifact.report["sequence_inherited_paths"] > 0
     assert state_artifact.asc.count("for (int64_t step") == 1
     assert state_artifact.asc.count("asc_sync_pipe(PIPE_ALL)") == 1
-    assert verify_plan(parse(state_artifact.plan_ir)) == state_artifact.report
+    assert semantic_report(verify_plan(parse(state_artifact.plan_ir))) == semantic_report(state_artifact.report)
     for count in (0, 1, 7, 1048576):
         w = runtime_work(plan, {"tiles": count})
         assert w["native_invocations"]["copy"] == count + 2

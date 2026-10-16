@@ -98,17 +98,18 @@ def _capture_extent(capture, stream):
     return extent
 
 
-def lower_scopes(program):
+def lower_scopes(program, *, _scope=None, _facts=None):
     from .lowering import _Actor, _check_loop_values, _work
     from .scope_model import compose_scope_actors, extract_scopes
 
     validate_source_arithmetic(program)
-    tree = collect_source_scopes(program)
+    tree = collect_source_scopes(program) if _scope is None else _scope
+    require(tree.op is program, "source collection belongs to another program")
     require(
         len(tree.items) == 1
         and isinstance(tree.items[0], Scope)
         and isinstance(tree.items[0].op, (PipelineOp, scf.ForOp)),
-        "nested AST pipelines require one parent Pipelined or a retained serial query loop",
+        "one parent Pipelined is required for nested source, optionally in a retained serial query loop",
     )
     serial, parent = None, tree.items[0]
     if isinstance(parent.op, scf.ForOp):
@@ -144,7 +145,7 @@ def lower_scopes(program):
                 serial is not None and op is serial.op,
                 "scoped pipelines require one actual serial query clock",
             )
-        if isinstance(op, MatmulOp):
+        if isinstance(op, MatmulOp) and program.attributes.get("frontend") == StringAttr("ast"):
             require(op.a.type.memory.data == "L0A", "nested AST matmul needs explicit L0 operands")
         if isinstance(op, PipelineOp) and op is not parent.op:
             require(
@@ -302,7 +303,7 @@ def lower_scopes(program):
         )
         modules.append(kernel.module)
     physical = modules[0] if len(modules) == 1 else compose_scope_actors(program, modules)
-    extracted = extract_scopes(physical)
+    extracted = extract_scopes(physical) if _facts is None else _facts.extract_scopes(physical)
     for uid, physical_leaf in extracted.leaves.items():
         family, source_leaf = lowered[uid]
         roots = {
@@ -317,5 +318,6 @@ def lower_scopes(program):
             source_leaf.pipeline,
             extracted=physical_leaf.loop,
             live_in=roots,
+            _facts=_facts,
         )
     return physical

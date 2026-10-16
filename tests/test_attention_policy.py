@@ -4,7 +4,6 @@ The host shim traces C++ loop/guard/event statements. Random legal FIFO retireme
 orders check pairing/progress, not arbitrary-N synchronization or tensor effects.
 """
 
-import ast
 import random
 import shutil
 import subprocess
@@ -15,7 +14,8 @@ import pytest
 
 from benchmarks.references.attention import reference_source
 from benchmarks.validation.attention import inputs_and_oracle
-from tests.fixtures.attention_target import target_source
+from tests.fixtures.attention_target import attention_target
+from xdsl_npu.source_ir import PipelineOp, StageOp
 
 
 @pytest.fixture(scope="module")
@@ -134,26 +134,28 @@ def test_traced_protocol_checker_rejects_missing_contribution_or_ready(traced_re
         retire_trace(trace, 0)
 
 
-def child_schedule(name, *, default=False):
-    tree = ast.parse(target_source(continuous=True))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.For) or not isinstance(node.iter, ast.Call):
+@pytest.fixture(scope="module")
+def target_schedule():
+    # Read the selected constexpr policy, including named issue-order tuples.
+    # The finite operand model below remains independent of synchronization.
+    return attention_target().to_ir()
+
+
+def child_schedule(module, name, *, default=False):
+    for node in module.walk():
+        if not isinstance(node, PipelineOp):
             continue
-        stages = {}
-        for statement in node.body:
-            if isinstance(statement, ast.With):
-                stage = statement.items[0].context_expr
-                if isinstance(stage, ast.Call) and stage.func.attr == "Stage":
-                    label = next(k.value.value for k in stage.keywords if k.arg == "name")
-                    stages[label] = stage.args[0].value
+        stages = {
+            stage.label.data: stage.offset.data
+            for stage in node.body.block.ops
+            if isinstance(stage, StageOp)
+        }
         if name not in stages:
             continue
         order = (
             tuple(stages)
             if default
-            else ast.literal_eval(
-                next(k.value for k in node.iter.keywords if k.arg == "issue_order")
-            )["cube"]
+            else tuple(label.data for label in node.issue_order.data["cube"])
         )
         return stages, order
     raise AssertionError("missing native child")
@@ -178,11 +180,11 @@ def check_single_operand(stages, order, producer, reader, count):
 @pytest.mark.parametrize(
     "producer,reader", [("operand_k", "qk_native"), ("operand_pv", "pv_native")]
 )
-def test_target_one_slot_requires_explicit_inner_issue_order(producer, reader):
+def test_target_one_slot_requires_explicit_inner_issue_order(target_schedule, producer, reader):
     for count in (0, 1, 2, 8, 17):
-        stages, order = child_schedule(producer)
+        stages, order = child_schedule(target_schedule, producer)
         check_single_operand(stages, order, producer, reader, count)
-    stages, order = child_schedule(producer, default=True)
+    stages, order = child_schedule(target_schedule, producer, default=True)
     with pytest.raises(AssertionError, match="overwritten before MAD"):
         check_single_operand(stages, order, producer, reader, 2)
 

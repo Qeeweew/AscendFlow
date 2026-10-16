@@ -6,7 +6,11 @@ the currently supported one-uniform-count predicate, not a general nonlinear
 or multi-axis domain solver.
 """
 
-from dataclasses import dataclass, field, replace
+from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import cached_property
 from math import gcd, lcm
 
 from .periodic import bounded_period
@@ -19,6 +23,13 @@ class CountDomain:
     exact: int | None = None
     minimum: int | None = None
     maximum: int | None = None
+
+    @cached_property
+    def _hash(self):
+        return hash((self.period, self.residue, self.exact, self.minimum, self.maximum))
+
+    def __hash__(self):
+        return self._hash
 
     def contains(self, count):
         return (
@@ -56,7 +67,85 @@ def _first(domain):
     if domain.exact is not None:
         return domain.exact
     minimum = domain.period if domain.minimum is None else domain.minimum
+    if domain.period == 1:
+        return minimum
     return minimum + (domain.residue - minimum) % domain.period
+
+
+_math_values = ContextVar("xdsl_npu_completion_math", default=None)
+_MISSING = object()
+
+
+class _CompletionMath:
+    """Immutable arithmetic values for one compilation, never graph proofs."""
+
+    def __init__(self):
+        self.values, self.intersections, self.inclusions = {}, {}, {}
+        self.value_requests = self.value_reuses = self.value_creations = 0
+        self.canonical_requests = self.canonical_reuses = 0
+        self.intersection_requests = self.intersection_reuses = 0
+        self.inclusion_requests = self.inclusion_reuses = 0
+
+    def value(self, key, candidate=None):
+        self.value_requests += 1
+        prior = self.values.get(key)
+        if prior is not None:
+            self.value_reuses += 1
+            return prior
+        if candidate is None:
+            candidate = CountDomain(*key)
+            self.value_creations += 1
+        self.values[key] = candidate
+        return candidate
+
+    def statistics(self):
+        return {
+            "value_requests": self.value_requests,
+            "value_reuses": self.value_reuses,
+            "value_creations": self.value_creations,
+            "values": len(self.values),
+            "canonical_requests": self.canonical_requests,
+            "canonical_reuses": self.canonical_reuses,
+            "intersection_requests": self.intersection_requests,
+            "intersection_reuses": self.intersection_reuses,
+            "intersection_pairs": len(self.intersections),
+            "inclusion_requests": self.inclusion_requests,
+            "inclusion_reuses": self.inclusion_reuses,
+            "inclusion_pairs": len(self.inclusions),
+        }
+
+
+@contextmanager
+def completion_math(*, isolated=False):
+    """Share pure value results in one invocation; nested analyses compose."""
+    active = _math_values.get()
+    if active is not None and not isolated:
+        yield active
+        return
+    active = _CompletionMath()
+    token = _math_values.set(active)
+    try:
+        yield active
+    finally:
+        _math_values.reset(token)
+
+
+def completion_math_statistics():
+    active = _math_values.get()
+    return {} if active is None else active.statistics()
+
+
+def count_domain(period, residue, exact=None, minimum=None, maximum=None):
+    """Construct an internal canonical value, sharing it only in this compile."""
+    if exact is not None:
+        key = 1, 0, exact, None, None
+    else:
+        first = period if minimum is None else minimum
+        if period != 1:
+            first += (residue - first) % period
+        key = period, residue, None, first, maximum
+    active = _math_values.get()
+    return CountDomain(*key) if active is None else active.value(key)
 
 
 @dataclass(frozen=True)
@@ -102,20 +191,64 @@ class Requirement:
 
 
 def canonical(domain):
-    return (
-        CountDomain(1, 0, exact=domain.exact)
-        if domain.exact is not None
-        else CountDomain(
-            domain.period, domain.residue, minimum=_first(domain), maximum=domain.maximum
+    if domain.exact is not None:
+        key = 1, 0, domain.exact, None, None
+        ready = (domain.period, domain.residue, domain.minimum, domain.maximum) == (
+            1,
+            0,
+            None,
+            None,
         )
-    )
+    else:
+        first = _first(domain)
+        key = domain.period, domain.residue, None, first, domain.maximum
+        ready = domain.minimum == first
+    active = _math_values.get()
+    if active is None:
+        return domain if ready else CountDomain(*key)
+    active.canonical_requests += 1
+    active.canonical_reuses += ready
+    return active.value(key, domain if ready else None)
 
 
 def intersection(left, right):
+    active = _math_values.get()
+    if active is None:
+        return _intersection(left, right)
+    active.intersection_requests += 1
+    key = (left, right) if hash(left) <= hash(right) else (right, left)
+    known = active.intersections.get(key, _MISSING)
+    if known is not _MISSING:
+        active.intersection_reuses += 1
+        return known
+    result = active.intersections[key] = _intersection(left, right)
+    return result
+
+
+def _intersection(left, right):
     if left.exact is not None:
-        return left if right.contains(left.exact) else None
+        return canonical(left) if right.contains(left.exact) else None
     if right.exact is not None:
-        return right if left.contains(right.exact) else None
+        return canonical(right) if left.contains(right.exact) else None
+    first = max(_first(left), _first(right))
+    maximum = (
+        right.maximum
+        if left.maximum is None
+        else left.maximum
+        if right.maximum is None
+        else min(left.maximum, right.maximum)
+    )
+    if left.period == right.period:
+        if left.residue != right.residue:
+            return None
+        bounded_period(left.period, "coupled region path predicate")
+        if maximum is not None and first > maximum:
+            return None
+        if first == left.minimum and maximum == left.maximum:
+            return canonical(left)
+        if first == right.minimum and maximum == right.maximum:
+            return canonical(right)
+        return count_domain(left.period, left.residue, minimum=first, maximum=maximum)
     divisor = gcd(left.period, right.period)
     if (right.residue - left.residue) % divisor:
         return None
@@ -127,14 +260,48 @@ def intersection(left, right):
         else ((right.residue - left.residue) // divisor * pow(left.period // divisor, -1, other))
         % other
     )
-    maxima = [d.maximum for d in (left, right) if d.maximum is not None]
-    result = CountDomain(
+    result = count_domain(
         period,
         (left.residue + left.period * shift) % period,
-        minimum=max(_first(left), _first(right)),
-        maximum=min(maxima) if maxima else None,
+        minimum=first,
+        maximum=maximum,
     )
     return result if result.maximum is None or _first(result) <= result.maximum else None
+
+
+def includes(outer, inner):
+    """One arithmetic interval contains another; no path/union proof is cached."""
+    if outer is inner or outer == inner:
+        return True
+    active = _math_values.get()
+    if active is None:
+        return _includes(outer, inner)
+    active.inclusion_requests += 1
+    key = outer, inner
+    known = active.inclusions.get(key, _MISSING)
+    if known is not _MISSING:
+        active.inclusion_reuses += 1
+        return known
+    result = active.inclusions[key] = _includes(outer, inner)
+    return result
+
+
+def _includes(outer, inner):
+    first = _first(inner)
+    if not outer.contains(first):
+        return False
+    if inner.exact is not None:
+        return True
+    last = (
+        None
+        if inner.maximum is None
+        else inner.maximum - (inner.maximum - inner.residue) % inner.period
+    )
+    if last == first:
+        return True
+    if outer.exact is not None or inner.period % outer.period:
+        return False
+    return outer.maximum is None or last is not None and last <= outer.maximum
 
 
 def covers(required, guards):
@@ -161,44 +328,50 @@ def uncovered(required, guards):
 def coalesce(domains):
     """Join adjacent pieces of the same residue class without filling holes."""
     items = list(dict.fromkeys(canonical(d) for d in domains))
-    changed = True
-    while changed:
-        changed = False
-        for i, a in enumerate(items):
-            for j in range(i + 1, len(items)):
-                b = items[j]
-                merged = None
-                if a.exact is not None or b.exact is not None:
-                    single, family = (a, b) if a.exact is not None else (b, a)
-                    n = single.exact
-                    if family.contains(n):
-                        merged = family
-                    elif family.exact is None and n % family.period == family.residue:
-                        if n + family.period == _first(family):
-                            merged = replace(family, minimum=n)
-                        elif family.maximum is not None:
-                            last = (
-                                family.maximum - (family.maximum - family.residue) % family.period
-                            )
-                            if last + family.period == n:
-                                merged = replace(family, maximum=n)
-                elif (a.period, a.residue) == (b.period, b.residue):
-                    first, second = (a, b) if _first(a) <= _first(b) else (b, a)
-                    if first.maximum is None or first.maximum + first.period >= _first(second):
-                        maximum = (
-                            None
-                            if a.maximum is None or b.maximum is None
-                            else max(a.maximum, b.maximum)
-                        )
-                        merged = replace(first, maximum=maximum)
-                if merged is not None:
-                    items[i] = merged
-                    items.pop(j)
-                    changed = True
-                    break
-            if changed:
-                break
-    return tuple(items)
+    groups, points = defaultdict(list), {}
+    for index, domain in enumerate(items):
+        if domain.exact is None:
+            groups[domain.period, domain.residue].append(
+                (_first(domain), domain.maximum, index, True)
+            )
+        else:
+            points[domain.exact] = index
+    result, consumed = [], set()
+    for (period, residue), intervals in groups.items():
+        # A singleton may bridge two pieces, or a chain of singletons may
+        # extend one piece. Sorting once finds that union without restarting
+        # an all-pairs scan after every extension. Other residue classes stay
+        # separate, and isolated points are emitted once after all groups.
+        pieces = intervals + [
+            (value, value, index, False)
+            for value, index in points.items()
+            if value % period == residue
+        ]
+        pieces.sort(key=lambda piece: piece[0])
+        lower = upper = order = None
+        family, singles = False, []
+
+        for first, last, index, native in pieces:
+            if lower is None or upper is not None and upper + period < first:
+                if family:
+                    result.append(
+                        (order, CountDomain(period, residue, minimum=lower, maximum=upper))
+                    )
+                    consumed.update(singles)
+                lower, upper, order, family = first, last, index, native
+                singles = [] if native else [first]
+                continue
+            upper = None if upper is None or last is None else max(upper, last)
+            order = min(order, index)
+            family |= native
+            if not native:
+                singles.append(first)
+        if family:
+            result.append((order, CountDomain(period, residue, minimum=lower, maximum=upper)))
+            consumed.update(singles)
+    result.extend((index, items[index]) for value, index in points.items() if value not in consumed)
+    result.sort(key=lambda item: item[0])
+    return tuple(domain for _, domain in result)
 
 
 def _uncovered(required, guards):

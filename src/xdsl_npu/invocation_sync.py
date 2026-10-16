@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 
 from xdsl.dialects.builtin import IntAttr, StringAttr
 
-from .completion import Point, Requirement, Site, intersection
+from .completion import Point, Requirement, Site, covers, intersection
 from .ir import InvocationChannelOp, InvocationSyncOp, LoopChannelOp, TaskOp
 from .loop_boundary import stream_operations
 from .model import require
@@ -23,6 +23,9 @@ from .region_summary import (
     summarize_reused_storage,
 )
 from .sequence_plan import Bridge as RegionBridge
+from .sequence_plan import materialization_snapshot
+
+_AUTHORITY = object()
 
 
 @dataclass(frozen=True)
@@ -314,6 +317,10 @@ def verify_invocation(loop, channel_map, graph, streams):
         proof = _proof(loop, channel_map, graph, streams, requirements, bridges)
         for requirement in requirements:
             require(proof.covered(requirement), requirement.reason)
+    return _report(loop, memory, resources, bridges, proof)
+
+
+def _report(loop, memory, resources, bridges, proof):
     return {
         "invocation_bound": loop.invocation.bound.text(),
         "invocation_frames": len(loop.invocation.frames),
@@ -325,13 +332,59 @@ def verify_invocation(loop, channel_map, graph, streams):
     }
 
 
-def plan_invocation(loop):
+@dataclass(frozen=True)
+class InvocationPlan:
+    loop: object
+    channel_map: dict
+    graph: object
+    streams: tuple
+    bridges: tuple[Bridge, ...]
+    proof: RegionCompletion | None
+    memory: tuple[Requirement, ...]
+    resources: tuple
+    resource_requirements: tuple[Requirement, ...]
+    memory_coverage: tuple[tuple[CountDomain, ...], ...]
+    resource_coverage: tuple[tuple[CountDomain, ...], ...]
+    snapshot: tuple
+    _authority: object
+
+    def complete(self, loop, channel_map, graph, streams):
+        """Match actual insertion output and consume completed owned results."""
+        require(
+            self._authority is _AUTHORITY
+            and self.loop is loop
+            and self.graph is graph
+            and self.channel_map == channel_map
+            and self.streams
+            == tuple((actor, tuple(commands)) for actor, commands in streams.items())
+            and self.bridges == _protocols(loop, channel_map)
+            and self.snapshot
+            == materialization_snapshot(loop.op, (InvocationChannelOp, InvocationSyncOp)),
+            "invocation materialization changed its owned native/protocol snapshot",
+        )
+        self._check_results()
+        return _report(loop, self.memory, self.resources, self.bridges, self.proof)
+
+    def _check_results(self):
+        if self.proof is not None:
+            for requests, coverage in (
+                (self.memory, self.memory_coverage),
+                (self.resource_requirements, self.resource_coverage),
+            ):
+                require(
+                    len(requests) == len(coverage),
+                    "invocation plan lacks its actual completed memory/resource result",
+                )
+                for request, result in zip(requests, coverage, strict=True):
+                    require(covers(request.domain, result), request.reason)
+
+
+def plan_invocation(loop, *, channel_map=None, graph=None, streams=None):
     """Extend proven slot credits, then propose precise terminal-to-head edges."""
     from .loop_graph import channels, completion_graph
 
-    if loop.invocation.bound.constant in {0, 1} or loop.constant_count == 0:
-        return
-    for op in loop.op.body.block.ops:
+    repeated = loop.invocation.bound.constant not in {0, 1} and loop.constant_count != 0
+    for op in loop.op.body.block.ops if repeated else ():
         if (
             isinstance(op, LoopChannelOp)
             and op.kind.data == "local"
@@ -341,15 +394,67 @@ def plan_invocation(loop):
             and op.distance.data > 0
         ):
             op.attributes["carry"] = IntAttr(1)
-    channel_map = channels(loop)
-    graph, streams, _, native = completion_graph(loop, channel_map)
+    actual = channels(loop)
+    require(
+        channel_map is None
+        or channel_map.keys() == actual.keys()
+        and all(
+            replace(old, carry=actual[name].carry) == actual[name]
+            for name, old in channel_map.items()
+        ),
+        "invocation carry selection changed its child protocol beyond startup credits",
+    )
+    channel_map = actual
+    if graph is None:
+        graph, streams, _, native = completion_graph(loop, channel_map)
+    else:
+        require(
+            streams is not None and graph.period == loop.protocol_period,
+            "invocation planning needs its actual child graph",
+        )
+        native = {
+            (command.actor, command.task.uid): command
+            for sequence in streams.values()
+            for command in sequence
+            if command.kind == "task"
+        }
     bridges = _protocols(loop, channel_map)
-    summary = _summary(loop)
+    summary, resources = _summary(loop), summarize_local_events(loop)
     requirements = _memory_requirements(loop, summary)
-    proof = _proof(loop, channel_map, graph, streams, requirements, bridges)
+    initial_resources = _resource_requirements(loop, resources, bridges)
+    reserved = tuple(
+        Requirement(
+            replace(request.destination, call=0),
+            replace(request.source, point="prefix", call=0),
+            request.domain,
+            "potential invocation boundary credit",
+        )
+        for request in requirements
+    )
+    proof = (
+        _proof(
+            loop, channel_map, graph, streams, requirements + initial_resources + reserved, bridges
+        )
+        if repeated
+        else None
+    )
+    snapshot = materialization_snapshot(loop.op, (InvocationChannelOp, InvocationSyncOp))
+    revision, completed, pending = 0, {}, {}
+
+    def coverage(request):
+        key = request.source, request.destination, request.domain
+        if key in completed:
+            return completed[key]
+        if key not in pending or pending[key][0] != revision:
+            result = tuple(proof.coverage(request))
+            pending[key] = revision, result
+            if covers(request.domain, result):
+                completed[key] = result
+        return pending[key][1]
+
     candidates = {}
-    for requirement in requirements:
-        if proof.covered(requirement):
+    for requirement in requirements if repeated else ():
+        if covers(requirement.domain, coverage(requirement)):
             continue
         left, right = requirement.source, requirement.destination
         require(
@@ -359,7 +464,7 @@ def plan_invocation(loop):
         key = left.task, right.task, left.position.offset, right.position.offset
         candidates.setdefault(key, []).append(requirement)
     for (source, destination, gap, index), required in candidates.items():
-        if all(proof.covered(requirement) for requirement in required):
+        if all(covers(requirement.domain, coverage(requirement)) for requirement in required):
             continue
         a, b = native[source].task, native[destination].task
         if a.pipe == b.pipe:
@@ -407,8 +512,38 @@ def plan_invocation(loop):
                 task.parent.insert_op_after(sync, task)
             else:
                 task.parent.insert_op_before(sync, task)
-        for bridge in _protocols(loop, channel_map):
-            if bridge.name == name and (transfer := _transfer(loop, bridge)):
-                proof.add_bridge(transfer)
-    # autosync_loop performs the mandatory final check from materialized IR.
-    # Do not repeat that same full parent proof as a planner preflight.
+        bridge = Bridge(
+            name,
+            free,
+            Site(source, Position(True, gap), "prefix"),
+            Site(destination, Position(False, index), "begin"),
+            CountDomain(1, 0, minimum=max(gap, index) + 1),
+            False,
+        )
+        bridges = (*bridges, bridge)
+        if transfer := _transfer(loop, bridge):
+            proof.add_bridge(transfer)
+        revision += 1
+    memory_coverage = tuple(coverage(request) for request in requirements) if repeated else ()
+    resource_requirements = _resource_requirements(loop, resources, bridges)
+    resource_coverage = (
+        tuple(coverage(request) for request in resource_requirements) if repeated else ()
+    )
+    plan = InvocationPlan(
+        loop,
+        channel_map,
+        graph,
+        tuple((actor, tuple(commands)) for actor, commands in streams.items()),
+        tuple(bridges),
+        proof,
+        requirements,
+        tuple(resources),
+        resource_requirements,
+        memory_coverage,
+        resource_coverage,
+        snapshot,
+        _AUTHORITY,
+    )
+    # The caller matches actual declarations/instructions once at completion.
+    # Existing native transfers and ordering results remain owned here.
+    return plan

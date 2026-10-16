@@ -12,6 +12,7 @@ from xdsl.dialects import scf
 from xdsl.dialects.builtin import IntAttr, StringAttr
 
 from examples.gemm.hierarchical import hierarchical_gemm
+from tests.report_contract import semantic_report
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.ir import (
@@ -199,7 +200,7 @@ def test_retained_physical_parent_frames_and_final_ir_revalidation(artifact):
     plan = parse(artifact.plan_ir)
     assert len([op for op in plan.walk() if isinstance(op, scf.ForOp)]) == 1
     assert len([op for op in plan.walk() if isinstance(op, FrameOp)]) == 3
-    assert verify_plan(plan) == artifact.report
+    assert semantic_report(verify_plan(plan)) == semantic_report(artifact.report)
     assert artifact.report["invocation_bound"] == "outputs"
     assert "core_id * npu_invocations + npu_invocation" in artifact.asc
     assert artifact.asc.count("asc_sync_pipe(PIPE_ALL)") == 1
@@ -341,7 +342,7 @@ def test_constant_parent_and_child_keep_one_native_body(outputs, panels):
     )
     assert result.report["native_templates"] == 6
     assert result.report["runtime_parameters"] == []
-    assert 0 < result.report["completion_statistics"]["condition_facts"] < 100000
+    assert 0 <= result.report["completion_statistics"]["condition_facts"] < 100000
     assert result.asc.count("asc_mmad(") == 1
     assert result.asc.count("asc_copy_l0c2gm(") == 1
 

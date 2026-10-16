@@ -8,9 +8,36 @@ lexical order, hazard labels, or the existence of another candidate.
 from dataclasses import dataclass, replace
 
 from .budget import poll
-from .completion import CountDomain, Point, Requirement, coalesce
+from .completion import CountDomain, Point, Requirement, coalesce, covers, uncovered
 from .model import require
-from .region_completion import _data, _task
+from .region_completion import _data, _task, mark
+
+_AUTHORITY = object()
+
+
+def materialization_snapshot(module, ignored):
+    """Linear correspondence for an owned insertion-only materializer."""
+    return tuple(
+        (
+            op,
+            op.parent,
+            tuple(op.attributes.items()),
+            tuple(op.properties.items()),
+            tuple(op.operands),
+            tuple(result.type for result in op.results),
+            tuple(
+                (
+                    block,
+                    tuple(argument.type for argument in block.args),
+                    tuple(child for child in block.ops if not isinstance(child, ignored)),
+                )
+                for region in op.regions
+                for block in region.blocks
+            ),
+        )
+        for op in module.walk()
+        if not isinstance(op, ignored)
+    )
 
 
 @dataclass(frozen=True)
@@ -30,6 +57,59 @@ class Candidate:
     destination: Point
 
 
+@dataclass(frozen=True)
+class SelectedRelation:
+    requirement: Requirement
+    inherited: tuple[CountDomain, ...]
+    inserted: tuple[CountDomain, ...]
+    source: Point
+    destination: Point
+
+
+@dataclass(frozen=True)
+class BridgeSelection:
+    """Actual coverage plus the native-capture rule for each inserted domain."""
+
+    proof: object
+    bridges: tuple[Bridge, ...]
+    relations: tuple[SelectedRelation, ...]
+    _authority: object
+
+    def check(self, sequence):
+        require(self._authority is _AUTHORITY, "boundary selection needs its owned result")
+        for relation in self.relations:
+            request = relation.requirement
+            require(
+                request.source.point in {"end", "prefix"}
+                and request.destination.point == "begin"
+                and mark(
+                    sequence.regions, relation.source, request.source.point, request.source.call
+                )
+                == request.source
+                and mark(sequence.regions, relation.destination, "begin", request.destination.call)
+                == request.destination
+                and covers(request.domain, (*relation.inherited, *relation.inserted)),
+                "boundary construction changed its actual memory endpoints or count domain",
+            )
+            for domain in relation.inserted:
+                require(
+                    covers(
+                        domain,
+                        (
+                            active
+                            for bridge in self.bridges
+                            if bridge.source == relation.source
+                            and bridge.destination == relation.destination
+                            and request.destination.call - request.source.call
+                            == int(bridge.carried)
+                            for active in bridge.domains
+                        ),
+                    ),
+                    "boundary selection lost an inserted native completion witness",
+                )
+        return self
+
+
 def domain_row(d):
     if d.exact is not None:
         return (1, 0, d.exact, 0)
@@ -38,11 +118,17 @@ def domain_row(d):
 
 
 def select_bridges(sequence, proof, candidates, banks, *, carried=False):
-    selected = []
+    selected, relations = [], []
     prefix = "call" if carried else "region"
     for candidate in candidates:
         poll("sequence uncovered relations", selected=len(selected), carried=carried)
-        missing = proof.missing(candidate.requirement)
+        coverage = tuple(proof.coverage(candidate.requirement))
+        missing = tuple(uncovered(candidate.requirement.domain, coverage))
+        relations.append(
+            SelectedRelation(
+                candidate.requirement, coverage, missing, candidate.source, candidate.destination
+            )
+        )
         if not missing:
             continue
         source, destination = candidate.source, candidate.destination
@@ -72,14 +158,18 @@ def select_bridges(sequence, proof, candidates, banks, *, carried=False):
     assigned = []
     for bridge in selected:
         if bridge.event_id >= 0:
-            sp, dp = _task(sequence.regions, bridge.source).pipe, _task(sequence.regions, bridge.destination).pipe
+            sp, dp = (
+                _task(sequence.regions, bridge.source).pipe,
+                _task(sequence.regions, bridge.destination).pipe,
+            )
             key = actor, sp, dp
             reserved = int(
-                (sp, dp) == ("S", "FIX") and _data(sequence.regions, bridge.source.region).program.config
+                (sp, dp) == ("S", "FIX")
+                and _data(sequence.regions, bridge.source.region).program.config
             )
             event_id = max(banks[key], reserved)
             require(event_id < 8, f"{key}: sequence event bank exhausted; no drain fallback")
             banks[key] = event_id + 1
             bridge = replace(bridge, event_id=event_id)
         assigned.append(bridge)
-    return assigned
+    return BridgeSelection(proof, tuple(assigned), tuple(relations), _AUTHORITY).check(sequence)

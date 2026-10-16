@@ -16,8 +16,15 @@ minimum/multiple从AST贯通launcher（CPU测试仅替换设备派发行）；
 `test_cv_protocols.py`与`test_attention_math.py`分别验证机器协议和独立数值参考。
 默认dense f16 FA已有独立CANN/设备资格；continuous等拒绝变体仍不能计作成功。
 当前算子优化停止；测试重构方案见[计划](../docs/refactor-plan.md)，
-不变量与normal/deep边界见[合同](../docs/compilation-invariants.md)。本轮仅改文档，
-尚未改变pytest默认行为或移除独立最终IR验证。
+不变量与normal/deep边界见[合同](../docs/compilation-invariants.md)。普通AST编译消费
+构造时建立的事实，deep和外部同步IR仍独立检查。pytest默认继续覆盖全部回归。
+
+本轮新增：`test_compilation.py`、`test_scope_planning_reuse.py`和
+`sync/test_owned_sequence_plans.py`约束普通路径不重建独立证明，同时破坏物化结果
+检查绑定失效；`test_scope_resource_reuse.py`保留event碰撞/guard/clock反例；
+`test_compact_fixed_summary.py`对照字节模型并检查大固定count的合格摘要工作量；
+`sync/test_incremental_potential.py`检查新增边的排名与零推进环。
+normal/deep报告比较使用显式列出的工作字段过滤，未列字段仍按语义比较。
 
 | 范围 | 入口 | 检查什么 |
 |---|---|---|

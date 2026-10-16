@@ -25,9 +25,21 @@ def install_query_transitions(query):
     protocols = (
         read_query_protocols(parent.program, parent.access) if parent.program.invocations else ()
     )
-    query.query_protocols = {protocol.name: protocol for protocol in protocols}
+    query.query_protocols = {}
     query.query_events = {}
-    forwarding = {}
+    query.query_forwarding = {}
+    query.query_protocol_edges = 0
+    append_query_transitions(query, protocols)
+
+
+def append_query_transitions(query, protocols):
+    """Append a checked actual-IR suffix, retaining earlier lexical forwarding.
+
+    The owner checks the native snapshot and the exact old protocol prefix
+    before calling this function. Old nodes, cuts and arcs never change.
+    """
+    parent = query.parent
+    forwarding = query.query_forwarding
     by_site = {
         (uid, replace(site, point="begin")): owner
         for owner, (uid, site) in parent.access.endpoints.items()
@@ -76,8 +88,10 @@ def install_query_transitions(query):
 
     before_edges = query.topology.edge_count
     for protocol in protocols:
+        require(protocol.name not in query.query_protocols, "query transition already installed")
         distance = protocol.target.query
         require(distance < query.copies, "query proof window omits a protocol consumer")
+        query.query_protocols[protocol.name] = protocol
         owners = {
             action: by_site[endpoint.call, replace(endpoint.site, point="begin")]
             for action, endpoint in (("set", protocol.source), ("wait", protocol.target))
@@ -146,7 +160,7 @@ def install_query_transitions(query):
                 query.query_events[index, owners["set"][0], protocol.name, "set"],
                 query.query_events[index + distance, owners["wait"][0], protocol.name, "wait"],
             )
-    query.query_protocol_edges = query.topology.edge_count - before_edges
+    query.query_protocol_edges += query.topology.edge_count - before_edges
 
 
 def query_event_bindings(query, endpoint):

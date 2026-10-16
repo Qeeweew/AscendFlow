@@ -6,6 +6,7 @@ nodes from their paths. Native arcs, milestones and prefix induction are the
 existing Graph/SymbolicCompletion contracts; no hardware model is rebuilt.
 """
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 from .budget import bounded, poll
@@ -27,6 +28,63 @@ from .symbolic_completion import (
 MAX_GUARDED_CASES = 16_384
 MAX_GUARDED_ORIGINS = 65_536
 MAX_GUARDED_TRANSFERS = 2_000_000
+
+
+class NodeActivations(Mapping):
+    """An owned append-only table; imported graph nodes have frozen bindings.
+
+    Existing immutable Activation values may be published again unchanged.
+    A new binding on an already imported node is forbidden too: absence is
+    part of that node's established activation contract.
+    """
+
+    def __init__(self, values=()):
+        self._values, self._entries, self._sealed_nodes = {}, [], 0
+        self.update(values)
+
+    def __getitem__(self, node):
+        return self._values[node]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __setitem__(self, node, activation):
+        require(type(node) is int and node >= 0, "invalid guarded scope activation node")
+        require(isinstance(activation, Activation), "scope completion needs an Activation")
+        if node in self._values:
+            require(
+                self._values[node] == activation,
+                "an existing guarded scope node activation changed",
+            )
+            return
+        require(node >= self._sealed_nodes, "an existing guarded scope node activation changed")
+        self._values[node] = activation
+        self._entries.append((node, activation))
+
+    def __delitem__(self, node):
+        require(False, "an existing guarded scope node activation changed")
+
+    def update(self, values):
+        for node, activation in values.items() if isinstance(values, Mapping) else values:
+            self[node] = activation
+
+    @property
+    def revision(self):
+        return len(self._entries)
+
+    def appended(self, revision):
+        require(
+            type(revision) is int and 0 <= revision <= len(self._entries),
+            "guarded scope activation table revision changed",
+        )
+        return self._entries[revision:]
+
+    def seal_nodes(self, count):
+        require(count >= self._sealed_nodes, "guarded scope activation nodes must be append-only")
+        self._sealed_nodes = count
 
 
 def _domain(domain):
@@ -83,6 +141,8 @@ class GuardedCompletion:
         self.flows, self.origins, self.answers = {}, {}, {}
         self.endpoints, self.boundaries = {}, {}
         self.conditions, self.registered = [], {}
+        self._activation_revision = 0
+        self.activation_checks = 0
         self.arcs = self.cases = self.origin_count = self.queries = self.propagations = 0
         self.aliases = 0
         self._sync()
@@ -122,14 +182,19 @@ class GuardedCompletion:
             len(self.graph.nodes) >= old_nodes and len(self.graph.edges) >= self.arcs,
             "guarded scope graph must be append-only",
         )
-        require(
-            all(
-                self.node_activations.get(node) == activation
-                for node, activation in self.registered.items()
-            ),
-            "an existing guarded scope node activation changed",
-        )
-        for node, activation in self.node_activations.items():
+        owned = type(self.node_activations) is NodeActivations
+        if owned:
+            additions = self.node_activations.appended(self._activation_revision)
+        else:
+            for node, activation in self.registered.items():
+                self.activation_checks += 1
+                require(
+                    self.node_activations.get(node) == activation,
+                    "an existing guarded scope node activation changed",
+                )
+            additions = self.node_activations.items()
+        for node, activation in additions:
+            self.activation_checks += 1
             require(
                 type(node) is int and 0 <= node < len(self.graph.nodes),
                 "guarded scope activation has no actual graph node",
@@ -163,6 +228,9 @@ class GuardedCompletion:
                 for flow in self.flows.values():
                     flow.replay(source, edge)
         self.arcs = len(self.graph.edges)
+        if owned:
+            self.node_activations.seal_nodes(len(self.graph.nodes))
+            self._activation_revision = self.node_activations.revision
         if changed or self.aliases != len(self.graph.ids):
             # Appended paths cannot invalidate a proof covering its entire
             # required count domain. Partial answers still need fresh queries.
@@ -511,6 +579,7 @@ class GuardedCompletion:
             "cases": self.cases,
             "propagation_passes": self.propagations,
             "boundary_domains": len(self.boundaries),
+            "activation_checks": self.activation_checks,
             "translated_domain_states": 0,
             **{key: sum(count[key] for count in counts) for key in FACT_STATISTICS},
         }

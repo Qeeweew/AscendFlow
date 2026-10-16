@@ -631,7 +631,7 @@ def proposal_execution(program, proposals, issued):
 
 
 @bounded
-def autosync(module: ModuleOp, *, _imports=(), _capture=None) -> ModuleOp:
+def autosync(module: ModuleOp, *, _imports=(), _capture=None, _facts=None) -> ModuleOp:
     """Preserve issue/stage/storage. Reduce redundant *whole channels* with witnesses.
 
     The finite proof permits testing ring widths and removing channels, with no
@@ -644,7 +644,7 @@ def autosync(module: ModuleOp, *, _imports=(), _capture=None) -> ModuleOp:
         from .scope_sync import autosync_scopes
 
         require(not _imports, "nested planning must discharge its actual parent entry reads")
-        return autosync_scopes(module, _capture=_capture)
+        return autosync_scopes(module, _capture=_capture, _facts=_facts)
     from .ir import MixedOp, StaticDispatchOp
     from .loop_model import is_symbolic
     from .sequence_model import is_sequence
@@ -653,13 +653,13 @@ def autosync(module: ModuleOp, *, _imports=(), _capture=None) -> ModuleOp:
         from .sequence_sync import autosync_sequence
 
         require(not _imports, "sequential planning must discharge its actual entry reads")
-        return autosync_sequence(module, _capture=_capture)
+        return autosync_sequence(module, _capture=_capture, _facts=_facts)
 
     if is_symbolic(module):
         from .loop_sync import autosync_loop
 
         require(not _imports, "symbolic planning cannot assume finite imports")
-        return autosync_loop(module, _capture=_capture)
+        return autosync_loop(module, _capture=_capture, _facts=_facts)
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):
         from .dispatch import autosync_dispatch

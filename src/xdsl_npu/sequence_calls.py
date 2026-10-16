@@ -6,13 +6,13 @@ only depend on an earlier call. Actual native prefixes discharge memory, and
 separate Wait-to-Set obligations discharge finite event resources.
 """
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
-from .completion import CountDomain, Requirement, Site
+from .completion import CountDomain, Requirement, Site, covers
 from .model import require
 from .region_completion import RegionCompletion, _point, _task, mark, position
 from .region_summary import Access, summarize_local_events
-from .sequence_plan import Candidate, select_bridges
+from .sequence_plan import BridgeSelection, Candidate, select_bridges
 
 
 def memory_requirements(sequence):
@@ -88,17 +88,61 @@ def boundary_requirements(sequence, bridges):
     return tuple(result)
 
 
-def verify_calls(sequence, analyses, bridges):
+@dataclass(frozen=True)
+class CallRequirements:
+    memory: tuple[Requirement, ...]
+    events: tuple[Requirement, ...]
+    reserved: tuple[Requirement, ...]
+
+
+def prepare_call_requirements(sequence, forward):
     if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
-        return {}
-    memory = memory_requirements(sequence)
-    events = event_requirements(sequence) + boundary_requirements(sequence, bridges)
-    proof = RegionCompletion(sequence.regions, analyses, memory + events, bridges=bridges)
-    for requirement in memory + events:
-        require(
-            proof.covered(requirement),
-            f"missing sequence invocation {requirement.reason}: {requirement.source} -> {requirement.destination}, {requirement.domain}",
+        return None
+    memory, events = memory_requirements(sequence), event_requirements(sequence)
+    # Reserve source bits and exact native cuts before projecting fixed
+    # children. These are future resource QUESTIONS, not completion edges.
+    reserved = tuple(
+        Requirement(
+            replace(request.destination, call=0),
+            replace(request.source, point="prefix", call=call),
+            request.domain,
+            "potential boundary event reuse",
         )
+        for requests, call in ((forward, 1), (memory, 0))
+        for request in requests
+    )
+    reserved += tuple(
+        replace(
+            request,
+            source=replace(request.source, call=1),
+            destination=replace(request.destination, call=1),
+        )
+        for request in forward
+    )
+    return CallRequirements(memory, events, reserved)
+
+
+@dataclass(frozen=True)
+class SequenceCallPlan:
+    sequence: object
+    selection: BridgeSelection
+    memory: tuple[Requirement, ...]
+    events: tuple[Requirement, ...]
+    coverage: tuple[tuple[CountDomain, ...], ...]
+
+    @property
+    def bridges(self):
+        return self.selection.bridges
+
+    @property
+    def proof(self):
+        return self.selection.proof
+
+    def report(self):
+        return _report(self.sequence, self.memory, self.events, self.proof)
+
+
+def _report(sequence, memory, events, proof):
     return {
         "invocation_bound": sequence.invocation.bound.text(),
         "invocation_frames": len(sequence.invocation.frames),
@@ -114,11 +158,43 @@ def verify_calls(sequence, analyses, bridges):
     }
 
 
-def plan_calls(sequence, analyses, forward, banks):
+def verify_calls(sequence, analyses, bridges):
     if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
-        return []
-    memory, events = memory_requirements(sequence), event_requirements(sequence)
-    proof = RegionCompletion(sequence.regions, analyses, memory + events, bridges=forward)
+        return {}
+    memory = memory_requirements(sequence)
+    events = event_requirements(sequence) + boundary_requirements(sequence, bridges)
+    proof = RegionCompletion(sequence.regions, analyses, memory + events, bridges=bridges)
+    for requirement in memory + events:
+        require(
+            proof.covered(requirement),
+            f"missing sequence invocation {requirement.reason}: {requirement.source} -> {requirement.destination}, {requirement.domain}",
+        )
+    return _report(sequence, memory, events, proof)
+
+
+def plan_calls(sequence, analyses, forward, banks, *, proof=None, requirements=None):
+    if sequence.invocation is None or sequence.invocation.bound.constant in {0, 1}:
+        return None
+    if requirements is None:
+        questions = tuple(
+            Requirement(
+                mark(sequence.regions, bridge.source, "prefix"),
+                mark(sequence.regions, bridge.destination, "begin"),
+                domain,
+                "forward boundary native cuts",
+            )
+            for bridge in forward
+            for domain in bridge.domains
+        )
+        requirements = prepare_call_requirements(sequence, questions)
+    memory, events = requirements.memory, requirements.events
+    if proof is None:
+        proof = RegionCompletion(
+            sequence.regions,
+            analyses,
+            memory + events + requirements.reserved,
+            bridges=forward,
+        )
     # A late reader release often covers an earlier writer and several input
     # rings. Examine real cross-pipe WARs before manufacturing same-pipe fences.
     ordered = sorted(
@@ -133,4 +209,12 @@ def plan_calls(sequence, analyses, forward, banks):
         ),
     )
     candidates = [Candidate(r, r.source.location, r.destination.location) for r in ordered]
-    return select_bridges(sequence, proof, candidates, banks, carried=True)
+    selection = select_bridges(sequence, proof, candidates, banks, carried=True)
+    events = events + boundary_requirements(sequence, (*forward, *selection.bridges))
+    coverage = tuple(tuple(proof.coverage(request)) for request in events)
+    for request, covered in zip(events, coverage, strict=True):
+        require(
+            covers(request.domain, covered),
+            f"missing sequence invocation {request.reason}: {request.source} -> {request.destination}, {request.domain}",
+        )
+    return SequenceCallPlan(sequence, selection, memory, events, coverage)

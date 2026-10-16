@@ -4,6 +4,7 @@ import pytest
 from xdsl.dialects.builtin import FloatAttr, f32
 
 from tests.fixtures.cv import cv_source, vector_source
+from tests.report_contract import semantic_report
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.compilation import Compilation, compile
 from xdsl_npu.ir import LoopChannelOp, LoopSyncOp, TaskOp
@@ -18,7 +19,8 @@ def test_frozen_compile_matches_independent_public_physical_path(factory, tmp_pa
     physical = lower_source(source)
     plan = autosync(physical)
     assert result.asc == emit_asc(plan)
-    assert result.report == verify_plan(plan)
+    assert semantic_report(result.report) == semantic_report(verify_plan(plan))
+    assert result.report["verification_mode"] == "normal"
     assert result.schedule
     assert result.timings["total_s"] > 0
     result.write(tmp_path)
@@ -70,3 +72,33 @@ def test_expert_synchronization_has_the_same_final_check():
     assert result.asc == emit_asc(plan, host_launcher=False)
     with pytest.raises(CompileError, match="missing"):
         compile(lower_source(vector_source(2)), synchronize=False)
+
+
+def test_owned_normal_path_reuses_facts_and_deep_is_explicit(monkeypatch):
+    import xdsl_npu.compilation as pipeline
+    import xdsl_npu.loop_sync as leaf
+    from examples.vector.scale import scale
+
+    original = pipeline.verify_plan
+    checks = []
+
+    def check(*args, **kwargs):
+        checks.append(True)
+        return original(*args, **kwargs)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("normal compilation rebuilt an independent leaf proof")
+
+    monkeypatch.setattr(pipeline, "verify_plan", check)
+    with monkeypatch.context() as normal_context:
+        normal_context.setattr(leaf, "_verify_leaf", unexpected)
+        normal = compile(scale)
+    assert not checks
+    assert normal.timings["final_check_s"] == normal.timings["debug_check_s"] == 0
+    assert "npu.loop_channel" not in normal.before_ir
+    assert "npu.loop_channel" in normal.plan_ir
+    deep = compile(scale, debug_verify=True)
+    assert len(checks) == 1
+    assert normal.asc == deep.asc
+    assert semantic_report(normal.report) == semantic_report(deep.report)
+    assert deep.timings["debug_check_s"] > 0

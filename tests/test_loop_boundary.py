@@ -7,6 +7,7 @@ from xdsl.dialects.builtin import StringAttr
 from xdsl.ir import Block, Region
 
 from examples.gemm.reduction import reduction_gemm
+from tests.report_contract import semantic_report
 from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
@@ -39,7 +40,7 @@ def test_retained_terminal_region_and_native_initialization(artifact):
     assert len(tasks) == 6
     assert [o.native.data for o in tasks][-2:] == ["mad_first", "fix"]
     assert artifact.report["terminal_templates"] == 1
-    assert verify_plan(parse(artifact.plan_ir)) == artifact.report
+    assert semantic_report(verify_plan(parse(artifact.plan_ir))) == semantic_report(artifact.report)
     assert "false, false, (g == 0)" in artifact.asc
     assert "if (g >= 1) { asc_sync_pipe(PIPE_M); }" in artifact.asc
     assert "if (g == n - 1) { asc_copy_l0c2gm" in artifact.asc

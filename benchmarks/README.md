@@ -68,14 +68,43 @@ zero/短循环使用 `--variant both --rows 0 8 16 24`，同一binary无需重�
 三批profile可用下文通用包装器，并以 `benchmarks.normalization.analyze ...
 --variants generated ascendc aclnn` 汇总。完整证据见[Vector算子验证](../docs/vector-row-performance.md)。
 
+冷编译使用独立工具；每次trial新建Python进程，不复用编译或分析cache：
+
 ```bash
-PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/state/frame_snapshot.py --entry frame_state_sum --trials 5 --output runs/cleanup/cold
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/vector/scale.py --entry scale --parameters '{"B":64}' --mode both --trials 5 --timeout 300 --metadata '{"policy":"fixed"}' --output runs/compile-cold
+```
+
+`--entry`必须指向捕获的AST `prim_func`；省略时读取序列化xDSL。constexpr用
+`--parameters` JSON对象显式指定（数组转为tuple），runtime长度不作为特化参数。
+`--mode normal/deep/both`分别调用普通编译、额外独立终检或两组对照，报告比较ASC身份。
+默认五次冷进程；`--trials 1`明确记为probe，不能作为五次性能资格。每trial的
+`--timeout`须在(0,300]秒内，整个worker及其子进程组共用硬期限；超时或失败立即
+落盘并停止后续trial、mode与input。正常或错误退出也清理残留子进程。
+
+`benchmark.json`记录当前run、状态、输入/entry/参数/metadata、模式和完成次数。
+独立run目录保存各trial的JSON与日志，每组只在首trial保存一份实际源码、source/物理IR、
+ASC和报告；重复运行不混用旧产物。每trial记录source/package/ASC SHA、RSS、内部phase，
+同组身份变化立即失败。工具不运行CANN或设备。
+
+`source_to_asc_s`从首次读取源码到compile返回，包含输入构造、AST、全部分析、ASC和
+内部IR/report snapshot；import、身份计算和artifact磁盘写入另列。`process_wall_s`
+覆盖完整worker生命周期，含这些额外工作及启动开销，不能将写文件前后挪动分析来
+降低总耗时。冷进程不代表清空OS文件cache。
+
+2026-10-16编译器重构的固定源码/政策对照结果见
+[当前状态](../docs/refactor-progress.md#本轮编译耗时)。FA基线1次、当前5次，小算子两版
+均5次；比较相同的编译器内部计时口径，同时列出完整源码到ASC和进程时间。
+本轮没有运行设备性能调优，编译加速与ACLNN性能差距是两项独立结果。
+
+以下为独立的离线构建示例：
+
+```bash
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.state.run_grouped --frame-snapshot --output runs/cleanup/frame --build
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run_policy --heads 1 --kv-heads 1 --groups 1 --output runs/cleanup/attention-reference --build
 ```
 
-第二条编译生成代码与手写参考；第三条只编译独立 AscendC FA，不能计为编译器
-FA 成功。冷编译计时从读源码到最终检查/ASC，import、CANN 及属性访问另计。
+第一条编译生成代码与手写参考；第二条只编译独立 AscendC FA，不能计为编译器
+FA 成功。
 
 ## 设备与大规模性能
 

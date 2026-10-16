@@ -8,7 +8,8 @@ is the conjunction along its real path; alternative paths retain their guards.
 from heapq import heappop, heappush
 
 from .budget import poll
-from .completion import CountDomain, _first, canonical, intersection
+from .completion import CountDomain, canonical, intersection
+from .completion import includes as _includes
 from .model import require
 
 ALL = CountDomain(1, 0, minimum=0)
@@ -29,25 +30,6 @@ def propagate_ordered(successors, seeds):
                 facts[target] |= bits
                 transfers += 1
     return facts, transfers
-
-
-def _includes(outer, inner):
-    """Containment of one nonempty arithmetic interval, without a union solver."""
-    first = _first(inner)
-    if not outer.contains(first):
-        return False
-    if inner.exact is not None:
-        return True
-    last = (
-        None
-        if inner.maximum is None
-        else inner.maximum - (inner.maximum - inner.residue) % inner.period
-    )
-    if last == first:
-        return True
-    if outer.exact is not None or inner.period % outer.period:
-        return False
-    return outer.maximum is None or last is not None and last <= outer.maximum
 
 
 class CompletionFlow:
