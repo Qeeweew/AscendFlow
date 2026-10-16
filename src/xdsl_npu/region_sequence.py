@@ -63,6 +63,23 @@ class Cell:
 
 
 @dataclass(frozen=True)
+class _Frontier:
+    reads_before_write: tuple[Endpoint, ...]
+    first_write: Endpoint | None
+    last_write: Endpoint | None
+    pending_reads: tuple[Endpoint, ...]
+
+
+@dataclass
+class _Work:
+    visits: int = 0
+
+    def charge(self, amount, kind):
+        self.visits += amount
+        require(self.visits <= MAX_SEQUENCE_VISITS, f"sequence {kind} budget exceeded")
+
+
+@dataclass(frozen=True)
 class SequenceSummary:
     bound: Expr | None
     bound_value: SSAValue | None
@@ -136,13 +153,79 @@ def _domains(entries):
         yield CountDomain(period, residue, minimum=boundary), first
 
 
+def _transfers(entries, work):
+    """Compose one complete semantic entry pattern, without physical bounds."""
+    result = []
+    for domain, count in _domains(entries):
+        incoming, pending, obligations = [], [], []
+        first, last = None, None
+
+        def add(hazard, source, destination, *, obligations=obligations):
+            work.charge(1, "transfer obligation")
+            obligations.append((hazard, source, destination))
+
+        for part, cells in entries:
+            # Inactive domains are examined too; sharing must not hide them.
+            work.charge(len(cells), "frontier")
+            poll("sequential access composition", visits=work.visits)
+            local_count = part.summary.constant_count
+            candidates = [
+                cell
+                for cell in cells
+                if cell.domain.contains(count if local_count is None else local_count)
+            ]
+            require(len(candidates) <= 1, "overlapping child byte/count domains")
+            if not candidates:
+                continue
+            cell = candidates[0]
+            work.charge(len(cell.reads_before_write) + len(cell.pending_reads) + 2, "endpoint")
+
+            def endpoint(access, *, part=part, local_count=local_count):
+                return Endpoint(part.name, access, local_count)
+
+            readers = tuple(endpoint(reader) for reader in cell.reads_before_write)
+            if last is not None:
+                for reader in readers:
+                    add("RAW", last, reader)
+            else:
+                incoming.extend(readers)
+            if cell.first_write is not None:
+                writer = endpoint(cell.first_write)
+                if last is not None:
+                    add("WAW", last, writer)
+                for reader in pending:
+                    add("WAR", reader, writer)
+                require(cell.last_write is not None, "first writer needs an exit writer")
+                first = first or writer
+                last = endpoint(cell.last_write)
+                pending = [endpoint(reader) for reader in cell.pending_reads]
+            else:
+                require(cell.last_write is None, "exit writer needs a first writer")
+                pending.extend(endpoint(reader) for reader in cell.pending_reads)
+        if incoming or first is not None or pending:
+            work.charge(1, "transfer")
+            result.append(
+                (
+                    domain,
+                    _Frontier(tuple(incoming), first, last, tuple(pending)),
+                    tuple(obligations),
+                )
+            )
+    return tuple(result)
+
+
 @bounded
-def summarize_sequence(parts):
+def summarize_sequence(parts, *, statistics=None):
     """Return exact sequence frontiers and unresolved cross-region hazards.
 
     Empty dynamic children contribute identity; surrounding constant-count
     regions still execute. Read-only children preserve complete reader spans,
     without assuming their last issued read retires the previous ones.
+
+    Identical entry patterns share domain selection and transfer computation
+    only within this call. Each physical interval still gets its own cells and
+    obligations, including holes and adjacent pieces. The visit budget charges
+    input signatures, unique transfers and every materialized output record.
     """
     parts = tuple(parts)
     require(
@@ -164,7 +247,7 @@ def summarize_sequence(parts):
     bound_value = next(iter(bound_values)) if bound_values else None
     # Sweep exact physical byte pieces separately for each allocation. Names
     # only locate the original SSA allocation inside each already extracted child.
-    roots = {}
+    roots, cell_patterns, work = {}, {}, _Work()
     input_cells = 0
     for index, part in enumerate(parts):
         require(
@@ -187,91 +270,101 @@ def summarize_sequence(parts):
                 cell.storage in origins and 0 <= cell.start < cell.stop, "invalid child byte cell"
             )
             root = origins[cell.storage]
+            # Coordinates and allocation identity do not affect a transfer.
+            # Keep every semantic field, including complete reader families and
+            # definition bindings, before interning a small per-analysis ID.
+            signature = (
+                cell.domain,
+                cell.reads_before_write,
+                cell.first_write,
+                cell.last_write,
+                cell.pending_reads,
+                cell.definitions,
+            )
+            work.charge(len(cell.reads_before_write) + len(cell.pending_reads) + 2, "input pattern")
+            pattern = cell_patterns.setdefault(signature, len(cell_patterns))
             events = roots.setdefault(root, {})
-            events.setdefault(cell.start, []).append((True, index, cell))
-            events.setdefault(cell.stop, []).append((False, index, cell))
+            events.setdefault(cell.start, []).append((True, index, cell, pattern))
+            events.setdefault(cell.stop, []).append((False, index, cell, pattern))
             input_cells += 1
             require(input_cells <= MAX_SEQUENCE_VISITS, "sequence input-piece budget exceeded")
             if input_cells % 256 == 0:
                 poll("sequential access indexing", pieces=input_cells)
 
-    output, obligations, visits = [], [], 0
+    output, obligations, transfers = [], [], {}
+    physical_intervals = reused_intervals = transfer_visits = materialized_visits = 0
+    input_pattern_visits = work.visits
     for root, events in roots.items():
         active = {}
         points = sorted(events)
         for point, stop in pairwise(points):
-            for add, index, cell in events[point]:
+            for add, index, cell, pattern in events[point]:
                 if add:
-                    active.setdefault(index, set()).add(cell)
+                    active.setdefault(index, {})[cell] = pattern
                 else:
-                    active[index].remove(cell)
+                    del active[index][cell]
                     if not active[index]:
                         del active[index]
             if not active:
                 continue  # Never fill holes with a bounding box.
-            entries = [(parts[i], tuple(active[i])) for i in sorted(active)]
-            for domain, count in _domains(entries):
-                incoming, pending = [], []
-                first, last = None, None
-
-                def add(
-                    hazard, source, destination, *, root=root, point=point, stop=stop, domain=domain
-                ):
-                    nonlocal visits
-                    visits += 1
-                    require(visits <= MAX_SEQUENCE_VISITS, "sequence obligation budget exceeded")
+            indices = sorted(active)
+            # Sorting interned IDs preserves multiplicity: two distinct cells
+            # with equal semantics must still diagnose overlapping domains.
+            work.charge(sum(len(active[i]) for i in indices), "entry pattern")
+            signature = tuple(
+                (parts[i].name, parts[i].summary.constant_count, tuple(sorted(active[i].values())))
+                for i in indices
+            )
+            physical_intervals += 1
+            if physical_intervals % 256 == 0:
+                poll(
+                    "sequential access composition",
+                    visits=work.visits,
+                    intervals=physical_intervals,
+                )
+            if signature not in transfers:
+                before = work.visits
+                entries = tuple((parts[i], tuple(active[i])) for i in indices)
+                transfers[signature] = _transfers(entries, work)
+                transfer_visits += work.visits - before
+            else:
+                reused_intervals += 1
+            before = work.visits
+            for domain, frontier, hazards in transfers[signature]:
+                for hazard, source, destination in hazards:
+                    work.charge(1, "obligation")
                     obligations.append(
                         Obligation(root, point, stop, domain, hazard, source, destination)
                     )
-
-                for part, cells in entries:
-                    # Charge actual examined domains, including inactive branches.
-                    visits += len(cells)
-                    require(visits <= MAX_SEQUENCE_VISITS, "sequence frontier budget exceeded")
-                    poll(
-                        "sequential access composition", visits=visits, obligations=len(obligations)
+                work.charge(
+                    len(frontier.reads_before_write) + len(frontier.pending_reads) + 1,
+                    "output-piece",
+                )
+                output.append(
+                    Cell(
+                        root,
+                        point,
+                        stop,
+                        domain,
+                        frontier.reads_before_write,
+                        frontier.first_write,
+                        frontier.last_write,
+                        frontier.pending_reads,
                     )
-                    local_count = part.summary.constant_count
-                    candidates = [
-                        cell
-                        for cell in cells
-                        if cell.domain.contains(count if local_count is None else local_count)
-                    ]
-                    require(len(candidates) <= 1, "overlapping child byte/count domains")
-                    if not candidates:
-                        continue
-                    cell = candidates[0]
-                    visits += len(cell.reads_before_write) + len(cell.pending_reads) + 2
-                    require(visits <= MAX_SEQUENCE_VISITS, "sequence endpoint budget exceeded")
-
-                    def endpoint(access, *, part=part, local_count=local_count):
-                        return Endpoint(part.name, access, local_count)
-
-                    readers = tuple(endpoint(reader) for reader in cell.reads_before_write)
-                    if last is not None:
-                        for reader in readers:
-                            add("RAW", last, reader)
-                    else:
-                        incoming.extend(readers)
-                    if cell.first_write is not None:
-                        writer = endpoint(cell.first_write)
-                        if last is not None:
-                            add("WAW", last, writer)
-                        for reader in pending:
-                            add("WAR", reader, writer)
-                        require(cell.last_write is not None, "first writer needs an exit writer")
-                        first = first or writer
-                        last = endpoint(cell.last_write)
-                        pending = [endpoint(reader) for reader in cell.pending_reads]
-                    else:
-                        require(cell.last_write is None, "exit writer needs a first writer")
-                        pending.extend(endpoint(reader) for reader in cell.pending_reads)
-                if incoming or first is not None or pending:
-                    visits += len(incoming) + len(pending) + 1
-                    require(visits <= MAX_SEQUENCE_VISITS, "sequence output-piece budget exceeded")
-                    output.append(
-                        Cell(
-                            root, point, stop, domain, tuple(incoming), first, last, tuple(pending)
-                        )
-                    )
-    return SequenceSummary(bound, bound_value, tuple(output), tuple(obligations), visits)
+                )
+            materialized_visits += work.visits - before
+    if statistics is not None:
+        statistics.update(
+            input_cells=input_cells,
+            input_pattern_visits=input_pattern_visits,
+            physical_intervals=physical_intervals,
+            unique_cell_patterns=len(cell_patterns),
+            unique_entry_patterns=len(transfers),
+            reused_intervals=reused_intervals,
+            transfer_visits=transfer_visits,
+            materialized_cells=len(output),
+            materialized_obligations=len(obligations),
+            materialized_visits=materialized_visits,
+            visits=work.visits,
+        )
+    return SequenceSummary(bound, bound_value, tuple(output), tuple(obligations), work.visits)
