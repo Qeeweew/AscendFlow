@@ -13,11 +13,11 @@ never from samples of N. This proposes memory obligations, not completion.
 from dataclasses import dataclass, replace
 
 from .budget import poll
-from .completion import CountDomain, _first, coalesce
+from .completion import CountDomain, Position, _first, coalesce
 from .completion_flow import ALL
 from .loop_model import Dependence
 from .model import require
-from .region_summary import Access
+from .region_summary import Access, CellSummary, ReadSpan
 from .scope_domains import Activation, ScopedDependence, affine, position
 from .symbolic_completion import choice, holds, le, meet
 
@@ -31,6 +31,9 @@ class LifetimePlan:
     reordered_roots: tuple[str, ...]
     fallbacks: tuple[tuple[str, str], ...]
     visits: int
+    # Physical occupancy at invocation boundaries, after logical RAW binding.
+    # Only roots whose WAW/WAR contract was actually reordered contribute.
+    boundaries: tuple[CellSummary, ...] = ()
 
 
 @dataclass
@@ -269,7 +272,7 @@ def _plan_root(program, access, root, endpoints, budget):
     for dep in old:
         if dep.hazard == "RAW":
             raw.setdefault(dep.destination, []).append(dep)
-    relations, changed = [], False
+    relations, boundaries, changed = [], [], False
     for lo, hi, uses in zip(points[:-1], points[1:], cells, strict=True):
         writers = []
         for use in uses:
@@ -309,6 +312,35 @@ def _plan_root(program, access, root, endpoints, budget):
                     raise _Unsupported("incoming read does not bind one exported logical version")
                 dep = bindings[0]
                 by_last[dep.source].readers.append((reader, dep.distance))
+        # Every writer in this contract exists at every parent generation.
+        # Their physical (stage, rank) order therefore has these extremal
+        # occupants for every positive N, including N=1. Readers stay bound
+        # to their logical writer even when their call is a separate child.
+        head = min(writers, key=lambda writer: (writer.stage, writer.rank))
+        tail = max(writers, key=lambda writer: (writer.stage, writer.rank))
+        if any(shift < 0 for _, shift in tail.readers):
+            raise _Unsupported("negative logical reader shift needs a boundary activation")
+        domain = (
+            CountDomain(1, 0, minimum=1)
+            if program.count is None
+            else CountDomain(1, 0, exact=program.count)
+        )
+        boundaries.append(
+            CellSummary(
+                root,
+                lo,
+                hi,
+                domain,
+                (),
+                Access(head.use.first, Position(False, 0)),
+                Access(tail.use.last, Position(True, 0)),
+                tuple(
+                    ReadSpan.one(Access(reader, Position(True, 0)))
+                    for reader, shift in tail.readers
+                    if shift == 0
+                ),
+            )
+        )
         stages = [writer.stage for writer in writers]
         span = max(stages) - min(stages)
         width = 2 * span + 2
@@ -356,7 +388,7 @@ def _plan_root(program, access, root, endpoints, budget):
                         len(relations) <= MAX_LIFETIME_RELATIONS,
                         "scope lifetime relation budget exceeded",
                     )
-    return _coalesce(relations) if changed else None
+    return (_coalesce(relations), tuple(boundaries)) if changed else None
 
 
 def plan_lifetimes(program, access) -> LifetimePlan:
@@ -373,7 +405,7 @@ def plan_lifetimes(program, access) -> LifetimePlan:
         (uid, site.task[1], site.position.evaluate(access.summaries[uid].constant_count)): key
         for key, (uid, site) in access.endpoints.items()
     }
-    budget, replacement, fallbacks = _Budget(), {}, []
+    budget, replacement, fallbacks, boundaries = _Budget(), {}, [], []
     for root in roots:
         try:
             planned = _plan_root(program, access, root, endpoints, budget)
@@ -381,13 +413,16 @@ def plan_lifetimes(program, access) -> LifetimePlan:
             fallbacks.append((root, str(error)))
             continue
         if planned is not None:
-            replacement[root] = planned
+            replacement[root] = planned[0]
+            boundaries.extend(planned[1])
     dependencies = tuple(
         dep
         for dep in access.obligations
         if dep.storage not in replacement or dep.hazard not in {"WAW", "WAR"}
     ) + tuple(dep for root in sorted(replacement) for dep in replacement[root])
-    return LifetimePlan(dependencies, tuple(sorted(replacement)), tuple(fallbacks), budget.visits)
+    return LifetimePlan(
+        dependencies, tuple(sorted(replacement)), tuple(fallbacks), budget.visits, tuple(boundaries)
+    )
 
 
 def propose_lifetimes(program, access) -> tuple[Dependence | ScopedDependence, ...]:

@@ -60,8 +60,11 @@ def test_parent_only_proof_cannot_be_published_as_query_verification(parent):
     assert report["cross_query_verified"] is False
     assert "remain unverified" in report["verification"]
     assert checked.program.invocations
+    assert checked.query_report is None
     before = dump(module)
-    with pytest.raises(CompileError, match="cross-query memory and event lifetime"):
+    with pytest.raises(
+        CompileError, match="missing cross-query memory and event lifetime synchronization:"
+    ):
         verify_plan(module)
     with pytest.raises(CompileError, match="unsynchronized physical calls"):
         autosync(module)
@@ -77,22 +80,22 @@ def test_actual_parent_sync_removal_invalidates_normalized_memory_proof(parent):
         _verify_scope_parent(extract_scopes(module))
 
 
-def test_real_query_ir_requires_unprojected_state_read_release(parent):
+def test_real_query_ir_exposes_missing_state_read_release(parent):
     _, _, _, _, checked, proof = parent
     uid = "aiv0_call0"
     leaf = checked.program.leaves[uid]
     data = next(iter(leaf.loop.actors.values()))
     tasks = {task.uid: task for task in data.program.tasks}
     endpoints = [site for call, site in checked.access.endpoints.values() if call == uid]
-    # The final MTE3 state reader has no query-local successor. It was not
-    # demanded by the inner proof: querying it must reject, not infer safety.
+    # The query summary demands the final MTE3 reader even though it has no
+    # query-local successor. Its retirement before the next fill is unproved.
     store = next(site for site in endpoints if tasks[site.task[1]].pipe == "MTE3")
     fill = next(site for site in endpoints if tasks[site.task[1]].native == "fill")
     query = QueryCompletion(proof)
     source = QuerySite(0, uid, replace(store, point="end"), Position(True, 0))
     target = QuerySite(1, uid, replace(fill, point="begin"), Position(False, 0))
-    with pytest.raises(CompileError, match="unknown scoped child completion query endpoint"):
-        query.covered(source, target, CountDomain(1, 0, exact=1))
+    assert checked.query_summary is not None
+    assert not query.covered(source, target, CountDomain(1, 0, exact=1))
 
 
 def test_real_query_ir_has_unresolved_child_event_republication(parent):

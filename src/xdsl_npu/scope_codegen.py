@@ -5,7 +5,7 @@ from itertools import combinations, product
 
 from .asc_scalar import ScalarScope
 from .codegen import QUALIFIER
-from .ir import CallOp, LoopChannelOp, LoopSyncOp, ScopeSyncOp, TaskOp
+from .ir import CallOp, LoopChannelOp, LoopSyncOp, QuerySyncOp, ScopeSyncOp, TaskOp
 from .model import require
 from .scalar import INT64_MAX, Expr
 from .scope_predicates import PARENT_CASES, case_activation, guard_active
@@ -298,22 +298,33 @@ def _endpoint_matches(checked, key, leaf, task, position):
 
 
 def scope_boundary(checked, leaf):
-    """Render only actual ScopeSyncOps beside their actual native instruction."""
+    """Render actual ScopeSync/QuerySyncs in their single mixed native order."""
     from .loop_codegen import _event
+    from .scope_query_protocols import read_query_protocols
 
     tasks = _parent_tasks(checked)
-    before, after, pending, previous = {}, {}, [], None
+    query_channels = (
+        {p.name: p for p in read_query_protocols(checked.program, checked.access)}
+        if checked.program.invocations
+        else {}
+    )
+    before, after, pending, previous, block = {}, {}, [], None, None
     for op, _ in scope_operations(leaf.stream):
+        if op.parent is not block:
+            require(not pending, "scope acquisition escaped its actual native region")
+            previous, block = None, op.parent
         if isinstance(op, TaskOp):
             before[op.uid.data], pending, previous = pending, [], op.uid.data
-        elif isinstance(op, ScopeSyncOp):
+        elif isinstance(op, (ScopeSyncOp, QuerySyncOp)):
             require(
                 op.parent_generation is leaf.call.generation
                 and op.child_generation is leaf.stream.body.block.args[0],
                 "scope synchronization uses a different parent or child clock",
             )
             require(
-                op.channel.data in checked.channels, "scope synchronization has an unknown channel"
+                op.channel.data
+                in (query_channels if isinstance(op, QuerySyncOp) else checked.channels),
+                "scope synchronization has an unknown channel",
             )
             if op.action.data == "set":
                 require(
@@ -326,9 +337,16 @@ def scope_boundary(checked, leaf):
                     "unsupported scope synchronization action",
                 )
                 pending.append(op)
+        else:
+            require(not pending, "scope acquisition must be adjacent to its actual native")
+            previous = None
     require(not pending, "scope acquisition has no following native instruction")
 
     def render(op, task):
+        if isinstance(op, QuerySyncOp):
+            from .scope_query_codegen import render_query_sync
+
+            return render_query_sync(checked, leaf, op, task, query_channels[op.channel.data])
         channel = checked.channels[op.channel.data]
         require(channel.kind in {"local", "cross", "barrier"}, "unsupported scope channel kind")
         require(
@@ -444,6 +462,9 @@ def emit_scope_actor(checked, actor, uniform_names):
             Expr("argument", ("$parent0",)): "npu_parent_g",
         }
     )
+    invocation = program.invocations.get(actor)
+    if invocation is not None:
+        names[Expr("argument", ("$parent1",))] = "npu_query_g"
     root_names = {storage.name for storage in checked.access.loop.actors[actor].program.storages}
     for call in calls:
         uid = call.uid.data
@@ -504,6 +525,16 @@ def emit_scope_actor(checked, actor, uniform_names):
         )
         lines += ["      }", "    } // asynchronous child exit"]
     lines.append("  } // parent pipeline: no per-call drain")
+    if invocation is not None:
+        from .scope_query_codegen import query_loop_lines
+
+        lines = [
+            lines[0],
+            *query_loop_lines(invocation, uniform_names),
+            "  for (int64_t npu_query_g = 0; npu_query_g < npu_query_n; ++npu_query_g) {",
+            *("  " + line for line in lines[1:]),
+            "  } // serial query: no per-invocation drain",
+        ]
     return lines
 
 
@@ -511,7 +542,9 @@ def emit_scopes(checked, *, host_launcher=True):
     from .loop_codegen import emit_loop
 
     require(
-        not checked.program.invocations,
+        not checked.program.invocations
+        or checked.query_report is not None
+        and checked.query_report.get("verified") is True,
         "nested serial invocations need verified cross-query protocols before ASC emission",
     )
     return emit_loop(

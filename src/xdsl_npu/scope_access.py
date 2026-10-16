@@ -26,7 +26,7 @@ from .loop_model import (
 )
 from .model import ITEMSIZE, Ref, Task, require
 from .periodic import bounded_period
-from .region_summary import Access, RegionSummary, summarize_fixed_storage
+from .region_summary import Access, CellSummary, RegionSummary, summarize_fixed_storage
 from .scalar import facts_from_sizes, from_ssa
 from .scope_model import ScopedProgram
 
@@ -51,6 +51,7 @@ class ScopeAccess:
     definition_roots: frozenset[str]
     lifetime_report: dict | None = None
     query: "QueryAccessMap | None" = None
+    lifetime_boundaries: tuple[CellSummary, ...] = ()
 
 
 def _coordinate(atom):

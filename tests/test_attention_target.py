@@ -1,4 +1,4 @@
-"""The P0 source is a design fixture, not a claimed executable FA kernel."""
+"""The shared FA example and its explicitly unsupported continuous policy."""
 
 import ast
 import operator
@@ -7,7 +7,7 @@ from collections import Counter
 import pytest
 
 from tests.fixtures.attention_target import activation_trace, attention_target, target_source
-from xdsl_npu import compile
+from xdsl_npu.lowering import lower_source
 from xdsl_npu.model import CompileError
 
 
@@ -45,15 +45,12 @@ def test_both_organizations_share_actual_algorithm_and_explicit_operations():
         assert not set(names) & {"task", "autosync", "verify_plan", "set_flag", "wait_flag"}
 
 
-def test_source_is_explicitly_refused_without_falling_back_to_legacy():
-    # The nested source now reaches physical IR with its real query/KV/child
-    # clocks. Cross-query memory and event lifetimes still need proof.
-    for continuous, error in (
-        (False, "cross-query memory and event lifetime synchronization"),
-        (True, "runtime-cycle predicates are unsupported"),
-    ):
-        with pytest.raises(CompileError, match=error):
-            compile(attention_target(continuous=continuous))
+def test_continuous_source_rejects_its_actual_unsupported_runtime_cycle():
+    # Nested actual-IR synchronization failures are covered by serial
+    # integration tests. This check fails during physical lowering, before
+    # any full-FA planning or event search can run.
+    with pytest.raises(CompileError, match="runtime-cycle predicates are unsupported"):
+        lower_source(attention_target(continuous=True))
 
 
 def static(expr, parameters):

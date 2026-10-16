@@ -2,7 +2,8 @@
 
 The only symbolic count remains the KV extent N. A static number of copies
 represents neighboring serial invocations; it never expands a query count M.
-Only the real per-actor issue/pipe prefixes cross the serial boundary. Neither
+Real per-actor issue/pipe prefixes, exclusive cross-counter Set FIFO and
+actual QueryChannel/QuerySync transitions cross the serial boundary. Neither
 a child exit nor the final native instruction becomes query-wide completion.
 """
 
@@ -11,9 +12,10 @@ from dataclasses import dataclass
 from .budget import bounded, poll
 from .child_completion import ChildPort
 from .completion import CountDomain, Position, Site, _first, canonical, coalesce, covers, uncovered
+from .loop_graph import Command
 from .model import require
 from .periodic import bounded_period
-from .scope_domains import affine
+from .scope_domains import affine, shifted
 from .symbolic_completion import FACT_STATISTICS, CompletionTopology, SymbolicCompletion, meet
 
 MAX_QUERY_NODES = 100_000
@@ -32,6 +34,17 @@ class QuerySite:
     parent: Position
 
 
+@dataclass(frozen=True)
+class QueryEvent:
+    """An actual parent/query Set effect or Wait consumption at its KV position."""
+
+    query: int
+    actor: str
+    channel: str
+    action: str
+    parent: Position
+
+
 class QueryCompletion:
     """Read-only snapshot of a completed parent proof, with exact endpoints.
 
@@ -40,9 +53,9 @@ class QueryCompletion:
     Coverage includes only counts where BOTH actual endpoints exist and every
     active case has its path. In particular a zero-trip native has no coverage.
 
-    This adapter supplies neither new synchronization nor a proof of outer
-    event pairing/progress. Its prefix carries apply to N >= 1; admitting an
-    empty query would additionally need a state-port identity contract.
+    This adapter reads synchronization only from actual IR. It is not a proof
+    of outer event pairing/progress. Its prefix carries apply to N >= 1;
+    admitting an empty query additionally needs a state-port identity contract.
     """
 
     @bounded
@@ -89,12 +102,29 @@ class QueryCompletion:
         before = self.topology.edge_count
         self._carry_prefixes()
         self.carry_edges = self.topology.edge_count - before
-        self.flow = SymbolicCompletion(topology=self.topology)
+        before = self.topology.edge_count
+        self._carry_cross_counters()
+        self.counter_edges = self.topology.edge_count - before
         self.origins, self.bindings, self.answers = {}, {}, {}
         self.queries = self.cases = 0
+        from .scope_query_transitions import install_query_transitions
+
+        install_query_transitions(self)
+        self.flow = SymbolicCompletion(topology=self.topology)
 
     def _version(self):
-        return len(self.guarded.topology.families), self.guarded.arcs, len(self.parent.graph.ids)
+        from .scope_query_protocols import read_query_protocols
+
+        return (
+            len(self.guarded.topology.families),
+            self.guarded.arcs,
+            len(self.parent.graph.ids),
+            tuple(self.parent.protocols),
+            tuple(self.parent.events.items()),
+            read_query_protocols(self.parent.program, self.parent.access)
+            if self.parent.program.invocations
+            else (),
+        )
 
     def _node(self, query, node):
         return query * self.size + node
@@ -151,6 +181,168 @@ class QueryCompletion:
                                 guard=guard,
                             )
 
+    def _event_command(self, endpoint):
+        require(
+            endpoint.actor in self.parent.access.loop.actors,
+            "unknown query completion event actor",
+        )
+        protocols = [p for p in self.parent.protocols if p.name == endpoint.channel]
+        require(len(protocols) == 1, "unknown query completion event channel")
+        protocol = protocols[0]
+        require(protocol.kind in {"local", "cross"}, "query completion event has no Set/Wait")
+        participants = protocol.sources if endpoint.action == "set" else protocol.destinations
+        owners = [owner for owner in participants if owner[0] == endpoint.actor]
+        require(len(owners) == 1, "query completion event has no actual participant")
+        owner = owners[0]
+        tasks = [
+            task
+            for task in self.parent.access.loop.actors[endpoint.actor].program.tasks
+            if task.uid == owner[1]
+        ]
+        require(len(tasks) == 1, "query completion event has no actual participant task")
+        require(
+            owner in self.parent.access.endpoints, "query completion event has no native endpoint"
+        )
+        uid, site = self.parent.access.endpoints[owner]
+        leaf = self.parent.program.leaves.get(uid)
+        require(
+            leaf is not None
+            and leaf.actor == endpoint.actor
+            and site.task[0] == endpoint.actor
+            and site.region == uid
+            and any(
+                task.uid == site.task[1]
+                for data in leaf.loop.actors.values()
+                for task in data.program.tasks
+            ),
+            "query completion event changed its actual native participant",
+        )
+        command = self.parent.events.get((endpoint.actor, endpoint.channel, endpoint.action))
+        expected_kind = ("cross_" if protocol.kind == "cross" else "") + endpoint.action
+        activation = (
+            None
+            if protocol.activation is None
+            else shifted(protocol.activation, 0 if endpoint.action == "set" else protocol.distance)
+        )
+        residues = (
+            protocol.residues
+            if endpoint.action == "set"
+            else tuple(sorted((r + protocol.distance) % protocol.period for r in protocol.residues))
+        )
+        lower, upper = (
+            (0, protocol.distance) if endpoint.action == "set" else (protocol.distance, 0)
+        )
+        if activation is not None:
+            residues = activation.residues
+            lower = 0 if activation.first.end else activation.first.offset
+            upper = activation.last.offset if activation.last.end else 0
+        require(
+            isinstance(command, Command)
+            and command.actor == endpoint.actor
+            and command.channel == endpoint.channel
+            and command.kind == expected_kind
+            and command.task is tasks[0]
+            and (command.period, command.residues, command.lower, command.upper)
+            == (protocol.period, residues, lower, upper),
+            "query completion event has no matching actual command",
+        )
+        point = "end" if endpoint.action == "set" else "begin"
+        for node in self.guarded._endpoint(command, point, source=True):
+            require(
+                node is None or self.parent.graph.nodes[node].command is command,
+                "query completion event changed its actual command",
+            )
+        return command
+
+    def _carry_cross_counters(self):
+        from .scope_native_activation import validate_scope_protocol
+
+        used, period = set(), self.parent.period
+        for protocol in self.parent.protocols:
+            if protocol.kind != "cross":
+                continue
+            require(
+                len(protocol.ids) == 1
+                and type(protocol.ids[0]) is int
+                and 0 <= protocol.ids[0] < 8
+                and protocol.ids[0] not in used,
+                "query completion cross counter needs one allocated exclusive ID",
+            )
+            used.update(protocol.ids)
+            require(
+                protocol.activation is None and not protocol.last and not protocol.carry,
+                "query completion cross counter activation/case form is unsupported",
+            )
+            require(
+                type(protocol.period) is int
+                and protocol.period > 0
+                and period % protocol.period == 0
+                and protocol.residues
+                and protocol.residues == tuple(sorted(set(protocol.residues)))
+                and all(type(r) is int and 0 <= r < protocol.period for r in protocol.residues),
+                "query completion cross counter has invalid actual residues",
+            )
+            require(
+                len({a for a, _ in protocol.sources}) == len(protocol.sources)
+                and len({a for a, _ in protocol.destinations}) == len(protocol.destinations)
+                and ({a for a, _ in protocol.sources}, {a for a, _ in protocol.destinations})
+                in (({"aic"}, {"aiv0", "aiv1"}), ({"aiv0", "aiv1"}, {"aic"})),
+                "query completion cross counter needs its actual AIC/two-AIV quorum",
+            )
+            validate_scope_protocol(self.parent.program, self.parent.access, protocol)
+            sends = []
+            for participants, action in (
+                (protocol.sources, "set"),
+                (protocol.destinations, "wait"),
+            ):
+                for actor, _ in participants:
+                    command = self._event_command(
+                        QueryEvent(0, actor, protocol.name, action, Position(False, 0))
+                    )
+                    if action == "set":
+                        sends.append(command)
+            for command in sends:
+                head = min(
+                    command.lower + (r - command.lower) % command.period for r in command.residues
+                )
+                entry = 0, head
+                target = self.parent.graph.ids.get((command.index, head % period, "end"))
+                require(
+                    target is not None, "query completion cross counter has no actual Set effect"
+                )
+                for residue in range(period):
+                    poll(
+                        "query completion cross counter FIFO",
+                        channel=protocol.name,
+                        residue=residue,
+                    )
+                    gap = command.upper + min(
+                        (residue - 1 - command.upper - r) % command.period for r in command.residues
+                    )
+                    exit = 1, -1 - gap
+                    source = self.parent.graph.ids.get(
+                        (command.index, (residue + exit[1]) % period, "end")
+                    )
+                    require(
+                        source is not None,
+                        "query completion cross counter has no actual Set effect",
+                    )
+                    guard = meet(
+                        CountDomain(period, residue, minimum=1),
+                        meet(
+                            self.guarded._point_guard(source, exit),
+                            self.guarded._point_guard(target, entry),
+                        ),
+                    )
+                    for query in range(self.copies - 1):
+                        self._edge(
+                            self._node(query, source),
+                            self._node(query + 1, target),
+                            source_point=exit,
+                            target_point=entry,
+                            guard=guard,
+                        )
+
     def _required(self, domain):
         require(isinstance(domain, CountDomain), "query completion needs a KV count domain")
         require(
@@ -176,26 +368,45 @@ class QueryCompletion:
 
     def _bindings(self, endpoint):
         require(
-            isinstance(endpoint, QuerySite)
+            isinstance(endpoint, (QuerySite, QueryEvent))
             and type(endpoint.query) is int
             and 0 <= endpoint.query < self.copies
-            and isinstance(endpoint.call, str)
-            and isinstance(endpoint.site, Site)
             and isinstance(endpoint.parent, Position)
             and type(endpoint.parent.end) is bool
             and type(endpoint.parent.offset) is int,
-            "query completion needs a full QuerySite identity",
+            "query completion needs a full QuerySite or QueryEvent identity",
         )
-        require(endpoint.call in self.parent.program.leaves, "unknown query completion call")
-        require(
-            endpoint.site.task[0] == self.parent.program.leaves[endpoint.call].actor,
-            "query completion endpoint changed its physical actor",
-        )
+        if isinstance(endpoint, QueryEvent):
+            require(
+                isinstance(endpoint.actor, str)
+                and isinstance(endpoint.channel, str)
+                and isinstance(endpoint.action, str)
+                and endpoint.action in {"set", "wait"},
+                "query completion needs a Set/Wait QueryEvent identity",
+            )
+            if endpoint.channel in self.query_protocols:
+                from .scope_query_transitions import query_event_bindings
+
+                return query_event_bindings(self, endpoint)
+            commands = (self._event_command(endpoint),)
+            event_point = "end" if endpoint.action == "set" else "begin"
+        else:
+            require(
+                isinstance(endpoint.call, str) and isinstance(endpoint.site, Site),
+                "query completion needs a full QuerySite identity",
+            )
+            require(endpoint.call in self.parent.program.leaves, "unknown query completion call")
+            require(
+                endpoint.site.task[0] == self.parent.program.leaves[endpoint.call].actor,
+                "query completion endpoint changed its physical actor",
+            )
+            commands = self.parent.completion.commands_for(endpoint.call, endpoint.site)
+            event_point = None
         if endpoint not in self.bindings:
             point = affine(endpoint.parent)
             selected = {}
-            for command in self.parent.completion.commands_for(endpoint.call, endpoint.site):
-                for node in self.guarded._endpoint(command, None, source=True):
+            for command in commands:
+                for node in self.guarded._endpoint(command, event_point, source=True):
                     if node is None:
                         continue
                     guard = self.guarded._point_guard(node, point)
@@ -216,17 +427,18 @@ class QueryCompletion:
             self.flow.seed(node, point, guard, bit)
         return self.origins[key]
 
-    @bounded
-    def coverage(self, source, destination, domain=POSITIVE):
+    def _check_snapshot(self):
         self.guarded._sync()
         require(
             self._version() == self.version, "parent query completion snapshot changed; rebuild"
         )
+
+    def _register(self, source, destination, domain, prepared):
         required = self._required(domain)
         sources, targets = self._bindings(source), self._bindings(destination)
         key = source, destination, domain
-        if key in self.answers:
-            return self.answers[key]
+        if key in self.answers or key in prepared:
+            return key
         self.queries += 1
         require(self.queries <= MAX_QUERY_CASES, "query completion query budget exceeded")
         cases = []
@@ -240,7 +452,10 @@ class QueryCompletion:
                 if needed is not None:
                     bit = self._origin(first, point, source_guard)
                     cases.append((last, target_point, bit, needed))
-        self.flow.propagate()
+        prepared[key] = cases
+        return key
+
+    def _complete(self, cases):
         active = coalesce(needed for _, _, _, needed in cases)
         missing = [
             failure
@@ -248,13 +463,39 @@ class QueryCompletion:
             for failure in uncovered(needed, self.flow.coverage(node, point, bit, needed))
         ]
         result = coalesce(covered for needed in active for covered in uncovered(needed, missing))
-        self.answers[key] = result
         return result
 
+    @bounded
+    def coverage_many(self, queries):
+        """Cover ordered (source, destination, domain) triples in one propagation."""
+        self._check_snapshot()
+        prepared, ordered = {}, []
+        for source, destination, domain in queries:
+            if len(ordered) % 128 == 0:
+                poll("query completion batch", queries=len(ordered))
+            ordered.append(self._register(source, destination, domain, prepared))
+        self._check_snapshot()
+        self.flow.propagate()
+        for key, cases in prepared.items():
+            self.answers[key] = self._complete(cases)
+        return [self.answers[key] for key in ordered]
+
+    @bounded
+    def covered_many(self, queries):
+        """Require every requested count for each ordered endpoint pair."""
+        queries = tuple(queries)
+        coverage = self.coverage_many(queries)
+        return [
+            required is not None and covers(required, result)
+            for (_, _, domain), result in zip(queries, coverage, strict=True)
+            for required in (self._required(domain),)
+        ]
+
+    def coverage(self, source, destination, domain=POSITIVE):
+        return self.coverage_many(((source, destination, domain),))[0]
+
     def covered(self, source, destination, domain=POSITIVE):
-        coverage = self.coverage(source, destination, domain)
-        required = self._required(domain)
-        return required is not None and covers(required, coverage)
+        return self.covered_many(((source, destination, domain),))[0]
 
     def statistics(self):
         facts = self.flow.statistics()
@@ -264,6 +505,9 @@ class QueryCompletion:
             "topology_nodes": len(self.topology.families),
             "topology_edges": self.topology.edge_count,
             "boundary_prefix_edges": self.carry_edges,
+            "cross_counter_fifo_edges": self.counter_edges,
+            "query_protocols": len(self.query_protocols),
+            "query_protocol_edges": self.query_protocol_edges,
             "queries": self.queries,
             "cases": self.cases,
             "origins": len(self.origins),

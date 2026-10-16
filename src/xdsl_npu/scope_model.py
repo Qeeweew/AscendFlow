@@ -27,6 +27,8 @@ from .ir import (
     LoopSyncOp,
     MixedOp,
     OnceOp,
+    QueryChannelOp,
+    QuerySyncOp,
     RuntimeSizeOp,
     ScopeChannelOp,
     ScopeGuardOp,
@@ -169,7 +171,7 @@ def _uniforms(operations, facts, *, allow_local=False):
     return values
 
 
-def _child_clock(call, stream, channels):
+def _child_clock(call, stream, channels, query_channels=(), query_clock=None):
     _clock(stream, "nested child")
     require(
         stream.limit is None and stream.count is not None,
@@ -189,7 +191,9 @@ def _child_clock(call, stream, channels):
         operations = stream_operations(stream)
     for op, _ in operations:
         require(
-            isinstance(op, (ViewOp, TaskOp, LoopChannelOp, LoopSyncOp, ScopeSyncOp, EndOp)),
+            isinstance(
+                op, (ViewOp, TaskOp, LoopChannelOp, LoopSyncOp, ScopeSyncOp, QuerySyncOp, EndOp)
+            ),
             f"unsupported nested child effect {op.name}",
         )
         if isinstance(op, (ViewOp, LoopSyncOp)):
@@ -209,6 +213,22 @@ def _child_clock(call, stream, channels):
             require(
                 0 <= op.position.data < stream.count.data,
                 "scope synchronization has no active inner position",
+            )
+        elif isinstance(op, QuerySyncOp):
+            require(
+                query_clock is not None
+                and op.query_generation is query_clock
+                and op.parent_generation is call.generation
+                and op.child_generation is coordinate,
+                "query synchronization uses a different query/KV/child clock",
+            )
+            require(
+                op.channel.data in query_channels and op.action.data in {"set", "wait"},
+                "query synchronization needs a declared local Set/Wait channel",
+            )
+            require(
+                0 <= op.position.data < stream.count.data and "scope_cases" not in op.attributes,
+                "query synchronization has no active child position or hides parent cases",
             )
     require(
         stream.count.data <= INT64_MAX - maximum,
@@ -249,7 +269,7 @@ def _leaf(kernel, call, stream, captures, *, case=None):
 
         child = filter_child(stream, call, case, value_mapper=values)
     for op in list(child.walk()):
-        if isinstance(op, ScopeSyncOp):
+        if isinstance(op, (ScopeSyncOp, QuerySyncOp)):
             op.parent.erase_op(op)  # Parent graph checks these actual insertions separately.
     block.add_ops([child, EndOp()])
     attrs = dict(kernel.attributes)
@@ -313,7 +333,10 @@ def extract_scopes(module):
             elif not isinstance(op, EndOp):
                 require(not entered, "mixed declarations must precede every actual actor")
                 require(
-                    isinstance(op, (RuntimeSizeOp, BufferOp, ScopeChannelOp, arith.ConstantOp))
+                    isinstance(
+                        op,
+                        (RuntimeSizeOp, BufferOp, ScopeChannelOp, QueryChannelOp, arith.ConstantOp),
+                    )
                     or type(op) in ARITHMETIC,
                     f"unsupported nested mixed root effect {op.name}",
                 )
@@ -341,6 +364,7 @@ def extract_scopes(module):
         "nested GM roots need a disjoint alias contract",
     )
     channels = {op.sym_name.data for op in declarations if isinstance(op, ScopeChannelOp)}
+    query_channels = {op.sym_name.data for op in declarations if isinstance(op, QueryChannelOp)}
     parents, leaves, bounds, invocations = {}, {}, set(), {}
     for actor, kernel in kernels.items():
         require(
@@ -364,6 +388,10 @@ def extract_scopes(module):
         if invocation is not None:
             invocations[actor] = invocation
     verify_query_domains(invocations, kernels)
+    require(
+        not query_channels or invocations,
+        "query channels require their actual serial query invocations",
+    )
     for actor, kernel in kernels.items():
         parent = parents[actor]
         invocation = invocations.get(actor)
@@ -447,6 +475,7 @@ def extract_scopes(module):
                         FixConfigOp,
                         Load3DConfigOp,
                         ScopeChannelOp,
+                        QueryChannelOp,
                         EndOp,
                         arith.ConstantOp,
                     ),
@@ -456,7 +485,7 @@ def extract_scopes(module):
             )
             if mixed:
                 require(
-                    not isinstance(op, (RuntimeSizeOp, ScopeChannelOp)),
+                    not isinstance(op, (RuntimeSizeOp, ScopeChannelOp, QueryChannelOp)),
                     "nested actor parameters/channels must be actual shared root declarations",
                 )
             if isinstance(op, (RuntimeSizeOp, CoreIdOp)):
@@ -504,7 +533,13 @@ def extract_scopes(module):
             children = [op for op in call.body.block.ops if isinstance(op, (StreamOp, OnceOp))]
             require(len(children) == 1, "call needs exactly one retained child region")
             stream = children[0]
-            _child_clock(call, stream, channels)
+            _child_clock(
+                call,
+                stream,
+                channels,
+                query_channels,
+                None if invocation is None else invocation.op.body.block.args[0],
+            )
             captures, seen, available = [], set(), actor_values | set(coordinates)
             entered = False
             for op in call.body.block.ops:

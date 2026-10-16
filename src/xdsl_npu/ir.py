@@ -256,6 +256,42 @@ class ScopeSyncOp(IRDLOperation):
 
 
 @irdl_op_definition
+class QueryChannelOp(IRDLOperation):
+    """Local event between actual native endpoints in distinct serial queries.
+
+    ``distance`` advances the query clock. Both parent positions and ``count``
+    refer independently to the KV clock; the encoded native positions refer
+    to the fixed child clock. No flattened generation replaces these axes.
+    """
+
+    name = "npu.query_channel"
+    sym_name = attr_def(StringAttr)
+    source = attr_def(StringAttr)
+    target = attr_def(StringAttr)
+    distance = attr_def(IntAttr)
+    source_parent = attr_def(DictionaryAttr)
+    target_parent = attr_def(DictionaryAttr)
+    count = attr_def(DictionaryAttr)
+    source_point = attr_def(StringAttr)
+    event_ids = attr_def(ArrayAttr[IntAttr])
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
+class QuerySyncOp(IRDLOperation):
+    """Actual local Set/Wait carrying the real query, KV and child clocks."""
+
+    name = "npu.query_sync"
+    query_generation = operand_def(IndexType)
+    parent_generation = operand_def(IndexType)
+    child_generation = operand_def(IndexType)
+    action = attr_def(StringAttr)
+    channel = attr_def(StringAttr)
+    position = attr_def(IntAttr)
+    traits = traits_def(AsyncEffects())
+
+
+@irdl_op_definition
 class ScopeGuardOp(IRDLOperation):
     """Native work selected by the retained parent's first or last generation.
 
@@ -596,6 +632,8 @@ NPU = Dialect(
         CallOp,
         ScopeChannelOp,
         ScopeSyncOp,
+        QueryChannelOp,
+        QuerySyncOp,
         ScopeGuardOp,
         ViewOp,
         StreamOp,

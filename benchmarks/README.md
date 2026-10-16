@@ -8,7 +8,7 @@
 参考构建入口使用 `xdsl_npu.build`，输入构造、分析、ASC和CANN共用≤300秒总期限。
 每个variant是单个算子构建；超时失败立即抛出，不能继续下一候选。构建结果先写
 临时目录，通过后发布；失败使成功manifest和二进制失效。复用已有库时，当前源码
-检查写入独立 `source-check/`，不覆盖待测库。新DSL完整FA仍未接通。
+检查写入独立 `source-check/`，不覆盖待测库。默认dense f16 FA现已接通，当前性能与编译成本仍未达标，见产品状态页。
 
 ## 目录与入口
 
@@ -16,7 +16,7 @@
 |---|---|
 | `compile.py`、`regions.py` | 冷进程源码→ASC 计时与静态结构压力输入 |
 | `vector/`、`gemm/`、`normalization/`、`state/` | 对应 AST 示例的固定政策验证与分析 |
-| `attention/` | 独立固定政策AscendC参考、分析与历史批次资格检查；尚无新DSL FA runner |
+| `attention/` | 新DSL FA及固定政策AscendC/ACLNN验证、分析与批次资格检查 |
 | `references/ascendc/` | 独立手写 ASC 模板，不能由生成 PlanIR 反向生成 |
 | `references/` | ASC 模板读取、固定 FA 参考参数与 ACLNN 适配器 |
 | `validation/` | 确定性输入和 CPU 数值参考，供测试与 benchmark 共用 |
@@ -25,6 +25,26 @@
 
 每个算子的参数、工作量和误差合同保留在其 runner。当前只合并重复启动、产物
 校验和共享输入/oracle，不引入通用算子注册框架；仍有重复设备执行代码待收敛。
+
+## 新DSL Flash Attention
+
+唯一数学主体在`examples/flash_attention/attention.py`。当前runner固定已验证的dense
+B1/H8/Hkv8/D128/f16政策；不会把其他constexpr当成已验变体。`--build`才编译，
+复用产物时按实际launcher ABI绑定参数并检查源/库hash。ACLNN记录其独立库身份。
+
+```bash
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run --output runs/fa --build
+PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run_policy --output runs/fa-reference --batch 1 --heads 8 --kv-heads 8 --groups 20 --dtype f16 --build
+ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run --output runs/fa --physical 6 --backend generated --cases 4096:4096 --scope sampled --warmup 5 --repeats 30
+```
+
+物理6仅为示例，运行前重新选择健康空闲卡。将`--backend`改为`aclnn`运行安装版
+基线；改为`ascendc`并加`--reference-output runs/fa-reference`运行独立手写参考。
+默认四个短域做全输出oracle；大例采样时每head每query tile检查6行并标注sampled。
+runner报告ACL stream间隔，包含host提交间隙；性能判定需msprof的device task时间。
+通用`profile.sh benchmarks.attention.run ...`和`profile_summary`均可复用，三批交替
+结果与硬件解释见[首个设备基线](../docs/attention-performance.md)。旧`attention/compare.py`
+保留历史记录schema；当前三后端profile原始证据及聚合脚本位于该基线列出的外层runs。
 
 ## 无设备验证
 

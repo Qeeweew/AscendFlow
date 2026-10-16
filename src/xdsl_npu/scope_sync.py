@@ -8,7 +8,7 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from .budget import bounded, poll
 from .child_completion import ChildPort, project_fixed_child
-from .ir import LoopChannelOp, ScopeChannelOp, ScopeSyncOp, TaskOp
+from .ir import LoopChannelOp, QueryChannelOp, QuerySyncOp, ScopeChannelOp, ScopeSyncOp, TaskOp
 from .loop_graph import Command
 from .loop_sync import _lifetime, _plan_leaf, _requirements
 from .model import require
@@ -50,6 +50,8 @@ class CheckedScopes:
     analyses: dict
     access: object
     channels: dict[str, ScopeProtocol]
+    query_summary: object | None = None
+    query_report: dict | None = None
 
 
 def _ints(values):
@@ -62,7 +64,15 @@ def _point(site, point):
 
 class ParentCompletion:
     def __init__(
-        self, program, analyses, access, period, *, resource_inputs=None, extra_protocols=()
+        self,
+        program,
+        analyses,
+        access,
+        period,
+        *,
+        resource_inputs=None,
+        extra_protocols=(),
+        boundary_sites=(),
     ):
         self.program, self.access = program, access
         self.events, self.protocols = {}, []
@@ -113,6 +123,19 @@ class ParentCompletion:
             )
         for (uid, site), points in selected:
             marks[uid].update(_point(site, point) for point in points)
+        for uid, site in boundary_sites:
+            require(uid in program.leaves, "query boundary names an unknown actual call")
+            leaf = program.leaves[uid]
+            require(
+                site.region == uid
+                and site.task[0] == leaf.actor
+                and not site.channel
+                and not site.action
+                and site.task[1]
+                in {task.uid for data in leaf.loop.actors.values() for task in data.program.tasks},
+                "query boundary needs an actual native in its original call and actor",
+            )
+            marks[uid].add(site)
         self.resource_pairs = []
         for uid in analyses:
             poll("child event resource projection")
@@ -572,6 +595,7 @@ def _scope_access(program):
         access = replace(
             access,
             obligations=plan.dependencies,
+            lifetime_boundaries=plan.boundaries,
             lifetime_report={
                 "reordered_roots": list(plan.reordered_roots),
                 "retained_logical_roots": dict(plan.fallbacks),
@@ -639,6 +663,8 @@ def _install(program, access, protocols):
     first = (
         next(iter(program.kernels.values()))
         if len(program.kernels) > 1
+        else next(iter(program.invocations.values())).op
+        if program.invocations
         else next(iter(program.parents.values()))
     )
     for p in protocols:
@@ -801,16 +827,20 @@ def autosync_scopes(module, *, _capture=None):
     result = module.clone()
     require(
         not any(
-            isinstance(op, (ScopeChannelOp, ScopeSyncOp, LoopChannelOp)) for op in result.walk()
+            isinstance(
+                op, (ScopeChannelOp, ScopeSyncOp, QueryChannelOp, QuerySyncOp, LoopChannelOp)
+            )
+            for op in result.walk()
         ),
         "nested AutoSync requires unsynchronized physical calls",
     )
     program = extract_scopes(result)
-    require(
-        not program.invocations,
-        "nested serial invocations need cross-query memory and event lifetime synchronization",
-    )
     _plan_scope_parent(program)
+    if program.invocations:
+        from .scope_query_planning import plan_query_memory
+
+        _, checked, parent = _verify_scope_parent(extract_scopes(result))
+        plan_query_memory(checked, parent)
     return _finish(result, _capture=_capture)
 
 
@@ -1066,6 +1096,11 @@ def _read_protocols(program, access, analyses):
                     )
                 else:
                     pending.append(op)
+            elif isinstance(op, QuerySyncOp):
+                # The query protocol reader checks the joint instruction
+                # order. Retain the original parent placement while rebuilding
+                # the invocation-only proof; query effects enter its adapter.
+                pass
             else:
                 # The child projection retains every local synchronization.
                 # A parent acquire is immediately before its native; a Set
@@ -1092,11 +1127,17 @@ def _read_protocols(program, access, analyses):
 @bounded
 def verify_scopes(module, *, _details=False):
     program = extract_scopes(module)
-    require(
-        not program.invocations,
-        "nested serial invocations need cross-query memory and event lifetime synchronization",
-    )
-    report, checked, _ = _verify_scope_parent(program)
+    report, checked, parent = _verify_scope_parent(program)
+    if program.invocations:
+        from .scope_query_verification import verify_query_invocations
+
+        query_report = verify_query_invocations(checked, parent)
+        checked = replace(checked, query_report=query_report)
+        report.update(
+            cross_query_verified=True,
+            verification="actual child, parent and serial query memory/event/progress proofs",
+            query_verification=query_report,
+        )
     return (report, checked) if _details else report
 
 
@@ -1109,7 +1150,37 @@ def _verify_scope_parent(program):
     reports, analyses = _analyses(program)
     channels, banks = _read_protocols(program, access, analyses)
     period = _scope_period(access, channels.values())
-    proof = ParentCompletion(program, analyses, access, period, extra_protocols=channels.values())
+    query_summary, boundary_sites = None, ()
+    if program.invocations:
+        from .scope_query_protocols import read_query_protocols
+        from .scope_query_summary import query_native_sites, summarize_queries
+
+        query_summary = summarize_queries(program, access)
+        boundary_sites = query_native_sites(query_summary, access)
+        boundary_sites += tuple(
+            (endpoint.call, _point(endpoint.site, point))
+            for protocol in read_query_protocols(program, access)
+            for endpoint in (protocol.source, protocol.target)
+            for point in (
+                "end",
+                "prefix",
+                "begin",
+                "issue",
+                "queue",
+                "retire",
+                "admit_issue",
+                "admit_queue",
+                "after_queue",
+            )
+        )
+    proof = ParentCompletion(
+        program,
+        analyses,
+        access,
+        period,
+        extra_protocols=channels.values(),
+        boundary_sites=boundary_sites,
+    )
     for channel in channels.values():
         proof.insert(channel)
     potential = proof.graph.potential()
@@ -1170,5 +1241,6 @@ def _verify_scope_parent(program):
             "cross-query memory and event lifetimes remain unverified"
         )
         report["cross_query_verified"] = False
-    checked = CheckedScopes(program, analyses, access, channels)
+        report["query_memory_summary"] = query_summary.statistics
+    checked = CheckedScopes(program, analyses, access, channels, query_summary)
     return report, checked, proof

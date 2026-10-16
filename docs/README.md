@@ -15,9 +15,10 @@
 [算子示例](../examples/README.md)与[验证工具](../benchmarks/README.md)分别给源码和
 复现入口。设计模板不作为可运行示例；历史证据不自动适用于新 AST 路径。
 
-## FA 目标与对照
+## FA 实现与对照
 
-- [目标数学、存储与政策](attention-target.md)，[未实现源码规格](design/attention_target.py.in)。
+- [已实现数学、存储与验证范围](attention-target.md)，[DSL 算子源码](../examples/flash_attention/attention.py)。
+- [新DSL与AscendC/ACLNN的4K设备基线](attention-performance.md)。
 - [独立 AscendC 的合同和测量](attention-reference.md)。
 - [legacy FA 的变体与性能](flash-attention.md)。
 

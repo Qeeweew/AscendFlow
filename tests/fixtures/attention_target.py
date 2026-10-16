@@ -1,46 +1,58 @@
-"""P0 design fixture: complete FA target source, deliberately not yet executable.
+"""The supported nested example and its unsupported continuous design policy.
 
-No finite builder or legacy fallback is called. Both organizations use the same
-mathematical body; only their retained device control differs. compile() currently
-rejects missing frontend/lowering capabilities. See docs/attention-target.md.
+The sole mathematical body belongs to examples.flash_attention.attention.
+Continuous control is derived by changing only the two outer loop headers;
+its runtime-cycle first/last predicates remain unsupported by lowering.
 """
 
-import textwrap
+import ast
 from pathlib import Path
 
+from examples.flash_attention.attention import NEG_INF
+from examples.flash_attention.attention import attention_target as _attention_target
 from xdsl_npu import language as N
-
-POLICY = '{"cube": ("qk", "pv"), "vector": ("update", "softmax")}'
 
 
 def target_source(*, continuous=False):
     if type(continuous) is not bool:
         raise ValueError("continuous must be an explicit boolean policy")
-    template = (
-        Path(__file__).resolve().parents[2] / "docs" / "design" / "attention_target.py.in"
-    ).read_text()
-    before, body = template.split("        @TASK_LOOP@\n")
-    body = textwrap.dedent(body)
-    if continuous:
-        header = (
-            f"        for task in N.Pipelined(local_queries * kv_tiles, stages=3, issue_order={POLICY}):\n"
-            "            query = task // kv_tiles\n"
-            "            kv = task % kv_tiles\n"
-        )
-        return before + header + textwrap.indent(body, " " * 12)
-    header = (
-        "        for query in N.serial(local_queries):\n"
-        f"            for kv in N.Pipelined(kv_tiles, stages=3, issue_order={POLICY}):\n"
-        "                task = query * kv_tiles + kv\n"
-    )
-    return before + header + textwrap.indent(body, " " * 16)
+    if not continuous:
+        return _attention_target.source
+    module = ast.parse(_attention_target.source)
+    function = module.body[0]
+    kernel = function.body[0]
+    for index, query in enumerate(kernel.body):
+        if (
+            isinstance(query, ast.For)
+            and isinstance(query.iter, ast.Call)
+            and isinstance(query.iter.func, ast.Attribute)
+            and query.iter.func.attr == "serial"
+        ):
+            if len(query.body) != 1 or not isinstance(query.body[0], ast.For):
+                raise ValueError("continuous fixture needs the example's actual query/KV loops")
+            kv = query.body[0]
+            expected = ast.parse("task = query * kv_tiles + kv").body[0]
+            if ast.dump(kv.body[0], include_attributes=False) != ast.dump(
+                expected, include_attributes=False
+            ):
+                raise ValueError("continuous fixture needs the example's actual task ordinal")
+            kv.target = ast.Name(id="task", ctx=ast.Store())
+            kv.iter.args[0] = ast.parse("local_queries * kv_tiles", mode="eval").body
+            kv.body = ast.parse("query = task // kv_tiles\nkv = task % kv_tiles").body + kv.body[1:]
+            kernel.body[index] = kv
+            return ast.unparse(ast.fix_missing_locations(module)) + "\n"
+    raise ValueError("continuous fixture needs the example's actual serial query loop")
 
 
 def attention_target(*, continuous=False):
+    if type(continuous) is not bool:
+        raise ValueError("continuous must be an explicit boolean policy")
+    if not continuous:
+        return _attention_target
     return N.from_source(
-        target_source(continuous=continuous),
-        constants={"NEG_INF": float("-inf")},
-        filename=f"<attention-target:{'continuous' if continuous else 'nested'}>",
+        target_source(continuous=True),
+        constants={"NEG_INF": NEG_INF},
+        filename="<attention-target:continuous>",
         disjoint_external=True,
     )
 
@@ -90,7 +102,11 @@ def main():
         source = target_source(continuous=mode)
         (args.output / f"{name}.dsl.py").write_text(source)
         records[name] = {
-            "status": "design fixture; frontend/physical lowering incomplete",
+            "status": (
+                "unsupported continuous runtime-cycle predicates"
+                if mode
+                else "supported nested example; device validation is limited to documented f16 cases"
+            ),
             "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
             "two_queries_three_kv": activation_trace(2, 3, continuous=mode),
         }

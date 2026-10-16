@@ -1,251 +1,82 @@
-# 重整计划：统一 DSL 到设备的完整编译链
+# 下一阶段：编译成本、向量路径与 Attention 变体
 
-2026-10-15。以[实际状态](refactor-progress.md)和用户最新要求为准，取代此前
-“继续优化 legacy FA”与“先取消首尾窗口”的安排。当前已完成旧公开API删除、输入minimum/multiple合同、局部查询域拓扑共享
-和通用构建期限；随后接通runtime轴SSA、商余寻址和cyclic局部ownership。
-实际测试与编译结果见状态页。以下保留整个重构的目标和退出
-条件；直接固定child的nested CV、stationary私有L0C复用和parent native首末
-条件已有设备闭环。原nested FA的query/KV/child物理lowering现已接通，跨query
-同步仍明确拒绝，完整FA仍未完成。
+2026-10-16。当前完整 dense f16 FA 已通过公开 DSL、真实同步IR、CANN 和设备数值验证。
+已完成和限制以[状态页](refactor-progress.md)为准。算子主体在 examples，编译器只增加通用语义。
+旧 `cube.task/vector.task`、legacy builder 和兼容路径不恢复。
 
-## 目标、边界与次序
+## 1. 先降低真实编译成本
 
-只保留一套面向用户的 TileLang 风格 AST DSL：tensor/view、显式存储、
-`serial/Pipelined/Stage`、`Cube/Vector` 和 typed 运算。用户表达多阶段流水及
-必要的派发政策，编译器负责物理访问、异步完成、buffer 退休与事件资源。
-不同执行引擎的局部流水和 CV 流水使用同一套可组合的语义。
+本次完整FA源码到ASC为169.10秒，其中规划111.71秒、最终独立检查54.51秒。
+这不是Python按Sq/Sk展开：运行时长度仍为SSA变量，72个native模板、12个call固定。
+主要成本来自父子投影、条件完成事实与规划期间重复建立parent proof。
 
-**不要求 DSL 向后兼容。** 直接删除 `cube.task/vector.task` 类用户入口、
-legacy tracer 和对应兼容路径，不提供 alias、弃用壳或 fallback。物理 TaskOp
-是编译器内部表示，可以保留；这不是继续支持旧 DSL。
+下一步按以下顺序修改，逐项保留同步指令、物理访问和buffer布局等价证据：
 
-工作顺序是：入口与合同收敛 → runtime 访问/控制与一般 CV 组合 → 完整 DSL FA
-→ 同主体连续流水与变体 → 多算子性能。event 表示、真实成本计数和测试整理
-从第一阶段并行跟进，不能留到最后；也不要求先建成庞大通用求解器才能接 FA。
-每步都交付实际源码、前后 IR、ASC 和相应验证，不以增加设计 fixture 代替实现。
+1. 让规划阶段交还已经建立的访问/leaf/协议结果，避免为了进入query层完整执行一遍
+   `_verify_scope_parent`。最终verifier仍从实际IR独立重建，规划缓存不作安全凭据。
+2. 合并同次分析中完全相同的静态工作：本次boundary transfer已由4503个cells共享667个
+   唯一effect序列；继续检查projection及condition事实表示，不跨不同domain合并路径。
+3. 按源/目标实际端点批量登记查询，不逐byte传播；每次真正插入协议后才更新完成关系。
+   不做“删一个同步→重跑全验证”的必要性搜索，不提高预算，不用C++重写掩盖算法规模。
+4. 稳定后做五个独立冷进程，从源码读取到最终验证/ASC计时，import/CANN/写盘另列。
+   常用kernel目标p50≤1秒/max≤2秒，完整FA目标p50≤5秒/max≤10秒。
 
-## 1. 删除旧入口，建立可验收的新入口（本轮已实施）
+所有算子构建仍用统一≤300秒硬期限覆盖构造、分析、ASC及CANN。超时停止整个候选序列。
 
-- 移除顶层 `xdsl_npu.Kernel` 和公开 `xdsl_npu.builder.Kernel`；生产 lowering
-  仍使用的最小 physical 构造器改为内部模块，不留下同名兼容导入。
-- 删除 `language.trace_func`、执行设备 Python 体的 tracer、隐式版本分配和
-  隐式 L0 的旧 `gemm` 语法。保留新 AST 的 `language.Kernel`、
-  `Cube/Vector/Stage/Pipelined` 及共用 typed 构造能力；不能按名字机械删除
-  当前前端也在使用的 `_Trace` 上下文或 `_matmul` 实现。
-- 旧 examples/runner 退出产品入口。测试按目的迁移：硬件与同步负例迁到
-  内部物理 fixture，用户语法测试改为 AST，只测试旧兼容行为的用例删除。
-  独立 AscendC、数学 oracle 和有界解释器保留，不依赖旧 FA builder。
-- 删除旧 attention suite 前，先把其全链300秒 watchdog、子进程清理和失败
-  即停止逻辑提取到通用构建入口并迁移回归，不能在清理期间失去总期限保护。
-- 本轮之前未提交的六个 block-sum 文件先明确保存其 diff/证据，再处理删除。
-  不为保留这个实验延续旧 FA，也不覆盖用户工作。
+## 2. 以源码和profiling解释性能差距，再改Vector政策
 
-验收：安装包只有新用户语言入口；旧 import/语法不再可用；正常 AST 示例继续
-走公共 `compile()`；关键 RAW/WAR/WAW、错误代次、event 配对与双 AIV 负例未丢。
-旧 FA 不再能运行不是回归，不以绕行内部 builder 的“新 example”替代迁移。
+起点固定B1/H8/Hkv8/Sq=Sk4096/D128/f16。必须保留实际DSL/IR/ASC/库hash、CANN选项、
+设备及输入、计时与缓存口径，三批generated/独立AscendC/ACLNN交替profiling。
+初测stream间隔约1143/1195/516µs，不用它替代device task时间或宣称无性能损失。
 
-## 2. 完成 runtime 输入、索引、控制和存储合同
+源码依据为ops-transformer `4bbfb3b2bccceb2a1b80828d04eee915169a2b2e` 的arch22，
+不是950路径或安装版ACLNN的已知构建提交。已确认的差异包括：
 
-先接通真实 FA 需要的有限语言子集，同时用 GEMM、向量尾块和递推状态反例检验：
+- 当前显式R64→packed merge/BRCB/8行输出更新；上游SoftmaxFlashV2历史量每行8份，
+  D128 Vec2按64行、直接Div。先检查Vector活动与生成指令，按UB容量和真实读写寿命选块。
+- 当前AIV update→softmax、serial query；上游Vec1→Vec2、taskId跨query连续。
+  派发尾部不等于硬件drain，需时间线判定重叠损失。
+- 当前Score/P/PV分离、O驻UB；上游f16 ND可复用Score/P地址并把中间O写回GM。
+  不能未经访问/ownership证明照搬alias，也不能靠额外搬运换取正确性。
 
-| 层 | 具体实现 | 必须拒绝或检测 |
+每次只做一个有测量依据的政策/通用变换。FP32 sum树可调整，按误差合同验收；
+P/O舍入边界及递推状态更新顺序仍须保留。不得按算子名、shape或生成字符串特判。
+对比硬件时用真实核数/频率、Cube工作、Vector活动、存储容量及L2工作集；
+条件峰值/理想下界单列，pipe活动不能相加，GM请求量不是实测HBM流量。
+超过ACLNN 5%仍为失败/继续调查线；三批波动交叠则记未决。
+
+## 3. 继续完善通用同步与ASC表达
+
+- 已接通query内存/已有parent-child事件/跨核counter强边界反馈。新query协议当前仅local；
+  条件缺乏反馈、bank满、动态别名或ownership无法证明时明确拒绝。
+- 下一步处理合法但资源不足的跨query复用：现有mixed recurrence在MTE1→MTE2 bank用满后拒绝。
+  先证明通知寿命的可共享区间或连续ordinal，再改分配；不添全局barrier、buffer或drain。
+- 专家排步和自动生成继续共用实际IR verifier。逻辑RAW、物理alias、异步完成、最后reader、
+  event消费及退休分别保留；Scope/Query/child三种同步在实际native旁统一按IR顺序检查和输出。
+- 通用纯整数canonicalize/CSE已接入；query短count case现按端点等价证明合并，FA新增ID为常量6。
+  仍有capture `/1`等表达冗余，后续在公共表达式IR/范围规则处理，不改ASC字符串。
+- 统一编译产物的结构化ABI元数据，避免launcher物理参数顺序与DSL形式参数不同导致调用者猜测。
+
+## 4. Attention变体按真实合同逐项接入
+
+| 顺序 | 范围 | 验收 |
 |---|---|---|
-| 输入/ABI | shape、stride、dtype、正值/非负、整除、参数顺序、workspace 与 external alias 前提进入 IR/launcher | 溢出、容量不足、违反可检查合同；不可证动态 ownership |
-| 索引/descriptor | 保留 BNSD 维度结构、head/group 映射、受限 runtime 乘积与 divmod 的来源/范围 | 不能通过任意字符串放行非线性表达式；零除数和越界明确诊断 |
-| 控制与时钟 | query/task/child 分开，Stage 位移整个 descriptor；uniform first/last、零次和短循环有实际激活域 | 不执行 Python 循环展开 runtime N；metadata 读取不能作为纯标量复制 |
-| 访问/布局 | root、subview、有效域、native 实际 footprint、recast、布局转换与 padding 全部保留 | 不同 tensor 名字不证明不别名；mask 不能缩小真实 DMA footprint |
-| 存储生命周期 | 区分环槽、跨 query 状态、只读共享和 fresh frame；按真实最后 reader 复用 | 不把 child 退出或某个 consumer 完成当作全部访问退休 |
+| A | 默认dense f16，当前已通 | 保留已测四个短域与4K；先解决编译和性能差距 |
+| B | bf16、GQA/MQA、cross attention | 正确head映射、共享KV只读、相同二进制多长度；各自CANN/数值/性能 |
+| C | 同主体continuous | runtime-cycle首末、跨query状态、未触slot和全部Wait消费；不能伪装成parent首末 |
+| D | causal/offset、tails、decode | 有效域、全mask行、padding真实DMA footprint、低并行度政策 |
+| E | varlen/paged/sparse/persistent/split-KV | metadata epoch、间接范围、任务generation/ownership及跨kernel归并 |
 
-运行长度不成为 constexpr；tile/layout/dtype/静态政策可特化。先支持带明确前提
-的直接访问，再扩展间接访问；不提前建设任意非线性整数求解器。
-各 group 的任务数不等、部分 group 零工作从首个 FA 闭环就要支持；256个
-query tile 分给20组已经产生12/13差异，不能追加长度整除组数的限制来回避。
+默认固定政策四个点已验证不等于所有constexpr/变体都支持。示例仅放一份数学主体；
+未实现政策留测试/设计合同，不复制一堆不可运行example。
+继续用GEMM、向量归约/normalization、RoPE/MoE、动态GMM/量化FFN和GDN检验抽象，
+不能为统一模型改变它们的有序状态或数值合同。
 
-## 3. 一般多阶段 CV 与同步组合
+## 交付门槛
 
-复用现有 `native_order` 和已接通的符号完成表示，延伸到真实 nested mixed/CV。
-已有首尾窗口已经取消，不重新实施；也不引入 FA 专用同步器。
+每个阶段交付实际补丁、针对性反例、可复现命令及明确支持/拒绝范围。常规pytest不反复长编译FA；
+完整FA由一次总期限受控的纵向构建和设备证据验收。同步关系用独立有限图交叉检查，
+有限规模结果不冒充任意程序证明。只有结果绑定当前代码/IR/ASC/库才算本阶段证据。
 
-固定的分析职责依次为：
-
-1. 从实际物理访问提取 RAW/WAR/WAW、generation 和 ownership 义务。
-2. 用同流水真实契约与已选协议扣除已覆盖关系，直接确定必要同步。
-3. 分开验证 ready、最后读取/release、event 消费/复用和最终 drain。
-4. 分配有限硬件资源，物化同步；最终从实际 IR 独立检查内存、事件和进展。
-
-父子关系保留 actor/clock/guard 和暴露的完成边界；共享不可变拓扑与必要边界，
-不为每个源、查询域复制整张图，不把所有 actor 强行排成一条串行时钟。
-现已接入AST词法scope和fixed child完成投影，local sequence实际使用同一投影，
-固定行步长列切片及其跨child访问frontier也已进入最终检查。以下下一步必须
-在已有实现上扩展，不能再写一套脱离lowering的summary原型。直接固定child的
-真实callsite、祖先地址别名、父Stage/issue policy及双AIV端点组合已经接线。
-这一真实路径已完成最终IR破坏检查、CANN与多长度设备闭环，两个反例的进度为：
-
-- `nested_copy`已按实际跨父调用寿命选择child宽度，并通过parent ready/release
-  池共享满足8个ID的硬件容量；保持原buffer与排步，设备闭环通过。更一般的
-  parent epoch轮转仍未支持，单通知child缺消费路径时明确拒绝。
-- 共享L0C已建立逻辑定义/read配对与RW recurrence，再选择独立定义的物理
-  占用次序，生成相邻定义的WAW与全部最后reader的WAR。不能将所有访问按issue
-  重排。`QK(t+1)→PV(t)`有负逻辑代次差；同步epoch与实际访问generation必须
-  分开表示。同步IR现在保存来源epoch的count与首末激活域，最终检查按实际IR
-  重建；`n=1`、启动及最终PV连续占用已通过独立实际IR模型与设备。该支持
-  限定stationary私有root；条件执行的root另外按实际case重建访问义务，不直接
-  套用fresh-definition重排。
-- native first/last已经从源条件接到实际固定child中的初始化、递推和末次导出。
-  分析使用N=1、first、middle、last四个互斥域，实际IR/ASC保留一份native模板。
-  首次写入到所有reader、所有reader到末次覆盖均需全域完成关系，不能只检查
-  相邻代次；父event激活域还必须落在实际native存在域内。fixed local row
-  frame支持以固定次数、统一正stride、frame内访问与allocation边界为前提。
-  这一能力不接纳runtime余数周期、parent条件ring或缺少复用证明的event宽度调整。
-
-主线是**原nested FA的serial query → runtime KV → fixed child**，不改target
-主体、不展开query，也不把parent首尾条件改成child末次。实际source/物理抽取已
-接通，保留72个native模板、12个call和20组AIC/双AIV的三个独立时钟。当前公共
-编译明确拒绝跨query同步，不能把结构/地址检查当作完整同步验证。
-
-1. **已接物理IR：**query、KV、child三个真实SSA时钟，Stage只位移KV；query与
-   原BNSD地址进入Capture。没有套用旧连续Frame，也尚未启用该结构的ASC。
-2. **已接域和地址边界：**query使用既有cyclic count，检查同group的AIC/双AIV有相同
-   `ceildiv(max(0,total_queries-group),groups)`域；覆盖12/13次与零工作owner。
-   KV保持uniform runtime bound，三块GM双槽和local状态跨query复用同一root。
-   这些域不自动证明GM写入不别名；最终ownership仍须进入同步分析。
-3. **地址分类已接线，跨query证明未完成：**实际全root effects区分只读Q/K/V、
-   O的cyclic query frame、stationary私有状态与Score/P/PV/alpha的全局epoch环。
-   原Capture和buffer不变；归一化只供单query访问分析，相位
-   `(query*kv_tiles)%2`作为真实合同保留。小型mixed recurrence和原FA均通过
-   单query规划与复核。通过批量登记真实候选/资源查询消除了本次2M工作量失败，
-   没有提高上限；原FA该阶段仍需约85秒，尚未达到编译耗时目标。
-4. **跨query下一步：**从实际字节frontier保留首次覆盖、全部最后reader、旧Wait
-   消费和未触字节的identity transfer。KV=1两槽环会隔两个query复用；证明范围
-   按静态槽周期确定，不按query数量展开。仅首KV写入的cache需完整reader span。
-   在同一ParentCompletion投影实际边界端点，再验证/生成所缺的memory与event
-   协议；adapter不能替代协议物化、有限资源、双AIV参与或进展检查。不插query drain。
-5. 同结构mixed递推已经通过source顺序数值/地址及实际物理IR时钟负测；下一步
-   补跨query的独立有限同步模型→ASC/CANN→设备
-   闭环，覆盖query=0/1/2/3和KV=1/2/3、漏一方AIV及错clock/root；随后用原FA
-   source验证下一具体阻塞。小反例不代替FA数值或性能验收。
-
-continuous版本的`task % kv_tiles`另需runtime周期边界和跨query重叠合同，不能
-借用当前四个parent case放行。保留共享L0C的原容量和source政策。
-`test_definition_lifetimes.py`固定独立逻辑合同，`test_scope_shared_l0c_model.py`
-检查当前编译结果；二者不替代完整FA数值与性能验收。
-双 AIV 的完整贡献、MTE2 import 的早 release、FIX 与共享 L0C 冲突都要表达。
-源码控制退出不插入 child drain；不以增加 buffer、搬运或 barrier 接通。
-先核实每个 native 的读退休、写完成和配置资源合同；当前主要使用 task end，
-不能把未来包含多个 native 的 recipe 合成一个不透明 completion。只有硬件
-依据允许时才区分更早的读退休，不能凭 SSA use-def 推定异步完成。
-
-关键反例优先于长算子测试：最后 reader 后仍有无关计算、两个 reader、Set 后
-继续工作、奇偶条件路径、零次 child、跨 query 新 QK 先于旧 PV、只有一方 AIV
-到达、旧 Wait 尚未消费就再次 Set。超出当前证明能力和真实资源冲突分别诊断。
-
-退出条件：完整 dense FA 的 nested 多级流水可编译、离线构建并通过小例设备
-检查；最终 ASC 保留 QK/PV 的子流水与 Vector 行块循环。失败时停在具体合同
-反例上修正公共表示，不再退回 legacy FA 做性能优化。
-
-## 4. event ID：先正确表示与分配，再通用化简
-
-现有分段周期编码及 xDSL `canonicalize → cse → canonicalize` 保留作为已有
-能力，不能重复宣称待接入。后续分三层解决：
-
-- **资源层**：把本地 channel、跨 region 活跃 event、入口 SPR 配置同步与收尾
-  都纳入可审查资源清单。局部二值事件和跨核计数通知保持真实硬件契约。
-- **分配层**：在实际通知寿命上证明旧 Wait 已消费后才能复用；规则环直接产生
-  常量、rotation 或有界条件分段表达。覆盖跨 channel/region 可共享与真实并发
-  超容量反例，不先枚举输入长度张表再压缩，不承诺任意程序全局最优着色。
-- **表达层**：对纯整数 IR 做通用 canonicalize/CSE；需要时增加有范围/同余
-  前提的通用规则。处理 guard 与 ordinal 时显式保持源 generation，不做 ASC
-  字符串替换或某个 FA 表的特判，不移动异步 effects。
-
-验收同时检查实际 Set/Wait ID、bank、代次、资源寿命和标量表达成本。已有有限
-表可作小域差分 oracle，不能继续扩成产品主路径。源码短不等于等待范围更小，
-也不等于 Scalar 性能已改善。
-
-## 5. 编译耗时：按当前结构修，不归咎于 Python
-
-runtime N 不参与静态规模。需要分别计量静态任务 T、访问片段 A、节点 V/边 E、
-查询域 D、各节点条件事实 F、环周期与层次深度：
-
-- 改动前每查询域复制拓扑带来约 `D*(V+E)` 建图成本；本轮已共用一份
-  `V+E`拓扑，各域事实仍独立，传播与事实成本没有消失。
-- `_remember` 对既有事实做包含扫描，单节点累计插入有 `F²` 风险；这是源码
-  上界风险，必须用结构曲线核实，不能冒充已测渐近结论。
-- 按 root 的周期/区间切分、父子组合及规划内部重复检查另计；最终独立 verifier
-  保留。正常 `compile()` 已把最终 analysis 交给 emitter，不能再误报它重复验证。
-
-本轮已补叶层真实domain/拓扑/条件片段/比较/更新/传播计数并共享拓扑；下一步
-规范化条件集合、减少同一次规划重复提取，补父层同口径计数。优化需同时证明未扩大
-等待范围或改变存储政策。缓存、C++ 重写和并行编译不作为结构失控的补救。
-
-验收包括同 binary 多长度、独立区域成本、模板/深度/周期分别增长；定向用例
-稳定后五冷进程测源码→ASC，import、CANN、写盘和 launch 分列。既有目标为常用
-内核 p50≤1s/max≤2s、完整 FA p50≤5s/max≤10s，当前未达成完整 FA 验收。
-全链单次构建硬上限为300秒，到时停止整个候选序列；第1步已要求先将旧 suite
-的 watchdog 提取为通用入口，此处验收各入口确实共用总 deadline，避免 Python
-与 CANN 各自另有一段预算。
-
-## 6. FA 接入和变体矩阵
-
-算子在 `examples/flash_attention/`；完整数学主体包含 QK、online softmax、P
-舍入、PV、O 更新与归一化。head mapping/mask/状态更新由 example 表达，编译器
-不按算子名/shape 生成隐藏任务。FP32 sum 树允许调整，按误差合同验收，不要求
-位级一致；其他状态更新和舍入边界不能悄悄改变。
-
-| 阶段 | 变体/政策 | 新增合同与验收 |
-|---|---|---|
-| FA-A | 完整 tile dense MHA，先f16再bf16 | runtime Sq/Sk、group不等长/零工作；嵌套 QK/PV/Vector、三个 GM 环、双 AIV；源码→设备完整链 |
-| FA-B | 同主体 continuous、GQA/MQA、cross attention | runtime task divmod、跨 query 状态、共享 KV/head 映射 |
-| FA-C | causal/offset、tails、decode | 有效域、全 mask 行、padding 初始化、空 owner；decode 低并行度政策独立记录 |
-| FA-D | varlen、paged KV、sparse | segment/metadata epoch、间接范围、页/块有效性、真实任务 generation 与 ownership |
-| FA-E | persistent、split-KV | 任务领取与状态生命周期；跨核或多 kernel partial 合并、launch/global phase 合同 |
-
-decode/persistent 是调度维度，不能写成某个新函数存在就自动支持所有mask/dtype。
-每个组合标注 frontend/lowering/sync/CANN/数值/性能状态；不一次复制一堆变体
-文件，也不在未接通前把失败 fixture 改名为可运行 example。
-
-## 7. 多算子性能：通用优化与明确政策
-
-从完整 DSL 路径做性能归因，并持续覆盖 Vector 搬运/elementwise/归约/normalization、
-GEMM/量化 FFN、RoPE/gather/scatter/MoE、动态 grouped matmul、GDN 递推状态，
-以及 attention。后三类的间接访问/动态 ownership/有序状态需各自落实，不能
-为了统一抽象改写算法。
-
-每项性能工作先给最终 ASC 与源码专家实现差异，再做一次有假设的改动：
-搬运与布局、buffer 复用、向量指令组织、流水重叠、分组负载。可调政策写在
-example 的少量明确参数中；编译器新增优化必须按通用语义/硬件条件匹配，并有
-FA 之外的实例或反例。禁止 shape→答案表、按名字特判和无界参数扫描。
-
-固定大规模起点：MHA B1/H8/Hkv8/Sq=Sk4096/D128/f16，GQA
-B1/H8/Hkv2/Sq=Sk8192/D64/bf16；接通后加入 H32/D128、cross4K×8K、
-MQA 和 decode32K。Vector/GEMM/状态沿用已有大例，不为漂亮数字缩小规模。
-分别记录热缓存与工作集超过 L2 的条件，不能仅凭 N 大就宣称测得 HBM 带宽。
-
-对照必须包含生成 ASC、独立 AscendC、ops-transformer 等参考源码及安装 ACLNN、
-profiling。相同 policy 的手写参考用于定位编译器损失，专家最佳 policy 用于
-定位算法/调度差距；二者不同就明确记录。三批交替、warmup≥5/repeats≥30，
-报告设备 kernel p50/p90 与批间波动；host stream interval 另列。
-
-用核数/频率、Cube 工作、Vector 指令/数据量、UB/L1/L0 容量、L2 工作集及实测
-pipe 活动定位瓶颈。条件峰值和理想下界单列；pipe 活动不能相加为总延迟，GM
-请求字节不是实测 HBM 流量。超过 ACLNN 5% 是继续调查线，不是自动允许损失；
-噪声覆盖写未决，未通过写失败。
-
-## 8. 测试、工具与协作交付
-
-测试按合同 → 同步关系/实际 IR 破坏 → 独立小域模型 → ASC/CANN → 设备分层。
-移除旧接口兼容测试的同时，逐项保留仍有效的语义反例；有限模型不冒充任意
-规模证明。常规修改先跑受影响层，集成稳定后才跑一次必要广泛回归。
-
-统一产物身份：DSL 源码、编译器版本、IR、ASC、ABI/数值/ownership 合同、CANN
-选项和库 hash；性能记录绑定同一产物及 shape/dtype/设备/输入/计时口径。
-examples 只留可运行算法，测试 fixture 和设计模板不混入；运行材料留外层 runs。
-
-多 Agent 按工作区 AGENTS.md 执行：`gpt-6.1-sol / max`，主 Agent 管公共接口
-和集成，子 Agent 负责边界清楚的编码/反例/测试；一文件一写入者。设备工作
-单一负责人排队，冷编译测量不与其他 CPU 压力任务混跑，不让每个 Agent 各跑
-一遍全量测试。每个交付报告真实支持范围、命令、证据和剩余缺口。
-
-旧API删除和关键反例迁移已完成；runtime输入标量与原始轴SSA、BNSD商余及cyclic
-局部任务和普通f32 `fill(±inf)`已接通。下一步保留这些合同，接一般nested CV及
-跨query状态，处理first/last初始化与父子完成边界。完整FA必须沿同一路径
-通过同步与设备验收，不继续扩展内部有限测试路径或恢复旧FA性能搜索。
+多Agent继续按根AGENTS.md一文件一写入者；主Agent审查接口/集成并独占排队设备任务。
+冷编译期间不并发CPU压力任务；不安装、打包、推送或发布作为验收替代。

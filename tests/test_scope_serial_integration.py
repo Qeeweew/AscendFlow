@@ -16,11 +16,16 @@ from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.sync import autosync, verify_plan
 
 
-@pytest.fixture(scope="module", params=["recurrence", "attention"])
-def physical(request):
-    source = scoped_query_recurrence if request.param == "recurrence" else attention_target()
+@pytest.fixture(scope="module")
+def recurrence():
     with limit(40):
-        module = lower_source(source)
+        return lower_source(scoped_query_recurrence)
+
+
+@pytest.fixture(scope="module", params=["recurrence", "attention"])
+def physical(request, recurrence):
+    with limit(40):
+        module = recurrence if request.param == "recurrence" else lower_source(attention_target())
         program = extract_scopes(module)
     return request.param, module, program
 
@@ -57,15 +62,26 @@ def test_actual_query_kv_child_clocks_and_guards_survive_physical_lowering(physi
         assert sum(natives.values()) == 16
 
 
-def test_physical_query_scope_cannot_bypass_cross_query_verification(physical):
-    _, module, _ = physical
+def test_unsynchronized_query_scope_rejects_real_missing_child_sync(physical):
+    name, module, _ = physical
     before = dump(module)
-    diagnostic = "cross-query memory and event lifetime synchronization"
-    for action in (
-        autosync,
-        verify_plan,
-        lambda value: compile(value, synchronize=False, timeout_s=40),
-    ):
-        with pytest.raises(CompileError, match=diagnostic):
-            action(module)
+    with limit(30), pytest.raises(CompileError, match="missing loop (RAW|WAR|WAW)"):
+        verify_plan(module)
+    assert dump(module) == before
+    if name == "recurrence":
+        with pytest.raises(CompileError, match="missing loop (RAW|WAR|WAW)"):
+            compile(module, synchronize=False, timeout_s=30)
         assert dump(module) == before
+
+
+def test_recurrence_autosync_rejects_its_exhausted_actual_binary_event_bank(recurrence):
+    before = dump(recurrence)
+    with (
+        limit(40),
+        pytest.raises(
+            CompileError,
+            match=r"\('aic', 'MTE1', 'MTE2'\): query release has no free binary event ID",
+        ),
+    ):
+        autosync(recurrence)
+    assert dump(recurrence) == before

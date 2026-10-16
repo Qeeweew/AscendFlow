@@ -80,7 +80,7 @@ prologue/steady/epilogue 是激活域的边界；N=0 必须正确配对或不产
 ## 目标：CV 的四个阶段
 
 下列为下一部分合同，函数名代表**待接通的 examples 数学块**，不是现有 opaque
-算子或已实现宏。完整展开数学见 [FA 源码规格](design/attention_target.py.in)。
+算子或已实现宏。完整展开数学见 [FA 算子源码](../examples/flash_attention/attention.py)。
 
 ```python
 for kv in T.Pipelined(

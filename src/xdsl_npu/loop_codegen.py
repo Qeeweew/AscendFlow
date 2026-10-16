@@ -208,6 +208,11 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None, scopes=None):
     ]
     if invocation is not None:
         expressions += [invocation.bound] + [frame.extent for frame in invocation.frames]
+    if scopes is not None:
+        expressions += [
+            item.bound if item.cyclic is None else item.cyclic.total
+            for item in scopes.program.invocations.values()
+        ]
     uniform_names, uniform_lines = bindings(expressions)
     kind = (
         "__mix__(1, 2)"

@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from xdsl.dialects import scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
 
 from .budget import bounded, poll
@@ -19,6 +20,7 @@ from .ir import (
     LoopChannelOp,
     LoopSyncOp,
     OnceOp,
+    QuerySyncOp,
     ScopeGuardOp,
     ScopeSyncOp,
     StreamOp,
@@ -174,6 +176,7 @@ def validate_child_scopes(stream, call):
                         LoopChannelOp,
                         LoopSyncOp,
                         ScopeSyncOp,
+                        QuerySyncOp,
                         EndOp,
                     ),
                 ),
@@ -235,6 +238,21 @@ def validate_child_scopes(stream, call):
                     op.parent_generation is call.generation and op.child_generation is coordinate,
                     "scope synchronization uses a different parent or child clock",
                 )
+            elif isinstance(op, QuerySyncOp):
+                parent = call.parent_op()
+                query = None if parent is None else parent.parent_op()
+                require(
+                    isinstance(parent, StreamOp)
+                    and isinstance(query, scf.ForOp)
+                    and len(query.body.block.args) == 1
+                    and op.query_generation is query.body.block.args[0]
+                    and op.parent_generation is call.generation
+                    and op.child_generation is coordinate
+                    and op.action.data in {"set", "wait"}
+                    and 0 <= op.position.data < stream.count.data
+                    and "scope_cases" not in op.attributes,
+                    "query synchronization needs its actual query/KV/child clocks and activation",
+                )
             elif isinstance(op, ViewOp):
                 require(op.generation is coordinate, "child view uses a different inner clock")
 
@@ -284,7 +302,7 @@ def filter_child(stream, call, case, *, value_mapper=None):
 
     Empty cases return a genuinely empty stream; callers must use
     ``child_is_empty`` instead of inventing a native command for analysis.
-    Parent ScopeSyncOps remain beside their selected native instructions for
+    ScopeSyncOps and QuerySyncOps remain beside their selected natives for
     the scope model to check and erase separately.
     """
     require(case in PARENT_CASES, "unknown parent child case")

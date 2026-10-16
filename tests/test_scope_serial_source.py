@@ -180,8 +180,11 @@ def test_ordinary_work_beside_kv_pipeline_is_not_silently_dropped():
         lower_source(source(text))
 
 
-def test_source_lowering_preserves_the_loop_until_cross_query_sync_is_implemented():
-    from xdsl_npu import compile
+def test_unsynchronized_source_fails_at_its_actual_child_memory_hazard():
+    from xdsl_npu.sync import verify_plan
 
-    with pytest.raises(CompileError, match="cross-query memory and event lifetime synchronization"):
-        compile(N.from_source(SOURCE, disjoint_external=True))
+    module = lower_source(source())
+    before = dump(module)
+    with pytest.raises(CompileError, match="missing loop (RAW|WAR|WAW)"):
+        verify_plan(module)
+    assert dump(module) == before
