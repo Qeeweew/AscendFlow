@@ -9,6 +9,11 @@ profiling/设备，也没有打包或推送。新算法尚未实现。** 三个 
 入口：[设计](design.md)、[不变量](compilation-invariants.md)、[实施计划](refactor-plan.md)。
 这些文件替换旧的“继续 GM→L1 优化”顺序，专项性能页中的旧下一步不再是活动任务。
 
+随后按用户要求清理了外层`runs/`：保留`refactor/cv-order`、`query-boundaries`和
+`l1-reuse`中的近期源码/ASC、编译记录、CSV/性能摘要与失败诊断，删除旧实验、二进制、
+缓存及profiler原始trace/数据库。保留目录是历史证据，已不是可直接运行的完整build；
+库需重新构建，其他历史runs路径可能已删除。清理明细见外层`runs/README.md`。
+
 ## 当前代码实际支持
 
 公开 `prim_func → source xDSL → physical IR → autosync → 实际 IR 独立终检 → ASC → CANN`

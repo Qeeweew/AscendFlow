@@ -4,6 +4,10 @@
 D128/f16，BQ128/BK1024/CK128/VR8，20组AIC/双AIV。真实公开DSL源码位于
 [attention.py](../examples/flash_attention/attention.py)。性能尚未通过相对ACLNN≤1.05的目标。
 
+本页是暂停前的历史测量，算子优化已停止。2026-10-16按用户要求清理runs后，近期
+源码/IR/ASC、编译信息、性能CSV/JSON及分析脚本保留；库、目标文件、profiler二进制
+dump/数据库/原始trace已删除。重新设备运行需要重新构建，清理没有产生新的性能结果。
+
 ## 三批设备计时
 
 每个后端交替运行三批，每批5次warmup、30次device task计时；排除host提交间隙。
@@ -25,8 +29,9 @@ AIV Vector活动380.181µs（旧版380.455），AIC MAC261.279µs（旧版261.68
 
 证据位于外层 `runs/refactor/cv-order/performance.json`、`profiles/`、`asc-audit.json`。
 当前ASC SHA256为`e6c0e1775b61306e1fdc82311706832a4cce6c2dafd16a6570c7cee7826a9e87`，
-CANN9.1、dav-2201、-O2；源码/IR/库/选项均保存在`build/`。旧block8和R64证据分别在
-`runs/refactor/compile-vector/`、`runs/refactor/query-boundaries/`。
+CANN9.1、dav-2201、-O2；源码/IR/ASC、选项和历史库hash记录保存在`build/`及关联报告。
+旧block8的`runs/refactor/compile-vector/`已清理；R64的
+`runs/refactor/query-boundaries/`保留源码、编译记录及性能摘要。
 
 ## msprof op 的其他指标
 
@@ -55,7 +60,7 @@ CANN9.1、dav-2201、-O2；源码/IR/库/选项均保存在`build/`。旧block8�
 同一AIC的两个AIV绑定到相邻query；K/V基址不随query变化，Matmul缓存仅在GM基址变化时
 失效，完整tile命中后直接取L1，不重发GM读取。
 
-用户指定下一步先解决GM→L1。对应政策是每个通信块含两个BM128原生行块，K/V每个CK
+暂停前用户指定先解决GM→L1。对应候选政策是每个通信块含两个BM128原生行块，K/V每个CK
 只搬一次，分别供两个QK/PV MAD读；Q/P各自保留。源码请求预算为
 `Q8 + K128 + V128 + P256 = 520MiB`。它不是ACLNN的实际tiling反推，也不是已测结果。
 候选BQ256/BM128的最新构建/设备状态见[状态页](refactor-progress.md)。
@@ -63,7 +68,7 @@ CANN9.1、dav-2201、-O2；源码/IR/库/选项均保存在`build/`。旧block8�
 L1→L0的8次Load2D展开可解释141,312条源码搬运与PMU141,332的接近，但指令数多
 本身不足以证明它是端到端瓶颈，本轮不把Load3D列为优先优化。
 
-原始op CSV、raw PMU、源码/库hash和命令位于`runs/refactor/cv-order/op-metrics/`，
+导出的op CSV/计数、源码/库hash和命令记录位于`runs/refactor/cv-order/op-metrics/`，
 三次汇总为`repeated-comparison.json`。解释这些指标时须保留以下口径：
 
 - op冲突比例分母是截断到整微秒的task duration×频率，不是Vector活跃周期；
@@ -83,5 +88,5 @@ FMA计2 FLOP的条件模型，峰值294.912TFLOP/s；两次矩阵乘工作68.719
 
 参考ops-transformer HEAD为`4bbfb3b2bccceb2a1b80828d04eee915169a2b2e`。
 安装版kernel模板家族可由安装元数据确认，但安装header与上游checkout不同，不能宣称同提交。
-当前Vec2每次8行、上游D128按64行，以及统计量布局/首KV计算仍有差异；先处理GM→L1
-并复测，再决定UB和Vector改动，不做无界参数搜索。
+当前Vec2每次8行、上游D128按64行，以及统计量布局/首KV计算仍有差异。GM→L1及后续
+UB/Vector改动均已暂停，当前执行顺序以[编译流程重构计划](refactor-plan.md)为准。
