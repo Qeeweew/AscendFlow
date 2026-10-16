@@ -6,7 +6,7 @@ external IR or infer completion from a successful structural verifier.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -15,10 +15,12 @@ from xdsl.ir import Operation
 from ..scalar import Expr
 from ..target.ascend910b import Actor, Engine
 from .structured_protocols import BoundPlacement, LogicalNotification, SynchronizationSelection
-from .structured_schedule import SyncAction
+from .structured_schedule import ActionGuard, SyncAction
 
 if TYPE_CHECKING:
+    from .event_domains import EventCase
     from .event_progress import GuardedTransfer, RegionProgress
+    from .event_windows import EventWindow
     from .structured_event_sharing import EventSharingWitness
 
 LocalBank = tuple[Actor, Engine, Engine]
@@ -61,15 +63,27 @@ class LeaseWitness:
     next_set: BoundPlacement
     steps: tuple[LeaseStep, ...] = ()
     upper_uses: int | None = None
+    condition: ActionGuard = field(kw_only=True)
+
+
+@dataclass(frozen=True, slots=True)
+class CaseLease:
+    """One case's proved ring, with its own radix and reuse premises."""
+
+    case: EventCase
+    width: int
+    ordinal: Expr
+    rings: tuple[tuple[EventWindow, int], ...]
+    inside: tuple[LeaseWitness, ...]
+    reentries: tuple[LeaseWitness, ...]
+    backlog: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class StructuredEventLease:
     notification: LogicalNotification
     width: int
-    inside: tuple[LeaseWitness, ...]
-    reentries: tuple[LeaseWitness, ...]
-    backlog: int | None = None
+    cases: tuple[CaseLease, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +91,7 @@ class StructuredEventAssignment:
     notification: LogicalNotification
     ids: tuple[int, ...]
     banks: tuple[LocalBank, ...]
-    ordinal: Expr
+    cases: tuple[CaseLease, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +134,9 @@ class StructuredProgress:
 @dataclass(slots=True)
 class ResourceWork:
     notifications: int = 0
+    parameter_cases: int = 0
+    parameter_splits: int = 0
+    window_constructions: int = 0
     lifetime_interfaces: int = 0
     lease_searches: int = 0
     witness_steps: int = 0
@@ -127,6 +144,9 @@ class ResourceWork:
     assigned_cross_ids: int = 0
     progress_points: int = 0
     progress_arcs: int = 0
+    progress_path_combinations: int = 0
+    progress_path_alternatives: int = 0
+    progress_case_branches: int = 0
 
 
 @dataclass(frozen=True)

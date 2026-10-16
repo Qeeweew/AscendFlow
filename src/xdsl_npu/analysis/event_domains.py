@@ -17,10 +17,10 @@ from xdsl.dialects import arith
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..indexing import arguments
-from ..scalar import Fact, expression, literal
+from ..scalar import Expr, Fact, expression, literal
 from ..target.ascend910b import Actor, Engine
 from .event_contracts import ResourceWork, _Order
-from .event_windows import EventWindow, WindowExistence, build_event_window
+from .event_windows import EventWindow, WindowExistence
 from .integer_facts import IntegerFacts
 from .structured_control import ControlFacts
 from .structured_dispatch import StructuredDispatch
@@ -43,12 +43,37 @@ def _loop_ancestors(control, operation):
     return tuple(result)
 
 
+@dataclass(frozen=True, eq=False, slots=True)
+class EventCase:
+    """One group-invocation-uniform alternative for a notification stream.
+
+    Identity is intentional: ports of distinct alternatives never pair. The
+    condition authorizes parameter substitution, not a change of loop clock.
+    Empty alternatives carry no selected FIRST/LAST expression.
+    """
+
+    condition: ActionGuard
+    substitutions: tuple[tuple[Expr, Expr], ...]
+    windows: tuple[EventWindow, ...]
+    projections: tuple[WindowExistence, ...]
+    empty: bool = False
+
+    def window(self, loop):
+        for window in self.windows:
+            if window.loop is loop:
+                return window
+        require(False, "event case has no established window for this clock")
+
+    def specialize(self, value):
+        return substitute(value, dict(self.substitutions))
+
+
 @dataclass(frozen=True, init=False)
 class EventDomains:
     """One owned collection of event-domain and physical ordering facts.
 
     Endpoint activation/ID checks may reject an unsupported proof. ``tests``
-    and ``windows`` are built once and exposed through read-only mappings.
+    and ``cases`` are built once and exposed through read-only mappings.
     Integer queries belong to one immutable input-fact environment; their
     answers and query counters may be filled without altering established domains.
     """
@@ -62,8 +87,7 @@ class EventDomains:
     notifications: tuple[LogicalNotification, ...]
     work: ResourceWork
     tests: Mapping[LogicalNotification, tuple[Comparison, ...]]
-    windows: Mapping[LogicalNotification, tuple[EventWindow, ...]]
-    projections: Mapping[LogicalNotification, tuple[WindowExistence, ...]]
+    cases: Mapping[LogicalNotification, tuple[EventCase, ...]]
 
     def __init__(self, selection: SynchronizationSelection, work: ResourceWork):
         memory = selection.dependencies.memory
@@ -77,13 +101,12 @@ class EventDomains:
             ("notifications", selection.notifications),
             ("work", work),
             ("tests", {}),
-            ("windows", {}),
-            ("projections", {}),
+            ("cases", {}),
         ):
             object.__setattr__(self, name, value)
         self.work.notifications = len(self.notifications)
         self._validate()
-        for name in ("tests", "windows", "projections"):
+        for name in ("tests", "cases"):
             object.__setattr__(self, name, MappingProxyType(getattr(self, name)))
 
     def _validate(self):
@@ -138,63 +161,66 @@ class EventDomains:
                     ),
                     "mode-2 notification needs the actual complete 1 AIC : 2 AIV quorum",
                 )
-            self.tests[notification] = tuple(
+            endpoints = tuple(
                 dict.fromkeys(
-                    test
-                    for bound in notification.sources + notification.consumers
-                    for test in self._ambient(bound)
+                    self._ambient(bound) for bound in notification.sources + notification.consumers
                 )
             )
+            for tests in endpoints:
+                missing = self.arithmetic.ordered_definedness(tests)
+                if missing is not None:
+                    required, prefix = missing
+                    self.fail(
+                        notification,
+                        "unsigned arithmetic lacks an ordered activation prefix proof",
+                        phase="structured-event-pairing",
+                        witness=(
+                            f"required: {required.lhs.text()} {required.predicate} {required.rhs.text()}",
+                            "endpoint prefix: "
+                            + "; ".join(
+                                f"{test.lhs.text()} {test.predicate} {test.rhs.text()}"
+                                for test in prefix
+                            ),
+                        ),
+                    )
+            self.tests[notification] = tuple(
+                dict.fromkeys(test for tests in endpoints for test in tests)
+            )
+            self.cases[notification] = self._family(notification)
             self._pair(notification)
-            clocks = self._clocks(notification)
-            projected = self.tests[notification]
-            windows, projections = {}, []
-            for loop in reversed(clocks):
-                logical = self.control.loops[loop]
-                count = substitute(
-                    logical.count,
-                    {self.control.sid: literal(int(notification.sources[0].actor is Actor.AIV1))},
-                )
-                window = build_event_window(
-                    notification,
-                    loop,
-                    ordinal=logical.ordinal,
-                    count=count,
-                    guards=projected,
-                    facts=self.facts,
-                    proves=self.arithmetic.prove,
-                    bounds=self.arithmetic.bounds,
-                    invariant=lambda value, loop=loop: self.control.invariant_over(value, loop),
-                )
-                windows[loop] = window
-                existence = window.project_exists()
-                projections.append(existence)
-                projected = existence.guard.comparisons
-            self.windows[notification] = tuple(windows[loop] for loop in clocks)
-            self.projections[notification] = tuple(projections)
+
+    def _family(self, notification):
+        from .event_families import build_event_family
+
+        return build_event_family(self, notification)
 
     def _pair(self, notification):
         """Every real endpoint exists in exactly the same canonical domain."""
         if notification.mechanism is NotificationKind.PIPE_FENCE:
             return
-        reference = self._ambient(notification.sources[0])
-        for bound in notification.sources + notification.consumers:
-            tests = self._ambient(bound)
-            if tests == reference:
-                # Equality of canonical domains includes the empty domain.
-                continue
-            if not all(self.arithmetic.prove(test, reference) for test in tests) or not all(
-                self.arithmetic.prove(test, tests) for test in reference
-            ):
-                self.fail(
-                    notification,
-                    "selected Set/Wait endpoint activation domains are not proved equivalent",
-                    phase="structured-event-pairing",
-                )
+        for case in self.cases[notification]:
+            first = self._instance(notification.sources[0], {}, case=case)
+            reference = first.guard.comparisons
+            for bound in notification.sources + notification.consumers:
+                endpoint = self._instance(bound, {}, case=case)
+                tests = endpoint.guard.comparisons
+                if tests == reference:
+                    continue
+                if not self._possible((first,)) and not self._possible((endpoint,)):
+                    continue
+                if not all(self.arithmetic.prove(test, reference) for test in tests) or not all(
+                    self.arithmetic.prove(test, tests) for test in reference
+                ):
+                    self.fail(
+                        notification,
+                        "selected Set/Wait endpoint activation domains are not proved equivalent",
+                        phase="structured-event-pairing",
+                    )
 
-    def _paired_id(self, assignment, bound, event):
+    def _paired_id(self, assignment, bound, event, *, case):
         bindings = {self.control.loops[loop].ordinal: value for loop, value in bound.coordinates}
-        restored = substitute(bound.expression(event), bindings)
+        restored = case.specialize(substitute(bound.expression(event), bindings))
+        event = case.specialize(event)
         if self.arithmetic.normalize(expression("sub", restored, event)).constant != 0:
             self.fail(
                 assignment.notification,
@@ -223,7 +249,7 @@ class EventDomains:
             for test in b
         )
 
-    def fail(self, notification, message, *, phase="structured-event-resources"):
+    def fail(self, notification, message, *, phase="structured-event-resources", witness=()):
         raise CompileError(
             f"{notification.name}: {message}",
             kind=ErrorKind.UNSUPPORTED,
@@ -232,15 +258,19 @@ class EventDomains:
             witness=(
                 f"mechanism={notification.mechanism.value}",
                 "no schedule change, hidden controller gate, or barrier fallback",
+                *witness,
             ),
         )
 
-    def _ambient(self, placement):
+    def _ambient(self, placement, *, extra_coordinate_guards=()):
         bindings = {
             self.control.loops[loop].ordinal: value for loop, value in placement.coordinates
         }
         bindings[self.control.sid] = literal(1 if placement.actor is Actor.AIV1 else 0)
         coordinate_guards = dict(placement.coordinate_guards)
+        for loop, guard in extra_coordinate_guards:
+            prior = coordinate_guards.get(loop, ActionGuard())
+            coordinate_guards[loop] = ActionGuard(prior.comparisons + guard.comparisons)
         tests = []
 
         def bind(test, substitutions):
@@ -304,19 +334,35 @@ class EventDomains:
         tests.extend(bind(test, bindings) for test in placement.guard.comparisons)
         return tuple(dict.fromkeys(tests))
 
-    def _instance(self, placement, bindings):
-        tests = tuple(
-            Comparison(
-                substitute(test.lhs, bindings), test.predicate, substitute(test.rhs, bindings)
+    def _instance(self, placement, bindings, *, case, extra_coordinate_guards=()):
+        # Parameter specialization is separate from a coordinate translation:
+        # a replacement coordinate must not itself be shifted a second time.
+        tests = list(case.condition.comparisons)
+        inactive = False
+        for test in self._ambient(placement, extra_coordinate_guards=extra_coordinate_guards):
+            specialized = Comparison(
+                substitute(case.specialize(test.lhs), bindings),
+                test.predicate,
+                substitute(case.specialize(test.rhs), bindings),
             )
-            for test in self._ambient(placement)
-        )
+            tests.append(specialized)
+            if (
+                specialized.lhs.constant is not None
+                and specialized.rhs.constant is not None
+                and not specialized.evaluate({})
+            ):
+                inactive = True
+                break
         return replace(
             placement,
-            coordinates=tuple(
-                (loop, substitute(value, bindings)) for loop, value in placement.coordinates
+            # There is no selected FIRST/LAST coordinate on an inactive fiber.
+            coordinates=()
+            if inactive
+            else tuple(
+                (loop, substitute(case.specialize(value), bindings))
+                for loop, value in placement.coordinates
             ),
-            guard=ActionGuard(tests),
+            guard=ActionGuard(tuple(dict.fromkeys(tests))),
             substitutions=(),
         )
 
@@ -344,12 +390,6 @@ class EventDomains:
             for placement in placements
             for test in placement.guard.comparisons
         )
-
-    def _window(self, notification, loop):
-        for window in self.windows[notification]:
-            if window.loop is loop:
-                return window
-        self.fail(notification, "endpoint projection has no established window for this clock")
 
     def _clocks(self, notification):
         placements = notification.sources + notification.consumers
@@ -455,47 +495,36 @@ class EventDomains:
     def _first_last(self, window):
         return window.first_last()
 
-    def _instances(self, notification, loop, offset, *, terminal=False):
+    def _instances(self, notification, case, loop, offset, *, terminal=False):
         logical = self.control.loops[loop]
         for last in (False, True):
             bindings = {logical.ordinal: expression("add", logical.ordinal, literal(offset))}
-            for child in self.windows[notification]:
-                if child.loop is loop:
+            prerequisites = []
+            for child in case.windows:
+                if child.loop is loop or loop not in _loop_ancestors(self.control, child.loop):
                     continue
-                paths = _loop_ancestors(self.control, child.loop)
-                if loop in paths:
-                    first, end = self._first_last(child)
-                    bindings[self.control.loops[child.loop].ordinal] = substitute(
-                        end if last else first, bindings
-                    )
-            sources = tuple(self._instance(p, bindings) for p in notification.sources)
-            consumers = tuple(self._instance(p, bindings) for p in notification.consumers)
-            yield sources, consumers
+                # These guards are canonical. _instance translates them once,
+                # before evaluating the selected coordinate's lexical tests.
+                prerequisites.append((child.loop, child.nonempty))
+                first, end = self._first_last(child)
+                bindings[self.control.loops[child.loop].ordinal] = substitute(
+                    end if last else first, bindings
+                )
+
+            def instance(placement, bindings=bindings, prerequisites=tuple(prerequisites)):
+                return self._instance(
+                    placement,
+                    bindings,
+                    case=case,
+                    extra_coordinate_guards=prerequisites,
+                )
+
+            yield (
+                tuple(instance(p) for p in notification.sources),
+                tuple(instance(p) for p in notification.consumers),
+            )
             if terminal:
                 break
-
-    def _project(self, notification, clock, last):
-        bindings = {}
-        for loop in self.control.loops:
-            if clock is not None and (
-                loop is clock or clock not in _loop_ancestors(self.control, loop)
-            ):
-                continue
-            if not any(
-                self.control.loops[loop].ordinal.args[0] in arguments(value)
-                for bound in notification.sources + notification.consumers
-                for owner, value in bound.coordinates
-                if owner is loop
-            ):
-                continue
-            window = self._window(notification, loop)
-            first, end = self._first_last(window)
-            bindings[self.control.loops[loop].ordinal] = substitute(
-                end if last else first, bindings
-            )
-        return tuple(self._instance(bound, bindings) for bound in notification.sources), tuple(
-            self._instance(bound, bindings) for bound in notification.consumers
-        )
 
     def _possible(self, bounds):
         tests = tuple(test for bound in bounds for test in bound.guard.comparisons)

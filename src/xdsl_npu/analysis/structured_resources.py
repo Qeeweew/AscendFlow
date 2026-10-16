@@ -26,7 +26,7 @@ from .event_lifetimes import bridge, establish_lease
 from .event_progress import prove_progress
 from .structured_event_sharing import EventSharingContext, prove_finite_event_sharing
 from .structured_protocols import NotificationKind, SynchronizationSelection
-from .structured_schedule import Placement, SyncAction
+from .structured_schedule import ActionGuard, Placement, SyncAction
 
 
 def allocate_structured_events(selection: SynchronizationSelection) -> StructuredEventPlan:
@@ -48,7 +48,7 @@ class _EventBanks:
         self.actions, self.assignments, self.reservations, self.sharing = [], [], [], []
         self.occupied, self.cross_occupied = {}, {}
         self.sharing_context = EventSharingContext(
-            domains.selection, domains.windows, domains._instance, partial(bridge, domains)
+            domains.selection, domains.cases, domains._instance, partial(bridge, domains)
         )
 
     def allocate(self, lifetimes, progress):
@@ -57,8 +57,8 @@ class _EventBanks:
             if notification.mechanism is NotificationKind.PIPE_FENCE:
                 self._place(notification, None)
                 continue
-            lease, ordinal = lifetimes[notification]
-            assignment = self._assign(notification, lease.width, ordinal)
+            lease = lifetimes[notification]
+            assignment = self._assign(notification, lease)
             self.assignments.append(assignment)
             self._place(notification, assignment)
         self._drain()
@@ -66,7 +66,7 @@ class _EventBanks:
             selection=self.domains.selection,
             actions=self._combine_actions(),
             assignments=tuple(self.assignments),
-            leases=tuple(lease for lease, _ in lifetimes.values()),
+            leases=tuple(lifetimes.values()),
             reservations=tuple(self.reservations),
             progress=progress,
             work=self.domains.work,
@@ -99,7 +99,8 @@ class _EventBanks:
                     EventReservation(bank, 7, "final native retirement drain", root)
                 )
 
-    def _assign(self, notification, width, ordinal):
+    def _assign(self, notification, lease):
+        width = lease.width
         cross = notification.mechanism is NotificationKind.CROSS_EVENT
         banks = (
             ()
@@ -143,7 +144,7 @@ class _EventBanks:
                     self.domains.work.assigned_cross_ids += width
                 else:
                     self.domains.work.assigned_local_ids += width * len(banks)
-                return StructuredEventAssignment(notification, ids, banks, ordinal)
+                return StructuredEventAssignment(notification, ids, banks, lease.cases)
         if cross:
             self.domains.fail(
                 notification,
@@ -160,51 +161,56 @@ class _EventBanks:
         fence = notification.mechanism is NotificationKind.PIPE_FENCE
         cross = notification.mechanism is NotificationKind.CROSS_EVENT
         if fence:
-            for bound in notification.consumers:
-                self.actions.append(
-                    SyncAction(
-                        bound.operation,
-                        bound.placement,
-                        (bound.actor,),
-                        SyncKind.FENCE,
-                        notification.source_engine,
-                        notification.destination_engine,
-                        guard=bound.guard,
-                        protocol=notification.name,
+            for case in self.domains.cases[notification]:
+                if case.empty:
+                    continue
+                for bound in notification.consumers:
+                    self.actions.append(
+                        SyncAction(
+                            bound.operation,
+                            bound.placement,
+                            (bound.actor,),
+                            SyncKind.FENCE,
+                            notification.source_engine,
+                            notification.destination_engine,
+                            guard=ActionGuard(case.condition.comparisons + bound.guard.comparisons),
+                            protocol=notification.name,
+                        )
                     )
-                )
             return
         require(assignment is not None, "notification needs its allocated event")
-        event = (
-            literal(assignment.ids[0])
-            if len(assignment.ids) == 1
-            else expression(
-                "add",
-                literal(assignment.ids[0]),
-                expression("rem", assignment.ordinal, literal(len(assignment.ids))),
-            )
-        )
-        for sources, bounds in ((True, notification.sources), (False, notification.consumers)):
-            kind = (
-                (SyncKind.CROSS_SET if sources else SyncKind.CROSS_WAIT)
-                if cross
-                else (SyncKind.LOCAL_SET if sources else SyncKind.LOCAL_WAIT)
-            )
-            for bound in bounds:
-                self.domains._paired_id(assignment, bound, event)
-                self.actions.append(
-                    SyncAction(
-                        bound.operation,
-                        bound.placement,
-                        (bound.actor,),
-                        kind,
-                        notification.source_engine,
-                        notification.destination_engine,
-                        bound.expression(event),
-                        bound.guard,
-                        notification.name,
-                    )
+        for lease in assignment.cases:
+            case = lease.case
+            event = (
+                literal(assignment.ids[0])
+                if lease.width == 1
+                else expression(
+                    "add",
+                    literal(assignment.ids[0]),
+                    expression("rem", lease.ordinal, literal(lease.width)),
                 )
+            )
+            for sources, bounds in ((True, notification.sources), (False, notification.consumers)):
+                kind = (
+                    (SyncKind.CROSS_SET if sources else SyncKind.CROSS_WAIT)
+                    if cross
+                    else (SyncKind.LOCAL_SET if sources else SyncKind.LOCAL_WAIT)
+                )
+                for bound in bounds:
+                    self.domains._paired_id(assignment, bound, event, case=case)
+                    self.actions.append(
+                        SyncAction(
+                            bound.operation,
+                            bound.placement,
+                            (bound.actor,),
+                            kind,
+                            notification.source_engine,
+                            notification.destination_engine,
+                            bound.expression(event),
+                            ActionGuard(case.condition.comparisons + bound.guard.comparisons),
+                            notification.name,
+                        )
+                    )
 
     def _drain(self):
         for reservation in self.reservations:

@@ -1,8 +1,8 @@
 """Scoped integer queries checked against independent finite arithmetic.
 
-All enumerated operations are defined throughout their small input domains.
-Ordered unsigned-guard definedness belongs to the event-window regressions;
-these tests check premise identity, fact isolation and sufficient answers.
+Enumerated arithmetic is defined throughout its small input domains. Ordered
+guard queries separately check unsigned prerequisites before short-circuiting;
+all queries retain premise identity and isolate their input facts.
 """
 
 from itertools import product
@@ -13,7 +13,7 @@ import pytest
 from xdsl_npu.analysis import integer_facts
 from xdsl_npu.analysis.integer_facts import IntegerFacts
 from xdsl_npu.analysis.structured_schedule import Comparison
-from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.diagnostics import CompileError, ErrorKind
 from xdsl_npu.scalar import Expr, Fact, expression, literal
 
 X, Y, D = (Expr("argument", (name,)) for name in ("x", "y", "d"))
@@ -166,6 +166,180 @@ def test_exact_repeated_queries_reuse_normalization_including_false_answers(monk
     assert len(calls) > count
 
 
+@pytest.mark.parametrize("kind", ("floordiv", "ceildiv", "rem"))
+def test_ordered_definedness_cannot_borrow_a_later_unsigned_prerequisite(kind):
+    queries = IntegerFacts({"x": Fact()})
+    numerator = expression("sub", X, literal(1))
+    value = expression(kind, numerator, literal(2))
+    prerequisite = Comparison(X, ">=", literal(1))
+    use = Comparison(value, ">=", literal(0))
+    missing = Comparison(numerator, ">=", literal(0))
+    assert queries.ordered_definedness((use, prerequisite)) == (missing, ())
+    assert queries.ordered_definedness((prerequisite, use)) is None
+
+
+@pytest.mark.parametrize("predicate", ("==", "!="))
+def test_mathematical_remainder_by_one_cannot_hide_a_negative_numerator(predicate):
+    queries = IntegerFacts({"x": Fact()})
+    numerator = expression("sub", X, literal(1))
+    remainder = expression("rem", numerator, literal(1))
+    use = Comparison(remainder, predicate, literal(0))
+    false_tail = Comparison(literal(0), "==", literal(1))
+    # Algebraic answers assume defined operands; they cannot authorize
+    # evaluating an invalid first expression in an empty conjunction.
+    assert queries.prove(Comparison(remainder, "==", literal(0)), ())
+    assert queries.ordered_definedness((use, false_tail)) == (
+        Comparison(numerator, ">=", literal(0)),
+        (),
+    )
+    with pytest.raises(CompileError, match="nonnegative numerator"):
+        use.evaluate({"x": 0})
+    assert queries.ordered_definedness((false_tail, use)) is None
+
+
+def test_ordered_definedness_reports_the_first_nested_operand_and_exact_prefix():
+    queries = IntegerFacts({"x": Fact(minimum=1)})
+    inner = expression("rem", expression("sub", X, literal(1)), D)
+    outer = expression("floordiv", inner, Y)
+    use = Comparison(literal(0), "==", outer)
+    positive_inner = Comparison(D, ">", literal(0))
+    positive_outer = Comparison(Y, ">", literal(0))
+    assert queries.ordered_definedness((use,)) == (positive_inner, ())
+    assert queries.ordered_definedness((positive_inner, use)) == (
+        positive_outer,
+        (positive_inner,),
+    )
+    assert queries.ordered_definedness((positive_inner, positive_outer, use)) is None
+
+
+def test_a_defined_false_comparison_short_circuits_the_unreachable_tail():
+    queries = IntegerFacts({"x": Fact()})
+    always_false = Comparison(expression("rem", X, literal(1)), "!=", literal(0))
+    numerator = expression("sub", Y, literal(1))
+    unreachable = Comparison(expression("rem", numerator, literal(1)), "==", literal(0))
+    assert queries.ordered_definedness((always_false, unreachable)) is None
+    assert queries.ordered_definedness((unreachable, always_false)) == (
+        Comparison(numerator, ">=", literal(0)),
+        (),
+    )
+
+
+def test_ordered_definedness_caches_the_complete_ordered_tuple_including_failures(monkeypatch):
+    queries = IntegerFacts({})
+    original = queries.prove
+    calls = []
+
+    def observed(test, assumptions):
+        calls.append((test, assumptions))
+        return original(test, assumptions)
+
+    monkeypatch.setattr(queries, "prove", observed)
+    nonnegative = Comparison(X, ">=", literal(0))
+    positive = Comparison(D, ">", literal(0))
+    use = Comparison(expression("rem", X, D), "==", literal(0))
+    tests = (nonnegative, positive, use)
+    assert queries.ordered_definedness(tests) is None
+    count = len(calls)
+    assert count
+    equivalent = tuple(Comparison(test.lhs, test.predicate, test.rhs) for test in tests)
+    assert queries.ordered_definedness(equivalent) is None
+    assert len(calls) == count
+    assert queries.ordered_definedness((positive, nonnegative, use)) is None
+    assert len(calls) > count
+    failure = queries.ordered_definedness((use, nonnegative, positive))
+    assert failure == (nonnegative, ())
+    count = len(calls)
+    assert queries.ordered_definedness((use, nonnegative, positive)) is failure
+    assert len(calls) == count
+
+
+def test_ordered_definedness_cannot_borrow_another_environments_operand_facts():
+    remainder = expression("rem", expression("sub", X, literal(1)), literal(1))
+    tests = (Comparison(remainder, "!=", literal(0)),)
+    positive = IntegerFacts({"x": Fact(minimum=1)})
+    nonnegative = IntegerFacts({"x": Fact()})
+    assert positive.ordered_definedness(tests) is None
+    assert nonnegative.ordered_definedness(tests) == (
+        Comparison(expression("sub", X, literal(1)), ">=", literal(0)),
+        (),
+    )
+    assert positive.ordered_definedness(tests) is None
+
+
+def test_an_unsupported_required_relation_remains_a_missing_unsigned_fact():
+    queries = IntegerFacts({"x": Fact()})
+    positive = Comparison(D, ">", literal(0))
+    inner = expression("rem", X, D)
+    numerator = expression("sub", inner, literal(1))
+    use = Comparison(expression("rem", numerator, literal(1)), "!=", literal(0))
+    assert queries.ordered_definedness((positive, use)) == (
+        Comparison(numerator, ">=", literal(0)),
+        (positive,),
+    )
+    with pytest.raises(CompileError, match="nonnegative numerator"):
+        use.evaluate({"x": 0, "d": 1})
+
+
+def test_ordered_definedness_propagates_analysis_budget_failures(monkeypatch):
+    queries = IntegerFacts({})
+    failure = CompileError("integer proof budget exhausted", kind=ErrorKind.ANALYSIS_LIMIT)
+
+    def exhausted(*args):
+        raise failure
+
+    monkeypatch.setattr(queries, "prove", exhausted)
+    use = Comparison(expression("rem", X, literal(1)), "==", literal(0))
+    with pytest.raises(CompileError) as raised:
+        queries.ordered_definedness((use,))
+    assert raised.value is failure
+
+
+def test_an_inactive_window_does_not_specialize_its_unreachable_count():
+    from xdsl.dialects.builtin import ModuleOp
+
+    from xdsl_npu.analysis.event_windows import build_event_window
+    from xdsl_npu.analysis.structured_protocols import LogicalNotification, NotificationKind
+    from xdsl_npu.target.ascend910b import Engine
+
+    queries = IntegerFacts({"d": Fact()})
+    loop = ModuleOp([])
+    count = expression("ceildiv", literal(1), D)
+    notification = LogicalNotification(
+        "inactive_count",
+        (),
+        (),
+        Engine.MTE2,
+        Engine.V,
+        NotificationKind.LOCAL_EVENT,
+        (),
+        loop,
+        Y,
+        1,
+        0,
+    )
+    guards = (
+        Comparison(D, "==", literal(0)),
+        Comparison(D, ">", literal(0)),
+        Comparison(Y, ">=", literal(0)),
+        Comparison(Y, "<", count),
+    )
+    window = build_event_window(
+        notification,
+        loop,
+        ordinal=Y,
+        count=count,
+        guards=guards,
+        facts=queries.facts,
+        proves=queries.prove,
+        bounds=queries.bounds,
+        ordered_definedness=queries.ordered_definedness,
+        invariant=lambda value: value != Y,
+        parameter_bindings={D: literal(0)},
+    )
+    assert window.count == literal(0) and window.residues == () and window.upper == 0
+    assert not window.membership.evaluate({}) and not window.project_exists().guard.evaluate({})
+
+
 def test_signed_intermediate_clamps_keep_their_integer_bounds():
     extent, offset, step = (Expr("argument", (name,)) for name in ("extent", "offset", "step"))
     queries = IntegerFacts(
@@ -242,6 +416,94 @@ def test_nonnegative_product_preserves_the_factor_premise():
     assert not queries.prove(Comparison(value, ">=", literal(0)), ())
     assert not queries.prove(Comparison(value, ">", literal(0)), premises)
     assert not queries.prove(Comparison(value, "<=", literal(0)), premises)
+
+
+@pytest.mark.parametrize("constant_on_left", (True, False), ids=("left", "right"))
+@pytest.mark.parametrize(
+    "scalar,minimum,maximum,expected",
+    (
+        (4, 2, None, (8, None)),
+        (-4, 2, None, (None, -8)),
+        (4, None, -2, (None, -8)),
+        (-4, None, -2, (8, None)),
+        (4, None, 5, (None, 20)),
+        (-4, None, 5, (-20, None)),
+        (4, -3, 5, (-12, 20)),
+        (-4, -3, 5, (-20, 12)),
+        (0, None, None, (0, 0)),
+        (0, 2, None, (0, 0)),
+        (4, None, None, (None, None)),
+        (-4, None, None, (None, None)),
+    ),
+)
+def test_constant_multiplication_preserves_signed_and_unknown_interval_endpoints(
+    constant_on_left, scalar, minimum, maximum, expected
+):
+    queries = IntegerFacts({})
+    # Keep both operand orders, including zero, before scalar simplification.
+    operands = (literal(scalar), X) if constant_on_left else (X, literal(scalar))
+    value = Expr("mul", operands)
+    premises = tuple(
+        Comparison(X, predicate, literal(bound))
+        for predicate, bound in ((">=", minimum), ("<=", maximum))
+        if bound is not None
+    )
+    assert queries.bounds(value, premises) == expected
+    actual = [
+        scalar * x
+        for x in range(-10, 11)
+        if (minimum is None or x >= minimum) and (maximum is None or x <= maximum)
+    ]
+    lower, upper = expected
+    assert lower is None or lower == min(actual)
+    assert upper is None or upper == max(actual)
+    if lower is None:
+        assert not queries.prove(Comparison(value, ">=", literal(-100)), premises)
+    if upper is None:
+        assert not queries.prove(Comparison(value, "<=", literal(100)), premises)
+
+
+@pytest.mark.parametrize("facts", ({}, {"x": Fact()}), ids=("unknown", "nonnegative"))
+def test_a_lower_factor_premise_proves_the_scaled_positive_difference(facts):
+    queries = IntegerFacts(facts)
+    premises = (Comparison(X, ">=", literal(2)),)
+    scaled = expression("mul", literal(4), X)
+    difference = expression("sub", scaled, literal(7))
+    assert queries.bounds(scaled, premises) == (8, None)
+    assert queries.bounds(difference, premises) == (1, None)
+    assert queries.prove(Comparison(difference, ">=", literal(0)), premises)
+    assert not queries.prove(Comparison(difference, ">", literal(1)), premises)
+    assert not queries.prove(Comparison(difference, ">=", literal(0)), ())
+
+
+def test_remainder_interval_preserves_its_factored_unsigned_domain():
+    queries = IntegerFacts({"x": Fact()})
+    factor = expression("sub", Y, literal(1))
+    scaled_factor = expression("mul", factor, X)
+    phase = expression(
+        "rem",
+        expression("sub", literal(2), expression("rem", scaled_factor, literal(2))),
+        literal(2),
+    )
+    count = expression("ceildiv", expression("max", X, literal(0)), literal(1))
+    previous = expression("sub", count, literal(1))
+    remainder = expression("rem", expression("sub", previous, phase), literal(2))
+    aligned = expression("sub", previous, remainder)
+    premises = (Comparison(Y, ">=", literal(1)), Comparison(count, ">", literal(1)))
+    test = Comparison(count, ">", aligned)
+    difference = expression("sub", count, aligned)
+    bounded = queries.bounded(difference)
+    assert queries.bounds(remainder, premises) == (0, 1)
+    assert queries.bounds(bounded, premises) == (1, 2)
+    assert queries.prove(test, premises)
+    assert not queries.prove(test, premises[:1])
+    assert not queries.prove(test, premises[1:])
+    assert not queries.prove(Comparison(difference, ">", literal(2)), premises)
+    for x, y in product(range(2, 9), range(1, 6)):
+        context = {"x": x, "y": y}
+        expected = x - (x - 1 - (x - 1 - (2 - (y - 1) * x % 2) % 2) % 2)
+        assert test.evaluate(context)
+        assert difference.evaluate(context) == bounded.evaluate(context) == expected
 
 
 def quotient_value(kind, numerator, denominator):

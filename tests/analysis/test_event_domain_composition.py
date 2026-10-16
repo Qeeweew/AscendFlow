@@ -25,10 +25,15 @@ def domains():
 
 
 def test_child_membership_is_projected_once_before_parent_window(domains):
-    projected = [value for value in domains.projections.values() if len(value) > 1]
+    projected = [
+        case.projections
+        for cases in domains.cases.values()
+        for case in cases
+        if len(case.projections) > 1
+    ]
     assert projected
-    for notification, projections in domains.projections.items():
-        windows = domains.windows[notification]
+    for case in (case for cases in domains.cases.values() for case in cases):
+        projections, windows = case.projections, case.windows
         assert tuple(p.loop for p in projections) == tuple(w.loop for w in reversed(windows))
         for index, projection in enumerate(projections[:-1]):
             parent = windows[-index - 2]
@@ -36,7 +41,8 @@ def test_child_membership_is_projected_once_before_parent_window(domains):
 
 
 def test_small_exact_existence_matches_actual_member_enumeration(domains):
-    for windows in domains.windows.values():
+    for case in (case for cases in domains.cases.values() for case in cases):
+        windows = case.windows
         for count in (0, 1, 2, 3):
             for outer in range(4):
                 context = {"n": count, "$group": 0, "$sid": 0}
@@ -59,4 +65,4 @@ def test_established_domain_identity_and_maps_are_read_only(domains):
     with pytest.raises(FrozenInstanceError):
         domains.notifications = ()
     with pytest.raises(TypeError):
-        domains.windows[domains.notifications[0]] = ()
+        domains.cases[domains.notifications[0]] = ()

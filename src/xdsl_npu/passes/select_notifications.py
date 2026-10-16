@@ -14,6 +14,7 @@ from math import gcd, lcm
 from xdsl.dialects import arith
 
 from ..analysis.access_frontier import LoopResidueSelection, ResiduePosition
+from ..analysis.integer_facts import IntegerFacts
 from ..analysis.structured_dependencies import StructuredDependencies
 from ..analysis.structured_dispatch import StructuredDispatch
 from ..analysis.structured_protocols import (
@@ -328,66 +329,73 @@ def _dispatch_path(placement, dispatch):
     return tuple(result)
 
 
-def _positive(value, need, memory):
-    from ..indexing import interval
+class _IssueOrder:
+    """Owned signed comparisons of actual hierarchical insertion positions.
 
-    ranges = [
-        (
-            memory.control.loops[d.loop].ordinal,
-            literal(max(d.distance, d.first)),
-            expression("sub", d.count, literal(1)),
-        )
-        for d in need.domains
-    ]
-    guarded = {}
-    for guard in need.guards:
-        if not isinstance(guard, LoopCountGuard):
-            continue
-        lower, upper = guarded.get(guard.count, (literal(0), guard.count))
-        threshold = _integer(guard.threshold)
-        if guard.relation.value == ">":
-            lower = expression("max", lower, expression("add", threshold, literal(1)))
-        else:
-            upper = expression("min", upper, threshold)
-        guarded[guard.count] = lower, upper
-    ranges.extend((count, lower, upper) for count, (lower, upper) in guarded.items())
-    try:
-        value = normalize(value, memory.control.environment.facts)
-    except CompileError as error:
-        # Exact quotient DAGs may retain fractional proof coefficients.
-        if error.message != "runtime address retains a fractional coefficient":
-            raise
-    low, _ = interval(value, ranges, memory.control.environment.facts)
-    return nonnegative(expression("sub", low, literal(1)), memory.control.environment.facts)
-
-
-def issue_order(before, after, need, dispatch):
-    """-1/0/1 for proved controller order; None retains an unproved relation.
-
-    This compares only the two actual insertion paths. It supplies no native
-    end FIFO, retirement, cross-actor order, or transitive completion graph.
+    A need's mathematical activation premises are established once. They do
+    not authorize unsigned guard evaluation; the event-domain stage retains
+    that ordered definedness obligation. Unknown order retains the required
+    notification, without supplying completion, retirement or visibility.
     """
-    if before.actor is not after.actor:
-        return None
-    memory = dispatch.memory
-    for a, b in zip(_dispatch_path(before, dispatch), _dispatch_path(after, dispatch)):
-        if a[0] is not b[0]:
+
+    def __init__(self, dispatch):
+        self.dispatch = dispatch
+        self.arithmetic = IntegerFacts(dispatch.memory.control.environment.facts)
+        self._loop_order = {loop: index for index, loop in enumerate(dispatch.memory.control.loops)}
+        self._premises = {}
+
+    def premises(self, need):
+        if need not in self._premises:
+            control = self.dispatch.memory.control
+            tests = [
+                Comparison(guard.count, guard.relation.value, _integer(guard.threshold))
+                if isinstance(guard, LoopCountGuard)
+                else _branch_test(guard.operation, guard.branch, control.environment)
+                for guard in need.guards
+            ]
+            for domain in sorted(need.domains, key=lambda item: self._loop_order[item.loop]):
+                ordinal = control.loops[domain.loop].ordinal
+                tests.extend(
+                    (
+                        Comparison(ordinal, ">=", literal(max(domain.first, domain.distance))),
+                        Comparison(ordinal, "<", domain.count),
+                    )
+                )
+                if domain.period != 1:
+                    tests.append(
+                        Comparison(
+                            expression("rem", ordinal, literal(domain.period)),
+                            "==",
+                            _integer(domain.residue),
+                        )
+                    )
+            self._premises[need] = tuple(dict.fromkeys(tests))
+        return self._premises[need]
+
+    def compare(self, before, after, need):
+        """Return -1/0/1 only for proved order on one actual controller."""
+        if before.actor is not after.actor:
             return None
-        difference = expression("sub", b[1], a[1])
-        if equivalent(a[1], b[1], memory.control.environment.facts):
-            if a[2] != b[2]:
-                return -1 if a[2] < b[2] else 1
-            continue
-        if _positive(difference, need, memory):
-            return -1
-        if _positive(expression("mul", literal(-1), difference), need, memory):
-            return 1
-        return None
-    if before.operation is not after.operation:
-        return None
-    if before.placement is after.placement:
-        return 0
-    return -1 if before.placement is Placement.BEFORE else 1
+        premises = self.premises(need)
+        for a, b in zip(
+            _dispatch_path(before, self.dispatch), _dispatch_path(after, self.dispatch)
+        ):
+            if a[0] is not b[0]:
+                return None
+            if self.arithmetic.prove(Comparison(a[1], "==", b[1]), premises):
+                if a[2] != b[2]:
+                    return -1 if a[2] < b[2] else 1
+                continue
+            if self.arithmetic.prove(Comparison(b[1], ">", a[1]), premises):
+                return -1
+            if self.arithmetic.prove(Comparison(a[1], ">", b[1]), premises):
+                return 1
+            return None
+        if before.operation is not after.operation:
+            return None
+        if before.placement is after.placement:
+            return 0
+        return -1 if before.placement is Placement.BEFORE else 1
 
 
 def _point_key(point, *, actor=True):
@@ -578,14 +586,14 @@ def _bind_notification(need, dispatch):
     )
 
 
-def _implicit(notification, dispatch):
+def _implicit(notification, order):
     source, consumer = notification.sources[0], notification.consumers[0]
     if (
         source.actor is not consumer.actor
-        or issue_order(source, consumer, notification.requirements[0], dispatch) != -1
+        or order.compare(source, consumer, notification.requirements[0]) != -1
     ):
         return None
-    native = dispatch.tasks[source.operation, source.actor]
+    native = order.dispatch.tasks[source.operation, source.actor]
     if native.engine is Engine.S:
         return "synchronous Scalar native end before controller dispatch"
     if native.engine is notification.destination_engine and native.implicit_completion:
@@ -593,7 +601,7 @@ def _implicit(notification, dispatch):
     return None
 
 
-def _group_captures(notifications, dispatch):
+def _group_captures(notifications, order):
     """One exact acquire may use its latest already-required engine capture."""
     grouped = {}
     for item in notifications:
@@ -610,14 +618,14 @@ def _group_captures(notifications, dispatch):
             grouped[key] = item
             continue
         orders = {
-            issue_order(previous.sources[0], item.sources[0], need, dispatch)
+            order.compare(previous.sources[0], item.sources[0], need)
             for need in previous.requirements + item.requirements
         }
         if None in orders or len(orders) != 1:
             grouped[key + (len(grouped),)] = item
             continue
-        order = next(iter(orders))
-        selected = item if order <= 0 else previous
+        relative = next(iter(orders))
+        selected = item if relative <= 0 else previous
         grouped[key] = replace(selected, requirements=previous.requirements + item.requirements)
     return tuple(grouped.values())
 
@@ -658,7 +666,7 @@ def _contains_activation(wide, narrow, memory):
     return True
 
 
-def _reuse_acquisitions(notifications, dispatch):
+def _reuse_acquisitions(notifications, order):
     """Reuse an already-selected real acquire on the same queue and domain.
 
     Coverage needs two concrete comparisons: the capture is after the needed
@@ -668,7 +676,7 @@ def _reuse_acquisitions(notifications, dispatch):
     """
 
     def key(item):
-        task = dispatch.tasks[item.consumers[0].operation, item.consumers[0].actor]
+        task = order.dispatch.tasks[item.consumers[0].operation, item.consumers[0].actor]
         steps, scope = [(task.stage, task.lexical)], task.scope
         while scope.parent is not None:
             steps.append((scope.parent_stage, scope.parent_lexical))
@@ -685,11 +693,11 @@ def _reuse_acquisitions(notifications, dispatch):
                 previous.source_engine is not item.source_engine
                 or previous.destination_engine is not item.destination_engine
                 or previous.sources[0].actor is not item.sources[0].actor
-                or not _contains_activation(previous, item, dispatch.memory)
+                or not _contains_activation(previous, item, order.dispatch.memory)
             ):
                 continue
             acquire = {
-                issue_order(previous.consumers[0], item.consumers[0], need, dispatch)
+                order.compare(previous.consumers[0], item.consumers[0], need)
                 for need in item.requirements
             }
             if not acquire <= {-1, 0}:
@@ -700,8 +708,7 @@ def _reuse_acquisitions(notifications, dispatch):
                 else previous.sources[0]
             )
             capture = {
-                issue_order(item.sources[0], capture_point, need, dispatch)
-                for need in item.requirements
+                order.compare(item.sources[0], capture_point, need) for need in item.requirements
             }
             if not capture <= {-1, 0}:
                 continue
@@ -774,6 +781,7 @@ def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
         isinstance(dispatch, StructuredDispatch) and dispatch.memory is dependencies.memory,
         "selection and dispatch belong to different owned memory facts",
     )
+    order = _IssueOrder(dispatch)
     notifications, coverage, unresolved = [], [], []
     for need in dependencies.required:
         if not isinstance(need.source, AccessOccurrence):
@@ -781,7 +789,7 @@ def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
             continue
         try:
             item = _bind_notification(need, dispatch)
-            if rule := _implicit(item, dispatch):
+            if rule := _implicit(item, order):
                 coverage.append(
                     NotificationCoverage(
                         need,
@@ -798,7 +806,7 @@ def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
                 )
             elif (
                 item.mechanism is NotificationKind.PIPE_FENCE
-                and issue_order(item.sources[0], item.consumers[0], need, dispatch) != -1
+                and order.compare(item.sources[0], item.consumers[0], need) != -1
             ):
                 unresolved.append(
                     UnresolvedSynchronization(
@@ -810,8 +818,8 @@ def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
         except CompileError as error:
             unresolved.append(UnresolvedSynchronization(need, error.message))
     grouped = _merge_residue_partitions(notifications, dependencies.memory)
-    grouped = _group_captures(grouped, dispatch)
-    grouped = _reuse_acquisitions(grouped, dispatch)
+    grouped = _group_captures(grouped, order)
+    grouped = _reuse_acquisitions(grouped, order)
     grouped, quorum_issues = _quorums(grouped)
     unresolved.extend(quorum_issues)
     selected = tuple(replace(item, name=f"notification_{i}") for i, item in enumerate(grouped))

@@ -273,8 +273,9 @@ def test_inactive_minimum_shift_does_not_drop_later_residue_gates():
     selection = isolated(selection, notifications)
     domains = EventDomains(selection, ResourceWork())
     composer = _Composer(domains)
-    wait = ProgressPort(notifications[0], notifications[0].consumers[0], "wait")
-    source = ProgressPort(notifications[1], notifications[1].sources[0], "set")
+    (wait_case,), (source_case,) = (domains.cases[n] for n in notifications)
+    wait = ProgressPort(notifications[0], notifications[0].consumers[0], "wait", wait_case)
+    source = ProgressPort(notifications[1], notifications[1].sources[0], "set", source_case)
     invocation = composer._invocation_guard(loop.operation, wait, source)
     assert invocation is not None and not invocation.comparisons
     shift, guard, exact = composer._gate_step(wait, source, loop.operation)

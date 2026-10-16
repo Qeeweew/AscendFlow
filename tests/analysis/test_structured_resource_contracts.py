@@ -228,9 +228,10 @@ def test_emitted_ring_ids_pair_each_actual_generation_across_clocks(source):
             assert notification.mechanism is NotificationKind.LOCAL_EVENT
             for need in notification.requirements:
                 for context in need_cases(need, uniform, memory):
-                    expected = assignment.ids[
-                        assignment.ordinal.evaluate(context) % len(assignment.ids)
-                    ]
+                    (case,) = tuple(
+                        case for case in assignment.cases if case.case.condition.evaluate(context)
+                    )
+                    expected = assignment.ids[case.ordinal.evaluate(context) % case.width]
                     for points, kind in (
                         (notification.sources, SyncKind.LOCAL_SET),
                         (notification.consumers, SyncKind.LOCAL_WAIT),
@@ -244,12 +245,13 @@ def test_emitted_ring_ids_pair_each_actual_generation_across_clocks(source):
                                 memory.control.loops[loop].ordinal.args[0]: value
                                 for loop, value in coordinates
                             }
-                            action = next(
-                                a
-                                for a in plan.actions
-                                if a.protocol == notification.name
-                                and a.kind is kind
-                                and a.anchor is point.operation
-                                and point.actor in a.participants
-                            )
-                            assert action.active_event(runtime) == expected
+                            events = [
+                                event
+                                for action in plan.actions
+                                if action.protocol == notification.name
+                                and action.kind is kind
+                                and action.anchor is point.operation
+                                and point.actor in action.participants
+                                and (event := action.active_event(runtime)) is not None
+                            ]
+                            assert events == [expected]

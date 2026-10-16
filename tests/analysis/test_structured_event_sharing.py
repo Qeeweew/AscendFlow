@@ -8,6 +8,7 @@ import pytest
 from examples.vector.scale import scale
 from tests.models.structured_domains import actual_dispatch
 from tests.support.structured import prepared, selection
+from xdsl_npu.analysis.event_domains import EventCase
 from xdsl_npu.analysis.event_lifetimes import bridge
 from xdsl_npu.analysis.structured_event_sharing import (
     EventSharingContext,
@@ -43,7 +44,7 @@ def sharing_context(selected):
     )
     allocator = prepared(selected)
     return EventSharingContext(
-        selected, allocator.windows, allocator._instance, partial(bridge, allocator)
+        selected, allocator.cases, allocator._instance, partial(bridge, allocator)
     )
 
 
@@ -136,7 +137,7 @@ def test_sharing_proof_is_bound_to_one_actual_directed_bank(finite):
     assert prove_finite_event_sharing(forward, reverse, context=sharing_context(finite)) is None
 
 
-def test_empty_common_windows_do_not_erase_repeated_actual_scopes():
+def test_finite_case_does_not_erase_repeated_actual_scopes():
     selected = selection(scale)
     forward = route(selected, Engine.MTE2)[0]
     context = sharing_context(selected)
@@ -147,7 +148,9 @@ def test_empty_common_windows_do_not_erase_repeated_actual_scopes():
 
     context = replace(
         context,
-        windows={n: () for n in (*selected.notifications, clone)},
+        cases={
+            n: (EventCase(ActionGuard(), (), (), ()),) for n in (*selected.notifications, clone)
+        },
         bridge=forbidden_bridge,
     )
     assert prove_finite_event_sharing(forward, clone, context=context) is None

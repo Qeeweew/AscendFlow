@@ -7,9 +7,9 @@ repeated invocation requires a per-ID proof beyond this finite contract.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from xdsl.ir import Operation
 
@@ -22,6 +22,9 @@ from .structured_protocols import (
     SynchronizationSelection,
 )
 from .structured_schedule import Comparison
+
+if TYPE_CHECKING:
+    from .event_domains import EventCase
 
 
 class SharingStep(Protocol):
@@ -52,11 +55,21 @@ class SharingBridge(Protocol):
     ) -> tuple[SharingStep, ...] | None: ...
 
 
+class CaseCanonicalizer(Protocol):
+    def __call__(
+        self,
+        placement: BoundPlacement,
+        bindings: Mapping[Expr, Expr],
+        *,
+        case: EventCase,
+    ) -> BoundPlacement: ...
+
+
 @dataclass(frozen=True)
 class EventSharingContext:
     selection: SynchronizationSelection
-    windows: Mapping[LogicalNotification, tuple[object, ...]]
-    canonicalize: Callable[[BoundPlacement, Mapping[Expr, Expr]], BoundPlacement]
+    cases: Mapping[LogicalNotification, tuple[EventCase, ...]]
+    canonicalize: CaseCanonicalizer
     bridge: SharingBridge
 
 
@@ -72,32 +85,32 @@ class EventSharingWitness:
 
 
 def _single_occurrence(notification, context):
-    if (
-        notification.mechanism is NotificationKind.PIPE_FENCE
-        or context.windows.get(notification) != ()
-    ):
-        return False
+    cases = context.cases.get(notification, ())
+    if notification.mechanism is NotificationKind.PIPE_FENCE or len(cases) != 1:
+        return None
+    case = cases[0]
+    if case.empty or case.windows:
+        return None
     control = context.selection.dependencies.memory.control
     root = control.module.body.block.first_op
     for placement in notification.sources + notification.consumers:
         frame = control.frames.get(placement.operation)
         if frame is None:
-            return False
+            return None
         coordinates = dict(placement.coordinates)
         if any(
             loop.operation not in coordinates
             or not control.invariant_over(coordinates[loop.operation], root)
             for loop in frame.loops()
         ):
-            return False
-        canonical = context.canonicalize(placement, {})
+            return None
+        canonical = context.canonicalize(placement, {}, case=case)
         if any(
-            not control.invariant_over(test.lhs, root)
-            or not control.invariant_over(test.rhs, root)
+            not control.invariant_over(test.lhs, root) or not control.invariant_over(test.rhs, root)
             for test in canonical.guard.comparisons
         ):
-            return False
-    return True
+            return None
+    return case
 
 
 def _local_bank(notification):
@@ -128,37 +141,39 @@ def prove_finite_event_sharing(
     Only existing selected Set/Wait interfaces can establish the return path.
     """
     bank = _local_bank(left)
-    if (
-        left is right
-        or bank is None
-        or bank != _local_bank(right)
-        or not _single_occurrence(left, context)
-        or not _single_occurrence(right, context)
-    ):
+    if left is right or bank is None or bank != _local_bank(right):
         return None
+    left_case, right_case = _single_occurrence(left, context), _single_occurrence(right, context)
+    if left_case is None or right_case is None:
+        return None
+    finite = {
+        notification: case
+        for notification in context.selection.notifications
+        if (case := _single_occurrence(notification, context)) is not None
+    }
     candidates = tuple(
         (
             notification,
-            tuple(context.canonicalize(p, {}) for p in notification.sources),
-            tuple(context.canonicalize(p, {}) for p in notification.consumers),
+            tuple(context.canonicalize(p, {}, case=case) for p in notification.sources),
+            tuple(context.canonicalize(p, {}, case=case) for p in notification.consumers),
         )
-        for notification in context.selection.notifications
-        if _single_occurrence(notification, context)
+        for notification, case in finite.items()
     )
     assumptions = tuple(
         test
-        for notification in (left, right)
+        for notification, case in ((left, left_case), (right, right_case))
         for placement in notification.sources + notification.consumers
-        for test in context.canonicalize(placement, {}).guard.comparisons
+        for test in context.canonicalize(placement, {}, case=case).guard.comparisons
     )
-    for earlier, later in ((left, right), (right, left)):
-        consume = context.canonicalize(earlier.consumers[0], {})
-        next_set = context.canonicalize(later.sources[0], {})
+    for earlier, earlier_case, later, later_case in (
+        (left, left_case, right, right_case),
+        (right, right_case, left, left_case),
+    ):
+        consume = context.canonicalize(earlier.consumers[0], {}, case=earlier_case)
+        next_set = context.canonicalize(later.sources[0], {}, case=later_case)
         # Both channels use the same actual bank, so the resource bridge's
         # goal source route is also the later channel's actual source route.
         steps = context.bridge(earlier, consume, next_set, None, 0, assumptions, candidates)
         if steps is not None:
-            return EventSharingWitness(
-                bank, earlier, later, consume, next_set, steps, assumptions
-            )
+            return EventSharingWitness(bank, earlier, later, consume, next_set, steps, assumptions)
     return None

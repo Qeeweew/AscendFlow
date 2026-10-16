@@ -60,6 +60,7 @@ def _window(count, extra=(), *, facts=None):
         facts=queries.facts,
         proves=queries.prove,
         bounds=queries.bounds,
+        ordered_definedness=queries.ordered_definedness,
         invariant=lambda value: not _contains_ordinal(value),
     )
 
@@ -175,6 +176,7 @@ def test_empty_alignment_cannot_wrap_its_first_into_a_nonempty_certificate():
     # There is only one in-range ordinal, and it has residue zero.
     assert not window.membership.evaluate({"g": INT64_MAX - 1})
     assert not window.nonempty.evaluate({})
+    assert 0 <= window.first.constant <= INT64_MAX
     assert not _guard(window.nonempty, {}, checked=False)
     assert not _guard(window.nonempty, {}, checked=True)
 
@@ -192,3 +194,40 @@ def test_same_id_guard_short_circuits_before_a_nonexistent_successor_overflows(w
     context = {"g": INT64_MAX - width - 1}
     assert _guard(successor_guard, context, checked=True)
     assert _evaluate(window.next_same_id(width), context, checked=True) == INT64_MAX - 1
+
+
+def test_dense_multi_residue_first_last_and_reuse_remain_defined_near_i64_limit():
+    # Reducing before multiplication avoids overflowing the source predicate.
+    remainder = expression(
+        "rem", expression("mul", expression("rem", G, literal(5)), literal(2)), literal(5)
+    )
+    lower = INT64_MAX - 20
+    window = _window(
+        INT64_MAX,
+        (
+            Comparison(G, ">=", literal(lower)),
+            Comparison(remainder, "<=", literal(1)),
+        ),
+    )
+    members = [g for g in range(lower, INT64_MAX) if g % 5 in (0, 3)]
+    assert _guard(window.nonempty, {}, checked=True)
+    first, last = window.first_last()
+    assert _evaluate(first, {}, checked=True) == members[0]
+    assert _evaluate(last, {}, checked=True) == members[-1]
+    for width in (1, 2, 3):
+        for index, g in enumerate(members):
+            context = {"g": g}
+            exists = index + width < len(members)
+            assert _guard(window.same_id_guard(width), context, checked=True) == exists
+            phases = [
+                delta
+                for guard, delta in window.reuse_phases(width)
+                if _guard(guard, context, checked=True)
+            ]
+            assert len(phases) == int(exists)
+            if exists:
+                assert (
+                    _evaluate(window.next_same_id(width), context, checked=True)
+                    == members[index + width]
+                )
+                assert g + phases[0] == members[index + width]

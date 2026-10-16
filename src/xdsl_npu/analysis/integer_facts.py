@@ -1,8 +1,8 @@
 """Integer query facts owned by one immutable scalar input environment.
 
 An answer is reused only for the same expression and complete ordered premise
-sequence. No query result establishes definedness, completion or ownership;
-callers establish ordered guard definedness before consuming these relations.
+sequence. Ordered definedness checks validate unsigned operands before other
+queries consume a guard's relations; no query establishes completion or ownership.
 Tables die with this analysis, never live in process-global memoized methods.
 """
 
@@ -13,6 +13,8 @@ from ..diagnostics import CompileError
 from ..indexing import normalize
 from ..scalar import DIVISION, Expr, expression, infer, literal, substitute
 from .structured_schedule import Comparison
+
+_OPPOSITE = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
 
 
 def _query(method):
@@ -67,6 +69,51 @@ class IntegerFacts:
         return infer(value, self.facts)
 
     @_query
+    def ordered_definedness(
+        self, tests: tuple[Comparison, ...]
+    ) -> tuple[Comparison, tuple[Comparison, ...]] | None:
+        """Return the first missing unsigned premise and its ordered prefix.
+
+        Every operand in the current comparison is checked before that
+        comparison can establish a short-circuiting false guard. A later
+        comparison supplies no premise for an earlier expression.
+        """
+
+        def proved(test, prefix):
+            try:
+                return self.prove(test, prefix)
+            except CompileError as error:
+                if error.message != "index divisor must be provably positive and uniform":
+                    raise
+                # Polynomial normalization cannot use a prefix-only dynamic
+                # divisor fact. This query remains unproved, never a reason
+                # to skip a later expression or accept a missing operand fact.
+                return False
+
+        def check(value, prefix):
+            for child in value.args:
+                if isinstance(child, Expr) and (missing := check(child, prefix)) is not None:
+                    return missing
+            if value.kind in DIVISION:
+                numerator, divisor = value.args
+                for required in (
+                    Comparison(numerator, ">=", literal(0)),
+                    Comparison(divisor, ">", literal(0)),
+                ):
+                    if not proved(required, prefix):
+                        return required
+            return None
+
+        for index, test in enumerate(tests):
+            prefix = tests[:index]
+            for value in (test.lhs, test.rhs):
+                if (missing := check(value, prefix)) is not None:
+                    return missing, prefix
+            if proved(Comparison(test.lhs, _OPPOSITE[test.predicate], test.rhs), prefix):
+                return None
+        return None
+
+    @_query
     def bounded(self, value):
         """Normalize integer ring arithmetic while retaining division atoms.
 
@@ -81,7 +128,10 @@ class IntegerFacts:
                 return current
             if current.kind in {"add", "mul"}:
                 return expression(current.kind, *(encode(child) for child in current.args))
-            atom = expression(current.kind, *(self.bounded(child) for child in current.args))
+            # Cancel the surrounding integer ring without expanding an atom's
+            # domain: (g-1)*k can be nonnegative under its factor premise even
+            # when interval reasoning cannot bound the expanded g*k-k.
+            atom = current
             if atom.kind in {"floordiv", "ceildiv", "rem"} and atom.args[1].constant == 1:
                 return encode(literal(0) if atom.kind == "rem" else atom.args[0])
             if atom.kind == "rem" and (period := atom.args[1].constant) is not None:
@@ -178,6 +228,19 @@ class IntegerFacts:
             elif value.kind == "add":
                 calculated_lower = None if al is None or bl is None else al + bl
                 calculated_upper = None if au is None or bu is None else au + bu
+            elif any(arg.constant is not None for arg in value.args):
+                scalar, (minimum, maximum) = (
+                    (value.args[0].constant, (bl, bu))
+                    if value.args[0].constant is not None
+                    else (value.args[1].constant, (al, au))
+                )
+                if scalar == 0:
+                    calculated_lower, calculated_upper = 0, 0
+                else:
+                    if scalar < 0:
+                        minimum, maximum = maximum, minimum
+                    calculated_lower = None if minimum is None else scalar * minimum
+                    calculated_upper = None if maximum is None else scalar * maximum
             elif all(bound is not None for bound in (al, au, bl, bu)):
                 products = (al * bl, al * bu, au * bl, au * bu)
                 calculated_lower, calculated_upper = min(products), max(products)
@@ -186,8 +249,10 @@ class IntegerFacts:
                     0 if al is not None and bl is not None and al >= 0 and bl >= 0 else None
                 )
                 calculated_upper = None
-            lower = calculated_lower if lower is None else lower
-            upper = calculated_upper if upper is None else upper
+            if calculated_lower is not None:
+                lower = calculated_lower if lower is None else max(lower, calculated_lower)
+            if calculated_upper is not None:
+                upper = calculated_upper if upper is None else min(upper, calculated_upper)
         return lower, upper
 
     @_query

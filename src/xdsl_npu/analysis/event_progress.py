@@ -19,6 +19,7 @@ from ..diagnostics import CompileError, ErrorKind
 from ..scalar import Expr, expression, literal, substitute
 from ..target.ascend910b import Actor, Engine
 from .event_contracts import ProgressPoint, StructuredProgress, _Order
+from .event_domains import EventCase
 from .structured_protocols import BoundPlacement, LogicalNotification, NotificationKind
 from .structured_schedule import ActionGuard, Comparison
 
@@ -28,6 +29,7 @@ class ProgressPort:
     notification: LogicalNotification
     bound: BoundPlacement
     phase: str
+    case: EventCase
     bindings: tuple[tuple[Expr, Expr], ...] = ()
 
     @property
@@ -97,6 +99,17 @@ class InvocationBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class GuardedRank:
+    """A local SCC rank under a whole-kernel uniform parameter condition."""
+
+    condition: ActionGuard
+    nodes: tuple[int, ...]
+    relations: tuple[int, ...]
+    stride: int
+    rank: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StreamProgress:
     operation: Operation
     ports: tuple[ProgressPort, ...]
@@ -104,6 +117,7 @@ class StreamProgress:
     relations: tuple[GuardedTransfer, ...]
     stride: int
     rank: tuple[int, ...]
+    conditional_ranks: tuple[GuardedRank, ...] = ()
 
     @property
     def nodes(self):
@@ -134,10 +148,16 @@ class RegionProgress:
     stream: StreamProgress | None
     excluded_cycles: tuple[ExcludedCycle, ...] = ()
     controller_entries: tuple[ControllerEntries, ...] = ()
+    conditional_ranks: tuple[GuardedRank, ...] = ()
 
 
 def _guard(tests):
     return ActionGuard(tuple(dict.fromkeys(tests)))
+
+
+def _opposite(test):
+    predicates = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
+    return Comparison(test.lhs, predicates[test.predicate], test.rhs)
 
 
 def _key(port):
@@ -145,6 +165,7 @@ def _key(port):
         return (port.operation, port.actor, port.engine, port.phase, port.coordinates)
     return (
         id(port.notification),
+        id(port.case),
         port.phase,
         port.actor,
         port.bound.operation,
@@ -157,7 +178,7 @@ def _binding_key(port):
     """The complete actual placement and its containing proof binding."""
     if isinstance(port, QueueCut):
         return (QueueCut, port)
-    return (ProgressPort, id(port.notification), port.phase, port.bound, port.bindings)
+    return (ProgressPort, id(port.notification), port.case, port.phase, port.bound, port.bindings)
 
 
 _UNESTABLISHED = object()
@@ -179,6 +200,10 @@ def _label(node):
 
 
 class _Composer:
+    MAX_PATH_ALTERNATIVES = 64
+    MAX_PATH_COMBINATIONS = 100_000
+    MAX_CONDITIONAL_RANKS = 64
+
     def __init__(self, domains):
         self.domains = domains
         self.control = domains.control
@@ -188,6 +213,7 @@ class _Composer:
         # no notification-only or cross-compilation result is reused.
         self._bound_facts = {}
         self._invocation_facts = {}
+        self._path_work = {}
         self.root = domains.memory.module.body.block.first_op
         self.events = tuple(
             n for n in domains.notifications if n.mechanism is not NotificationKind.PIPE_FENCE
@@ -207,10 +233,10 @@ class _Composer:
         self.owners = {n: self._owner(n) for n in self.events}
         self.components = []
 
-    def fail(self, region, message, witness=()):
+    def fail(self, region, message, witness=(), *, kind=ErrorKind.UNSUPPORTED):
         raise CompileError(
             message,
-            kind=ErrorKind.UNSUPPORTED,
+            kind=kind,
             phase="structured-event-progress",
             location=str(region.location),
             witness=witness,
@@ -256,11 +282,14 @@ class _Composer:
             if not self._is_ancestor(self.owners[notification], region):
                 continue
             for phase, bounds in (("set", notification.sources), ("wait", notification.consumers)):
-                result.extend(
-                    ProgressPort(notification, bound, phase)
-                    for bound in bounds
-                    if self._inside(bound, region)
-                )
+                for case in self.domains.cases[notification]:
+                    if case.empty:
+                        continue
+                    for bound in bounds:
+                        if self._inside(bound, region):
+                            port = ProgressPort(notification, bound, phase, case)
+                            if not self._impossible(self._ambient(port)):
+                                result.append(port)
         return tuple(result)
 
     def _is_ancestor(self, ancestor, region):
@@ -279,7 +308,7 @@ class _Composer:
         key = _binding_key(port)
         instance = self._bound_facts.get(key)
         if instance is None:
-            instance = self.domains._instance(port.bound, dict(port.bindings))
+            instance = self.domains._instance(port.bound, dict(port.bindings), case=port.case)
             self._bound_facts[key] = instance
         return instance
 
@@ -299,18 +328,24 @@ class _Composer:
     def _stream_port(self, port, region):
         """Rebase logical ancestor translations onto one actual invocation."""
         bindings = {}
-        coordinates = dict(self._instance(port).coordinates)
+        instance = self._instance(port)
+        if self._impossible(instance.guard.comparisons):
+            return None
+        coordinates = dict(instance.coordinates)
         for loop in self._ancestors(region)[:-1]:
             if loop is self.root:
                 continue
             ordinal = self.control.loops[loop].ordinal
+            if loop not in coordinates:
+                self.fail(region, "active stream port has no established ancestor coordinate")
             offset = self.domains.arithmetic.normalize(
                 expression("sub", coordinates[loop], ordinal)
             ).constant
             if offset is None:
                 self.fail(region, "stream ancestor binding is not an actual unit-rate invocation")
             bindings[ordinal] = expression("sub", ordinal, literal(offset))
-        return self._bind_port(port, bindings)
+        port = self._bind_port(port, bindings)
+        return None if self._impossible(self._ambient(port)) else port
 
     def _invocation_guard(self, region, *ports):
         if region is self.root or len(ports) < 2:
@@ -347,7 +382,9 @@ class _Composer:
         return _guard(tuple(tests))
 
     def _window_guard(self, port, region):
-        guard = self.domains._window(port.notification, region).nonempty
+        guard = _guard(
+            port.case.condition.comparisons + port.case.window(region).nonempty.comparisons
+        )
         bindings = dict(port.bindings)
         return _guard(
             tuple(
@@ -368,6 +405,8 @@ class _Composer:
             else node
             for node in (relation.source, relation.destination)
         )
+        if any(node is None for node in endpoints):
+            return None
         first, last = (
             node.bindings if isinstance(node, ProgressPort) else () for node in endpoints
         )
@@ -398,21 +437,28 @@ class _Composer:
         return RegionInterface(
             interface.operation,
             tuple(
-                self._stream_port(port, region) if port.notification in streams else port
+                imported
                 for port in interface.ports
+                if (
+                    imported := self._stream_port(port, region)
+                    if port.notification in streams
+                    else port
+                )
+                is not None
             ),
             interface.cuts,
             tuple(
-                self._import_transfer(region, relation, streams) for relation in interface.relations
+                imported
+                for relation in interface.relations
+                if (imported := self._import_transfer(region, relation, streams)) is not None
             ),
         )
 
     def _impossible(self, tests):
-        opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
         tests = tuple(dict.fromkeys(tests))
         return any(
             self.domains.arithmetic.prove(
-                Comparison(test.lhs, opposite[test.predicate], test.rhs),
+                _opposite(test),
                 tests[:index] + tests[index + 1 :],
             )
             for index, test in enumerate(tests)
@@ -587,42 +633,37 @@ class _Composer:
         )
         return shift, _guard(invariant), False
 
-    def _rank(self, region, ports, arcs):
-        count, offsets = len(ports), [0] * len(ports)
-        stride, predecessor = count + 1, [None] * count
+    @staticmethod
+    def _rank_attempt(count, arcs, stride):
+        offsets, predecessor = [0] * count, [None] * count
+        by_index = dict(arcs)
         for _ in range(count):
             changed = None
-            for index, arc in enumerate(arcs):
+            for index, arc in arcs:
                 required = offsets[arc.source] + 1 - stride * arc.steps
                 if required > offsets[arc.destination]:
                     offsets[arc.destination] = required
                     predecessor[arc.destination] = index
                     changed = arc.destination
             if changed is None:
-                return stride, tuple(offsets)
+                return tuple(offsets), ()
         if not count:
-            return 1, ()
+            return (), ()
         cursor = changed
         for _ in range(count):
-            cursor = arcs[predecessor[cursor]].source
-        first, witness = cursor, []
-        while not witness or cursor != first:
-            arc = arcs[predecessor[cursor]]
-            witness.append(
-                f"{_label(ports[arc.source])} -> {_label(ports[arc.destination])}, clock step {arc.steps}: {arc.reason}"
-            )
+            cursor = by_index[predecessor[cursor]].source
+        first, cycle = cursor, []
+        while not cycle or cursor != first:
+            cycle.append(predecessor[cursor])
+            arc = by_index[predecessor[cursor]]
             cursor = arc.source
-        self.fail(
-            region,
-            "selected structured notifications have no increasing blocking-interface rank",
-            witness,
-        )
+        return None, tuple(cycle)
 
-    def _finite_proof(self, region, ports, arcs):
-        """SCC conditions are conjoined once, never expanded into path histories."""
-        adjacency = [[] for _ in ports]
-        for index, arc in enumerate(arcs):
-            adjacency[arc.source].append((arc.destination, index))
+    @staticmethod
+    def _components(count, arcs):
+        adjacency = [[] for _ in range(count)]
+        for _, arc in arcs:
+            adjacency[arc.source].append(arc.destination)
         counter, stack, onstack, ids, low, groups = 0, [], set(), {}, {}, []
 
         def visit(node):
@@ -631,7 +672,7 @@ class _Composer:
             counter += 1
             stack.append(node)
             onstack.add(node)
-            for destination, _ in adjacency[node]:
+            for destination in adjacency[node]:
                 if destination not in ids:
                     visit(destination)
                     low[node] = min(low[node], low[destination])
@@ -647,57 +688,155 @@ class _Composer:
                         break
                 groups.append(tuple(group))
 
-        for node in range(len(ports)):
+        for node in range(count):
             if node not in ids:
                 visit(node)
-        excluded = []
-        for group in groups:
-            members = set(group)
-            internal = tuple(
-                index
-                for index, arc in enumerate(arcs)
-                if arc.source in members and arc.destination in members
+        return tuple(groups)
+
+    def _conditional_proof(self, region, ports, arcs, *, stream):
+        """Split uniform predicates only inside a structurally cyclic SCC.
+
+        Each SCC independently covers the complete parameter domain. There is
+        no Cartesian product across notifications or SCCs, and a stream never
+        splits on a predicate that can change along its iterations.
+        """
+        count, stride = len(ports), len(ports) + 1
+        indexed = tuple(enumerate(arcs))
+        rank, cycle = self._rank_attempt(count, indexed, stride)
+        if not cycle:
+            return stride, rank, (), ()
+        uniform = tuple(self._export_guard(arc.guard, self.root) for arc in arcs)
+        certificates, excluded = [], []
+
+        def internal(group, candidates):
+            nodes = set(group)
+            return tuple(
+                (index, arc)
+                for index, arc in candidates
+                if arc.source in nodes and arc.destination in nodes
             )
-            if len(group) == 1 and not any(
-                arcs[index].source == arcs[index].destination for index in internal
-            ):
+
+        def cyclic(group, candidates):
+            return len(group) > 1 or any(arc.source == arc.destination for _, arc in candidates)
+
+        def finite_exclusions(condition, candidates):
+            result = []
+            for group in self._components(count, candidates):
+                edges = internal(group, candidates)
+                if not cyclic(group, edges):
+                    continue
+                if any(
+                    sum(arc.source == node for _, arc in edges) != 1
+                    or sum(arc.destination == node for _, arc in edges) != 1
+                    for node in group
+                ):
+                    return None
+                activation = _guard(
+                    condition.comparisons
+                    + tuple(test for _, arc in edges for test in arc.guard.comparisons)
+                )
+                if not self._impossible(activation.comparisons):
+                    return None
+                result.append(ExcludedCycle(tuple(index for index, _ in edges), activation))
+            return result
+
+        for group in self._components(count, indexed):
+            edges = internal(group, indexed)
+            if not cyclic(group, edges):
                 continue
-            # For a simple structural SCC this conjunction is the complete
-            # cycle condition. Multiple guarded cycles need a stronger local
-            # projection contract; choosing one path would be unsound.
-            if any(
-                sum(arcs[index].source == node for index in internal) != 1
-                or sum(arcs[index].destination == node for index in internal) != 1
-                for node in group
-            ):
+            work = 0
+
+            def establish(condition, group=group, edges=edges):
+                nonlocal work
+                work += 1
+                self.domains.work.progress_case_branches += 1
+                if work > self.MAX_CONDITIONAL_RANKS:
+                    self.fail(
+                        region,
+                        "uniform-case SCC progress exceeds its explicit branch budget",
+                        kind=ErrorKind.ANALYSIS_LIMIT,
+                    )
+                if self._impossible(condition.comparisons):
+                    return
+                active = tuple(
+                    (index, arc)
+                    for index, arc in edges
+                    if not self._impossible(condition.comparisons + uniform[index].comparisons)
+                )
+                local_rank, local_cycle = self._rank_attempt(count, active, stride)
+                if not local_cycle:
+                    certificates.append(
+                        GuardedRank(
+                            condition,
+                            tuple(group),
+                            tuple(index for index, _ in active),
+                            stride,
+                            tuple(local_rank[node] for node in group),
+                        )
+                    )
+                    return
+                if not stream and (impossible := finite_exclusions(condition, active)) is not None:
+                    excluded.extend(impossible)
+                    return
+                # Follow each witness's existing predicate order. A predicate
+                # is split only after all its earlier uniform prerequisites
+                # have already been established on this proof branch.
+                split = None
+                for index in local_cycle:
+                    for test in uniform[index].comparisons:
+                        if self.domains.arithmetic.prove(test, condition.comparisons):
+                            continue
+                        if not self.domains.arithmetic.prove(
+                            _opposite(test), condition.comparisons
+                        ):
+                            split = test
+                        break
+                    if split is not None:
+                        break
+                if split is not None:
+                    establish(_guard(condition.comparisons + (split,)))
+                    establish(_guard(condition.comparisons + (_opposite(split),)))
+                    return
+                if stream:
+                    message = "selected structured notifications have no increasing blocking-interface rank"
+                else:
+                    active_groups = self._components(count, active)
+                    branched = any(
+                        cyclic(part, (local := internal(part, active)))
+                        and any(
+                            sum(arc.source == node for _, arc in local) != 1
+                            or sum(arc.destination == node for _, arc in local) != 1
+                            for node in part
+                        )
+                        for part in active_groups
+                    )
+                    message = (
+                        "conditional region SCC needs an exact joint interface projection"
+                        if branched
+                        else "selected finite region has a possible blocking cycle under its shared activation condition"
+                        if all(arcs[index].exact for index in local_cycle)
+                        else "child blocking relation cannot be projected exactly for a possible parent cycle"
+                    )
                 self.fail(
                     region,
-                    "conditional region SCC needs an exact joint interface projection",
-                    tuple(arcs[index].reason for index in internal),
+                    message,
+                    tuple(
+                        f"{_label(ports[arcs[index].source])} -> {_label(ports[arcs[index].destination])}, "
+                        f"clock step {arcs[index].steps}: {arcs[index].reason}"
+                        for index in local_cycle
+                    ),
                 )
-            condition = _guard(
-                tuple(test for index in internal for test in arcs[index].guard.comparisons)
-            )
-            if self._impossible(condition.comparisons):
-                excluded.append(ExcludedCycle(internal, condition))
-                continue
-            exact = all(arcs[index].exact for index in internal)
-            message = (
-                "selected finite region has a possible blocking cycle under its shared activation condition"
-                if exact
-                else "child blocking relation cannot be projected exactly for a possible parent cycle"
-            )
-            self.fail(
-                region,
-                message,
-                tuple(
-                    f"{ports[arcs[index].source].notification.name}:{ports[arcs[index].source].phase} -> {ports[arcs[index].destination].notification.name}:{ports[arcs[index].destination].phase}: {arcs[index].reason}"
-                    for index in internal
-                ),
-            )
-        # DAG components and exclusions certify the finite graph; no
-        # unconditional numeric rank is claimed for its guarded cyclic arcs.
-        return tuple(excluded)
+
+            establish(ActionGuard())
+        return stride, (), tuple(certificates), tuple(excluded)
+
+    def _rank(self, region, ports, arcs):
+        stride, rank, conditional, _ = self._conditional_proof(region, ports, arcs, stream=True)
+        return stride, rank, conditional
+
+    def _finite_proof(self, region, ports, arcs):
+        _, _, conditional, excluded = self._conditional_proof(region, ports, arcs, stream=False)
+        return excluded, conditional
 
     def _export_guard(self, guard, region):
         return _guard(
@@ -858,17 +997,18 @@ class _Composer:
                     window
                     for port in graph_ports
                     if isinstance(port, ProgressPort)
-                    for window in self.domains.projections[port.notification]
+                    for window in port.case.projections
                 )
             ),
         )
         return graph, cuts
 
     def _paths(self, graph):
-        """One necessary-condition matrix, with exact direct witnesses."""
+        """Bounded ordered conjunctions, with OR across alternative routes."""
         ports, region = graph.ports, graph.operation
-        paths = [[None] * len(ports) for _ in ports]
-        direct, ordered_tests = {}, []
+        paths = [[{} for _ in ports] for _ in ports]
+        direct = {}
+        self._path_work[region] = 0
         for arc in graph.relations:
             a, b = ports[arc.source], ports[arc.destination]
             guard, projections = arc.guard, arc.projections
@@ -878,10 +1018,11 @@ class _Composer:
                 and a.phase == "set"
                 and b.phase == "wait"
                 and a.notification is b.notification
+                and a.case is b.case
                 and region in self.domains._clocks(a.notification)
             ):
                 guard = self._window_guard(a, region)
-                projections = self.domains.projections[a.notification]
+                projections = a.case.projections
             exported = self._export_guard(guard, region)
             witness = replace(
                 arc,
@@ -889,45 +1030,65 @@ class _Composer:
                 exact=arc.exact and exported == guard,
                 projections=projections,
             )
-            conditions = frozenset(exported.comparisons)
-            old = paths[arc.source][arc.destination]
-            paths[arc.source][arc.destination] = conditions if old is None else old & conditions
+            self._add_path(region, paths[arc.source][arc.destination], exported)
             direct.setdefault((arc.source, arc.destination), []).append(witness)
-            ordered_tests.extend(exported.comparisons)
-        return paths, direct, tuple(dict.fromkeys(ordered_tests))
+        return paths, direct
 
-    @staticmethod
-    def _eliminate(paths, members):
-        # Conditions compose by union along a path and intersection across
-        # alternatives. This enumerates structural ports, never path histories.
+    def _add_path(self, region, alternatives, guard):
+        self._path_work[region] += 1
+        self.domains.work.progress_path_combinations += 1
+        if self._path_work[region] > self.MAX_PATH_COMBINATIONS:
+            self.fail(
+                region,
+                "ordered region-interface alternative composition exceeds its budget",
+                kind=ErrorKind.ANALYSIS_LIMIT,
+            )
+        tests = frozenset(guard.comparisons)
+        if any(prior <= tests for prior in alternatives) or self._impossible(guard.comparisons):
+            return
+        for prior in tuple(alternatives):
+            if tests < prior:
+                del alternatives[prior]
+        # Keep the actual ordered witness, never sort predicates. A weaker
+        # existing conjunction absorbs a stronger alternative by Boolean OR.
+        alternatives[tests] = guard
+        self.domains.work.progress_path_alternatives += 1
+        if len(alternatives) > self.MAX_PATH_ALTERNATIVES:
+            self.fail(
+                region,
+                "region-interface OR alternatives exceed their explicit budget",
+                kind=ErrorKind.ANALYSIS_LIMIT,
+            )
+
+    def _eliminate(self, region, paths, members):
+        # This is structural reachability over ordered guard conjunctions.
+        # No notification-case product or runtime iteration is constructed.
         for k in members:
             for i in range(len(paths)):
-                if paths[i][k] is None:
+                left = tuple(paths[i][k].values())
+                if not left:
                     continue
                 for j in range(len(paths)):
-                    if paths[k][j] is None:
-                        continue
-                    conditions = paths[i][k] | paths[k][j]
-                    old = paths[i][j]
-                    paths[i][j] = conditions if old is None else old & conditions
+                    right = tuple(paths[k][j].values())
+                    for a in left:
+                        for b in right:
+                            self._add_path(
+                                region, paths[i][j], _guard(a.comparisons + b.comparisons)
+                            )
 
-    @staticmethod
-    def _path_guard(conditions, ordered_tests):
-        return _guard(tuple(test for test in ordered_tests if test in conditions))
-
-    def _boundary(self, graph, paths, direct, ordered_tests, count):
+    def _boundary(self, graph, paths, direct, count):
         result = []
         for i in range(count):
             for j in range(count):
-                conditions = paths[i][j]
-                if conditions is None:
-                    continue
-                witnesses = direct.get((i, j), ())
-                result.extend(witnesses)
-                if any(frozenset(arc.guard.comparisons) == conditions for arc in witnesses):
-                    continue
-                guard = self._path_guard(conditions, ordered_tests)
-                if not self._impossible(guard.comparisons):
+                for conditions, guard in paths[i][j].items():
+                    witnesses = tuple(
+                        arc
+                        for arc in direct.get((i, j), ())
+                        if frozenset(arc.guard.comparisons) == conditions
+                    )
+                    if witnesses:
+                        result.extend(witnesses)
+                        continue
                     result.append(
                         GuardedTransfer(
                             i,
@@ -939,39 +1100,32 @@ class _Composer:
                             (graph,),
                         )
                     )
-        return self._unique_arcs(
-            arc for arc in result if not self._impossible(arc.guard.comparisons)
-        )
+        return self._unique_arcs(result)
 
-    def _interface(self, graph, paths, direct, ordered_tests, ports, cuts):
+    def _interface(self, graph, paths, direct, ports, cuts):
         """Export only open notifications and this region's queue cuts."""
         retained = tuple(graph.ports.index(node) for node in ports + cuts)
         result = []
         for i in retained:
             for j in retained:
-                conditions = paths[i][j]
-                if conditions is None:
-                    continue
-                guard = self._path_guard(conditions, ordered_tests)
-                if self._impossible(guard.comparisons):
-                    continue
-                witness = next(
-                    (
-                        arc
-                        for arc in direct.get((i, j), ())
-                        if arc.exact and frozenset(arc.guard.comparisons) == conditions
-                    ),
-                    None,
-                )
-                result.append(
-                    InterfaceTransfer(
-                        graph.ports[i],
-                        graph.ports[j],
-                        guard,
-                        witness is not None,
-                        witness.projections if witness is not None else (graph,),
+                for conditions, guard in paths[i][j].items():
+                    witness = next(
+                        (
+                            arc
+                            for arc in direct.get((i, j), ())
+                            if arc.exact and frozenset(arc.guard.comparisons) == conditions
+                        ),
+                        None,
                     )
-                )
+                    result.append(
+                        InterfaceTransfer(
+                            graph.ports[i],
+                            graph.ports[j],
+                            guard,
+                            witness is not None,
+                            witness.projections if witness is not None else (graph,),
+                        )
+                    )
         return RegionInterface(graph.operation, ports, cuts, tuple(result))
 
     def _controller_entries(self, region, interfaces):
@@ -1052,6 +1206,8 @@ class _Composer:
             ]
             for a in sources:
                 for b in consumers:
+                    if ports[a].case is not ports[b].case:
+                        continue
                     invocation = self._invocation_guard(region, ports[a], ports[b])
                     if invocation is None:
                         continue
@@ -1138,8 +1294,14 @@ class _Composer:
         child_ports = tuple(port for interface in interfaces for port in interface.ports)
         ports, seen = [], set()
         own_ports = tuple(
-            self._stream_port(port, region) if port.notification in streams else port
+            imported
             for port in self._ports(region)
+            if (
+                imported := self._stream_port(port, region)
+                if port.notification in streams
+                else port
+            )
+            is not None
         )
         for port in own_ports + child_ports:
             if _key(port) not in seen:
@@ -1148,7 +1310,8 @@ class _Composer:
         stream_ports = tuple(port for port in ports if port.notification in streams)
         ports = tuple(port for port in ports if port.notification not in streams)
         if region is not self.root and any(
-            not self.control.invariant_over(dict(self._coordinates(port))[region], region)
+            region not in (coordinates := dict(self._coordinates(port)))
+            or not self.control.invariant_over(coordinates[region], region)
             for port in ports
         ):
             self.fail(
@@ -1160,17 +1323,18 @@ class _Composer:
             stream_cuts = tuple(cut for interface in interfaces for cut in interface.cuts)
             nodes = stream_ports + stream_cuts
             stream_arcs = self._local_arcs(region, nodes, streams, interfaces, stream=True)
-            stride, rank = self._rank(region, nodes, stream_arcs)
+            stride, rank, conditional = self._rank(region, nodes, stream_arcs)
             stream_proof = StreamProgress(
-                region, stream_ports, stream_cuts, stream_arcs, stride, rank
+                region, stream_ports, stream_cuts, stream_arcs, stride, rank, conditional
             )
             self.components.append((region, nodes, stream_arcs, rank, stride))
         own_finite = tuple(n for n in own if n not in streams)
         direct_arcs = self._local_arcs(region, ports, own_finite, (), stream=False)
         graph, cuts = self._graph(region, ports, stream_proof, direct_arcs, interfaces)
-        paths, direct, ordered_tests = self._paths(graph)
+        paths, direct = self._paths(graph)
         own_cut_keys = {_key(cut) for cut in cuts}
         self._eliminate(
+            region,
             paths,
             (
                 i
@@ -1178,14 +1342,24 @@ class _Composer:
                 if _key(graph.ports[i]) not in own_cut_keys
             ),
         )
-        arcs = self._boundary(graph, paths, direct, ordered_tests, len(ports))
-        excluded = self._finite_proof(region, ports, arcs)
+        arcs = self._boundary(graph, paths, direct, len(ports))
+        excluded, conditional = self._finite_proof(region, ports, arcs)
         open_ports = tuple(port for port in ports if self.owners[port.notification] is not region)
         open_keys = {_key(port) for port in open_ports}
-        self._eliminate(paths, (i for i in range(len(ports)) if _key(ports[i]) not in open_keys))
-        interface = self._interface(graph, paths, direct, ordered_tests, open_ports, cuts)
+        self._eliminate(
+            region, paths, (i for i in range(len(ports)) if _key(ports[i]) not in open_keys)
+        )
+        interface = self._interface(graph, paths, direct, open_ports, cuts)
         proof = RegionProgress(
-            region, ports, arcs, interface, children, stream_proof, excluded, controller_entries
+            region,
+            ports,
+            arcs,
+            interface,
+            children,
+            stream_proof,
+            excluded,
+            controller_entries,
+            conditional,
         )
         self.components.append((region, ports, arcs, (), 1))
         return proof

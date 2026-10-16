@@ -48,8 +48,10 @@ def mixed():
 def test_two_finite_uses_get_two_ids_without_selecting_reverse_events(finite):
     assert len(finite.assignments) == 2
     assert all(len(item.ids) == 2 for item in finite.assignments)
-    assert all(lease.inside[0].kind is LeaseKind.FINITE for lease in finite.leases)
-    assert all(not lease.reentries for lease in finite.leases)
+    assert all(
+        case.inside[0].kind is LeaseKind.FINITE for lease in finite.leases for case in lease.cases
+    )
+    assert all(not case.reentries for lease in finite.leases for case in lease.cases)
     assert {
         (item.notification.source_engine, item.notification.destination_engine)
         for item in finite.assignments
@@ -73,21 +75,23 @@ def test_real_parent_reentry_has_its_own_consumption_witness(repeated):
     invocations = [
         witness
         for lease in repeated.leases
-        for witness in lease.reentries
+        for case in lease.cases
+        for witness in case.reentries
         if witness.kind is LeaseKind.INVOCATION
     ]
     assert invocations and any(witness.delta == 2 for witness in invocations)
     assert all(witness.steps for witness in invocations)
     for lease in repeated.leases:
-        for witness in lease.inside + lease.reentries:
-            current = lease.notification
-            for step in witness.steps:
-                assert step.controller == (
-                    current.mechanism is NotificationKind.CROSS_EVENT
-                    or current.destination_engine is Engine.S
-                )
-                if step.notification is not None:
-                    current = step.notification
+        for case in lease.cases:
+            for witness in case.inside + case.reentries:
+                current = lease.notification
+                for step in witness.steps:
+                    assert step.controller == (
+                        current.mechanism is NotificationKind.CROSS_EVENT
+                        or current.destination_engine is Engine.S
+                    )
+                    if step.notification is not None:
+                        current = step.notification
 
 
 def test_missing_real_return_path_does_not_become_child_exit_completion(repeated):
@@ -99,7 +103,8 @@ def test_missing_real_return_path_does_not_become_child_exit_completion(repeated
         if n.source_engine is Engine.MTE2
         and n.sources[0].operation is selected.dependencies.memory.templates[0].operation
     )
-    parent = allocator.windows[ready][0].loop
+    (case,) = allocator.cases[ready]
+    parent = case.windows[0].loop
     remaining = replace(
         selected,
         notifications=tuple(n for n in selected.notifications if n.source_engine is Engine.MTE2),
@@ -107,7 +112,8 @@ def test_missing_real_return_path_does_not_become_child_exit_completion(repeated
         coverage=(),
     )
     allocator = prepared(remaining)
-    assert reentry(allocator, ready, parent, 2) is None
+    (case,) = allocator.cases[ready]
+    assert reentry(allocator, ready, case, case.window(parent), 2) is None
 
 
 def test_non_scalar_wait_only_gates_its_real_destination_queue():
@@ -119,16 +125,18 @@ def test_non_scalar_wait_only_gates_its_real_destination_queue():
         for n in selected.notifications
         if n.source_engine is Engine.V and n.destination_engine is Engine.MTE2
     )
-    loop = allocator.windows[forward][0].loop
+    (forward_case,) = allocator.cases[forward]
+    (reverse_case,) = allocator.cases[reverse]
+    loop = forward_case.windows[0].loop
     ordinal = allocator.control.loops[loop].ordinal
-    wait = allocator._instance(forward.consumers[0], {})
+    wait = allocator._instance(forward.consumers[0], {}, case=forward_case)
     source = allocator._instance(
-        forward.sources[0], {ordinal: expression("add", ordinal, literal(4))}
+        forward.sources[0], {ordinal: expression("add", ordinal, literal(4))}, case=forward_case
     )
     assert allocator._order(wait, source, ())
     assert not allocator._follows(forward, wait, forward, source, ())
     source = allocator._instance(
-        reverse.sources[0], {ordinal: expression("add", ordinal, literal(4))}
+        reverse.sources[0], {ordinal: expression("add", ordinal, literal(4))}, case=reverse_case
     )
     assert allocator._follows(forward, wait, reverse, source, ())
     assert not allocator._gate(forward)
@@ -142,6 +150,7 @@ def test_mode2_keeps_every_real_contributor_receiver_and_bounds_backlog(mixed):
     ]
     assert len(cross) == 2
     for assignment in cross:
+        assert len(assignment.ids) == 1 and all(case.width == 1 for case in assignment.cases)
         notification = assignment.notification
         assert (
             {b.actor for b in notification.sources},
@@ -155,9 +164,10 @@ def test_mode2_keeps_every_real_contributor_receiver_and_bounds_backlog(mixed):
             actor for a in actions if a.kind is SyncKind.CROSS_WAIT for actor in a.participants
         } == {b.actor for b in notification.consumers}
     assert all(
-        lease.backlog is not None and 1 <= lease.backlog <= CROSS_BACKLOG
+        case.backlog is not None and 1 <= case.backlog <= CROSS_BACKLOG
         for lease in mixed.leases
         if lease.notification.mechanism is NotificationKind.CROSS_EVENT
+        for case in lease.cases
     )
 
 

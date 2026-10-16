@@ -115,6 +115,8 @@ def definedness(domains, bound, parent):
         domains.arithmetic.prove,
         domains.arithmetic.bounds,
         lambda value: domains.control.invariant_over(value, parent.operation),
+        parameter_bindings={},
+        ordered_definedness=domains.arithmetic.ordered_definedness,
     )
     builder.definedness()
     return ActionGuard(guards)

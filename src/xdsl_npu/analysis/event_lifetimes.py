@@ -11,12 +11,14 @@ from ..scalar import expression, literal
 from .event_contracts import (
     CROSS_BACKLOG,
     LOCAL_CAPACITY,
+    CaseLease,
     LeaseKind,
     LeaseStep,
     LeaseWitness,
     StructuredEventLease,
 )
 from .structured_protocols import NotificationKind
+from .structured_schedule import ActionGuard
 
 MAX_INTERFACE_STEPS = 128
 
@@ -50,94 +52,136 @@ def bridge(domains, notification, old, goal, loop, delta, assumptions, candidate
     return None
 
 
-def roundtrip(domains, notification, window, width):
-    loop, delta = window.loop, width * window.period
+def roundtrip(domains, notification, case, window, width):
+    """Prove the nearest same-ID reuse in every member phase of this case."""
+    loop = window.loop
     logical = domains.control.loops[loop]
-    old_sources = tuple(domains._instance(p, {}) for p in notification.sources)
-    old_consumers = tuple(domains._instance(p, {}) for p in notification.consumers)
-    shifted = {logical.ordinal: window.next_same_id(width)}
-    next_sources = tuple(domains._instance(p, shifted) for p in notification.sources)
-    next_consumers = tuple(domains._instance(p, shifted) for p in notification.consumers)
-    assumptions = tuple(
-        dict.fromkeys(
-            window.same_id_guard(width).comparisons
-            + tuple(
-                test
-                for p in old_sources + old_consumers + next_sources + next_consumers
-                for test in p.guard.comparisons
-            )
-        )
-    )
-    candidates = []
-    for peer in domains.notifications:
-        if peer.mechanism is NotificationKind.PIPE_FENCE or not any(
-            w.loop is loop for w in domains.windows[peer]
-        ):
-            continue
-        # A bounded event/slot-distance search, never a loop-count scan.
-        for offset in range(-min(8, delta), delta + 1):
-            for sources, consumers in domains._instances(peer, loop, offset):
-                candidates.append((peer, sources, consumers))
+    old_sources = tuple(domains._instance(p, {}, case=case) for p in notification.sources)
+    old_consumers = tuple(domains._instance(p, {}, case=case) for p in notification.consumers)
     witnesses = []
-    for old in old_consumers:
-        for goal in next_sources:
-            chain = bridge(domains, notification, old, goal, loop, delta, assumptions, candidates)
-            if chain is None:
-                return None
-            witnesses.append(
-                LeaseWitness(
-                    LeaseKind.CONTROLLER if not chain[:-1] else LeaseKind.QUEUE_ROUNDTRIP,
-                    loop,
-                    delta,
-                    old,
-                    goal,
-                    chain,
+    for phase, delta in window.reuse_phases(width):
+        shifted = {logical.ordinal: expression("add", logical.ordinal, literal(delta))}
+        next_sources = tuple(domains._instance(p, shifted, case=case) for p in notification.sources)
+        next_consumers = tuple(
+            domains._instance(p, shifted, case=case) for p in notification.consumers
+        )
+        condition = ActionGuard(
+            tuple(dict.fromkeys(case.condition.comparisons + phase.comparisons))
+        )
+        assumptions = tuple(
+            dict.fromkeys(
+                condition.comparisons
+                + tuple(
+                    test
+                    for p in old_sources + old_consumers + next_sources + next_consumers
+                    for test in p.guard.comparisons
                 )
             )
+        )
+        candidates = []
+        for peer in domains.notifications:
+            if peer.mechanism is NotificationKind.PIPE_FENCE:
+                continue
+            for peer_case in domains.cases[peer]:
+                if peer_case.empty or not any(w.loop is loop for w in peer_case.windows):
+                    continue
+                # A bounded event/slot-distance search, never a loop-count scan.
+                for offset in range(-min(8, delta), delta + 1):
+                    for sources, consumers in domains._instances(peer, peer_case, loop, offset):
+                        candidates.append((peer, sources, consumers))
+        for old in old_consumers:
+            for goal in next_sources:
+                chain = bridge(
+                    domains, notification, old, goal, loop, delta, assumptions, candidates
+                )
+                if chain is None:
+                    return None
+                witnesses.append(
+                    LeaseWitness(
+                        LeaseKind.CONTROLLER if not chain[:-1] else LeaseKind.QUEUE_ROUNDTRIP,
+                        loop,
+                        delta,
+                        old,
+                        goal,
+                        chain,
+                        condition=condition,
+                    )
+                )
     return tuple(witnesses)
 
 
-def reentry(domains, notification, loop, delta=1):
-    candidates = []
-    horizon = delta + max((abs(peer.distance or 0) for peer in domains.notifications), default=0)
-    for peer in domains.notifications:
-        if peer.mechanism is NotificationKind.PIPE_FENCE:
-            continue
-        for offset in range(horizon + 1):
-            for sources, consumers in domains._instances(peer, loop, offset):
-                candidates.append((peer, sources, consumers))
-    old_sources, old_consumers = list(domains._instances(notification, loop, 0))[-1]
-    next_sources, next_consumers = next(domains._instances(notification, loop, delta))
-    assumptions = tuple(
-        test
-        for p in old_sources + old_consumers + next_sources + next_consumers
-        for test in p.guard.comparisons
-    )
+def reentry(domains, notification, case, window, width=1):
+    """Return from the last child use to the next same-ID real invocation."""
+    loop = window.loop
     witnesses = []
-    for old in old_consumers:
-        for goal in next_sources:
-            chain = bridge(domains, notification, old, goal, loop, delta, assumptions, candidates)
-            if chain is None:
-                return None
-            witnesses.append(LeaseWitness(LeaseKind.INVOCATION, loop, delta, old, goal, chain))
+    for phase, delta in window.reuse_phases(width):
+        candidates = []
+        horizon = delta + max(
+            (abs(peer.distance or 0) for peer in domains.notifications), default=0
+        )
+        for peer in domains.notifications:
+            if peer.mechanism is NotificationKind.PIPE_FENCE:
+                continue
+            for peer_case in domains.cases[peer]:
+                if peer_case.empty:
+                    continue
+                for offset in range(horizon + 1):
+                    for sources, consumers in domains._instances(peer, peer_case, loop, offset):
+                        candidates.append((peer, sources, consumers))
+        old_sources, old_consumers = list(domains._instances(notification, case, loop, 0))[-1]
+        next_sources, next_consumers = next(domains._instances(notification, case, loop, delta))
+        condition = ActionGuard(
+            tuple(dict.fromkeys(case.condition.comparisons + phase.comparisons))
+        )
+        assumptions = tuple(
+            dict.fromkeys(
+                condition.comparisons
+                + tuple(
+                    test
+                    for p in old_sources + old_consumers + next_sources + next_consumers
+                    for test in p.guard.comparisons
+                )
+            )
+        )
+        for old in old_consumers:
+            for goal in next_sources:
+                chain = bridge(
+                    domains, notification, old, goal, loop, delta, assumptions, candidates
+                )
+                if chain is None:
+                    return None
+                witnesses.append(
+                    LeaseWitness(
+                        LeaseKind.INVOCATION,
+                        loop,
+                        delta,
+                        old,
+                        goal,
+                        chain,
+                        condition=condition,
+                    )
+                )
     return tuple(witnesses)
 
 
-def establish_lease(domains, notification):
-    windows = domains.windows[notification]
+def _establish_case(domains, notification, case):
+    windows = case.windows
     capacity = (
         CROSS_BACKLOG if notification.mechanism is NotificationKind.CROSS_EVENT else LOCAL_CAPACITY
     )
     width, rings, inside, reentries = 1, [], [], []
+    consume = domains._instance(notification.consumers[0], {}, case=case)
+    source = domains._instance(notification.sources[0], {}, case=case)
     if not windows:
         inside.append(
             LeaseWitness(
                 LeaseKind.FINITE,
                 None,
                 0,
-                notification.consumers[0],
-                notification.sources[0],
+                consume,
+                source,
                 upper_uses=1,
+                condition=case.condition,
             )
         )
     for index in reversed(range(len(windows))):
@@ -149,15 +193,16 @@ def establish_lease(domains, notification):
                         LeaseKind.FINITE,
                         window.loop,
                         0,
-                        notification.consumers[0],
-                        notification.sources[0],
+                        consume,
+                        source,
                         upper_uses=window.upper,
+                        condition=case.condition,
                     ),
                 )
             elif index == len(windows) - 1:
-                witnesses = roundtrip(domains, notification, window, candidate)
+                witnesses = roundtrip(domains, notification, case, window, candidate)
             else:
-                witnesses = reentry(domains, notification, window.loop, candidate * window.period)
+                witnesses = reentry(domains, notification, case, window, candidate)
             if witnesses is not None:
                 break
         else:
@@ -179,11 +224,22 @@ def establish_lease(domains, notification):
         )
         ordinal = expression("add", expression("mul", ordinal, literal(ring)), local)
     cross = notification.mechanism is NotificationKind.CROSS_EVENT
-    lease = StructuredEventLease(
-        notification,
+    return CaseLease(
+        case,
         1 if cross else width,
+        ordinal,
+        tuple(rings),
         tuple(inside),
         tuple(reentries),
         width if cross else None,
     )
-    return lease, ordinal
+
+
+def establish_lease(domains, notification):
+    """Prove every nonempty case before reserving one shared physical ring."""
+    cases = tuple(
+        _establish_case(domains, notification, case)
+        for case in domains.cases[notification]
+        if not case.empty
+    )
+    return StructuredEventLease(notification, max((case.width for case in cases), default=0), cases)

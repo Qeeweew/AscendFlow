@@ -67,6 +67,7 @@ def window(control, logical, extra=(), domains=()):
         facts=control.environment.facts,
         proves=predicates.prove,
         bounds=predicates.bounds,
+        ordered_definedness=predicates.ordered_definedness,
         invariant=lambda value: control.invariant_over(value, logical.operation),
     )
 

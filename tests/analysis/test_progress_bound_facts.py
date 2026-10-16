@@ -21,8 +21,9 @@ def invocation(domains):
     composer = _Composer(domains)
     parent, child = domains.control.loops
     notification = next(n for n in domains.notifications if composer.owners[n] is parent)
-    source = ProgressPort(notification, notification.sources[0], "set")
-    wait = ProgressPort(notification, notification.consumers[0], "wait")
+    (case,) = domains.cases[notification]
+    source = ProgressPort(notification, notification.sources[0], "set", case)
+    wait = ProgressPort(notification, notification.consumers[0], "wait", case)
     return composer, parent, child, source, wait
 
 
@@ -30,9 +31,11 @@ def count_instances(monkeypatch):
     calls = []
     original = EventDomains._instance
 
-    def instance(self, bound, bindings):
-        calls.append((bound, bindings))
-        return original(self, bound, bindings)
+    def instance(self, bound, bindings, *, case, extra_coordinate_guards=()):
+        calls.append((bound, bindings, case, extra_coordinate_guards))
+        return original(
+            self, bound, bindings, case=case, extra_coordinate_guards=extra_coordinate_guards
+        )
 
     monkeypatch.setattr(EventDomains, "_instance", instance)
     return calls
