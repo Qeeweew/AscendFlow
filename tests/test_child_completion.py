@@ -11,11 +11,12 @@ from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.child_completion import ChildPort, project_fixed_child
 from xdsl_npu.completion import CountDomain, Position, Site, covers
 from xdsl_npu.completion_flow import ALL
-from xdsl_npu.ir import LoopSyncOp, TaskOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import LoopSyncOp, TaskOp
 from xdsl_npu.loop_graph import Command, Graph
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.mixed import compose
-from xdsl_npu.model import CompileError
 from xdsl_npu.native_order import instruction_points
 from xdsl_npu.sequence_sync import verify_sequence
 from xdsl_npu.symbolic_completion import Family, SymbolicCompletion

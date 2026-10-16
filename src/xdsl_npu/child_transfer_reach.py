@@ -8,7 +8,7 @@ engine never expands a fixed trip count or constructs all endpoint pairs.
 
 from .budget import poll
 from .completion_flow import ALL
-from .model import require
+from .diagnostics import require
 from .symbolic_completion import CompletionTopology, Family, SymbolicCompletion
 
 Binding = tuple[int, tuple[int, int]]

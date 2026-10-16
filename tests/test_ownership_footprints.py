@@ -6,13 +6,14 @@ from types import SimpleNamespace
 import pytest
 from xdsl.dialects.builtin import IntAttr
 
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.loop_model import (
     Loop,
     _check_accesses,
     _ownership_footprints,
     verify_access_ownership,
 )
-from xdsl_npu.model import CompileError, Ref, Storage
+from xdsl_npu.model import Ref, Storage
 
 
 def storage(size=16384):

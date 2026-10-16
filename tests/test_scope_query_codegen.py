@@ -12,9 +12,9 @@ from tests.test_scope_serial_source import SOURCE
 from xdsl_npu import language as N
 from xdsl_npu.budget import limit
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import QueryChannelOp, QuerySyncOp, ScopeSyncOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import QueryChannelOp, QuerySyncOp, ScopeSyncOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scalar import bindings
 from xdsl_npu.scope_codegen import emit_scope_actor, emit_scopes, scope_boundary
 from xdsl_npu.scope_model import extract_scopes

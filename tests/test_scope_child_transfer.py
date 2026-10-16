@@ -10,7 +10,7 @@ from tests.test_scope_completion import Parent
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.child_completion import project_fixed_child
 from xdsl_npu.completion import CountDomain, Position, Site
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.scope_child_transfer import (
     ConditionalChildTransfer,
     FixedChildTransfer,

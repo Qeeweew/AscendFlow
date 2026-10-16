@@ -8,8 +8,10 @@ from tests.fixtures.physical_state import recurrent_gdn
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.check import bounded_check
-from xdsl_npu.ir import SyncOp, TaskOp, dump, parse
-from xdsl_npu.model import CompileError, Instance, dependencies, extract
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import SyncOp, TaskOp
+from xdsl_npu.model import Instance, dependencies, extract
 from xdsl_npu.sync import completion_graph, execution
 
 

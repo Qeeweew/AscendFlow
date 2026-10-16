@@ -12,18 +12,10 @@ from time import perf_counter
 from xdsl.dialects.builtin import IntAttr, ModuleOp, StringAttr
 
 from .budget import bounded
-from .ir import ChannelOp, KernelOp, StreamOp, SyncOp, TaskOp
-from .model import (
-    IMPLICIT_COMPLETION,
-    CompileError,
-    Instance,
-    Program,
-    dependencies,
-    extract,
-    optional_int,
-    require,
-    storage_layout,
-)
+from .diagnostics import CompileError, require
+from .dialects.physical import ChannelOp, KernelOp, StreamOp, SyncOp, TaskOp
+from .model import Instance, Program, dependencies, extract, optional_int, storage_layout
+from .target.native import IMPLICIT_COMPLETION
 
 
 @dataclass(frozen=True)
@@ -397,7 +389,7 @@ def verify_plan(module: ModuleOp, *, _imports=(), _details=False):
 
         require(not _imports, "symbolic proof cannot assume finite imports")
         return verify_loop(module, _details=_details)
-    from .ir import MixedOp, StaticDispatchOp
+    from .dialects.physical import MixedOp, StaticDispatchOp
 
     if isinstance(module.body.block.first_op, StaticDispatchOp):
         from .dispatch import verify_dispatch
@@ -510,7 +502,7 @@ def arithmetic_span(epochs):
 
 @bounded
 def explain_plan(module: ModuleOp) -> dict:
-    from .ir import MixedOp, StaticDispatchOp
+    from .dialects.physical import MixedOp, StaticDispatchOp
     from .loop_model import is_symbolic
 
     if is_symbolic(module):
@@ -645,7 +637,7 @@ def autosync(module: ModuleOp, *, _imports=(), _capture=None, _facts=None) -> Mo
 
         require(not _imports, "nested planning must discharge its actual parent entry reads")
         return autosync_scopes(module, _capture=_capture, _facts=_facts)
-    from .ir import MixedOp, StaticDispatchOp
+    from .dialects.physical import MixedOp, StaticDispatchOp
     from .loop_model import is_symbolic
     from .sequence_model import is_sequence
 

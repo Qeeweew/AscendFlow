@@ -7,11 +7,11 @@ import pytest
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from xdsl_npu import language as N
-from xdsl_npu.ir import CallOp, CaptureOp, ScopeChannelOp, ScopeSyncOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import CallOp, CaptureOp, ScopeChannelOp, ScopeSyncOp
+from xdsl_npu.dialects.source import ProgramOp
 from xdsl_npu.scope_codegen import emit_scopes, scope_boundary
 from xdsl_npu.scope_lowering import lower_scopes
-from xdsl_npu.source_ir import ProgramOp
 
 VECTOR = """
     def nested(X:N.Tensor((GROUPS,n,2,64),N.f32),

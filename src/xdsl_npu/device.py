@@ -10,8 +10,8 @@ import re
 import subprocess
 from pathlib import Path
 
-from .model import require
-from .toolchain import CANN
+from .backend.cann import CANN
+from .diagnostics import require
 
 
 def health_snapshot(physical: int, output: Path) -> dict:

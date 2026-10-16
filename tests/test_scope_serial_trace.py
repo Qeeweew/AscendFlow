@@ -10,9 +10,8 @@ from xdsl.dialects import arith, scf
 
 from tests.fixtures.scoped_queries import GROUPS, scoped_query_recurrence
 from tests.test_index_frontend import evaluate as evaluate_index
-from xdsl_npu.ir import dump, parse
-from xdsl_npu.model import ITEMSIZE
-from xdsl_npu.source_ir import (
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.source import (
     AllocationOp,
     CopyOp,
     DomainOp,
@@ -26,6 +25,7 @@ from xdsl_npu.source_ir import (
     ViewOp,
     YieldOp,
 )
+from xdsl_npu.target.native import ITEMSIZE
 
 
 def view(ref):

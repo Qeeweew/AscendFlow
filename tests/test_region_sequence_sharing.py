@@ -13,7 +13,7 @@ from xdsl_npu import region_sequence
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.budget import poll
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.model import CompileError, require
+from xdsl_npu.diagnostics import CompileError, require
 from xdsl_npu.region_sequence import (
     Cell,
     Endpoint,

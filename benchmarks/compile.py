@@ -66,7 +66,7 @@ def worker(path, *, entry, parameters, mode, metadata, deadline, artifacts=None)
     """Measure all input work through immutable ASC/IR snapshot construction."""
     started = perf_counter()
     import xdsl_npu
-    from xdsl_npu.ir import parse
+    from xdsl_npu.dialects.io import parse
 
     imported = perf_counter()
     package = Path(xdsl_npu.__file__).parent

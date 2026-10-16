@@ -4,8 +4,9 @@ from dataclasses import dataclass
 
 from xdsl.dialects import scf
 
-from .ir import BufferOp, FrameOp, OnceOp, StreamOp
-from .model import Storage, optional_int, require
+from .diagnostics import require
+from .dialects.physical import BufferOp, FrameOp, OnceOp, StreamOp
+from .model import Storage, optional_int
 from .scalar import Expr, expression, literal
 
 

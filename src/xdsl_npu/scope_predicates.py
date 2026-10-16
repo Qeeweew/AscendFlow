@@ -8,10 +8,10 @@ Four fixed analysis cases classify native effects without expanding runtime N.
 from xdsl.dialects import arith, scf
 
 from .completion import CountDomain, Position
-from .model import require
+from .diagnostics import require
+from .dialects.source import PipelineOp
 from .scalar import expression, from_ssa, literal
 from .scope_domains import Activation
-from .source_ir import PipelineOp
 
 PARENT_CASES = ("single", "first", "middle", "last")
 

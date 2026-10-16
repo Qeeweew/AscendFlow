@@ -4,7 +4,8 @@ import random
 
 import pytest
 
-from xdsl_npu.model import CompileError, Instance, Program, Ref, Storage, Task, dependencies
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.model import Instance, Program, Ref, Storage, Task, dependencies
 
 
 def byte_frontier(program):

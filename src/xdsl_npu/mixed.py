@@ -14,7 +14,8 @@ from dataclasses import dataclass, replace
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, ModuleOp, StringAttr
 from xdsl.ir import Block, Region
 
-from .ir import (
+from .diagnostics import CompileError, require
+from .dialects.physical import (
     BufferOp,
     ChannelOp,
     CrossChannelOp,
@@ -28,14 +29,12 @@ from .ir import (
     TaskOp,
 )
 from .model import (
-    CompileError,
     Instance,
     Program,
     Ref,
     dependencies,
     extract,
     optional_int,
-    require,
     verify_translated_owners,
 )
 from .sync import Graph, autosync, execution, parts

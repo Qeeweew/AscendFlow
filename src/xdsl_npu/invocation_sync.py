@@ -11,9 +11,9 @@ from dataclasses import dataclass, replace
 from xdsl.dialects.builtin import IntAttr, StringAttr
 
 from .completion import Point, Requirement, Site, covers, intersection
-from .ir import InvocationChannelOp, InvocationSyncOp, LoopChannelOp, TaskOp
+from .diagnostics import require
+from .dialects.physical import InvocationChannelOp, InvocationSyncOp, LoopChannelOp, TaskOp
 from .loop_boundary import stream_operations
-from .model import require
 from .region_completion import RegionCompletion
 from .region_summary import (
     Access,

@@ -5,8 +5,10 @@ import pytest
 from tests.fixtures.physical_operators import batched_matmul_nt, rms_norm, rope, softmax, swiglu
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
-from xdsl_npu.ir import ChannelOp, SyncOp, dump, parse
-from xdsl_npu.model import CompileError, dependencies, extract
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import ChannelOp, SyncOp
+from xdsl_npu.model import dependencies, extract
 
 
 @pytest.mark.parametrize(
@@ -187,7 +189,7 @@ def test_matmul_releases_l1_at_load2d_and_l0_at_mad():
 def test_matmul_cannot_accumulate_an_uninitialized_l0c_carry():
     from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
-    from xdsl_npu.ir import TaskOp
+    from xdsl_npu.dialects.physical import TaskOp
 
     source = batched_matmul_nt(1, 16, 16, 32, k_block=16)
     task = next(t for t in source.walk() if isinstance(t, TaskOp) and t.uid.data == "mad_init")

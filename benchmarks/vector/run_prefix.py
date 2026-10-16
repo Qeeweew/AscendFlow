@@ -8,9 +8,9 @@ from pathlib import Path
 
 from examples.vector.prefix import scale_prefix
 from xdsl_npu import compile
+from xdsl_npu.backend.cann import offline_compile
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.model import require
-from xdsl_npu.toolchain import offline_compile
+from xdsl_npu.diagnostics import require
 
 
 def main():

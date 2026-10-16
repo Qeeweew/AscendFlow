@@ -10,9 +10,9 @@ from tests.test_scope_query_transitions import FiniteQueryTransitions
 from xdsl_npu import scope_query_planning
 from xdsl_npu.budget import limit
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import QueryChannelOp, QuerySyncOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import QueryChannelOp, QuerySyncOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_query_checks import prepare_memory_checks
 from xdsl_npu.scope_query_completion import QueryCompletion, QueryEvent, QuerySite

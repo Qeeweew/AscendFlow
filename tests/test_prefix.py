@@ -7,10 +7,19 @@ from xdsl.dialects.builtin import IntAttr
 from examples.vector.prefix import scale_prefix
 from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile, verify_plan
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import (
+    BufferOp,
+    LoopChannelOp,
+    LoopSyncOp,
+    RuntimeSizeOp,
+    StreamOp,
+    TaskOp,
+    ViewOp,
+)
 from xdsl_npu.frontend import from_source
-from xdsl_npu.ir import BufferOp, LoopChannelOp, LoopSyncOp, RuntimeSizeOp, StreamOp, TaskOp, ViewOp
 from xdsl_npu.loop_sync import verify_loop
-from xdsl_npu.model import CompileError, Program
+from xdsl_npu.model import Program
 
 
 @pytest.fixture(scope="module")

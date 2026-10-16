@@ -8,8 +8,8 @@ import pytest
 
 from xdsl_npu.completion import CountDomain, Position
 from xdsl_npu.completion_flow import ALL
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.loop_graph import Command, Graph
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_domains import Activation
 from xdsl_npu.scope_guarded_completion import GuardedCompletion
 

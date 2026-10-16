@@ -4,10 +4,10 @@ import pytest
 from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
 from xdsl_npu import language as N
-from xdsl_npu.ir import BufferOp, RuntimeSizeOp, StreamOp, TaskOp, ViewOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import BufferOp, RuntimeSizeOp, StreamOp, TaskOp, ViewOp
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 
 SOURCE = """
 def local_frames(

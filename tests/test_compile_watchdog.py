@@ -8,8 +8,9 @@ from time import monotonic
 
 import pytest
 
-from xdsl_npu import toolchain
-from xdsl_npu.build import bounded_process, build_file, build_module
+from xdsl_npu.backend import cann
+from xdsl_npu.build import build_file, build_module
+from xdsl_npu.runtime.process import bounded_process
 
 
 def test_operator_watchdog_stops_and_records_cpu_compilation(tmp_path):
@@ -39,11 +40,11 @@ def test_cann_watchdog_kills_the_process_group_and_invalidates_manifest(tmp_path
         processes.append(process)
         return process
 
-    monkeypatch.setattr(toolchain.subprocess, "Popen", compiler)
+    monkeypatch.setattr(cann.subprocess, "Popen", compiler)
     manifest = tmp_path / "test.compile.json"
     manifest.write_text('{"status":"old success"}')
     with pytest.raises(TimeoutError, match="process group killed"):
-        toolchain.offline_compile("source", tmp_path, "test", timeout_s=0.1)
+        cann.offline_compile("source", tmp_path, "test", timeout_s=0.1)
     assert processes[0].poll() is not None
     assert not manifest.exists()
     record = json.loads((tmp_path / "test.timeout.json").read_text())
@@ -80,7 +81,7 @@ def fake_cann(tmp_path, monkeypatch, *, pause=0, background=False, exit_code=0):
         executable = binary / name
         executable.write_text(script)
         executable.chmod(0o755)
-    monkeypatch.setattr(toolchain, "CANN", root)
+    monkeypatch.setattr(cann, "CANN", root)
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])
@@ -91,10 +92,10 @@ def test_standalone_cann_reaps_background_children_after_any_exit(tmp_path, monk
     output = tmp_path / "output"
     if exit_code:
         with pytest.raises(RuntimeError, match="CANN failed"):
-            toolchain.offline_compile("reference", output, "reference", shared=True, timeout_s=3)
+            cann.offline_compile("reference", output, "reference", shared=True, timeout_s=3)
         assert not list(output.glob("*.compile.json"))
     else:
-        toolchain.offline_compile("reference", output, "reference", shared=True, timeout_s=3)
+        cann.offline_compile("reference", output, "reference", shared=True, timeout_s=3)
     # DEVNULL keeps the background process out of communicate()'s pipe lifetime.
     # Its delayed side effect detects escape without looking for unrelated PIDs.
     assert len(list((tmp_path / "children").glob("started-*"))) == (1 if exit_code else 4)
@@ -127,7 +128,7 @@ def test_cann_phases_do_not_restart_the_standalone_deadline(tmp_path, monkeypatc
     fake_cann(tmp_path, monkeypatch, pause=0.15)
     output = tmp_path / "output"
     with pytest.raises(TimeoutError, match="shared deadline"):
-        toolchain.offline_compile("reference", output, "reference", shared=True, timeout_s=0.4)
+        cann.offline_compile("reference", output, "reference", shared=True, timeout_s=0.4)
     assert not list(output.glob("*.compile.json"))
     assert not list(output.glob("*.aibin"))
     assert not list(output.glob("*.so"))
@@ -256,9 +257,9 @@ def test_shared_group_cann_cannot_start_an_independent_shorter_timeout(tmp_path,
 
     monkeypatch.setenv("XDSL_NPU_BUILD_GROUP", "1")
     monkeypatch.setenv("XDSL_NPU_BUILD_DEADLINE", str(monotonic() + 3))
-    monkeypatch.setattr(toolchain.subprocess, "Popen", no_spawn)
+    monkeypatch.setattr(cann.subprocess, "Popen", no_spawn)
     with pytest.raises(ValueError, match="must inherit the outer deadline"):
-        toolchain.offline_compile("reference", tmp_path / "inner", "inner", timeout_s=0.05)
+        cann.offline_compile("reference", tmp_path / "inner", "inner", timeout_s=0.05)
     assert not (tmp_path / "inner").exists()
 
 
@@ -318,8 +319,8 @@ def test_command_watchdog_cannot_leave_a_nested_cli_worker_or_its_child(tmp_path
 
 def test_file_ast_build_specializes_then_publishes_a_checked_plan(tmp_path):
     from benchmarks.artifacts import read_artifact
-    from xdsl_npu.ir import LoopChannelOp, LoopSyncOp
-    from xdsl_npu.model import CompileError
+    from xdsl_npu.diagnostics import CompileError
+    from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp
     from xdsl_npu.sync import verify_plan
 
     source = Path(__file__).parents[1] / "examples/vector/scale.py"
@@ -347,7 +348,7 @@ def test_file_ast_build_specializes_then_publishes_a_checked_plan(tmp_path):
 
 def test_source_only_reference_artifact_does_not_import_stale_plan_ir(tmp_path):
     from benchmarks.artifacts import read_artifact
-    from xdsl_npu.model import CompileError
+    from xdsl_npu.diagnostics import CompileError
 
     (tmp_path / "after.xdsl").write_text("stale compiler plan")
     report = build_module(lambda: "reference source", tmp_path, name="reference", timeout_s=2)

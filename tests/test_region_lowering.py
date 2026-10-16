@@ -7,8 +7,8 @@ import pytest
 from examples.state.grouped import grouped_state_sum
 from xdsl_npu import compile
 from xdsl_npu import language as N
-from xdsl_npu.ir import dump
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
 
 
 def test_work_outside_nested_parent_is_refused_before_native_construction(monkeypatch):

@@ -14,7 +14,7 @@ from itertools import islice
 from .budget import poll
 from .completion import _first, canonical, count_domain, intersection
 from .completion_flow import ALL, _includes
-from .model import require
+from .diagnostics import require
 
 FACT_STATISTICS = (
     "fact_nodes",

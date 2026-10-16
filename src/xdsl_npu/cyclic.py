@@ -7,8 +7,8 @@ an owner-local bound is never evidence that its addresses stay in the total.
 
 from dataclasses import dataclass
 
+from .diagnostics import require
 from .indexing import equivalent
-from .model import require
 from .scalar import Expr, expression, literal
 
 CORE = Expr("argument", ("$core",))

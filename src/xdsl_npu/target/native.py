@@ -1,0 +1,570 @@
+"""Trusted dav-2201 native footprints and machine resource contracts.
+
+The contracts consume physical reference descriptions. They do not extract
+programs, enumerate finite instances, or plan synchronization.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from ..diagnostics import CompileError, require
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from ..model import Ref, Task
+
+
+CAPACITY = {
+    "UB": 192 * 1024,
+    "L1": 512 * 1024,
+    "L0A": 64 * 1024,
+    "L0B": 64 * 1024,
+    "L0C": 128 * 1024,
+}
+
+
+ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2}
+
+
+IMPLICIT_COMPLETION = {"S"}
+
+
+# Current supported MAD clear-cycle policy, independent of finite expansion.
+# This is an implementation range, not a hardware resource or instruction limit.
+MAX_MAD_CYCLE = 4096
+
+
+def implicit_completion(task: Task) -> bool:
+    if task.pipe in IMPLICIT_COMPLETION:
+        return True
+    if task.pipe != "M":
+        return False
+    m, n = (16, 16) if task.native == "mad16" else task.params[:2]
+    # AtlasA2 CATLASS TileMmad fences short instructions: <10 output
+    # fractals cannot supply the prior blanket M completion guarantee.
+    return (m // 16) * (n // 16) >= 10
+
+
+def check_load3d(tasks: Iterable[Task], config: tuple[int, int] | None):
+    """Only the explicit root initializer may write the Load3D register state.
+
+    All other admitted natives preserve it; opaque/external calls are rejected
+    by native_contract. The initializer's local S->MTE1 pair is fully consumed
+    before stream dispatch, so event ID0 has no lifetime inside any loop.
+    """
+    for task in tasks:
+        if task.native in {"load3d_a", "load3d_b_nn"}:
+            index = 0 if task.native == "load3d_a" else 1
+            require(
+                config is not None and config[index] == task.params[0],
+                "Load3D needs a preceding matching invariant FMATRIX configuration",
+            )
+
+
+def _disjoint_ub_copy(source: Ref, destination: Ref):
+    """Prove disjoint contiguous operands without a memmove assumption.
+
+    Different physical UB allocations are separate. For two views of one
+    allocation, equal translations leave a constant relative displacement;
+    this remains valid for every generation, owner and runtime count. Other
+    aliases require a stronger native overlap contract and are rejected.
+    """
+    if source.storage != destination.storage:
+        return True
+
+    def translation(ref):
+        generation, core = {}, {}
+        for _, stride, modulus, divisor in ref.terms:
+            key = modulus, divisor
+            generation[key] = generation.get(key, 0) + stride
+        for stride, divisor, modulus in ref.core_terms:
+            key = modulus, divisor
+            core[key] = core.get(key, 0) + stride
+        return (
+            {key: stride for key, stride in generation.items() if stride},
+            {key: stride for key, stride in core.items() if stride},
+            ref.count_offset,
+            ref.count_core_stride,
+        )
+
+    displacement = sum(term[0] for term in destination.terms) - sum(
+        term[0] for term in source.terms
+    )
+    return (
+        translation(source) == translation(destination) and abs(displacement) >= source.total_nbytes
+    )
+
+
+def native_contract(
+    native: str, refs: tuple[Ref, ...], params: tuple[int, ...]
+) -> tuple[str, tuple[str, ...]]:
+    """Validate a physical native footprint and return its engine and access modes.
+
+    Bounds, ownership, and completion coverage remain obligations of the
+    consuming analysis; an admitted native does not supply those proofs.
+    """
+    if native in {"load3d_a", "load3d_b_nn"}:
+        # Complete b16 matrix, unit filters/strides, zero padding. Layout and
+        # byte footprints are identical to the corresponding audited Load2D.
+        return native_contract("load2d_a" if native == "load3d_a" else "load2d_b_nn", refs, params)
+    banks = tuple(r.storage.bank for r in refs)
+    dtypes = tuple(r.dtype for r in refs)
+    lengths = tuple(r.total_nbytes for r in refs)
+    layouts = tuple(r.layout for r in refs)
+    if native == "copy":
+        require(all(r.contiguous for r in refs), "DMA recipe requires contiguous physical views")
+        require(len(refs) == 2 and lengths[0] == lengths[1], "copy needs equal native footprints")
+        require(dtypes[0] == dtypes[1], "copy cannot silently convert dtype")
+        routes = {
+            ("GM", "UB"): "MTE2",
+            ("UB", "GM"): "MTE3",
+            ("GM", "L1"): "MTE2",
+            ("L1", "L0A"): "MTE1",
+            ("L1", "L0B"): "MTE1",
+            ("UB", "UB"): "V",
+        }
+        require(banks in routes, f"unsupported dav-2201 DMA route {banks}; no hidden GM staging")
+        require(not params, "copy has no unchecked native parameters")
+        if banks[0] == "L1":
+            expected = ("NZ", "ZZ" if banks[1] == "L0A" else "ZN")
+            require(
+                dtypes[0] == dtypes[1] in {"f16", "bf16"}
+                and lengths == (512, 512)
+                and layouts == expected,
+                "L1->L0 requires one complete b16 16x16 fractal",
+            )
+        else:
+            require(layouts[0] == layouts[1], "raw DMA must preserve physical layout")
+            require(
+                lengths[0] % 32 == 0 and 0 < lengths[0] <= 65535 * 32,
+                "raw DMA footprint must be positive, 32-byte aligned and fit burst length",
+            )
+        if banks == ("UB", "UB"):
+            # CANN 9.1/2201 asc_copy_ub2ub uses copy_ubuf_to_ubuf on PIPE_V.
+            # Its size is bytes, divided by 32 into a uint16_t burst length.
+            require(
+                all(ref.prefix_extent is None and not ref.tail_nbytes for ref in refs),
+                "UB-to-UB copy requires fixed complete 32-byte blocks",
+            )
+            require(
+                _disjoint_ub_copy(*refs),
+                "UB-to-UB copy requires provably disjoint source and destination ranges; "
+                "overlapping or changing aliases are unsupported",
+            )
+        return routes[banks], ("R", "W")
+    if native == "copy_rows":
+        require(
+            len(refs) == 2
+            and banks in {("GM", "UB"), ("UB", "GM")}
+            and dtypes[0] == dtypes[1]
+            and layouts == ("linear", "linear")
+            and refs[0].rows == refs[1].rows
+            and refs[0].nbytes == refs[1].nbytes
+            and 1 <= refs[0].rows <= 4095
+            and refs[0].nbytes % 32 == 0
+            and 0 < refs[0].nbytes <= 65535 * 32
+            and all(r.row_stride % 32 == 0 for r in refs)
+            and not any(r.tail_nbytes for r in refs)
+            and all(r.rows == 1 or 0 <= (r.row_stride - r.nbytes) // 32 <= 65535 for r in refs)
+            and not params,
+            "row DMA requires equal, aligned physical rows in GM and UB",
+        )
+        return ("MTE2" if banks[0] == "GM" else "MTE3"), ("R", "W")
+    if native in {"convert_f32", "convert_rn"}:
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and not params
+            and lengths[0] // ITEMSIZE[dtypes[0]] == lengths[1] // ITEMSIZE[dtypes[1]] > 0
+            and (
+                dtypes[0] in {"f16", "bf16"} and dtypes[1] == "f32"
+                if native == "convert_f32"
+                else dtypes[0] == "f32" and dtypes[1] in {"f16", "bf16"}
+            ),
+            "conversion needs equal element counts in separate contiguous b16/f32 UB views",
+        )
+        # Different-width overlap cannot be repaired by an event or by native
+        # in-place conversion assumptions. Origins are rechecked at extraction.
+        return "V", ("R", "W")
+    if native in {
+        "muls",
+        "adds",
+        "add",
+        "mul",
+        "sub",
+        "div",
+        "max",
+        "exp",
+        "rsqrt",
+        "sqrt",
+        "scale_value",
+        "sub_value",
+    }:
+        arity = 3 if native in {"add", "mul", "sub", "div", "max"} else 2
+        require(
+            len(refs) == arity
+            and banks == ("UB",) * arity
+            and dtypes == ("f32",) * arity
+            and layouts == ("linear",) * arity
+            and len(set(lengths)) == 1
+            and lengths[0] > 0
+            and lengths[0] % 4 == 0,
+            "Vector recipe requires equal contiguous f32 UB footprints",
+        )
+        require(all(r.contiguous for r in refs), "count-mode Vector requires contiguous views")
+        require(not params, "Vector recipe has no unchecked native parameters")
+        return "V", ("R",) * (arity - 1) + ("W",)
+    if native == "scalar_load":
+        require(
+            banks == ("UB",)
+            and dtypes == ("f32",)
+            and layouts == ("linear",)
+            and lengths == (4,)
+            and not params,
+            "Scalar load requires one f32 UB word",
+        )
+        return "S", ("R",)
+    if native == "vector_copy":
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous for r in refs)
+            and lengths[0] == lengths[1] > 0
+            and lengths[0] % 4 == 0
+            and not params,
+            "bitwise Vector copy needs equal contiguous f32 UB footprints",
+        )
+        return "V", ("R", "W")
+    if native in {"fill", "fill_neg_inf"}:
+        require(
+            len(refs) == 1
+            and banks == ("UB",)
+            and dtypes == ("f32",)
+            and layouts == ("linear",)
+            and refs[0].contiguous
+            and lengths[0] > 0
+            and lengths[0] % 4 == 0
+            and not params,
+            "Vector fill needs a contiguous f32 UB destination",
+        )
+        return "V", ("W",)
+    if native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
+        require(len(params) == 2, "row broadcast arithmetic needs (rows,columns)")
+        rows, cols = params
+        require(
+            1 <= rows <= 255
+            and 64 <= cols <= 1024
+            and cols % 64 == 0
+            and len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and all(r.contiguous for r in refs)
+            and lengths == (rows * cols * 4, rows * 32, rows * cols * 4),
+            "row broadcast arithmetic needs complete f32 rows and eight identical words per row",
+        )
+        return "V", ("R", "R", "W")
+    if native in {"merge_sum_packed", "merge_max_packed"}:
+        require(len(params) == 2, "packed partial reduction needs (rows,partials)")
+        rows, partials = params
+        require(
+            1 <= rows <= 255
+            and 1 <= partials <= 64
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and refs[0].rows == rows
+            and refs[0].nbytes == partials * 4
+            and refs[0].row_stride % 32 == 0
+            and partials * 4 <= refs[0].row_stride <= 255 * 32
+            and refs[1].contiguous
+            and lengths[1] == rows * 4,
+            "packed partial reduction reads masked words in aligned rows and writes compact statistics",
+        )
+        return "V", ("R", "W")
+    if native in {"mul_columns64", "fma_columns64"}:
+        require(len(params) == 1, "column operation needs its physical row count")
+        rows = params[0]
+        require(
+            1 <= rows <= 255
+            and len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and lengths == (rows * 256, 256, rows * 256),
+            "column operation requires complete contiguous f32 rows of 64 elements",
+        )
+        return "V", ("R", "R", "RW" if native == "fma_columns64" else "W")
+    if native == "reduce_rows64":
+        require(len(params) == 1, "packed row reduction needs its physical row count")
+        rows = params[0]
+        require(
+            1 <= rows <= 255
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and lengths == (rows * 256, rows * 4),
+            "packed reduction requires f32 rows of 64 and one contiguous result per row",
+        )
+        return "V", ("R", "W")
+    if native == "brcb8":
+        require(len(params) == 1, "BRCB needs the source word count")
+        rows = params[0]
+        require(
+            8 <= rows <= 255 * 8
+            and rows % 8 == 0
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and lengths == (rows * 4, rows * 32),
+            "BRCB replicates each of a multiple of eight f32 words to one 32-byte block",
+        )
+        return "V", ("R", "W")
+    if native == "broadcast_rows64":
+        require(len(params) == 1, "row broadcast needs its physical row count")
+        rows = params[0]
+        require(
+            1 <= rows <= 255
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous and not r.tail_nbytes for r in refs)
+            and lengths == (rows * 32, rows * 256),
+            "row broadcast copies each 32-byte block to a complete f32 row of 64",
+        )
+        return "V", ("R", "W")
+    if native in {"mul_rows", "sub_rows", "add_rows", "div_rows"}:
+        require(len(params) == 2, "row binary recipe needs (rows, columns)")
+        rows, cols = params
+        require(
+            1 <= rows <= 255
+            and cols > 0
+            and cols % 8 == 0
+            and len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and all(r.rows == rows and r.nbytes == cols * 4 for r in refs),
+            "row binary requires bounded equal f32 rows with aligned origins",
+        )
+        return "V", ("R", "R", "W")
+    if native in {"reduce_tile_sum64", "reduce_tile_max64"}:
+        require(len(params) == 2, "plane reduction needs (rows,columns)")
+        rows, cols = params
+        require(
+            8 <= rows <= 128
+            and rows % 8 == 0
+            and cols in {64, 128}
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous for r in refs)
+            and lengths == (rows * cols * 4, rows * (cols // 64) * 4),
+            "plane reduction writes one compact row-statistic plane for each aligned 64-column chunk",
+        )
+        return "V", ("R", "W")
+    if native in {"reduce_max8", "reduce_sum8"}:
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.contiguous for r in refs)
+            and lengths[0] >= 256
+            and lengths[0] % 256 == 0
+            and lengths[0] == 8 * lengths[1]
+            and not params,
+            f"datablock {'max' if native == 'reduce_max8' else 'sum'} needs contiguous f32 UB, whole 64-element repeats, and one result per eight inputs",
+        )
+        return "V", ("R", "W")
+    if native in {"reduce_sum64", "reduce_max64"}:
+        require(len(params) == 2, "native reduction needs (rows, columns)")
+        rows, cols = params
+        require(
+            1 <= rows <= 255 and 64 <= cols <= 4096 and cols % 64 == 0,
+            "native row reduction requires positive rows and 64-aligned columns <=4096",
+        )
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and refs[0].contiguous
+            and lengths[0] == rows * cols * 4
+            and refs[1].rows == rows
+            and refs[1].nbytes == cols // 64 * 4,
+            "reduction partials must expose their exact row footprint",
+        )
+        return "V", ("R", "W")
+    if native in {"merge_sum", "merge_max"}:
+        require(len(params) == 2, "partial reduction needs (rows, partials)")
+        rows, partials = params
+        require(
+            1 <= rows <= 255
+            and 1 <= partials <= 64
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and refs[0].rows == refs[1].rows == rows
+            and refs[0].nbytes == partials * 4
+            and refs[1].nbytes == 4,
+            "partial reduction must preserve rows and exact compact results",
+        )
+        return "V", ("R", "W")
+    if native in {"stat_muls", "stat_adds", "stat_rsqrt", "stat_sqrt"}:
+        require(
+            len(params) == 1
+            and 1 <= params[0] <= 255
+            and len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes == ("f32", "f32")
+            and layouts == ("linear", "linear")
+            and all(r.rows == params[0] and r.nbytes == 4 for r in refs),
+            "statistics operation needs one aligned f32 result per row",
+        )
+        return "V", ("R", "W")
+    if native in {"mul_gamma", "add_bias"}:
+        require(len(refs) == 3, "Gamma multiplication needs matrix, Gamma and output")
+        require(len(params) == 2, "Gamma multiplication needs (rows, columns)")
+        rows, cols = params
+        require(
+            1 <= rows <= 255
+            and cols > 0
+            and cols % 8 == 0
+            and len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and all(r.contiguous for r in refs)
+            and lengths == (rows * cols * 4, cols * 4, rows * cols * 4),
+            "column broadcast requires a resident column vector and contiguous rows",
+        )
+        return "V", ("R", "R", "W")
+    if native in {"stat_fill", "stat_div"}:
+        arity = 1 if native == "stat_fill" else 3
+        require(
+            len(params) == 1
+            and 1 <= params[0] <= 255
+            and len(refs) == arity
+            and banks == ("UB",) * arity
+            and dtypes == ("f32",) * arity
+            and layouts == ("linear",) * arity
+            and all(r.rows == params[0] and r.nbytes == 4 for r in refs),
+            "statistics recipe needs aligned f32 words per row",
+        )
+        return "V", ("W",) if arity == 1 else ("R", "R", "W")
+    if native in {"nd2nz", "load2d_a", "load2d_b_nt", "load2d_b_nn"}:
+        require(len(params) == 2, "matrix DMA requires (rows, columns)")
+        rows, cols = params
+        require(
+            16 <= rows <= 256
+            and 16 <= cols <= (65520 if native == "nd2nz" else 256)
+            and rows % 16 == cols % 16 == 0,
+            "matrix DMA requires complete b16 fractals and bounded native dimensions",
+        )
+        require(
+            len(refs) == 2
+            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and lengths == (rows * cols * 2,) * 2,
+            "matrix DMA must expose the full source and destination tile",
+        )
+        if native == "nd2nz":
+            require(
+                banks == ("GM", "L1")
+                and layouts == ("linear", "NZ")
+                and refs[0].rows == rows
+                and refs[0].nbytes == cols * 2
+                and refs[0].row_stride % 2 == 0
+                and cols <= refs[0].row_stride // 2 <= 65535
+                and refs[1].contiguous,
+                "ND2NZ needs precise GM rows, legal leading dimension and compact NZ output",
+            )
+            return "MTE2", ("R", "W")
+        destination = "L0A" if native == "load2d_a" else "L0B"
+        layout = "ZZ" if native == "load2d_a" else "ZN"
+        require(
+            banks == ("L1", destination)
+            and layouts == ("NZ", layout)
+            and all(r.contiguous for r in refs)
+            and (native == "load2d_a" or rows * cols // 256 <= 255),
+            "Load2D requires complete compact fractals and a legal repeat count",
+        )
+        return "MTE1", ("R", "W")
+    if native in {"mad", "mad_cycle", "mad_first"}:
+        require(
+            len(params) == (3 if native == "mad_first" else 4),
+            "MAD requires exact dimensions and initialization policy",
+        )
+        m, n, k = params[:3]
+        clear = params[3] if native != "mad_first" else 0
+        require(
+            all(16 <= dim <= 256 and dim % 16 == 0 for dim in (m, n, k))
+            and (
+                native == "mad_first"
+                or (clear in {0, 1} if native == "mad" else 1 <= clear <= MAX_MAD_CYCLE)
+            )
+            and banks == ("L0A", "L0B", "L0C")
+            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and dtypes[2] == "f32"
+            and layouts == ("ZZ", "ZN", "NZ")
+            and lengths == (m * k * 2, n * k * 2, m * n * 4)
+            and all(r.contiguous for r in refs),
+            "MAD requires exact b16 operand tiles and an f32 accumulator, without padding",
+        )
+        return "M", ("R", "R", "W" if native == "mad" and clear else "RW")
+    if native == "fix":
+        require(len(params) == 2, "Fixpipe requires (M,N)")
+        m, n = params
+        require(
+            16 <= m <= 256
+            and 16 <= n <= 256
+            and m % 16 == n % 16 == 0
+            and banks == ("L0C", "GM")
+            and dtypes == ("f32", "f32")
+            and layouts == ("NZ", "linear")
+            and lengths == (m * n * 4,) * 2
+            and refs[0].contiguous
+            and refs[1].rows == m
+            and refs[1].nbytes == n * 4
+            and refs[1].row_stride % 4 == 0,
+            "Fixpipe requires the exact f32 NZ tile and ND destination rows",
+        )
+        return "FIX", ("R", "W")
+    if native == "mad16":
+        require(
+            banks == ("L0A", "L0B", "L0C")
+            and dtypes == ("f16", "f16", "f32")
+            and lengths == (512, 512, 1024)
+            and layouts == ("ZZ", "ZN", "NZ")
+            and params in {(0,), (1,)},
+            "MAD v0.1 requires f16 16x16x16, f32 accumulation",
+        )
+        return "M", ("R", "R", "W" if params[0] else "RW")
+    if native == "fix16":
+        require(
+            banks == ("L0C", "GM")
+            and dtypes == ("f32", "f32")
+            and lengths == (1024, 1024)
+            and layouts == ("NZ", "linear")
+            and not params,
+            "Fixpipe v0.1 requires a complete f32 16x16 NZ->ND transfer",
+        )
+        return "FIX", ("R", "W")
+    raise CompileError(
+        f"unmodeled native operation {native!r}: effects/completion contract required"
+    )

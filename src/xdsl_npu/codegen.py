@@ -4,9 +4,10 @@ from functools import partial
 from math import isinf
 
 from .asc_scalar import ScalarScope
-from .ir import TaskOp
-from .model import ITEMSIZE, Ref, optional_int, storage_layout
+from .dialects.physical import TaskOp
+from .model import Ref, optional_int, storage_layout
 from .sync import execution, parts, verify_plan
+from .target.native import ITEMSIZE
 
 QUALIFIER = {
     "GM": "__gm__",
@@ -340,7 +341,7 @@ def _body_lines(p, ex, stream, *, cross=None, drains=(), core_expression=None):
     }
     # Read actual sync placements, then retain the compact physical step loop.
     before, after, pending, previous = {}, {}, [], None
-    from .ir import CrossSyncOp, SyncOp
+    from .dialects.physical import CrossSyncOp, SyncOp
 
     for op in stream.body.block.ops:
         if isinstance(op, TaskOp):
@@ -468,7 +469,7 @@ def _emit_checked(module, analysis, *, host_launcher=True):
         from .scope_codegen import emit_scopes
 
         return emit_scopes(analysis, host_launcher=host_launcher)
-    from .ir import MixedOp, StaticDispatchOp
+    from .dialects.physical import MixedOp, StaticDispatchOp
     from .loop_model import is_symbolic
     from .sequence_model import is_sequence
 
@@ -540,7 +541,7 @@ def _emit_mixed(analysis, *, host_launcher):
 
 
 def _mixed_body_lines(m, channels, *, core_expression=None):
-    from .ir import CrossDrainOp, StreamOp
+    from .dialects.physical import CrossDrainOp, StreamOp
 
     lines = []
     for actor, kernel in m.actors.items():

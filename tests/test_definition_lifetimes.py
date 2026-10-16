@@ -16,7 +16,7 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from tests.fixtures.nested import shared_l0c_qk_pv
 from xdsl_npu.completion import CountDomain, Position, Site
-from xdsl_npu.ir import (
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CallOp,
     CaptureOp,

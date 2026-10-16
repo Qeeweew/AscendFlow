@@ -10,8 +10,8 @@ import pytest
 from tests.fixtures.pipelines import vector_pipeline
 from xdsl_npu import autosync, emit_asc
 from xdsl_npu.asc_scalar import ScalarScope
+from xdsl_npu.dialects.io import dump
 from xdsl_npu.events import selection_expression
-from xdsl_npu.ir import dump
 from xdsl_npu.loop_codegen import _event, _guard
 
 

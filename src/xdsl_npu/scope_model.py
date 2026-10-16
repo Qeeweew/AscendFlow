@@ -12,8 +12,8 @@ from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType, IntAttr, ModuleOp, StringAttr
 from xdsl.ir import Block, Region
 
-from .indexing import check_axis, interval, nonnegative
-from .ir import (
+from .diagnostics import require
+from .dialects.physical import (
     BufferOp,
     CallOp,
     CaptureOp,
@@ -37,9 +37,10 @@ from .ir import (
     TaskOp,
     ViewOp,
 )
+from .indexing import check_axis, interval, nonnegative
 from .loop_boundary import stream_operations
 from .loop_model import _storage, extract_loop
-from .model import CAPACITY, require, storage_layout
+from .model import storage_layout
 from .scalar import (
     ARITHMETIC,
     INT64_MAX,
@@ -58,6 +59,7 @@ from .scope_invocation import (
     query_domains,
     verify_query_domains,
 )
+from .target.native import CAPACITY
 
 
 @dataclass(frozen=True)

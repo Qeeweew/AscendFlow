@@ -1,10 +1,10 @@
 # 结构化循环与统一自动同步设计
 
-2026-10-16。**这是替换现有算法的设计，不是已实现能力。** 本轮只整理文档；停止的源码实验保持原样。当前事实见[状态](refactor-progress.md)，实施顺序见[计划](refactor-plan.md)。
+2026-10-16。**这是替换现有算法的目标设计；M1部分基础组件已落地，完整主线尚未替换。** 重构前实验保存在bbc1458，当前实现事实见[状态](refactor-progress.md)，实施顺序见[计划](refactor-plan.md)。
 
 ## 1. 要替换什么
 
-目前源码按 finite / loop / sequence / invocation / scope / query 分派同步与代码生成。`scope_lowering.py` 特别要求外层 serial 只包含一个 KV pipeline，child 必须是直接固定长度循环；`ir.py` 为这些层次分别定义 Channel/Sync，`scope_query_completion.py` 再复制父流水图。
+尚未替换的同步与生成主线按 finite / loop / sequence / invocation / scope / query 分派。`scope_lowering.py` 特别要求外层 serial 只包含一个 KV pipeline，child 必须是直接固定长度循环；原`ir.py`（现已拆入dialects/physical.py）的层次专用Channel/Sync尚未删除，`scope_query_completion.py`仍复制父流水图。
 
 这些限制来自实现，不是 dav-2201 的要求。FA 的 Q 块、GEMM 的输出块、MoE 的任务只是不同算法的外层迭代，不应决定编译器选哪个求解器。普通顺序、嵌套循环、局部多级流水、CV 排步必须组合相同的语义。
 

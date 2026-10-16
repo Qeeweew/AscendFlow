@@ -10,8 +10,8 @@ from xdsl.dialects import scf
 from xdsl.dialects.builtin import IndexType
 
 from .cyclic import CyclicDomain
-from .ir import CyclicCountOp, StreamOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import CyclicCountOp, StreamOp
 from .scalar import Expr, expression, literal, uniform
 
 

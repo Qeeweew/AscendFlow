@@ -12,7 +12,8 @@ from examples.vector.scale import scale
 from tests.test_cyclic_domain import cyclic_program
 from xdsl_npu import compile
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.ir import (
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import (
     BoundaryOp,
     BufferOp,
     CyclicCountOp,
@@ -23,7 +24,6 @@ from xdsl_npu.ir import (
     TaskOp,
 )
 from xdsl_npu.loop_sync import verify_loop
-from xdsl_npu.model import CompileError
 from xdsl_npu.performance import runtime_work
 from xdsl_npu.scalar import INT64_MAX, Expr
 

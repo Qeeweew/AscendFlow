@@ -15,7 +15,7 @@ from tests.fixtures.nested import nested_copy
 from tests.models.scoped_local import finite_check
 from xdsl_npu import compile
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.ir import (
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CallOp,
     CaptureOp,
@@ -27,10 +27,10 @@ from xdsl_npu.ir import (
     ScopeSyncOp,
     StreamOp,
     TaskOp,
-    TaskType,
     ViewOp,
     task_attrs,
 )
+from xdsl_npu.dialects.types import TaskType
 
 COUNTS = (0, 1, 2, 3, 7)
 

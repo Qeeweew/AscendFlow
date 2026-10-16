@@ -1,7 +1,7 @@
 """Independent fixed-policy AscendC FA source, with no device side effects."""
 
 from benchmarks.references import ascendc_source
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 
 NAME = "attention_reference"
 

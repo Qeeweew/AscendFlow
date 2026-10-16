@@ -1,10 +1,10 @@
 # 源码职责与包结构重构
 
-2026-10-16，只读审查基线为 `7ddaa54` 加停止的未提交实验。**以下目录是目标结构，尚未迁移源码。** 不以搬文件数量代表完成，算法替换顺序见[计划](refactor-plan.md)。
+2026-10-16，结构审查基线为 `7ddaa54` 加停止的实验，已整体保存至 `bbc1458`。**以下为目标结构；M1已经迁移dialects/frontend/target及进程控制，剩余planner和后端仍待替换。** 实际状态见[状态页](refactor-progress.md)，不以搬文件数量代表完成。
 
 ## 1. 当前问题
 
-核心包有93个Python模块、35,848行，全部平铺；36个模块以scope_开头。`model.py` 1461行、`scope_sync.py` 1383行、`loop_model.py` 1381行、`language.py` 1128行、`lowering.py` 1088行。
+审查基线核心包有93个Python模块、35,848行，全部平铺；36个模块以scope_开头。`model.py` 1461行、`scope_sync.py` 1383行、`loop_model.py` 1381行、`language.py` 1128行、`lowering.py` 1088行。下面的依赖问题记录基线，不将已迁移部分继续称为当前未改动。
 
 问题是职责重叠而不只是行数。model 同时包含错误类型、物理对象、原语合同、提取和依赖，79个模块依赖它；scope_sync 同时构图、查询、插入、分配、检查和编排。各层持有不同的“已完成事实”，形成适配和重复查询。
 
@@ -47,6 +47,7 @@ src/xdsl_npu/
     ascend910b.py     # engine、milestone、event bank、可见性/阻塞合同
     native.py         # 原语合法性、物理effects、数值与原生表示合同
   analysis/
+    iteration.py      # 真实SSA循环域、控制句柄，供admission和PLE共用
     access.py         # root/view/范围、ownership、reaching definitions
     dependencies.py   # RAW/WAR/WAW与slot carried依赖
     frontier.py       # 有类型完成前沿与覆盖/合流，不是全源闭包

@@ -8,8 +8,8 @@ from xdsl.dialects.builtin import StringAttr
 from tests.fixtures.nested import nested_cv
 from xdsl_npu import language as N
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import ScopeGuardOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import ScopeGuardOp
 from xdsl_npu.scope_access import analyze_scope_access
 from xdsl_npu.scope_domains import Activation, ScopedDependence
 from xdsl_npu.scope_guarded_access import (

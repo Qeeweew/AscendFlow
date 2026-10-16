@@ -19,9 +19,9 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import FileLineColLoc, IndexType, IntAttr, ModuleOp, StringAttr, i1
 from xdsl.ir import Block, OpResult, Region, SSAValue, SSAValues
 
-from . import language as N
-from .model import CompileError, require
-from .source_ir import PipelineOp, YieldOp
+from ..diagnostics import CompileError, require
+from ..dialects.source import PipelineOp, YieldOp
+from . import builders, contracts, syntax
 
 
 class FrontendError(CompileError):
@@ -31,6 +31,9 @@ class FrontendError(CompileError):
 @dataclass(frozen=True)
 class _Symbol:
     name: str
+
+
+_DSL_NAMESPACE = object()
 
 
 _CALLS = {
@@ -81,7 +84,7 @@ _COMPARE = {
 
 
 def _constant(value):
-    if type(value) in {int, float, str, bool, type(None)} or isinstance(value, N.DType):
+    if type(value) in {int, float, str, bool, type(None)} or isinstance(value, syntax.DType):
         return value
     if type(value) is tuple:
         return tuple(_constant(item) for item in value)
@@ -106,7 +109,7 @@ class PrimFunction:
         return replace(self, specializations=tuple(bound.items()))
 
 
-def capture(function, *, disjoint_external=False):
+def capture(function, *, namespace, disjoint_external=False):
     require(type(disjoint_external) is bool, "disjoint_external must be a boolean contract")
     try:
         lines, first = inspect.getsourcelines(function)
@@ -121,8 +124,8 @@ def capture(function, *, disjoint_external=False):
     environment = {}
     for name in names & available.keys():
         value = available[name]
-        if value is N:
-            environment[name] = N
+        if value is namespace:
+            environment[name] = _DSL_NAMESPACE
         else:
             # Only names resolved from the host are frozen; parameters/local
             # bindings shadow them in the AST parser.
@@ -145,7 +148,7 @@ def from_source(source, *, constants=None, filename="<dsl>", disjoint_external=F
     """Parse explicit source; this function does not use exec/eval or import it."""
     require(type(source) is str, "DSL source must be a string")
     require(type(disjoint_external) is bool, "disjoint_external must be a boolean contract")
-    environment = {"N": N, "T": N}
+    environment = {"N": _DSL_NAMESPACE, "T": _DSL_NAMESPACE}
     for name, value in (constants or {}).items():
         require(name not in {"N", "T"} and name.isidentifier(), "invalid captured constant name")
         environment[name] = _constant(value)
@@ -186,7 +189,7 @@ class _Parser:
             if not (
                 isinstance(target, ast.Attribute)
                 and target.attr == "prim_func"
-                and self.expr(target.value) is N
+                and self.expr(target.value) is _DSL_NAMESPACE
             ):
                 self.fail(decorator, "unsupported decorator; it will not be executed or ignored")
             if isinstance(decorator, ast.Call):
@@ -203,9 +206,9 @@ class _Parser:
         args = func.args
         if args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg or func.returns:
             self.fail(func, "use named tensor/scalar parameters; no variadic or return annotation")
-        self.trace = N._Trace(func.name, self.definition.disjoint_external)
+        self.trace = builders._Trace(func.name, self.definition.disjoint_external)
         self.trace.op.attributes["frontend"] = StringAttr("ast")
-        token = N._current.set(self.trace)
+        token = builders._current.set(self.trace)
         try:
             self.locate(func)
             self.signature(args)
@@ -216,7 +219,7 @@ class _Parser:
             module.verify()
             return module
         finally:
-            N._current.reset(token)
+            builders._current.reset(token)
 
     def signature(self, args):
         defaults = dict(zip([arg.arg for arg in args.args[-len(args.defaults) :]], args.defaults))
@@ -261,7 +264,7 @@ class _Parser:
                 if len(options) != len(annotation.keywords):
                     self.fail(annotation, "int64 contract keywords cannot repeat")
             try:
-                self.env[name] = N.dynamic(name, **options)
+                self.env[name] = contracts.dynamic(name, **options)
             except CompileError as error:
                 self.fail(annotation, str(error))
             self.trace.size(self.env[name])
@@ -272,9 +275,9 @@ class _Parser:
                 self.fail(arg, "only constexpr parameters may have defaults")
             annotation = annotations[arg.arg]
             typ = self.expr(annotation)
-            if not isinstance(typ, N.Tensor):
+            if not isinstance(typ, syntax.Tensor):
                 self.fail(arg, "expected Tensor shape/dtype/access annotation")
-            self.env[arg.arg] = N._allocate(
+            self.env[arg.arg] = builders._allocate(
                 typ.shape, typ.dtype, "GM", name=arg.arg, access=typ.access
             )
 
@@ -313,7 +316,9 @@ class _Parser:
             with ExitStack() as scopes:
                 for item in node.items:
                     scope = self.expr(item.context_expr)
-                    if not isinstance(scope, (N.Kernel, N.Stage, N.Cube, N.Vector)):
+                    if not isinstance(
+                        scope, (builders.Kernel, builders.Stage, builders.Cube, builders.Vector)
+                    ):
                         self.fail(item.context_expr, "expected Kernel/Stage/Cube/Vector scope")
                     value = scopes.enter_context(scope)
                     if item.optional_vars:
@@ -376,8 +381,8 @@ class _Parser:
             ):
                 self.fail(call, "Pipelined requires one bound and explicit stages")
             limit = args[0]
-            if type(limit) is int or isinstance(limit, N._Dimension):
-                operation = N.Pipelined(limit, **kwargs).op
+            if type(limit) is int or isinstance(limit, contracts._Dimension):
+                operation = builders.Pipelined(limit, **kwargs).op
             else:
                 operation = PipelineOp.create(
                     operands=[self.scalar(limit)],
@@ -385,13 +390,13 @@ class _Parser:
                         "uid": StringAttr(self.trace.name("pipeline")),
                         "stages": IntAttr(kwargs["stages"]),
                         "order": StringAttr(kwargs.get("order", "source")),
-                        **N._issue_order(kwargs.get("issue_order")),
+                        **builders._issue_order(kwargs.get("issue_order")),
                     },
                     regions=[Region(Block(arg_types=[IndexType()]))],
                 )
             self.trace.enter(operation)
             self.trace.pipelines.append(operation)
-            self.env[node.target.id] = N._coordinate(operation.body.block.args[0])
+            self.env[node.target.id] = builders._coordinate(operation.body.block.args[0])
             try:
                 self.body(node.body)
             finally:
@@ -421,7 +426,7 @@ class _Parser:
             self.trace.blocks.append(block)
             self.trace.values.append([])
             self.env.update(zip(carried, block.args[1:]))
-            self.env[node.target.id] = N._coordinate(block.args[0])
+            self.env[node.target.id] = builders._coordinate(block.args[0])
             try:
                 self.body(node.body)
                 results = [self.scalar_result(self.env[name], node) for name in carried]
@@ -522,10 +527,10 @@ class _Parser:
                 self.fail(node, value.name)
             return value
         if isinstance(node, ast.Attribute):
-            if self.expr(node.value) is not N:
+            if self.expr(node.value) is not _DSL_NAMESPACE:
                 self.fail(node, "attribute access is restricted to registered DSL names")
             if node.attr in _CONSTANTS:
-                return getattr(N, node.attr)
+                return getattr(syntax, node.attr)
             if node.attr in _CALLS | _SYNTAX:
                 return _Symbol(node.attr)
             self.fail(node, f"unknown DSL operation {node.attr}")
@@ -556,7 +561,7 @@ class _Parser:
             )
         if isinstance(node, ast.Subscript):
             value, index = self.expr(node.value), self.expr(node.slice)
-            if not isinstance(value, (N._Buffer, N._View, N._Value, tuple)):
+            if not isinstance(value, (builders._Buffer, builders._View, builders._Value, tuple)):
                 self.fail(node, "only tensor views and constexpr tuples support indexing")
             return value[index]
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
@@ -569,7 +574,7 @@ class _Parser:
                     self.fail(node, "device integer division requires // or N.ceildiv")
                 return lhs / rhs
             if type(lhs) not in {int, float} or type(rhs) not in {int, float}:
-                lhs, rhs = N._index(lhs), N._index(rhs)
+                lhs, rhs = builders._index(lhs), builders._index(rhs)
             return _BINARY[type(node.op)](lhs, rhs)
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in _COMPARE:
             lhs, rhs = self.expr(node.left), self.expr(node.comparators[0])
@@ -603,5 +608,7 @@ class _Parser:
                 return self.trace.index_op(cls, a, b)
             if name not in _CALLS:
                 self.fail(node, f"{name} is only valid in its declaration/control position")
-            return getattr(N, name)(*args, **kwargs)
+            if name == "Tensor":
+                return syntax.Tensor(*args, **kwargs)
+            return getattr(builders, name)(*args, **kwargs)
         self.fail(node, f"unsupported device expression {type(node).__name__}")

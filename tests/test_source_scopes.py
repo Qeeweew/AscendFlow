@@ -6,8 +6,8 @@ from xdsl.ir import Block, Operation
 
 from tests.fixtures.attention_target import attention_target
 from xdsl_npu import language as N
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import CopyOp, ElementOp, MatmulOp, PipelineOp, ProgramOp, ReduceOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.source import CopyOp, ElementOp, MatmulOp, PipelineOp, ProgramOp, ReduceOp
 from xdsl_npu.source_scopes import Scope, Work, collect_source_scopes
 
 MIXED_CHILDREN = """

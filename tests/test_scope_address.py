@@ -10,13 +10,14 @@ from xdsl.ir import SSAValue
 
 from tests.fixtures.attention_target import attention_target
 from tests.test_index_frontend import evaluate as evaluate_ssa
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.source import AllocationOp, DomainOp, PipelineOp, ProgramOp, SizeOp, ViewOp
 from xdsl_npu.indexing import arguments, check_axis, equivalent
 from xdsl_npu.lowering import _refs
-from xdsl_npu.model import ITEMSIZE, CompileError
 from xdsl_npu.scalar import Expr, Fact, expression, facts_from_sizes, from_ssa, literal
 from xdsl_npu.scope_address import split_offset
-from xdsl_npu.source_ir import AllocationOp, DomainOp, PipelineOp, ProgramOp, SizeOp, ViewOp
 from xdsl_npu.source_scopes import Scope, Work, collect_source_scopes
+from xdsl_npu.target.native import ITEMSIZE
 
 
 def test_captured_multiclock_remainder_keeps_its_proved_slot_range():

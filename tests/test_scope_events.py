@@ -9,7 +9,7 @@ from tests.fixtures.nested import nested_copy, nested_cv
 from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile
 from xdsl_npu import language as N
-from xdsl_npu.ir import dump
+from xdsl_npu.dialects.io import dump
 from xdsl_npu.loop_graph import Graph
 from xdsl_npu.loop_sync import _plan_leaf
 from xdsl_npu.scope_access import analyze_scope_access

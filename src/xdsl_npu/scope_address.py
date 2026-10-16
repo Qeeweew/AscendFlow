@@ -8,8 +8,8 @@ the original allocation identity and the caller's stage/guard activation.
 
 from collections.abc import Collection, Mapping
 
+from .diagnostics import require
 from .indexing import _to_expr, arguments, physical_terms, polynomial
-from .model import require
 from .scalar import Expr, Fact, expression, literal
 
 

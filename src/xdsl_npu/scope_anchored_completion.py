@@ -8,7 +8,7 @@ bounds. It preserves the original count predicates; N is never instantiated.
 from .budget import bounded, poll
 from .completion import CountDomain, Position, coalesce, covers, uncovered
 from .completion_flow import ALL
-from .model import require
+from .diagnostics import require
 from .scope_domains import affine
 from .scope_guarded_completion import GuardedCompletion, _activation
 from .scope_transfer_queries import (

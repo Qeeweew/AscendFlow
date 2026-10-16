@@ -9,7 +9,8 @@ from math import sqrt
 
 from tests.fixtures.physical_operators import align32
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.model import require, round_f32
+from xdsl_npu.diagnostics import require
+from xdsl_npu.target.scalars import round_f32
 
 
 def recurrent_gdn(

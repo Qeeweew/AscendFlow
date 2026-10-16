@@ -14,7 +14,8 @@ from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.child_completion import project_fixed_child
 from xdsl_npu.completion import Position, Site
-from xdsl_npu.ir import TaskOp, dump
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import TaskOp
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.loop_sync import _verify_leaf
 from xdsl_npu.lowering import lower_source

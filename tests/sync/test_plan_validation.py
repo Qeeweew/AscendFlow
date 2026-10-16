@@ -8,8 +8,15 @@ from xdsl.utils.exceptions import VerifyException
 from examples.state.grouped import grouped_state_sum
 from tests.models.local_sequence import finite_check, physical_regions
 from xdsl_npu import compile, verify_plan
-from xdsl_npu.ir import BufferOp, FrameOp, RegionChannelOp, RegionSyncOp, TaskOp, ViewOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import (
+    BufferOp,
+    FrameOp,
+    RegionChannelOp,
+    RegionSyncOp,
+    TaskOp,
+    ViewOp,
+)
 
 
 def test_preceding_vector_barrier_cannot_retire_the_task_that_follows_it(frame_artifact):
@@ -134,7 +141,7 @@ def test_real_parent_frame_coordinate_is_required(grouped_artifact):
 def test_whole_last_reader_not_compute_completion_protects_state_reuse():
     from dataclasses import replace
 
-    from xdsl_npu.ir import TaskOp
+    from xdsl_npu.dialects.physical import TaskOp
 
     source = grouped_state_sum.source.replace(
         "(GROUPS, outputs, tiles, B)", "(GROUPS, outputs, 1, B)"

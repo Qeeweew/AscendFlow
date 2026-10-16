@@ -12,8 +12,8 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
 from .budget import bounded
-from .ir import QueryChannelOp, QuerySyncOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import QueryChannelOp, QuerySyncOp
 
 Bank = tuple[str, str, str]
 _AUTHORITY = object()

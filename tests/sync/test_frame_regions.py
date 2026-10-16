@@ -7,8 +7,8 @@ import pytest
 from examples.state.frame_snapshot import frame_state_sum
 from tests.models.local_sequence import finite_check
 from xdsl_npu import compile
-from xdsl_npu.ir import FrameOp, RegionChannelOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import FrameOp, RegionChannelOp
 from xdsl_npu.sequence_model import extract_sequence
 
 

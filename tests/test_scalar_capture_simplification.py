@@ -8,10 +8,11 @@ import pytest
 from xdsl.dialects import arith
 
 from xdsl_npu import language as N
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import TaskOp
 from xdsl_npu.indexing import check_axis
-from xdsl_npu.ir import TaskOp, dump
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scalar import INT64_MAX, Expr, bindings, expression, literal
 from xdsl_npu.scope_model import extract_scopes
 

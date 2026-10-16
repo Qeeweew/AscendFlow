@@ -6,10 +6,12 @@ from xdsl.dialects import arith, scf
 from examples.vector.scale import scale
 from xdsl_npu import compile
 from xdsl_npu import language as N
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import CallOp, StreamOp, TaskOp
+from xdsl_npu.dialects.source import AllocationOp, CopyOp, ElementOp, PipelineOp, SizeOp
 from xdsl_npu.frontend import FrontendError, PrimFunction
-from xdsl_npu.ir import CallOp, StreamOp, TaskOp, dump, parse
-from xdsl_npu.model import CompileError, Program
-from xdsl_npu.source_ir import AllocationOp, CopyOp, PipelineOp, SizeOp
+from xdsl_npu.model import Program
 
 
 def test_prim_func_captures_body_instead_of_executing_it():
@@ -28,6 +30,30 @@ def test_prim_func_captures_body_instead_of_executing_it():
     with pytest.raises(FrontendError, match=r"test_frontend.py:\d+:\d+: unsupported host"):
         bad.to_ir()
     assert calls == []
+
+
+def test_captured_namespace_never_executes_rebound_host_operations(monkeypatch):
+    syntax = N
+    calls = []
+
+    def host_effect(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("public syntax invoked as a host builder")
+
+    @syntax.prim_func
+    def captured(n: "syntax.int64(minimum=4, multiple_of=2)"):
+        with syntax.Kernel():
+            x = syntax.alloc_ub((64,))
+            for i in syntax.Pipelined(n, stages=1):
+                syntax.fill(x, 1.0)
+
+    for name in ("Kernel", "alloc_ub", "fill"):
+        monkeypatch.setattr(syntax, name, host_effect)
+    source = captured.to_ir()
+    assert calls == []
+    size = next(op for op in source.walk() if isinstance(op, SizeOp))
+    assert (size.minimum.data, size.multiple.data) == (4, 2)
+    assert [op.kind.data for op in source.walk() if isinstance(op, ElementOp)] == ["fill"]
 
 
 def test_scalar_parameters_are_resolved_before_tensor_annotations_and_slots_are_explicit():

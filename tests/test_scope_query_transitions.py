@@ -10,8 +10,8 @@ from tests.test_scope_query_completion import FiniteQueries
 from tests.test_scope_query_planning import query_state_store
 from xdsl_npu.budget import limit
 from xdsl_npu.completion import CountDomain, Position
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_query_checks import prepare_memory_checks
 from xdsl_npu.scope_query_completion import QueryCompletion, QueryEvent, QuerySite

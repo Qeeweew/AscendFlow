@@ -9,7 +9,7 @@ Exhaustion of the state budget is reported as incomplete, never as a proof.
 
 from dataclasses import dataclass
 
-from .model import CompileError, require
+from .diagnostics import CompileError, require
 from .sync import execution
 
 
@@ -22,7 +22,7 @@ class CheckResult:
 
 
 def bounded_check(module, *, max_states=200_000) -> CheckResult:
-    from .ir import MixedOp
+    from .dialects.physical import MixedOp
     from .loop_model import is_symbolic
 
     require(

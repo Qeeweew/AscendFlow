@@ -11,10 +11,10 @@ from dataclasses import dataclass, replace
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, StringAttr
 
+from .diagnostics import require
+from .dialects.source import AllocationOp, DomainOp, MatmulOp, PipelineOp, SizeOp, ViewOp, YieldOp
 from .lowering_context import ActorBindings
-from .model import require
 from .scalar import ARITHMETIC, from_ssa, literal
-from .source_ir import AllocationOp, DomainOp, MatmulOp, PipelineOp, SizeOp, ViewOp, YieldOp
 from .source_scopes import Scope, collect_source_scopes
 from .source_scopes import Work as ScopedWork
 

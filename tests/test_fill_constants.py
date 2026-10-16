@@ -15,10 +15,12 @@ from tests.report_contract import semantic_report
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import parse
+from xdsl_npu.dialects.physical import TaskOp
+from xdsl_npu.dialects.source import ElementOp
 from xdsl_npu.frontend import FrontendError
-from xdsl_npu.ir import TaskOp, parse
-from xdsl_npu.model import CompileError, round_f32
-from xdsl_npu.source_ir import ElementOp
+from xdsl_npu.target.scalars import round_f32
 
 POS_INF, NEG_INF = float("inf"), float("-inf")
 

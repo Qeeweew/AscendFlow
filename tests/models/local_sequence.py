@@ -10,7 +10,7 @@ from itertools import product
 
 from xdsl.dialects import arith, scf
 
-from xdsl_npu.ir import (
+from xdsl_npu.dialects.physical import (
     BoundaryOp,
     BufferOp,
     FrameOp,

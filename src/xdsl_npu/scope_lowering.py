@@ -11,13 +11,13 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
 from xdsl.ir import Block, Region
 
+from .diagnostics import require
+from .dialects.physical import CallOp, CaptureOp, CoreIdOp, EndOp, StreamOp, ViewOp
+from .dialects.source import AllocationOp, MatmulOp, PipelineOp
 from .indexing import equivalent, validate_source_arithmetic
-from .ir import CallOp, CaptureOp, CoreIdOp, EndOp, StreamOp, ViewOp
 from .lowering_context import ActorBindings
-from .model import require
 from .scalar import ARITHMETIC, from_ssa, literal
 from .scope_predicates import classify_guard
-from .source_ir import AllocationOp, MatmulOp, PipelineOp
 from .source_scopes import ClockFrame, Scope, Work, collect_source_scopes
 
 

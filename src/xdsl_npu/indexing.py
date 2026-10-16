@@ -10,7 +10,7 @@ from collections import Counter
 from fractions import Fraction
 from itertools import product
 
-from .model import CompileError, require
+from .diagnostics import CompileError, require
 from .scalar import Expr, expression, literal
 
 MAX_TERMS = 256
@@ -358,8 +358,9 @@ def validate_source_arithmetic(program):
     """
     from xdsl.dialects import arith, scf
 
+    from .analysis.iteration import iteration_domain
+    from .dialects.source import DomainOp, PipelineOp
     from .scalar import facts_from_sizes, from_ssa, positive
-    from .source_ir import DomainOp, PipelineOp
 
     facts = facts_from_sizes(program.body.block.ops)
     owner = program.body.block.args[0]
@@ -393,23 +394,32 @@ def validate_source_arithmetic(program):
                 number += 1
                 value = op.body.block.args[0]
                 if isinstance(op, DomainOp):
+                    lower = literal(0)
                     bound = literal(
                         2 if program.kind.data == "mixed" and op.kind.data == "vector" else 1
                     )
-                elif isinstance(op, scf.ForOp):
-                    bound = from_ssa(op.ub, coordinates=coordinates, facts=facts)
                 else:
-                    bound = (
-                        from_ssa(op.limit, coordinates=coordinates, facts=facts)
-                        if op.limit is not None
-                        else literal(op.count.data)
+                    domain = iteration_domain(op)
+                    lower = (
+                        literal(domain.lower)
+                        if type(domain.lower) is int
+                        else from_ssa(domain.lower, coordinates=coordinates, facts=facts)
                     )
-                if bound == literal(0):
+                    bound = (
+                        literal(domain.upper)
+                        if type(domain.upper) is int
+                        else from_ssa(domain.upper, coordinates=coordinates, facts=facts)
+                    )
+                if lower == bound or (
+                    lower.constant is not None
+                    and bound.constant is not None
+                    and lower.constant >= bound.constant
+                ):
                     continue  # No scalar operation in this loop can execute.
                 local = coordinates | {value: name}
                 ranges = [
                     *domains,
-                    (Expr("argument", (name,)), literal(0), expression("sub", bound, literal(1))),
+                    (Expr("argument", (name,)), lower, expression("sub", bound, literal(1))),
                 ]
             for region in op.regions:
                 for child in region.blocks:

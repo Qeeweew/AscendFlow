@@ -6,7 +6,7 @@ import pytest
 
 from xdsl_npu import compile
 from xdsl_npu import language as N
-from xdsl_npu.ir import LoopChannelOp, LoopSyncOp
+from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp
 from xdsl_npu.loop_graph import channels, completion_graph
 from xdsl_npu.loop_planning import DirectCompletion
 

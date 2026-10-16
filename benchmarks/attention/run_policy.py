@@ -12,7 +12,7 @@ from benchmarks.references.attention import NAME, reference_source
 from benchmarks.validation.attention import decode, inputs_and_oracle
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import hardware_snapshot
 
 

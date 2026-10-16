@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from benchmarks.references.attention import NAME, reference_source
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import profile_evidence, theoretical_metrics
 
 

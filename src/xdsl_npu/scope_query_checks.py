@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 
 from .budget import bounded, poll
 from .completion import CountDomain, Position, coalesce, covers
-from .model import require
+from .diagnostics import require
 from .region_patterns import HazardPattern
 from .region_sequence import Obligation
 from .region_summary import Access, ReadSpan

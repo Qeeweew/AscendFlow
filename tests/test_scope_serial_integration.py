@@ -9,9 +9,10 @@ from tests.fixtures.attention_target import attention_target
 from tests.fixtures.scoped_queries import scoped_query_recurrence
 from xdsl_npu import compile
 from xdsl_npu.budget import limit
-from xdsl_npu.ir import FrameOp, ScopeGuardOp, TaskOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import FrameOp, ScopeGuardOp, TaskOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.sync import autosync, verify_plan
 

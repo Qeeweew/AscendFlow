@@ -10,8 +10,8 @@ from dataclasses import dataclass, replace
 
 from .budget import bounded, poll
 from .completion import Position, Site
+from .diagnostics import require
 from .loop_sync import _successor
-from .model import require
 from .region_summary import EventReuse, fixed_event_reuse
 
 

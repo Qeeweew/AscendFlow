@@ -9,18 +9,18 @@ from examples.vector.independent_rings import independent_rings
 from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.ir import dump, parse
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.source import AllocationOp, PipelineOp, ProgramOp, SizeOp, ViewOp
 from xdsl_npu.loop_graph import Channel
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.region_summary import (
     Access,
     _event_reuse,
     summarize_local_events,
     summarize_reused_storage,
 )
-from xdsl_npu.source_ir import AllocationOp, PipelineOp, ProgramOp, SizeOp, ViewOp
 
 
 def _value(value, bindings):

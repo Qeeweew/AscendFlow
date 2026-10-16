@@ -14,9 +14,9 @@ from dataclasses import dataclass, field, replace
 from .budget import bounded, poll
 from .child_completion import ChildPort, FixedChildProjection, ProjectionPoint
 from .completion import Site
-from .ir import CallOp, OnceOp, StreamOp
+from .diagnostics import require
+from .dialects.physical import CallOp, OnceOp, StreamOp
 from .loop_graph import Command, Graph
-from .model import require
 from .periodic import MAX_PERIOD_TEMPLATES, bounded_period
 from .scope_child_transfer import (
     ConditionalChildTransfer,

@@ -9,7 +9,9 @@ operators belong in the AST examples; these factories are only migration oracles
 from math import isfinite
 
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.model import CAPACITY, CompileError, require, round_f32
+from xdsl_npu.diagnostics import CompileError, require
+from xdsl_npu.target.native import CAPACITY
+from xdsl_npu.target.scalars import round_f32
 
 
 def align32(n):
@@ -519,7 +521,7 @@ def gemm_bias_silu(
     """
     from xdsl.dialects.builtin import IntAttr, StringAttr
 
-    from xdsl_npu.ir import BufferOp, ViewOp
+    from xdsl_npu.dialects.physical import BufferOp, ViewOp
     from xdsl_npu.mixed import compose
     from xdsl_npu.sync import parts
 

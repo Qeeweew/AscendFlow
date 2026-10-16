@@ -7,9 +7,10 @@ import pytest
 from tests.fixtures.scoped_queries import scoped_query_recurrence
 from xdsl_npu.budget import limit
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import BufferOp, CaptureOp, ScopeChannelOp, ScopeSyncOp, TaskOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import BufferOp, CaptureOp, ScopeChannelOp, ScopeSyncOp, TaskOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_event_pools import allocate_parent_pools
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_query_completion import QueryCompletion, QuerySite

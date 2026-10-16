@@ -1,29 +1,22 @@
-"""Small physical dialect. SSA task identity is deliberately not a completion token.
+"""Physical asynchronous operations and explicit synchronization structure.
 
-All executing operations have observable effects. Generic CSE/DCE must not treat
-an unused task result as dead asynchronous work. Precise effects live in model.py;
-the ordinary xDSL interface conservatively exposes an unqualified write too.
+SSA task identity is deliberately not a completion token. Executing operations
+have observable effects, so generic CSE/DCE cannot erase asynchronous work.
 """
 
-from io import StringIO
-
-from xdsl.context import Context
 from xdsl.dialects.builtin import (
     ArrayAttr,
-    Builtin,
     DictionaryAttr,
     FloatAttr,
     IndexType,
     IntAttr,
-    ModuleOp,
     StringAttr,
     f32,
 )
-from xdsl.ir import Dialect, Operation, ParametrizedAttribute, TypeAttribute
+from xdsl.ir import Dialect
 from xdsl.irdl import (
     IRDLOperation,
     attr_def,
-    irdl_attr_definition,
     irdl_op_definition,
     operand_def,
     opt_attr_def,
@@ -34,37 +27,11 @@ from xdsl.irdl import (
     traits_def,
     var_operand_def,
 )
-from xdsl.parser import Parser
-from xdsl.printer import Printer
-from xdsl.traits import (
-    EffectInstance,
-    IsTerminator,
-    MemoryEffect,
-    MemoryEffectKind,
-    RecursiveMemoryEffect,
-)
+from xdsl.traits import IsTerminator, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
-
-@irdl_attr_definition
-class RefType(ParametrizedAttribute, TypeAttribute):
-    name = "npu.ref"
-    bank: StringAttr
-    dtype: StringAttr
-    layout: StringAttr
-
-
-@irdl_attr_definition
-class TaskType(ParametrizedAttribute, TypeAttribute):
-    name = "npu.task_id"
-
-
-class AsyncEffects(MemoryEffect):
-    @classmethod
-    def get_effects(cls, op: Operation):
-        return frozenset(
-            {EffectInstance(MemoryEffectKind.READ), EffectInstance(MemoryEffectKind.WRITE)}
-        )
+from .loops import LoopScheduleAttr
+from .types import AsyncEffects, RefType, TaskType, verify_runtime_contract
 
 
 @irdl_op_definition
@@ -427,7 +394,7 @@ class RuntimeSizeOp(IRDLOperation):
     value = result_def(IndexType)
 
     def verify_(self):
-        _verify_runtime_contract(self.sym_name.data, self.minimum.data, self.multiple.data)
+        verify_runtime_contract(self.sym_name.data, self.minimum.data, self.multiple.data)
 
 
 @irdl_op_definition
@@ -441,17 +408,6 @@ class CyclicCountOp(IRDLOperation):
     name = "npu.cyclic_count"
     total = operand_def(IndexType)
     count = result_def(IndexType)
-
-
-def _verify_runtime_contract(name, minimum, multiple):
-    if not name.isidentifier():
-        raise VerifyException("runtime size requires a parameter name")
-    if type(minimum) is not int or not 0 <= minimum <= (1 << 63) - 1:
-        raise VerifyException("runtime minimum must be a nonnegative int64 integer")
-    if type(multiple) is not int or not 0 < multiple <= (1 << 63) - 1:
-        raise VerifyException("runtime multiple must be a positive int64 integer")
-    if ((minimum + multiple - 1) // multiple) * multiple > (1 << 63) - 1:
-        raise VerifyException("runtime input contract has no representable int64 value")
 
 
 def _verify_conditional_loop_context(op):
@@ -657,35 +613,8 @@ NPU = Dialect(
         CrossDrainOp,
         EndOp,
     ],
-    [RefType, TaskType],
+    [RefType, TaskType, LoopScheduleAttr],
 )
-
-
-def dump(module: ModuleOp) -> str:
-    output = StringIO()
-    Printer(stream=output).print_op(module)
-    return output.getvalue() + "\n"
-
-
-def parse(text: str) -> ModuleOp:
-    from xdsl.dialects.arith import Arith
-    from xdsl.dialects.scf import Scf
-
-    from .source_ir import SOURCE
-
-    ctx = Context()
-    ctx.load_dialect(Builtin)
-    ctx.load_dialect(NPU)
-    ctx.load_dialect(SOURCE)
-    ctx.load_dialect(Arith)
-    ctx.load_dialect(Scf)
-    module = Parser(ctx, text).parse_module()
-    module.verify()
-    return module
-
-
-def ref_type(bank: str, dtype: str, layout: str = "linear") -> RefType:
-    return RefType(StringAttr(bank), StringAttr(dtype), StringAttr(layout))
 
 
 def task_attrs(uid: str, native: str, stage: int, params=(), scalar=0.0):

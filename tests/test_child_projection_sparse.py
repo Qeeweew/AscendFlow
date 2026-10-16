@@ -9,7 +9,7 @@ import pytest
 from xdsl_npu.child_completion import ChildPort, FixedChildProjection, _fixed_relations
 from xdsl_npu.completion import Position, Site
 from xdsl_npu.completion_flow import ALL
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.symbolic_completion import Family, SymbolicCompletion
 
 

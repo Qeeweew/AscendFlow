@@ -8,7 +8,7 @@ from functools import wraps
 from math import isfinite
 from time import perf_counter
 
-from .model import CompileError, require
+from .diagnostics import CompileError, ErrorKind, require
 
 
 @dataclass
@@ -52,7 +52,10 @@ def poll(phase, **counts):
     if cancelled or perf_counter() >= budget.deadline:
         detail = ", ".join(f"{name}={value}" for name, value in counts.items())
         reason = "cancelled" if cancelled else "deadline exceeded"
-        raise CompileError(f"compilation {reason} at {phase}" + (f" ({detail})" if detail else ""))
+        raise CompileError(
+            f"compilation {reason} at {phase}" + (f" ({detail})" if detail else ""),
+            kind=ErrorKind.ANALYSIS_LIMIT,
+        )
 
 
 def bounded(function):

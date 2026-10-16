@@ -14,12 +14,11 @@ from xdsl.dialects.builtin import (
     f32,
     i1,
 )
-from xdsl.ir import Block, Dialect, ParametrizedAttribute, TypeAttribute
+from xdsl.ir import Block, Dialect
 from xdsl.irdl import (
     AttrSizedOperandSegments,
     IRDLOperation,
     attr_def,
-    irdl_attr_definition,
     irdl_op_definition,
     operand_def,
     opt_attr_def,
@@ -33,7 +32,7 @@ from xdsl.irdl import (
 from xdsl.traits import IsTerminator, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
-from .ir import AsyncEffects, _verify_runtime_contract
+from .types import AsyncEffects, TensorType, TileType, verify_runtime_contract
 
 
 def _verify_yield(op):
@@ -61,22 +60,6 @@ def _verify_dependencies(op, inputs):
         typ = inputs[index.data].type
         if value.type.shape != typ.shape or value.type.dtype != typ.dtype:
             raise VerifyException("logical dependency type must match its consumed input")
-
-
-@irdl_attr_definition
-class TensorType(ParametrizedAttribute, TypeAttribute):
-    name = "npu_source.tensor"
-    shape: ArrayAttr[IntAttr]
-    dtype: StringAttr
-    memory: StringAttr
-    layout: StringAttr
-
-
-@irdl_attr_definition
-class TileType(ParametrizedAttribute, TypeAttribute):
-    name = "npu_source.tile"
-    shape: ArrayAttr[IntAttr]
-    dtype: StringAttr
 
 
 @irdl_op_definition
@@ -166,7 +149,7 @@ class SizeOp(IRDLOperation):
     value = result_def(IndexType)
 
     def verify_(self):
-        _verify_runtime_contract(self.sym_name.data, self.minimum.data, self.multiple.data)
+        verify_runtime_contract(self.sym_name.data, self.minimum.data, self.multiple.data)
         if not isinstance(self.parent_op(), ProgramOp):
             raise VerifyException("runtime size is a uniform program parameter")
 

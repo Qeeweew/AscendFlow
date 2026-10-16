@@ -7,19 +7,18 @@ from xdsl.transforms.dead_code_elimination import dce
 from tests.fixtures.cv import cv_program
 from xdsl_npu import autosync, compile, verify_plan
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.dispatch import extract_dispatch, static_dispatch
-from xdsl_npu.ir import (
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CrossChannelOp,
     CrossDrainOp,
     CrossSyncOp,
     TaskOp,
     ViewOp,
-    dump,
-    parse,
 )
+from xdsl_npu.dispatch import extract_dispatch, static_dispatch
 from xdsl_npu.mixed import ACTORS, global_dependencies, mixed_execution, mixed_graph
-from xdsl_npu.model import CompileError
 
 
 @pytest.fixture(scope="module")

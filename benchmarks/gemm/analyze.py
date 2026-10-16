@@ -6,7 +6,7 @@ from pathlib import Path
 from statistics import median
 
 from benchmarks.artifacts import verified_source
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import profile_evidence, theoretical_metrics
 
 

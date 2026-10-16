@@ -6,7 +6,7 @@ import pytest
 from xdsl.dialects.builtin import DictionaryAttr, IntAttr
 
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.scope_domains import (
     Activation,
     decode_activation,

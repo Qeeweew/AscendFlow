@@ -14,7 +14,7 @@ from xdsl_npu.completion import (
     includes,
     intersection,
 )
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.periodic import MAX_PERIOD
 
 

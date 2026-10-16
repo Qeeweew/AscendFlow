@@ -8,9 +8,9 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr
 from tests.test_scope_query_planning import query_state_store
 from xdsl_npu import loop_sync, scope_event_pools, scope_query_verification
 from xdsl_npu.budget import limit
-from xdsl_npu.ir import CaptureOp, QueryChannelOp, ScopeSyncOp, TaskOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import CaptureOp, QueryChannelOp, ScopeSyncOp, TaskOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_query_planning import plan_query_memory
 from xdsl_npu.scope_query_resources import prepare_binary_resources, verify_query_resources

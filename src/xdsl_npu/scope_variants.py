@@ -13,7 +13,8 @@ from xdsl.dialects import scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
 
 from .budget import bounded, poll
-from .ir import (
+from .diagnostics import require
+from .dialects.physical import (
     BoundaryOp,
     CallOp,
     EndOp,
@@ -27,7 +28,6 @@ from .ir import (
     TaskOp,
     ViewOp,
 )
-from .model import require
 from .scope_predicates import PARENT_CASES, guard_active
 
 

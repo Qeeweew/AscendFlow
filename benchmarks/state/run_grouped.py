@@ -14,7 +14,7 @@ from examples.state.grouped import grouped_state_sum
 from examples.state.shared_inputs import shared_state_sum
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import hardware_snapshot, runtime_work
 
 

@@ -9,14 +9,16 @@ completion, retirement, or safe reuse between queries.
 from dataclasses import dataclass, replace
 
 from .budget import bounded, poll
+from .diagnostics import require
+from .dialects.physical import BufferOp, CallOp, CaptureOp, CoreIdOp, RuntimeSizeOp, TaskOp, ViewOp
 from .indexing import arguments, constant_ratio, equivalent, polynomial
-from .ir import BufferOp, CallOp, CaptureOp, CoreIdOp, RuntimeSizeOp, TaskOp, ViewOp
 from .loop_model import _storage
-from .model import Storage, native_contract, optional_int, require
+from .model import Storage, optional_int
 from .periodic import bounded_period
 from .scalar import Expr, expression, facts_from_sizes, from_ssa, literal
 from .scope_invocation import extract_scope_invocation, verify_query_domains
 from .scope_model import Captured, ScopedProgram, _uniforms
+from .target.native import native_contract
 
 CORE = Expr("argument", ("$core",))
 KV = Expr("argument", ("$parent0",))

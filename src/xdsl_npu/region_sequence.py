@@ -16,7 +16,7 @@ from math import lcm
 from xdsl.ir import SSAValue
 
 from .budget import bounded, poll
-from .model import require
+from .diagnostics import require
 from .periodic import bounded_period
 from .region_patterns import HazardCoverage, HazardPattern, PhysicalRanges, materialize_hazards
 from .region_summary import Access, CountDomain, ReadSpan, RegionSummary

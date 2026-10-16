@@ -10,11 +10,11 @@ from xdsl.dialects.builtin import IntAttr, StringAttr
 from tests.test_scope_native_guards import SOURCE
 from xdsl_npu import language as N
 from xdsl_npu.completion import Position
-from xdsl_npu.ir import LoopSyncOp, ScopeGuardOp, ScopeSyncOp, TaskOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import LoopSyncOp, ScopeGuardOp, ScopeSyncOp, TaskOp
 from xdsl_npu.loop_codegen import _guard, _region_lines
 from xdsl_npu.loop_graph import channels, commands
 from xdsl_npu.loop_sync import _verify_leaf
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_codegen import (
     _parent_case_guard,
     emit_scope_actor,

@@ -6,7 +6,8 @@ from examples.state.grouped import grouped_state_sum
 from tests.models.local_sequence import finite_check
 from tests.report_contract import semantic_report
 from xdsl_npu import compile, verify_plan
-from xdsl_npu.ir import RegionChannelOp, parse
+from xdsl_npu.dialects.io import parse
+from xdsl_npu.dialects.physical import RegionChannelOp
 from xdsl_npu.performance import runtime_work
 
 

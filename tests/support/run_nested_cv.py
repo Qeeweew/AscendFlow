@@ -13,7 +13,7 @@ from pathlib import Path
 
 from xdsl_npu.build import build_file
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 
 
 def main():

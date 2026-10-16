@@ -5,11 +5,11 @@ from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
 
 from examples.normalization.rms_norm import rms_normalize
 from xdsl_npu import compile, verify_plan
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp, TaskOp
+from xdsl_npu.dialects.source import PipelineOp, ReduceOp, ScalarReadOp
 from xdsl_npu.frontend import from_source
-from xdsl_npu.ir import LoopChannelOp, LoopSyncOp, TaskOp
 from xdsl_npu.loop_model import extract_loop, loop_dependencies
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import PipelineOp, ReduceOp, ScalarReadOp
 
 
 @pytest.fixture(scope="module")

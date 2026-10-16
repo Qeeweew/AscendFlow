@@ -18,7 +18,7 @@ from examples.gemm.reduction import reduction_gemm
 from xdsl_npu import language as N
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import hardware_snapshot, runtime_work
 
 

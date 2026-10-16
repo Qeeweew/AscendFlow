@@ -13,7 +13,9 @@ from xdsl_npu import compile
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.child_completion import ChildPort, project_fixed_child
 from xdsl_npu.completion import Position, Site
-from xdsl_npu.ir import (
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CallOp,
     CaptureOp,
@@ -23,12 +25,10 @@ from xdsl_npu.ir import (
     OnceOp,
     StreamOp,
     TaskOp,
-    dump,
 )
 from xdsl_npu.loop_graph import Graph
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.loop_sync import _plan_leaf, _verify_leaf, verify_loop
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_completion import _transitive_reduction, compose_calls
 from xdsl_npu.symbolic_completion import native_family
 

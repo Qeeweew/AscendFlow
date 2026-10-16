@@ -11,7 +11,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from .completion import coalesce, covers
-from .model import require
+from .diagnostics import require
 from .native_order import instruction_points, prefix_inputs
 from .scope_domains import affine
 from .symbolic_completion import Family, le, meet

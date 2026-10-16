@@ -9,8 +9,8 @@ from tests.test_region_sequence import check, finite, occurrences, part, source
 from tests.test_region_sequence_sharing import repeated
 from xdsl_npu import region_sequence
 from xdsl_npu.completion import CountDomain
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.region_sequence import summarize_sequence
 from xdsl_npu.region_summary import ReadSpan
 from xdsl_npu.scope_model import extract_scopes

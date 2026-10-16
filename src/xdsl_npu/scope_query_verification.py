@@ -1,7 +1,7 @@
 """Compose owned query results, or independently verify imported actual IR."""
 
 from .budget import bounded
-from .model import require
+from .diagnostics import require
 from .scope_query_checks import check_memory, memory_check_reason, prepare_memory_checks
 from .scope_query_completion import QueryCompletion
 from .scope_query_protocols import read_query_protocols

@@ -4,7 +4,7 @@ import math
 import struct
 from dataclasses import asdict, dataclass
 
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 
 
 @dataclass(frozen=True)

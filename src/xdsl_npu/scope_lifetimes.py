@@ -15,8 +15,8 @@ from dataclasses import dataclass, replace
 from .budget import poll
 from .completion import CountDomain, Position, _first, coalesce
 from .completion_flow import ALL
+from .diagnostics import require
 from .loop_model import Dependence
-from .model import require
 from .region_summary import Access, CellSummary, ReadSpan
 from .scope_domains import Activation, ScopedDependence, affine, position
 from .symbolic_completion import choice, holds, le, meet

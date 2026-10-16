@@ -10,10 +10,11 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType, IntAttr
 
 from ._physical_builder import Kernel
-from .ir import FrameOp
-from .model import ITEMSIZE, require
+from .diagnostics import require
+from .dialects.physical import FrameOp
+from .dialects.source import AllocationOp, MatmulOp, PipelineOp, SizeOp
 from .scalar import ARITHMETIC, expression, facts_from_sizes, from_ssa, literal, uniform
-from .source_ir import AllocationOp, MatmulOp, PipelineOp, SizeOp
+from .target.native import ITEMSIZE
 
 
 class ActorBindings:
@@ -82,8 +83,8 @@ class ActorBindings:
 
     def runtime_bound(self, pipeline):
         """Admit a cyclic owner domain from actual SSA, without a trusted flag."""
+        from .dialects.physical import CyclicCountOp
         from .indexing import equivalent
-        from .ir import CyclicCountOp
 
         if pipeline.limit in self.uniform:
             return self.uniform[pipeline.limit]
@@ -125,8 +126,8 @@ class ActorBindings:
         clock and the inner KV clock have independent bounds and identities.
         """
         from .cyclic import CyclicDomain
+        from .dialects.physical import CyclicCountOp
         from .indexing import equivalent
-        from .ir import CyclicCountOp
         from .scalar import Expr
 
         require(

@@ -8,11 +8,18 @@ from xdsl.dialects import scf
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from .budget import bounded
-from .ir import InvocationChannelOp, InvocationSyncOp, KernelOp, LoopChannelOp, LoopSyncOp, StreamOp
+from .diagnostics import CompileError, require
+from .dialects.physical import (
+    InvocationChannelOp,
+    InvocationSyncOp,
+    KernelOp,
+    LoopChannelOp,
+    LoopSyncOp,
+    StreamOp,
+)
 from .loop_graph import channels, commands, completion_graph
 from .loop_model import extract_loop, loop_dependencies
 from .loop_planning import DirectCompletion, Protocol
-from .model import CompileError, require
 from .periodic import bounded_period, project, union
 
 

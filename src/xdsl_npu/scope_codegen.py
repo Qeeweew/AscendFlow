@@ -5,8 +5,8 @@ from itertools import combinations, product
 
 from .asc_scalar import ScalarScope
 from .codegen import QUALIFIER
-from .ir import CallOp, LoopChannelOp, LoopSyncOp, QuerySyncOp, ScopeSyncOp, TaskOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import CallOp, LoopChannelOp, LoopSyncOp, QuerySyncOp, ScopeSyncOp, TaskOp
 from .scalar import INT64_MAX, Expr
 from .scope_predicates import PARENT_CASES, case_activation, guard_active
 from .scope_variants import operation_cases, scope_operations

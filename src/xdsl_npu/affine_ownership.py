@@ -8,7 +8,7 @@ This proves physical ownership only, never completion or initialization.
 from itertools import pairwise
 
 from .budget import poll
-from .model import require
+from .diagnostics import require
 
 MAX_AFFINE_VISITS = 1_000_000
 

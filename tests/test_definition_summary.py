@@ -8,9 +8,11 @@ from tests.fixtures.nested import shared_l0c_qk_pv
 from xdsl_npu import budget
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.completion import CountDomain
-from xdsl_npu.ir import TaskOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import TaskOp
 from xdsl_npu.loop_model import extract_loop
-from xdsl_npu.model import CompileError, Ref
+from xdsl_npu.model import Ref
 from xdsl_npu.region_summary import CellSummary, summarize_fixed_storage, summarize_reused_storage
 from xdsl_npu.scope_lowering import lower_scopes
 from xdsl_npu.scope_model import extract_scopes

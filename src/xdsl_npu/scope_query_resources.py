@@ -16,8 +16,8 @@ from math import gcd, lcm
 
 from .budget import bounded, poll
 from .completion import CountDomain, Position, canonical, coalesce
-from .ir import FixConfigOp, Load3DConfigOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import FixConfigOp, Load3DConfigOp
 from .periodic import bounded_period, normalize
 from .region_summary import summarize_local_events
 from .scope_domains import affine, legacy_activation, position, validate_activation

@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from .budget import bounded, poll
 from .child_completion import ChildPort
 from .completion import CountDomain, Position, Site, _first, canonical, coalesce, covers, uncovered
+from .diagnostics import require
 from .loop_graph import Command
-from .model import require
 from .periodic import bounded_period
 from .scope_child_transfer import VirtualNode, direct, point_guard
 from .scope_domains import affine, shifted

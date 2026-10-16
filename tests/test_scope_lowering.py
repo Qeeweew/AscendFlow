@@ -13,10 +13,11 @@ from tests.fixtures.nested import nested_copy
 from xdsl_npu import language as N
 from xdsl_npu import lowering, source_scopes
 from xdsl_npu.compilation_facts import PhysicalFacts
-from xdsl_npu.ir import CallOp, StreamOp, TaskOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import CallOp, StreamOp, TaskOp
+from xdsl_npu.dialects.source import CopyOp, ElementOp, MatmulOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import CopyOp, ElementOp, MatmulOp
 
 
 def test_actual_ast_prefix_loop_suffix_use_one_scope_collection_and_no_legacy_walker(monkeypatch):

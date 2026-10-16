@@ -4,10 +4,10 @@ import pytest
 from xdsl.dialects import arith, scf
 
 from xdsl_npu import compile
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.source import PipelineOp, SizeOp, YieldOp
 from xdsl_npu.frontend import FrontendError, from_source
-from xdsl_npu.ir import dump, parse
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import PipelineOp, SizeOp, YieldOp
 
 
 def interpret(block, values, arguments):

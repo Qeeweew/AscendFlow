@@ -10,8 +10,9 @@ from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType, IntAttr, StringAttr
 from xdsl.ir import Block
 
-from xdsl_npu.ir import RuntimeSizeOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import RuntimeSizeOp
+from xdsl_npu.dialects.source import SizeOp
 from xdsl_npu.scalar import (
     INT64_MAX,
     Expr,
@@ -25,7 +26,6 @@ from xdsl_npu.scalar import (
     positive,
     uniform,
 )
-from xdsl_npu.source_ir import SizeOp
 
 
 def argument(name):

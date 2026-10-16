@@ -14,7 +14,7 @@ from pathlib import Path
 from benchmarks.artifacts import read_artifact
 from xdsl_npu.build import build_file
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import runtime_work
 
 

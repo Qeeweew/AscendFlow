@@ -6,8 +6,8 @@ from xdsl.utils.exceptions import VerifyException
 from examples.normalization.softmax import softmax
 from xdsl_npu import compile
 from xdsl_npu import language as T
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import ElementOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.source import ElementOp
 
 
 @pytest.fixture(scope="module")

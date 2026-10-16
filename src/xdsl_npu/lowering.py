@@ -14,12 +14,9 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import DictionaryAttr, IntAttr, StringAttr
 from xdsl.ir import Block, Region
 
-from .ir import BoundaryOp, EndOp, ScopeGuardOp
-from .lowering_context import ActorBindings
-from .mixed import extract_mixed, global_dependencies
-from .model import ITEMSIZE, Instance, dependencies, extract, ranges_cover, require
-from .scalar import Expr, expression, from_ssa, literal, prefix
-from .source_ir import (
+from .diagnostics import require
+from .dialects.physical import BoundaryOp, EndOp, ScopeGuardOp
+from .dialects.source import (
     AllocationOp,
     CopyOp,
     DomainOp,
@@ -35,7 +32,12 @@ from .source_ir import (
     ViewOp,
     block8_reduction_widths,
 )
+from .lowering_context import ActorBindings
+from .mixed import extract_mixed, global_dependencies
+from .model import Instance, dependencies, extract, ranges_cover
+from .scalar import Expr, expression, from_ssa, literal, prefix
 from .source_scopes import Context
+from .target.native import ITEMSIZE
 
 
 def shape(value):

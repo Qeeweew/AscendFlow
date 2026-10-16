@@ -9,9 +9,9 @@ from xdsl.dialects import arith, scf
 
 from xdsl_npu import compile
 from xdsl_npu import language as N
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.source import PredicateOp
 from xdsl_npu.frontend import FrontendError
-from xdsl_npu.ir import dump
-from xdsl_npu.source_ir import PredicateOp
 
 SOURCE = """\
 def asserted(n:N.int64, B:N.constexpr=64):

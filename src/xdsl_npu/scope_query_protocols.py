@@ -16,8 +16,8 @@ from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
 
 from .budget import bounded, poll
 from .completion import CountDomain, Position
-from .ir import QueryChannelOp, QuerySyncOp, ScopeChannelOp, ScopeSyncOp, TaskOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import QueryChannelOp, QuerySyncOp, ScopeChannelOp, ScopeSyncOp, TaskOp
 from .scalar import INT64_MAX, facts_from_sizes
 from .scope_domains import Activation, validate_activation
 from .scope_variants import operation_cases, scope_operations

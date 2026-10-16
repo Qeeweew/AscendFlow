@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from xdsl.dialects.builtin import IntAttr, ModuleOp, StringAttr
 from xdsl.ir import Block, Region
 
-from .ir import EndOp, MixedOp, StaticCaseOp, StaticDispatchOp
+from .diagnostics import require
+from .dialects.physical import EndOp, MixedOp, StaticCaseOp, StaticDispatchOp
 from .mixed import extract_mixed, merge_ranges
-from .model import ranges_overlap, require
+from .model import ranges_overlap
 
 
 @dataclass

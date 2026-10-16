@@ -9,7 +9,9 @@ from tests.fixtures.physical_operators import gemm_bias_silu
 from tests.fixtures.pipelines import mixed_pipeline
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
-from xdsl_npu.ir import (
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CrossChannelOp,
     CrossDrainOp,
@@ -18,13 +20,10 @@ from xdsl_npu.ir import (
     KernelOp,
     StreamOp,
     TaskOp,
-    TaskType,
     ViewOp,
-    dump,
-    parse,
-    ref_type,
     task_attrs,
 )
+from xdsl_npu.dialects.types import TaskType, ref_type
 from xdsl_npu.mixed import (
     ACTORS,
     cross_op,
@@ -34,7 +33,7 @@ from xdsl_npu.mixed import (
     mixed_graph,
 )
 from xdsl_npu.mixed_check import bounded_mixed_check
-from xdsl_npu.model import CompileError, Instance
+from xdsl_npu.model import Instance
 from xdsl_npu.sync import explain_plan
 from xdsl_npu.sync import verify_plan as local_verify
 

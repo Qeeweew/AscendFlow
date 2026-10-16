@@ -7,7 +7,7 @@ family onto the protocol clock by CRT, retaining its earliest real occurrence.
 
 from math import gcd, lcm
 
-from .model import require
+from .diagnostics import require
 
 MAX_PERIOD = 840
 MAX_PERIOD_TEMPLATES = 65536

@@ -9,10 +9,19 @@ from xdsl.utils.exceptions import VerifyException
 
 from tests.fixtures.attention_target import attention_target
 from xdsl_npu import language as N
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.source import (
+    AllocationOp,
+    PipelineOp,
+    ProgramOp,
+    SizeOp,
+    StageOp,
+    ViewOp,
+    YieldOp,
+)
 from xdsl_npu.frontend import FrontendError
-from xdsl_npu.ir import dump, parse
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import AllocationOp, PipelineOp, ProgramOp, SizeOp, StageOp, ViewOp, YieldOp
+from xdsl_npu.frontend import builders as source_builders
 
 BNSD_COPY = """
     def tiled(X: N.Tensor((B,H,S,D),N.f32),
@@ -266,12 +275,12 @@ def test_valid_prefix_is_an_explicit_index_operand_with_verified_provenance():
 
 
 def escaped_child_index(count):
-    trace = N._Trace("exported", False)
-    token = N._current.set(trace)
+    trace = source_builders._Trace("exported", False)
+    token = source_builders._current.set(trace)
     try:
-        child = N.Pipelined(count, stages=1).op
+        child = source_builders.Pipelined(count, stages=1).op
         trace.enter(child)
-        coordinate = N._coordinate(child.body.block.args[0])
+        coordinate = source_builders._coordinate(child.body.block.args[0])
         index = ((coordinate + 1) % 2) * 16
         trace.leave(child)
         value = trace.scalar(trace.resolve_index(index))
@@ -280,7 +289,7 @@ def escaped_child_index(count):
         module.verify()
         return value, module
     finally:
-        N._current.reset(token)
+        source_builders._current.reset(token)
 
 
 def test_static_child_export_substitutes_the_whole_ssa_expression():
@@ -379,7 +388,7 @@ def test_view_checks_scope_dominance_across_stages():
 
 @pytest.mark.parametrize("continuous", [False, True])
 def test_real_attention_math_and_descriptors_reach_verified_source_ir(continuous):
-    from xdsl_npu.source_ir import ElementOp, MatmulOp, ReduceOp
+    from xdsl_npu.dialects.source import ElementOp, MatmulOp, ReduceOp
 
     source = attention_target(continuous=continuous).to_ir()
     source.verify()

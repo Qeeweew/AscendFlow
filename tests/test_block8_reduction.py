@@ -5,10 +5,11 @@ from xdsl.utils.exceptions import VerifyException
 
 from xdsl_npu import compile, emit_asc, verify_plan
 from xdsl_npu import language as N
-from xdsl_npu.ir import LoopSyncOp, TaskOp, dump, parse
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import LoopSyncOp, TaskOp
+from xdsl_npu.dialects.source import ReduceOp
 from xdsl_npu.loop_model import extract_loop
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import ReduceOp
 
 
 def definition(kind="sum", rows=8, columns=1024, workspace=1152):

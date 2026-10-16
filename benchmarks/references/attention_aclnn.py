@@ -3,7 +3,7 @@
 import ctypes as ct
 
 from benchmarks.references.aclnn import OperatorReference
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 
 
 class FlashAttentionReference(OperatorReference):

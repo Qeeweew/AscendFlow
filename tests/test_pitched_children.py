@@ -8,8 +8,8 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr
 from tests.fixtures.pitched_children import cube_columns, pitched_children
 from tests.models.local_sequence import finite_check
 from xdsl_npu import compile
-from xdsl_npu.ir import RegionChannelOp, RegionSyncOp, StreamOp, ViewOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import RegionChannelOp, RegionSyncOp, StreamOp, ViewOp
 from xdsl_npu.sequence_model import extract_sequence
 from xdsl_npu.sync import verify_plan
 

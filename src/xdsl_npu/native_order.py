@@ -6,7 +6,7 @@ and a notification effect. In particular a Set effect never enters a native
 retirement prefix or the following instruction's FIFO-begin prefix.
 """
 
-from .model import require
+from .diagnostics import require
 
 
 def instruction_points(command, before, node, edge):

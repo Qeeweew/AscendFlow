@@ -9,18 +9,12 @@ from xdsl.irdl import IRDLOperation, irdl_op_definition, traits_def
 from tests.fixtures.nested import nested_copy
 from tests.test_scope_serial_source import SOURCE
 from xdsl_npu import language as N
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import CoreIdOp, CyclicCountOp, RuntimeSizeOp, StreamOp, ViewOp
+from xdsl_npu.dialects.types import AsyncEffects
 from xdsl_npu.indexing import arguments
-from xdsl_npu.ir import (
-    AsyncEffects,
-    CoreIdOp,
-    CyclicCountOp,
-    RuntimeSizeOp,
-    StreamOp,
-    ViewOp,
-    dump,
-)
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scalar import Expr, facts_from_sizes, uniform
 from xdsl_npu.scope_model import extract_scopes
 

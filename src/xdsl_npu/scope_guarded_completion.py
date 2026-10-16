@@ -12,8 +12,8 @@ from dataclasses import replace
 from .budget import bounded, poll
 from .completion import CountDomain, coalesce, covers, uncovered
 from .completion_flow import ALL
+from .diagnostics import require
 from .loop_graph import Command
-from .model import require
 from .scope_domains import Activation, affine
 from .scope_transfer_queries import (
     VirtualCut,

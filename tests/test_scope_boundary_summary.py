@@ -6,7 +6,7 @@ from random import Random
 import pytest
 
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.region_summary import Access, CellSummary, ReadSpan
 from xdsl_npu.scope_boundary_summary import summarize_frontiers
 from xdsl_npu.scope_domains import Activation

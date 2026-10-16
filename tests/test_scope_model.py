@@ -8,8 +8,9 @@ from xdsl.irdl import IRDLOperation, irdl_op_definition, traits_def
 from tests.fixtures.nested import nested_copy, nested_cv
 from tests.test_scope_codegen import VECTOR
 from xdsl_npu import language as N
-from xdsl_npu.ir import (
-    AsyncEffects,
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CoreIdOp,
     FixConfigOp,
@@ -18,9 +19,8 @@ from xdsl_npu.ir import (
     RegionSyncOp,
     ScopeSyncOp,
     ViewOp,
-    dump,
 )
-from xdsl_npu.model import CompileError
+from xdsl_npu.dialects.types import AsyncEffects
 from xdsl_npu.scalar import INT64_MAX
 from xdsl_npu.scope_lowering import lower_scopes
 from xdsl_npu.scope_model import extract_scopes

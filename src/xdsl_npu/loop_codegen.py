@@ -4,9 +4,11 @@ from itertools import groupby
 
 from .asc_scalar import ScalarScope
 from .codegen import QUALIFIER, load3d_init, native_line
-from .ir import InvocationChannelOp, MixedOp, OnceOp
-from .model import ITEMSIZE, require, storage_layout
+from .diagnostics import require
+from .dialects.physical import InvocationChannelOp, MixedOp, OnceOp
+from .model import storage_layout
 from .scalar import bindings, facts_from_sizes, from_ssa
+from .target.native import ITEMSIZE
 
 
 def _guard(command, channel=None):

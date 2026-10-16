@@ -7,9 +7,11 @@ from tests.fixtures.physical_state import recurrent_gdn
 from tests.fixtures.pipelines import phased_pipeline, vector_pipeline
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.check import bounded_check
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import ChannelOp
 from xdsl_npu.events import minimum_chains, pack_event_lifetimes, selection_expression
-from xdsl_npu.ir import ChannelOp, dump, parse
-from xdsl_npu.model import CompileError, extract
+from xdsl_npu.model import extract
 from xdsl_npu.sync import explain_plan
 
 

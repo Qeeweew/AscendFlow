@@ -18,8 +18,8 @@ from tests.test_definition_lifetimes import (
 )
 from xdsl_npu import language as N
 from xdsl_npu.compilation import compile
-from xdsl_npu.ir import CallOp, TaskOp, ViewOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import CallOp, TaskOp, ViewOp
 from xdsl_npu.scope_access import analyze_scope_access
 from xdsl_npu.scope_domains import ScopedDependence
 from xdsl_npu.scope_lifetimes import plan_lifetimes, propose_lifetimes

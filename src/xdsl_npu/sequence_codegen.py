@@ -1,6 +1,6 @@
 """Format the checked region endpoints in their actual physical IR order."""
 
-from .ir import RegionSyncOp, TaskOp
+from .dialects.physical import RegionSyncOp, TaskOp
 from .loop_boundary import stream_operations
 
 

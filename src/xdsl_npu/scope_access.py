@@ -15,6 +15,7 @@ from xdsl.ir import SSAValue
 
 from .budget import poll
 from .completion import Position, Site
+from .diagnostics import require
 from .indexing import constant_ratio, physical_terms
 from .loop_model import (
     Actor,
@@ -25,7 +26,7 @@ from .loop_model import (
     loop_dependencies,
     verify_access_ownership,
 )
-from .model import ITEMSIZE, Ref, Task, require
+from .model import Ref, Task
 from .periodic import bounded_period
 from .region_summary import (
     Access,
@@ -36,6 +37,7 @@ from .region_summary import (
 )
 from .scalar import facts_from_sizes, from_ssa
 from .scope_model import ScopedProgram
+from .target.native import ITEMSIZE
 
 if TYPE_CHECKING:
     from .scope_query_access import QueryAccessMap

@@ -11,9 +11,9 @@ from tests.fixtures.cv import vector_source
 from xdsl_npu import compile, region_summary
 from xdsl_npu import language as N
 from xdsl_npu.completion import CountDomain, Position
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.loop_graph import Channel, channels
 from xdsl_npu.loop_model import extract_loop
-from xdsl_npu.model import CompileError
 from xdsl_npu.region_summary import Access, EventReuse, fixed_event_reuse, summarize_local_events
 
 BANK = ("aiv0", "MTE2", "V")

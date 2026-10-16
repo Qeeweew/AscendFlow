@@ -9,7 +9,7 @@ from collections import defaultdict
 from dataclasses import replace
 
 from .budget import poll
-from .model import require
+from .diagnostics import require
 from .scope_domains import Activation, affine, position, validate_activation
 from .scope_event_borrow import ParentEventBankExhausted
 from .symbolic_completion import add, le, meet

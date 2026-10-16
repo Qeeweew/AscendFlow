@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from itertools import combinations
 
 from .budget import bounded, poll
-from .model import require
+from .diagnostics import require
 from .scope_event_borrow import (
     ParentEventBankExhausted,
     allocate_borrows,

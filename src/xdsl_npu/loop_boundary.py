@@ -1,7 +1,7 @@
 """Visit retained physical boundary regions without instantiating iterations."""
 
-from .ir import BoundaryOp, EndOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import BoundaryOp, EndOp
 
 
 def stream_operations(stream):

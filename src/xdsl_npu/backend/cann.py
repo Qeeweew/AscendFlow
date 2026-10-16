@@ -2,13 +2,17 @@
 
 import hashlib
 import json
-import os
-import signal
 import subprocess
 from pathlib import Path
 from time import monotonic
 
-from .build import deadline, in_build_group, remaining
+from ..runtime.process import (
+    MAX_BUILD_SECONDS,
+    deadline,
+    in_build_group,
+    kill_process_group,
+    remaining,
+)
 
 CANN = Path("/usr/local/Ascend/cann-9.1.0")
 FLAGS = [
@@ -22,7 +26,13 @@ FLAGS = [
 
 
 def offline_compile(
-    source: str, directory: Path, name: str, *, shared=False, timeout_s=300.0, _deadline=None
+    source: str,
+    directory: Path,
+    name: str,
+    *,
+    shared=False,
+    timeout_s=MAX_BUILD_SECONDS,
+    _deadline=None,
 ) -> dict:
     """Compile within one wall-clock budget, killing the compiler process group on expiry."""
     started = monotonic()
@@ -75,7 +85,7 @@ def offline_compile(
     def stop(proc):
         try:
             if own_group:
-                os.killpg(proc.pid, signal.SIGKILL)
+                kill_process_group(proc.pid)
             else:
                 # The outer watchdog owns the whole worker group and always
                 # reaps it, including compiler descendants, when work ends.

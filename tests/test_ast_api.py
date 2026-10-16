@@ -9,8 +9,10 @@ from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from xdsl_npu import compile
 from xdsl_npu import language as N
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import parse
+from xdsl_npu.dialects.physical import TaskOp
 from xdsl_npu.frontend import FrontendError
-from xdsl_npu.ir import TaskOp, parse
 
 
 def test_public_physical_builder_has_been_removed():
@@ -29,6 +31,15 @@ def test_removed_source_entry_has_no_compatibility_alias(name):
 
 def test_pipeline_has_no_python_tracing_iterator():
     assert "__iter__" not in N.Pipelined.__dict__
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [lambda: N.Kernel(), lambda: N.alloc_ub((64,)), lambda: N.Pipelined(2, stages=1)],
+)
+def test_device_syntax_cannot_start_executable_python_tracing(operation):
+    with pytest.raises(CompileError, match="AST capture"):
+        operation()
 
 
 @pytest.mark.parametrize("name", ["alloc_ub", "alloc_l1", "alloc_l0a", "alloc_l0b", "alloc_l0c"])

@@ -3,8 +3,8 @@
 import pytest
 
 from xdsl_npu.cyclic import CyclicDomain
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.indexing import check_axis, interval
-from xdsl_npu.model import CompileError
 from xdsl_npu.scalar import Expr, Fact
 from xdsl_npu.scalar import expression as e
 from xdsl_npu.scalar import literal as c

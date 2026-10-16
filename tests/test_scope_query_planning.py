@@ -8,9 +8,10 @@ import pytest
 
 from xdsl_npu import language as N
 from xdsl_npu.budget import limit
-from xdsl_npu.ir import QueryChannelOp, QuerySyncOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import QueryChannelOp, QuerySyncOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_query_checks import check_memory, prepare_memory_checks
 from xdsl_npu.scope_query_completion import QueryCompletion, QueryEvent

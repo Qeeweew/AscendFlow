@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 
 from xdsl_npu.completion import Site
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 
 MILESTONES = (
     "begin",

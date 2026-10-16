@@ -12,10 +12,11 @@ from time import perf_counter
 
 from .budget import limit, poll
 from .codegen import _emit_checked
-from .ir import KernelOp, TaskOp, dump, parse
+from .diagnostics import require
+from .dialects.io import dump, parse
+from .dialects.physical import KernelOp, TaskOp
+from .dialects.source import ProgramOp
 from .lowering import lower_source
-from .model import require
-from .source_ir import ProgramOp
 from .sync import autosync, explain_plan, verify_plan
 
 

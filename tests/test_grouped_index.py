@@ -10,11 +10,12 @@ from examples.vector.grouped import grouped_scale
 from tests.test_runtime_contract import host_launcher
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as T
-from xdsl_npu.ir import BufferOp, LoopSyncOp, dump, parse
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import BufferOp, LoopSyncOp
+from xdsl_npu.dialects.source import ViewOp
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import ViewOp
 
 
 @pytest.fixture(scope="module")

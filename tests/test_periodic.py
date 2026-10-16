@@ -8,11 +8,11 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr
 from examples.vector.independent_rings import independent_rings
 from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile, verify_plan
-from xdsl_npu.ir import BufferOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import BufferOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
 from xdsl_npu.loop_model import extract_loop, loop_dependencies
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.periodic import normalize, project, union
 
 

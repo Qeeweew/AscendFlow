@@ -8,10 +8,8 @@ from tests.report_contract import semantic_report
 from xdsl_npu import autosync, compile, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.ir import (
-    parse,
-)
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import parse
 from xdsl_npu.performance import runtime_work
 
 

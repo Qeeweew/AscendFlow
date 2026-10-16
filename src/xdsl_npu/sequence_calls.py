@@ -9,7 +9,7 @@ separate Wait-to-Set obligations discharge finite event resources.
 from dataclasses import dataclass, replace
 
 from .completion import CountDomain, Requirement, Site, covers
-from .model import require
+from .diagnostics import require
 from .region_completion import RegionCompletion, _point, _task, mark, position
 from .region_summary import Access, summarize_local_events
 from .sequence_plan import BridgeSelection, Candidate, select_bridges

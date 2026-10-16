@@ -7,8 +7,8 @@ import pytest
 from tests.fixtures.nested import nested_copy
 from tests.test_scope_events import planned_children
 from tests.test_scope_protocol_review import fifo_proof
-from xdsl_npu.ir import dump
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
 from xdsl_npu.scope_access import analyze_scope_access
 from xdsl_npu.scope_event_pools import allocate_parent_pools, verify_parent_pools
 from xdsl_npu.scope_events import event_choices, resource_inputs

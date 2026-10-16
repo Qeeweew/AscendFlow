@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.loop_graph import Command, Graph
-from xdsl_npu.model import CompileError
 
 
 def node(graph):

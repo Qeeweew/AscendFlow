@@ -18,7 +18,7 @@ from .completion import (
     uncovered,
 )
 from .completion_flow import ALL
-from .model import require
+from .diagnostics import require
 from .native_order import prefix_inputs
 from .region_summary import Access
 from .symbolic_completion import Family, SymbolicCompletion, native_family

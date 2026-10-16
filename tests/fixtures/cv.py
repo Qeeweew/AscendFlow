@@ -9,8 +9,8 @@ from xdsl.dialects.builtin import StringAttr
 
 from xdsl_npu import language as T
 from xdsl_npu._physical_builder import Kernel
+from xdsl_npu.diagnostics import require
 from xdsl_npu.mixed import compose
-from xdsl_npu.model import require
 
 
 def vector_source(count=4):

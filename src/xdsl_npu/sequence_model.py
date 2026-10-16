@@ -4,7 +4,8 @@ from dataclasses import dataclass, replace
 
 from xdsl.dialects import scf
 
-from .ir import (
+from .diagnostics import require
+from .dialects.physical import (
     InvocationChannelOp,
     InvocationSyncOp,
     KernelOp,
@@ -14,7 +15,7 @@ from .ir import (
     StreamOp,
 )
 from .loop_model import _extract_loop_after_verify, slope
-from .model import require, verify_translated_owners
+from .model import verify_translated_owners
 from .region_sequence import Part, summarize_sequence
 from .region_summary import allocation, summarize_reused_storage
 

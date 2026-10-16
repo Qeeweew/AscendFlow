@@ -12,9 +12,10 @@ from tests.test_scope_query_completion import FiniteQueries
 from tests.test_scope_query_resources import actual_word, endpoint_coordinate
 from xdsl_npu import compile, scope_event_pools
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import ScopeChannelOp, ScopeSyncOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import ScopeChannelOp, ScopeSyncOp
 from xdsl_npu.loop_graph import Graph
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_anchored_completion import AnchoredCompletion
 from xdsl_npu.scope_domains import shifted
 from xdsl_npu.scope_event_borrow import (
@@ -165,7 +166,7 @@ def test_actual_second_parent_on_one_child_id_is_rejected(actual):
 
 @pytest.mark.parametrize("child", (False, True), ids=("parent", "child"))
 def test_deleting_actual_wait_is_rejected(actual, child):
-    from xdsl_npu.ir import LoopSyncOp
+    from xdsl_npu.dialects.physical import LoopSyncOp
 
     changed = actual[0].clone()
     name = actual[4][0].name

@@ -1,7 +1,7 @@
 """Render actual serial-query clocks and local event activation at native cuts."""
 
 from .asc_scalar import ScalarScope
-from .model import require
+from .diagnostics import require
 from .scalar import INT64_MAX
 
 

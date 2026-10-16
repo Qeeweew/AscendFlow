@@ -10,9 +10,18 @@ from collections import deque
 from dataclasses import dataclass
 
 from .budget import poll
-from .ir import EndOp, InvocationSyncOp, LoopChannelOp, LoopSyncOp, RegionSyncOp, TaskOp, ViewOp
+from .diagnostics import require
+from .dialects.physical import (
+    EndOp,
+    InvocationSyncOp,
+    LoopChannelOp,
+    LoopSyncOp,
+    RegionSyncOp,
+    TaskOp,
+    ViewOp,
+)
 from .loop_boundary import stream_operations
-from .model import optional_int, require
+from .model import optional_int
 from .native_order import instruction_points, prefix_inputs
 from .periodic import MAX_PERIOD_TEMPLATES, MAX_PROOF_STATES
 

@@ -7,8 +7,8 @@ it never reconfigures registers across an outstanding asynchronous load.
 
 from xdsl.dialects.builtin import IntAttr, StringAttr
 
-from .ir import KernelOp, Load3DConfigOp, TaskOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import KernelOp, Load3DConfigOp, TaskOp
 
 
 def select_load3d(module):

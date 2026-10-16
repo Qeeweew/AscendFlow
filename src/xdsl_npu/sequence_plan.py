@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 
 from .budget import poll
 from .completion import CountDomain, Point, Requirement, coalesce, covers, uncovered
-from .model import require
+from .diagnostics import require
 from .region_completion import _data, _task, mark
 
 _AUTHORITY = object()

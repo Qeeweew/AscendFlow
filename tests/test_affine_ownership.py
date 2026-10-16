@@ -5,7 +5,8 @@ from random import Random
 import pytest
 
 from xdsl_npu.affine_ownership import verify_affine_frames
-from xdsl_npu.model import CompileError, Ref, Storage
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.model import Ref, Storage
 
 
 def _refs(width, pitch, rows, stride, offsets, owner_stride):

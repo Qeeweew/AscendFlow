@@ -8,7 +8,7 @@ new graph from actual IR and never reads this planner's path cache.
 from collections import defaultdict
 from dataclasses import dataclass
 
-from .model import require
+from .diagnostics import require
 
 
 @dataclass(frozen=True, slots=True)

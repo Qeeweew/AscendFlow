@@ -5,7 +5,8 @@ from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
 from xdsl.ir import Block, Region
 
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.ir import (
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CallOp,
     EndOp,
@@ -16,12 +17,11 @@ from xdsl_npu.ir import (
     ScopeSyncOp,
     StreamOp,
     TaskOp,
-    TaskType,
     task_attrs,
 )
+from xdsl_npu.dialects.types import TaskType
 from xdsl_npu.loop_model import extract_loop
 from xdsl_npu.loop_sync import _verify_leaf
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_predicates import PARENT_CASES
 from xdsl_npu.scope_variants import (
     child_is_empty,

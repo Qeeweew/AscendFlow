@@ -5,10 +5,10 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import language as N
-from xdsl_npu.ir import LoopSyncOp, ScopeSyncOp, TaskOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import LoopSyncOp, ScopeSyncOp, TaskOp
 from xdsl_npu.loop_boundary import stream_operations
 from xdsl_npu.loop_graph import Command
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_access import analyze_scope_access
 from xdsl_npu.scope_lowering import lower_scopes
 from xdsl_npu.scope_model import extract_scopes

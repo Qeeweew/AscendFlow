@@ -12,8 +12,8 @@ from tests.test_scope_protocol_review import fifo_proof
 from tests.test_scope_query_completion import FiniteQueries
 from xdsl_npu import compile
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import dump
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
 from xdsl_npu.scope_domains import Activation
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_query_completion import QueryCompletion, QuerySite
@@ -398,7 +398,7 @@ def test_final_resources_rebuild_actual_binary_and_query_channel_reuse(local_que
 def test_final_resource_query_window_covers_the_actual_id_rotation(local_queries):
     from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
-    from xdsl_npu.ir import QueryChannelOp
+    from xdsl_npu.dialects.physical import QueryChannelOp
     from xdsl_npu.scope_query_protocols import read_query_protocols
     from xdsl_npu.scope_query_resources import _query_bank
     from xdsl_npu.scope_sync import _leaf_banks
@@ -457,7 +457,7 @@ def test_final_resource_checker_rejects_two_actual_query_channels_sharing_one_id
 
 
 def test_final_resource_checker_rejects_missing_actual_query_wait(local_queries):
-    from xdsl_npu.ir import QuerySyncOp
+    from xdsl_npu.dialects.physical import QuerySyncOp
 
     module = local_queries[0].clone()
     wait = next(

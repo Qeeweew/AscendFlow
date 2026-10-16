@@ -9,8 +9,8 @@ from dataclasses import replace
 import pytest
 
 from xdsl_npu._physical_builder import Kernel
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.loop_model import extract_loop
-from xdsl_npu.model import CompileError
 from xdsl_npu.region_sequence import Part, summarize_sequence
 from xdsl_npu.region_summary import Access, summarize_reused_storage
 from xdsl_npu.scalar import expression, literal

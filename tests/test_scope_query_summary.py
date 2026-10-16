@@ -8,7 +8,8 @@ import pytest
 from tests.fixtures.scoped_queries import scoped_query_recurrence
 from tests.test_index_frontend import evaluate as evaluate_ssa
 from xdsl_npu import language as N
-from xdsl_npu.ir import CaptureOp, CoreIdOp, ScopeGuardOp, TaskOp, ViewOp, dump
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import CaptureOp, CoreIdOp, ScopeGuardOp, TaskOp, ViewOp
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.region_summary import ReadSpan
 from xdsl_npu.scope_model import extract_scopes

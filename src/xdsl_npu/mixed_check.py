@@ -11,8 +11,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from .check import CheckResult
+from .diagnostics import CompileError, require
 from .mixed import MAX_CROSS_BACKLOG, merge_ranges, mixed_execution
-from .model import CompileError, ranges_cover, require
+from .model import ranges_cover
 
 
 @dataclass(frozen=True)

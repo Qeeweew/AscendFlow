@@ -19,8 +19,9 @@ from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.child_completion import ChildPort
 from xdsl_npu.completion import CountDomain, Position, Site
-from xdsl_npu.ir import CallOp, dump
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import CallOp
 from xdsl_npu.scope_domains import Activation
 from xdsl_npu.scope_query_completion import QueryCompletion, QueryEvent, QuerySite
 from xdsl_npu.scope_sync import ParentCompletion, ScopeProtocol, _scope_period, verify_scopes

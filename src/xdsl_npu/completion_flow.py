@@ -10,7 +10,7 @@ from heapq import heappop, heappush
 from .budget import poll
 from .completion import CountDomain, canonical, intersection
 from .completion import includes as _includes
-from .model import require
+from .diagnostics import require
 
 ALL = CountDomain(1, 0, minimum=0)
 

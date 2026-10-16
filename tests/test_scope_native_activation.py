@@ -9,8 +9,8 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 from tests.fixtures.guarded import native_guarded_recurrence
 from xdsl_npu import compile
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import ScopeChannelOp, ScopeSyncOp, TaskOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import ScopeChannelOp, ScopeSyncOp, TaskOp
 from xdsl_npu.scope_domains import Activation, encode_activation, legacy_activation
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_native_activation import _intersects, validate_scope_protocol

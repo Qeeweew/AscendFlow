@@ -7,9 +7,11 @@ from xdsl.dialects.builtin import IntAttr
 
 from xdsl_npu import budget
 from xdsl_npu import language as N
-from xdsl_npu.ir import StreamOp, TaskOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import StreamOp, TaskOp
 from xdsl_npu.loop_sync import _requirements
-from xdsl_npu.model import CompileError, Ref
+from xdsl_npu.model import Ref
 from xdsl_npu.scalar import Expr, expression
 from xdsl_npu.scope_access import analyze_scope_access
 from xdsl_npu.scope_lowering import lower_scopes

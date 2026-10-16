@@ -7,9 +7,9 @@ from tests.fixtures.cv import cv_source, vector_source
 from tests.report_contract import semantic_report
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu.compilation import Compilation, compile
-from xdsl_npu.ir import LoopChannelOp, LoopSyncOp, TaskOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp, TaskOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 
 
 @pytest.mark.parametrize("factory", [vector_source, cv_source])

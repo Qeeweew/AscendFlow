@@ -12,7 +12,7 @@ from pathlib import Path
 from statistics import median
 
 from benchmarks.artifacts import verified_source
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import profile_evidence
 
 
@@ -92,7 +92,7 @@ def compare(directory, *, max_ratio=1.05):
             "one backend changed code across batches",
         )
         if variant == "aclnn":
-            from xdsl_npu.toolchain import CANN
+            from xdsl_npu.backend.cann import CANN
 
             require(
                 hashlib.sha256((CANN / "lib64/libopapi.so").read_bytes()).hexdigest() == key[-1],

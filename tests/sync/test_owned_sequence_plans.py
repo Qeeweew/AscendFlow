@@ -7,8 +7,8 @@ from examples.gemm.hierarchical import hierarchical_gemm
 from examples.state.grouped import grouped_state_sum
 from examples.state.recurrence import state_sum
 from xdsl_npu import compile, invocation_sync, loop_graph, sequence_calls, sequence_sync
-from xdsl_npu.ir import RegionSyncOp, TaskOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import RegionSyncOp, TaskOp
 from xdsl_npu.region_completion import RegionCompletion
 
 

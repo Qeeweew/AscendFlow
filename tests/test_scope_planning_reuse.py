@@ -9,9 +9,9 @@ from tests.fixtures.scoped_queries import scoped_query_recurrence
 from tests.test_scope_query_planning import query_state_store
 from xdsl_npu import scope_sync
 from xdsl_npu.budget import limit
-from xdsl_npu.ir import BufferOp, CaptureOp, LoopChannelOp, ScopeSyncOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import BufferOp, CaptureOp, LoopChannelOp, ScopeSyncOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.region_summary import summarize_local_events
 from xdsl_npu.scope_events import resource_sites
 from xdsl_npu.scope_model import extract_scopes

@@ -11,8 +11,8 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
 from .budget import bounded, poll
 from .completion import CountDomain, coalesce, covers
-from .ir import QueryChannelOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import QueryChannelOp
 from .scope_domains import affine
 from .scope_query_checks import QueryMemoryCheck, check_memory, prepare_memory_checks
 from .scope_query_completion import QueryCompletion, QueryEvent

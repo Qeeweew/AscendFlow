@@ -14,10 +14,11 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from .budget import poll
 from .completion import Point
-from .ir import LoopSyncOp, RegionChannelOp, RegionSyncOp, TaskOp
+from .diagnostics import require
+from .dialects.physical import LoopSyncOp, RegionChannelOp, RegionSyncOp, TaskOp
 from .loop_boundary import stream_operations
 from .loop_sync import _plan_leaf, _verify_leaf
-from .model import optional_int, require
+from .model import optional_int
 from .periodic import bounded_period
 from .region_completion import (
     RegionCompletion,

@@ -7,10 +7,17 @@ from math import lcm
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from .budget import bounded, poll
-from .ir import LoopChannelOp, QueryChannelOp, QuerySyncOp, ScopeChannelOp, ScopeSyncOp, TaskOp
+from .diagnostics import require
+from .dialects.physical import (
+    LoopChannelOp,
+    QueryChannelOp,
+    QuerySyncOp,
+    ScopeChannelOp,
+    ScopeSyncOp,
+    TaskOp,
+)
 from .loop_graph import Command
 from .loop_sync import _plan_leaf, _requirements, establishes_directly
-from .model import require
 from .native_order import instruction_points, prefix_inputs
 from .periodic import bounded_period, project
 from .region_summary import summarize_local_events

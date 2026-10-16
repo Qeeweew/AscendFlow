@@ -9,7 +9,7 @@ from tests.test_definition_lifetimes import _pv_recurrence, _read_qk_operand_zer
 from tests.test_scope_completion import Parent
 from xdsl_npu import compile
 from xdsl_npu._physical_builder import Kernel
-from xdsl_npu.ir import (
+from xdsl_npu.dialects.physical import (
     LoopChannelOp,
     LoopSyncOp,
     ScopeChannelOp,

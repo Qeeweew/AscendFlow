@@ -9,12 +9,14 @@ from tests.fixtures.cv import cv_source, vector_source
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu import language as N
 from xdsl_npu.check import bounded_check
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import CrossChannelOp, CrossSyncOp
+from xdsl_npu.dialects.source import AllocationOp, DomainOp, PipelineOp, StageOp, ViewOp
+from xdsl_npu.dialects.types import TileType
 from xdsl_npu.frontend import FrontendError
-from xdsl_npu.ir import CrossChannelOp, CrossSyncOp, dump, parse
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.mixed import extract_mixed
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import AllocationOp, DomainOp, PipelineOp, StageOp, TileType, ViewOp
 
 
 def diagnostic_physical(module):
@@ -185,8 +187,8 @@ def test_nested_pipeline_keeps_child_clock_for_borrowed_tile():
         """,
         disjoint_external=True,
     )
-    from xdsl_npu.ir import CallOp, StreamOp
-    from xdsl_npu.ir import ViewOp as PhysicalViewOp
+    from xdsl_npu.dialects.physical import CallOp, StreamOp
+    from xdsl_npu.dialects.physical import ViewOp as PhysicalViewOp
 
     physical = lower_source(definition.to_ir())
     calls = [op for op in physical.walk() if isinstance(op, CallOp)]
@@ -265,7 +267,7 @@ def test_internal_cv_fixture_keeps_prefetch_and_complete_outer_handoffs(count, s
 
 def test_internal_cv_fixture_rejects_ready_before_all_segment_contributions():
     from tests.fixtures.cv import cv_program
-    from xdsl_npu.ir import TaskOp
+    from xdsl_npu.dialects.physical import TaskOp
     from xdsl_npu.mixed import mixed_execution, mixed_graph
     from xdsl_npu.model import Instance
 

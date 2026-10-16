@@ -7,8 +7,10 @@ from tests.fixtures.physical_operators import gemm_nt
 from xdsl_npu import autosync, emit_asc, verify_plan
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.check import bounded_check
-from xdsl_npu.ir import ChannelOp, SyncOp, TaskOp, ViewOp, dump, parse
-from xdsl_npu.model import CompileError, extract
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import ChannelOp, SyncOp, TaskOp, ViewOp
+from xdsl_npu.model import extract
 
 
 @pytest.mark.parametrize("ratio,slots", [(1, 1), (2, 1), (2, 2), (3, 2), (3, 3), (4, 3)])

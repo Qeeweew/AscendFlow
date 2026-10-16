@@ -9,8 +9,8 @@ from xdsl.dialects.builtin import StringAttr
 
 from tests.test_scope_codegen import VECTOR, checked_source, task_for_sync
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import ScopeSyncOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import ScopeSyncOp
 from xdsl_npu.scope_codegen import _activation_guard, scope_boundary
 from xdsl_npu.scope_domains import Activation
 

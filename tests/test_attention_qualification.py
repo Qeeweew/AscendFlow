@@ -1,7 +1,7 @@
 import pytest
 
 from benchmarks.attention.compare import qualification
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 
 
 def test_clear_slowdown_fails_and_overlap_is_not_called_success():

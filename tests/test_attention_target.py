@@ -7,11 +7,12 @@ from math import prod
 import pytest
 
 from tests.fixtures.attention_target import activation_trace, attention_target, target_source
-from xdsl_npu.ir import BufferOp, RuntimeSizeOp, ScopeGuardOp, TaskOp, ViewOp
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import BufferOp, RuntimeSizeOp, ScopeGuardOp, TaskOp, ViewOp
+from xdsl_npu.dialects.source import AllocationOp
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CAPACITY, CompileError
 from xdsl_npu.scope_model import extract_scopes
-from xdsl_npu.source_ir import AllocationOp
+from xdsl_npu.target.native import CAPACITY
 
 
 def tree(mode):

@@ -12,7 +12,7 @@ from itertools import pairwise
 
 from xdsl.dialects import arith
 
-from xdsl_npu.ir import (
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CallOp,
     CaptureOp,

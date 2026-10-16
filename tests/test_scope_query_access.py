@@ -14,18 +14,11 @@ from tests.fixtures.scoped_queries import scoped_query_recurrence
 from tests.test_index_frontend import evaluate as evaluate_ssa
 from tests.test_scope_serial_source import SOURCE
 from xdsl_npu import language as N
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import BufferOp, CaptureOp, CoreIdOp, StreamOp, TaskOp, ViewOp
 from xdsl_npu.indexing import arguments
-from xdsl_npu.ir import (
-    BufferOp,
-    CaptureOp,
-    CoreIdOp,
-    StreamOp,
-    TaskOp,
-    ViewOp,
-    dump,
-)
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scalar import expression, literal
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_query_access import normalize_query_access

@@ -7,7 +7,7 @@ from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 from tests.fixtures.guarded import native_guarded_recurrence
 from tests.models.scoped_local import execute, finite_check
 from xdsl_npu import compile
-from xdsl_npu.ir import (
+from xdsl_npu.dialects.physical import (
     CallOp,
     LoopChannelOp,
     LoopSyncOp,

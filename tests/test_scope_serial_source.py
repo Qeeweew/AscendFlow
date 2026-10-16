@@ -5,22 +5,22 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType
 
 from xdsl_npu import language as N
-from xdsl_npu.indexing import arguments
-from xdsl_npu.ir import (
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import (
     CyclicCountOp,
     FrameOp,
     LoopSyncOp,
     ScopeSyncOp,
     StreamOp,
     TaskOp,
-    dump,
 )
+from xdsl_npu.dialects.source import AllocationOp, PipelineOp
+from xdsl_npu.indexing import arguments
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.lowering_context import ActorBindings
-from xdsl_npu.model import CompileError
 from xdsl_npu.scalar import Expr
 from xdsl_npu.scope_model import extract_scopes
-from xdsl_npu.source_ir import AllocationOp, PipelineOp
 
 SOURCE = """
 def scoped_serial(Q:N.Tensor((total_queries,2,16,16),N.f16),

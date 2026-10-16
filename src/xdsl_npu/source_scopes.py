@@ -14,9 +14,8 @@ from dataclasses import dataclass, replace
 from xdsl.dialects import arith, scf
 from xdsl.ir import Block, SSAValue
 
-from .model import require
-from .scalar import ARITHMETIC
-from .source_ir import (
+from .diagnostics import require
+from .dialects.source import (
     AllocationOp,
     CopyOp,
     DomainOp,
@@ -33,6 +32,7 @@ from .source_ir import (
     ViewOp,
     YieldOp,
 )
+from .scalar import ARITHMETIC
 
 SourceEffect = CopyOp | ElementOp | MatmulOp | ReduceOp | ScalarReadOp | ScaleOp
 Loop = PipelineOp | scf.ForOp

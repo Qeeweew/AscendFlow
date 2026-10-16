@@ -15,7 +15,8 @@ from tests.test_definition_lifetimes import (
     _pv_recurrence,
 )
 from xdsl_npu.budget import limit
-from xdsl_npu.ir import TaskOp, dump
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import TaskOp
 from xdsl_npu.lowering import lower_source
 from xdsl_npu.scope_access import analyze_scope_access
 from xdsl_npu.scope_lifetimes import plan_lifetimes

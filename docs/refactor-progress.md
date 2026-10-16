@@ -4,13 +4,31 @@
 
 ## 1. 当前工作和代码现场
 
-用户已停止算子优化以及上一轮同步求解器局部补丁。本轮授权工作是：审查整体结构、清理文档、重写大幅重构计划。**本轮未修改编译器/测试/算子代码，未运行编译、CANN或设备。**
+用户已授权按新方案完成重构。算子优化和旧求解器局部调优仍停止。M0文档整理已完成，当前M1实施中；本轮已修改底层结构并建立新的控制/前沿/边界组件，尚未替换公共入口的同步算法，没有运行CANN或设备。
 
-产品HEAD为 `7ddaa54ec060a92e219d0462df162939b8b32d72`，标题为“Reuse owned synchronization analyses and reduce cold compilation work”。该交付已被用户判定不达标。根目录没有产品Git，全部现有未提交代码实验保留。
+此前 `7ddaa54ec060a92e219d0462df162939b8b32d72` 的交付未达标。重构前全部实验和文档已保存到 `bbc1458`，标题为“Checkpoint paused synchronization experiments and structured-loop refactor plan”，不是资格声明。根目录没有产品Git。
 
-工作树上的未提交实验包括compact query patterns、virtual child cuts、局部transfer、边界批读和ownership区间合并，以及对应测试。它们不是新计划的已完成阶段；下一轮逐项判断语义工具能否复用，不能把它们默认为正确的最终架构。停止前只完成部分定向回归，没有当前工作树的完整新资格。
+保存在bbc1458的实验包括compact query patterns、virtual child cuts、局部transfer、边界批读和ownership区间合并，以及对应测试。它们不是新计划的已完成阶段；公共同步路径当前仍保留它们，待M2–M4替换。不能把它们默认为最终架构或称为全量已验证。
 
 本轮文档从36份收敛为10份。原文、四个入口README及SHA256清单保存到[外层历史归档](../../reports/compiler-refactor/20261016-before-structured-loops/README.md)，不纳入产品Git。运行数据没有迁移、删除或改写。
+
+### M1当前实现
+
+- dialect已拆到`dialects/{source,physical,types,io}.py`，删除旧文件与反向注册依赖；无旧模块兼容转发。
+- frontend已拆parser/builders/syntax/contracts，language只提供公开声明与捕获入口；移除frontend↔language以及对model诊断/标量助手的依赖。
+- 原语与机器常量在target/native，f32字面语义在target/scalars；统一diagnostics支持类别/阶段/位置/witness，预算失败标为ANALYSIS_LIMIT。
+- 构建期限和进程组清理下沉runtime/process，CANN驱动迁backend/cann；保留整个构建上限与失败清理。
+- `passes/lower_pipeline.py`在真实SSA循环上建立最多4个PLE相位，不复制body，保留普通前后work、相邻循环、nested runtime以及serial lower/stride/carry结构。它当前是显式控制规范化入口，不是公共编译已接受全部这些组合。
+- `analysis/frontier.py`为声明的前缀域保存至多一个rank；acquire/must-merge/quorum与通知identity明确，Clock按声明身份而非名字比较。尚不推断任意guard包含或跨clock关系。
+- `analysis/regions.py`只代入固定边界wiring和局部保证；要求保留真实consumer，不能因后面的要求更强就删除早等待位置。`analysis/loops.py`只验证显式候选的一步保持和单独basecase，不求全闭包/不动点，不冒称完整exit summary。
+
+本轮定向结果：构建watchdog24项；dialect/API25项；frontend113项及runtime注解16项；原语/effects18项；budget/fill18项。合并后控制/前沿/region/编译入口85项通过，随后加入loop归纳和同名clock反例后的新analysis/loops组77项通过。各组有重叠，不合计成独立总数；未跑全量回归。相关Ruff与diff检查通过。
+
+拆分前后scale的ASC及source/before/plan IR逐字相同。真实FA仅做了source/control检查：276个操作、6个循环模板、3层嵌套、21个相位描述，body克隆和迭代展开均为0。证据在[控制阶段产物](../../runs/structured-loops/m1-control/results.json)；该阶段约4ms，不是FA source→ASC耗时，也没有重新取得≤5s资格。
+
+随后把loop domain数据下沉`analysis/iteration.py`，source算术admission与PLE共用真实lower/upper/stride，修正负下界被误当0、非零起点被误拒、非零上界空循环仍检查不执行除法的问题；相关39项通过。`Actor.view`仍有旧零起点地址假设，所以控制/admission支持nonzero lower/stride不代表完整设备路径已支持。
+
+M1尚缺控制有效域与实际native完成/入口出口的接线，以及由真实effects推导有限layout、carried候选和精确出口。一步保持结果是带前提的合同：相同guard标签本身不证明FIRST/LAST等条件在下一代仍成立，必须由控制层建立合法successor域。M2–M6未完成。
 
 ## 2. 编译耗时：明确未达标
 
@@ -69,4 +87,4 @@
 
 原始摘要仍在[performance.json](../../runs/refactor/cv-order/performance.json)及[op指标目录](../../runs/refactor/cv-order/op-metrics)。历史文档原文见外层归档的 `compiler/docs/attention-performance.md`。此前清理已删除库、部分profiler原始数据和旧候选目录，需重建才能再次运行；不恢复旧优化任务。
 
-未来比较必须直接看生成ASC、手写AscendC、ops-transformer/ACLNN和硬件条件下界，详见[验收](validation.md)。当前仅M0文档整理完成，M1–M6未开始。
+未来比较必须直接看生成ASC、手写AscendC、ops-transformer/ACLNN和硬件条件下界，详见[验收](validation.md)。当前M0完成、M1实施中，M2–M6未完成。

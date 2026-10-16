@@ -10,8 +10,8 @@ from dataclasses import dataclass, replace
 
 from .budget import poll
 from .completion import Position
-from .ir import LoopChannelOp
-from .model import CompileError, require
+from .diagnostics import CompileError, require
+from .dialects.physical import LoopChannelOp
 from .region_summary import summarize_local_events
 from .scope_domains import legacy_activation, shifted
 from .scope_events import resource_sites

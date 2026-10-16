@@ -25,13 +25,14 @@ from benchmarks.references.attention import NAME as REFERENCE_NAME
 from benchmarks.references.attention import reference_source
 from benchmarks.references.attention_aclnn import FlashAttentionReference
 from benchmarks.validation.attention import decode, inputs_and_oracle
+from xdsl_npu.backend.cann import CANN
 from xdsl_npu.build import build_file
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.ir import BufferOp, KernelOp, MixedOp, RuntimeSizeOp, parse
-from xdsl_npu.model import require
+from xdsl_npu.diagnostics import require
+from xdsl_npu.dialects.io import parse
+from xdsl_npu.dialects.physical import BufferOp, KernelOp, MixedOp, RuntimeSizeOp
+from xdsl_npu.dialects.source import AllocationOp, ElementOp, ProgramOp, SizeOp
 from xdsl_npu.performance import hardware_snapshot
-from xdsl_npu.source_ir import AllocationOp, ElementOp, ProgramOp, SizeOp
-from xdsl_npu.toolchain import CANN
 
 ENTRY = "attention_target"
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples/flash_attention/attention.py"

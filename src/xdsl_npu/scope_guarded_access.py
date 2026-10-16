@@ -12,8 +12,9 @@ from math import lcm
 from .budget import poll
 from .completion import CountDomain, Position, Site, _first, coalesce
 from .completion_flow import ALL
+from .diagnostics import require
 from .loop_model import verify_access_ownership
-from .model import Ref, Task, require
+from .model import Ref, Task
 from .periodic import bounded_period
 from .region_summary import summarize_fixed_storage
 from .scope_access import ScopeAccess, _cut_cost, _local_uid

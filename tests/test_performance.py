@@ -2,7 +2,7 @@ import pytest
 
 from tests.fixtures.cv import cv_program
 from xdsl_npu import autosync
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.performance import physical_work, profile_evidence, theoretical_metrics
 
 

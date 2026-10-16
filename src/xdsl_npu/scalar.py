@@ -12,8 +12,8 @@ from math import gcd
 
 from xdsl.dialects import arith
 
-from .ir import RuntimeSizeOp
-from .model import CompileError, require
+from .diagnostics import CompileError, require
+from .dialects.physical import RuntimeSizeOp
 
 INT64_MAX = (1 << 63) - 1
 DIVISION = {"floordiv", "rem", "ceildiv"}
@@ -48,7 +48,7 @@ class Fact:
 
 def facts_from_sizes(operations):
     """Collect Size/RuntimeSize contracts from an explicitly chosen IR scope."""
-    from .source_ir import SizeOp
+    from .dialects.source import SizeOp
 
     facts = {}
     for op in operations:
@@ -237,7 +237,7 @@ def from_ssa(value, *, coordinates=None, memo=None, facts=None):
     Coordinate names may occur in numerators. ``facts`` only declares uniform
     inputs; coordinate range facts belong to a separate call to ``infer``.
     """
-    from .source_ir import SizeOp
+    from .dialects.source import SizeOp
 
     memo = {} if memo is None else memo
     environment = {} if facts is None else _facts(facts)

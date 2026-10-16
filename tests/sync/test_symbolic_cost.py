@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from xdsl_npu.completion_flow import ALL
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.loop_graph import Command, Graph
-from xdsl_npu.model import CompileError
 from xdsl_npu.symbolic_completion import CompletionTopology, Family, SymbolicCompletion
 
 
@@ -212,7 +212,7 @@ def test_wider_fact_preserves_existing_bits_at_its_exact_condition():
 def test_public_verifier_rebuilds_after_actual_release_is_removed():
     from xdsl_npu import compile, verify_plan
     from xdsl_npu import language as N
-    from xdsl_npu.ir import LoopChannelOp, LoopSyncOp
+    from xdsl_npu.dialects.physical import LoopChannelOp, LoopSyncOp
 
     artifact = compile(
         N.from_source(

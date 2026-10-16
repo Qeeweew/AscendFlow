@@ -8,7 +8,7 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp, StringAttr, f32
 from xdsl.ir import Block, Region, SSAValue
 
-from .ir import (
+from .dialects.physical import (
     BufferOp,
     EndOp,
     FixConfigOp,
@@ -17,11 +17,10 @@ from .ir import (
     RuntimeSizeOp,
     StreamOp,
     TaskOp,
-    TaskType,
     ViewOp,
-    ref_type,
     task_attrs,
 )
+from .dialects.types import TaskType, ref_type
 
 
 class Kernel:

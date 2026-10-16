@@ -8,9 +8,11 @@ from xdsl.dialects.builtin import IntAttr
 from xdsl_npu import budget
 from xdsl_npu._physical_builder import Kernel
 from xdsl_npu.completion import Position
-from xdsl_npu.ir import FrameOp, TaskOp, dump
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump
+from xdsl_npu.dialects.physical import FrameOp, TaskOp
 from xdsl_npu.loop_model import extract_loop
-from xdsl_npu.model import CompileError, Ref
+from xdsl_npu.model import Ref
 from xdsl_npu.region_summary import Access, summarize_fixed_storage, summarize_reused_storage
 from xdsl_npu.scalar import literal
 

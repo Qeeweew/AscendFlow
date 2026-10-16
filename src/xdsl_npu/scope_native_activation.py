@@ -9,7 +9,7 @@ from bisect import bisect_left
 
 from .budget import bounded, poll
 from .completion import CountDomain, Position
-from .model import require
+from .diagnostics import require
 from .periodic import bounded_period
 from .scope_domains import Activation, affine, legacy_activation, shifted, validate_activation
 from .scope_predicates import PARENT_CASES, case_activation

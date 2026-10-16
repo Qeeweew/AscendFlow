@@ -10,8 +10,8 @@ from dataclasses import dataclass, replace
 
 from .budget import bounded, poll
 from .completion import CountDomain
+from .diagnostics import require
 from .loop_model import slope
-from .model import require
 from .region_patterns import (
     FrontierGroup,
     HazardPattern,

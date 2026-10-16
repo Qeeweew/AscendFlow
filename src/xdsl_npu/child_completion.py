@@ -14,7 +14,7 @@ from sys import int_info
 from .budget import poll
 from .completion import Position, Site
 from .completion_flow import ALL
-from .model import require
+from .diagnostics import require
 from .native_order import prefix_inputs
 from .symbolic_completion import Family, SymbolicCompletion, native_family
 

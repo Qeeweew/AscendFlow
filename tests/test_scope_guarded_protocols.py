@@ -8,8 +8,8 @@ from xdsl.dialects.builtin import IntAttr
 from tests.fixtures.nested import shared_l0c_qk_pv
 from xdsl_npu.compilation import compile
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import ScopeChannelOp
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.physical import ScopeChannelOp
 from xdsl_npu.scope_domains import Activation, decode_activation, encode_activation
 from xdsl_npu.scope_sync import verify_scopes
 

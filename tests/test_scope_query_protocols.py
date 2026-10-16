@@ -8,7 +8,9 @@ from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
 from tests.fixtures.scoped_queries import scoped_query_recurrence
 from xdsl_npu.budget import limit
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.ir import (
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import (
     BufferOp,
     CaptureOp,
     LoopSyncOp,
@@ -17,11 +19,8 @@ from xdsl_npu.ir import (
     ScopeSyncOp,
     TaskOp,
     ViewOp,
-    dump,
-    parse,
 )
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_access import analyze_scope_access
 from xdsl_npu.scope_model import extract_scopes
 from xdsl_npu.scope_query_completion import QuerySite

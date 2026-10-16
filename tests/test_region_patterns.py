@@ -11,7 +11,7 @@ from tests.test_region_sequence_sharing import legacy_sequence, repeated
 from tests.test_scope_boundary_summary import FIRST, LAST, _expanded, _literal, effect
 from xdsl_npu import region_patterns, region_sequence
 from xdsl_npu.completion import CountDomain, Position
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.region_patterns import (
     PatternPart,
     PatternRegion,

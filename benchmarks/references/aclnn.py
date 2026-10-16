@@ -7,9 +7,10 @@ import struct
 from pathlib import Path
 
 from benchmarks.validation.operators import operator_inputs
+from xdsl_npu.backend.cann import CANN
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.model import extract, require
-from xdsl_npu.toolchain import CANN
+from xdsl_npu.diagnostics import require
+from xdsl_npu.model import extract
 
 
 class OperatorReference:
@@ -189,7 +190,7 @@ class GemmBiasSiluReference:
 
 
 def run_reference(plan, output: Path, *, physical=1, repeats=30, warmup=5, data_case="standard"):
-    from xdsl_npu.ir import MixedOp
+    from xdsl_npu.dialects.physical import MixedOp
 
     mixed = isinstance(plan.body.block.first_op, MixedOp)
     if mixed:

@@ -11,14 +11,16 @@ from tests.report_contract import semantic_report
 from tests.test_loop_sync import finite_hardware_dag
 from xdsl_npu import compile, verify_plan
 from xdsl_npu import language as N
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import parse
+from xdsl_npu.dialects.physical import BufferOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp
+from xdsl_npu.dialects.source import CopyOp, MatmulOp, PipelineOp
+from xdsl_npu.dialects.source import ViewOp as SourceViewOp
+from xdsl_npu.dialects.types import TensorType
 from xdsl_npu.frontend import FrontendError
-from xdsl_npu.ir import BufferOp, LoopChannelOp, LoopSyncOp, TaskOp, ViewOp, parse
 from xdsl_npu.loop_model import extract_loop, loop_dependencies
 from xdsl_npu.loop_sync import verify_loop
 from xdsl_npu.lowering import lower_source
-from xdsl_npu.model import CompileError
-from xdsl_npu.source_ir import CopyOp, MatmulOp, PipelineOp, TensorType
-from xdsl_npu.source_ir import ViewOp as SourceViewOp
 
 
 @pytest.fixture(scope="module", params=[False, True])

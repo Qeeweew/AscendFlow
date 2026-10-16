@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 
 from .completion import CountDomain, Position, _first
 from .completion_flow import ALL
-from .model import require
+from .diagnostics import require
 from .periodic import bounded_period
 from .symbolic_completion import add, holds, le, meet
 

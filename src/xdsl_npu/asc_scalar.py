@@ -16,7 +16,7 @@ from xdsl.ir import Block, Region, SSAValue
 from xdsl.transforms.canonicalize import CanonicalizePass
 from xdsl.transforms.common_subexpression_elimination import CommonSubexpressionElimination
 
-from .model import require
+from .diagnostics import require
 
 
 class ScalarScope:

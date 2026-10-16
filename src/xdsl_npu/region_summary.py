@@ -20,9 +20,10 @@ from xdsl.ir import SSAValue
 
 from .budget import poll
 from .completion import CountDomain, Position
-from .ir import BufferOp, FrameOp
+from .diagnostics import require
+from .dialects.physical import BufferOp, FrameOp
 from .loop_model import access_cells, cut_access_cells, slope
-from .model import require, verify_translated_owners
+from .model import verify_translated_owners
 from .scalar import Expr
 
 MAX_SUMMARY_VISITS = 1_000_000

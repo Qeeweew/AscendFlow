@@ -16,8 +16,10 @@ from collections import Counter
 from pathlib import Path
 from statistics import median
 
-from .model import ITEMSIZE, require, storage_layout
-from .toolchain import CANN
+from .backend.cann import CANN
+from .diagnostics import require
+from .model import storage_layout
+from .target.native import ITEMSIZE
 
 
 def runtime_work(module, arguments):
@@ -91,7 +93,7 @@ def runtime_work(module, arguments):
 
 
 def _runtime_leaf(analysis, arguments):
-    from .ir import InvocationChannelOp
+    from .dialects.physical import InvocationChannelOp
     from .scalar import INT64_MAX, Expr, facts_from_sizes, from_ssa, literal
 
     loop, channels, sequences, _, _ = analysis
@@ -404,8 +406,8 @@ def hardware_snapshot(physical):
 
 def physical_work(plan, *, useful_cube_flops=None):
     """Count EVERY finite native activation, weighted by its actual group grid."""
+    from .dialects.physical import StaticDispatchOp
     from .dispatch import extract_dispatch
-    from .ir import StaticDispatchOp
     from .mixed import extract_mixed, mixed_execution
     from .sync import verify_plan
 

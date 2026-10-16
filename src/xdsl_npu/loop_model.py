@@ -14,7 +14,8 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType
 
 from .budget import poll
-from .ir import (
+from .diagnostics import require
+from .dialects.physical import (
     BufferOp,
     CyclicCountOp,
     EndOp,
@@ -35,20 +36,7 @@ from .ir import (
     ViewOp,
 )
 from .loop_boundary import stream_operations
-from .model import (
-    CAPACITY,
-    ITEMSIZE,
-    Ref,
-    Storage,
-    Task,
-    check_load3d,
-    native_contract,
-    optional_int,
-    ranges_overlap,
-    require,
-    storage_layout,
-    task_scalar,
-)
+from .model import Ref, Storage, Task, optional_int, ranges_overlap, storage_layout, task_scalar
 from .periodic import MAX_ACCESS_SEGMENTS, MAX_PERIOD_TEMPLATES, bounded_period
 from .scalar import (
     ARITHMETIC,
@@ -60,6 +48,7 @@ from .scalar import (
     literal,
     uniform,
 )
+from .target.native import CAPACITY, ITEMSIZE, check_load3d, native_contract
 
 
 @dataclass(frozen=True)

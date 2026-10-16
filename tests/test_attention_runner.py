@@ -11,7 +11,7 @@ from xdsl.utils.exceptions import VerifyException
 
 from benchmarks.attention import run
 from benchmarks.attention.contract import AttentionPolicy
-from xdsl_npu.model import CompileError
+from xdsl_npu.diagnostics import CompileError
 
 GENERATED_ORDER = ("Q", "K", "Score", "P", "V", "PV", "O")
 POLICIES = tuple(

@@ -10,8 +10,8 @@ streams, including independent event-lifetime and progress checks.
 from dataclasses import dataclass
 
 from .budget import poll
+from .diagnostics import require
 from .loop_graph import Command, Graph
-from .model import require
 from .native_order import instruction_points, prefix_inputs
 
 

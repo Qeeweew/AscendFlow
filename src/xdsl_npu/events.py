@@ -10,8 +10,8 @@ from collections import defaultdict, deque
 
 from xdsl.dialects.builtin import ArrayAttr, IntAttr
 
-from .ir import ChannelOp
-from .model import require
+from .diagnostics import require
+from .dialects.physical import ChannelOp
 
 
 def bits(mask):

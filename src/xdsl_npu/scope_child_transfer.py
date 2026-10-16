@@ -11,8 +11,8 @@ from .child_completion import ChildPort, FixedChildProjection, native_fixed_chil
 from .child_transfer_reach import LocalTransfer
 from .completion import Position, Site
 from .completion_flow import ALL
+from .diagnostics import require
 from .loop_graph import Command
-from .model import require
 from .scope_domains import Activation, affine
 from .symbolic_completion import Family, le, meet
 

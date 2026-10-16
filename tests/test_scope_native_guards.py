@@ -10,7 +10,9 @@ from xdsl.utils.exceptions import VerifyException
 
 from tests.fixtures.attention_target import attention_target
 from xdsl_npu import language as N
-from xdsl_npu.ir import (
+from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.dialects.io import dump, parse
+from xdsl_npu.dialects.physical import (
     CallOp,
     EndOp,
     LoopChannelOp,
@@ -20,14 +22,11 @@ from xdsl_npu.ir import (
     StreamOp,
     TaskOp,
     ViewOp,
-    dump,
-    parse,
 )
+from xdsl_npu.dialects.source import AllocationOp, PipelineOp
 from xdsl_npu.lowering import _Actor, _work
-from xdsl_npu.model import CompileError
 from xdsl_npu.scope_lowering import _segments, lower_scopes
 from xdsl_npu.scope_predicates import PARENT_CASES, case_activation, classify_guard, guard_active
-from xdsl_npu.source_ir import AllocationOp, PipelineOp
 from xdsl_npu.source_scopes import ClockFrame, collect_source_scopes
 
 SOURCE = """

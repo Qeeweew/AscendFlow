@@ -11,8 +11,8 @@ from dataclasses import dataclass, replace
 from .budget import bounded, poll
 from .child_completion import FixedChildProjection
 from .completion import Site
+from .diagnostics import require
 from .loop_graph import Command
-from .model import require
 from .periodic import MAX_PERIOD_TEMPLATES
 from .scope_completion import MAX_SCOPE_ARCS, _ClockSlot, _components, compose_calls
 from .scope_domains import Activation

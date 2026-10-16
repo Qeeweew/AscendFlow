@@ -1,6 +1,6 @@
 """Directed virtual native endpoints on an owned scope boundary graph."""
 
-from .model import require
+from .diagnostics import require
 from .scope_child_transfer import VirtualCut, VirtualNode
 from .scope_child_transfer import point_guard as native_point_guard
 from .symbolic_completion import Family, le, meet

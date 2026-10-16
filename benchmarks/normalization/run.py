@@ -15,11 +15,12 @@ from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from examples.normalization.rms_norm import rms_normalize
 from examples.normalization.softmax import softmax
+from xdsl_npu.backend.cann import CANN
 from xdsl_npu.build import build_module
 from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.model import require, round_f32
+from xdsl_npu.diagnostics import require
 from xdsl_npu.performance import hardware_snapshot, runtime_work
-from xdsl_npu.toolchain import CANN
+from xdsl_npu.target.scalars import round_f32
 
 
 def oracle(values, columns, epsilon):
