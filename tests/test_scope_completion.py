@@ -243,6 +243,18 @@ def test_reduced_real_projection_matches_all_unreduced_endpoint_queries(
     parent = Parent(count)
     for order, (uid, stage) in enumerate(zip(("load", "capture", "consume"), stages)):
         plan, projection, _ = children[uid]
+        # Child projection now already supplies sparse edges. Reconstruct the
+        # small fixture's closure so this still tests the parent's reduction
+        # against genuinely unreduced input, with all negative queries intact.
+        projection = replace(
+            projection,
+            relations=frozenset(
+                (source, target)
+                for source in (*projection.inputs, *projection.endpoints)
+                for target in (*projection.endpoints, *projection.outputs)
+                if projection.reaches(source, target)
+            ),
+        )
         parent.add(uid, plan, projection, stage=stage, order=order, shared=("shared",))
     reduced = compose_calls(parent.calls, period=period, count=count)
     with monkeypatch.context() as original:

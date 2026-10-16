@@ -83,6 +83,31 @@ def parent_path(projection, source, target, bridge=None):
     return (1, target) in seen
 
 
+def _relation_closure(relations, sources, targets):
+    following = defaultdict(set)
+    for source, target in relations:
+        following[source].add(target)
+    result = set()
+    for source in sources:
+        seen, pending = {source}, [source]
+        while pending:
+            for target in following[pending.pop()]:
+                if target not in seen:
+                    seen.add(target)
+                    pending.append(target)
+        result.update((source, target) for target in targets if source != target and target in seen)
+    return frozenset(result)
+
+
+def _projection_relations(projection):
+    return frozenset(
+        (source, target)
+        for source in (*projection.inputs, *projection.endpoints)
+        for target in (*projection.endpoints, *projection.outputs)
+        if projection.reaches(source, target)
+    )
+
+
 def test_terminal_fix_read_needs_its_actual_release_not_mad_or_whole_child_retirement(cube):
     plan, analysis = cube
     before = dump(plan)
@@ -197,7 +222,7 @@ def test_zero_trip_child_has_only_matching_prefix_identity_transfers():
     projection = project_fixed_child(analysis, ())
     assert projection.count == 0
     assert projection.endpoints == ()
-    assert projection.relations == frozenset(
+    assert _projection_relations(projection) == frozenset(
         (port, replace(port, side="output")) for port in projection.inputs
     )
     actor = next(iter(analysis[0].actors))
@@ -594,7 +619,7 @@ def test_cut_projection_preserves_all_real_native_and_sync_relations(request, fi
                 endpoints.append(command_site(command, g, point))
     ordinary = project_fixed_child(analysis, endpoints)
     cuts = project_fixed_child(analysis, endpoints, insertion_cuts=True)
-    assert cuts.relations == ordinary.relations
+    assert _projection_relations(cuts) == _projection_relations(ordinary)
     assert cuts.native_templates == ordinary.native_templates
     assert cuts.native_node_count > ordinary.native_node_count
     if fixture == "one_copy":
@@ -608,7 +633,7 @@ def test_cut_projection_preserves_all_real_native_and_sync_relations(request, fi
 def test_zero_trip_cut_projection_is_only_prefix_identity():
     _, analysis = checked(fill_child(0))
     projection = project_fixed_child(analysis, (), insertion_cuts=True)
-    assert projection.relations == frozenset(
+    assert _projection_relations(projection) == frozenset(
         (port, replace(port, side="output")) for port in projection.inputs
     )
     actor = next(iter(analysis[0].actors))
@@ -744,16 +769,23 @@ def test_complete_relation_set_matches_literal_paths_and_scans_each_target_bindi
         unique = {bindings[target] for target in targets}
         assert counted.reads == len(unique)
         assert counted.records == sum(len(facts.get(node, {})) for node, _ in unique)
-        # Retain the exact previous all-count coverage oracle as well as an
-        # independent instance graph. Every Site alias remains a separate pair.
+        # Origins are shared only for identical actual bindings. Retain every
+        # external Site alias in both independent complete-reach oracles.
+        all_sources = tuple(
+            dict.fromkeys((*sources, *(target for target in targets if isinstance(target, Site))))
+        )
+        origin = {bindings[source]: 1 << bit for bit, source in enumerate(sources)}
         expected = frozenset(
             (source, target)
-            for bit, source in enumerate(sources)
+            for source in all_sources
             for target in targets
-            if source != target and covers(ALL, flow.coverage(*bindings[target], 1 << bit, ALL))
+            if source != target
+            and covers(ALL, flow.coverage(*bindings[target], origin[bindings[source]], ALL))
         )
-        assert result == expected == _literal_projection_relations(flow, sources, targets, bindings)
-        old_reads = sum(source != target for source in sources for target in targets)
+        assert result <= expected
+        assert _relation_closure(result, all_sources, targets) == expected
+        assert expected == _literal_projection_relations(flow, all_sources, targets, bindings)
+        old_reads = sum(source != target for source in all_sources for target in targets)
         assert counted.reads < old_reads
         assert len(unique) < len(targets)  # Constant and end-relative Site aliases.
         measured.append((len(result), counted.reads, old_reads))

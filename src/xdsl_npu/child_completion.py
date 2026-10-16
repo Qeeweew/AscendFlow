@@ -7,6 +7,8 @@ captured facts on its own pipe, not completion of the child as a whole.
 """
 
 from dataclasses import dataclass
+from functools import cached_property
+from sys import int_info
 
 from .budget import poll
 from .completion import Position, Site
@@ -55,9 +57,26 @@ class FixedChildProjection:
     native_edge_count: int
     fact_statistics: tuple[tuple[str, int], ...]
 
+    @cached_property
+    def _following(self):
+        following = {}
+        for source, target in self.relations:
+            following.setdefault(source, []).append(target)
+        return following
+
     def reaches(self, source, target):
         """A proved nonidentity relation, with full endpoint identity."""
-        return (source, target) in self.relations
+        if source == target:
+            return False
+        seen, pending = {source}, [source]
+        while pending:
+            for point in self._following.get(pending.pop(), ()):
+                if point == target:
+                    return True
+                if point not in seen:
+                    seen.add(point)
+                    pending.append(point)
+        return False
 
     def statistics(self):
         return {
@@ -71,7 +90,38 @@ class FixedChildProjection:
         }
 
 
-def _fixed_origins(flow, node, point):
+def _seed_words(count):
+    whole, remainder = divmod(count, int_info.bits_per_digit)
+    return int_info.bits_per_digit * whole * (whole + 1) // 2 + (whole + 1) * remainder
+
+
+@dataclass
+class _ProjectionBudget:
+    words: int
+    visits: int = 0
+
+    def visit(self):
+        self.visits += 1
+        require(
+            self.visits <= MAX_PROJECTION_RELATIONS, "fixed child projection work budget exceeded"
+        )
+
+    def mask(self, bits):
+        self.words += (bits.bit_length() + int_info.bits_per_digit - 1) // int_info.bits_per_digit
+        require(
+            self.words <= MAX_PROJECTION_RELATIONS, "fixed child projection mask budget exceeded"
+        )
+
+    def edge(self, relations, source, target):
+        self.visit()
+        relations.add((source, target))
+        require(
+            len(relations) <= MAX_PROJECTION_RELATIONS,
+            "fixed child endpoint relation budget exceeded (edges)",
+        )
+
+
+def _fixed_origins(flow, node, point, *, _budget=None):
     """Read every covered origin once at one constant, unconditional point.
 
     This specialization belongs to the fixed-child construction below. Its
@@ -89,6 +139,8 @@ def _fixed_origins(flow, node, point):
         return 0
     result = 0
     for (lo, hi, guard), bits in flow.facts.get(node, {}).items():
+        if _budget is not None:
+            _budget.visit()
         require(
             lo[0] == hi[0] == 0 and guard == ALL,
             "fixed child coverage requires constant intervals and unconditional facts",
@@ -99,20 +151,79 @@ def _fixed_origins(flow, node, point):
 
 
 def _fixed_relations(flow, sources, targets, bindings):
-    covered, relations = {}, set()
+    """Build a sparse graph with exactly the fixed native preorder's closure.
+
+    Every source has one origin per actual binding. Equal predecessor masks
+    (including that origin) characterize endpoint SCCs. Ports remain distinct:
+    an output has no origin, so equal output masks do not prove equivalence.
+    """
+    budget = _ProjectionBudget(_seed_words(len(sources)))
+    require(budget.words <= MAX_PROJECTION_RELATIONS, "fixed child projection mask budget exceeded")
+    source_bits = {bindings[source]: index for index, source in enumerate(sources)}
+    require(len(source_bits) == len(sources), "duplicate fixed child origin binding")
+    covered, groups, relations = {}, {}, set()
     for index, target in enumerate(targets):
+        budget.visit()
         if index % 128 == 0:
             poll("fixed child endpoint coverage", target=index, sources=len(sources))
         binding = bindings[target]
         if binding not in covered:
-            covered[binding] = _fixed_origins(flow, *binding)
-        bits = covered[binding]
-        while bits:
-            bit = bits & -bits
-            bits ^= bit
-            source = sources[bit.bit_length() - 1]
-            if source != target:
-                relations.add((source, target))
+            covered[binding] = _fixed_origins(flow, *binding, _budget=budget)
+            budget.mask(covered[binding])
+        if isinstance(target, Site):
+            groups.setdefault(covered[binding], []).append(target)
+
+    components, destinations = [], []
+    for index, source in enumerate(sources):
+        budget.visit()
+        if isinstance(source, ChildPort):
+            require(source.side == "input", "fixed child output cannot be an origin")
+            bit = 1 << index
+            budget.mask(bit)
+            components.append((source, bit, bit))
+    for ancestors, members in groups.items():
+        budget.visit()
+        representative = members[0]
+        bit = 1 << source_bits[bindings[representative]]
+        require(ancestors & bit, "fixed child endpoint lost its own origin")
+        budget.mask(bit)
+        components.append((representative, bit, ancestors))
+        destinations.append((representative, ancestors, bit))
+        for member in members[1:]:
+            budget.edge(relations, representative, member)
+            budget.edge(relations, member, representative)
+    destinations.extend(
+        (target, covered[bindings[target]], 0)
+        for target in targets
+        if isinstance(target, ChildPort)
+    )
+
+    # Strict ancestors have strictly smaller inclusive predecessor masks.
+    # Suffix masks select the greatest remaining rank by binary search without
+    # enumerating dense closure pairs or scanning all components per target.
+    ordered = sorted(components, key=lambda component: component[2].bit_count())
+    suffix = [0] * (len(ordered) + 1)
+    for index in range(len(ordered) - 1, -1, -1):
+        budget.visit()
+        suffix[index] = suffix[index + 1] | ordered[index][1]
+        budget.mask(suffix[index])
+    for index, (target, ancestors, own) in enumerate(destinations):
+        budget.visit()
+        if index % 128 == 0:
+            poll("fixed child sparse relations", target=index, edges=len(relations))
+        remaining = ancestors & suffix[0] & ~own
+        while remaining:
+            low, high = 0, len(ordered)
+            while high - low > 1:
+                budget.visit()
+                middle = (low + high) // 2
+                if remaining & suffix[middle]:
+                    low = middle
+                else:
+                    high = middle
+            source, _, preceding = ordered[low]
+            budget.edge(relations, source, target)
+            remaining &= ~preceding
     return frozenset(relations)
 
 
@@ -124,9 +235,9 @@ def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
     their actor, path, call, inner position and native/sync milestone. Unknown
     or inactive sites are rejected, including nonexistent terminal instances.
 
-    Relations run from inputs or requested sites to requested sites or outputs.
-    Only source-equals-target identity edges are omitted. Different Site
-    identities at the same physical milestone retain their proved relations.
+    Sparse relations have the same closure from inputs or requested sites to
+    requested sites or outputs. Source-equals-target queries are false.
+    Different Site identities at one physical milestone remain mutually reachable.
     Ports preserve incoming prefix facts even for a zero-trip child; they never
     create a child completion milestone.
 
@@ -159,8 +270,8 @@ def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
     )
     ports = sum(1 + 3 * len({c.task.pipe for c in sequence}) for sequence in streams.values())
     require(
-        (ports + len(endpoints)) ** 2 <= MAX_PROJECTION_RELATIONS,
-        "fixed child endpoint relation budget exceeded",
+        2 * ports + len(endpoints) <= MAX_PROJECTION_RELATIONS,
+        "fixed child endpoint relation budget exceeded (points)",
     )
     poll("fixed child completion projection", endpoints=len(endpoints), ports=ports)
     if insertion_cuts:
@@ -313,7 +424,16 @@ def project_fixed_child(analysis, endpoints, *, insertion_cuts=False):
                 if (gate := prefix_inputs(last, points).get(kind)) is not None:
                     flow.edge(gate, exit, source_point=(0, generation), target_point=(0, 0))
 
-    sources, targets = (*inputs, *endpoints), (*endpoints, *outputs)
+    # Head/tail names and normalized wait milestones may bind to one actual
+    # native point. Share their instrumentation origin, keeping every Site.
+    origins = {}
+    for source in (*inputs, *endpoints):
+        origins.setdefault(bindings[source], source)
+    sources, targets = tuple(origins.values()), (*endpoints, *outputs)
+    require(
+        _seed_words(len(sources)) <= MAX_PROJECTION_RELATIONS,
+        "fixed child projection mask budget exceeded",
+    )
     for bit, source in enumerate(sources):
         node, point = bindings[source]
         flow.seed(node, point, ALL, 1 << bit)
