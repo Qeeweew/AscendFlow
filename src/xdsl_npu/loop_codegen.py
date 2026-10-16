@@ -169,7 +169,7 @@ def _region_lines(
     return lines
 
 
-def emit_loop(analysis, *, host_launcher=True, sequence=None, scopes=None):
+def emit_loop(analysis, *, host_launcher=True, sequence=None, scopes=None, body_emitter=None):
     loop, channel_map, sequences, _, _ = analysis
     require(
         sequence is None or scopes is None, "ASC emission needs one retained region organization"
@@ -284,7 +284,8 @@ def emit_loop(analysis, *, host_launcher=True, sequence=None, scopes=None):
 
             lines += emit_scope_actor(scopes, actor, uniform_names)
         elif sequence is None:
-            lines += _region_lines(
+            render_body = _region_lines if body_emitter is None else body_emitter
+            lines += render_body(
                 actor,
                 data,
                 sequences,

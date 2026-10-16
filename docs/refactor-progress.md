@@ -4,7 +4,7 @@
 
 ## 1. 当前工作和代码现场
 
-用户已授权按新方案完成重构。算子优化和旧求解器局部调优仍停止。M0文档整理已完成，M1基础组件保存于`a111140`；当前继续M1接线和M2局部同步。尚未替换公共入口的同步算法，没有运行CANN或设备。
+用户已要求本轮commit后暂时暂停重构。M0文档整理已完成，M1基础组件保存于`a111140`，effects/原语接线保存于`8773953`；M2局部同步已有可运行的新入口。公共入口仍未切换；新scale/批量GEMM已有CANN离线结果，没有运行设备。算子优化和旧求解器局部调优继续停止。
 
 此前 `7ddaa54ec060a92e219d0462df162939b8b32d72` 的交付未达标。重构前全部实验和文档已保存到 `bbc1458`，标题为“Checkpoint paused synchronization experiments and structured-loop refactor plan”，不是资格声明。根目录没有产品Git。
 
@@ -30,14 +30,49 @@
 
 M1尚缺控制有效域与实际native完成/入口出口的接线，以及由真实effects推导有限layout、carried候选和精确出口。一步保持结果是带前提的合同：相同guard标签本身不证明FIRST/LAST等条件在下一代仍成立，必须由控制层建立合法successor域。M2–M6未完成。
 
-### M2当前接线（未完成）
+### M2局部闭环（仍有范围缺口）
 
 - `passes/native_recipes.py`从旧`_Actor.emit`抽出copy、element/BRCB、reduce、Scalar和显式L0 matmul，返回真实task、定义位置、每个源输入的全部实际reader。旧logical Tile检查已消费这些reader，避免仅检查第一个reader而漏掉后续覆盖。控制、地址绑定及legacy L1 operand展开仍在旧adapter。
 - `analysis/native.py`把已admit的单actor局部流水绑定到实际TaskOp/operand/root SSA、精确Ref及SPR effects。原语合同和view根在首次解码时建立，后续绑定clock不再重解码。嵌套/CV/动态任务尚不由此入口处理。
 - `analysis/hazards.py`一次消费已有物理依赖，保留RAW/WAR/WAW、真实首尾cut、距离/余数/末次域和实际root。显式区分consumer logical generation与physical step坐标；没有通过名字证明不别名，没有枚举运行长度。
 - `analysis/transitions.py`使用目标合同给出单指令native/Set/Wait/pipe fence转移。退休端口只是完成时的条件状态，派发不能取得它；Set effect不回注后续源流水。filtered implicit只覆盖满足目标合同的原语，不能借large MAD证明此前short MAD退休。已有capture的坐标代换同时处理prefix和handoff ordinal，不重放历史。
 
-定向证据：recipe相关16项通过，四个小例native IR与抽取前相同；effects提取14项通过；hazard绑定10项通过；单指令转移14项通过。合并后的analysis、loop归纳、recipe及小例公共compile/API组共137项通过（5.89s），各组存在重叠，不相加。这些不是新同步生成器或整条公共路径验收。尚缺协议选择、carried/首尾合同接通、资源分配与新同步IR物化；Scalar SPR setup也必须在实际指令排步中明确，不能只靠effects字段宣称完成。
+上述基础组件合并后的analysis、loop归纳、recipe及小例公共compile/API组共137项通过（5.89s）。后续实现如下，各阶段测试有重叠，不相加成全量回归总数：
+
+- `analysis/dependencies.py`成为唯一周期访问扫描，在writer/pending-reader更新时直接保存ReadCarry；RAW/WAR已覆盖的WAW不进入必需协议。`mad_first/mad_cycle`清零代没有实际read，部分覆盖继续保留WAW；不做WAW与全部reader的事后两两搜索。
+- `passes/local_sync.py`消费实际admission需求，按固定派发次序选择缺口。每个预声明engine/stage/activation键至多保存一个当前capture；同一consumer可使用其本来就需要的较晚源capture，但不会把早consumer的等待推到后面。普通queue与Scalar controller传播分别处理。
+- `analysis/progress.py`只对最终选定指令建立一次整数排序合同，不回答内存覆盖查询。V个milestone变量、E条约束，至多V轮、O(VE)工作量；不是全来源闭包，也不含运行次数N。
+- `analysis/resources.py`按真实consume→nextSet链建立最小可证width，然后分配ID。反向bank按接口索引，普通Wait不冒充controller gate；当前跨channel共享仍明确不支持。ID分配不重建内存关系。
+- `passes/insert_sync.py::synchronize_local`和`backend/local.py::emit_local`已连接真实DSL lowering之后的局部物理IR、同步生成、资源、实际物化及ASC。测试禁止它们调用旧autosync、DirectCompletion、completion_graph和verify_loop；旧验证器只作单独迁移交叉检查，不能当独立硬件语义oracle。
+- ASC直接消费同一个`LoopScheduleAttr.phases`，使用普通for或prologue/steady/epilogue及独立short分支，去掉稳态stage判断；不在后端再维护一份相位分解公式。phase有效域用于化简同步guard、删去恒假指令。原始IR body不克隆，ASC可能常量倍增，需要计量输出/编译成本。用户允许这些输出形式变化，不以旧ASC文本一致为交付条件。
+
+本轮相关合并组148项通过（9.97s）；最后统一canonical phase来源后，输出与真实集成组59项通过（3.02s）。各组有重叠，非全量回归。真实scale/Cube固定N从2^10改到2^20，模板/协议/进展变量及selection/resource工作量相同。Scalar管线复用MTE2→S ready对controller的贡献，省掉重复MTE2→V通知，lease通过真实Scalar桥闭合。
+
+明确边界：该入口目前只接受一个已admit的本地actor/clock；terminal-only native、尚未显式展开的Scalar SPR setup、嵌套/CV、跨调用lease仍未接通。legacy local LoopChannel/LoopSync编码和native/launcher打印工具暂时复用，不代表M4统一IR/后端完成。主线的query/child/parent求解器仍未删除；FA尚不走新入口。当前示例分开调用旧`lower_source`与新物理入口，前者的逻辑Tile检查建立的访问/依赖尚未直接交接，整个DSL闭环仍有重复提取；不能把新物理入口内的一次admission称作全产品已消除重复工作。
+
+可复现的CPU新入口（产品目录内执行）：
+
+```python
+from examples.vector.scale import scale
+from xdsl_npu.lowering import lower_source
+from xdsl_npu.passes.insert_sync import synchronize_local
+from xdsl_npu.backend.local import emit_local
+plan = synchronize_local(lower_source(scale.to_ir()))
+print(emit_local(plan))
+```
+
+真实scale和`examples/gemm/batched.py`的源码/同步前后IR/ASC、源码hash及CANN日志在[本地闭环产物](../../runs/structured-loops/m2-local/)。构建由该目录的`build_probe.py`与`runtime.process.bounded_process`执行，单次整个Python→CANN进程组上限300秒。小例离线结果不能替代FA编译门槛或设备正确性/性能。
+
+最终代码的单次新进程结果（source→ASC含源码载入和IR快照，Python包import另列在JSON；不是五次冷测）：
+
+| 真实DSL | source→ASC | 其中同步 | 整个Python→CANN构建 | 资格 |
+|---|---:|---:|---:|---|
+| scale，B64/f32、两个UB slot、runtime tiles | 0.262s | 0.0072s | 2.827s | CPU与CANN离线通过 |
+| batched_matmul，M32/N64/K64、f16→f32、20 groups、L1三槽/L0两槽、runtime tiles | 0.485s | 0.0178s | 3.088s | CPU与CANN离线通过 |
+
+两个结果均未设备执行，不是FA的加速成绩。对应ASC可直接查看[scale.asc](../../runs/structured-loops/m2-local/scale/scale.asc)和[batched_matmul.asc](../../runs/structured-loops/m2-local/batched_matmul/batched_matmul.asc)。
+
+恢复后的顺序：先把真实source控制、native lowering与已建立的effects/依赖交接成一个入口；再完成嵌套loop边界、terminal/SPR、CV和共享lease；然后切换公共compile并删除旧专用求解器及过渡编码/打印适配；最后执行默认FA五次冷编译、相关算子回归、CANN和大规模设备资格。当前暂停不改变FA≤5s/≤10s等验收门槛。
 
 ## 2. 编译耗时：明确未达标
 
@@ -84,7 +119,8 @@ M1尚缺控制有效域与实际native完成/入口出口的接线，以及由�
 | AST DSL→xDSL→ASC | Vector、normalization、GEMM、状态和默认dense FA示例已接通旧主线 | 新统一循环算法尚未实现；语法通过不代表任意组合通过 |
 | 普通编译事实所有权 | 已提交版本有normal/deep分离、资源结果交付和纯整数化简 | 不等于统一算法或成本达标 |
 | CPU回归 | 7ddaa54对应旧记录有分段2831项；停止实验有定向回归 | 不把历史总数写成当前工作树全量通过 |
-| CANN | 7ddaa54记录FA/GEMM/scale离线构建成功 | 本轮没有新CANN结果 |
+| 新局部路径 | scale和独立批量GEMM经新选择/资源/PLE输出，已CANN离线编译 | 不是完整重构、FA或设备资格；Scalar SPR/terminal/nested仍有缺口 |
+| 历史CANN | 7ddaa54记录FA/GEMM/scale离线构建成功 | 不能代表新FA路径已通过 |
 | 默认FA设备 | 对应历史产物有短域全输出、4K/8K采样与msprof | 当前未提交分析实验没有新的设备资格；采样不是全输出 |
 | Attention变体 | runner可表达部分dtype/head/tile政策 | 不代表causal、tail、varlen、paged/sparse、persistent等全部实现 |
 

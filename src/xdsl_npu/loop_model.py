@@ -13,6 +13,7 @@ from math import lcm
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType
 
+from .analysis.dependencies import Dependence, analyze_dependencies, cut_access_cells
 from .analysis.native import (
     DecodedNativeEffects,
     decode_native_task,
@@ -128,21 +129,6 @@ class Loop:
 
     def root(self, actor, ref):
         return ref.storage.name if ref.storage.external else actor + "/" + ref.storage.name
-
-
-@dataclass(frozen=True)
-class Dependence:
-    source: tuple[str, str]
-    destination: tuple[str, str]
-    distance: int
-    period: int
-    residues: tuple[int, ...]
-    hazard: str
-    storage: str
-    start: int
-    stop: int
-    last: bool = False
-    prefix: bool = False
 
 
 def is_symbolic(module):
@@ -1190,155 +1176,9 @@ def access_cells(loop, *, roots=None, include_readonly=False):
     yield from cut_access_cells(cells)
 
 
-def cut_access_cells(cells):
-    """Exact interval cuts shared by periodic and fixed-domain access scans."""
-    for root, work in cells.items():
-        points = sorted({p for _, _, _, parts in work for lo, hi, _, _ in parts for p in (lo, hi)})
-        cuts = {point: i for i, point in enumerate(points)}
-        per_cell = [[] for _ in points[:-1]]
-        for g, actor, uid, parts in work:
-            touched = {}
-            for start, stop, mode, init in parts:
-                for cell in range(cuts[start], cuts[stop]):
-                    old_read, old_write, old_init = touched.get(cell, (False, False, False))
-                    touched[cell] = (
-                        old_read or "R" in mode,
-                        old_write or "W" in mode,
-                        old_init or init,
-                    )
-            for cell, (read, write, init) in touched.items():
-                per_cell[cell].append(((g, actor, uid), read, write, init))
-        for lo, hi, cell_events in zip(points, points[1:], per_cell):
-            if cell_events:
-                yield root, lo, hi, cell_events
-
-
-def loop_dependencies(loop, *, live_in=()):
-    """Exact periodic frontier and startup obligations, independent of N."""
-    edges = {}
-    task_map = {
-        (actor, t.uid): t for actor, data in loop.actors.items() for t in data.program.tasks
-    }
-
-    def edge(source, destination, hazard, root, lo, hi, terminal=False, prefix=False):
-        if source is None or source == destination:
-            return
-        sg, sa, su = source
-        dg, da, du = destination
-        distance = dg - sg
-        require(distance >= 0, "logical effect order is inconsistent")
-        key = (sa, su, da, du, distance, hazard, root, lo, hi, terminal, prefix)
-        edges.setdefault(key, set()).add(dg)
-
-    for root, lo, hi, cell_events in access_cells(loop):
-        period = loop.storage_periods[root]
-        initialized = cell_events[-1][3]
-        steady = [
-            (event, read, write)
-            for event, read, write, _ in cell_events
-            if not task_map[event[1:]].last
-        ]
-        terminal = [
-            (event, read, write)
-            for event, read, write, _ in cell_events
-            if task_map[event[1:]].last
-        ]
-        writes = [i for i, (_, _, write) in enumerate(steady) if write]
-        last = writes[-1] if writes and root not in loop.frames else None
-        writer = None if last is None else (steady[last][0][0] - period, *steady[last][0][1:])
-        pending = (
-            []
-            if last is None
-            else [(event[0][0] - period, *event[0][1:]) for event in steady[last + 1 :] if event[1]]
-        )
-        unbounded_readers = not writes and root not in loop.frames
-        if unbounded_readers:
-            pending = [(event[0] - period, *event[1:]) for event, read, _ in steady if read]
-
-        def visit(
-            events,
-            writer,
-            pending,
-            *,
-            terminal=False,
-            root=root,
-            period=period,
-            initialized=initialized,
-            lo=lo,
-            hi=hi,
-            unbounded_readers=unbounded_readers,
-        ):
-            for destination, read, write in events:
-                g, actor, uid = destination
-                task = task_map[actor, uid]
-                first_clear = (
-                    task.native == "mad_first" and g == 0 and root == loop.root(actor, task.refs[2])
-                )
-                active = loop.constant_count is None or g < loop.constant_count
-                shift = 0
-                if terminal and loop.constant_count is not None:
-                    active = loop.constant_count > 0 and (loop.constant_count - 1) % period == g
-                    shift = loop.constant_count - 1 - g
-                if read:
-                    require(
-                        initialized
-                        or root in live_in
-                        or first_clear
-                        or not active
-                        or (writer is not None and writer[0] + shift >= 0),
-                        f"{actor}/{uid} has an undefined {'terminal' if terminal else 'first'} read on {root}[{lo}:{hi}]",
-                    )
-                    edge(writer, destination, "RAW", root, lo, hi, terminal)
-                    pending.append(destination)
-                if write:
-                    edge(writer, destination, "WAW", root, lo, hi, terminal)
-                    # A cell read throughout the stream but written only
-                    # at its end has no finite last-writer window. Prove
-                    # cumulative retirement of each reader family; an
-                    # individual latest read need not retire earlier DMA.
-                    frontier = pending
-                    if terminal and unbounded_readers:
-                        latest = {}
-                        for reader in pending:
-                            latest[reader[1:]] = max(reader, latest.get(reader[1:], reader))
-                        frontier = latest.values()
-                    for reader in frontier:
-                        prefix = terminal and unbounded_readers and not task_map[reader[1:]].last
-                        edge(reader, destination, "WAR", root, lo, hi, terminal, prefix)
-                    writer, pending = destination, []
-            return writer, pending
-
-        # Boundary effects run on a copy of the actual frontier, then are
-        # discarded. They must never shadow a steady writer/reader in the
-        # next iteration of the periodic proof.
-        by_generation, tails = {}, {}
-        for event in steady:
-            by_generation.setdefault(event[0][0], []).append(event)
-        for event in terminal:
-            tails.setdefault(event[0][0], []).append(event)
-        for g in sorted(by_generation.keys() | tails.keys()):
-            if root in loop.frames:
-                writer, pending = None, []
-            writer, pending = visit(by_generation.get(g, ()), writer, pending)
-            visit(tails.get(g, ()), writer, list(pending), terminal=True)
-    return tuple(
-        Dependence(
-            (sa, su),
-            (da, du),
-            distance,
-            loop.storage_periods[root],
-            tuple(sorted(residues)),
-            hazard,
-            root,
-            lo,
-            hi,
-            terminal,
-            prefix,
-        )
-        for (sa, su, da, du, distance, hazard, root, lo, hi, terminal, prefix), residues in sorted(
-            edges.items()
-        )
-    )
+def loop_dependencies(loop, *, live_in=()) -> tuple[Dependence, ...]:
+    """Transitional entry to the one authoritative periodic access scan."""
+    return analyze_dependencies(loop, live_in=live_in).obligations
 
 
 def compose_loop(name, cube, vector0, vector1, *, disjoint_external):
