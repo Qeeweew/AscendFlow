@@ -89,15 +89,9 @@ class EventReservation:
 
 
 @dataclass(frozen=True, slots=True)
-class ProgressArc:
-    source: int
-    destination: int
-    steps: tuple[int, ...]
-    reason: str
-
-
-@dataclass(frozen=True, slots=True)
 class ProgressPoint:
+    """A proof node: a real notification action or an explicit queue cut."""
+
     operation: Operation
     actor: Actor
     phase: str
@@ -108,14 +102,15 @@ class ProgressPoint:
 
 @dataclass(frozen=True, slots=True)
 class StructuredProgress:
-    """Region composition, with local stream ranks and guarded interfaces.
+    """Region composition, with local stream ranks and guarded queue interfaces.
 
     Finite cyclic interfaces are certified by their region exclusions. They
     do not claim one unconditional numeric rank across incompatible guards.
+    Queue cuts certify blocking only, with no completion or lease semantics.
     """
 
     points: tuple[ProgressPoint, ...]
-    arcs: tuple[ProgressArc | GuardedTransfer, ...]
+    arcs: tuple[GuardedTransfer, ...]
     clocks: tuple[Operation, ...]
     ranks: tuple[tuple[int, ...], ...]
     strides: tuple[int, ...] = ()

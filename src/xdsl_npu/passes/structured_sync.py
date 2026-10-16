@@ -24,6 +24,7 @@ from ..diagnostics import require
 from ..dialects.io import dump
 from .lower_native import NativeStructure, lower_native_structure
 from .materialize_structure import materialize_notifications
+from .simplify_scalars import simplify_scalars
 
 if TYPE_CHECKING:
     from ..analysis.structured_resources import StructuredEventPlan
@@ -72,6 +73,9 @@ def _materialize_owned(structure, admission, dependencies, selection, resources)
     before_ir = dump(structure.module)
     module = materialize_notifications(admission.memory, resources.actions)
     require(module is structure.module, "notification insertion changed its owned physical module")
+    # Stock pure-integer rewrites preserve native/control/notification identity
+    # and their values. Retained execution facts therefore remain applicable.
+    simplify_scalars(module)
     result = object.__new__(StructuredSynchronization)
     for name, value in (
         ("structure", structure),

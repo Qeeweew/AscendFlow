@@ -424,6 +424,13 @@ def test_prologue_stream_epilogue_keeps_two_separate_progress_certificates():
     assert {point.notification.name for point in stream.ports} == {"body"}
     assert {point.notification.name for point in child.ports} == {"startup", "finish"}
     assert len(stream.ports) == len(child.ports) == 2
+    assert child.interface.ports == child.ports
+    assert all(cut.operation is child.operation for cut in child.interface.cuts)
+    retained = child.interface.ports + child.interface.cuts
+    assert all(
+        relation.source in retained and relation.destination in retained
+        for relation in child.interface.relations
+    )
     for edge in stream.relations:
         assert (
             stream.rank[edge.source] + 1

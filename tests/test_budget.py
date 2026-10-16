@@ -4,6 +4,7 @@ import pytest
 
 from examples.vector.scale import scale
 from xdsl_npu import budget, compile
+from xdsl_npu import language as N
 from xdsl_npu.diagnostics import CompileError, ErrorKind
 
 
@@ -30,4 +31,16 @@ def test_invalid_deadline_policy_is_rejected(seconds):
 
 
 def test_deadline_does_not_change_successful_generated_code():
-    assert compile(scale, timeout_s=3).asc == compile(scale, timeout_s=60).asc
+    source = N.from_source(
+        """
+        def finite(X: N.Tensor((64,), N.f32), Y: N.Tensor((64,), N.f32, access="write")):
+            with N.Kernel():
+                x=N.alloc_ub((64,))
+                y=N.alloc_ub((64,))
+                N.copy(X, x)
+                N.mul(x, 2.0, out=y)
+                N.copy(y, Y)
+        """,
+        disjoint_external=True,
+    )
+    assert compile(source, timeout_s=3).asc == compile(source, timeout_s=60).asc

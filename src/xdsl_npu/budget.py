@@ -4,7 +4,6 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import wraps
 from math import isfinite
 from time import perf_counter
 
@@ -56,16 +55,3 @@ def poll(phase, **counts):
             f"compilation {reason} at {phase}" + (f" ({detail})" if detail else ""),
             kind=ErrorKind.ANALYSIS_LIMIT,
         )
-
-
-def bounded(function):
-    """Standalone public analyses get the same default as compile()."""
-
-    @wraps(function)
-    def run(*args, **kwargs):
-        if _active.get() is not None:
-            return function(*args, **kwargs)
-        with limit():
-            return function(*args, **kwargs)
-
-    return run

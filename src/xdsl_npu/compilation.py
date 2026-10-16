@@ -112,7 +112,7 @@ class Compilation:
             ],
         }
         schedule = {
-            scope.clock.name: [
+            scope.name: [
                 {
                     "task": task.operation.uid.data,
                     "stage": task.stage,

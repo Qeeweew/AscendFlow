@@ -92,4 +92,9 @@ IRDL verifier 负责结构和类型，不能替代异步正确性。有限模型
 - `EventWindow` 必须等价于实际membership；`first`/`last`仅在非空条件内使用，stride必须对应下一次同ID的活跃使用。未知稀疏guard不能被区间摘要吞掉。child到parent的存在条件由已证窗口显式投影，保留代次关联。
 - lifetime只使用真正的Wait消费、后续queue/controller admission以及选中通知；Set效果不门控未来source native。有限child出口不会自动产生全体完成。
 - progress用必须/可能/不可能三种顺序关系。必须边用于建立reuse证据；可能阻塞不能漏掉，其成立条件也不能在parent合并时丢失。已由同一循环覆盖的义务不在root重新投影再证明。
+- region进展摘要只导出尚未在本层配对的实际通知端口，以及本region的queue输入和queue/controller阻塞输出。内部native与子层接口消去后留在本地witness；父层不重新导入它们。该摘要只用于可能阻塞与进展，不能给lifetime、memory或buffer复用提供完成证据。
+- 非Scalar的局部Wait只阻塞目标queue；Scalar/cross Wait才门控实际controller。两个AIV的接口保持独立，不能以一个Vector族节点替代两个贡献。跨调用坐标的平移作用于整条关系及其guard；不同父代不能在child拼成零步边。
+- 空循环不产生内部发布/阻塞贡献；外围同queue/controller本有的次序继续保留。未知投影必须保持为可能关系并标记其证明边界，不能因无法消去条件就丢边，也不能把保守摘要用于证明必然完成。
 - bank allocation只能使用已有生命周期或具体sharing witness。同一bank找不到ID表示支持的分配策略未得到方案，不能当作硬件容量下界证明。
+
+最终标量阶段只将带 `Pure` trait 的标量整数/index `arith` 根交给 xDSL 通用 canonicalization/DCE。浮点、向量、除法/取余及所有控制、地址、native、通知不在改写入口内；不做 reassociation、CSE 或跨 block 移动。该阶段在通知物化后调用一次，保持这些执行操作与 region 的身份、次序和数值，不重新建立内存或同步事实。规则与接线通过独立短 IR 回归检查，普通编译不反复做前后全图比对。

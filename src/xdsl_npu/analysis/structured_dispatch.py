@@ -18,9 +18,7 @@ from xdsl.ir import Operation
 from ..diagnostics import require
 from ..dialects.physical import KernelOp, MixedOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
-from ..target.ascend910b import Actor, Milestone
-from .frontier import Clock, PrefixRank
-from .native import NativeCut
+from ..target.ascend910b import Actor
 from .structured_memory import MemoryTemplate, NativeMemoryFacts
 
 
@@ -28,7 +26,7 @@ from .structured_memory import MemoryTemplate, NativeMemoryFacts
 class DispatchScope:
     operation: Operation
     actor: Actor
-    clock: Clock
+    name: str
     parent: DispatchScope | None
     parent_stage: int = 0
     parent_lexical: int = 0
@@ -50,10 +48,6 @@ class StructuredTask:
         return self.scope.actor
 
     @property
-    def clock(self):
-        return self.scope.clock
-
-    @property
     def engine(self):
         return self.template.contract.engine
 
@@ -62,40 +56,8 @@ class StructuredTask:
         return self.template.contract.implicit_completion
 
     @property
-    def packet(self):
-        return self.template.contract.packet
-
-    @property
     def native(self):
         return self.template.contract.native
-
-    @property
-    def scalar_source(self):
-        return self.template.scalar_source
-
-    @property
-    def registers(self):
-        # Native packets are closed. Invariant FIX/Load3D configuration is
-        # admitted once on the owned structure, separately from local edges.
-        return ()
-
-    @property
-    def last(self):
-        # FIRST/LAST are actual boundary occurrences, never a Task attribute.
-        return False
-
-    @property
-    def rank(self):
-        return PrefixRank(self.clock, self.stage, self.lexical)
-
-    def cut(self, milestone, *, generation_offset=0):
-        return NativeCut(
-            self.operation,
-            self.actor,
-            None if milestone is Milestone.ISSUE else self.engine,
-            PrefixRank(self.clock, self.stage + generation_offset, self.lexical),
-            milestone,
-        )
 
 
 @dataclass(frozen=True)
@@ -121,7 +83,7 @@ def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:
     )
 
     def scope_for(op, actor, parent=None, stage=0, lexical=0):
-        scope = DispatchScope(op, actor, Clock(f"scope-{len(scopes)}"), parent, stage, lexical)
+        scope = DispatchScope(op, actor, f"scope-{len(scopes)}", parent, stage, lexical)
         scopes[op, actor], bodies[scope] = scope, []
         return scope
 

@@ -186,14 +186,14 @@ def test_each_region_certifies_stream_ranks_and_guarded_interfaces(repeated):
     opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
 
     def check(region):
-        assert all(0 <= index < len(region.ports) for index in region.interface)
         assert all(port.phase in {"set", "wait"} for port in region.ports)
-        if region.clock is not None:
-            assert len(region.rank) == len(region.ports)
-            for edge in region.relations:
+        stream = region.stream
+        if stream is not None:
+            assert len(stream.rank) == len(stream.nodes)
+            for edge in stream.relations:
                 assert (
-                    region.rank[edge.source] + 1
-                    <= region.stride * edge.steps + region.rank[edge.destination]
+                    stream.rank[edge.source] + 1
+                    <= stream.stride * edge.steps + stream.rank[edge.destination]
                 )
         for cycle in region.excluded_cycles:
             tests = cycle.condition.comparisons

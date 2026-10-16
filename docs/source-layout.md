@@ -22,12 +22,13 @@
 | 派发进展 | `analysis/event_progress.py` | 实际阻塞接口及循环组合；不读取分配 ID |
 | 事件分配 | `analysis/structured_resources.py`、`event_contracts.py` | 连接资源阶段、bank/ID 台账、配置预留与最终 drain |
 | 物化 | `passes/materialize_structure.py`、`analysis/structured_schedule.py` | 将已确定指令写成真实 SCF 条件、event SSA 和 NotificationOp |
+| 标量化简 | `passes/simplify_scalars.py` | 对最终 IR 的纯整数/index arith 根应用 xDSL 通用规则；不移动或重写控制与异步操作 |
 | ASC | `backend/structured.py`、`structured_native.py`、`native.py` | 读取最终 IR；不得另用动作表重建执行，不插隐藏同步 |
 | CANN 与构建 | `backend/cann.py`、`build.py`、`runtime/process.py` | 一个算子一次进程组期限、离线工具调用、成功产物发布 |
 
 `structured_regions.py` 存共享关系类型；`structured_access.py` 负责范围投影；`structured_dependencies.py` 负责递归合成。这三者不能各自重新解释一次地址、slot 或循环有效域。
 
-资源阶段已经拆开事实、生命周期、进展和分配；窗口等价及存在投影已经接通，多层有限端口与重复流的组合仍待完成。它们共享一次建立的 `EventDomains`，没有通过 mixin 或回调总 planner 拼装另一套求解器。
+资源阶段拆开事实、生命周期、进展和分配，共享一次建立的 `EventDomains`。进展区分内部 stream rank 与对外 queue/阻塞接口；子层 native 留在本地 witness，完整嵌套功能资格仍见状态页。
 
 ## 必须保持的依赖方向
 

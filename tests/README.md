@@ -9,13 +9,13 @@
 | 范围 | 入口 | 主要检查 |
 |---|---|---|
 | Source 与控制 | `test_frontend.py`、`control/`、`loops/`、`test_compilation.py` | 显式控制、Stage/actor、原始 SSA、source 所有权与不可变产物 |
-| Native 与内存 | `analysis/test_native_geometry.py`、`test_native_packets.py`、`test_native_anchors.py`、`test_structured_*.py` | 静态 native 规则、issue packet、真实地址/footprint、bounds、owner、SPR、初始化和数值生产者 |
+| Native 与内存 | `analysis/test_native_geometry.py`、`test_native_packets.py`、`test_structured_*.py` | 静态 native 规则、issue packet、真实地址/footprint、bounds、owner、SPR、初始化和数值生产者 |
 | 依赖与同步选择 | `analysis/test_access_frontier.py`、`test_structured_dependencies.py`、`sync/test_notification_selection.py` | 实际读写/退休义务、捕获/获取端点、实际代次与完整 CV quorum |
 | 资源与进展 | `analysis/test_event_*.py`、`test_progress_*.py`、`test_structured_resources.py`、`test_structured_resource_contracts.py`、`test_structured_event_sharing.py` | 精确激活、空/短循环、窗口投影、ID lease、最后消费、真实阻塞路径和 region 接口 |
 | 最终 IR 与 ASC | `backend/test_structured_emission.py`、`sync/test_structured_pipeline.py` | 后端消费既有事实、实际 Notification/SCF/Address SSA 与生成调用 |
 | 数学、ABI 和测量记录 | `test_attention_math.py`、`test_runtime_contract.py`、`test_attention_runner.py`、`test_performance.py`、`test_work_inventory.py` | 数学参考、host guards、命名 ABI、证据身份、静态工作量与显式分析假设 |
 
-旧硬件反例按职责保留在当前表示中：`sync/test_structured_event_semantics.py` 和 `models/structured_events.py` 包含 native end 非 FIFO、RAW/WAR/WAW、删 Wait、错 ID、过早 Set、跨 body 二元事件复用、Scalar controller 阻塞、双 AIV mode2 quorum、未消费容量与跨队列阻塞环。共享 GM 输入的有限字节检查使用同一 structured 模型。几何、packet 和 native cut 合同直接使用当前静态对象或实际 SSA。旧求解器的节点数量、缓存、路径搜索与旧 IR 布局断言不再作为产品合同。
+旧硬件反例按职责保留在当前表示中：`sync/test_structured_event_semantics.py` 和 `models/structured_events.py` 包含 native end 非 FIFO、RAW/WAR/WAW、删 Wait、错 ID、过早 Set、跨 body 二元事件复用、Scalar controller 阻塞、双 AIV mode2 quorum、未消费容量与跨队列阻塞环。共享 GM 输入的有限字节检查使用同一 structured 模型。几何与 packet 合同直接使用当前静态对象或实际 SSA；native end 与退休的区别由实际事件模型检查。旧求解器的节点数量、缓存、路径搜索与旧 IR 布局断言不再作为产品合同。
 
 这些覆盖说明测试职责，不代表所有旧场景都已在新编译器获得证明。当前 mixed region、祖先 invocation 和完整 source 集成必须分别满足现有同步契约；未证明的关系应明确拒绝。FA、CANN、设备和性能资格不能由目录清理或小合同通过推导。
 
