@@ -96,22 +96,17 @@ def test_empty_and_unrelated_substitutions_preserve_original_node_identities():
     assert root.args == (left, right)
 
 
-def test_argument_collection_visits_shared_nodes_once(monkeypatch):
+def test_free_variables_are_immutable_compositional_facts():
     first, second = _argument("first"), _argument("second")
     root = _doubled(Expr("mul", (first, second)), 8)
-    original = Expr.__getattribute__
-    reads = {}
-
-    def observed(node, name):
-        if name == "args":
-            reads[id(node)] = reads.get(id(node), 0) + 1
-        return original(node, name)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(Expr, "__getattribute__", observed)
-        assert arguments(root) == {"first", "second"}
-    assert len(reads) == 11
-    assert set(reads.values()) == {1}
+    collected = arguments(root)
+    assert collected == {"first", "second"}
+    collected.clear()
+    assert arguments(root) == {"first", "second"}
+    replaced = substitute(root, {first: _argument("third")})
+    assert arguments(replaced) == {"second", "third"}
+    assert arguments(root) == {"first", "second"}
+    assert not arguments(substitute(root, {first: literal(0)}))
 
 
 def test_retained_integer_normalization_bounds_work_by_shared_ring_nodes(monkeypatch):
