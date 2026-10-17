@@ -1,21 +1,19 @@
-# 编译器文档
+# 编译器文档入口
 
-当前统一编译链路及旧实现清退已落地，继续补齐完整算子的编译资格与编译耗时分析；算子优化暂停。**实现、测量与未解决问题只在[状态页](refactor-progress.md)登记；设计和计划不能当支持证据。**
+2026-10-17。**自动同步生成需要重新设计，当前不是最后几项证明器优化的收尾阶段。** 用户已停止算法开发，本次只整理交接。下一位agent先读[实际状态](refactor-progress.md)和[新计划](refactor-plan.md)。
 
-| 文档 | 唯一职责 |
+| 文档 | 职责 |
 |---|---|
-| [design.md](design.md) | 统一prologue/loop/epilogue、边界/回边、完成前沿与资源语义 |
-| [source-layout.md](source-layout.md) | 包结构、依赖方向、当前模块去留和迁移纪律 |
-| [compilation-invariants.md](compilation-invariants.md) | 每项保证的建立者、保持/失效与normal/debug边界 |
-| [refactor-plan.md](refactor-plan.md) | 当前结构、剩余事件域任务与验收顺序 |
-| [refactor-progress.md](refactor-progress.md) | 当前代码身份、支持范围、失败指标及证据 |
-| [dsl-multistage.md](dsl-multistage.md) | 用户语法、运行时/constexpr、CV多阶段和组合限制 |
-| [attention-target.md](attention-target.md) | 当前FA example的数学、存储和资格合同 |
-| [validation.md](validation.md) | 分层测试、复杂度、冷编译、CANN及设备性能验收 |
-| [source-notes.md](source-notes.md) | 参考HEAD、必须保留的硬件语义和来源边界 |
+| [refactor-progress.md](refactor-progress.md) | Git身份、停止点、失败证据及资格边界 |
+| [refactor-plan.md](refactor-plan.md) | 生成职责审计、规则/组合重构及旧职责退出顺序 |
+| [design.md](design.md) | 必须保持的DSL、循环、硬件和同步语义目标 |
+| [compilation-invariants.md](compilation-invariants.md) | 输入前提、构造保证、保持/失效和独立验证的区别 |
+| [source-layout.md](source-layout.md) | 真实调用链、代码入口和替换边界 |
+| [dsl-multistage.md](dsl-multistage.md) | 用户语法、runtime/constexpr与CV多stage模型 |
+| [attention-target.md](attention-target.md) | 当前FA example的数学与存储合同；资格以状态页为准 |
+| [validation.md](validation.md) | 分层验证、工作量、冷编译、CANN及后续设备性能口径 |
+| [source-notes.md](source-notes.md) | 参考HEAD与硬件语义来源 |
 
-用户源码在[examples](../examples/README.md)，工具入口在[benchmarks](../benchmarks/README.md)，现有测试入口在[tests](../tests/README.md)。
+算法在[examples](../examples/README.md)，基准工具在[benchmarks](../benchmarks/README.md)，语义回归在[tests](../tests/README.md)。设计、计划、测试总数和报告标签都不能代替实际资格。
 
-重写前36份文档和四个README原文保存在[产品仓库外的归档](../../reports/compiler-refactor/20261016-before-structured-loops/README.md)，有HEAD、状态和SHA256清单。历史性能/阶段报告不再堆在产品docs，也不保留指向旧计划的转发页。历史链接和命令按原文保存，不保证在当前代码上可运行。
-
-维护约定：新能力更新对应合同和状态；新阶段只更新计划完成标记，不再追加一份“当前设计”。测量JSON、ASC、日志和历史报告放外层，Git仅提交产品文件。必要的新文档须有独立长期职责，避免重复状态页。
+产品文档只维护上述职责，历史实现由Git追溯，不另建legacy说明或复制旧solver。更早36份文档的外层归档见[历史归档](../../reports/compiler-refactor/20261016-before-structured-loops/README.md)，内容只供溯源，不能覆盖本次交接。运行数据、ASC、日志与临时审查留外层runs，产品Git只包含源码、测试、示例和当前文档。

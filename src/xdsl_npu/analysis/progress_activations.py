@@ -3,6 +3,9 @@
 Guard leaves retain their complete ordered execution witnesses. The Boolean
 circuit serves mathematical queries only; interning, mapping and refutation
 neither admit unsigned arithmetic nor establish exact interface projection.
+
+This unfinished post-selection experiment is retained as the current snapshot,
+not prescribed as the future synchronization generator. See docs/refactor-plan.md.
 """
 
 from __future__ import annotations

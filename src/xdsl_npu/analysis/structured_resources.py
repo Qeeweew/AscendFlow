@@ -1,9 +1,10 @@
 """Compose event-domain, lifetime, progress and bank-allocation contracts.
 
-No stage rediscovers memory dependencies. Endpoint activation is established
-once, then reused by progress, consumption and allocation. This module owns
-only the finite hardware bank ledger and construction of materialization
-records; symbolic domain and queue reasoning live in their named stages.
+This is the current post-selection analysis pipeline. It orchestrates domain,
+progress and lease reasoning before bank allocation and materialization records;
+the selector does not yet supply their complete guarantees by construction.
+Do not disable these obligations before the redesign in docs/refactor-plan.md
+has established their replacements.
 """
 
 from dataclasses import replace
@@ -31,7 +32,7 @@ from .structured_schedule import ActionGuard, Placement, SyncAction
 
 
 def allocate_structured_events(selection: SynchronizationSelection) -> StructuredEventPlan:
-    """Establish each resource obligation once and materialize its instructions."""
+    """Analyze selected notifications before allocating their hardware resources."""
     work = ResourceWork(notifications=len(selection.notifications))
     domains = EventDomains(selection, work)
     progress = prove_progress(domains)

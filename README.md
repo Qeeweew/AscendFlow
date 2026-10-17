@@ -3,7 +3,7 @@
 面向Ascend 910B / dav-2201，使用xDSL 0.73.0 → 物理执行IR → ASC → CANN 9.1。
 用户表达计算、物理存储、缓冲和多阶段排步，编译器负责真实异步访问与资源复用同步。不引入MLIR工程或参考仓库构建依赖。
 
-**先完成结构重构，再分析编译性能；算子优化继续暂停。** 当前 source 入口已接到递归物理访问、统一逻辑通知、事件资源与最终 IR 后端，嵌套CV已通过CANN离线编译。真实双runtime循环/双slot已完成条件生命周期与CANN闭环；默认FA已越过整数规约问题，当前仍需分开逻辑值依赖与实际排步下的物理复用合同。被替代的编译路径直接删除，不保留兼容层或历史实现目录。历史耗时和设备结果不代表当前工作树，具体证据见[当前状态](docs/refactor-progress.md)。
+**当前重构未完成，算法开发已停止并准备交接。** 现有normal链路在通知选择之后仍执行progress、lease与ID共享路径分析，尚未建立完整的、可组合的同步生成保证。接手请先读[重构计划](docs/refactor-plan.md)，不要默认继续优化当前后置求解器。源码/测试快照`1231f4f`是未完成实验；FA、CANN与设备资格只以[当前状态](docs/refactor-progress.md)的对应证据为准。
 
 ## 文档与代码入口
 
@@ -32,13 +32,13 @@ artifact = compile(scale.specialize(B=64))
 print(artifact.asc)
 ```
 
-`tiles`是runtime参数，B是tile容量。`debug_verify=True`执行最终IR的结构检查，不能替代异步正确性证明；普通编译消费各阶段已建立的事实。旧`cube.task/vector.task`已删除，不恢复兼容。
+`tiles`是runtime参数，B是tile容量。`debug_verify=True`执行最终IR的结构检查，不能替代异步正确性证明；普通编译当前仍包含通知选择后的协议分析。旧`cube.task/vector.task`已删除，不恢复兼容。
 
 ## 仓库边界
 
 | 路径 | 职责 |
 |---|---|
-| src/xdsl_npu | DSL、IR、通用分析/变换、ASC和运行支持；目标目录尚待迁移 |
+| src/xdsl_npu | DSL、IR、通用分析/变换、ASC和运行支持 |
 | examples | 算法及显式政策，编译器不得导入它们来选择实现 |
 | tests | 语义反例、实际IR破坏、有限模型与复杂度回归 |
 | benchmarks | 编译计时、手写AscendC/ACLNN、数值与profiling工具 |

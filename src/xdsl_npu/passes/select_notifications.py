@@ -777,6 +777,8 @@ def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
 
     This establishes data coverage only. Pairing, event lifetimes, capacity
     and progress remain explicit duties of the single resource stage.
+    This incomplete generation contract is the redesign entry point described
+    in docs/refactor-plan.md; coverage alone cannot authorize executable sync.
     """
     require(isinstance(dependencies, StructuredDependencies), "selection needs actual dependencies")
     dependencies.require_closed()

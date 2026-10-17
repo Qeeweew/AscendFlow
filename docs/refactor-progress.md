@@ -1,95 +1,58 @@
-# 当前重构状态
+# 交接状态与证据
 
-**重构尚未完成。** 本轮已直接替换区域进展的 DNF 路径列表，实际编译链使用共享 AND/OR 激活公式；导出、祖先绑定和 rank 按同一变换批量处理共享子图。旧容器、笛卡尔积、回调、旧计数和单根映射入口均已删除。当前默认 FA 仍未通过完整构建，不能用局部测试宣称已完成。
+2026-10-17。**用户已停止算法开发，要求重新设计Set/Wait生成。重构未完成。** 本次整理只保存代码、纠正文档并提供新agent prompt；不继续FA构建或算子优化。
 
-合同见[编译不变量](compilation-invariants.md)，职责见[源码组织](source-layout.md)，剩余工作见[重构计划](refactor-plan.md)。算子调优、打包和设备任务没有恢复。
+## 1. 代码身份
 
-## 已落地的结构
+| 版本 | 含义 |
+|---|---|
+| `475f49b` | 先前提交：共享AND/OR替换DNF，但仍提前组合区域路径 |
+| `1231f4f` | 停止时源码/测试快照：惰性Path、hidden图、三值查询和共享source搜索树；**未完成实验，不是认可的最终架构** |
+| 交接整理提交 | 在上述快照上纠正文档与源码说明；以`git log`查看实际HEAD，不修改同步算法 |
 
-- 唯一入口接收 DSL/source，经 native、访问与准入、逻辑值流、实际 dispatch 存储生命周期、通知、事件资源、最终物理 IR、ASC 到 CANN。物理快照不作为已证明输入重新导入。
-- `logical_valueflow` 保留 RAW、条件 KILL/UPDATE 与代次；`storage_packets/word/lifetimes` 按已证明闭合的 private 生命周期构造 PLE 相邻 WAR/WAW。边界共用 consumer j/source j-distance，不展开 runtime 次数。
-- 进展分为区域合同、端点与顺序事实、数学合取、共享激活公式、稀疏连通、rank 和组合编排。被替代的编排器方法、dense 消元、类型出口和重复测试准备入口已删除，没有 alias 或第二求解器。
-- `IntegerFacts` 现在按完整有序 tuple 建立 owned context，递归范围/比较查询只引用该 context。换序、重复谓词及不同输入环境保持各自身份，不提前解释后续谓词。
-- `_constraint` 惰性建立原始带因子的约束，`_difference` 惰性建立原来的 `bounded(lhs-rhs)`。相同原式在多个 context 中复用派生结果，但范围/比较答案仍绑定完整 context。旧模块 `_term` 删除，无兼容包装。
-- 有序定义性按当前比较的原始节点 identity 遍历共享子图；左右操作数共用成功集合，下一个比较重建集合。原始 unsigned 前提、首个诊断及短路顺序不变。
-- 算法仍在 examples；两个 AIV 共用 body/runtime sid，源算法、buffer、issue order、通知及硬件资源约束未改变。公式工作预算采用新计数合同，见编译不变量。
+没有回滚或隐藏已有工作；没有新增legacy目录、兼容入口或第二编译路径。后续agent可以直接替换失败设计，不必维护这些内部API。Git快照仅供溯源，不代表功能资格。
 
-## 本轮替换与回归
+## 2. 必须重新处理的根因
 
-- 每对端点保存一个激活根，消元执行 `old OR (incoming AND outgoing)`。公式叶保存原始有序 guard；祖先替换作用于整棵公式，exact/projection 证据独立保留。全部 may 边的数值 rank 优先；只在有环时按需查询。
-- 七级二选一路径的图测试覆盖全部16,384个布尔赋值，35个共享公式节点、312工作、1条保留关系，构造期间无条件查询；不再存储对应的128个DNF项。它是有限测试，不是任意规模形式化证明。
-- 公式20项测试通过（1.28秒）；连通10项通过（1.80秒）；完整绑定、OR真环与exact/projection7项通过（0.79秒）。后者也包含在随后73项集成回归内（15.51秒），包括公共Vector/Cube source编译、端点/父子接口和同步物化。
-- 扩大资源回归曾得到53通过、1个嵌套双AIV CV错误：逐关系映射重复遍历共享子图，触及区域100000工作上限。已替换为同一已验证变换的forest批量映射；空替换直接复用，非空绑定分别分组。失败项修复后通过（8.82秒），未提高预算。没有单根API的兼容wrapper。
+`select_notifications` 的函数合同明确为data coverage only；普通编译接着在 `allocate_structured_events` 调用 `EventDomains`、`prove_progress`、`establish_lease`，分配ID时还可能调用事件路径覆盖/共享证明。通知选择尚未提供完整、可组合的协议进展和生命周期保证。
 
-默认FA的55秒阶段诊断仍保持44个native、726条依赖、221条通知、142个case及1个packet分区。source→domains18.30秒，四个内部循环完成；每个子图建公式约0.016–0.044秒、消元约0.003–0.006秒。55.08秒在父区域建图阶段按期限结束，尚未到达之前失败的父消元位置。累计1664个公式节点、50527工作、零公式查询；见[阶段日志](../../runs/factored-progress/progress.log)。该局部结果不等于成功FA编译或设备提速。
+此前迭代主要优化上述后置求解器。缓存、factored公式、惰性路径和搜索树没有解决生成算法的职责缺口。新方向见[计划](refactor-plan.md)。不能直接关闭检查；也不能继续把当前Path方案写成已经确定的未来架构。
 
-### 当前完整 FA 资格结果
+`Compilation.report["verification_mode"]` 当前仍使用 `owned-construction` 标签；它描述产物来源/私有IR装配，**不能作为同步已由构造保证正确的证据**。相关消费点在`benchmarks/attention/run.py`和对应测试，后续应连同报告合同审查。
 
-公共CLI默认 `attention_target` 构建 **failed，56.87秒，returncode=1**。同一父区域 `attention.py:98:13` 在 `RegionConnectivity.eliminate` 的关系插入处触及 region activation work 100000 上限；没有成功ASC或CANN产物。旧DNF备选上限已不再参与，两个失败耗时不能当成功编译速度比较。见[build-result.json](../../runs/factored-progress/fa-default/build-result.json)、[build.log](../../runs/factored-progress/fa-default/build.log)、[源码指纹](../../runs/factored-progress/build-source.json)。worker已结束，没有继续其他候选。
+## 3. 完整FA构建的实际结果
 
-新增公式与真实资源短回归合并47项通过（17.37秒，与前述公式/连通测试重叠）。下一项是实际父图的结构消元工作量，区分节点/边fill与公式成本，不提高预算或引入legacy路径。
+默认`attention_target`：B=1、HQ=HKV=8、D=128、BQ=BM=128、BK=1024、CK=128、VR=8、GROUPS=20、f16；Sq/Sk为runtime参数。下表都是失败耗时，**不能用作成功编译提速比较**。
 
-## 上一提交的事实复用证据
+| 源码状态 | 结果 | 证据 |
+|---|---|---|
+| `91eb40d` | 125.44秒，父区域DNF备选超限 | [scalar-cost](../../runs/scalar-cost/fa-default/build-result.json) |
+| `475f49b` | 56.87秒，父区域急切消元工作超限 | [factored-progress](../../runs/factored-progress/fa-default/build-result.json) |
+| Path接入、共享source搜索树之前 | 56.69秒，已进入finite progress查询，路径见证BFS触区域预算 | [lazy-progress结果](../../runs/lazy-progress/fa-default/build-result.json)、[日志](../../runs/lazy-progress/fa-default/build.log)、[源码指纹](../../runs/lazy-progress/build-source.json) |
 
-136项短回归通过（2.52秒）：整数关系、owned context、原式定义性和进展条件；加强一个观测断言后19项通过（0.95秒，与前组重叠）。规则正文经展开派生 helper 后的 AST 对照保持，Ruff和diff检查通过。新测试检查前提/环境隔离、异常重试、raw factor/unsigned语义和共享 DAG 工作量。
+三次均未产生成功ASC/CANN产物。**最终`1231f4f`中的共享source搜索树之后，没有再次完整构建FA。** 不得把前一次失败或后续短测试当作该版本完整资格。
 
-递归范围查询在0/1/64条前提的测试中，缓存key均不再哈希任何 premise Comparison；这只说明递归key的成本，首次建立完整context和实际约束扫描仍有成本。相同差值在不同有序context下不再重复构造，不意味着省略对应的证明。
+## 4. 停止前的局部证据
 
-`cf44eec` 的107项结构/公共编译/Vector-Cube/资源回归及26项重叠端点接线回归是上一提交的证据；本轮没有重跑完整suite，也没有设备资格。
+这些结果由上一轮执行，本次整理未重跑；各组有重叠，不能相加为独立覆盖率。
 
-### 固定输入的阶段测量
+| 检查 | 实际结果 | 限制 |
+|---|---|---|
+| 端点/父子区域/进展集成 | 48通过，4.19秒 | 搜索树改动之前 |
+| 资源与公共Vector/Cube链路 | 46通过，26.35秒 | 不代表默认FA或当前CANN资格 |
+| 最后图、条件、case与接口小组 | 62通过，2.38秒 | 搜索树之后；有界/单元与小集成 |
+| 条件事实清理 | 7通过，0.52秒 | 删除无生产调用的union/subset等旧辅助入口 |
 
-同一默认 `attention_target`、同一55秒协作/60秒外部诊断，无跨进程结果缓存。44个native模板、726条依赖义务、221条通知、142个case、1个packet分区保持不变。运行期 Sq/Sk 仍是变量。
+三节点全部边mask/hidden集合、七级diamond、非空自环、旧快照不变、双AIV贡献及guard次序等测试有保留价值；测试期待应是硬件/语义合同，不能要求重构后保留旧求解器形状或缓存结构。
 
-| 阶段（秒） | cf44eec | 仅context与定义性 | 再加入派生事实 |
-|---|---:|---:|---:|
-| source→EventDomains | 22.42 | 20.47 | 17.88 |
-| 第一个子区域有限端点关系 | 13.99 | 9.39 | 4.08 |
-| 第一个子区域混合区域图 | 11.07 | 7.43 | 3.16 |
-| 第一个子区域总计 | 28.52 | 19.31 | 8.20 |
+最近历史shared L0C模型/CANN记录为`4b2c432`，双AIV嵌套CV为`dbcef70`。它们只能说明对应历史源码，不代表本工作树已获CANN或设备资格。
 
-最终诊断完成 `$loop2..5` 四个内部子区域；55.14秒在父区域 `$loop1` 的图构造阶段停止。累计1735个条件集合、18712次底层证明、8793次已有答案复用、3077次路径插入/组合。见 [progress-derived.log](../../runs/scalar-cost/progress-derived.log)。这些是局部诊断，不能作为完整冷编译或设备性能结论。
+## 5. 可用的诊断资料
 
-此前对8次端点关系的同步 profiling 记录了约17.8万次事实查找与4.9万次Expr构造，用于定位成本，见 [relations-profile.log](../../runs/scalar-cost/relations-profile.log)。曾尝试额外通用结构key包装，阶段耗时反增至39.51秒；该方案及测试已从产品代码完整撤掉。没有保留旧/新两套表达式路径。
+外层`runs/factored-progress/`有实际父图与数学条件快照、拓扑重放、同形节点/消元顺序/吸收实验。固定输入曾为44 native、726 needs、221 notifications、142 cases、1 packet分区；父图284节点、2159条原边、150个隐藏节点。
 
-### 上一提交的完整 FA 构建失败
+这些资料说明后置求解成本如何产生，不要求新agent继续研究这些算法。纯拓扑或Boolean表示的结果只对相应抽象成立，不证明真实NPU程序正确；快照不能导入编译器充当已证明输入。运行数据、ASC、缓存和报告均留外层，不进入产品Git。
 
-公共 CLI 使用默认 constexpr：B=1、HQ=HKV=8、D=128、BQ=BM=128、BK=1024、CK=128、VR=8、GROUPS=20、f16。总期限300秒，覆盖Python构造、ASC与CANN；未改变输入合同或排步。
+## 6. 下一位agent的入口
 
-结果为 **failed，125.44秒，returncode=1**：`attention.py:98:13` 的父区域在稀疏消元期间触及 `region-interface OR alternatives exceed their explicit budget`。见 [build-result.json](../../runs/scalar-cost/fa-default/build-result.json) 与 [build.log](../../runs/scalar-cost/fa-default/build.log)。子进程已结束，没有继续其他候选。源码及改动指纹见 [build-source.json](../../runs/scalar-cost/build-source.json)。没有成功ASC/CANN产物。
-
-这里的64是同一端点对的路径条件备选数，不是64次运行期迭代。当前把 `incoming AND outgoing` 展开为合取备选的笛卡尔积；七级独立二选一路径就可能产生128个展开项。本轮已替换该表示，没有提高旧预算掩盖组合增长；新工作量的定义见编译不变量。
-
-## 剩余顺序与边界
-
-1. 默认FA必须在当前唯一编译链获得完整资格。任何新的失败都定位到实际阶段，不恢复旧路径或继续其他候选。
-2. 因式化只保持已抽象图上的布尔连通性，不能自动解决任意finite/stream联合存在投影，也不能把保守摘要当必然完成。
-3. private重排、动态ownership、周期reset等支持边界不扩大。未知关系不能当作安全，无全局barrier、额外搬运或算子特判。
-4. 当前 shared L0C 最近完整模型/CANN资格仍为 `4b2c432`，双AIV嵌套CV为 `dbcef70`。本轮IR/资源回归不能替代重新生成的CANN或设备资格。编译资格完成后再恢复设备性能工作。
-
-## 复现
-
-在 `compiler/` 执行受影响回归：
-
-```bash
-timeout --kill-after=3s 60s ../.venv/bin/python -m pytest -q \
-  tests/analysis/test_progress_activations.py \
-  tests/analysis/test_progress_connectivity.py \
-  tests/analysis/test_progress_activation_interfaces.py \
-  tests/analysis/test_case_progress.py \
-  tests/analysis/test_progress_bound_facts.py \
-  tests/analysis/test_progress_queue_interfaces.py \
-  tests/analysis/test_event_progress_regions.py \
-  tests/analysis/test_progress_parent_interfaces.py \
-  tests/sync/test_structured_pipeline.py
-```
-
-当前公共FA资格命令（完整构建总上限300秒）：
-
-```bash
-../.venv/bin/python -m xdsl_npu.cli \
-  --input examples/flash_attention/attention.py --entry attention_target \
-  --output /workspace/xdsl-910b/runs/factored-progress/fa-default --compile --timeout 300
-```
-
-产品文件进入 compiler Git；环境、缓存、构建产物和运行数据留在外层。
+接手时先检查实际HEAD和未提交修改，再读[计划](refactor-plan.md)、[不变量](compilation-invariants.md)与[源码职责](source-layout.md)。先审计生成义务和复杂度，明确规则后直接实现；不默认恢复停止的后置证明器优化。

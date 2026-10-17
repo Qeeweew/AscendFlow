@@ -5,6 +5,10 @@ Selection establishes capture/acquire coverage; one resource stage establishes
 pairing, reuse and progress across both finite and repeated invocations. Only
 then does materialization insert real notification operations in physical IR.
 The backend consumes that IR, never a second action-placement interpretation.
+
+This describes the current pipeline, not a proof-by-construction generator:
+normal compilation still invokes post-selection progress and lease analysis.
+The generation-contract redesign is specified in docs/refactor-plan.md.
 """
 
 from __future__ import annotations
@@ -90,7 +94,7 @@ def _materialize_owned(structure, admission, dependencies, selection, resources)
 
 
 def synchronize_structure(source) -> StructuredSynchronization:
-    """Establish each stage's facts once and materialize the selected program.
+    """Run the current analysis stages, then materialize the selected program.
 
     Imported physical snapshots are not accepted by this source entry. It
     reports an unsupported contract when a required fact cannot be established.

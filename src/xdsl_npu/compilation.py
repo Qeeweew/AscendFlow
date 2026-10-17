@@ -77,6 +77,8 @@ class Compilation:
         report = {
             "kernel": plan.module.body.block.first_op.sym_name.data,
             "pipeline": "structured-regions",
+            # Describes owned IR assembly, not synchronization correctness by
+            # construction: normal still runs post-selection resource analyses.
             "verification_mode": "owned-construction",
             "debug_structural_verification": debug_verify,
             "analysis_work": {
