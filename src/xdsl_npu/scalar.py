@@ -7,6 +7,8 @@ prefix; unsupported domains fail explicitly.
 """
 
 from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from math import gcd
 
@@ -18,6 +20,51 @@ from .dialects.physical import RuntimeSizeOp
 INT64_MAX = (1 << 63) - 1
 DIVISION = {"floordiv", "rem", "ceildiv"}
 BINARY = {"add", "mul", "min", "max", *DIVISION}
+_expression_nodes = ContextVar("xdsl_npu_expression_nodes", default=None)
+
+
+@contextmanager
+def expression_scope():
+    """Own raw syntax nodes for one compilation, never range or proof facts."""
+    nodes = {}
+    token = _expression_nodes.set(nodes)
+    try:
+        yield
+    finally:
+        _expression_nodes.reset(token)
+        nodes.clear()
+
+
+class _ExprType(type):
+    def __call__(cls, kind, args):
+        nodes = _expression_nodes.get()
+        if nodes is None or cls is not Expr:
+            return super().__call__(kind, args)
+        # Validate the key's shape before lookup: Python otherwise conflates
+        # invalid True/1.0 constants with a cached, valid integer 1. Failed
+        # constructions retain their original diagnostics and never enter the
+        # arena. A hit shares syntax, not the domain of its original SSA use.
+        if type(kind) is not str or type(args) is not tuple:
+            return super().__call__(kind, args)
+        if kind == "constant":
+            valid = len(args) == 1 and type(args[0]) is int
+        elif kind == "argument":
+            valid = len(args) == 1 and type(args[0]) is str
+        else:
+            valid = (
+                kind in BINARY
+                and len(args) == 2
+                and type(args[0]) is Expr
+                and type(args[1]) is Expr
+            )
+        if not valid:
+            return super().__call__(kind, args)
+        key = kind, args
+        node = nodes.get(key)
+        if node is None:
+            node = super().__call__(kind, args)
+            nodes[key] = node
+        return node
 
 
 @dataclass(frozen=True)
@@ -78,7 +125,7 @@ def _facts(names_or_facts):
 
 
 @dataclass(frozen=True, slots=True)
-class Expr:
+class Expr(metaclass=_ExprType):
     kind: str
     args: tuple
     weight: int = field(init=False, compare=False, repr=False)

@@ -147,6 +147,28 @@ class StructuredNeed:
     period: int = 1
     residue: int | Expr = 0
     instance_of: StructuredNeed | None = field(default=None, repr=False, compare=False)
+    _hash: int | None = field(default=None, init=False, compare=False, repr=False)
+
+    def __hash__(self):
+        value = self._hash
+        if value is None:
+            value = hash(
+                (
+                    self.cell,
+                    self.kind,
+                    self.source,
+                    self.consumer,
+                    self.scope,
+                    self.domains,
+                    self.guards,
+                    self.loop,
+                    self.distance,
+                    self.period,
+                    self.residue,
+                )
+            )
+            object.__setattr__(self, "_hash", value)
+        return value
 
     @property
     def source_cut(self):

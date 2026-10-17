@@ -38,8 +38,9 @@ class Compilation:
         debug_verify=False,
     ):
         from .frontend import PrimFunction
+        from .scalar import expression_scope
 
-        with limit(timeout_s, cancel):
+        with limit(timeout_s, cancel), expression_scope():
             require(
                 isinstance(module, PrimFunction)
                 or isinstance(module, ModuleOp)

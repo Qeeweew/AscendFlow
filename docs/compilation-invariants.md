@@ -22,6 +22,16 @@
 构造标量范围 DAG，保留 owner/iteration 的联合区间；原始除法和源码算术仍独立
 检查。Expr 的 free variables 在节点构造时建立，不依赖 range/guard 环境。
 
+公共编译在独立 expression scope 内驻留完全相同的原始 `(kind, args)` 节点，
+退出、异常或取消时释放节点表，嵌套 scope 恢复外层。它不保存 range、guard、
+alias 或完成证据；数学等价的不同原式不会在此合并。所有原始 SSA 使用仍检查
+各自的有序定义性。查表前检查 key 类型，不能让 Python 的 `True == 1 == 1.0`
+将非法常量误认为已构造的合法整数。确定性排序继续使用结构键。
+
+BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变记录中
+按需保存，相等语义仍由全部原比较字段决定；hash 碰撞不代表相等。记录替换
+重新计算自己的 hash，既有 hash 不授权修改 guard、成员、width 或共享关系。
+
 ## 2. 保证的目标归属与当前缺口
 
 | 不变量 | 目标建立职责 | 当前应核对的代码/缺口 |

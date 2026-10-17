@@ -11,10 +11,13 @@
 `runs/generation-redesign/incoming/`。独立 pre-sync 对照已集成；临时 generation_order
 原型已由当前规则替换，没有复制进 legacy。实际提交身份以产品 Git 为准。
 
-本页最终执行证据对应代码提交 `1286a783271ab123a430440e6e306140944df744`，
+生成重构的冻结执行证据对应代码提交 `1286a783271ab123a430440e6e306140944df744`，
 前两个实施提交为 `bf36729`、`0fc4923`。实际 Python package tree SHA256 为
 `eebbf12fe2ad23afb8609e471de46d4793a18b9674efbf4644a077c2dda6a297`；
 本页后续文档提交不改变该代码身份。
+
+后续数据表示优化的独立代码身份与执行结果见下节，不借用冻结版的测试或
+CANN 资格作为新代码已经验证的证据。
 
 外层没有 Git，未创建根 Git；reference、旧 TileLang 工作区和容器没有修改或重建。
 CATLASS、ops-transformer、ops-nn 的实际 HEAD 已再次核对，见 [source-notes.md](source-notes.md)。
@@ -33,6 +36,47 @@ CATLASS、ops-transformer、ops-nn 的实际 HEAD 已再次核对，见 [source-
 
 `generated-lifetimes` 是来源标签，不能授权外部 physical IR，也不替代规则论证、
 独立模型或硬件证据。输入与规则前提检查保留，未把必要检查搬进 debug。
+
+## 数据表示优化（冻结版之后）
+
+当前仅实施了有隔离原型收益的两项：单次编译内驻留完全相同的 raw Expr，
+以及在 BoundPlacement、LogicalNotification、StructuredNeed 中按需保存 hash。
+没有合入尚未测收益的 range/polynomial 索引。原型分析、火焰图和单次对照在
+[外层报告](../../runs/compile-cost/head-0a749f4/analysis.md)。
+
+生产实现使用独立 scope，退出或异常即释放；结构相等、原式定义性和每程序
+同步检查保持。新增回归覆盖 arena 作用域、异常清理、不同事实环境及非法
+`True`/`1.0` 与合法 `1` 的 key 碰撞，以及 hash 后的记录替换。
+
+生产代码的 Python package SHA256 为
+`9b8b67e3975e6c4779123f5ace337dc41fe431140405d24ff14d2bd2587c5220`。
+默认 FA 的一次冷 source→ASC 为 **8.5678s**，import 0.3597s，进程总计
+9.1774s，peak RSS 63652 KiB。对应
+[原始冷测量](../../runs/data-structures/cold/fa-default/benchmark.json)
+包含完整源码构造、分析、化简、输出和快照；未改变计时边界。
+source/同步前后 IR/ASC hash 及完整分析报告与冻结版一致。
+
+该结果是生产实现的单次 probe，不能与原型 8.8814s 混为同一个版本或统计
+样本；仍未达到五次 p50≤5s/max≤10s 资格，不执行五次验收。
+
+本次生产实现全套回归为 **1623 passed in 148.68s**，见
+[完整日志](../../runs/data-structures/full-tests.log)，SHA256 为
+`6c446d58de5975f15310e1aed1a75b97d4fb15c1fdff8ae294c5f4e6239923f6`。
+Ruff 与 `git diff --check` 通过。四项新冷进程 probe 的源码、source/同步前后
+IR、ASC hash 和完整分析报告均与冻结版相同，见
+[冷测量清单](../../runs/data-structures/cold/source-to-asc.json)：
+
+| 算子 | 单次冷 source→ASC | import | 冷进程总耗时 | 独立构建 CANN | 独立构建总计 |
+|---|---:|---:|---:|---:|---:|
+| Vector scale，B64 | 0.4858s | 0.3500s | 1.0683s | 5.3073s | 6.3270s |
+| 默认 GEMM | 0.6379s | 0.3442s | 1.1673s | 5.4754s | 6.6785s |
+| 嵌套 CV | 0.9182s | 0.3477s | 1.4676s | 5.6483s | 7.1414s |
+| 默认 FA | 8.5678s | 0.3597s | 9.1774s | 8.0131s | 17.3919s |
+
+四项均在新的完整 300 秒进程组期限内取得实际 `.o`、`.aibin`、`.so`，见
+[新构建清单](../../runs/data-structures/qualification/source-builds.json)。
+冷测量和 CANN 属于不同构建，不直接相加。新构建的 source/同步前后 IR/ASC
+hash 与冻结版逐项一致；本次没有设备数值或性能验证。
 
 ## 独立回归
 
@@ -58,7 +102,7 @@ Ruff 和 `git diff --check` 通过。汇总身份与结果见
 [evidence.json](../../runs/generation-redesign/qualified/evidence.json)；其整体状态为
 `incomplete`，功能/离线检查为 `passed`，不能据此宣称耗时资格或设备资格通过。
 
-## 当前编译证据与计时边界
+## 生成重构冻结版的编译证据与计时边界
 
 默认 FA 政策保持 B1/Hq8/Hkv8/D128、BQ=BM128、BK1024、CK128、VR8、GROUPS20、f16。
 source→ASC 包含源码读取/构造、全部分析/化简/输出和内部快照；import、进程总耗时、

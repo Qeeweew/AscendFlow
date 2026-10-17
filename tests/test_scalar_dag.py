@@ -7,7 +7,7 @@ import pytest
 from xdsl_npu import scalar
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.indexing import arguments, normalize
-from xdsl_npu.scalar import Expr, Fact, expression, literal, substitute
+from xdsl_npu.scalar import Expr, Fact, expression, expression_scope, literal, substitute
 
 
 def _argument(name):
@@ -141,3 +141,67 @@ def test_shared_graphs_still_obey_expanded_weight_and_depth_budgets():
     assert chain.depth == 128
     with pytest.raises(CompileError, match="4096 terms / depth 128"):
         Expr("add", (chain, one))
+
+
+def test_expression_scope_shares_only_identical_raw_syntax_and_restores_outer_scope():
+    with expression_scope():
+        first = expression("add", _argument("n"), literal(3))
+        assert expression("add", _argument("n"), literal(3)) is first
+        assert expression("mul", _argument("n"), literal(3)) is not first
+        raw_division = Expr("floordiv", (_argument("n"), literal(1)))
+        assert raw_division.kind == "floordiv" and raw_division is not _argument("n")
+        with pytest.raises(RuntimeError, match="inner"), expression_scope():
+            inner = expression("add", _argument("n"), literal(3))
+            assert inner == first and inner is not first
+            raise RuntimeError("inner")
+        assert expression("add", _argument("n"), literal(3)) is first
+    outside = expression("add", _argument("n"), literal(3))
+    assert outside == first and outside is not first
+    with expression_scope():
+        assert expression("add", _argument("n"), literal(3)) is not first
+
+
+@pytest.mark.parametrize("invalid", (True, 1.0))
+def test_expression_arena_does_not_mask_invalid_constants_equal_to_cached_integers(invalid):
+    with expression_scope():
+        valid = Expr("constant", (1,))
+        for _ in range(2):
+            with pytest.raises(CompileError, match="invalid scalar constant"):
+                Expr("constant", (invalid,))
+        assert Expr("constant", (1,)) is valid
+        with pytest.raises(CompileError, match="immutable tuple"):
+            Expr("constant", [1])
+
+
+def test_expression_arena_never_shares_definedness_between_fact_environments():
+    from xdsl_npu.analysis.integer_facts import IntegerFacts
+    from xdsl_npu.analysis.structured_schedule import Comparison
+
+    with expression_scope():
+        quotient = expression("floordiv", literal(1), _argument("n"))
+        assert expression("floordiv", literal(1), _argument("n")) is quotient
+        test = Comparison(quotient, ">=", literal(0))
+        positive = IntegerFacts({"n": Fact(minimum=1)})
+        possibly_zero = IntegerFacts({"n": Fact()})
+        assert positive.ordered_definedness((test,)) is None
+        assert possibly_zero.ordered_definedness((test,)) is not None
+        assert positive.ordered_definedness((test,)) is None
+
+
+def test_compilation_releases_its_expression_scope_after_failure(monkeypatch):
+    from examples.vector.scale import scale
+    from xdsl_npu import compile
+    from xdsl_npu.compilation import Compilation
+
+    captured = []
+
+    def fail(*args, **kwargs):
+        captured.append(expression("add", _argument("scope_cleanup"), literal(3)))
+        assert expression("add", _argument("scope_cleanup"), literal(3)) is captured[0]
+        raise RuntimeError("compile failure")
+
+    monkeypatch.setattr(Compilation, "_build_structured", fail)
+    with pytest.raises(RuntimeError, match="compile failure"):
+        compile(scale.specialize(B=64))
+    outside = expression("add", _argument("scope_cleanup"), literal(3))
+    assert outside == captured[0] and outside is not captured[0]
