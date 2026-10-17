@@ -38,13 +38,13 @@ class Reuse:
 
 
 class HandbackRule:
-    def __init__(self, domains):
+    def __init__(self, domains, *, boundaries=()):
         self.domains = domains
         self.peers = tuple(
             n for n in domains.notifications if n.mechanism is not NotificationKind.PIPE_FENCE
         )
         self.at_native = {}
-        self.boundary_cases = {}
+        self.boundary_cases = dict(boundaries)
         for peer in self.peers:
             for source in peer.sources:
                 self.at_native.setdefault((source.operation, source.actor), []).append(

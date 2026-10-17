@@ -33,17 +33,17 @@ def allocate_structured_events(program) -> StructuredEventPlan:
         isinstance(program, NotificationProgram),
         "allocation requires generated notification lifetimes",
     )
-    return _EventBanks(program.domains, program.channels).allocate(
+    return _EventBanks(program.domains, program.channels, program.boundaries).allocate(
         {lease.notification: lease for lease in program.leases}, program.order
     )
 
 
 class _EventBanks:
-    def __init__(self, domains, channels):
+    def __init__(self, domains, channels, boundaries):
         self.domains = domains
         self.actions, self.assignments, self.reservations, self.sharing = [], [], [], []
         self.occupied, self.cross_occupied = {}, {}
-        self.handbacks = HandbackRule(domains)
+        self.handbacks = HandbackRule(domains, boundaries=boundaries)
         self.channels = {member: channel for channel in channels for member in channel.members}
         self.cell_channels = channels
         self.channel_ids = {}

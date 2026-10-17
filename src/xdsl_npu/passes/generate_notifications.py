@@ -11,10 +11,10 @@ from time import perf_counter
 
 from ..analysis.cell_channels import CellChannel, construct_cell_channels
 from ..analysis.event_contracts import ResourceWork, StructuredEventLease
-from ..analysis.event_domains import EventDomains
+from ..analysis.event_domains import EventCase, EventDomains
 from ..analysis.notification_lifetimes import HandbackRule
 from ..analysis.queue_order import QueueOrder, establish_queue_order
-from ..analysis.structured_protocols import SynchronizationSelection
+from ..analysis.structured_protocols import LogicalNotification, SynchronizationSelection
 from .notification_binding import bind_notifications
 
 
@@ -25,6 +25,7 @@ class NotificationProgram:
     order: QueueOrder
     leases: tuple[StructuredEventLease, ...]
     channels: tuple[CellChannel, ...]
+    boundaries: tuple[tuple[LogicalNotification, tuple[EventCase, ...]], ...]
     timings: tuple[tuple[str, float], ...]
 
     def __init__(self, *args, **kwargs):
@@ -61,6 +62,7 @@ def _complete_bindings(selection, *, binding_s=0.0):
         ("order", order),
         ("leases", leases),
         ("channels", channels),
+        ("boundaries", tuple(rule.boundary_cases.items())),
         ("timings", timings),
     ):
         object.__setattr__(result, name, value)

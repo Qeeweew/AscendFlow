@@ -248,6 +248,27 @@ def test_a_proved_absent_domain_does_not_consume_finite_event_capacity():
     assert not check_structured_events(plan.memory, {"n": 3}).natives
 
 
+def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch):
+    from tests.fixtures.nested import nested_copy
+    from xdsl_npu.analysis import event_families
+    from xdsl_npu.analysis.structured_resources import _EventBanks
+
+    program = _complete_bindings(selected(nested_copy))
+    assert program.boundaries
+    established = dict(program.boundaries)
+    original = event_families.build_event_family
+
+    def only_new_premises(domains, notification):
+        assert notification not in established, "unchanged child membership was rebuilt"
+        return original(domains, notification)
+
+    monkeypatch.setattr(event_families, "build_event_family", only_new_premises)
+    allocator = _EventBanks(program.domains, program.channels, program.boundaries)
+    for notification, cases in program.boundaries:
+        assert allocator.handbacks._cases(notification) is cases
+    allocator.allocate({lease.notification: lease for lease in program.leases}, program.order)
+
+
 def test_configuration_and_final_drain_have_explicit_unborrowed_bank_entries():
     from examples.gemm.batched import batched_matmul
     from xdsl_npu.analysis.structured_resources import allocate_structured_events

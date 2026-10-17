@@ -105,6 +105,8 @@ handoff，其成员和 FIRST/LAST 边界才按需建立；已有普遍配对在�
 精确 projection 消去被选中的内部时钟，父层保留自由祖先的 membership，
 不从展开的 LAST 算式重新推导其已成立的范围。候选 handoff 只在旧 Wait 与
 下一 Set 的 physical-step 区间内，范围由有限 width 决定，不随 runtime 长度展开。
+已建立的边界 cases 随 `NotificationProgram.boundaries` 传给分配器，原式、
+坐标和成员未变时直接消费。分配新共享关系所需的新增边界在分配器内只建立一次。
 
 ## 5. 循环与首尾
 
