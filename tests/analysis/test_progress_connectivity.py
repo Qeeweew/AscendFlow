@@ -1,4 +1,4 @@
-"""Independent finite Boolean reachability for sparse region elimination."""
+"""Independent finite Boolean paths through shared original region graphs."""
 
 from collections import defaultdict
 from itertools import permutations, product
@@ -112,7 +112,7 @@ def test_elimination_orders_preserve_all_retained_pairs_and_conditional_cycles()
             assert_projection(result, edges, (0, 4), 5)
 
 
-def test_factored_or_retains_original_ordered_guard_leaves():
+def test_path_graph_retains_original_ordered_guard_leaves():
     prefix = Comparison(P, ">", literal(0))
     residue = Comparison(
         expression("rem", expression("sub", P, literal(1)), literal(2)), "==", literal(0)
@@ -126,10 +126,11 @@ def test_factored_or_retains_original_ordered_guard_leaves():
     result, scope, _ = graph(4, edges)
     result.eliminate((2, 1))
     relation = result.relation(0, 3)
-    assert relation.kind == "or"
-    assert len(relation.operands) == 2
-    assert all(branch.kind == "and" for branch in relation.operands)
-    leaves = tuple(leaf for branch in relation.operands for leaf in branch.operands)
+    assert relation.kind == "path"
+    frozen, hidden, source, destination = relation.path
+    assert hidden == {1, 2} and (source, destination) == (0, 3)
+    assert frozen.topology.edges == tuple((a, b) for a, b, _ in edges)
+    leaves = frozen.inputs
     assert {id(leaf.guard) for leaf in leaves} == {id(guard) for _, _, guard in edges}
     for _, _, guard in edges:
         assert scope.guard(guard) in leaves
@@ -146,26 +147,30 @@ def test_internal_self_loop_star_adds_no_weaker_path_and_retained_cycle_is_nonem
     )
     result, scope, _ = graph(3, edges)
     result.eliminate((1,))
-    assert result.relation(0, 2) is scope.all_of(scope.guard(edges[0][2]), scope.guard(edges[2][2]))
+    assert result.relation(0, 2).kind == "path"
     assert result.relation(0, 0) is scope.false
     assert result.relation(2, 2) is scope.guard(edges[4][2])
     assert_projection(result, edges, (0, 2), 3)
     result.eliminate((2,))
-    assert result.relation(0, 0) is scope.all_of(scope.guard(edges[0][2]), scope.guard(edges[2][2]))
+    assert result.relation(0, 0).kind == "path"
     assert_projection(result, edges, (0,), 3)
 
 
-def test_deleted_nodes_have_no_edges_or_stale_neighbor_indexes():
+def test_hidden_nodes_keep_original_witnesses_and_cannot_be_active_endpoints():
     edges = ((0, 1, YES), (1, 2, YES), (2, 3, YES), (1, 1, YES))
     result, scope, work = graph(5, edges)
     result.eliminate((1,))
+    original = result.relation(0, 2)
+    assert original.kind == "path"
+    assert original.path[0].topology.edges == tuple((a, b) for a, b, _ in edges)
     assert result.active == {0, 2, 3, 4}
     assert all(
         result.relation(a, b) is scope.false for a, b in product(range(5), repeat=2) if 1 in (a, b)
     )
     prior = work.progress_formula_work
     result.eliminate((1, 1))
-    assert work.progress_formula_work == prior
+    assert work.progress_formula_work > prior
+    assert result.active == {0, 2, 3, 4}
     with pytest.raises(ValueError, match="eliminated"):
         result.add(1, 4, scope.true)
     with pytest.raises(ValueError, match="eliminated"):
@@ -174,6 +179,7 @@ def test_deleted_nodes_have_no_edges_or_stale_neighbor_indexes():
     edges += ((4, 2, ActionGuard((Q_TRUE,))),)
     result.eliminate((2,))
     assert_projection(result, edges, (0, 3, 4), 5)
+    assert original.evaluate({})
 
 
 def test_retained_iteration_is_sparse_deterministic_and_has_no_identity_edges():
@@ -238,14 +244,107 @@ def test_seven_independent_diamonds_keep_a_small_factored_relation():
     assert tuple(result.retained((0, 3 * levels))) == ((0, 3 * levels, relation),)
     assert result.relation(0, 0) is scope.false
     assert result.relation(3 * levels, 3 * levels) is scope.false
-    # There are 2**7 non-absorbable DNF terms. Construction instead retains
-    # shared subformulas and a bounded number of actual graph/formula visits.
+    assert relation.kind == "path"
+    assert len(relation.path[0].inputs) == 4 * levels
+    # There are 2**7 non-absorbable DNF terms. Construction retains the shared
+    # original graph and a bounded number of actual graph/formula visits.
     assert work.progress_formula_nodes <= 8 * levels + 2
     assert work.progress_formula_work < 1000
     for bits in product(range(2), repeat=len(names)):
         values = dict(zip(names, bits))
         expected = all(bits[2 * index] or bits[2 * index + 1] for index in range(levels))
         assert relation.evaluate(values) == expected, values
+
+
+def test_output_selection_does_not_hide_other_active_boundaries():
+    edges = (
+        (0, 1, ActionGuard((P_TRUE,))),
+        (1, 2, YES),
+        (2, 3, ActionGuard((Q_TRUE,))),
+        (3, 4, YES),
+    )
+    result, scope, _ = graph(5, edges)
+    result.eliminate((1, 3))
+    assert tuple(result.retained((0, 4))) == ()
+    assert result.relation(0, 4) is scope.false
+    assert_projection(result, edges, (0, 2, 4), 5)
+
+
+def test_hidden_growth_freezes_each_returned_path_and_reuses_original_graph():
+    edges = ((0, 1, ActionGuard((P_TRUE,))), (1, 2, YES), (2, 3, ActionGuard((Q_TRUE,))))
+    result, scope, _ = graph(4, edges)
+    result.eliminate((1,))
+    earlier = result.relation(0, 2)
+    assert result.relation(0, 3) is scope.false
+    result.eliminate((2,))
+    later = result.relation(0, 3)
+    assert earlier.path[0] is later.path[0]
+    assert earlier.path[1] == {1} and later.path[1] == {1, 2}
+    assert result.relation(0, 2) is scope.false
+    for values in VALUES:
+        assert earlier.evaluate(values) == bool(values["p"])
+        assert later.evaluate(values) == bool(values["p"] and values["q"])
+
+
+def test_appending_active_edges_preserves_hidden_edges_and_old_path_versions():
+    edges = ((0, 1, ActionGuard((P_TRUE,))), (1, 2, YES), (2, 3, ActionGuard((Q_TRUE,))))
+    result, scope, _ = graph(4, edges)
+    result.eliminate((1, 2))
+    earlier = result.relation(0, 3)
+    extra = ActionGuard((R_TRUE,))
+    result.add(0, 3, scope.guard(extra))
+    later = result.relation(0, 3)
+    assert earlier.path[0] is not later.path[0]
+    assert earlier.path[0].topology.edges == tuple((a, b) for a, b, _ in edges)
+    assert later.path[0].topology.edges == tuple((a, b) for a, b, _ in edges) + ((0, 3),)
+    for values in VALUES:
+        assert earlier.evaluate(values) == bool(values["p"] and values["q"])
+        assert later.evaluate(values) == bool((values["p"] and values["q"]) or values["r"])
+    assert_projection(result, edges + ((0, 3, extra),), (0, 3), 4)
+
+
+def test_direct_identity_is_kept_only_when_it_covers_the_whole_relation():
+    direct = ActionGuard((R_TRUE,))
+    edges = ((0, 2, direct), (0, 1, ActionGuard((P_TRUE,))), (1, 2, ActionGuard((Q_TRUE,))))
+    result, scope, _ = graph(4, edges)
+    assert result.relation(0, 2) is scope.guard(direct)
+    result.eliminate((3,))
+    assert result.relation(0, 2) is scope.guard(direct)
+    result.eliminate((1,))
+    assert result.relation(0, 2).kind == "path"
+    result.add(0, 2, scope.true)
+    assert result.relation(0, 2) is scope.true
+    assert tuple(result.retained((0, 2))) == ((0, 2, scope.true),)
+
+
+def test_a_may_hidden_scc_does_not_prove_a_conditional_path_active():
+    edges = (
+        (0, 1, ActionGuard((P_TRUE,))),
+        (1, 2, ActionGuard((P_FALSE,))),
+        (2, 1, YES),
+        (2, 3, YES),
+    )
+    result, _, _ = graph(4, edges)
+    result.eliminate((1, 2))
+    relation = result.relation(0, 3)
+    assert relation.kind == "path"
+    assert all(not relation.evaluate(values) for values in VALUES)
+    assert_projection(result, edges, (0, 3), 4)
+
+
+def test_projection_construction_keeps_the_owner_budget_explicit():
+    work = ResourceWork()
+    owner = ProgressActivations(ProgressConditions(IntegerFacts({})), work)
+    scope = owner.region(ModuleOp([]))
+    result = RegionConnectivity(3, scope)
+    result.add(0, 1, scope.guard(ActionGuard((P_TRUE,))))
+    result.add(1, 2, scope.guard(ActionGuard((Q_TRUE,))))
+    result.eliminate((1,))
+    owner.MAX_REGION_WORK = work.progress_formula_work
+    with pytest.raises(CompileError) as failure:
+        tuple(result.retained((0, 2)))
+    assert failure.value.kind is ErrorKind.ANALYSIS_LIMIT
+    assert result.active == {0, 2}
 
 
 def test_empty_graph_and_invalid_nodes_fail_at_the_container_boundary():

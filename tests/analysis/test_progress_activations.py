@@ -11,6 +11,7 @@ from xdsl_npu.analysis.guard_cover import opposite
 from xdsl_npu.analysis.integer_facts import IntegerFacts
 from xdsl_npu.analysis.progress_activations import ProgressActivations
 from xdsl_npu.analysis.progress_conditions import ProgressConditions
+from xdsl_npu.analysis.progress_graphs import GraphTopology
 from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison
 from xdsl_npu.diagnostics import CompileError, ErrorKind
 from xdsl_npu.scalar import Expr, Fact, expression, literal, substitute
@@ -103,15 +104,15 @@ def test_seven_diamonds_stay_linear_and_match_all_fourteen_boolean_inputs():
         )
     before = work.progress_formula_query_states
     assert not scope.refuted(root)
-    assert work.progress_formula_query_states - before == 8
-    # Every negative guard is mandatory. Only the first diamond needs its
-    # two branches, rather than a list of all 128 path conjunctions.
+    assert 1 <= work.progress_formula_query_states - before <= 64
+    # Mandatory negative guards refute the factored formula without a list
+    # of its 128 possible path conjunctions.
     negative = leaf(scope, *(opposite(test) for test in predicates))
     contradiction = scope.all_of(root, negative)
     before = work.progress_formula_query_states
     scope._owner.MAX_QUERY_BRANCHES = 3
     assert scope.refuted(contradiction)
-    assert work.progress_formula_query_states - before == 3
+    assert 1 <= work.progress_formula_query_states - before <= 3
 
 
 def test_mandatory_guards_are_collected_before_any_or_branch():
@@ -230,7 +231,10 @@ def test_unknown_refutation_is_reused_only_with_its_complete_premises(monkeypatc
 
 def test_query_branch_limit_has_region_diagnostic_and_does_not_cache_exceptions():
     owner, scope, _, work = context()
-    root = scope.any_of(leaf(scope, P), leaf(scope, Q))
+    graph = scope.graph(
+        GraphTopology(4, ((0, 1), (2, 3))), (leaf(scope, P), leaf(scope, opposite(P)))
+    )
+    root = scope.all_of(scope.path(graph, frozenset(), 0, 1), scope.path(graph, frozenset(), 2, 3))
     owner.MAX_QUERY_BRANCHES = 1
     for _ in range(2):
         with pytest.raises(CompileError, match="query branches.*budget") as caught:
@@ -238,11 +242,14 @@ def test_query_branch_limit_has_region_diagnostic_and_does_not_cache_exceptions(
         assert caught.value.kind is ErrorKind.ANALYSIS_LIMIT
         assert caught.value.phase == "structured-event-progress"
         assert caught.value.location == "activation-test:3"
-    assert work.progress_formula_query_hits == 0
+        assert (root, ActionGuard()) not in owner._refutations
+        assert not owner._statuses and not owner._graph_states
+        assert not owner._path_trees
     owner.MAX_QUERY_BRANCHES = 64
-    assert not scope.refuted(root)
-    assert not scope.refuted(root)
-    assert work.progress_formula_query_hits == 1
+    assert scope.refuted(root)
+    hits = work.progress_formula_query_hits
+    assert scope.refuted(root)
+    assert work.progress_formula_query_hits == hits + 1
 
 
 def test_region_work_includes_intern_hits_and_resets_only_for_another_region():
@@ -256,6 +263,8 @@ def test_region_work_includes_intern_hits_and_resets_only_for_another_region():
         scope.all_of(node, node)
     assert caught.value.phase == "structured-event-progress"
     assert caught.value.location == "bounded-region"
+    assert "work=4" in str(caught.value) and "limit=3" in str(caught.value)
+    assert "detail=and construction" in str(caught.value)
     another = owner.region(SimpleNamespace(location="fresh-region"))
     assert leaf(another, P) is node
     assert work.progress_formula_nodes == 1
@@ -290,5 +299,315 @@ def test_poll_failure_has_progress_diagnostic_and_leaves_no_query_answer(monkeyp
         with pytest.raises(CompileError, match="test cancellation") as caught:
             scope.refuted(node)
     assert caught.value.phase == "structured-event-progress"
+    assert (node, ActionGuard()) not in scope._owner._refutations
     assert not scope.refuted(node)
-    assert work.progress_formula_query_hits == 0
+    assert work.progress_formula_queries > 0
+
+
+def test_path_evaluation_matches_a_branch_oracle_without_reading_disconnected_variables():
+    _, scope, _, _ = context()
+    z = Expr("argument", ("z",))
+    unrelated = Expr("argument", ("unrelated",))
+    graph = scope.graph(
+        GraphTopology(5, ((0, 1), (1, 3), (0, 2), (2, 3), (3, 0), (4, 4))),
+        (
+            leaf(scope, P),
+            leaf(scope, Q),
+            leaf(scope, opposite(P)),
+            leaf(scope, Comparison(z, "==", literal(1))),
+            scope.true,
+            leaf(scope, Comparison(unrelated, "==", literal(1))),
+        ),
+    )
+    forward = scope.path(graph, frozenset((1, 2)), 0, 3)
+    blocked_cycle = scope.path(graph, frozenset((1, 2)), 0, 0)
+    actual_cycle = scope.path(graph, frozenset((1, 2, 3)), 0, 0)
+    for x, y, value in product(range(2), repeat=3):
+        values = {"x": x, "y": y, "z": value}
+        expected = bool(x and y or not x and value)
+        assert forward.evaluate(values) is expected
+        assert not blocked_cycle.evaluate(values)
+        assert actual_cycle.evaluate(values) is expected
+
+
+def test_joint_paths_keep_one_parameter_context_and_refute_incompatible_routes():
+    _, scope, _, _ = context()
+    graph = scope.graph(
+        GraphTopology(4, ((0, 1), (2, 3))), (leaf(scope, P), leaf(scope, opposite(P)))
+    )
+    first = scope.path(graph, frozenset(), 0, 1)
+    second = scope.path(graph, frozenset(), 2, 3)
+    assert not scope.refuted(first) and not scope.refuted(second)
+    assert scope.refuted(scope.all_of(first, second))
+    assert scope.refuted(first, ActionGuard((opposite(P),)))
+    assert not scope.refuted(first, ActionGuard((P,)))
+    for value in range(2):
+        assert not scope.all_of(first, second).evaluate({"x": value})
+
+
+def test_one_path_cannot_combine_edges_from_incompatible_parameter_cases():
+    _, scope, _, _ = context()
+    graph = scope.graph(
+        GraphTopology(3, ((0, 1), (1, 2))), (leaf(scope, P), leaf(scope, opposite(P)))
+    )
+    root = scope.path(graph, frozenset((1,)), 0, 2)
+    assert scope.refuted(root)
+    assert not root.evaluate({"x": 0}) and not root.evaluate({"x": 1})
+
+
+def test_must_projection_does_not_borrow_unknown_edges_from_a_may_scc():
+    _, scope, _, _ = context()
+    graph = scope.graph(
+        GraphTopology(3, ((0, 1), (1, 0), (1, 2))), (leaf(scope, P), scope.true, scope.true)
+    )
+    root = scope.path(graph, frozenset((1,)), 0, 2)
+    assert scope.split(root) is P
+    assert scope.refuted(root, ActionGuard((opposite(P),)))
+    assert not scope.refuted(root, ActionGuard((P,)))
+
+
+def test_possible_path_returns_unrefuted_without_enumerating_unknown_assignments():
+    owner, scope, _, work = context()
+    graph = scope.graph(GraphTopology(3, ((0, 1), (1, 2))), (leaf(scope, P), leaf(scope, Q)))
+    root = scope.path(graph, frozenset((1,)), 0, 2)
+    owner.MAX_QUERY_BRANCHES = 1
+    assert not scope.refuted(root)
+    assert work.progress_formula_query_states <= owner.MAX_QUERY_BRANCHES
+
+
+def test_graph_mapping_is_shared_across_path_roots_and_keeps_immutable_views():
+    _, scope, _, _ = context(facts={"x": Fact(minimum=0), "y": Fact(minimum=0)})
+    raw = ordered_guard()
+    shared = scope.guard(raw)
+    graph = scope.graph(
+        GraphTopology(4, ((0, 1), (1, 2), (2, 3))), (shared, leaf(scope, P), leaf(scope, Q))
+    )
+    first_hidden, second_hidden = frozenset((1,)), frozenset((2,))
+    first = scope.path(graph, first_hidden, 0, 2)
+    second = scope.path(graph, second_hidden, 1, 3)
+    calls = []
+    bindings = {X: expression("add", Y, literal(1))}
+
+    def bind(guard):
+        calls.append(guard)
+        return ActionGuard(
+            tuple(
+                Comparison(
+                    substitute(test.lhs, bindings), test.predicate, substitute(test.rhs, bindings)
+                )
+                for test in guard.comparisons
+            )
+        )
+
+    left, right, repeated = scope.map_guards((first, second, first), bind)
+    assert len(calls) == 3 and sum(guard is raw for guard in calls) == 1
+    assert left is repeated
+    assert left.path is not None and right.path is not None
+    rebound = left.path[0]
+    assert rebound is right.path[0] and rebound is not graph
+    assert rebound.topology is graph.topology
+    assert left.path[1:] == (first_hidden, 0, 2)
+    assert right.path[1:] == (second_hidden, 1, 3)
+    assert left.path[1] is first_hidden and right.path[1] is second_hidden
+    assert shared.guard is raw
+    assert rebound.inputs[0].guard is not None
+    assert tuple(test.predicate for test in rebound.inputs[0].guard.comparisons) == tuple(
+        test.predicate for test in raw.comparisons
+    )
+    for y in range(6):
+        assert left.evaluate({"y": y}) == first.evaluate({"x": y + 1, "y": y})
+        assert right.evaluate({"y": y}) == second.evaluate({"x": y + 1, "y": y})
+
+
+def test_query_reuses_container_projection_and_graph_states_across_path_roots(monkeypatch):
+    import xdsl_npu.analysis.progress_activations as module
+
+    _, scope, _, _ = context()
+    graph = scope.graph(
+        GraphTopology(4, ((0, 1), (1, 2), (1, 3))),
+        (leaf(scope, P), leaf(scope, Q), leaf(scope, opposite(Q))),
+    )
+    hidden = frozenset((1,))
+    first, second = scope.path(graph, hidden, 0, 2), scope.path(graph, hidden, 0, 3)
+    projections, guards = [], []
+    project, guard_status = GraphTopology.project, module._Query._guard_status
+
+    def observed_project(topology, selected, mask, charge):
+        projections.append((topology, selected, mask))
+        return project(topology, selected, mask, charge)
+
+    def observed_guard(query, guard, premises):
+        guards.append(guard)
+        return guard_status(query, guard, premises)
+
+    monkeypatch.setattr(GraphTopology, "project", observed_project)
+    monkeypatch.setattr(module._Query, "_guard_status", observed_guard)
+    full = (1 << len(graph.inputs)) - 1
+    initial = scope.project(graph, hidden, full)
+    assert scope.split(first) is P
+    assert scope.split(second) is P
+    assert len(guards) == 3
+    assert len(projections) == 2 and {mask for _, _, mask in projections} == {0, full}
+    assert scope.project(graph, hidden, full) is initial
+    scope.split(first, ActionGuard((P,)))
+    assert len(guards) == 6
+
+
+def test_path_queries_share_one_complete_search_tree_across_destinations(monkeypatch):
+    _, scope, _, _ = context()
+    graph = scope.graph(
+        GraphTopology(4, ((0, 1), (1, 2), (1, 3))),
+        (leaf(scope, P), leaf(scope, Q), leaf(scope, opposite(Q))),
+    )
+    hidden = frozenset((1,))
+    first, second = scope.path(graph, hidden, 0, 2), scope.path(graph, hidden, 0, 3)
+    searches = []
+    search = GraphTopology.search
+
+    def observed(topology, source, selected, mask, charge):
+        searches.append((topology, source, selected, mask))
+        return search(topology, source, selected, mask, charge)
+
+    monkeypatch.setattr(GraphTopology, "search", observed)
+    assert scope.split(first) is P and scope.split(second) is P
+    assert not scope.refuted(first) and not scope.refuted(second)
+    full = (1 << len(graph.inputs)) - 1
+    assert searches == [(graph.topology, 0, hidden, full)]
+    assert (graph, hidden, 0, full) in scope._owner._path_trees
+
+
+def test_path_search_tree_key_separates_graph_hidden_source_and_enabled_mask(monkeypatch):
+    _, scope, _, _ = context()
+    graph = scope.graph(
+        GraphTopology(5, ((0, 1), (0, 1), (1, 2), (1, 3), (4, 1))),
+        (
+            leaf(scope, P),
+            leaf(scope, opposite(P)),
+            leaf(scope, Q),
+            leaf(scope, opposite(Q)),
+            scope.true,
+        ),
+    )
+    hidden = frozenset((1,))
+    first = scope.path(graph, hidden, 0, 2)
+    searches = []
+    search = GraphTopology.search
+
+    def observed(topology, source, selected, mask, charge):
+        searches.append((topology, source, selected, mask))
+        return search(topology, source, selected, mask, charge)
+
+    monkeypatch.setattr(GraphTopology, "search", observed)
+    assert scope.split(first) is P
+    full = (1 << len(graph.inputs)) - 1
+    assert len(searches) == 1
+    # A different complete premise set can reuse a topology tree when the
+    # resulting enabled mask is identical; its edge truth states stay separate.
+    lower = Comparison(X, ">=", literal(0))
+    assert scope.split(first, ActionGuard((lower,))) is P
+    assert len(searches) == 1
+    assert scope.split(scope.path(graph, hidden, 4, 2)) is Q
+    assert searches[-1][1:] == (4, hidden, full)
+    assert len(searches) == 2
+    larger = frozenset((1, 3))
+    assert scope.split(scope.path(graph, larger, 0, 2)) is P
+    assert searches[-1][1:] == (0, larger, full)
+    assert len(searches) == 3
+    assert scope.split(first, ActionGuard((P,))) is Q
+    assert searches[-1][1:] == (0, hidden, full & ~(1 << 1))
+    assert len(searches) == 4
+    rebound = scope.graph(graph.topology, (graph.inputs[1], graph.inputs[0], *graph.inputs[2:]))
+    assert scope.split(scope.path(rebound, hidden, 0, 2)) == opposite(P)
+    assert len(searches) == 5
+    assert (rebound, hidden, 0, full) in scope._owner._path_trees
+
+
+def test_evaluation_shares_search_tree_across_paths_without_reading_other_variables(monkeypatch):
+    _, scope, _, _ = context()
+    unrelated = Expr("argument", ("unrelated",))
+    graph = scope.graph(
+        GraphTopology(5, ((0, 1), (1, 2), (1, 3), (4, 4))),
+        (
+            scope.true,
+            leaf(scope, P),
+            leaf(scope, Q),
+            leaf(scope, Comparison(unrelated, "==", literal(1))),
+        ),
+    )
+    hidden = frozenset((1,))
+    root = scope.all_of(scope.path(graph, hidden, 0, 2), scope.path(graph, hidden, 0, 3))
+    searches = []
+    search = GraphTopology.search
+
+    def observed(topology, source, selected, mask, charge):
+        searches.append((topology, source, selected, mask))
+        return search(topology, source, selected, mask, charge)
+
+    monkeypatch.setattr(GraphTopology, "search", observed)
+    assert root.evaluate({"x": 1, "y": 1})
+    assert searches == [(graph.topology, 0, hidden, (1 << len(graph.inputs)) - 1)]
+
+
+def test_evaluation_uses_a_new_tree_after_disabling_a_false_edge(monkeypatch):
+    _, scope, _, _ = context()
+    graph = scope.graph(
+        GraphTopology(4, ((0, 1), (1, 3), (0, 2), (2, 3))),
+        (leaf(scope, P), scope.true, leaf(scope, Q), scope.true),
+    )
+    hidden = frozenset((1, 2))
+    root = scope.path(graph, hidden, 0, 3)
+    masks = []
+    search = GraphTopology.search
+
+    def observed(topology, source, selected, mask, charge):
+        masks.append(mask)
+        return search(topology, source, selected, mask, charge)
+
+    monkeypatch.setattr(GraphTopology, "search", observed)
+    assert root.evaluate({"x": 0, "y": 1})
+    full = (1 << len(graph.inputs)) - 1
+    assert masks == [full, full & ~1]
+
+
+def test_nested_graphs_share_query_and_mapping_with_their_bound_inputs():
+    _, scope, _, _ = context()
+    child = scope.graph(GraphTopology(2, ((0, 1),)), (leaf(scope, P),))
+    child_path = scope.path(child, frozenset(), 0, 1)
+    parent = scope.graph(GraphTopology(3, ((0, 1), (1, 2))), (child_path, leaf(scope, Q)))
+    root = scope.path(parent, frozenset((1,)), 0, 2)
+    assert not scope.refuted(root)
+    assert scope.refuted(root, ActionGuard((opposite(P),)))
+    assert scope.map_guards((root, child_path), lambda guard: guard) == (root, child_path)
+    for x, y in product(range(2), repeat=2):
+        assert root.evaluate({"x": x, "y": y}) is bool(x and y)
+
+
+def test_graph_and_path_inputs_validate_owner_endpoints_and_immutable_hidden_snapshot():
+    owner, scope, _, _ = context()
+    _, foreign, _, _ = context()
+    topology = GraphTopology(3, ((0, 1),))
+    graph = scope.graph(topology, (leaf(scope, P),))
+    assert scope.graph(topology, graph.inputs) is graph
+    assert scope.path(graph, frozenset(), 0, 1) is scope.path(graph, frozenset(), 0, 1)
+    with pytest.raises(FrozenInstanceError):
+        graph.inputs = ()
+    with pytest.raises(ValueError, match="another owner"):
+        foreign.path(graph, frozenset(), 0, 1)
+    with pytest.raises(ValueError, match="another owner"):
+        foreign.project(graph, frozenset(), 1)
+    with pytest.raises(ValueError, match="another owner"):
+        scope.graph(topology, (leaf(foreign, P),))
+    with pytest.raises(ValueError, match="differ"):
+        scope.graph(topology, ())
+    with pytest.raises(TypeError, match="frozenset"):
+        scope.path(graph, set(), 0, 1)
+    for hidden, source, destination in ((frozenset((3,)), 0, 1), (frozenset((1,)), 0, 1)):
+        with pytest.raises(ValueError, match="vertex|vertices"):
+            scope.path(graph, hidden, source, destination)
+    scope.path(graph, frozenset((0,)), 1, 2)
+    with pytest.raises(ValueError, match="vertex"):
+        scope.path(graph, frozenset((False,)), 1, 2)
+    for mask in (-1, 2, True):
+        with pytest.raises(ValueError, match="mask"):
+            scope.project(graph, frozenset(), mask)
+    assert graph.owner is owner

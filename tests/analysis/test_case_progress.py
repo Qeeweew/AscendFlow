@@ -102,8 +102,13 @@ def test_alternative_routes_are_or_and_keep_each_ordered_witness(composer):
     paths, _ = composer._paths(graph)
     paths.eliminate((1, 2))
     activation = paths.relation(0, 3)
-    assert activation.kind == "or"
-    assert {node.guard.comparisons for node in activation.operands} == {(a,), (b,)}
+    assert activation.kind == "path"
+    retained_graph, hidden, source, destination = activation.path
+    assert hidden == frozenset((1, 2)) and (source, destination) == (0, 3)
+    assert {node.guard.comparisons for node in retained_graph.inputs if node.kind == "guard"} == {
+        (a,),
+        (b,),
+    }
     for mode in range(4):
         assert activation.evaluate({"mode": mode})
 
@@ -117,7 +122,11 @@ def test_alternative_routes_are_or_and_keep_each_ordered_witness(composer):
     paths, _ = composer._paths(ordered)
     paths.eliminate((1,))
     activation = paths.relation(0, 3)
-    assert activation.guard.comparisons == (prefix, residue)
+    assert activation.kind == "path"
+    assert any(
+        node.kind == "guard" and node.guard.comparisons == (prefix, residue)
+        for node in activation.path[0].inputs
+    )
     for count in range(5):
         assert activation.evaluate({"n": count}) == (count > 0 and (count - 1) % 2 == 0)
 

@@ -8,6 +8,7 @@ from tests.analysis.test_case_progress import edge, nodes
 from tests.analysis.test_progress_bound_facts import invocation
 from tests.analysis.test_progress_parent_interfaces import PARENT_REUSE
 from tests.support.structured import prepared, selected
+from xdsl_npu.analysis.progress_graphs import GraphTopology
 from xdsl_npu.analysis.progress_regions import (
     ChannelProjection,
     InterfaceTransfer,
@@ -25,7 +26,8 @@ def domains():
     return prepared(selected(PARENT_REUSE))
 
 
-def test_child_formula_uses_one_ancestor_shift_for_every_boolean_branch(domains):
+@pytest.mark.parametrize("opaque_path", (False, True))
+def test_child_formula_uses_one_ancestor_shift_for_every_boolean_branch(domains, opaque_path):
     composer, parent, child, source, wait = invocation(domains)
     ordinal = domains.control.loops[parent].ordinal
     shifted_source = composer.endpoints.stream_port(source, child)
@@ -44,6 +46,9 @@ def test_child_formula_uses_one_ancestor_shift_for_every_boolean_branch(domains)
         scope.any_of(equals(ordinal, 1), equals(ordinal, 3)),
         scope.any_of(equals(following, 2), equals(following, 5)),
     )
+    if opaque_path:
+        graph = scope.graph(GraphTopology(3, ((0, 1), (1, 2))), (activation, scope.true))
+        activation = scope.path(graph, frozenset((1,)), 0, 2)
     provenance = (object(),)
     relation = InterfaceTransfer(shifted_source, shifted_wait, activation, False, provenance)
     interface = RegionInterface(child, (shifted_source, shifted_wait), (), (relation,))
@@ -96,7 +101,7 @@ def test_aggregate_or_keeps_exactness_only_for_a_complete_direct_witness(domains
         assert transfer.activation.evaluate({"n": 0})
         assert transfer.activation.evaluate({"n": 1}) is inexact_route
     if inexact_route:
-        assert boundary.activation.kind == "or"
+        assert boundary.activation.kind == "path"
     else:
         assert boundary.activation is direct.activation
 
@@ -137,8 +142,75 @@ def test_real_cycle_through_an_or_path_is_never_refuted_as_an_and(domains, strea
     paths.eliminate((2,))
     arcs = composer._boundary(graph, paths, witnesses, 2)
     forward = next(arc for arc in arcs if arc.source == 0)
-    assert forward.activation.kind == "or"
+    assert forward.activation.kind == "path"
     assert all(arc.activation.evaluate({"n": 0}) for arc in arcs)
     establish = composer.ranks.stream if stream else composer.ranks.finite
     with pytest.raises(CompileError, match="rank|possible parent cycle"):
         establish(composer.root, ports[:2], arcs)
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_separate_path_predicates_share_the_same_condition_context(domains, stream):
+    composer, *_ = invocation(domains)
+    scope = composer.activations.region(composer.root)
+    first, other = Comparison(N, "==", literal(0)), Comparison(N, "!=", literal(0))
+    graph = scope.graph(
+        GraphTopology(4, ((0, 2), (2, 1), (1, 3), (3, 0))),
+        (
+            scope.guard(ActionGuard((first,))),
+            scope.true,
+            scope.guard(ActionGuard((other,))),
+            scope.true,
+        ),
+    )
+    hidden = frozenset((2, 3))
+    arcs = (
+        replace(edge(composer, 0, 1), activation=scope.path(graph, hidden, 0, 1), exact=False),
+        replace(edge(composer, 1, 0), activation=scope.path(graph, hidden, 1, 0), exact=False),
+    )
+    for n in range(3):
+        assert sum(arc.activation.evaluate({"n": n}) for arc in arcs) == 1
+    if stream:
+        _, rank, certificates = composer.ranks.stream(composer.root, nodes(composer, 2), arcs)
+        assert not rank and len(certificates) == 2
+        for n in range(3):
+            assert any(certificate.condition.evaluate({"n": n}) for certificate in certificates)
+    else:
+        excluded, conditional = composer.ranks.finite(composer.root, nodes(composer, 2), arcs)
+        assert len(excluded) == 1 and not conditional
+        assert all(not excluded[0].condition.evaluate({"n": n}) for n in range(3))
+
+
+def test_nested_path_stream_filter_removes_varying_predicates_at_every_graph_level(domains):
+    composer, parent, _, _, _ = invocation(domains)
+    scope = composer.activations.region(parent)
+    ordinal = domains.control.loops[parent].ordinal
+    first = scope.guard(ActionGuard((Comparison(ordinal, "==", literal(0)),)))
+    other = scope.guard(ActionGuard((Comparison(ordinal, "!=", literal(0)),)))
+    graph = scope.graph(
+        GraphTopology(4, ((0, 2), (2, 1), (1, 3), (3, 0))),
+        (first, scope.true, other, scope.true),
+    )
+    hidden = frozenset((2, 3))
+    nested = scope.graph(
+        GraphTopology(3, ((0, 1), (1, 2))),
+        (scope.path(graph, hidden, 0, 1), scope.true),
+    )
+    arcs = (
+        replace(
+            edge(composer, 0, 1),
+            activation=scope.path(nested, frozenset((1,)), 0, 2),
+            steps=1,
+            exact=False,
+        ),
+        replace(
+            edge(composer, 1, 0),
+            activation=scope.path(graph, hidden, 1, 0),
+            steps=-1,
+            exact=False,
+        ),
+    )
+    # The two visits may use different generations. The same bare ordinal
+    # must not exclude their cycle in a stream, even through a nested Path.
+    with pytest.raises(CompileError, match="increasing blocking-interface rank"):
+        composer.ranks.stream(parent, nodes(composer, 2), arcs)

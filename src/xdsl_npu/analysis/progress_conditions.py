@@ -27,12 +27,6 @@ class Condition:
     members: frozenset[Comparison]
     predicates: tuple[Comparison, ...]
 
-    def __contains__(self, predicate: Comparison) -> bool:
-        return predicate in self.members
-
-    def issubset(self, other: Condition) -> bool:
-        return self.members <= other.members
-
 
 class ProgressConditions:
     """Own sufficient inconsistency facts for one immutable integer environment.
@@ -75,9 +69,6 @@ class ProgressConditions:
             )
             condition = self._conditions[members] = Condition(members, predicates)
         return condition
-
-    def union(self, *conditions: Condition) -> Condition:
-        return self.intern(frozenset().union(*(condition.members for condition in conditions)))
 
     def impossible(self, tests: Iterable[Comparison] | Condition) -> bool:
         condition = self.intern(tests)

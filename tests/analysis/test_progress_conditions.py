@@ -43,18 +43,15 @@ def test_permutations_and_duplicates_share_one_inconsistency_proof(contradiction
     assert independent is not condition and independent.predicates == condition.predicates
 
 
-def test_interned_conditions_are_immutable_and_unions_support_absorption():
+def test_interned_conditions_are_immutable_and_empty_queries_reuse_their_fact():
     owner = ProgressConditions(IntegerFacts({}))
     lower = Comparison(X, ">=", literal(0))
     upper = Comparison(X, "<=", literal(4))
-    empty, first, second = owner.union(), owner.intern((lower,)), owner.intern((upper,))
-    both = owner.union(first, second)
-    assert lower in both and upper in both
-    assert empty.issubset(first) and first.issubset(both)
-    assert not both.issubset(first)
-    assert owner.union(empty, both, first) is both
+    empty = owner.intern(())
+    both = owner.intern((lower, upper))
+    assert both.members == frozenset((lower, upper))
     assert owner.intern((upper, lower)) is both
-    assert owner.condition_count == 4 and owner.proof_queries == owner.cache_hits == 0
+    assert owner.condition_count == 2 and owner.proof_queries == owner.cache_hits == 0
     with pytest.raises(FrozenInstanceError):
         both.predicates = ()
     for name in ("condition_count", "proof_queries", "cache_hits"):
