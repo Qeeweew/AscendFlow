@@ -19,7 +19,7 @@ from ascendflow.target.ascend910b import Actor, Engine
 from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
-from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
+from tests.fixtures.nested import nested_copy, nested_cv, partitioned_cv, shared_l0c_qk_pv
 from tests.models.structured_domains import actual_dispatch, need_cases, occurrence_key, point_key
 from tests.support.structured import selected
 
@@ -31,6 +31,7 @@ from tests.support.structured import selected
         batched_matmul,
         nested_copy,
         nested_cv,
+        partitioned_cv,
         shared_l0c_qk_pv,
         attention_target,
     ],
@@ -126,7 +127,7 @@ def test_selected_set_and_wait_existence_is_exact_for_empty_short_and_reentry(ac
         uniform = {
             "tiles": count,
             "n": count,
-            "Sq": 128 if requested_group else 512,
+            "Sq": 256 if requested_group else 512,
             "Sk": max(1, count) * 1024,
             "$group": group,
             "$sid": 0,
@@ -175,12 +176,18 @@ def test_first_count_and_dynamic_residues_are_not_replaced_by_unbounded_activati
     assert dynamic
     assert any(d.first > 0 for n in result.dependencies.required for d in n.domains)
     assert any(p.families for n in result.notifications for p in n.sources)
-    assert all(all(p.coordinates for p in (*n.sources, *n.consumers)) for n in result.notifications)
+    frames = result.dependencies.memory.control.frames
+    assert all(
+        bool(p.coordinates) == bool(tuple(frames[p.operation].loops()))
+        for n in result.notifications
+        for p in (*n.sources, *n.consumers)
+    )
     assert any(n.distance is None for n in result.notifications)
 
 
-def test_incomplete_mode2_quorum_stays_explicitly_unresolved():
-    result = selected(nested_cv)
+@pytest.mark.parametrize("source", [nested_cv, partitioned_cv])
+def test_incomplete_mode2_quorum_stays_explicitly_unresolved(source):
+    result = selected(source)
     broken = replace(
         result.dependencies,
         required=tuple(

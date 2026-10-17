@@ -10,6 +10,39 @@ from examples.cv.nested import nested_cv  # noqa: F401 - shared source fixture
 
 
 @N.prim_func(disjoint_external=True)
+def partitioned_cv(
+    X: N.Tensor((n, 2, 16, 16), N.f16),
+    Exchange: N.Tensor((2, 32, 16), N.f32, access="write"),
+    Back: N.Tensor((2, 32, 16), N.f16, access="write"),
+    n: N.int64,
+):
+    """Two Cube operations address the separate halves of one AIV quorum."""
+    with N.Kernel(1, kind="mixed"):
+        l1 = N.alloc_l1((2, 16, 16), N.f16)
+        a = N.alloc_l0a((2, 16, 16), N.f16)
+        b = N.alloc_l0b((2, 16, 16), N.f16)
+        c = N.alloc_l0c((2, 16, 16), N.f32)
+        receive = N.alloc_l1((2, 16, 16), N.f16)
+        u = N.alloc_ub((16, 16), N.f32)
+        v = N.alloc_ub((16, 16), N.f16)
+        for t in N.Pipelined(n, stages=3):
+            with N.Stage(0, name="produce"), N.Cube():
+                for part in N.unroll(2):
+                    x = N.copy(X[t, part, :, :], l1[part, :, :])
+                    aa = N.copy(x, a[part, :, :])
+                    bb = N.copy(x, b[part, :, :], transpose=True)
+                    z = N.matmul(aa, bb, accum=c[part, :, :], initialize=True)
+                    N.copy(z, Exchange[t % 2, part * 16 : (part + 1) * 16, :])
+            with N.Stage(1, name="transform"), N.Vector() as lane:
+                x = N.copy(Exchange[t % 2, lane * 16 : (lane + 1) * 16, :], u)
+                y = N.cast(x, out=v)
+                N.copy(y, Back[t % 2, lane * 16 : (lane + 1) * 16, :])
+            with N.Stage(2, name="consume"), N.Cube():
+                for part in N.unroll(2):
+                    N.copy(Back[t % 2, part * 16 : (part + 1) * 16, :], receive[part, :, :])
+
+
+@N.prim_func(disjoint_external=True)
 def nested_copy(
     X: N.Tensor((n, 4, 8), N.f32),
     Y: N.Tensor((n, 4, 8), N.f32, access="write"),

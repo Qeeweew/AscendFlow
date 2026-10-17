@@ -1,6 +1,6 @@
 """Dense f16 BNSD Flash Attention with retained query/KV/child pipelines.
 
-The default configuration uses B1/Hq8/Hkv8/D128 and BQ128/BK1024/CK128/VR8.
+The default configuration uses B1/Hq8/Hkv8/D128 and BQ256/BM128/BK1024/CK128/VR8.
 Score, P and PV are explicit double-buffered GM workspaces. Other constexpr
 variants have no current qualification. Historical device evidence does not
 establish device correctness or performance for those configurations.
@@ -31,7 +31,7 @@ def attention_target(
     HQ: N.constexpr = 8,
     HKV: N.constexpr = 8,
     D: N.constexpr = 128,
-    BQ: N.constexpr = 128,
+    BQ: N.constexpr = 256,
     BM: N.constexpr = 128,
     BK: N.constexpr = 1024,
     CK: N.constexpr = 128,
@@ -64,10 +64,16 @@ def attention_target(
         else:
             p1 = N.alloc_l1((2, BQ // BM, BM, CK), DTYPE)
         v1 = N.alloc_l1((2, CK, D), DTYPE)
-        qa = N.alloc_l0a((BM, D), DTYPE)
-        pa = N.alloc_l0a((BM, CK), DTYPE)
-        kb = N.alloc_l0b((D, CK), DTYPE)
-        vb = N.alloc_l0b((CK, D), DTYPE)
+        if BQ == BM:
+            qa = N.alloc_l0a((BM, D), DTYPE)
+            pa = N.alloc_l0a((BM, CK), DTYPE)
+        else:
+            # A paired row tile uses a separate operand slot for each part.
+            # QK/PV share those slots; total L0A remains 64KiB.
+            a0 = N.alloc_l0a((2, BM, D), DTYPE)
+        # QK and PV share the physical L0B bank. Two slots let MTE1
+        # prepare the next operand while MAD still reads the other slot.
+        b0 = N.alloc_l0b((2, D, CK), DTYPE)
         # Shared QK/PV L0C: two native planes, not three allocations.
         c0 = N.alloc_l0c((2, BM, CK), N.f32)
         score_in = N.alloc_ub((2, VR, BK), N.f32)
@@ -88,7 +94,9 @@ def attention_target(
         inverse = N.alloc_ub((VR,), N.f32)
         # Physical BRCB scratch is explicit; no full-size broadcast tile.
         soft_broadcast = N.alloc_ub((VR, 8), N.f32)
-        out_broadcast = N.alloc_ub((VR, 8), N.f32)
+        out_broadcast = N.alloc_ub((BQ // 2, 8), N.f32)
+        with N.Vector():
+            N.fill(ones, 1.0)
         query_tiles = Sq // BQ
         kv_tiles = Sk // BK
         local_queries = N.ceildiv(N.max(0, B * HQ * query_tiles - group), GROUPS)
@@ -138,14 +146,24 @@ def attention_target(
                         with N.Stage(0, name="load_k"):
                             N.copy(K[batch, kv_head, j : j + CK, :], k1[chunk % 2, :, :])
                         with N.Stage(1, name="operand_k"):
-                            N.copy(k1[chunk % 2, :, :], kb, transpose=True)
+                            N.copy(k1[chunk % 2, :, :], b0[chunk % 2, :, :], transpose=True)
                         with N.Stage(2, name="qk_native"):
                             if BQ == BM:
-                                N.matmul(qa, kb, accum=c0[chunk % 2, :, :], initialize=True)
+                                N.matmul(
+                                    qa,
+                                    b0[chunk % 2, :, :],
+                                    accum=c0[chunk % 2, :, :],
+                                    initialize=True,
+                                )
                             else:
                                 for part in N.unroll(BQ // BM):
-                                    N.copy(q1[part, :, :], qa)
-                                    N.matmul(qa, kb, accum=c0[part, :, :], initialize=True)
+                                    N.copy(q1[part, :, :], a0[part, :, :])
+                                    N.matmul(
+                                        a0[part, :, :],
+                                        b0[chunk % 2, :, :],
+                                        accum=c0[part, :, :],
+                                        initialize=True,
+                                    )
                         with N.Stage(3, name="export_score"):
                             if BQ == BM:
                                 N.copy(
@@ -189,9 +207,14 @@ def attention_target(
                             )
                             N.maximum(m[r : r + VR], next_m, out=next_m)
                             N.sub(m[r : r + VR], next_m, out=alpha[s, r : r + VR])
-                            N.exp(alpha[s, r : r + VR], out=alpha[s, r : r + VR])
                             N.sub(work, next_m[:, None], out=work, scratch=soft_broadcast)
+                            N.exp(alpha[s, r : r + VR], out=alpha[s, r : r + VR])
                             N.exp(work, out=work)
+                            # P has separate storage. Publish its conversion
+                            # before the denominator reduction so work's final
+                            # reader is the first reduction, not this cast.
+                            # The denominator still consumes unrounded f32 P.
+                            N.cast(work, out=p_out[row % 2, :, :])
                             N.reduce_sum(
                                 work,
                                 axis=1,
@@ -202,7 +225,6 @@ def attention_target(
                             N.mul(l[r : r + VR], alpha[s, r : r + VR], out=l[r : r + VR])
                             N.add(l[r : r + VR], row_sum, out=l[r : r + VR])
                             N.copy(next_m, m[r : r + VR])
-                            N.cast(work, out=p_out[row % 2, :, :])
                         with N.Stage(2, name="export_p"):
                             N.copy(p_out[row % 2, :, :], P[group, s, g : g + VR, :])
                 with N.Stage(1, name="pv"), N.Cube():
@@ -233,40 +255,47 @@ def attention_target(
                         with N.Stage(1, name="operand_pv"):
                             if BQ == BM:
                                 N.copy(p1[chunk % 2, :, :], pa)
-                            N.copy(v1[chunk % 2, :, :], vb)
+                            N.copy(v1[chunk % 2, :, :], b0[chunk % 2, :, :])
                         with N.Stage(2, name="pv_native"):
                             if BQ == BM:
-                                N.matmul(pa, vb, accum=c0[0, :, :], initialize=(chunk == 0))
+                                N.matmul(
+                                    pa,
+                                    b0[chunk % 2, :, :],
+                                    accum=c0[0, :, :],
+                                    initialize=(chunk == 0),
+                                )
                             else:
                                 for part in N.unroll(BQ // BM):
-                                    N.copy(p1[chunk % 2, part, :, :], pa)
-                                    N.matmul(pa, vb, accum=c0[part, :, :], initialize=(chunk == 0))
+                                    N.copy(p1[chunk % 2, part, :, :], a0[part, :, :])
+                                    N.matmul(
+                                        a0[part, :, :],
+                                        b0[chunk % 2, :, :],
+                                        accum=c0[part, :, :],
+                                        initialize=(chunk == 0),
+                                    )
                     for part in N.unroll(BQ // BM):
                         N.copy(c0[part, :, :], PV[group, s, part * BM : (part + 1) * BM, :])
                 with N.Stage(2, name="update"), N.Vector() as lane:
                     if kv == 0:
                         N.fill(o, 0.0)
+                    # All rows rescale independently before adding this PV.
+                    # Broadcast once for the complete state; retain separate
+                    # FP32 multiply/add and the later normalization boundary.
+                    N.mul(o, alpha[s, :, None], out=o, scratch=out_broadcast)
                     for row in N.Pipelined(BQ // 2 // VR, stages=3):
                         r = row * VR
                         g = lane * (BQ // 2) + r
                         with N.Stage(0, name="import_pv"):
                             N.copy(PV[group, s, g : g + VR, :], pv_in[row % 2, :, :])
                         with N.Stage(1, name="accumulate_o"):
-                            N.mul(
-                                o[r : r + VR, :],
-                                alpha[s, r : r + VR, None],
-                                out=o[r : r + VR, :],
-                                scratch=out_broadcast,
-                            )
                             N.add(o[r : r + VR, :], pv_in[row % 2, :, :], out=o[r : r + VR, :])
                             if kv == kv_tiles - 1:
-                                N.fill(ones, 1.0)
                                 N.div(ones, l[r : r + VR], out=inverse)
                                 N.mul(
                                     o[r : r + VR, :],
                                     inverse[:, None],
                                     out=pv_in[row % 2, :, :],
-                                    scratch=out_broadcast,
+                                    scratch=out_broadcast[:VR, :],
                                 )
                                 N.cast(pv_in[row % 2, :, :], out=o_out[row % 2, :, :])
                         with N.Stage(2, name="export_o"):

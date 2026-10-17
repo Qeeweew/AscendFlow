@@ -13,6 +13,7 @@ from ascendflow.passes.materialize_structure import materialize_notifications
 from ascendflow.passes.structured_sync import synchronize_structure
 from ascendflow.scalar import literal
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
+from tests.fixtures.nested import partitioned_cv
 from tests.fixtures.notification_cycles import (
     PARENT_REUSE,
     actual_port_cycle,
@@ -172,6 +173,13 @@ def test_generated_counter_quorum_retains_two_private_actors():
         vector = item.sources if len(item.sources) == 2 else item.consumers
         assert {p.actor for p in vector} == {Actor.AIV0, Actor.AIV1}
         assert vector[0].operation is vector[1].operation
+
+
+def test_partitioned_cube_prefix_and_acquire_keep_all_real_reader_versions():
+    plan = synchronize_structure(partitioned_cv)
+    for count in (0, 1, 2, 3, 5):
+        execution = check_compiled_events(plan, {"n": count}, groups=(0,))
+        assert count == 0 or execution.bytes_read and execution.bytes_written
 
 
 def finite_independent_cells(*, scalar):

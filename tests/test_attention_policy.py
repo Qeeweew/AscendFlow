@@ -161,32 +161,36 @@ def child_schedule(module, name, *, default=False):
     raise AssertionError("missing native child")
 
 
-def check_single_operand(stages, order, producer, reader, count):
-    current, consumed = None, True
+def check_operand_ring(stages, order, producer, reader, count, slots):
+    current, consumed = [None] * slots, [True] * slots
     for step in range(count + max(stages.values())):
         for name in order:
             generation = step - stages[name]
             if not 0 <= generation < count:
                 continue
+            slot = generation % slots
             if name == producer:
-                assert consumed, f"operand overwritten before MAD generation {current}"
-                current, consumed = generation, False
+                assert consumed[slot], f"operand overwritten before MAD generation {current[slot]}"
+                current[slot], consumed[slot] = generation, False
             if name == reader:
-                assert current == generation, "MAD reads wrong operand generation"
-                consumed = True
-    assert consumed
+                assert current[slot] == generation, "MAD reads wrong operand generation"
+                consumed[slot] = True
+    assert all(consumed)
 
 
 @pytest.mark.parametrize(
-    "producer,reader", [("operand_k", "qk_native"), ("operand_pv", "pv_native")]
+    "producer,reader,slots", [("operand_k", "qk_native", 2), ("operand_pv", "pv_native", 1)]
 )
-def test_target_one_slot_requires_explicit_inner_issue_order(target_schedule, producer, reader):
+def test_target_operand_issue_order_respects_its_ring(target_schedule, producer, reader, slots):
     for count in (0, 1, 2, 8, 17):
         stages, order = child_schedule(target_schedule, producer)
-        check_single_operand(stages, order, producer, reader, count)
+        check_operand_ring(stages, order, producer, reader, count, slots)
     stages, order = child_schedule(target_schedule, producer, default=True)
-    with pytest.raises(AssertionError, match="overwritten before MAD"):
-        check_single_operand(stages, order, producer, reader, 2)
+    if slots == 1:
+        with pytest.raises(AssertionError, match="overwritten before MAD"):
+            check_operand_ring(stages, order, producer, reader, 2, slots)
+    else:
+        check_operand_ring(stages, order, producer, reader, 17, slots)
 
 
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])

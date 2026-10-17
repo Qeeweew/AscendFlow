@@ -16,6 +16,7 @@ from ascendflow.dialects.io import dump, parse
 from ascendflow.dialects.structured import NotificationOp
 from ascendflow.passes.simplify_scalars import simplify_scalars
 from ascendflow.target.ascend910b import Actor
+from benchmarks.attention.run import generated_contract, launcher_abi
 from tests.models.structured_events import check_structured_events
 
 
@@ -24,15 +25,33 @@ def default_attention(tmp_path_factory):
     directory = tmp_path_factory.mktemp("default-fa")
     source = Path(__file__).parents[2] / "examples/flash_attention/attention.py"
     report = build_file(source, directory, entry="attention_target", timeout_s=300)
-    assert report["native_templates"] == 44
+    assert report["native_templates"] == 52
     final = collect_native_memory(parse((directory / "after.xdsl").read_text()))
     original = collect_native_memory(parse((directory / "before.xdsl").read_text()))
     asc = (directory / "attention_target.asc").read_text()
-    return final, original, asc
+    return final, original, asc, directory
+
+
+def test_default_attention_artifact_matches_the_device_runner(default_attention):
+    _, _, asc, directory = default_attention
+    contract = generated_contract(directory)
+    assert contract["local_bytes_by_actor"]["aiv0"]["bytes"]["UB"] == 187264
+    assert launcher_abi(asc, "attention_target", generated=True).keys == (
+        "stream",
+        "q",
+        "k",
+        "v",
+        "o",
+        "score",
+        "p",
+        "pv",
+        "sq",
+        "sk",
+    )
 
 
 def test_default_attention_keeps_shared_vector_sync_in_its_runtime_lane_body(default_attention):
-    final, _, asc = default_attention
+    final, _, asc, _ = default_attention
     assert asc.count("if ASC_IS_AIV") == 1
     assert "asc_get_sub_block_id()" in asc and asc.count("npu_sid") > 1
     assert "npu_sid ==" not in asc
@@ -42,8 +61,9 @@ def test_default_attention_keeps_shared_vector_sync_in_its_runtime_lane_body(def
 
 
 def test_default_attention_has_compact_single_clock_output(default_attention):
-    _, _, asc = default_attention
-    assert len(asc.splitlines()) <= 500
+    _, _, asc, _ = default_attention
+    # The paired A/B storage adds real boundary acquire/release guards.
+    assert len(asc.splitlines()) <= 560
     assert not re.search(r"NpuPipelinePhase|prologue|steady|epilogue|short|auto npu_stage_", asc)
     assert "__int128" not in asc
     launcher = asc.split('extern "C" int launch_attention_target(', 1)[1]
@@ -54,7 +74,7 @@ def test_default_attention_has_compact_single_clock_output(default_attention):
 
 
 def test_default_attention_scalar_simplification_is_idempotent(default_attention):
-    final, _, asc = default_attention
+    final, _, asc, _ = default_attention
     before = dump(final.module)
     module = parse(before)
     simplify_scalars(module)
@@ -65,9 +85,9 @@ def test_default_attention_scalar_simplification_is_idempotent(default_attention
     assert not re.search(r"\b0 \+ npu_", asc) and " * 1)" not in asc
 
 
-@pytest.mark.parametrize("sq,sk", [(128, 1024), (128, 2048), (128, 3072), (512, 2048)])
+@pytest.mark.parametrize("sq,sk", [(256, 1024), (256, 2048), (256, 3072), (1024, 2048)])
 def test_default_attention_native_versions_and_real_event_consumption(default_attention, sq, sk):
-    final, original, _ = default_attention
+    final, original, _, _ = default_attention
     execution = check_structured_events(
         final,
         {"Sq": sq, "Sk": sk},

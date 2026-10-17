@@ -65,7 +65,7 @@ python -m benchmarks.attention.run_policy --output build/attention/reference --b
 ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 python -m benchmarks.attention.run --output build/attention/generated --physical 6 --backend generated --cases 4096:4096 8192:8192 --scope sampled --warmup 5 --repeats 30
 ```
 
-`--backend aclnn`使用安装版对照；`--backend ascendc --reference-output build/attention/reference`使用手写参考。sampled当前按每head每Q块取6行，必须如实标注；不能替代短域全输出检查、输入不变和guard检查。ACL stream interval包含host提交间隙，性能结论应同时使用msprof设备task时间。
+`--backend aclnn`使用安装版对照；`--backend ascendc --reference-output build/attention/reference`使用手写参考。sampled当前按每head每128行取6行，必须如实标注；不能替代短域全输出检查、输入不变和guard检查。ACL stream interval包含host提交间隙，性能结论应同时使用msprof设备task时间。
 
 profiling统一通过`benchmarks/profile.sh <模块名> <参数...>`调用，`ASCENDFLOW_PYTHON` 指向当前 Python 环境的解释器；物理映射等环境变量同样传给被profile进程。通用汇总入口为：
 
@@ -74,5 +74,19 @@ python -m benchmarks.profile_summary build/attention/profiles/trial-0/generated 
 ```
 
 原始profile必须与该源码/ASC/库和设备绑定，不能混用旧路径。主例使用4K/8K等稳态规模，固定政策，三后端交替有限批次；不无界调参。
+
+FA的`benchmarks.attention.compare`读取每个profile目录下的`summary.json`和
+`device/device.json`。一次profile只运行一个`--cases Sq:Sk`，并用`--record`
+将runner记录写到对应的`device/device.json`；该记录必须完成数值、输入及guard检查。
+每个shape单独收集`trial-0`至`trial-2`，各含`generated`和`aclnn`目录，再运行：
+
+```bash
+python -m benchmarks.attention.compare build/attention/profiles/4096 --output build/attention/profiles/4096/comparison.json
+```
+
+比较器从runner的`cases`读取数值结果，健康和硬件信息来自顶层记录。
+生成库检查其ASC/CANN manifest；安装版ACLNN检查实际`libopapi.so`、
+`libnnopbase.so`及适配器身份，不要求它具有生成代码的manifest。
+默认允许时间比为1.00，即设备时间不能慢于ACLNN；超过目标会保存`failed`结果并以非零状态退出。
 
 先审查最终ASC的搬运、槽位、early release、CV派发与等待，再用可用的pipe/访存/冲突指标解释差距。不同PMU replay组不可相加分解延迟；GM请求包含L2命中，不等于HBM实流量。理论算力/带宽下界写明核心数、频率、dtype、FLOP/字节和假设，不能从设计宣称性能无损。

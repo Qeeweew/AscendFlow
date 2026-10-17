@@ -104,7 +104,7 @@ def test_fa_structure_debug_prints_each_template_once_and_is_not_executable(monk
     work = EmissionWork()
     asc = emit_structure_debug(facts, work=work)
     assert work.native_templates == work.native_prints == structure.work["native_templates"]
-    assert work.native_templates == 44
+    assert work.native_templates == 52
     assert all(count == 1 for count in work.task_prints.values())
     assert work.output_bytes == len(asc.encode())
     assert asc.count("if ASC_IS_AIV") == 1 and asc.count("if ASC_IS_AIC") == 1

@@ -707,15 +707,43 @@ def _unique_points(points):
     return tuple(result.values())
 
 
-def _quorums(notifications):
+def _quorum_cube_point(points, requirements, order, *, source):
+    """Capture the latest Cube prefix, or acquire before its first reader.
+
+    The caller groups only identical activation/coordinate domains. Every
+    moved endpoint must have a proved controller order under every original
+    requirement; joining the two Vector participants alone supplies no order.
+    """
+    selected = points[0]
+    for point in points[1:]:
+        relative = {order.compare(selected, point, need) for need in requirements}
+        if relative <= {-1, 0}:
+            if source:
+                selected = point
+        elif relative <= {0, 1}:
+            if not source:
+                selected = point
+        else:
+            return None
+    return selected
+
+
+def _quorums(notifications, order):
     local, cross = [], {}
     for item in notifications:
         if item.mechanism is not NotificationKind.CROSS_EVENT:
             local.append(item)
             continue
+        cube_source = item.sources[0].actor is Actor.AIC
+        cube = item.sources[0] if cube_source else item.consumers[0]
+        vector = item.consumers[0] if cube_source else item.sources[0]
         key = (
-            _point_key(item.sources[0], actor=False),
-            _point_key(item.consumers[0], actor=False),
+            cube_source,
+            _point_key(vector, actor=False),
+            # Different Cube operations may produce/consume the two AIV
+            # partitions. They must still share the exact activation and
+            # invocation; cumulative capture/acquire order is checked below.
+            _point_key(cube, actor=False)[1:],
             item.source_engine,
             item.destination_engine,
             _domain_key(item),
@@ -731,6 +759,17 @@ def _quorums(notifications):
             b == {Actor.AIC} and a == {Actor.AIV0, Actor.AIV1}
         )
         requirements = tuple(n for item in items for n in item.requirements)
+        if complete:
+            cube_source = a == {Actor.AIC}
+            cube = sources if cube_source else consumers
+            vector = consumers if cube_source else sources
+            selected = _quorum_cube_point(cube, requirements, order, source=cube_source)
+            complete = selected is not None and len(vector) == 2
+            if complete:
+                if cube_source:
+                    sources = (selected,)
+                else:
+                    consumers = (selected,)
         if not complete:
             unresolved.extend(
                 UnresolvedSynchronization(
@@ -823,7 +862,7 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     # allocation may unite their instruction spelling after assigning IDs.
     grouped = _group_captures(notifications, order)
     grouped = _reuse_acquisitions(grouped, order)
-    grouped, quorum_issues = _quorums(grouped)
+    grouped, quorum_issues = _quorums(grouped, order)
     unresolved.extend(quorum_issues)
     selected = tuple(replace(item, name=f"notification_{i}") for i, item in enumerate(grouped))
     for item in selected:

@@ -74,7 +74,7 @@ def test_declared_default_physical_allocations_fit_per_actor_not_combined_ub():
         size = 4 if tensor.dtype.data == "f32" else 2
         nbytes = math.prod(dim.data for dim in tensor.shape) * size
         memory[tensor.memory.data.lower()] += (nbytes + 31) // 32 * 32
-    assert memory["l1"] == 224 * 1024
+    assert memory["l1"] == 320 * 1024
     assert memory["l0a"] == memory["l0b"] == 64 * 1024
     assert memory["l0c"] == 128 * 1024
     assert memory["ub"] <= 192 * 1024

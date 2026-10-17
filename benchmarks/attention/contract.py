@@ -55,7 +55,7 @@ class AttentionPolicy:
     dim: int = 128
     groups: int = 20
     dtype: str = "f16"
-    query_tile: int = 128
+    query_tile: int = 256
 
     def __post_init__(self):
         require(
@@ -131,10 +131,12 @@ class AttentionPolicy:
             ((2, 128, 128), dtype, "L1", "NZ"),
             ((2, bq, 128) if bq == bm else (2, bq // bm, bm, 128), dtype, "L1", "NZ"),
             ((2, 128, 128), dtype, "L1", "NZ"),
-            ((bm, 128), dtype, "L0A", "ZZ"),
-            ((bm, 128), dtype, "L0A", "ZZ"),
-            ((128, 128), dtype, "L0B", "ZN"),
-            ((128, 128), dtype, "L0B", "ZN"),
+            *(
+                (((bm, 128), dtype, "L0A", "ZZ"),) * 2
+                if bq == bm
+                else (((2, bm, 128), dtype, "L0A", "ZZ"),)
+            ),
+            ((2, 128, 128), dtype, "L0B", "ZN"),
             ((2, bm, 128), "f32", "L0C", "NZ"),
             ((2, 8, 1024), "f32", "UB", "linear"),
             *((((8, 1024), "f32", "UB", "linear"),) if bq == bm else ()),
@@ -147,7 +149,8 @@ class AttentionPolicy:
             ((2, bq // 2), "f32", "UB", "linear"),
             ((1152,), "f32", "UB", "linear"),
             *(((8,), "f32", "UB", "linear"),) * 4,
-            *(((8, 8), "f32", "UB", "linear"),) * 2,
+            ((8, 8), "f32", "UB", "linear"),
+            ((bq // 2, 8), "f32", "UB", "linear"),
         )
 
     def validate_case(self, sq, sk):

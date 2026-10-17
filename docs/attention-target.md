@@ -5,7 +5,7 @@
 ## 当前默认配置
 
 - dense、无mask forward，BNSD，f16输入输出，B1/Hq8/Hkv8/D128。
-- BQ128/BM128/BK1024/CK128/VR8，20组AIC/双AIV。
+- BQ256/BM128/BK1024/CK128/VR8，20组AIC/双AIV。
 - Sq/Sk为runtime参数，满足`Sq>0且Sq%BQ==0`、`Sk>0且Sk%BK==0`；空owner不发任务。
 - 每组串行处理分配到的Q块，每个Q块遍历KV块，内部Cube/Vector再分块。这里的Q块不是编译器应特殊识别的控制类型。
 
@@ -19,13 +19,30 @@ Q/K/V/O与workspace的真实指针区间遵守外部disjoint合同；局部L1/L0
 
 QK产生FP32 score，online softmax保留FP32 m/l；denominator使用未舍入p32，P显式RN后进入PV。O在FP32 rescale/add，最后归一化并RN输出。FP32求和树允许按误差合同调整；其余算法/舍入边界不自动获得修改授权。
 
-默认AIC先新QK后旧PV、AIV先新softmax后旧update。QK子流水为load/MAD/operand/FIX，PV子流水为load/MAD/operand并在外部FIX。编译器保持这些政策、早释放、缓冲复用与事件共享。
+默认AIC先新QK后旧PV、AIV先新softmax后旧update。每个K/V分块服务两个BM128行片，减少重复的GM→L1读取。两个片各占一份L0C；QK子流水先导出旧片，再按load/MAD/operand发射，PV子流水为load/MAD/operand并在外部FIX。编译器保持这些政策、早释放、缓冲复用与事件共享。
+
+两个AIV分别处理128行，仍共用一份runtime SID body。其GM分片对应不同的Cube操作；通用通知合并只在相同激活域和坐标下、Cube发射次序可证明时，选择较晚的累计capture或较早的acquire。两个AIV的真实贡献、原始storage lifetime和有限配对检查均保留。
+
+L1为320KiB，L0A/B各64KiB、L0C128KiB，每AIV UB187264B。Score/P/PV的GM环分别为40/20/5MiB。相对BQ128，workspace增大，K/V每次装入服务的行数翻倍；这项权衡在example声明，编译器没有按FA或shape特判。
+
+输出状态的各行独立rescale合并为一次整片广播和乘法，再逐块加PV。除法的常数1在每个AIV入口填充一次；最后归一化复用广播scratch的前8行。FP32乘、加及除法的舍入边界保持不变。
+
+QK/PV共用L0B的两个32KiB槽，按各自chunk代次选择槽；总容量仍为64KiB。
+QK可在MAD读取一槽时装入下一槽，跨QK/PV交接及每槽真实最后reader由同一同步链建立。
+默认配对BM片的L0A也在相同64KiB容量中分为两槽，按part选择；QK/PV共用它们。
+装入第二片无需等第一片MAD读完同一槽；跨阶段覆盖仍等待对应槽的真实最后reader。
+softmax中独立的alpha Exp与矩阵减法按完成依赖排步；P的独立FP16转换提前到
+denominator归约之前，归约继续读取原始FP32 work，不读取转换后的P。
+这些选择不改变逐行递推、FP32归约树或输出dtype。
 
 ## 资格边界
 
-数值验收配置包括 Sq:Sk 为128:1024、384:3072、768:1024、512:2048等，
+默认数值验收配置包括 Sq:Sk 为256:1024、768:3072、1536:1024、1024:2048等，
 误差阈值为rtol=0.002、atol=0.0002；4K/8K用于稳态性能比较。
-每次结论绑定本次生成的ASC和库、输入与设备，采样与全输出验证分别标明。
+每次结论绑定本次生成的ASC和库、输入与设备，采样与全输出验证分别标明。性能目标为同卡设备时间不慢于ACLNN（时间比≤1.00）；BQ128仍可显式选择，其历史性能不能代替当前默认政策的资格。
+
+当前重复 PIPE_V 屏障的事实、原因及后续验收要求见
+[待处理的性能问题](deferred-optimizations.md)。本轮保留该问题，尚未实现去重。
 
 runner能接受某些dtype/head/tile参数不代表其全部通过。causal、mask、tail、空序列、varlen、paged/sparse、persistent及continuous多时钟状态不在默认例资格内。后续变体应通过通用控制/访问合同表达，不创建attention专属pass。
 

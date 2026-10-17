@@ -288,7 +288,7 @@ def test_compound_physical_slot_short_children_and_long_children_match_trace():
 def test_default_flash_attention_closes_in_compact_actual_fragment_families():
     result = dependencies(attention_target)
     result.require_closed()
-    assert result.work.native_templates == 44
+    assert result.work.native_templates == 52
     assert result.work.projected_accesses < 500
     assert result.work.cells < 200
     assert result.work.needs < 1500

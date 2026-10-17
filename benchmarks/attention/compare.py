@@ -1,12 +1,11 @@
 """Qualify three independent Attention profile batches against ACLNN.
 
 Uses device task time, identical inputs/contracts and artifact hashes. Failure
-of the default 1.05 time ratio is a failed performance target, never a warning
+of the default 1.00 time ratio is a failed performance target, never a warning
 that can silently become success. Overlapping batch ranges remain unresolved.
 """
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from statistics import median
@@ -14,9 +13,41 @@ from statistics import median
 from ascendflow.diagnostics import require
 from ascendflow.performance import profile_evidence
 from benchmarks.artifacts import verified_source
+from benchmarks.attention.contract import AttentionPolicy
+from benchmarks.attention.run import load_backend
 
 
-def qualification(generated, reference, *, max_ratio=1.05):
+def artifact_identity(record, case, variant):
+    artifact = record["artifact"]
+    require(
+        artifact["backend"] == case["backend"] == variant
+        and artifact["library"] == case["library"]
+        and artifact["shared_sha256"] == case["shared_sha256"],
+        "artifact/record mismatch",
+    )
+    if variant == "aclnn":
+        # Installed ACLNN has library identities, not a generated ASC manifest.
+        current = load_backend(None, "aclnn", policy=AttentionPolicy(**record["policy"]))
+        require(artifact == current.identity, "ACLNN libraries or adapter changed")
+        require(
+            case["reference_opapi_sha256"] == artifact["shared_sha256"],
+            "ACLNN library/record mismatch",
+        )
+        return None, artifact["shared_sha256"], artifact["adapter_sha256"]
+    manifest = json.loads(Path(case["library"]).with_suffix(".compile.json").read_text())
+    source = verified_source(manifest)
+    require(
+        str(source.resolve()) == artifact["compiled_source"]
+        and manifest["source_sha256"]
+        == artifact["compiled_source_sha256"]
+        == case["compiled_source_sha256"]
+        and manifest["shared_sha256"] == case["shared_sha256"],
+        "artifact/record mismatch",
+    )
+    return case["compiled_source_sha256"], case["shared_sha256"], None
+
+
+def qualification(generated, reference, *, max_ratio=1.0):
     require(
         len(generated) >= 3 and len(reference) == len(generated), "three paired batches required"
     )
@@ -37,7 +68,7 @@ def qualification(generated, reference, *, max_ratio=1.05):
     }
 
 
-def compare(directory, *, max_ratio=1.05):
+def compare(directory, *, max_ratio=1.0):
     directory = Path(directory).resolve()
     trials = {"generated": [], "aclnn": []}
     identity, source_identity = None, {}
@@ -45,9 +76,14 @@ def compare(directory, *, max_ratio=1.05):
     for path in sorted(directory.glob("trial-*/*/summary.json")):
         variant = path.parent.name
         require(variant in trials, "unexpected profile backend")
-        device = json.loads((path.parent / "device/device.json").read_text())
+        record = json.loads((path.parent / "device/device.json").read_text())
         summary = json.loads(path.read_text())
-        require(device["backend"] == variant, "profile/backend mismatch")
+        require(record["backend"] == variant, "profile/backend mismatch")
+        require(
+            record["status"] == "passed" and len(record["cases"]) == 1,
+            "each profiling run requires exactly one completed numerical case",
+        )
+        device = record["cases"][0]
         contract = tuple(
             json.dumps(device[key], sort_keys=True)
             for key in (
@@ -65,8 +101,8 @@ def compare(directory, *, max_ratio=1.05):
         )
         contract += (
             tuple(device["argument_sha256"][key] for key in ("q", "k", "v")),
-            device["health"]["physical_device"],
-            device["hardware"]["platform_sha256"],
+            record["health"]["physical_device"],
+            record["hardware"]["platform_sha256"],
         )
         require(
             identity is None or identity == contract, "profile input/math/hardware contracts differ"
@@ -75,35 +111,17 @@ def compare(directory, *, max_ratio=1.05):
         require(
             device["inputs_unchanged"] and device["guards_checked"], "missing input/guard checks"
         )
-        manifest = json.loads(Path(device["library"]).with_suffix(".compile.json").read_text())
-        verified_source(manifest)
-        require(
-            manifest["source_sha256"] == device["compiled_source_sha256"]
-            and manifest["shared_sha256"] == device["shared_sha256"],
-            "artifact/record mismatch",
-        )
-        key = (
-            device["compiled_source_sha256"],
-            device["shared_sha256"],
-            device.get("reference_opapi_sha256"),
-        )
+        key = artifact_identity(record, device, variant)
         require(
             source_identity.setdefault(variant, key) == key,
             "one backend changed code across batches",
         )
-        if variant == "aclnn":
-            from ascendflow.backend.cann import CANN
-
-            require(
-                hashlib.sha256((CANN / "lib64/libopapi.so").read_bytes()).hexdigest() == key[-1],
-                "ACLNN library changed",
-            )
         require(len(summary["operators"]) == 1, "one device kernel per launch required")
         kernel, operator = next(iter(summary["operators"].items()))
         evidence = profile_evidence(
             path.parent,
             summary,
-            physical=device["health"]["physical_device"],
+            physical=record["health"]["physical_device"],
             warmup=device["warmup"],
             repeats=device["repeats"],
             kernel=kernel,
@@ -142,7 +160,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profiles", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--max-ratio", type=float, default=1.05)
+    parser.add_argument("--max-ratio", type=float, default=1.0)
     args = parser.parse_args()
     result = compare(args.profiles, max_ratio=args.max_ratio)
     args.output.parent.mkdir(parents=True, exist_ok=True)

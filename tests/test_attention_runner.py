@@ -75,11 +75,14 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
         name, shape, dtype, extent = tensor.name, tensor.shape, tensor.dtype, tensor.extent
         operands = "" if extent is None else "%" + extent.lower()
         types = "" if extent is None else "index"
-        nbytes = tensor.fixed_bytes
+        nbytes = tensor.fixed_bytes if extent is None else tensor.bytes_per_extent
+        count_scale = (
+            "" if extent is None else f", count_scale=#builtin.int<{tensor.bytes_per_extent}>"
+        )
         physical.append(
             f'%{name} = "npu.buffer"({operands}) {{sym_name="{name}", nbytes=#builtin.int<{nbytes}>, '
-            f"external=#builtin.int<1>, initialized=#builtin.int<{int(name in {'Q', 'K', 'V'})}>, "
-            f'count_scale=#builtin.int<{tensor.bytes_per_extent}>}} : ({types}) -> !npu.ref<"GM", "{dtype}", "linear">'
+            f"external=#builtin.int<1>, initialized=#builtin.int<{int(name in {'Q', 'K', 'V'})}>"
+            f'{count_scale}}} : ({types}) -> !npu.ref<"GM", "{dtype}", "linear">'
         )
         dimensions = ", ".join(f"#builtin.int<{n}>" for n in shape)
         axes = "#builtin.int<2>" if extent else ""
@@ -94,10 +97,8 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
         "chunk",
         "p1",
         "v1",
-        "qa",
-        "pa",
-        "kb",
-        "vb",
+        *(("qa", "pa") if policy.query_tile == 128 else ("a0",)),
+        "b0",
         "c0",
         "score_in",
         *(("score_work",) if policy.query_tile == 128 else ()),
@@ -331,7 +332,7 @@ def test_reusing_generated_artifact_never_builds_and_records_its_own_identity(ar
     assert identity["library"] == str(artifact / "attention_target.so")
     assert identity["shared_sha256"] == run.sha256((artifact / "attention_target.so").read_bytes())
     assert identity["launcher_parameters"][3:5] == ("arg_Score", "arg_P")
-    assert identity["contract"]["buffers"]["score"]["fixed_bytes"] == 20971520
+    assert identity["contract"]["buffers"]["score"]["fixed_bytes"] == 41943040
     origin = identity["source_build"]
     assert origin["pipeline"] == "structured-regions"
     assert origin["verification_mode"] == "generated-lifetimes"
@@ -344,10 +345,12 @@ def test_reusing_generated_artifact_never_builds_and_records_its_own_identity(ar
     assert "not kernel-only" in result["timing_scope"]
 
 
-def test_bq128_artifact_without_a_bm_symbol_remains_loadable(artifact):
+def test_bq128_artifact_without_a_bm_symbol_remains_loadable(tmp_path):
     # Saved source IR describes tensors, not the current Python constexpr list.
+    policy = AttentionPolicy(query_tile=128)
+    artifact = publish(tmp_path / "bq128", policy=policy)
     assert "BM" not in (artifact / "source.xdsl").read_text()
-    contract = run.generated_contract(artifact)
+    contract = run.generated_contract(artifact, policy=policy)
     assert contract["specialization"]["BQ"] == contract["specialization"]["BM"] == 128
     assert contract["buffers"]["score"]["fixed_bytes"] == 20971520
 
@@ -642,7 +645,7 @@ def test_each_selected_policy_matches_actual_ir_and_reaches_public_specialize(
         **{
             name: {
                 "core": "aiv",
-                "bytes": {"UB": 182400 if policy.query_tile == 128 else 183424},
+                "bytes": {"UB": 184192 if policy.query_tile == 128 else 187264},
             }
             for name in ("aiv0", "aiv1")
         },
@@ -669,8 +672,9 @@ def test_bq256_local_geometry_keeps_native_rows_and_reuses_score_storage():
     footprints = AttentionPolicy(query_tile=256).local_footprints
     assert footprints[0] == ((2, 128, 128), "f16", "L1", "NZ")
     assert footprints[2] == ((2, 2, 128, 128), "f16", "L1", "NZ")
-    assert footprints[4:6] == (((128, 128), "f16", "L0A", "ZZ"),) * 2
-    assert footprints[8] == ((2, 128, 128), "f32", "L0C", "NZ")
+    assert footprints[4] == ((2, 128, 128), "f16", "L0A", "ZZ")
+    assert footprints[5] == ((2, 128, 128), "f16", "L0B", "ZN")
+    assert footprints[6] == ((2, 128, 128), "f32", "L0C", "NZ")
     assert ((8, 1024), "f32", "UB", "linear") not in footprints
 
 
@@ -720,7 +724,7 @@ def test_bq256_rejects_stale_source_or_physical_local_storage(tmp_path, field):
         run.load_backend(artifact, "generated", policy=policy)
 
 
-@pytest.mark.parametrize("policy", POLICIES[1:])
+@pytest.mark.parametrize("policy", [p for p in POLICIES if p != run.DEFAULT_POLICY])
 def test_default_artifact_cannot_be_relabelled_as_another_policy(artifact, policy):
     with pytest.raises(CompileError, match="policy differs"):
         run.main(["--output", str(artifact), "--physical", "0", *policy_arguments(policy)])
@@ -782,11 +786,11 @@ def test_selected_policy_checks_actual_allocation_integer_overflow(tmp_path):
     # Each Sk element needs 256 bytes for MQA, while Q/O retain 2048 bytes/Sq.
     safe_sk = ((2**63 - 1) // 256 // 1024) * 1024
     args = run.parse_args(
-        ["--output", str(tmp_path), "--kv-heads", "1", "--cases", f"128:{safe_sk}"]
+        ["--output", str(tmp_path), "--kv-heads", "1", "--cases", f"256:{safe_sk}"]
     )
     assert args.policy.kv_heads == 1
     with pytest.raises(CompileError, match="allocation bytes exceed"):
-        run.parse_args(["--output", str(tmp_path), "--cases", f"128:{safe_sk}"])
+        run.parse_args(["--output", str(tmp_path), "--cases", f"256:{safe_sk}"])
 
 
 def mock_execution(monkeypatch, policy, *, actual_value=1.25, expected_value=1.25):
@@ -980,7 +984,7 @@ def test_runtime_uses_original_dtype_tolerance_without_adaptation(tmp_path, monk
         "--physical",
         "0",
         "--cases",
-        "128:1024",
+        f"{policy.query_tile}:1024",
         "--scope",
         "sampled",
         *policy_arguments(policy),
@@ -1007,7 +1011,7 @@ def test_wrong_oracle_allocation_is_rejected_before_health_or_acl(tmp_path, monk
                 "--physical",
                 "0",
                 "--cases",
-                "128:1024",
+                f"{policy.query_tile}:1024",
                 *policy_arguments(policy),
             ]
         )

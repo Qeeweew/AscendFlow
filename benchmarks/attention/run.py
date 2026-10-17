@@ -316,9 +316,10 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
             buffer.parent_op() is root
             and buffer.ref.type.bank.data == "GM"
             and buffer.ref.type.dtype.data == dtype
-            and buffer.nbytes.data == tensor.fixed_bytes
-            and buffer.count_scale is not None
-            and buffer.count_scale.data == tensor.bytes_per_extent
+            and buffer.nbytes.data
+            == (tensor.fixed_bytes if extent is None else tensor.bytes_per_extent)
+            and (0 if buffer.count_scale is None else buffer.count_scale.data)
+            == tensor.bytes_per_extent
             and buffer.initialized.data == int(name in {"Q", "K", "V"})
             and buffer.extent_count is (None if extent is None else sizes[extent].value),
             f"compiled attention physical extent/type differs for {name}",

@@ -392,7 +392,7 @@ def test_real_attention_math_and_descriptors_reach_verified_source_ir(continuous
 
     source = attention_target(continuous=continuous).to_ir()
     source.verify()
-    assert sum(isinstance(op, MatmulOp) for op in source.walk()) == 2
+    assert sum(isinstance(op, MatmulOp) for op in source.walk()) == 4
     assert sum(isinstance(op, ReduceOp) for op in source.walk()) == 2
     assert sum(isinstance(op, PipelineOp) for op in source.walk()) == 5
     assert any(

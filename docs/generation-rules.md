@@ -89,6 +89,12 @@ ID，并保留双方实际参与者的原始 edges。复用理由是对物理 li
 两个 AIV 只有一份 body。UB 和本地 bank 仍逐 actor 私有；mode-2 ready 要两个
 receiver 都消费，release 要两个实际 reader 都贡献。少一个成员由域准入拒绝。
 
+不同 Cube native 可以对应两个 AIV 的分片。只有 Vector 端点相同、Cube 端点的
+激活域和实际坐标相同、且在每个原始 requirement 前提下都能比较 Cube 发射顺序时，
+合并为一个 quorum：发布选最后 Cube native 后的累计完成前缀，获取选首个 Cube
+consumer 前的 queue Wait。两个 AIV 的原始 lifetime edges 全部保留；配对、阶段序
+和 cell credit 仍检查合并后的实际位置，无法比较顺序或缺少参与者仍拒绝。
+
 ## 4. 无稳定 cell 的通知
 
 真正 streaming 地址之间没有物理 slot 可提供上述归纳。它们使用明确的有限使用
