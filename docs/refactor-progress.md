@@ -11,6 +11,11 @@
 `runs/generation-redesign/incoming/`。独立 pre-sync 对照已集成；临时 generation_order
 原型已由当前规则替换，没有复制进 legacy。实际提交身份以产品 Git 为准。
 
+本页最终执行证据对应代码提交 `1286a783271ab123a430440e6e306140944df744`，
+前两个实施提交为 `bf36729`、`0fc4923`。实际 Python package tree SHA256 为
+`eebbf12fe2ad23afb8609e471de46d4793a18b9674efbf4644a077c2dda6a297`；
+本页后续文档提交不改变该代码身份。
+
 外层没有 Git，未创建根 Git；reference、旧 TileLang 工作区和容器没有修改或重建。
 CATLASS、ops-transformer、ops-nn 的实际 HEAD 已再次核对，见 [source-notes.md](source-notes.md)。
 
@@ -46,7 +51,12 @@ CATLASS、ops-transformer、ops-nn 的实际 HEAD 已再次核对，见 [source-
 positive 测试（prefix、循环内 allocation）。现已明确它们的拒绝边界，并修正
 一个未对齐 alias fixture，使其实际触发 alias 检查。没有把这些拒绝算成 DSL 支持。
 
-最终全套回归和冻结产物记录正在生成，完成后在本页补齐。
+最终全套为 **1617 passed in 158.19s**，包含 child boundary 事实复用回归。
+日志为 [qualified-tests.log](../../runs/generation-redesign/qualified-tests.log)，SHA256 为
+`dd57821a5a0362acfca8f8917db6ffa2b646e3f7f8c7d0438508886631681b3d`。
+Ruff 和 `git diff --check` 通过。汇总身份与结果见
+[evidence.json](../../runs/generation-redesign/qualified/evidence.json)；其整体状态为
+`incomplete`，功能/离线检查为 `passed`，不能据此宣称耗时资格或设备资格通过。
 
 ## 当前编译证据与计时边界
 
@@ -54,22 +64,79 @@ positive 测试（prefix、循环内 allocation）。现已明确它们的拒绝
 source→ASC 包含源码读取/构造、全部分析/化简/输出和内部快照；import、进程总耗时、
 文件发布和 CANN 分别记录。没有跨编译结果缓存。
 
-冻结前的公共源码构建已取得四项 IR/ASC/对象/库（`runs/generation-redesign/qualification/`）：
+最终四项均从公共 Python 源码取得同步前后 IR、可读 ASC、`.o`、`.aibin` 和 `.so`。
+构建清单为 [source-builds.json](../../runs/generation-redesign/qualified/qualification/source-builds.json)，
+冷进程测量为 [source-to-asc.json](../../runs/generation-redesign/qualified/cold/source-to-asc.json)。
+每项构建使用现有进程组硬期限，覆盖 Python 构造至 CANN，总计上限 300 秒。
 
-| 算子 | Python 内部编译 | CANN | 状态 |
-|---|---:|---:|---|
-| Vector scale，B64 | 0.307s | 5.348s | 离线编译通过 |
-| 默认 batched GEMM | 0.561s | 5.417s | 离线编译通过 |
-| examples/cv/nested.py | 0.954s | 5.696s | 离线编译通过 |
-| 默认 FA | 11.507s | 8.965s | 离线编译通过 |
+| 算子 | 单次冷 source→ASC | import | 冷进程总耗时 | 独立构建的 CANN | 独立构建总耗时 |
+|---|---:|---:|---:|---:|---:|
+| Vector scale，B64 | 0.4948s | 0.3462s | 1.0179s | 5.3526s | 5.8865s |
+| 默认 batched GEMM | 0.7015s | 0.3494s | 1.2684s | 5.3354s | 6.0908s |
+| examples/cv/nested.py | 1.0455s | 0.3472s | 1.6178s | 5.5951s | 6.6996s |
+| 默认 FA | **10.4814s** | 0.3464s | 11.0821s | 8.9355s | 19.9849s |
 
-上述 Python 内部时间不包括源码构造，不能充当完整冷编译时间。之后修复了完整
-credit 台账、共享 view/实际位置事实和精确整数系数；最终资格将绑定保存后的提交。
+冷测量与 CANN 构建属于不同进程，表中两类时间不直接相加。两者的 source、
+source IR、同步前后 IR 和 ASC hashes 已逐项核对相同；实际库与 CANN 清单一致。
+ASC 使用 `dav-2201`、`-O2 -fPIC -std=c++20` 和
+`-mllvm -cce-aicore-dcpreload-args=false`，完整实际命令、编译器版本和产物
+hashes 保存在每个算子的 `*.compile.json`。
 
-完整 source→ASC 单次 probe `fa-coefficient-probe` 为 **10.6469s**；此前
-`fa-current-probe` 为 67.5209s（47.2971s 在旧的逐端点队列准入），均是各自源码的
-真实成功 ASC 构建。带 cProfile 的 74.5243s 仅作诊断，不能当冷编译成绩。
-当前未达到五次 p50≤5s、max≤10s，未执行五次，不降低门槛。
+默认 FA 的 [source IR](../../runs/generation-redesign/qualified/qualification/fa-default/source.xdsl)、
+[同步前 IR](../../runs/generation-redesign/qualified/qualification/fa-default/before.xdsl)、
+[同步后 IR](../../runs/generation-redesign/qualified/qualification/fa-default/after.xdsl)、
+[ASC](../../runs/generation-redesign/qualified/qualification/fa-default/attention_target.asc)
+和 [CANN 清单](../../runs/generation-redesign/qualified/qualification/fa-default/attention_target.compile.json)
+均已保存。ASC SHA256 为
+`b8bd67c607f9dacf883fb313e65fc76ff22142c6175acda6806d5bdc6cb05b7e`。
+其余算子的对应产物在同级 `vector/`、`gemm/`、`nested-cv/` 目录。
+直接审查的 ASC 保留 `__mix__(1,2)`、runtime sub-block ID 和共享 Vector body，
+无 `PIPE_ALL`；native 模板数与实际打印数一致。
+
+以上各算子只做一次冷进程 probe。**默认 FA 未达到 p50≤5s、max≤10s 的目标，
+没有执行五次耗时验收，也不能从单次数据推出 p50。** 文件发布另计约 1–2ms。
+此前 `fa-coefficient-probe` 的 10.6469s、其他阶段的 14.2963s/67.5209s
+来自各自不同快照；不能混成当前五次成绩。带 cProfile 的 74.5243s 只作历史诊断。
+
+## 默认 FA 的当前工作量和耗时来源
+
+以下均来自上述最终冷测量，不使用旧 solver 的失败预算或历史 profile 解释当前耗时。
+
+| 当前工作 | 秒 | 具体规模或操作 |
+|---|---:|---|
+| endpoint domains | 1.9026 | 453 组端点 guard；1162 次坐标往返；2702 次配对蕴含查询 |
+| notification binding | 1.2768 | 526 条 retained requirements，绑定并合并实际捕获/获取为 264 条通知（含 fence） |
+| queue order | 0.8888 | 7 个 region，累计 662 个位置、354 个保留边界、5113 条边界传递关系 |
+| credit lifetimes | 0.8098 | 161 个 cell 分片组成 69 个 physical credit；同 occurrence 分片域检查 |
+| dependencies | 1.0797 | 249 个投影访问、90 个 cell、726 条诊断 needs，其中 loop carries 485 条 |
+| bounds / admission | 1.2689 | 43 个 view/45 个 domain 合同；89 个 read proofs、90 个初始化覆盖检查 |
+| materialize / scalar simplification | 1.3487 | 445 个计划动作及其有序 guard 的 SSA 构造和化简 |
+| event banks | 0.2574 | 消费既有生命周期、检查新增 ID 共享，12 个 mode-2 ID（0..11） |
+| lowering、构造、快照、输出及其余工作 | 1.6489 | 最终 ASC 445929 字节；无 runtime 迭代展开 |
+
+源码只有 44 个 native 模板、6 个循环，但分析对象仍按物理参与者、cell、
+首末/loop-carried 分片和实际 activation 域细分。69 个 credit 的合并发生在域
+建立之后，尚未减少前面按通知做的全部域工作。绑定阶段还枚举已有 acquire
+候选并做实际次序比较；queue order 逐层枚举相关 Wait/Set，逐保留边界建立
+有限可达摘要。父层消费子层边界，不重开子层路径，但摘要本身仍较密：
+累计 zero/positive relations 为 5888/2172，summary visits 为 13263。
+
+因此同步生成加分配为 5.1353s（总计约 49%），耗时分散在符号域、次序和
+分片处理；不再是旧 Path 搜索触预算。上述计数是操作次数，不代表每次查询
+成本相同；当前快照没有函数级 profile，不能据此声称已量出底层算术热点。
+后续要降低不必要的分片/端点/边界关系及重复符号变换，须保持原式定义性、
+实际配对、全部 reader release 和新增资源约束，不能删检查或只缓存旧查询。
+
+其他三个算子的实测规模如下：
+
+| 算子 | native 模板 | needs / retained | notifications | cell credits | plan actions |
+|---|---:|---:|---:|---:|---:|
+| Vector B64 | 3 | 12 / 8 | 8 | 8 | 22 |
+| GEMM | 6 | 36 / 24 | 20 | 20 | 48 |
+| 嵌套 CV | 8 | 60 / 44 | 28 | 28 | 76 |
+
+默认 FA 的 window constructions 和 streaming rings 都为 0；参数化 body 没有
+按 runtime 长度展开。其他 streaming 规则有独立回归，不能把该计数推广为所有算子。
 
 ## 支持与具体拒绝
 
@@ -81,6 +148,26 @@ Cube/Fixpipe、参数化嵌套和相邻循环、共享双 AIV CV 以及本页默
 数据相关控制、无范围的 scalar carry、未封闭的多时钟/稀疏 activation、prefix native
 地址、循环内 allocation、continuous FA 状态边界仍不宣称支持。没有全局 barrier、
 额外搬运、减少 overlap、调大旧 solver 预算或 FA 名称/shape 特判。
+其他 FA constexpr 变体没有本次完整资格；未做设备数值验证或性能测量，不能
+宣称相对 AscendC/ACLNN 没有性能损失。
+
+## 复现
+
+工作区根运行，使用独立 `.venv`；产物留外层。以下每条实际算子构建都有 300 秒总期限：
+
+```sh
+PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m xdsl_npu.cli --input compiler/examples/vector/scale.py --entry scale --parameters '{"B":64}' --output runs/reproduce/vector --shared --timeout 300
+PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m xdsl_npu.cli --input compiler/examples/gemm/batched.py --entry batched_matmul --output runs/reproduce/gemm --shared --timeout 300
+PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m xdsl_npu.cli --input compiler/examples/cv/nested.py --entry nested_cv --output runs/reproduce/nested-cv --shared --timeout 300
+PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m xdsl_npu.cli --input compiler/examples/flash_attention/attention.py --entry attention_target --output runs/reproduce/fa --shared --timeout 300
+PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m benchmarks.compile --input compiler/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output runs/reproduce/fa-cold
+```
+
+上面的 `--trials 1` 复现单次诊断，不是五次验收。全套回归在 `compiler/` 下运行：
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 ../.venv/bin/python -m pytest -q --tb=short --basetemp=/workspace/xdsl-910b/runs/generation-redesign/qualified-test-tmp -o cache_dir=/workspace/xdsl-910b/runs/generation-redesign/pytest-cache
+```
 
 ## 历史失败只作溯源
 
