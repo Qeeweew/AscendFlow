@@ -1,12 +1,12 @@
 """Native reader retirement and source-value bindings on structured dependencies."""
 
+from ascendflow import language as N
+from ascendflow.analysis.hazards import HazardKind
+from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.target.ascend910b import Actor, Engine, Milestone
 from tests.analysis.test_structured_dependencies import materialized_edges
-from xdsl_npu import language as N
-from xdsl_npu.analysis.hazards import HazardKind
-from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.target.ascend910b import Actor, Engine, Milestone
 
 
 def dependencies(source):

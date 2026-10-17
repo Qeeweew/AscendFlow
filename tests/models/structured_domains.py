@@ -10,11 +10,11 @@ edge. Finite enumeration here is not a general symbolic proof.
 
 from xdsl.dialects import arith, scf
 
-from xdsl_npu.analysis.access_frontier import LoopResidueSelection
-from xdsl_npu.analysis.structured_regions import BranchGuard, LoopCountGuard, LoopOrdinalGuard
-from xdsl_npu.dialects.physical import TaskOp
-from xdsl_npu.dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
-from xdsl_npu.target.ascend910b import Actor
+from ascendflow.analysis.access_frontier import LoopResidueSelection
+from ascendflow.analysis.structured_regions import BranchGuard, LoopCountGuard, LoopOrdinalGuard
+from ascendflow.dialects.physical import TaskOp
+from ascendflow.dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
+from ascendflow.target.ascend910b import Actor
 
 
 def expression_value(value, values):

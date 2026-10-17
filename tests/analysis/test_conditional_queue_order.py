@@ -9,25 +9,25 @@ from dataclasses import replace
 
 import pytest
 
-from tests.models.structured_domains import actual_dispatch
-from xdsl_npu import language as N
-from xdsl_npu.analysis.access_frontier import AccessEndpoint
-from xdsl_npu.analysis.event_contracts import ResourceWork
-from xdsl_npu.analysis.event_domains import EventCase, EventDomains
-from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
-from xdsl_npu.analysis.structured_dispatch import bind_structured_dispatch
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.analysis.structured_protocols import (
+from ascendflow import language as N
+from ascendflow.analysis.access_frontier import AccessEndpoint
+from ascendflow.analysis.event_contracts import ResourceWork
+from ascendflow.analysis.event_domains import EventCase, EventDomains
+from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.analysis.structured_protocols import (
     BoundPlacement,
     LogicalNotification,
     NotificationKind,
     SynchronizationSelection,
 )
-from xdsl_npu.analysis.structured_regions import AccessOccurrence, LoopBinding
-from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison, Placement
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.scalar import Expr, expression, literal
-from xdsl_npu.target.ascend910b import Actor
+from ascendflow.analysis.structured_regions import AccessOccurrence, LoopBinding
+from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.scalar import Expr, expression, literal
+from ascendflow.target.ascend910b import Actor
+from tests.models.structured_domains import actual_dispatch
 
 
 def domains_for(source):

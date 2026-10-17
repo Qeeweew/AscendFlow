@@ -4,14 +4,14 @@ from dataclasses import replace
 
 import pytest
 
+from ascendflow.analysis import native
+from ascendflow.analysis.native import NativeContract
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.diagnostics import CompileError
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.target.ascend910b import Engine
+from ascendflow.target.packets import MaskStep, NativePacket, audited_packet
 from examples.vector.scale import scale
-from xdsl_npu.analysis import native
-from xdsl_npu.analysis.native import NativeContract
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.target.ascend910b import Engine
-from xdsl_npu.target.packets import MaskStep, NativePacket, audited_packet
 
 
 @pytest.mark.parametrize(

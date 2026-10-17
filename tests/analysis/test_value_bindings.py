@@ -12,21 +12,21 @@ from xdsl.dialects import arith
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp
 from xdsl.ir import Block, Region
 
-from xdsl_npu import language as N
-from xdsl_npu.analysis import value_bindings
-from xdsl_npu.analysis.value_bindings import (
+from ascendflow import language as N
+from ascendflow.analysis import value_bindings
+from ascendflow.analysis.value_bindings import (
     LastTile,
     TileDefinition,
     ValueScope,
     bind_values,
 )
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.dialects.loops import LoopScheduleAttr
-from xdsl_npu.dialects.physical import BufferOp, EndOp, TaskOp, task_attrs
-from xdsl_npu.dialects.source import CopyOp, DomainOp, ElementOp, PipelineOp, StageOp
-from xdsl_npu.dialects.structured import PipelineLoopOp
-from xdsl_npu.dialects.types import TaskType, ref_type
-from xdsl_npu.passes.native_recipes import NativeRead, RecipeResult
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.dialects.loops import LoopScheduleAttr
+from ascendflow.dialects.physical import BufferOp, EndOp, TaskOp, task_attrs
+from ascendflow.dialects.source import CopyOp, DomainOp, ElementOp, PipelineOp, StageOp
+from ascendflow.dialects.structured import PipelineLoopOp
+from ascendflow.dialects.types import TaskType, ref_type
+from ascendflow.passes.native_recipes import NativeRead, RecipeResult
 
 STAGED = """
 def staged(X:N.Tensor((3,64),N.f32)):

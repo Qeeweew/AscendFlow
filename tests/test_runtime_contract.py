@@ -14,15 +14,15 @@ import pytest
 from xdsl.dialects.builtin import IntAttr
 from xdsl.utils.exceptions import VerifyException
 
+from ascendflow import compile
+from ascendflow import language as T
+from ascendflow.dialects.io import parse
+from ascendflow.dialects.physical import RuntimeSizeOp
+from ascendflow.dialects.source import SizeOp
+from ascendflow.frontend import FrontendError
 from examples.state.grouped import grouped_state_sum
 from examples.vector.scale import scale
 from tests.fixtures.source_programs import cv_source
-from xdsl_npu import compile
-from xdsl_npu import language as T
-from xdsl_npu.dialects.io import parse
-from xdsl_npu.dialects.physical import RuntimeSizeOp
-from xdsl_npu.dialects.source import SizeOp
-from xdsl_npu.frontend import FrontendError
 
 
 def contract_source(*, minimum=1, multiple=4):

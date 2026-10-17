@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Runtime dimensions in annotations are captured by the DSL frontend.
 # ruff: noqa: F821
-from xdsl_npu import language as N
+from ascendflow import language as N
 
 
 @N.prim_func(disjoint_external=True)

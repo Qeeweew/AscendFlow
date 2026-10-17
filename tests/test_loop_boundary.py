@@ -4,10 +4,10 @@ from dataclasses import replace
 
 import pytest
 
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
 from examples.gemm.reduction import reduction_gemm
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
 
 
 def test_first_clear_does_not_initialize_other_ring_slots():

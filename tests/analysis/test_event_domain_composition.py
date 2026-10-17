@@ -21,7 +21,7 @@ def nested(X:N.Tensor((n,2,64),N.f32),n:N.int64):
 
 @pytest.fixture(scope="module")
 def domains():
-    from xdsl_npu.analysis.event_families import build_event_family
+    from ascendflow.analysis.event_families import build_event_family
 
     result = prepared(selected(NESTED))
     # Test the window rule explicitly. Stable cell credits in normal

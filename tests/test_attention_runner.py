@@ -9,9 +9,9 @@ from types import SimpleNamespace
 import pytest
 from xdsl.utils.exceptions import VerifyException
 
+from ascendflow.diagnostics import CompileError
 from benchmarks.attention import run
 from benchmarks.attention.contract import AttentionPolicy
-from xdsl_npu.diagnostics import CompileError
 
 GENERATED_ORDER = ("Q", "K", "Score", "P", "V", "PV", "O")
 POLICIES = tuple(
@@ -42,8 +42,8 @@ def generated_source(order=GENERATED_ORDER):
 
 
 def test_runner_uses_the_actual_compiler_launcher_parameter_names():
-    from xdsl_npu import compile
-    from xdsl_npu import language as N
+    from ascendflow import compile
+    from ascendflow import language as N
 
     parameters = ",".join(f"{name}:N.Tensor((64,),N.f32)" for name in GENERATED_ORDER)
     source = N.from_source(f"""

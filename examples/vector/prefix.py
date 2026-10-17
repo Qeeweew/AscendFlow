@@ -6,7 +6,7 @@ padded to the pipeline tile. The launch contract requires min(n, m) % 8 == 0.
 
 from __future__ import annotations
 
-from xdsl_npu import language as N
+from ascendflow import language as N
 
 
 @N.prim_func(disjoint_external=True)

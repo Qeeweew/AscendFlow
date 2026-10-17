@@ -5,9 +5,9 @@ from collections import Counter
 
 import pytest
 
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.source import AllocationOp
 from tests.fixtures.attention_target import activation_trace, attention_target, target_source
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.source import AllocationOp
 
 
 def tree(mode):

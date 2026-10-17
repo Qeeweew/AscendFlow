@@ -7,11 +7,10 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp, i64
 from xdsl.utils.exceptions import VerifyException
 
-from tests.fixtures.attention_target import attention_target
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.source import (
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.source import (
     AllocationOp,
     PipelineOp,
     ProgramOp,
@@ -20,8 +19,9 @@ from xdsl_npu.dialects.source import (
     ViewOp,
     YieldOp,
 )
-from xdsl_npu.frontend import FrontendError
-from xdsl_npu.frontend import builders as source_builders
+from ascendflow.frontend import FrontendError
+from ascendflow.frontend import builders as source_builders
+from tests.fixtures.attention_target import attention_target
 
 BNSD_COPY = """
     def tiled(X: N.Tensor((B,H,S,D),N.f32),
@@ -388,7 +388,7 @@ def test_view_checks_scope_dominance_across_stages():
 
 @pytest.mark.parametrize("continuous", [False, True])
 def test_real_attention_math_and_descriptors_reach_verified_source_ir(continuous):
-    from xdsl_npu.dialects.source import ElementOp, MatmulOp, ReduceOp
+    from ascendflow.dialects.source import ElementOp, MatmulOp, ReduceOp
 
     source = attention_target(continuous=continuous).to_ir()
     source.verify()

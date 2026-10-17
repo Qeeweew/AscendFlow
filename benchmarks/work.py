@@ -10,9 +10,9 @@ from collections import Counter
 from xdsl.dialects import scf
 from xdsl.dialects.builtin import ModuleOp
 
-from xdsl_npu.diagnostics import require
-from xdsl_npu.dialects.physical import BufferOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
-from xdsl_npu.dialects.structured import (
+from ascendflow.diagnostics import require
+from ascendflow.dialects.physical import BufferOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
+from ascendflow.dialects.structured import (
     ActorDomainOp,
     NotificationOp,
     PipelineLoopOp,

@@ -7,17 +7,17 @@ from xdsl.dialects import scf
 from xdsl.dialects.builtin import IntAttr
 from xdsl.utils.exceptions import VerifyException
 
-from examples.vector.scale import scale
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.dialects.io import create_context, dump, parse
-from xdsl_npu.dialects.loops import LoopScheduleAttr, PhaseKind
-from xdsl_npu.dialects.source import PipelineOp, StageOp
-from xdsl_npu.passes.lower_pipeline import (
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.dialects.io import create_context, dump, parse
+from ascendflow.dialects.loops import LoopScheduleAttr, PhaseKind
+from ascendflow.dialects.source import PipelineOp, StageOp
+from ascendflow.passes.lower_pipeline import (
     SCHEDULE_ATTRIBUTE,
     LowerPipelinePass,
     normalize_loop_controls,
 )
+from examples.vector.scale import scale
 
 
 @pytest.mark.parametrize("depth", (0, 1, 2, 4, 32))

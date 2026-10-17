@@ -1,6 +1,6 @@
 """Real source fixtures for fixed-child row geometry and boundary composition."""
 
-from xdsl_npu import language as N
+from ascendflow import language as N
 
 
 @N.prim_func(disjoint_external=True)

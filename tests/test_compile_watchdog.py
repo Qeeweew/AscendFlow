@@ -8,9 +8,9 @@ from time import monotonic
 
 import pytest
 
-from xdsl_npu.backend import cann
-from xdsl_npu.build import build_file, build_module
-from xdsl_npu.runtime.process import bounded_process
+from ascendflow.backend import cann
+from ascendflow.build import build_file, build_module
+from ascendflow.runtime.process import bounded_process
 
 
 def test_operator_watchdog_stops_and_records_cpu_compilation(tmp_path):
@@ -235,7 +235,7 @@ def test_shared_command_group_rejects_an_independent_shorter_build_deadline(tmp_
     script = tmp_path / "command.py"
     script.write_text(
         "from pathlib import Path\n"
-        "from xdsl_npu.build import build_module\n"
+        "from ascendflow.build import build_module\n"
         "def construct():\n"
         f" Path({str(called)!r}).write_text('called')\n"
         " return 'reference'\n"
@@ -255,8 +255,8 @@ def test_shared_group_cann_cannot_start_an_independent_shorter_timeout(tmp_path,
     def no_spawn(*args, **kwargs):
         raise AssertionError("a rejected shared-group deadline must not launch a compiler")
 
-    monkeypatch.setenv("XDSL_NPU_BUILD_GROUP", "1")
-    monkeypatch.setenv("XDSL_NPU_BUILD_DEADLINE", str(monotonic() + 3))
+    monkeypatch.setenv("ASCENDFLOW_BUILD_GROUP", "1")
+    monkeypatch.setenv("ASCENDFLOW_BUILD_DEADLINE", str(monotonic() + 3))
     monkeypatch.setattr(cann.subprocess, "Popen", no_spawn)
     with pytest.raises(ValueError, match="must inherit the outer deadline"):
         cann.offline_compile("reference", tmp_path / "inner", "inner", timeout_s=0.05)
@@ -268,7 +268,7 @@ def source_fixture(directory):
     # repeated-loop synchronization qualification in tests/sync.
     source = directory / "definition.py"
     source.write_text("""from __future__ import annotations
-from xdsl_npu import language as N
+from ascendflow import language as N
 @N.prim_func(disjoint_external=True)
 def point(X:N.Tensor((B,),N.f32),Y:N.Tensor((B,),N.f32,access="write"),B:N.constexpr=64):
     with N.Kernel():
@@ -287,7 +287,7 @@ def test_command_watchdog_allows_one_cli_build_with_its_inherited_deadline(tmp_p
         [
             sys.executable,
             "-m",
-            "xdsl_npu.cli",
+            "ascendflow",
             "--input",
             str(source),
             "--entry",
@@ -318,7 +318,7 @@ def test_command_watchdog_cannot_leave_a_nested_cli_worker_or_its_child(tmp_path
             [
                 sys.executable,
                 "-m",
-                "xdsl_npu.cli",
+                "ascendflow",
                 "--input",
                 str(source),
                 "--entry",
@@ -335,9 +335,9 @@ def test_command_watchdog_cannot_leave_a_nested_cli_worker_or_its_child(tmp_path
 
 
 def test_file_ast_build_specializes_and_publishes_owned_source_artifacts(tmp_path):
+    from ascendflow.dialects.io import dump
+    from ascendflow.dialects.structured import NotificationOp
     from benchmarks.artifacts import read_artifact
-    from xdsl_npu.dialects.io import dump
-    from xdsl_npu.dialects.structured import NotificationOp
 
     source = source_fixture(tmp_path)
     report = build_file(source, tmp_path, entry="point", parameters={"B": 32}, timeout_s=5)
@@ -361,8 +361,8 @@ def test_file_ast_build_specializes_and_publishes_owned_source_artifacts(tmp_pat
 
 
 def test_source_only_reference_artifact_does_not_import_stale_plan_ir(tmp_path):
+    from ascendflow.diagnostics import CompileError
     from benchmarks.artifacts import read_artifact
-    from xdsl_npu.diagnostics import CompileError
 
     (tmp_path / "after.xdsl").write_text("stale compiler plan")
     report = build_module(lambda: "reference source", tmp_path, name="reference", timeout_s=2)

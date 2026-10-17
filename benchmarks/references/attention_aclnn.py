@@ -2,8 +2,8 @@
 
 import ctypes as ct
 
+from ascendflow.diagnostics import require
 from benchmarks.references.aclnn import OperatorReference
-from xdsl_npu.diagnostics import require
 
 
 class FlashAttentionReference(OperatorReference):

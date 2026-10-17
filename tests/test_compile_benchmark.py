@@ -93,11 +93,11 @@ def test_probe_modes_and_explicit_parameters_are_recorded(tmp_path, fake_trials)
 def test_worker_includes_input_construction_and_snapshot_work_before_artifact_io(
     tmp_path, monkeypatch, mode
 ):
-    import xdsl_npu
+    import ascendflow
 
     source = tmp_path / "kernel.py"
     source.write_text(
-        "from xdsl_npu import language as N\n@N.prim_func\ndef kernel(B:N.constexpr=8):\n    pass\n"
+        "from ascendflow import language as N\n@N.prim_func\ndef kernel(B:N.constexpr=8):\n    pass\n"
     )
     calls = []
 
@@ -119,7 +119,7 @@ def test_worker_includes_input_construction_and_snapshot_work_before_artifact_io
             write=write,
         )
 
-    monkeypatch.setattr(xdsl_npu, "compile", compile_definition)
+    monkeypatch.setattr(ascendflow, "compile", compile_definition)
     monkeypatch.setattr(benchmark, "_package_sha", lambda _: "package")
     metrics = benchmark.worker(
         source,

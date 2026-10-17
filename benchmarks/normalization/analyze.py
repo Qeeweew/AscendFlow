@@ -6,10 +6,10 @@ import json
 from pathlib import Path
 from statistics import median
 
+from ascendflow.diagnostics import require
+from ascendflow.performance import profile_evidence
 from benchmarks.artifacts import verified_source
 from benchmarks.work import read_work
-from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import profile_evidence
 
 
 def main():

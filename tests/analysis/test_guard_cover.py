@@ -10,17 +10,17 @@ from math import prod
 
 import pytest
 
-from xdsl_npu.analysis.guard_cover import (
+from ascendflow.analysis.guard_cover import (
     CoverLeaf,
     CoverWork,
     IntegerSplit,
     ResidueSplit,
     prove_guard_cover,
 )
-from xdsl_npu.analysis.integer_facts import IntegerFacts
-from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.scalar import Expr, Fact, expression, literal
+from ascendflow.analysis.integer_facts import IntegerFacts
+from ascendflow.analysis.structured_schedule import ActionGuard, Comparison
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.scalar import Expr, Fact, expression, literal
 
 M, P, G, X, Y = (Expr("argument", (name,)) for name in ("m", "p", "g", "x", "y"))
 WORD = expression("add", expression("mul", P, M), G)

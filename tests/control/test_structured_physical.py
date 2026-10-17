@@ -15,9 +15,9 @@ from xdsl.ir import Block, Region
 from xdsl.traits import Pure, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.loops import LoopScheduleAttr
-from xdsl_npu.dialects.physical import (
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.loops import LoopScheduleAttr
+from ascendflow.dialects.physical import (
     BufferOp,
     CoreIdOp,
     EndOp,
@@ -27,8 +27,8 @@ from xdsl_npu.dialects.physical import (
     TaskOp,
     task_attrs,
 )
-from xdsl_npu.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
-from xdsl_npu.dialects.types import AsyncEffects, TaskType, ref_type
+from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
+from ascendflow.dialects.types import AsyncEffects, TaskType, ref_type
 
 
 def index(value):

@@ -2,11 +2,11 @@
 
 import pytest
 
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.source import ProgramOp
-from xdsl_npu.indexing import validate_source_arithmetic
-from xdsl_npu.passes.lower_pipeline import normalize_loop_controls
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.source import ProgramOp
+from ascendflow.indexing import validate_source_arithmetic
+from ascendflow.passes.lower_pipeline import normalize_loop_controls
 
 
 def program(lower, upper, expression, *, step=1):

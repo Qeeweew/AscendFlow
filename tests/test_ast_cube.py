@@ -6,13 +6,13 @@ import pytest
 from xdsl.dialects.builtin import IntAttr
 from xdsl.utils.exceptions import VerifyException
 
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.source import CopyOp, MatmulOp, PipelineOp
+from ascendflow.dialects.source import ViewOp as SourceViewOp
+from ascendflow.frontend import FrontendError
 from examples.gemm.batched import batched_matmul
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.source import CopyOp, MatmulOp, PipelineOp
-from xdsl_npu.dialects.source import ViewOp as SourceViewOp
-from xdsl_npu.frontend import FrontendError
 
 
 def test_cube_bf16_uses_the_same_explicit_storage_semantics():

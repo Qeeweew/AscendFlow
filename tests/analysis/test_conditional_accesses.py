@@ -10,18 +10,18 @@ from textwrap import indent
 import pytest
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
-from xdsl_npu import language as N
-from xdsl_npu.analysis.native import AccessMode, ConditionalRead, NativeContract
-from xdsl_npu.analysis.structured_admission import admit_structured_memory
-from xdsl_npu.analysis.structured_bounds import admit_memory_bounds
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.io import dump
-from xdsl_npu.dialects.physical import TaskOp
-from xdsl_npu.dialects.structured import PipelineLoopOp, PipelineStageOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.target.ascend910b import Engine
-from xdsl_npu.target.native import NativeReadReset, native_read_resets
+from ascendflow import language as N
+from ascendflow.analysis.native import AccessMode, ConditionalRead, NativeContract
+from ascendflow.analysis.structured_admission import admit_structured_memory
+from ascendflow.analysis.structured_bounds import admit_memory_bounds
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.io import dump
+from ascendflow.dialects.physical import TaskOp
+from ascendflow.dialects.structured import PipelineLoopOp, PipelineStageOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.target.ascend910b import Engine
+from ascendflow.target.native import NativeReadReset, native_read_resets
 
 
 def _structure(body=None, *, ring=False):

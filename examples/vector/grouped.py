@@ -7,7 +7,7 @@ runtime batch/head/query descriptor needed by attention, without its math.
 
 from __future__ import annotations
 
-from xdsl_npu import language as T
+from ascendflow import language as T
 
 
 @T.prim_func(disjoint_external=True)

@@ -5,23 +5,23 @@ import inspect
 
 import pytest
 
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.io import parse
+from ascendflow.dialects.physical import TaskOp
+from ascendflow.frontend import FrontendError
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.io import parse
-from xdsl_npu.dialects.physical import TaskOp
-from xdsl_npu.frontend import FrontendError
 
 
 def test_public_physical_builder_has_been_removed():
-    import xdsl_npu
+    import ascendflow
 
-    assert not hasattr(xdsl_npu, "Kernel")
-    assert "Kernel" not in xdsl_npu.__all__
-    with pytest.raises(ModuleNotFoundError, match="xdsl_npu.builder"):
-        importlib.import_module("xdsl_npu.builder")
+    assert not hasattr(ascendflow, "Kernel")
+    assert "Kernel" not in ascendflow.__all__
+    with pytest.raises(ModuleNotFoundError, match="ascendflow.builder"):
+        importlib.import_module("ascendflow.builder")
 
 
 @pytest.mark.parametrize("name", ["trace_func", "alloc_workspace", "gemm"])

@@ -3,12 +3,12 @@
 import pytest
 from xdsl.dialects import arith, scf
 
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.source import AllocationOp, CopyOp, ElementOp, PipelineOp, SizeOp
+from ascendflow.frontend import FrontendError, PrimFunction
 from examples.vector.scale import scale
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.source import AllocationOp, CopyOp, ElementOp, PipelineOp, SizeOp
-from xdsl_npu.frontend import FrontendError, PrimFunction
 
 
 def test_prim_func_captures_body_instead_of_executing_it():

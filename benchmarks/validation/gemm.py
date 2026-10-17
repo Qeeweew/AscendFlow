@@ -1,7 +1,7 @@
 """Deterministic inputs and an independent numerical reference."""
 
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import require
+from ascendflow import language as N
+from ascendflow.diagnostics import require
 
 
 def inputs_and_oracle(policy, panels):

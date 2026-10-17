@@ -7,7 +7,7 @@ numerical evidence, never presented as a full-output numerical comparison.
 
 from time import perf_counter
 
-from xdsl_npu.diagnostics import require
+from ascendflow.diagnostics import require
 
 
 def encode(values, dtype):

@@ -3,17 +3,17 @@
 import pytest
 from xdsl.dialects import scf
 
+from ascendflow import language as N
+from ascendflow.analysis.structured_addresses import StructuredAddresses
+from ascendflow.analysis.structured_control import _division_iteration_range, build_control_facts
+from ascendflow.dialects.physical import TaskOp
+from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.scalar import Expr, Fact, expression, literal
+from ascendflow.target.ascend910b import Actor
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.control.test_shared_aiv import SHARED
-from xdsl_npu import language as N
-from xdsl_npu.analysis.structured_addresses import StructuredAddresses
-from xdsl_npu.analysis.structured_control import _division_iteration_range, build_control_facts
-from xdsl_npu.dialects.physical import TaskOp
-from xdsl_npu.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.scalar import Expr, Fact, expression, literal
-from xdsl_npu.target.ascend910b import Actor
 
 
 @pytest.mark.parametrize(
@@ -150,8 +150,8 @@ def test_divided_loop_bound_keeps_joint_ancestor_bias_and_exact_active_range(div
 
 
 def test_complete_tiles_use_floor_bound_without_requiring_length_multiple():
-    from xdsl_npu.analysis.structured_bounds import admit_memory_bounds
-    from xdsl_npu.analysis.structured_memory import collect_native_memory
+    from ascendflow.analysis.structured_bounds import admit_memory_bounds
+    from ascendflow.analysis.structured_memory import collect_native_memory
 
     source = N.from_source("""
         def full_tiles(X:N.Tensor((n,),N.f32),n:N.int64):

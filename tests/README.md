@@ -37,7 +37,7 @@
 先执行小规模 Python/IR 检查，再考虑 ASC/CANN 离线编译。运行结果按实际提交及产物记录在 `docs/refactor-progress.md`，不把 collection 当作通过。可从工作区检查当前入口：
 
 ```bash
-.venv/bin/python -m pytest --collect-only -q compiler/tests
+.venv/bin/python -m pytest --collect-only -q AscendFlow/tests
 ```
 
 collection 不执行 fixture 和测试体。完整 generated pipeline 用例仍需在资源及进展契约闭合后单独验证；现有手工 IR 模型和后端筛选结果不能外推完整 source 资格。

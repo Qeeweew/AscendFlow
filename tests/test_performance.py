@@ -1,7 +1,7 @@
 import pytest
 
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.performance import profile_evidence, theoretical_metrics
+from ascendflow.diagnostics import CompileError
+from ascendflow.performance import profile_evidence, theoretical_metrics
 
 
 def test_roofline_uses_explicit_array_and_bandwidth_assumptions():

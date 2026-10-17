@@ -5,12 +5,12 @@ from dataclasses import FrozenInstanceError
 import pytest
 from xdsl.dialects.builtin import ModuleOp
 
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.compilation import Compilation
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.dialects.io import dump
-from xdsl_npu.dialects.structured import NotificationOp
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.compilation import Compilation
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.dialects.io import dump
+from ascendflow.dialects.structured import NotificationOp
 
 SOURCE = """
 def point(X:N.Tensor((64,),N.f32),Y:N.Tensor((64,),N.f32,access="write")):

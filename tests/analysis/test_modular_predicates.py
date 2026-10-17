@@ -6,16 +6,16 @@ from math import gcd, prod
 
 import pytest
 
-from xdsl_npu.analysis import modular
-from xdsl_npu.analysis.modular import (
+from ascendflow.analysis import modular
+from ascendflow.analysis.modular import (
     ModularAtom,
     ModularPredicate,
     modular_predicate,
     specialize_residues,
 )
-from xdsl_npu.analysis.structured_schedule import Comparison
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.scalar import Expr, expression, literal
+from ascendflow.analysis.structured_schedule import Comparison
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.scalar import Expr, expression, literal
 
 G = Expr("argument", ("g",))
 P = Expr("argument", ("p",))

@@ -4,23 +4,23 @@ from dataclasses import replace
 
 import pytest
 
-from examples.vector.scale import scale
-from tests.fixtures.nested import nested_copy
-from tests.models.structured_domains import actual_dispatch, need_cases
-from tests.support.structured import selected
-from xdsl_npu.analysis.access_frontier import AccessEndpoint
-from xdsl_npu.analysis.structured_protocols import (
+from ascendflow.analysis.access_frontier import AccessEndpoint
+from ascendflow.analysis.structured_protocols import (
     BoundPlacement,
     LogicalNotification,
     NotificationKind,
 )
-from xdsl_npu.analysis.structured_regions import AccessOccurrence, LoopBinding
-from xdsl_npu.analysis.structured_resources import allocate_structured_events
-from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison, Placement
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.passes.generate_notifications import _complete_bindings
-from xdsl_npu.scalar import expression, literal
-from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
+from ascendflow.analysis.structured_regions import AccessOccurrence, LoopBinding
+from ascendflow.analysis.structured_resources import allocate_structured_events
+from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement
+from ascendflow.diagnostics import CompileError
+from ascendflow.passes.generate_notifications import _complete_bindings
+from ascendflow.scalar import expression, literal
+from ascendflow.target.ascend910b import Actor, Engine, SyncKind
+from examples.vector.scale import scale
+from tests.fixtures.nested import nested_copy
+from tests.models.structured_domains import actual_dispatch, need_cases
+from tests.support.structured import selected
 
 POINT = """
 def point(X:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write")):

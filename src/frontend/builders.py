@@ -203,7 +203,7 @@ def _index_arithmetic():
     )
 
 
-_current = ContextVar("xdsl_npu_source", default=None)
+_current = ContextVar("ascendflow_source", default=None)
 
 
 class _Trace:

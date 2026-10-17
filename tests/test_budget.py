@@ -2,10 +2,10 @@
 
 import pytest
 
+from ascendflow import budget, compile
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError, ErrorKind
 from examples.vector.scale import scale
-from xdsl_npu import budget, compile
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError, ErrorKind
 
 
 def test_deadline_includes_phase_and_structure(monkeypatch):

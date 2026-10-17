@@ -9,13 +9,11 @@ import operator
 import pytest
 from xdsl.dialects import arith, scf
 
-from examples.gemm.batched import batched_matmul
-from examples.vector.scale import scale
-from xdsl_npu import language as N
-from xdsl_npu.analysis.value_bindings import LastTile, TileDefinition
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.physical import (
+from ascendflow import language as N
+from ascendflow.analysis.value_bindings import LastTile, TileDefinition
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.physical import (
     BufferOp,
     CoreIdOp,
     EndOp,
@@ -23,9 +21,11 @@ from xdsl_npu.dialects.physical import (
     RuntimeSizeOp,
     TaskOp,
 )
-from xdsl_npu.dialects.source import CopyOp, PipelineOp
-from xdsl_npu.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
-from xdsl_npu.passes.lower_native import lower_native_structure
+from ascendflow.dialects.source import CopyOp, PipelineOp
+from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
+from ascendflow.passes.lower_native import lower_native_structure
+from examples.gemm.batched import batched_matmul
+from examples.vector.scale import scale
 
 
 def interpret(block, values, arguments, trace):

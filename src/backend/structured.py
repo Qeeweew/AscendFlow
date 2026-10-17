@@ -397,7 +397,7 @@ class _Emitter:
             else "__vector__"
         )
         lines = [
-            "// xdsl-npu structured ASC: retained SSA control and actor issue packets",
+            "// AscendFlow ASC: retained SSA control and actor issue packets",
             '#include "c_api/asc_simd.h"',
             "#include <cstdint>",
             "#include <climits>",

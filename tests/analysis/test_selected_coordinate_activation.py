@@ -9,22 +9,25 @@ from dataclasses import replace
 
 import pytest
 
-from tests.analysis.test_conditional_accesses import _retarget, _structure
-from xdsl_npu import language as N
-from xdsl_npu.analysis.access_frontier import AccessEndpoint, LoopResidueSelection, ResiduePosition
-from xdsl_npu.analysis.event_contracts import ResourceWork
-from xdsl_npu.analysis.event_domains import EventDomains
-from xdsl_npu.analysis.event_windows import _Builder
-from xdsl_npu.analysis.hazards import HazardKind
-from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
-from xdsl_npu.analysis.structured_dispatch import bind_structured_dispatch
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.analysis.structured_protocols import (
+from ascendflow import language as N
+from ascendflow.analysis.access_frontier import (
+    AccessEndpoint,
+    LoopResidueSelection,
+    ResiduePosition,
+)
+from ascendflow.analysis.event_contracts import ResourceWork
+from ascendflow.analysis.event_domains import EventDomains
+from ascendflow.analysis.event_windows import _Builder
+from ascendflow.analysis.hazards import HazardKind
+from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.analysis.structured_protocols import (
     LogicalNotification,
     NotificationKind,
     SynchronizationSelection,
 )
-from xdsl_npu.analysis.structured_regions import (
+from ascendflow.analysis.structured_regions import (
     AccessOccurrence,
     LoopBinding,
     LoopDomain,
@@ -32,12 +35,13 @@ from xdsl_npu.analysis.structured_regions import (
     StorageCell,
     StructuredNeed,
 )
-from xdsl_npu.analysis.structured_schedule import ActionGuard
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.notification_binding import _bind_endpoint, _IssueOrder
-from xdsl_npu.scalar import expression, literal
-from xdsl_npu.target.ascend910b import Actor, Engine
+from ascendflow.analysis.structured_schedule import ActionGuard
+from ascendflow.diagnostics import CompileError
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.passes.notification_binding import _bind_endpoint, _IssueOrder
+from ascendflow.scalar import expression, literal
+from ascendflow.target.ascend910b import Actor, Engine
+from tests.analysis.test_conditional_accesses import _retarget, _structure
 
 
 @pytest.fixture(scope="module")

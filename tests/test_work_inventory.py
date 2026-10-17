@@ -6,11 +6,11 @@ import sys
 
 import pytest
 
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.io import dump
+from ascendflow.passes.lower_native import lower_native_structure
 from benchmarks.work import read_work, structure_inventory, work_record
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.io import dump
-from xdsl_npu.passes.lower_native import lower_native_structure
 
 
 def inventory(count):

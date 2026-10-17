@@ -4,21 +4,21 @@ from collections import Counter
 
 import pytest
 
-from examples.gemm.batched import batched_matmul
-from examples.vector.scale import scale
-from xdsl_npu.analysis.structured_dispatch import bind_structured_dispatch
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.analysis.structured_schedule import (
+from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.analysis.structured_schedule import (
     ActionGuard,
     Comparison,
     Placement,
     SyncAction,
     SyncKind,
 )
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.structured_sync import synchronize_structure
-from xdsl_npu.scalar import Expr, expression, literal
-from xdsl_npu.target.ascend910b import Actor, Engine
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.passes.structured_sync import synchronize_structure
+from ascendflow.scalar import Expr, expression, literal
+from ascendflow.target.ascend910b import Actor, Engine
+from examples.gemm.batched import batched_matmul
+from examples.vector.scale import scale
 
 
 @pytest.fixture(scope="module", params=[scale, batched_matmul])
@@ -42,8 +42,8 @@ def test_actual_local_pipeline_has_one_owned_structure(selected):
 
 
 def test_actual_selected_actions_materialize_as_guarded_ssa_ir(selected):
-    from xdsl_npu.dialects.io import dump, parse
-    from xdsl_npu.dialects.structured import NotificationOp
+    from ascendflow.dialects.io import dump, parse
+    from ascendflow.dialects.structured import NotificationOp
 
     memory = selected.memory
     # The final scalar pass can replace/delete arith SSA. Execution, control
@@ -114,7 +114,7 @@ def test_guarded_last_id_does_not_evaluate_empty_loop_remainder():
 
 @pytest.mark.parametrize("entry", [scale, batched_matmul])
 def test_public_source_compile_uses_the_recursive_owned_path(entry, monkeypatch):
-    from xdsl_npu import compile
+    from ascendflow import compile
 
     result = compile(entry, debug_verify=True)
     assert result.report["pipeline"] == "structured-regions"

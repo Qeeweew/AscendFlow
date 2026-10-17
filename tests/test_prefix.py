@@ -2,10 +2,10 @@
 
 import pytest
 
+from ascendflow import compile
+from ascendflow.diagnostics import CompileError
+from ascendflow.frontend import from_source
 from examples.vector.prefix import scale_prefix
-from xdsl_npu import compile
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.frontend import from_source
 
 
 def test_incorrect_valid_expression_is_not_treated_as_padding():
@@ -22,7 +22,7 @@ def test_incorrect_valid_expression_is_not_treated_as_padding():
 
 
 def test_uniform_scalar_codegen_has_no_exponential_ternary_expansion():
-    from xdsl_npu.scalar import Expr, bindings, expression
+    from ascendflow.scalar import Expr, bindings, expression
 
     value = Expr("argument", ("a0",))
     for i in range(1, 32):

@@ -3,11 +3,11 @@
 import pytest
 from xdsl.dialects import arith, scf
 
-from xdsl_npu import compile
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.source import PipelineOp, SizeOp, YieldOp
-from xdsl_npu.frontend import FrontendError, from_source
+from ascendflow import compile
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.source import PipelineOp, SizeOp, YieldOp
+from ascendflow.frontend import FrontendError, from_source
 
 
 def interpret(block, values, arguments):

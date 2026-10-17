@@ -4,6 +4,15 @@ from dataclasses import replace
 
 import pytest
 
+from ascendflow.analysis.queue_order import establish_queue_order
+from ascendflow.analysis.structured_protocols import NotificationKind
+from ascendflow.analysis.structured_schedule import Placement, SyncAction
+from ascendflow.diagnostics import CompileError
+from ascendflow.passes.generate_notifications import _complete_bindings
+from ascendflow.passes.materialize_structure import materialize_notifications
+from ascendflow.passes.structured_sync import synchronize_structure
+from ascendflow.scalar import literal
+from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from tests.fixtures.notification_cycles import (
     PARENT_REUSE,
     actual_port_cycle,
@@ -21,15 +30,6 @@ from tests.fixtures.notification_cycles import (
 )
 from tests.models.structured_events import EventModelError, _causality, check_structured_events
 from tests.support.structured import prepared, selected
-from xdsl_npu.analysis.queue_order import establish_queue_order
-from xdsl_npu.analysis.structured_protocols import NotificationKind
-from xdsl_npu.analysis.structured_schedule import Placement, SyncAction
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.passes.generate_notifications import _complete_bindings
-from xdsl_npu.passes.materialize_structure import materialize_notifications
-from xdsl_npu.passes.structured_sync import synchronize_structure
-from xdsl_npu.scalar import literal
-from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
 
 
 def order(selection):
@@ -131,7 +131,7 @@ def test_distinct_parent_invocations_match_independent_command_causality(count):
 
 @pytest.fixture(scope="module")
 def parent_credit():
-    from xdsl_npu import language as N
+    from ascendflow import language as N
 
     return synchronize_structure(N.from_source(PARENT_REUSE, disjoint_external=True))
 
@@ -145,8 +145,8 @@ def test_physical_cell_credit_spans_child_and_parent_invocations(parent_credit, 
 
 
 def test_allocation_rejects_coverage_only_instead_of_trusting_a_label():
+    from ascendflow.analysis.structured_resources import allocate_structured_events
     from examples.vector.scale import scale
-    from xdsl_npu.analysis.structured_resources import allocate_structured_events
 
     selection = selected(scale)
     with pytest.raises(CompileError, match="generated notification lifetimes"):
@@ -170,7 +170,7 @@ def test_generated_counter_quorum_retains_two_private_actors():
 
 
 def finite_independent_cells(*, scalar):
-    from xdsl_npu import language as N
+    from ascendflow import language as N
 
     declarations = "\n".join(f"        x{i}=N.alloc_ub((64,))" for i in range(9))
     body = "\n".join(
@@ -202,7 +202,7 @@ def test_new_id_sharing_requires_a_real_consumption_handback():
 
 
 def test_a_finite_credit_fragment_cannot_license_sharing_its_later_loop():
-    from xdsl_npu import language as N
+    from ascendflow import language as N
 
     source = finite_independent_cells(scalar=True).source
     source = source.replace(
@@ -229,7 +229,7 @@ def test_a_finite_credit_fragment_cannot_license_sharing_its_later_loop():
 
 
 def test_a_proved_absent_domain_does_not_consume_finite_event_capacity():
-    from xdsl_npu import language as N
+    from ascendflow import language as N
 
     source = finite_independent_cells(scalar=False).source
     source = source.replace(
@@ -249,9 +249,9 @@ def test_a_proved_absent_domain_does_not_consume_finite_event_capacity():
 
 
 def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch):
+    from ascendflow.analysis import event_families
+    from ascendflow.analysis.structured_resources import _EventBanks
     from tests.fixtures.nested import nested_copy
-    from xdsl_npu.analysis import event_families
-    from xdsl_npu.analysis.structured_resources import _EventBanks
 
     program = _complete_bindings(selected(nested_copy))
     assert program.boundaries
@@ -270,8 +270,8 @@ def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch)
 
 
 def test_configuration_and_final_drain_have_explicit_unborrowed_bank_entries():
+    from ascendflow.analysis.structured_resources import allocate_structured_events
     from examples.gemm.batched import batched_matmul
-    from xdsl_npu.analysis.structured_resources import allocate_structured_events
 
     program = _complete_bindings(selected(batched_matmul.specialize(M=16, N=16, K=16, GROUPS=1)))
     plan = allocate_structured_events(program)

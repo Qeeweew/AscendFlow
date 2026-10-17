@@ -9,15 +9,15 @@ import pytest
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
 
+from ascendflow import language as N
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.analysis.structured_schedule import Placement, SyncAction
+from ascendflow.dialects.structured import AddressOp, NotificationOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.passes.materialize_structure import materialize_notifications
+from ascendflow.scalar import literal
+from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from tests.models.structured_events import EventModelError, check_structured_events
-from xdsl_npu import language as N
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.analysis.structured_schedule import Placement, SyncAction
-from xdsl_npu.dialects.structured import AddressOp, NotificationOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.materialize_structure import materialize_notifications
-from xdsl_npu.scalar import literal
-from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
 
 
 def snapshots(source):

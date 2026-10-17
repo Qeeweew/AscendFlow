@@ -16,7 +16,7 @@ class Budget:
     cancel: Callable[[], bool] | None
 
 
-_active = ContextVar("xdsl_npu_analysis_budget", default=None)
+_active = ContextVar("ascendflow_analysis_budget", default=None)
 
 
 @contextmanager

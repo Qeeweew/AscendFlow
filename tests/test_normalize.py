@@ -3,11 +3,11 @@
 import pytest
 from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, StringAttr
 
+from ascendflow import compile
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.source import PipelineOp, ScalarReadOp
+from ascendflow.frontend import from_source
 from examples.normalization.rms_norm import rms_normalize
-from xdsl_npu import compile
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.source import PipelineOp, ScalarReadOp
-from xdsl_npu.frontend import from_source
 
 
 @pytest.mark.parametrize(

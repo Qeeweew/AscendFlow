@@ -6,13 +6,13 @@ These helpers run neither complete memory admission nor executable compilation
 and are not independent correctness oracles. Importing creates no fixture.
 """
 
-from xdsl_npu import language as N
-from xdsl_npu.analysis.event_contracts import ResourceWork
-from xdsl_npu.analysis.event_domains import EventDomains
-from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.notification_binding import bind_notifications
+from ascendflow import language as N
+from ascendflow.analysis.event_contracts import ResourceWork
+from ascendflow.analysis.event_domains import EventDomains
+from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.passes.notification_binding import bind_notifications
 
 
 def selected(source):

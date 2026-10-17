@@ -7,14 +7,14 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
 from xdsl.ir import Block
 
-from xdsl_npu import indexing
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.dialects.physical import BufferOp
-from xdsl_npu.dialects.source import AllocationOp, PipelineOp, SizeOp, ViewOp
-from xdsl_npu.dialects.types import TensorType, ref_type
-from xdsl_npu.passes.native_addresses import lower_address, subview
-from xdsl_npu.target.native import ITEMSIZE
+from ascendflow import indexing
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.dialects.physical import BufferOp
+from ascendflow.dialects.source import AllocationOp, PipelineOp, SizeOp, ViewOp
+from ascendflow.dialects.types import TensorType, ref_type
+from ascendflow.passes.native_addresses import lower_address, subview
+from ascendflow.target.native import ITEMSIZE
 
 
 def _ints(values):

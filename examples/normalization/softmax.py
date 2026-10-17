@@ -6,7 +6,7 @@ The R64/packed merge order and FP32 division are part of this example's contract
 
 from __future__ import annotations
 
-from xdsl_npu import language as T
+from ascendflow import language as T
 
 
 @T.prim_func(disjoint_external=True)

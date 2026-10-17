@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
+from ascendflow.dialects.source import PipelineOp, StageOp
 from benchmarks.references.attention import reference_source
 from benchmarks.validation.attention import inputs_and_oracle
 from tests.fixtures.attention_target import attention_target
-from xdsl_npu.dialects.source import PipelineOp, StageOp
 
 
 @pytest.fixture(scope="module")

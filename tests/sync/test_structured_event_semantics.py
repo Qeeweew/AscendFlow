@@ -10,24 +10,24 @@ import pytest
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import ArrayAttr, IndexType, StringAttr
 
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.dialects.io import parse
+from ascendflow.dialects.physical import MixedOp
+from ascendflow.dialects.structured import ActorDomainOp, NotificationOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.analysis.test_event_parameter_cases import nested_slot_source
 from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
 from tests.models.structured_events import EventModelError, check_structured_events
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.dialects.io import parse
-from xdsl_npu.dialects.physical import MixedOp
-from xdsl_npu.dialects.structured import ActorDomainOp, NotificationOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
 
 
 def test_shared_l0c_packet_reuse_keeps_actual_read_versions_through_loop_boundaries():
-    from xdsl_npu.budget import limit
-    from xdsl_npu.passes.structured_sync import synchronize_structure
+    from ascendflow.budget import limit
+    from ascendflow.passes.structured_sync import synchronize_structure
 
     # One symbolic compilation, shared by empty, singleton and steady cases.
     with limit(300):
@@ -204,11 +204,11 @@ def test_oracle_never_calls_production_selection_resource_or_progress(monkeypatc
         raise AssertionError("finite oracle consulted a production proof")
 
     for module, function in (
-        ("xdsl_npu.passes.notification_binding", "bind_notifications"),
-        ("xdsl_npu.analysis.structured_resources", "allocate_structured_events"),
+        ("ascendflow.passes.notification_binding", "bind_notifications"),
+        ("ascendflow.analysis.structured_resources", "allocate_structured_events"),
     ):
         monkeypatch.setattr(import_module(module), function, forbidden)
-    generation = import_module("xdsl_npu.passes.generate_notifications")
+    generation = import_module("ascendflow.passes.generate_notifications")
     monkeypatch.setattr(generation, "establish_queue_order", forbidden)
     monkeypatch.setattr(generation, "generate_notifications", forbidden)
     for operation in facts.module.walk():
@@ -378,7 +378,7 @@ def test_cross_wait_blocks_the_actual_controller_across_different_engines(wait_f
     params=[scale.specialize(B=64), batched_matmul.specialize(M=16, N=16, K=16, GROUPS=1)],
 )
 def generated(request):
-    from xdsl_npu.passes.structured_sync import synchronize_structure
+    from ascendflow.passes.structured_sync import synchronize_structure
 
     # One actual compiled IR is interpreted at every small runtime count.
     plan = synchronize_structure(request.param)
@@ -420,7 +420,7 @@ def test_nested_slots_final_ir_preserves_event_consumption_and_byte_versions(
 
 @pytest.fixture(scope="module", params=[nested_copy, nested_cv])
 def nested_credit(request):
-    from xdsl_npu.passes.structured_sync import synchronize_structure
+    from ascendflow.passes.structured_sync import synchronize_structure
 
     plan = synchronize_structure(request.param)
     return plan, collect_native_memory(parse(plan.before_ir))
@@ -444,7 +444,7 @@ def test_adjacent_child_and_parent_credits_preserve_the_pre_sync_native_referenc
 
 @pytest.mark.parametrize("mutation", ["delete_wait", "wrong_id", "early_set"])
 def test_generated_actual_waits_and_retirement_captures_are_necessary(mutation):
-    from xdsl_npu.passes.structured_sync import synchronize_structure
+    from ascendflow.passes.structured_sync import synchronize_structure
 
     plan = synchronize_structure(scale.specialize(B=64))
     check_structured_events(plan.memory, {"tiles": 3})

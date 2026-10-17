@@ -20,20 +20,20 @@ from pathlib import Path
 from xdsl.dialects.builtin import f32
 
 import benchmarks.validation.attention as attention_validation
+from ascendflow.backend.cann import CANN
+from ascendflow.build import build_file
+from ascendflow.device import ACL, health_snapshot
+from ascendflow.diagnostics import require
+from ascendflow.dialects.io import parse
+from ascendflow.dialects.physical import BufferOp, KernelOp, MixedOp, RuntimeSizeOp
+from ascendflow.dialects.source import AllocationOp, ElementOp, ProgramOp, SizeOp
+from ascendflow.dialects.structured import ActorDomainOp
+from ascendflow.performance import hardware_snapshot
 from benchmarks.attention.contract import DEFAULT_POLICY, AttentionPolicy
 from benchmarks.references.attention import NAME as REFERENCE_NAME
 from benchmarks.references.attention import reference_source
 from benchmarks.references.attention_aclnn import FlashAttentionReference
 from benchmarks.validation.attention import decode, inputs_and_oracle
-from xdsl_npu.backend.cann import CANN
-from xdsl_npu.build import build_file
-from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.diagnostics import require
-from xdsl_npu.dialects.io import parse
-from xdsl_npu.dialects.physical import BufferOp, KernelOp, MixedOp, RuntimeSizeOp
-from xdsl_npu.dialects.source import AllocationOp, ElementOp, ProgramOp, SizeOp
-from xdsl_npu.dialects.structured import ActorDomainOp
-from xdsl_npu.performance import hardware_snapshot
 
 ENTRY = "attention_target"
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples/flash_attention/attention.py"

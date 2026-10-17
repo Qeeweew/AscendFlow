@@ -2,19 +2,19 @@
 
 import pytest
 
+from ascendflow import language as N
+from ascendflow.analysis import structured_memory
+from ascendflow.analysis.structured_control import build_control_facts
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.physical import TaskOp
+from ascendflow.dialects.structured import ActorDomainOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.target import native
+from ascendflow.target.ascend910b import Actor
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.control.test_shared_aiv import SHARED
-from xdsl_npu import language as N
-from xdsl_npu.analysis import structured_memory
-from xdsl_npu.analysis.structured_control import build_control_facts
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.physical import TaskOp
-from xdsl_npu.dialects.structured import ActorDomainOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.target import native
-from xdsl_npu.target.ascend910b import Actor
 
 
 @pytest.mark.parametrize(

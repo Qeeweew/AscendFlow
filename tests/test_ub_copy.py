@@ -2,9 +2,9 @@
 
 import pytest
 
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
 
 
 @pytest.mark.parametrize("destination", ("0:16", "8:24"))

@@ -6,10 +6,10 @@ not replace the symbolic range and ownership obligations with parameter samples.
 
 import pytest
 
-from xdsl_npu import indexing
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.indexing import check_axis, equivalent, physical_terms, polynomial
-from xdsl_npu.scalar import Expr, Fact, expression, literal
+from ascendflow import indexing
+from ascendflow.diagnostics import CompileError
+from ascendflow.indexing import check_axis, equivalent, physical_terms, polynomial
+from ascendflow.scalar import Expr, Fact, expression, literal
 
 
 def argument(name):

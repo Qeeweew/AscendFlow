@@ -7,14 +7,14 @@ from xdsl.dialects import arith
 from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
 from xdsl.ir import Block
 
-from xdsl_npu import indexing, scalar
-from xdsl_npu.analysis.structured_addresses import ScalarEnvironment, StructuredAddresses
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.dialects.physical import BufferOp
-from xdsl_npu.dialects.structured import AddressOp
-from xdsl_npu.dialects.types import ref_type
-from xdsl_npu.scalar import Expr, Fact, expression, literal
-from xdsl_npu.target.native import NativeGeometry
+from ascendflow import indexing, scalar
+from ascendflow.analysis.structured_addresses import ScalarEnvironment, StructuredAddresses
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.dialects.physical import BufferOp
+from ascendflow.dialects.structured import AddressOp
+from ascendflow.dialects.types import ref_type
+from ascendflow.scalar import Expr, Fact, expression, literal
+from ascendflow.target.native import NativeGeometry
 
 
 def _index(block, value):
@@ -336,7 +336,7 @@ def test_axis_failure_classification_marks_a_missing_cyclic_joint_range_unsuppor
 
 
 def test_axis_failure_classification_preserves_an_explicit_analysis_limit(monkeypatch):
-    from xdsl_npu.analysis import structured_addresses
+    from ascendflow.analysis import structured_addresses
 
     block = Block()
     root = _buffer(block)

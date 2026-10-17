@@ -5,17 +5,17 @@ from collections.abc import Callable
 import pytest
 from xdsl.dialects.builtin import ModuleOp
 
-from xdsl_npu.analysis import event_windows
-from xdsl_npu.analysis.event_windows import WindowPartitionRequired, build_event_window
-from xdsl_npu.analysis.integer_facts import IntegerFacts
-from xdsl_npu.analysis.periodic import evaluate_comparison_at, evaluate_phase, period_of
-from xdsl_npu.analysis.structured_protocols import LogicalNotification, NotificationKind
-from xdsl_npu.analysis.structured_regions import LoopDomain
-from xdsl_npu.analysis.structured_schedule import Comparison
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.indexing import arguments
-from xdsl_npu.scalar import INT64_MAX, Expr, Fact, expression, literal
-from xdsl_npu.target.ascend910b import Engine
+from ascendflow.analysis import event_windows
+from ascendflow.analysis.event_windows import WindowPartitionRequired, build_event_window
+from ascendflow.analysis.integer_facts import IntegerFacts
+from ascendflow.analysis.periodic import evaluate_comparison_at, evaluate_phase, period_of
+from ascendflow.analysis.structured_protocols import LogicalNotification, NotificationKind
+from ascendflow.analysis.structured_regions import LoopDomain
+from ascendflow.analysis.structured_schedule import Comparison
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.indexing import arguments
+from ascendflow.scalar import INT64_MAX, Expr, Fact, expression, literal
+from ascendflow.target.ascend910b import Engine
 
 G = Expr("argument", ("g",))
 N = Expr("argument", ("n",))

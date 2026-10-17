@@ -4,23 +4,23 @@ from itertools import product
 
 import pytest
 
+from ascendflow import language as N
+from ascendflow.analysis.hazards import HazardKind
+from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.analysis.structured_regions import (
+    AccessOccurrence,
+    DependencyIssueKind,
+)
+from ascendflow.diagnostics import CompileError
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.scalar import Expr
+from ascendflow.target.ascend910b import Actor
 from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
 from tests.models.structured_domains import expression_value, guard_active, occurrence_key
-from xdsl_npu import language as N
-from xdsl_npu.analysis.hazards import HazardKind
-from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.analysis.structured_regions import (
-    AccessOccurrence,
-    DependencyIssueKind,
-)
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.scalar import Expr
-from xdsl_npu.target.ascend910b import Actor
 
 
 def dependencies(source):

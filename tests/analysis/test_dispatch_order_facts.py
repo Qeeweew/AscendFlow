@@ -10,11 +10,9 @@ from dataclasses import replace
 import pytest
 from xdsl.dialects import scf
 
-from tests.models.structured_domains import actual_dispatch, need_cases, occurrence_key, point_key
-from tests.support.structured import selected
-from xdsl_npu.analysis.access_frontier import AccessEndpoint
-from xdsl_npu.analysis.structured_protocols import BoundPlacement
-from xdsl_npu.analysis.structured_regions import (
+from ascendflow.analysis.access_frontier import AccessEndpoint
+from ascendflow.analysis.structured_protocols import BoundPlacement
+from ascendflow.analysis.structured_regions import (
     AccessOccurrence,
     BranchGuard,
     CountRelation,
@@ -22,11 +20,13 @@ from xdsl_npu.analysis.structured_regions import (
     LoopCountGuard,
     LoopDomain,
 )
-from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison, Placement
-from xdsl_npu.indexing import arguments
-from xdsl_npu.passes.notification_binding import _IssueOrder
-from xdsl_npu.scalar import Expr, expression, literal
-from xdsl_npu.target.ascend910b import Actor, Engine
+from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement
+from ascendflow.indexing import arguments
+from ascendflow.passes.notification_binding import _IssueOrder
+from ascendflow.scalar import Expr, expression, literal
+from ascendflow.target.ascend910b import Actor, Engine
+from tests.models.structured_domains import actual_dispatch, need_cases, occurrence_key, point_key
+from tests.support.structured import selected
 
 
 @pytest.mark.parametrize("minimum", (0, 1))

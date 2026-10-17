@@ -10,10 +10,10 @@ from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType, IntAttr, StringAttr
 from xdsl.ir import Block
 
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.physical import RuntimeSizeOp
-from xdsl_npu.dialects.source import SizeOp
-from xdsl_npu.scalar import (
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.physical import RuntimeSizeOp
+from ascendflow.dialects.source import SizeOp
+from ascendflow.scalar import (
     INT64_MAX,
     Expr,
     Fact,

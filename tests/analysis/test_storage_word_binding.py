@@ -8,16 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from ascendflow import language as N
+from ascendflow.analysis.hazards import HazardKind
+from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.analysis.structured_regions import AccessOccurrence, LoopOrdinalGuard
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.scalar import Expr
+from ascendflow.target.ascend910b import Actor
 from tests.analysis.test_structured_dependencies import materialized_edges, trace_edges
 from tests.models.structured_domains import actual_dispatch
-from xdsl_npu import language as N
-from xdsl_npu.analysis.hazards import HazardKind
-from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.analysis.structured_regions import AccessOccurrence, LoopOrdinalGuard
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.scalar import Expr
-from xdsl_npu.target.ascend910b import Actor
 
 
 def _source(offsets, reverse):

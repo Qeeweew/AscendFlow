@@ -1,4 +1,4 @@
-"""xDSL NPU: source programs with compiler-owned physical synchronization."""
+"""AscendFlow: an Ascend 910B pipeline compiler built on xDSL."""
 
 from .compilation import Compilation, compile
 

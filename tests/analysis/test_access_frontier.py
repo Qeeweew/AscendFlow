@@ -5,17 +5,17 @@ from dataclasses import fields
 import pytest
 from xdsl.dialects import scf
 
-from xdsl_npu import language as N
-from xdsl_npu.analysis.access_frontier import (
+from ascendflow import language as N
+from ascendflow.analysis.access_frontier import (
     AccessEndpoint,
     LoopResidueSelection,
     ResiduePosition,
 )
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.structured import PipelineLoopOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.target.ascend910b import Actor
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.structured import PipelineLoopOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.target.ascend910b import Actor
 
 
 @pytest.mark.parametrize("serial", [False, True])

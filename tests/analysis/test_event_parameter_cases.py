@@ -4,11 +4,11 @@ from dataclasses import replace
 
 import pytest
 
+from ascendflow.analysis.event_contracts import ResourceWork
+from ascendflow.analysis.event_domains import EventDomains
+from ascendflow.analysis.structured_schedule import ActionGuard, Comparison
+from ascendflow.scalar import Expr, expression, literal
 from tests.support.structured import selected
-from xdsl_npu.analysis.event_contracts import ResourceWork
-from xdsl_npu.analysis.event_domains import EventDomains
-from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison
-from xdsl_npu.scalar import Expr, expression, literal
 
 
 @pytest.fixture(scope="module")
@@ -82,7 +82,7 @@ def test_uniform_partition_is_disjoint_cover_and_keeps_interleaved_residues(base
 
 
 def test_empty_intersection_does_not_hide_mismatched_endpoints(base):
-    from xdsl_npu.diagnostics import CompileError
+    from ascendflow.diagnostics import CompileError
 
     original = next(
         n for n in base.notifications if n.sources[0].coordinates == n.consumers[0].coordinates
@@ -150,7 +150,7 @@ def test_real_nested_slot_selection_preserves_actual_endpoint_domains():
 
 
 def test_more_general_memory_frontier_remains_an_explicit_separate_boundary():
-    from xdsl_npu.diagnostics import CompileError
+    from ascendflow.diagnostics import CompileError
 
     # Event-window multi-residue support does not claim the earlier memory
     # dependency frontier can represent every multi-residue access word.
@@ -160,7 +160,7 @@ def test_more_general_memory_frontier_remains_an_explicit_separate_boundary():
 
 
 def test_endpoint_cannot_borrow_another_endpoints_division_prefix(base):
-    from xdsl_npu.diagnostics import CompileError
+    from ascendflow.diagnostics import CompileError
 
     original = next(
         n for n in base.notifications if n.sources[0].coordinates == n.consumers[0].coordinates
@@ -191,7 +191,7 @@ def test_endpoint_cannot_borrow_another_endpoints_division_prefix(base):
 
 
 def test_mathematically_empty_domain_does_not_hide_undefined_source_remainder(base):
-    from xdsl_npu.diagnostics import CompileError
+    from ascendflow.diagnostics import CompileError
 
     original = next(
         n for n in base.notifications if n.sources[0].coordinates == n.consumers[0].coordinates

@@ -6,10 +6,10 @@ import hashlib
 import json
 from pathlib import Path
 
+from ascendflow.build import build_file
+from ascendflow.device import ACL, health_snapshot
+from ascendflow.diagnostics import require
 from benchmarks.artifacts import read_artifact
-from xdsl_npu.build import build_file
-from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.diagnostics import require
 
 
 def main():

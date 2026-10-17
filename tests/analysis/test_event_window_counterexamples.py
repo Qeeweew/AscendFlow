@@ -9,16 +9,16 @@ Explicit unsupported arithmetic is allowed instead of an unsafe certificate.
 import pytest
 from xdsl.dialects.builtin import ModuleOp
 
-from xdsl_npu import language as N
-from xdsl_npu.analysis.event_windows import build_event_window
-from xdsl_npu.analysis.integer_facts import IntegerFacts
-from xdsl_npu.analysis.structured_control import build_control_facts
-from xdsl_npu.analysis.structured_protocols import LogicalNotification, NotificationKind
-from xdsl_npu.analysis.structured_schedule import Comparison
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.scalar import INT64_MAX, Expr, Fact, expression, literal
-from xdsl_npu.target.ascend910b import Engine
+from ascendflow import language as N
+from ascendflow.analysis.event_windows import build_event_window
+from ascendflow.analysis.integer_facts import IntegerFacts
+from ascendflow.analysis.structured_control import build_control_facts
+from ascendflow.analysis.structured_protocols import LogicalNotification, NotificationKind
+from ascendflow.analysis.structured_schedule import Comparison
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.scalar import INT64_MAX, Expr, Fact, expression, literal
+from ascendflow.target.ascend910b import Engine
 
 G = Expr("argument", ("g",))
 PARENT = Expr("argument", ("parent",))

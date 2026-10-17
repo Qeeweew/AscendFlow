@@ -58,8 +58,8 @@
 复现冷编译工具（从工作区根目录运行，执行结果见状态页）：
 
 ```bash
-PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output runs/structured-loops/fa-probe
-PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 5 --timeout 300 --output runs/structured-loops/fa-cold
+PYTHONPATH=AscendFlow .venv/bin/python -m benchmarks.compile --input AscendFlow/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output runs/structured-loops/fa-probe
+PYTHONPATH=AscendFlow .venv/bin/python -m benchmarks.compile --input AscendFlow/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 5 --timeout 300 --output runs/structured-loops/fa-cold
 ```
 
 冻结源码、编译器Git加未提交diff身份、constexpr政策、版本、ASC SHA、命令及原始JSON。单次probe和带采样诊断不作为五次p50；当前 normal 使用生成规则的域、phase 和 credit 前提；不再执行旧 progress/path solver。`generated-lifetimes` 仅描述来源，不能作为独立证明。normal与额外结构验证的成本分开。无需清空OS文件cache，不允许跨编译结果缓存。

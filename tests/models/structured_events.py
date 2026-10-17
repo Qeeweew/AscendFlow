@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 from xdsl.dialects import arith, scf
 from xdsl.ir import Operation
 
-from xdsl_npu.dialects.physical import (
+from ascendflow.dialects.physical import (
     BufferOp,
     CoreIdOp,
     EndOp,
@@ -35,17 +35,17 @@ from xdsl_npu.dialects.physical import (
     RuntimeSizeOp,
     TaskOp,
 )
-from xdsl_npu.dialects.structured import (
+from ascendflow.dialects.structured import (
     ActorDomainOp,
     AddressOp,
     NotificationOp,
     PipelineLoopOp,
     PipelineStageOp,
 )
-from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
+from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 
 if TYPE_CHECKING:
-    from xdsl_npu.analysis.structured_memory import NativeMemoryFacts
+    from ascendflow.analysis.structured_memory import NativeMemoryFacts
 
 
 class EventModelError(AssertionError):

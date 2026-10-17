@@ -3,12 +3,12 @@
 import pytest
 from xdsl.utils.exceptions import VerifyException
 
+from ascendflow import compile
+from ascendflow import language as T
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.physical import RuntimeSizeOp
+from ascendflow.dialects.source import ElementOp
 from examples.normalization.softmax import softmax
-from xdsl_npu import compile
-from xdsl_npu import language as T
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.physical import RuntimeSizeOp
-from xdsl_npu.dialects.source import ElementOp
 
 
 @pytest.fixture(scope="module")

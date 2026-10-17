@@ -25,7 +25,7 @@
 从工作区根目录使用已有环境：
 
 ```bash
-PYTHONPATH=compiler .venv/bin/python -m examples.vector.scale --output runs/quickstart/vector
+PYTHONPATH=AscendFlow .venv/bin/python -m examples.vector.scale --output runs/quickstart/vector
 ```
 
 FA只有一个正常数学主体`attention_target`。默认dense f16 B1/Hq8/Hkv8/D128及BQ128/BK1024/CK128/VR8的数学、workspace和历史资格见[FA合同](../docs/attention-target.md)。Sq/Sk是runtime；不把外层Q块当成编译器专属控制类型。

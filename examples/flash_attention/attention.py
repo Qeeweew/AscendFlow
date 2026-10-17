@@ -8,7 +8,7 @@ qualify the refactored compiler; see docs/refactor-progress.md.
 
 from __future__ import annotations
 
-from xdsl_npu import language as N
+from ascendflow import language as N
 
 # Tensor dimensions in annotations are interpreted by the DSL signature pass.
 # ruff: noqa: F821

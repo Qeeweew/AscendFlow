@@ -4,12 +4,12 @@ from dataclasses import replace
 
 import pytest
 
+from ascendflow import compile
+from ascendflow import language as T
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.physical import RuntimeSizeOp
 from examples.vector.grouped import grouped_scale
 from tests.test_runtime_contract import host_launcher
-from xdsl_npu import compile
-from xdsl_npu import language as T
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.physical import RuntimeSizeOp
 
 
 @pytest.fixture(scope="module")

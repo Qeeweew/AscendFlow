@@ -7,7 +7,7 @@ product, and tests of compilation itself do not use these fixtures.
 
 import pytest
 
-from xdsl_npu import compile
+from ascendflow import compile
 
 
 @pytest.fixture(scope="session")

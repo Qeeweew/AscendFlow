@@ -34,8 +34,8 @@ runner能接受某些dtype/head/tile参数不代表其全部通过。causal、ma
 从工作区根目录运行；以下命令说明接口，本轮文档整理未执行：
 
 ```bash
-PYTHONPATH=compiler .venv/bin/python -m xdsl_npu.cli --input compiler/examples/flash_attention/attention.py --entry attention_target --compile --timeout 300 --output runs/structured-loops/cann-fa
-PYTHONPATH=compiler .venv/bin/python -m benchmarks.attention.run --output runs/structured-loops/fa --build
+PYTHONPATH=AscendFlow .venv/bin/python -m ascendflow --input AscendFlow/examples/flash_attention/attention.py --entry attention_target --compile --timeout 300 --output runs/structured-loops/cann-fa
+PYTHONPATH=AscendFlow .venv/bin/python -m benchmarks.attention.run --output runs/structured-loops/fa --build
 ```
 
 独立手写AscendC/ACLNN、设备运行和profile见[benchmarks](../benchmarks/README.md)。手写参考通过不等于本DSL通过。每次构建总期限≤300s；设备运行需全卡检查、显式物理映射，失败立即停止。

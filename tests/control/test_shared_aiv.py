@@ -5,14 +5,14 @@ Dispatch interpretation does not synchronize AIC/AIV or prove device results.
 
 import pytest
 
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.physical import BufferOp, MixedOp, TaskOp
+from ascendflow.dialects.source import DomainOp
+from ascendflow.dialects.structured import ActorDomainOp, PipelineLoopOp
+from ascendflow.passes.lower_native import lower_native_structure
 from tests.control.test_recursive_native import dispatch
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.physical import BufferOp, MixedOp, TaskOp
-from xdsl_npu.dialects.source import DomainOp
-from xdsl_npu.dialects.structured import ActorDomainOp, PipelineLoopOp
-from xdsl_npu.passes.lower_native import lower_native_structure
 
 SHARED = """
 def shared(A:N.Tensor((GROUPS,n,32,16),N.f16),

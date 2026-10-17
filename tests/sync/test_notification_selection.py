@@ -10,18 +10,18 @@ from importlib import import_module
 
 import pytest
 
+from ascendflow.analysis.structured_protocols import NotificationKind
+from ascendflow.analysis.structured_regions import AccessOccurrence
+from ascendflow.diagnostics import CompileError
+from ascendflow.indexing import arguments
+from ascendflow.passes.notification_binding import bind_notifications
+from ascendflow.target.ascend910b import Actor, Engine
 from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
 from tests.models.structured_domains import actual_dispatch, need_cases, occurrence_key, point_key
 from tests.support.structured import selected
-from xdsl_npu.analysis.structured_protocols import NotificationKind
-from xdsl_npu.analysis.structured_regions import AccessOccurrence
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.indexing import arguments
-from xdsl_npu.passes.notification_binding import bind_notifications
-from xdsl_npu.target.ascend910b import Actor, Engine
 
 
 @pytest.fixture(
@@ -216,9 +216,9 @@ def test_selection_reuses_owned_memory_dependency_and_native_facts(monkeypatch):
         raise AssertionError("selection rebuilt an owned analysis input")
 
     targets = [
-        ("xdsl_npu.analysis.structured_memory", "collect_native_memory"),
-        ("xdsl_npu.analysis.structured_dependencies", "build_structured_dependencies"),
-        ("xdsl_npu.target.native", "native_contract"),
+        ("ascendflow.analysis.structured_memory", "collect_native_memory"),
+        ("ascendflow.analysis.structured_dependencies", "build_structured_dependencies"),
+        ("ascendflow.target.native", "native_contract"),
     ]
     modules = [(import_module(name), attribute) for name, attribute in targets]
     for module, attribute in modules:

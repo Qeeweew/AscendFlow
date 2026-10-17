@@ -4,12 +4,12 @@ import pytest
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 from xdsl.utils.exceptions import VerifyException
 
+from ascendflow import language as N
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.source import AllocationOp, DomainOp, PipelineOp, StageOp, ViewOp
+from ascendflow.dialects.types import TileType
+from ascendflow.frontend import FrontendError
 from tests.fixtures.source_programs import cv_source, vector_source
-from xdsl_npu import language as N
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.source import AllocationOp, DomainOp, PipelineOp, StageOp, ViewOp
-from xdsl_npu.dialects.types import TileType
-from xdsl_npu.frontend import FrontendError
 
 
 def test_typed_copy_requires_an_explicit_rounding_conversion():

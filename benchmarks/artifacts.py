@@ -5,8 +5,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from xdsl_npu.diagnostics import require
-from xdsl_npu.dialects.io import parse
+from ascendflow.diagnostics import require
+from ascendflow.dialects.io import parse
 
 
 @dataclass(frozen=True)

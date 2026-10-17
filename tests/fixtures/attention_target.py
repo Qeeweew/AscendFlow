@@ -8,9 +8,9 @@ its runtime-cycle first/last predicates remain unsupported by lowering.
 import ast
 from pathlib import Path
 
+from ascendflow import language as N
 from examples.flash_attention.attention import NEG_INF
 from examples.flash_attention.attention import attention_target as _attention_target
-from xdsl_npu import language as N
 
 
 def target_source(*, continuous=False):

@@ -8,10 +8,8 @@ import numpy as np
 import pytest
 from xdsl.dialects import arith, scf
 
-from tests.fixtures.scoped_queries import GROUPS, scoped_query_recurrence
-from tests.test_index_frontend import evaluate as evaluate_index
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.source import (
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.source import (
     AllocationOp,
     CopyOp,
     DomainOp,
@@ -25,7 +23,9 @@ from xdsl_npu.dialects.source import (
     ViewOp,
     YieldOp,
 )
-from xdsl_npu.target.native import ITEMSIZE
+from ascendflow.target.native import ITEMSIZE
+from tests.fixtures.scoped_queries import GROUPS, scoped_query_recurrence
+from tests.test_index_frontend import evaluate as evaluate_index
 
 
 def view(ref):

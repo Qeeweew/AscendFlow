@@ -2,15 +2,15 @@
 
 import pytest
 
+from ascendflow import language as N
+from ascendflow.analysis.hazards import HazardKind
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.structured import NotificationOp
+from ascendflow.passes.structured_sync import synchronize_structure
+from ascendflow.target.ascend910b import Engine, SyncKind
 from tests.fixtures.nested import shared_l0c_qk_pv
 from tests.models.structured_events import EventModelError, check_structured_events
 from tests.support.structured import selected
-from xdsl_npu import language as N
-from xdsl_npu.analysis.hazards import HazardKind
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.structured import NotificationOp
-from xdsl_npu.passes.structured_sync import synchronize_structure
-from xdsl_npu.target.ascend910b import Engine, SyncKind
 
 
 def scratch(order=("b_fill", "b_read", "a_fill", "a_read")):

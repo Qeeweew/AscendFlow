@@ -2,8 +2,8 @@
 
 import ctypes as ct
 
-from xdsl_npu.backend.cann import CANN
-from xdsl_npu.diagnostics import require
+from ascendflow.backend.cann import CANN
+from ascendflow.diagnostics import require
 
 
 class OperatorReference:

@@ -11,17 +11,17 @@ import hashlib
 import json
 from pathlib import Path
 
+from ascendflow.backend.cann import CANN
+from ascendflow.build import build_module
+from ascendflow.device import ACL, health_snapshot
+from ascendflow.diagnostics import require
+from ascendflow.performance import hardware_snapshot
+from ascendflow.target.scalars import round_f32
 from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from benchmarks.work import structure_inventory, work_record
 from examples.normalization.rms_norm import rms_normalize
 from examples.normalization.softmax import softmax
-from xdsl_npu.backend.cann import CANN
-from xdsl_npu.build import build_module
-from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import hardware_snapshot
-from xdsl_npu.target.scalars import round_f32
 
 
 def oracle(values, columns, epsilon):

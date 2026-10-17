@@ -11,14 +11,14 @@ import pytest
 from xdsl.dialects.builtin import FloatAttr, f16, f32, f64
 from xdsl.utils.exceptions import VerifyException
 
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.io import parse
-from xdsl_npu.dialects.physical import TaskOp
-from xdsl_npu.dialects.source import ElementOp
-from xdsl_npu.frontend import FrontendError
-from xdsl_npu.target.scalars import round_f32
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.io import parse
+from ascendflow.dialects.physical import TaskOp
+from ascendflow.dialects.source import ElementOp
+from ascendflow.frontend import FrontendError
+from ascendflow.target.scalars import round_f32
 
 POS_INF, NEG_INF = float("inf"), float("-inf")
 

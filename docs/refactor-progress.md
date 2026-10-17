@@ -22,6 +22,46 @@ CANN 资格作为新代码已经验证的证据。
 外层没有 Git，未创建根 Git；reference、旧 TileLang 工作区和容器没有修改或重建。
 CATLASS、ops-transformer、ops-nn 的实际 HEAD 已再次核对，见 [source-notes.md](source-notes.md)。
 
+## 当前产品名与目录
+
+产品已命名为 **AscendFlow**。基于 `4dedce9` 将项目、包与命令统一为
+`ascendflow`；产品目录直接改为 `AscendFlow/`，代码直接位于 `src/`，
+没有额外的同名包目录。项目配置将逻辑包 `ascendflow` 映射到 `src`，
+xDSL 0.73.0 仍是底层 IR 框架依赖。
+目录理由、开发安装和入口分别见 [源码布局](source-layout.md) 与 [README](../README.md)。
+产品 Git 与全部历史随目录移至 `/workspace/xdsl-910b/AscendFlow`。
+
+当前独立 venv 已更新开发安装，`ascendflow` 与 `python -m ascendflow`
+都调用 `cli.main`；测试通过开发安装从当前 `src` 导入。旧安装、旧命令和旧包目录已移除，
+不保留兼容层。构建期限和 profiling 的环境变量统一为 `ASCENDFLOW_*`。
+旧 build、测试缓存、bytecode、egg-info 原样保存于外层
+`runs/ascendflow-rename/incoming/`；安装生成的 metadata 也留外层。
+
+82 个原有产品模块经 namespace 替换后的 AST 核对一致，例外只涉及 CLI
+说明/程序名及包 docstring；新加 `__main__.py` 转到同一个入口。ASC 仅将
+生成器注释改为 AscendFlow，少 9 字节。同步规则、IR dialect 名称、实际指令、
+地址、guard、ID、循环和数值合同不随产品名更改。
+
+当前 Python package SHA256 为
+`36f694a1e544ba050d2eed103f8218e572c9786d4c7d9f22bf4338c4ff661658`。
+最终目录下默认 FA 单次冷 source→ASC 为 **8.6808s**，import 0.3754s，
+进程总计 9.3285s，见
+[原始测量](../../runs/ascendflow-layout/cold/fa-default/benchmark.json)。
+source/同步前后 IR 与更名前一致；报告差异仅为 ASC 注释导致的输出字节数。
+仍没有五次性能资格或设备验证。下文的旧提交、哈希和结果保留各自快照身份，
+不能作为更名版本已执行的资格。
+
+最终目录的完整回归为 **1623 passed in 147.41s**，见
+[完整日志](../../runs/ascendflow-layout/full-tests.log)，SHA256 为
+`69aa9abfea23e265071dcdc08fbefeeb5852c3ab93be8cca87434080e7e38a7c`。
+Ruff 和 `git diff --check` 通过。Vector、GEMM、嵌套 CV、默认 FA 均通过
+新目录下的真实 CANN 离线编译，各自取得 IR、ASC、`.o`、`.aibin` 和 `.so`，
+每项构建使用 300 秒进程组硬期限。见
+[当前构建清单](../../runs/ascendflow-layout/qualification/source-builds.json) 和
+[目录、安装与源码核对](../../runs/ascendflow-layout/source-audit.json)。
+这些离线构建与回归并行，仅用于功能资格，耗时不充当冷编译性能成绩；
+上面的单次冷测量在它们完成后独立执行。
+
 ## 已实施
 
 - [生成规则及事实归属](generation-rules.md)：逐项输入、建立者、产出、消费者和失效条件。
@@ -200,14 +240,14 @@ Cube/Fixpipe、参数化嵌套和相邻循环、共享双 AIV CV 以及本页默
 工作区根运行，使用独立 `.venv`；产物留外层。以下每条实际算子构建都有 300 秒总期限：
 
 ```sh
-PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m xdsl_npu.cli --input compiler/examples/vector/scale.py --entry scale --parameters '{"B":64}' --output runs/reproduce/vector --shared --timeout 300
-PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m xdsl_npu.cli --input compiler/examples/gemm/batched.py --entry batched_matmul --output runs/reproduce/gemm --shared --timeout 300
-PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m xdsl_npu.cli --input compiler/examples/cv/nested.py --entry nested_cv --output runs/reproduce/nested-cv --shared --timeout 300
-PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m xdsl_npu.cli --input compiler/examples/flash_attention/attention.py --entry attention_target --output runs/reproduce/fa --shared --timeout 300
-PYTHONPATH=compiler PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m benchmarks.compile --input compiler/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output runs/reproduce/fa-cold
+PYTHONPATH=AscendFlow PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m ascendflow --input AscendFlow/examples/vector/scale.py --entry scale --parameters '{"B":64}' --output runs/reproduce/vector --shared --timeout 300
+PYTHONPATH=AscendFlow PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m ascendflow --input AscendFlow/examples/gemm/batched.py --entry batched_matmul --output runs/reproduce/gemm --shared --timeout 300
+PYTHONPATH=AscendFlow PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m ascendflow --input AscendFlow/examples/cv/nested.py --entry nested_cv --output runs/reproduce/nested-cv --shared --timeout 300
+PYTHONPATH=AscendFlow PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m ascendflow --input AscendFlow/examples/flash_attention/attention.py --entry attention_target --output runs/reproduce/fa --shared --timeout 300
+PYTHONPATH=AscendFlow PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m benchmarks.compile --input AscendFlow/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output runs/reproduce/fa-cold
 ```
 
-上面的 `--trials 1` 复现单次诊断，不是五次验收。全套回归在 `compiler/` 下运行：
+上面的 `--trials 1` 复现单次诊断，不是五次验收。全套回归在 `AscendFlow/` 下运行：
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 ../.venv/bin/python -m pytest -q --tb=short --basetemp=/workspace/xdsl-910b/runs/generation-redesign/qualified-test-tmp -o cache_dir=/workspace/xdsl-910b/runs/generation-redesign/pytest-cache

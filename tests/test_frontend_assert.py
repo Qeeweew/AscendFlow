@@ -7,11 +7,11 @@ from dataclasses import replace
 import pytest
 from xdsl.dialects import arith, scf
 
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.dialects.io import dump
-from xdsl_npu.dialects.source import PredicateOp
-from xdsl_npu.frontend import FrontendError
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.dialects.io import dump
+from ascendflow.dialects.source import PredicateOp
+from ascendflow.frontend import FrontendError
 
 SOURCE = """\
 def asserted(n:N.int64, B:N.constexpr=64):
@@ -117,8 +117,8 @@ def test_decorated_assertion_diagnostic_refers_to_captured_file_and_line():
 
 def test_host_optimization_cannot_remove_a_captured_dsl_assertion(tmp_path):
     script = tmp_path / "optimized_dsl_assert.py"
-    script.write_text("""from xdsl_npu import language as N
-from xdsl_npu.frontend import FrontendError
+    script.write_text("""from ascendflow import language as N
+from ascendflow.frontend import FrontendError
 
 @N.prim_func
 def checked(B:N.constexpr=64):

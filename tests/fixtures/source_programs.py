@@ -1,6 +1,6 @@
 """Small retained source programs; no physical builder or planner."""
 
-from xdsl_npu import language as T
+from ascendflow import language as T
 
 
 def vector_source(count=4):

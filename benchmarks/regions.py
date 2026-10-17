@@ -12,7 +12,7 @@ def source(streams=32, unused=128):
     if not (1 <= streams <= 128 and 0 <= unused <= 512):
         raise ValueError("source-size experiment requires 1..128 streams and 0..512 declarations")
     result = """from __future__ import annotations
-from xdsl_npu import language as N
+from ascendflow import language as N
 @N.prim_func(disjoint_external=True)
 def chain(A:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write"),n:N.int64):
     with N.Kernel():

@@ -4,9 +4,9 @@ from dataclasses import replace
 
 import pytest
 
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.target import native as target_native
-from xdsl_npu.target.native import NativeGeometry, native_contract
+from ascendflow.diagnostics import CompileError
+from ascendflow.target import native as target_native
+from ascendflow.target.native import NativeGeometry, native_contract
 
 
 def test_geometry_counts_accessed_bytes_without_including_pitched_holes():

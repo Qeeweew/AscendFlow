@@ -4,10 +4,10 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from xdsl_npu import scalar
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.indexing import arguments, normalize
-from xdsl_npu.scalar import Expr, Fact, expression, expression_scope, literal, substitute
+from ascendflow import scalar
+from ascendflow.diagnostics import CompileError
+from ascendflow.indexing import arguments, normalize
+from ascendflow.scalar import Expr, Fact, expression, expression_scope, literal, substitute
 
 
 def _argument(name):
@@ -110,7 +110,7 @@ def test_free_variables_are_immutable_compositional_facts():
 
 
 def test_retained_integer_normalization_bounds_work_by_shared_ring_nodes(monkeypatch):
-    from xdsl_npu.analysis import integer_facts
+    from ascendflow.analysis import integer_facts
 
     depth = 10
     root = _doubled(_argument("n"), depth)
@@ -174,8 +174,8 @@ def test_expression_arena_does_not_mask_invalid_constants_equal_to_cached_intege
 
 
 def test_expression_arena_never_shares_definedness_between_fact_environments():
-    from xdsl_npu.analysis.integer_facts import IntegerFacts
-    from xdsl_npu.analysis.structured_schedule import Comparison
+    from ascendflow.analysis.integer_facts import IntegerFacts
+    from ascendflow.analysis.structured_schedule import Comparison
 
     with expression_scope():
         quotient = expression("floordiv", literal(1), _argument("n"))
@@ -189,9 +189,9 @@ def test_expression_arena_never_shares_definedness_between_fact_environments():
 
 
 def test_compilation_releases_its_expression_scope_after_failure(monkeypatch):
+    from ascendflow import compile
+    from ascendflow.compilation import Compilation
     from examples.vector.scale import scale
-    from xdsl_npu import compile
-    from xdsl_npu.compilation import Compilation
 
     captured = []
 

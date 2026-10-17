@@ -2,9 +2,9 @@
 
 from dataclasses import replace
 
+from ascendflow.analysis.structured_schedule import Placement
 from examples.vector.scale import scale
 from tests.support.structured import selected
-from xdsl_npu.analysis.structured_schedule import Placement
 
 
 def test_hashed_notification_records_remain_structural_keys_after_replacement():

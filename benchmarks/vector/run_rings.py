@@ -3,8 +3,8 @@
 import argparse
 from pathlib import Path
 
+from ascendflow.build import build_file
 from benchmarks.artifacts import read_artifact
-from xdsl_npu.build import build_file
 
 
 def main():

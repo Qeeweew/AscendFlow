@@ -5,11 +5,11 @@ from itertools import pairwise, permutations
 
 import pytest
 
-from xdsl_npu.analysis import storage_word
-from xdsl_npu.analysis.storage_word import StoragePacketPosition as Position
-from xdsl_npu.analysis.storage_word import build_storage_word
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.scalar import Expr, expression, literal
+from ascendflow.analysis import storage_word
+from ascendflow.analysis.storage_word import StoragePacketPosition as Position
+from ascendflow.analysis.storage_word import build_storage_word
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.scalar import Expr, expression, literal
 
 N = Expr("argument", ("count",))
 J = Expr("argument", ("ordinal",))

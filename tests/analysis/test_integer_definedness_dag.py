@@ -5,9 +5,9 @@ from types import CodeType
 
 import pytest
 
-from xdsl_npu.analysis.integer_facts import IntegerFacts
-from xdsl_npu.analysis.structured_schedule import Comparison
-from xdsl_npu.scalar import Expr, Fact, expression, literal
+from ascendflow.analysis.integer_facts import IntegerFacts
+from ascendflow.analysis.structured_schedule import Comparison
+from ascendflow.scalar import Expr, Fact, expression, literal
 
 X, D, Y = (Expr("argument", (name,)) for name in ("x", "d", "y"))
 

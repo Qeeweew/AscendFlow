@@ -20,7 +20,7 @@ from .dialects.physical import RuntimeSizeOp
 INT64_MAX = (1 << 63) - 1
 DIVISION = {"floordiv", "rem", "ceildiv"}
 BINARY = {"add", "mul", "min", "max", *DIVISION}
-_expression_nodes = ContextVar("xdsl_npu_expression_nodes", default=None)
+_expression_nodes = ContextVar("ascendflow_expression_nodes", default=None)
 
 
 @contextmanager

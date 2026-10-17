@@ -14,6 +14,24 @@ from importlib import import_module
 import pytest
 from xdsl.dialects import arith, scf
 
+from ascendflow import language as N
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.analysis.structured_schedule import (
+    ActionGuard,
+    Comparison,
+    Placement,
+    SyncAction,
+    SyncKind,
+)
+from ascendflow.backend.structured import EmissionWork, _emit_owned, emit_structure_debug
+from ascendflow.diagnostics import CompileError
+from ascendflow.dialects.io import dump
+from ascendflow.dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.passes.materialize_structure import materialize_notifications
+from ascendflow.passes.structured_sync import synchronize_structure
+from ascendflow.scalar import expression, literal
+from ascendflow.target.ascend910b import Actor, Engine
 from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.gemm.reduction import reduction_gemm
@@ -21,24 +39,6 @@ from examples.vector.scale import scale
 from tests.control.test_recursive_native import NESTED, dispatch
 from tests.control.test_shared_aiv import SHARED
 from tests.fixtures.nested import nested_cv
-from xdsl_npu import language as N
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.analysis.structured_schedule import (
-    ActionGuard,
-    Comparison,
-    Placement,
-    SyncAction,
-    SyncKind,
-)
-from xdsl_npu.backend.structured import EmissionWork, _emit_owned, emit_structure_debug
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.dialects.io import dump
-from xdsl_npu.dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.materialize_structure import materialize_notifications
-from xdsl_npu.passes.structured_sync import synchronize_structure
-from xdsl_npu.scalar import expression, literal
-from xdsl_npu.target.ascend910b import Actor, Engine
 
 CARRY = """
 def carry(n:N.int64):
@@ -66,11 +66,11 @@ def forbid_analysis(monkeypatch):
         raise AssertionError("formatting must consume the existing owned facts")
 
     targets = (
-        ("xdsl_npu.target.native", ("native_contract",)),
-        ("xdsl_npu.passes.lower_native", ("lower_native_structure",)),
-        ("xdsl_npu.analysis.structured_memory", ("collect_native_memory",)),
-        ("xdsl_npu.analysis.structured_bounds", ("admit_memory_bounds",)),
-        ("xdsl_npu.analysis.structured_dependencies", ("build_structured_dependencies",)),
+        ("ascendflow.target.native", ("native_contract",)),
+        ("ascendflow.passes.lower_native", ("lower_native_structure",)),
+        ("ascendflow.analysis.structured_memory", ("collect_native_memory",)),
+        ("ascendflow.analysis.structured_bounds", ("admit_memory_bounds",)),
+        ("ascendflow.analysis.structured_dependencies", ("build_structured_dependencies",)),
     )
     modules = [(import_module(name), attributes) for name, attributes in targets]
     for module, attributes in modules:
@@ -607,7 +607,7 @@ int main(){
 
 
 def test_guarded_event_and_first_last_arithmetic_stay_inside_short_circuit(tmp_path):
-    from xdsl_npu.backend.structured import _Context, _Emitter
+    from ascendflow.backend.structured import _Context, _Emitter
 
     _, facts = memory(
         N.from_source("""
@@ -670,7 +670,7 @@ const int64_t npu_size_n=n;
 
 
 def test_singleton_participant_guard_precedes_event_arithmetic_in_actual_actor_scope(tmp_path):
-    from xdsl_npu.dialects.structured import ActorDomainOp
+    from ascendflow.dialects.structured import ActorDomainOp
 
     _, facts = memory(
         N.from_source("""
@@ -793,7 +793,7 @@ def test_async_native_and_notification_operations_survive_generic_scalar_passes(
     from xdsl.transforms.canonicalize import CanonicalizePass
     from xdsl.transforms.common_subexpression_elimination import CommonSubexpressionElimination
 
-    from xdsl_npu.dialects.physical import TaskOp
+    from ascendflow.dialects.physical import TaskOp
 
     _, facts = memory(
         N.from_source("""
@@ -854,7 +854,7 @@ def test_real_reduction_first_chunk_clear_uses_actual_stage_ordinal_ssa(tmp_path
         flags = [int(line[6:]) for line in result.stdout.splitlines() if line.startswith("clear ")]
         assert flags == [int(index == 0) for index in range(count)]
 
-    from xdsl_npu.backend.structured_native import format_native
+    from ascendflow.backend.structured_native import format_native
 
     template = next(item for item in facts.templates if item.contract.native == "mad_first")
     from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr

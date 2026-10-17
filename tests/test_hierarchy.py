@@ -2,9 +2,9 @@
 
 from xdsl.dialects import arith, scf
 
+from ascendflow.dialects.io import dump, parse
+from ascendflow.dialects.source import AllocationOp, PipelineOp, ProgramOp, SizeOp, ViewOp
 from examples.gemm.hierarchical import hierarchical_gemm
-from xdsl_npu.dialects.io import dump, parse
-from xdsl_npu.dialects.source import AllocationOp, PipelineOp, ProgramOp, SizeOp, ViewOp
 
 
 def _value(value, bindings):

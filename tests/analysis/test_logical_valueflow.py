@@ -9,24 +9,24 @@ from itertools import product
 
 import pytest
 
-from tests.analysis.test_conditional_accesses import _retarget, _structure
-from tests.fixtures.nested import shared_l0c_qk_pv
-from tests.models.structured_domains import expression_value, guard_active, occurrence_key
-from tests.models.structured_events import _Interpret
-from xdsl_npu import language as N
-from xdsl_npu.analysis.hazards import HazardKind
-from xdsl_npu.analysis.logical_valueflow import build_logical_valueflow
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.analysis.structured_regions import (
+from ascendflow import language as N
+from ascendflow.analysis.hazards import HazardKind
+from ascendflow.analysis.logical_valueflow import build_logical_valueflow
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.analysis.structured_regions import (
     AccessOccurrence,
     BoundaryPort,
     DependencyIssueKind,
     LogicalWriteKind,
     LoopOrdinalGuard,
 )
-from xdsl_npu.dialects.physical import KernelOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.target.ascend910b import Actor
+from ascendflow.dialects.physical import KernelOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.target.ascend910b import Actor
+from tests.analysis.test_conditional_accesses import _retarget, _structure
+from tests.fixtures.nested import shared_l0c_qk_pv
+from tests.models.structured_domains import expression_value, guard_active, occurrence_key
+from tests.models.structured_events import _Interpret
 
 
 def flow_for(source):

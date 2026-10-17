@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from ascendflow import language as N
+
 # Runtime dimensions in annotations are captured by the DSL frontend.
 # ruff: noqa: F821
 from examples.cv.nested import nested_cv  # noqa: F401 - shared source fixture
-from xdsl_npu import language as N
 
 
 @N.prim_func(disjoint_external=True)

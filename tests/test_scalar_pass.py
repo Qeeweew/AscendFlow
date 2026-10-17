@@ -16,13 +16,13 @@ from xdsl.dialects.builtin import (
 )
 from xdsl.ir import Block, Region, SSAValue
 
-from xdsl_npu import compile
-from xdsl_npu import language as N
-from xdsl_npu.dialects.io import dump
-from xdsl_npu.dialects.physical import RuntimeSizeOp, TaskOp
-from xdsl_npu.dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
-from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.simplify_scalars import simplify_scalars
+from ascendflow import compile
+from ascendflow import language as N
+from ascendflow.dialects.io import dump
+from ascendflow.dialects.physical import RuntimeSizeOp, TaskOp
+from ascendflow.dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
+from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.passes.simplify_scalars import simplify_scalars
 
 _ARITH_OPERATIONS = tuple(arith.Arith.operations)
 _MAX_I64 = (1 << 63) - 1
@@ -268,7 +268,7 @@ def test_floating_fastmath_and_vector_arithmetic_remain_outside_scalar_rewrites(
 
 
 def test_public_compile_simplifies_final_ssa_once_after_notification_materialization(monkeypatch):
-    from xdsl_npu.passes import structured_sync
+    from ascendflow.passes import structured_sync
 
     source = N.from_source("""
         def wired(n: N.int64):

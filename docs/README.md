@@ -1,4 +1,4 @@
-# 编译器文档入口
+# AscendFlow 文档入口
 
 2026-10-17。当前同步生成采用物理 cell credit、精确边界与分层派发规则。先读[实际状态](refactor-progress.md)、[生成规则](generation-rules.md)及[不变量](compilation-invariants.md)，区分实现、编译资格与设备证据。
 

@@ -10,11 +10,11 @@ from operator import eq, ge, gt, le, lt, ne
 
 import pytest
 
-from xdsl_npu.analysis import integer_facts
-from xdsl_npu.analysis.integer_facts import IntegerFacts
-from xdsl_npu.analysis.structured_schedule import Comparison
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.scalar import Expr, Fact, expression, literal
+from ascendflow.analysis import integer_facts
+from ascendflow.analysis.integer_facts import IntegerFacts
+from ascendflow.analysis.structured_schedule import Comparison
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.scalar import Expr, Fact, expression, literal
 
 X, Y, D = (Expr("argument", (name,)) for name in ("x", "y", "d"))
 PREDICATES = {"==": eq, "!=": ne, "<": lt, "<=": le, ">": gt, ">=": ge}
@@ -350,9 +350,9 @@ def test_ordered_definedness_propagates_analysis_budget_failures(monkeypatch):
 def test_an_inactive_window_does_not_specialize_its_unreachable_count():
     from xdsl.dialects.builtin import ModuleOp
 
-    from xdsl_npu.analysis.event_windows import build_event_window
-    from xdsl_npu.analysis.structured_protocols import LogicalNotification, NotificationKind
-    from xdsl_npu.target.ascend910b import Engine
+    from ascendflow.analysis.event_windows import build_event_window
+    from ascendflow.analysis.structured_protocols import LogicalNotification, NotificationKind
+    from ascendflow.target.ascend910b import Engine
 
     queries = IntegerFacts({"d": Fact()})
     loop = ModuleOp([])

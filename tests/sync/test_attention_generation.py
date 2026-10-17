@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
+from ascendflow.analysis.structured_memory import collect_native_memory
+from ascendflow.build import build_file
+from ascendflow.dialects.io import parse
 from tests.models.structured_events import check_structured_events
-from xdsl_npu.analysis.structured_memory import collect_native_memory
-from xdsl_npu.build import build_file
-from xdsl_npu.dialects.io import parse
 
 
 @pytest.fixture(scope="module")

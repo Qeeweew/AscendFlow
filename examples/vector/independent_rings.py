@@ -7,7 +7,7 @@ so the existing scale oracle and guarded device runner apply unchanged.
 
 from __future__ import annotations
 
-from xdsl_npu import language as N
+from ascendflow import language as N
 
 
 @N.prim_func(disjoint_external=True)

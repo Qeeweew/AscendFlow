@@ -7,13 +7,13 @@ import json
 from pathlib import Path
 
 import benchmarks.validation.attention as attention_validation
+from ascendflow.build import build_module
+from ascendflow.device import ACL, health_snapshot
+from ascendflow.diagnostics import require
+from ascendflow.performance import hardware_snapshot
 from benchmarks.artifacts import read_artifact
 from benchmarks.references.attention import NAME, reference_source
 from benchmarks.validation.attention import decode, inputs_and_oracle
-from xdsl_npu.build import build_module
-from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import hardware_snapshot
 
 
 def main():

@@ -1,4 +1,4 @@
-"""Source DSL/IR compiler; algorithm options belong to examples."""
+"""AscendFlow: compile multistage Ascend 910B source programs to ASC."""
 
 import argparse
 import json
@@ -8,8 +8,8 @@ from .build import build_file
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="typed source xDSL")
+    parser = argparse.ArgumentParser(prog="ascendflow", description=__doc__)
+    parser.add_argument("--input", type=Path, required=True, help="Python DSL or serialized source IR")
     parser.add_argument("--entry", help="captured AST prim_func in a Python input file")
     parser.add_argument(
         "--parameters", type=json.loads, default={}, help="JSON AST constexpr specializations"

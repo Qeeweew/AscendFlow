@@ -11,15 +11,15 @@ import hashlib
 import json
 from pathlib import Path
 
+from ascendflow import language as N
+from ascendflow.build import build_module
+from ascendflow.device import ACL, health_snapshot
+from ascendflow.diagnostics import require
+from ascendflow.performance import hardware_snapshot
 from benchmarks.artifacts import read_artifact
 from benchmarks.references import ascendc_source
 from benchmarks.work import structure_inventory, work_record
 from examples.gemm.batched import batched_matmul
-from xdsl_npu import language as N
-from xdsl_npu.build import build_module
-from xdsl_npu.device import ACL, health_snapshot
-from xdsl_npu.diagnostics import require
-from xdsl_npu.performance import hardware_snapshot
 
 
 def reference_source(policy):

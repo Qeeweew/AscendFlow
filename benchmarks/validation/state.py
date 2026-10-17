@@ -1,6 +1,6 @@
 """Deterministic inputs and an independent numerical reference."""
 
-from xdsl_npu.diagnostics import require
+from ascendflow.diagnostics import require
 
 
 def inputs_and_oracle(groups, count, tile, *, rounding=False):

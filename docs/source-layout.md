@@ -1,6 +1,40 @@
-# 源码职责和唯一编译链
+# AscendFlow 源码布局和唯一编译链
 
 2026-10-17。规则及事实归属见 [generation-rules.md](generation-rules.md)，实际资格见 [refactor-progress.md](refactor-progress.md)。
+
+## 产品与包边界
+
+产品名 **AscendFlow**；安装项目、Python 包与命令均为 `ascendflow`。
+xDSL 0.73.0 是实现所依赖的 IR 框架。产品仓库为
+`/workspace/xdsl-910b/AscendFlow`；工作区仍为 `/workspace/xdsl-910b`。
+
+```text
+AscendFlow/
+  pyproject.toml          # ascendflow 包映射到 src；统一 CLI
+  src/                   # 直接存放产品代码
+    __init__.py          # ascendflow 公共 API
+    cli.py               # 命令行入口
+    frontend/            # TileLang 风格 DSL
+    dialects/            # 基于 xDSL 的 source/physical IR
+    analysis/            # 内存、依赖、同步与资源事实
+    passes/              # lowering、生成和物化
+    backend/             # ASC 与 CANN
+    runtime/             # 构建期限和进程组
+  examples/              # 算法及政策
+  tests/                 # 语义与集成回归
+  benchmarks/            # 编译及后续设备测量
+  docs/                  # 当前设计与资格
+```
+
+`src/` 直接放置代码，没有额外的 `src/ascendflow/`。项目配置将逻辑包
+`ascendflow` 映射到 `src`，子包仍使用 `ascendflow.analysis` 等导入名，
+不把 `analysis`、`runtime` 等通用名字暴露为顶层包。独立 venv 的开发安装
+直接指向当前 `src`；CLI、测试和 benchmark 子进程使用同一份源码。
+`ascendflow` 与 `python -m ascendflow` 都调用 `cli.main`。profiling 使用
+`ASCENDFLOW_PYTHON`；构建组期限使用 `ASCENDFLOW_BUILD_*` 环境变量。
+不提供旧包或旧环境变量的兼容入口。
+
+## 编译链与职责
 
 ```text
 compile / Compilation

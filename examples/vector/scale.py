@@ -9,8 +9,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from xdsl_npu import language as N
-from xdsl_npu.build import build_file
+from ascendflow import language as N
+from ascendflow.build import build_file
 
 
 @N.prim_func(disjoint_external=True)

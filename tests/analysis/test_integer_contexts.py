@@ -4,11 +4,11 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from xdsl_npu.analysis import integer_facts
-from xdsl_npu.analysis.integer_facts import IntegerFacts
-from xdsl_npu.analysis.structured_schedule import Comparison
-from xdsl_npu.diagnostics import CompileError, ErrorKind
-from xdsl_npu.scalar import Expr, Fact, expression, literal
+from ascendflow.analysis import integer_facts
+from ascendflow.analysis.integer_facts import IntegerFacts
+from ascendflow.analysis.structured_schedule import Comparison
+from ascendflow.diagnostics import CompileError, ErrorKind
+from ascendflow.scalar import Expr, Fact, expression, literal
 
 X, Y = (Expr("argument", (name,)) for name in ("x", "y"))
 

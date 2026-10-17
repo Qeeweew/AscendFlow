@@ -5,9 +5,9 @@ import subprocess
 
 import pytest
 
-from xdsl_npu.diagnostics import CompileError
-from xdsl_npu.indexing import check_axis
-from xdsl_npu.scalar import INT64_MAX, Expr, bindings, expression, literal
+from ascendflow.diagnostics import CompileError
+from ascendflow.indexing import check_axis
+from ascendflow.scalar import INT64_MAX, Expr, bindings, expression, literal
 
 
 @pytest.mark.parametrize("kind", ("floordiv", "ceildiv"))

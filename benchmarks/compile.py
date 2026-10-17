@@ -65,11 +65,11 @@ def _constexpr(value):
 def worker(path, *, entry, parameters, mode, metadata, deadline, artifacts=None):
     """Measure all input work through immutable ASC/IR snapshot construction."""
     started = perf_counter()
-    import xdsl_npu
-    from xdsl_npu.dialects.io import parse
+    import ascendflow
+    from ascendflow.dialects.io import parse
 
     imported = perf_counter()
-    package = Path(xdsl_npu.__file__).parent
+    package = Path(ascendflow.__file__).parent
     identity_started = perf_counter()
     package_sha = _package_sha(package)
     identity_before_s = perf_counter() - identity_started
@@ -83,7 +83,7 @@ def worker(path, *, entry, parameters, mode, metadata, deadline, artifacts=None)
     else:
         import runpy
 
-        from xdsl_npu.frontend import PrimFunction
+        from ascendflow.frontend import PrimFunction
 
         module = runpy.run_path(str(path))[entry]
         if not isinstance(module, PrimFunction):
@@ -92,7 +92,7 @@ def worker(path, *, entry, parameters, mode, metadata, deadline, artifacts=None)
             **{name: _constexpr(value) for name, value in parameters.items()}
         )
     constructed = perf_counter()
-    result = xdsl_npu.compile(module, timeout_s=_remaining(deadline), debug_verify=mode == "deep")
+    result = ascendflow.compile(module, timeout_s=_remaining(deadline), debug_verify=mode == "deep")
     completed = perf_counter()
     # compile() already serializes every IR/report snapshot. Publication of
     # those immutable strings and identity recording happen after this boundary.

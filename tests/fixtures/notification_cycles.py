@@ -5,19 +5,19 @@ These builders specify actual placements, not a progress solver or an oracle.
 
 from dataclasses import replace
 
-from tests.models.structured_domains import actual_dispatch
-from tests.models.structured_events import Command, Occurrence
-from tests.support.structured import selected
-from xdsl_npu.analysis.access_frontier import AccessEndpoint
-from xdsl_npu.analysis.structured_protocols import (
+from ascendflow.analysis.access_frontier import AccessEndpoint
+from ascendflow.analysis.structured_protocols import (
     BoundPlacement,
     LogicalNotification,
     NotificationKind,
 )
-from xdsl_npu.analysis.structured_regions import AccessOccurrence, LoopBinding, LoopDomain
-from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison, Placement
-from xdsl_npu.scalar import expression, literal
-from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
+from ascendflow.analysis.structured_regions import AccessOccurrence, LoopBinding, LoopDomain
+from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement
+from ascendflow.scalar import expression, literal
+from ascendflow.target.ascend910b import Actor, Engine, SyncKind
+from tests.models.structured_domains import actual_dispatch
+from tests.models.structured_events import Command, Occurrence
+from tests.support.structured import selected
 
 
 def isolated(selection, notifications):

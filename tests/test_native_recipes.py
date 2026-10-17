@@ -4,12 +4,12 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType, IntAttr, ModuleOp, StringAttr, f32
 from xdsl.ir import Block
 
-from xdsl_npu import language as N
-from xdsl_npu.dialects.physical import BufferOp, TaskOp, task_attrs
-from xdsl_npu.dialects.source import ElementOp, ReduceOp, ScalarReadOp, ScaleOp
-from xdsl_npu.dialects.structured import AddressOp
-from xdsl_npu.dialects.types import TaskType, ref_type
-from xdsl_npu.passes.native_recipes import (
+from ascendflow import language as N
+from ascendflow.dialects.physical import BufferOp, TaskOp, task_attrs
+from ascendflow.dialects.source import ElementOp, ReduceOp, ScalarReadOp, ScaleOp
+from ascendflow.dialects.structured import AddressOp
+from ascendflow.dialects.types import TaskType, ref_type
+from ascendflow.passes.native_recipes import (
     RecipeContext,
     lower_element,
     lower_reduce,
