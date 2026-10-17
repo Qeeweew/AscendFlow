@@ -35,11 +35,19 @@ softmax中独立的alpha Exp与矩阵减法按完成依赖排步；P的独立FP1
 denominator归约之前，归约继续读取原始FP32 work，不读取转换后的P。
 这些选择不改变逐行递推、FP32归约树或输出dtype。
 
+最终 O 只在最后一个 KV 块输出。对应行流水采用 import/accumulate 两个 stage，
+归一化、RN cast 和 GM 写回在 accumulate 末尾的同一个 LAST 条件内执行；
+Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
+
 ## 资格边界
 
 默认数值验收配置包括 Sq:Sk 为256:1024、768:3072、1536:1024、1024:2048等，
 误差阈值为rtol=0.002、atol=0.0002；4K/8K用于稳态性能比较。
 每次结论绑定本次生成的ASC和库、输入与设备，采样与全输出验证分别标明。性能目标为同卡设备时间不慢于ACLNN（时间比≤1.00）；BQ128仍可显式选择，其历史性能不能代替当前默认政策的资格。
+
+合并最终 O 写回 stage 后的具体数值、性能与产物身份见
+[性能与设备验证记录](performance-results.md)。其中 default/BQ128、全输出/采样及
+standard/uniform/sharp 分别记录，资格不随 runner 参数自动扩展。
 
 当前重复 PIPE_V 屏障的事实、原因及后续验收要求见
 [待处理的性能问题](deferred-optimizations.md)。本轮保留该问题，尚未实现去重。

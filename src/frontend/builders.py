@@ -32,6 +32,7 @@ from ..dialects.source import (
     StageOp,
     ViewOp,
     YieldOp,
+    copy_compatible,
 )
 from ..dialects.types import TensorType, TileType
 from ..target.scalars import round_f32
@@ -772,10 +773,14 @@ def _issue_order(order):
     }
 
 
-def copy(source, destination, *, valid=None, transpose=False):
+def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
     src, dst = _view(source), _view(destination).bound()
     require(dst.buffer.op.access.data != "read", "copy cannot write a read-only tensor")
     require(type(transpose) is bool, "copy transpose policy must be constexpr boolean")
+    require(
+        pad_value is None or type(pad_value) in {int, float} and pad_value == 0,
+        "copy padding currently requires pad_value=0",
+    )
     if transpose:
         require(
             (src.buffer.memory, dst.buffer.memory) == ("L1", "L0B")
@@ -784,9 +789,13 @@ def copy(source, destination, *, valid=None, transpose=False):
             "transposed copy currently requires a complete L1→L0B matrix",
         )
     require(
-        (src.shape[::-1] if transpose else src.shape) == dst.shape
-        and src.buffer.dtype == dst.buffer.dtype,
-        "copy requires identical typed extents; use explicit cast",
+        copy_compatible(
+            _type(src.shape, src.buffer.dtype, src.buffer.memory, src.buffer.layout),
+            _type(dst.shape, dst.buffer.dtype, dst.buffer.memory, dst.buffer.layout),
+            transpose=transpose,
+            zero_pad=pad_value is not None,
+        ),
+        "copy requires compatible extents/types; use explicit cast or pad_value=0",
     )
     op = CopyOp.build(
         operands=[src.emit(valid), dst.emit(valid), _deps([source])],
@@ -794,6 +803,7 @@ def copy(source, destination, *, valid=None, transpose=False):
         attributes={
             "dependency_inputs": _dependency_inputs([source]),
             **({"transpose": IntAttr(1)} if transpose else {}),
+            **({"zero_pad": IntAttr(1)} if pad_value is not None else {}),
         },
     )
     _trace().add(op)

@@ -9,6 +9,7 @@
 | 语法 | 合同 |
 |---|---|
 | `@T.prim_func` | 捕获源码、参数及位置 |
+| `@T.inline` | 词法作用域的透明 AST 内联；不执行 Python helper |
 | `T.Tensor` / `T.int64` | 外部tensor与runtime标量；长度不是constexpr |
 | `T.int64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
 | `T.constexpr` | tile、dtype/layout、固定政策等显式特化参数 |
@@ -16,6 +17,7 @@
 | `T.Kernel(groups, kind=...)` | launch域；mixed每组1 AIC/2 AIV |
 | `T.Cube()` / `T.Vector() as lane` | actor域，具体engine由原语确定 |
 | `T.serial(N)` | 源顺序循环，退出无隐式drain |
+| `T.tile_ranges(E, B)` | constexpr 整块/尾块区间 `(base, count, valid)`，最多两份 body；省略空区间 |
 | `T.Pipelined(N, stages=S, issue_order=...)` | 有限stage政策；保留runtime循环 |
 | `T.Stage(s, name=...)` | 当前pipeline的逻辑偏移，不是完成边界 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理容量、布局、slot与别名 |
@@ -41,13 +43,28 @@ for t in T.Pipelined(tiles, stages=3):
 
 pipeline在actor-local step j执行 `t=j-s`，仅在合法域内激活。issue_order决定同actor的派发次序，不按stage编号强行排序；它不构成跨actor完成关系。用户不给Set/Wait、初始token或event ID。
 
+只在归约最后一块写回的算子，在 compute stage 末尾保留 LAST 条件并写回，
+不为这一次写回单设 export stage。MAD→FIX、Vector→MTE3 及输出存储下一次
+覆盖前的最后读取，仍由实际 effects 推导同步。stage 不是硬件 pipe 或完成边界。
+
 ## 3. CV与嵌套语义
 
 FA的真实数学主体在[attention.py](../examples/flash_attention/attention.py)。四个stage是QK、softmax、PV、output update；内部还有Cube分块和Vector行块pipeline。用户政策可令AIC先新QK后旧PV、AIV先新softmax后旧update。
 
 不同stage可以共用物理存储，但各自逻辑代次、slot和状态必须准确。两个AIV对P的贡献和GM reader释放由编译器根据实际访问建立；不能把一个actor完成当成两者都完成。
 
-数学块名称不是编译器内置attention API，也不是目前已有的通用函数宏。任意Python函数调用仍被拒绝。透明宏如后续加入，必须保留source位置、类型、scratch/effects、作用域和内部循环，不靠opaque Python回调隐藏原语；这不是本轮已经支持的能力。
+数学块名称不是编译器内置 attention API。`@T.inline` 已支持透明 DSL helper，
+参数接收标量、view 或 tuple，允许一个末尾 return；没有提前 return、变长参数或
+Python 回调。helper 捕获自身的不可变常量和其他 DSL helper，局部名字不会读写
+调用方的局部变量。内部原语、view、循环及源位置在正常 AST 链路中展开，访问、
+scratch/effects、原式定义性、ownership 和同步合同不变。内联共用 10000 条展开
+预算，调用深度最多 16；任意 Python 函数调用仍拒绝。显式文本可用
+`T.from_source(..., functions={"helper": captured_helper})` 绑定捕获后的 helper。
+
+`T.tile_ranges(259, 128)` 依次绑定 `(0, 2, 128)` 和 `(256, 1, 3)`。
+用户再对 count 写 `T.serial` 或 `T.Pipelined`，设备循环仍保留，未按每个 tile 展开。
+extent/width 必须是 constexpr 整数，extent 非负、width 为正；只拆分静态有效宽度，
+没有声明输入天然在界内或绕过 native 对齐要求。
 
 serial、pipeline、嵌套及循环前后操作使用统一控制与region接口，语义见[循环与边界组合](design.md)。示例源码列于[examples](../examples/README.md)；设计示意本身不构成可运行API。
 
@@ -63,7 +80,8 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 | FIRST/LAST/受限边界guard | 已有子集，组合限制存在 | 空/短/重合/孔洞的统一存在域 |
 | 数据相关分支、间接alias/owner、任意多时钟连续任务 | 未普遍支持 | 明确可验证输入合同或具体拒绝 |
 | prefix native 地址、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
-| opaque Python函数/任意宏 | 不支持 | 透明AST复用另列实现，不以增加原语名单替代 |
+| 透明 `@T.inline` helper / 静态尾块区间 | 已实现 | 同一 AST、native lowering、访问检查和同步链；不引入设备 call |
+| opaque Python函数/任意宏 | 不支持 | 不以 host 执行隐藏原语或 effects |
 
 语法/admission与lowering能力应对应；不能先接受一种构造，再以不相关的“需要KV/query”诊断拒绝。
 

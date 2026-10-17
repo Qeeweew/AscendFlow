@@ -23,6 +23,7 @@ from ..dialects.source import (
     ScaleOp,
     ViewOp,
     block8_reduction_widths,
+    copy_compatible,
 )
 
 
@@ -59,6 +60,8 @@ class RecipeContext:
     view: SourceView
     subview: PhysicalSubview
     emit: NativeEmitter
+    load3d_b_width: int | None = None
+    load3d_a_width: int | None = None
 
 
 @dataclass(frozen=True)
@@ -91,46 +94,91 @@ def source_allocation(value):
     return root
 
 
+def strided_b_width(op):
+    if (
+        not isinstance(op, CopyOp)
+        or (op.source.type.memory.data, op.destination.type.memory.data) != ("L1", "L0B")
+        or op.transpose is not None
+        and op.transpose.data
+        or len(op.source.type.shape) != 2
+    ):
+        return None
+    rows, cols = source_shape(op.source)
+    width = source_allocation(op.source).ref.type.shape.data[-2].data
+    # Load3D handles this strided zN rectangle in one instruction. Complete
+    # planes and one-fractal dimensions keep their existing Load2D recipe.
+    return width if 16 < rows < width and cols > 16 else None
+
+
+def compact_a_width(op):
+    if (
+        not isinstance(op, CopyOp)
+        or (op.source.type.memory.data, op.destination.type.memory.data) != ("L1", "L0A")
+        or len(op.source.type.shape) != 2
+    ):
+        return None
+    rows, _ = source_shape(op.source)
+    return (
+        rows
+        if rows > 16 and source_allocation(op.source).ref.type.shape.data[-2].data == rows
+        else None
+    )
+
+
 def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
     require(
         source_allocation(op.destination).access.data != "read", "copy writes a read-only tensor"
     )
     require(
-        (
-            source_shape(op.source)[::-1]
-            if op.transpose is not None and op.transpose.data
-            else source_shape(op.source)
-        )
-        == source_shape(op.destination)
-        and op.source.type.dtype == op.destination.type.dtype,
-        "copy must preserve element type/extent; use an explicit cast",
+        copy_compatible(
+            op.source.type,
+            op.destination.type,
+            transpose=op.transpose is not None and bool(op.transpose.data),
+            zero_pad=op.zero_pad is not None,
+        ),
+        "copy needs compatible extents/types, explicit padding or cast",
     )
     banks = op.source.type.memory.data, op.destination.type.memory.data
     if banks == ("GM", "L1"):
         require(len(source_shape(op.source)) == 2, "ND→NZ copy requires a matrix")
+        padded = op.zero_pad is not None and source_shape(op.source) != source_shape(op.destination)
         task = context.emit(
             "_copy",
-            "nd2nz",
+            "nd2nz_pad" if padded else "nd2nz",
             context.view(op.source, matrix=True),
             context.view(op.destination),
-            params=source_shape(op.source),
+            params=source_shape(op.source) + (source_shape(op.destination) if padded else ()),
         )
     elif banks in {("L1", "L0A"), ("L1", "L0B")}:
         transpose = op.transpose is not None and op.transpose.data
+        native = "load2d_a" if banks[1] == "L0A" else "load2d_b_nt" if transpose else "load2d_b_nn"
+        if context.load3d_b_width is not None and strided_b_width(op) == context.load3d_b_width:
+            native = "load3d_b_nn"
+        if context.load3d_a_width is not None and compact_a_width(op) == context.load3d_a_width:
+            native = "load3d_a"
         task = context.emit(
             "_copy",
-            "load2d_a" if banks[1] == "L0A" else "load2d_b_nt" if transpose else "load2d_b_nn",
+            native,
             context.view(op.source),
             context.view(op.destination),
             params=source_shape(op.source),
         )
     elif banks == ("L0C", "GM"):
+        source = context.view(op.source)
+        params = source_shape(op.source)
+        if source_shape(op.source) != source_shape(op.destination):
+            m, n = source_shape(op.destination)
+            stride = source_shape(op.source)[0]
+            source = context.subview(
+                source, m * 16 * 4, rows=(n + 15) // 16, row_stride=stride * 16 * 4
+            )
+            params = (m, n, stride)
         task = context.emit(
             "_export",
             "fix",
-            context.view(op.source),
+            source,
             context.view(op.destination, matrix=True),
-            params=source_shape(op.source),
+            params=params,
         )
     else:
         source, destination = context.view(op.source), context.view(op.destination)

@@ -287,6 +287,24 @@ def test_l1_nz_column_slice_retains_axes_and_uses_fractal_byte_coordinates():
     ]
 
 
+def test_l1_nz_row_and_column_slice_keeps_physical_fractal_gaps():
+    source = Block(arg_types=[IndexType()])
+    allocation = _allocation((2, 256, 128), dtype="f16", bank="L1", layout="NZ")
+    view = _view(
+        source,
+        allocation,
+        (1, 128, 32),
+        (1, 2),
+        (source.args[0], _index(source, 128), _index(source, 16)),
+    )
+    output = Block(arg_types=[IndexType()])
+    address, _, _ = _lower(
+        view, matrix=True, bindings=[(source.args[0], output.args[0])], output=output
+    )
+    assert (address.nbytes.data, address.rows.data, address.row_stride.data) == (4096, 2, 8192)
+    assert [_evaluate(address.offset, {output.args[0]: slot}) for slot in (0, 1)] == [12288, 77824]
+
+
 def test_nested_subviews_keep_the_original_root_and_axis_metadata():
     source = Block(arg_types=[IndexType()])
     view = _view(

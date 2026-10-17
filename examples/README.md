@@ -16,6 +16,7 @@
 | [gemm/reduction.py](gemm/reduction.py) | runtime K归约 | benchmarks.gemm.run_reduction |
 | [gemm/hierarchical.py](gemm/hierarchical.py) | 输出块循环嵌套K流水 | benchmarks.gemm.run_hierarchical |
 | [gemm/dense.py](gemm/dense.py) | 连续 NT 矩阵、配对列片与输出缓存政策 | benchmarks.gemm.run_dense |
+| [gemm/matmul.py](gemm/matmul.py) | 连续 C=A@B、FP16/BF16 输入输出与任意正尺寸尾块 | benchmarks.gemm.run_matmul |
 | [cv/nested.py](cv/nested.py) | 双缓冲 GM handoff、嵌套 Cube 与共享双 AIV body | 通用 CLI，entry=nested_cv |
 | [state/recurrence.py](state/recurrence.py) | 初始化、递推、导出 | benchmarks.state.run |
 | [state/grouped.py](state/grouped.py) | 两runtime轴、跨调用复用 | benchmarks.state.run_grouped |
@@ -31,4 +32,4 @@ python -m examples.vector.scale --output build/quickstart/vector
 
 FA只有一个正常数学主体`attention_target`。默认dense f16 B1/Hq8/Hkv8/D128及BQ256/BK1024/CK128/VR8的数学、workspace和验证要求见[FA合同](../docs/attention-target.md)。Sq/Sk是runtime；不把外层Q块当成编译器专属控制类型。
 
-runner参数存在不等于变体已验证。causal、tail、空序列、varlen、paged/sparse、persistent和continuous多时钟状态分别需要明确合同。设计中的数学块/宏不是可运行API，不在examples堆预期失败的方案文件或多份候选算子。
+runner参数存在不等于变体已验证。causal、tail、空序列、varlen、paged/sparse、persistent和continuous多时钟状态分别需要明确合同。透明 DSL helper 和静态尾块区间的现有语法见 [dsl-multistage.md](../docs/dsl-multistage.md)；设计中的其他数学块/宏不构成已实现 API，不在 examples 堆预期失败的方案文件或多份候选算子。

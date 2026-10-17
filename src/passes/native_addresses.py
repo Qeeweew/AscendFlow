@@ -180,15 +180,21 @@ def lower_address(
             len(shape) >= 2
             and len(dimensions) == 2
             and axes == (len(shape) - 2, len(shape) - 1)
-            and dimensions[0] == shape[-2]
+            and (column_slice or dimensions[0] == shape[-2])
             and (column_slice or dimensions[1] == shape[-1])
             and all(size > 0 and size % 16 == 0 for size in dimensions)
-            and _constant(view.origins[-2]) == 0
+            and (column_slice or _constant(view.origins[-2]) == 0)
             and (column_slice or _constant(view.origins[-1]) == 0),
-            "fractal view needs a complete matrix plane or an aligned full-row L1 NZ column slice",
+            "fractal view needs a complete matrix plane or an aligned L1 NZ rectangle",
             unsupported=True,
         )
-    if len(dimensions) == 2 and typ.layout.data == "linear" and (matrix or not contiguous):
+    if typ.layout.data == "NZ" and dimensions[0] != shape[-2]:
+        nbytes, rows, row_stride = (
+            dimensions[0] * 16 * itemsize,
+            dimensions[1] // 16,
+            shape[-2] * 16 * itemsize,
+        )
+    elif len(dimensions) == 2 and typ.layout.data == "linear" and (matrix or not contiguous):
         rows, columns = dimensions
         nbytes, row_stride = columns * itemsize, selected[0]
     else:
@@ -214,6 +220,8 @@ def lower_address(
         physical_stride = stride
         if typ.layout.data == "NZ" and axis == len(pairs) - 1:
             physical_stride = indices.binary(arith.MuliOp, stride, shape[-2])
+        elif typ.layout.data == "NZ" and axis == len(pairs) - 2:
+            physical_stride = 16 * itemsize
         offset = indices.binary(
             arith.AddiOp, offset, indices.binary(arith.MuliOp, origin, physical_stride)
         )
@@ -272,7 +280,9 @@ def subview(
                 and (same_row or first + (rows - 1) * row_stride // pitch < owner.rows.data),
                 "static native subview crosses a parent row gap",
             )
-        if root.type.layout.data != "linear":
+        if root.type.layout.data != "linear" and not (
+            root.type.bank.data == "L0C" and root.type.layout.data == "NZ"
+        ):
             _require(
                 offset == 0 and rows == 1 and nbytes == owner.nbytes.data,
                 "fractal subview must retain the complete matrix plane",

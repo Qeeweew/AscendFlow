@@ -9,7 +9,7 @@ from ascendflow.analysis.structured_admission import admit_structured_memory
 from ascendflow.analysis.structured_bounds import admit_memory_bounds
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_ownership import admit_owners
-from ascendflow.analysis.structured_tiles import nd_grid_cell
+from ascendflow.analysis.structured_tiles import nd_rectangle
 from ascendflow.build import build_file
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import parse
@@ -63,13 +63,13 @@ def test_tiled_owner_proof_uses_grid_cells_and_retains_every_actual_access():
     # Geometry identity must not trust axes independently of real bytes.
     facts = memory.control.environment.facts
     assert (
-        nd_grid_cell(
+        nd_rectangle(
             expression("add", access.offset, literal(4)), access.geometry, access.axes, facts
         )
         is None
     )
     assert (
-        nd_grid_cell(access.offset, replace(access.geometry, row_stride=16 * 4), access.axes, facts)
+        nd_rectangle(access.offset, replace(access.geometry, row_stride=16 * 4), access.axes, facts)
         is None
     )
 
@@ -125,7 +125,7 @@ def test_nz_column_slice_needs_fractal_alignment_even_when_bytes_are_aligned():
                 T.copy(x[:,8:24],a)
     """)
     memory = collect_native_memory(lower_native_structure(source).module)
-    with pytest.raises(CompileError, match="aligned full-row L1 NZ column slice"):
+    with pytest.raises(CompileError, match="aligned L1 NZ rectangle"):
         admit_memory_bounds(memory)
 
 

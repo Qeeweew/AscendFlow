@@ -282,7 +282,7 @@ def attention_target(
                     # Broadcast once for the complete state; retain separate
                     # FP32 multiply/add and the later normalization boundary.
                     N.mul(o, alpha[s, :, None], out=o, scratch=out_broadcast)
-                    for row in N.Pipelined(BQ // 2 // VR, stages=3):
+                    for row in N.Pipelined(BQ // 2 // VR, stages=2):
                         r = row * VR
                         g = lane * (BQ // 2) + r
                         with N.Stage(0, name="import_pv"):
@@ -298,8 +298,6 @@ def attention_target(
                                     scratch=out_broadcast[:VR, :],
                                 )
                                 N.cast(pv_in[row % 2, :, :], out=o_out[row % 2, :, :])
-                        with N.Stage(2, name="export_o"):
-                            if kv == kv_tiles - 1:
                                 N.copy(
                                     o_out[row % 2, :, :],
                                     O[batch, head, query_row + g : query_row + g + VR, :],

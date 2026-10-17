@@ -189,6 +189,8 @@ def _original_view(address: AddressFacts, facts):
         physical_stride = stride
         if geometry.layout == "NZ" and axis == len(pairs) - 1:
             physical_stride = expression("mul", stride, axes.extents[-2])
+        elif geometry.layout == "NZ" and axis == len(pairs) - 2:
+            physical_stride = literal(16 * itemsize)
         base = expression("add", base, expression("mul", origin, physical_stride))
         stride = expression("mul", stride, extent)
     expected = expression("add", base, literal(axes.displacement))
@@ -234,25 +236,34 @@ def _original_view(address: AddressFacts, facts):
         _require(
             rank >= 2
             and selected == (rank - 2, rank - 1)
-            and equivalent(axes.origins[-2], literal(0), facts)
+            and (column_slice or equivalent(axes.origins[-2], literal(0), facts))
             and (column_slice or equivalent(axes.origins[-1], literal(0), facts))
             and all(extent is not None and extent > 0 and extent % 16 == 0 for extent in extents)
-            and axes.widths[-2] == extents[0]
+            and (column_slice or axes.widths[-2] == extents[0])
+            and axes.widths[-2] % 16 == 0
+            and _multiple_of(axes.origins[-2], 16, facts)
             and axes.widths[-1] % 16 == 0
             and _multiple_of(axes.origins[-1], 16, facts)
             and (column_slice or axes.widths[-1] == extents[1]),
-            "fractal address needs its complete matrix plane or an aligned full-row L1 NZ column slice",
+            "fractal address needs its complete matrix plane or an aligned L1 NZ rectangle",
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )
         _require(
-            axes.displacement == 0
+            geometry.layout == "NZ"
+            or axes.displacement == 0
             and geometry.contiguous
             and geometry.total_nbytes == width * rows,
             "fractal native subview must retain the complete selected physical plane",
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )
+        if geometry.layout == "NZ" and axes.widths[-2] != extents[0]:
+            return (
+                axes.widths[-2] * 16 * itemsize,
+                axes.widths[-1] // 16,
+                extents[0] * 16 * itemsize,
+            )
         return width * rows, 1, 0
     return width, rows, pitch
 
@@ -308,6 +319,8 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
             alignment = (
                 512
                 if bank != "GM" and engine in {Engine.M, Engine.MTE1, Engine.FIX}
+                else ITEMSIZE[access.address.geometry.dtype]
+                if bank == "GM" and template.operation.native.data in {"nd2nz", "nd2nz_pad", "fix"}
                 else 4
                 if engine is Engine.S
                 else 32

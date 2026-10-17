@@ -8,6 +8,8 @@ GM partial accumulator。M/N/K 为 constexpr；当前 native 行步长仍要求�
 M/N/K 分别是 128/256/256 的正倍数；不支持尾块。每个 owner 循环处理输出
 块，每块按 K 顺序累计。相邻两个列片共用 A，保留各自的 L0C、最后 MAD 和
 FIX 退休点。L1 384 KiB，L0A/B 各 64 KiB，L0C 128 KiB，无 GM workspace。
+仅最后一个 K panel 写回，FIXPIPE 位于 compute 末尾的 LAST 条件内，
+与 compute 共用 stage；pipeline horizon 为 `PREFETCH+1`。
 
 普通 ND 输出 tile 的核间 ownership 和跨迭代分离使用通用的 tile-grid 坐标
 合同：实际二维 footprint 与 axes/offset 一致、原点按 tile 宽度对齐、所有
@@ -69,34 +71,6 @@ cubeMathType=0）。每个构建经唯一 DSL→IR→ASC→CANN 路径和单次 
 的身份。三个生成批次中最慢的 p50 也必须不慢于最快 ACLNN 批次的 p50；
 统计同时报告三批 p50 的中位数，不放宽 1.00 门槛。
 
-本轮证据位于 `build/gemm-20261017/`。具体已通过的形状、批次和性能以该目录
-最终报告及 JSON 为准，不将小 tile 或预先 panel-major 的旧 GEMM 结果作为
-普通大矩阵的资格，也不外推至 NN、BF16、FP16 输出、任意尾块或冷缓存。
-
-## 2026-10-17 验收结果
-
-Ascend910B3 物理卡 2 映射逻辑卡 0，CANN 9.1.0 / dav-2201 / `-O2`。
-每个形状交替运行两个 backend，共三批，每批预热 5 次、计时 30 次。
-下表为三批设备 task p50 的中位数，单位 µs；输出均为 FP32。
-
-| M=N=K | AscendFlow | ACLNN | 时间降低 | 输出缓存 |
-|---|---:|---:|---:|---|
-| 4096 | 486.192 | 507.038 | 4.11% | normal，64 MiB |
-| 8192 | 4032.550 | 4236.804 | 4.82% | bypass，256 MiB |
-
-最慢 AscendFlow 批次 / 最快 ACLNN 批次分别为 0.961881 和 0.963746，
-均通过 1.00 门槛。完整 DSL→IR→ASC→CANN 构建分别为 6.944 s、7.050 s，
-低于单次 300 s 上限；没有将这两次构建当作多批冷编译统计。
-
-配对列片把 4K GM→L1 请求从 2 GiB 降至 1.5 GiB，与 ACLNN 相同。
-8K 输出旁路后，L2 `write_cache_miss_allocate` 中位计数从 524288 降至 0，
-r0 读 miss 分配比例约从 6.80% 降至 3.24%。该归因对照保持设备 kernel body
-字节一致，仅改变 launcher 的输出地址绑定。GM 请求不能当作 HBM 实测流量，
-不同 PMU 组的计时也不相加。
-
-当前代码通过 1703 项回归。6 个形状分别对 generated/ACLNN 和正态/精确
-输入做全输出检查，共 24 项通过，其中一个形状强制 bypass 验证地址别名。
-4K/8K 的独立 FP64 oracle 分别检查 193/385 行的全部列，另检查全输出有限性、
-hash、输入不变和 512 B guard；三个批次的 generated/ACLNN 完整输出 hash
-全部相同。大形状没有执行全输出 FP64 oracle。详细范围和产物身份见
-`build/gemm-20261017/result.md`、`evidence.json` 及两份 `comparison-*.json`。
+具体已测形状、数值范围、三批性能及历史缓存调查集中在
+[性能与设备验证记录](performance-results.md)。性能资格按对应产物记录限定；
+小 tile 或 panel-major 输入的结果不替代普通大矩阵资格。

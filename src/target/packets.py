@@ -26,6 +26,7 @@ class NativePacket:
     # A row loop may call a count C API repeatedly. Each such call contains
     # this complete sequence, rather than one setup surrounding all rows.
     each_count_call: bool = False
+    internal_fences: tuple[str, ...] = ()
 
     @property
     def closed_mask(self):
@@ -132,6 +133,10 @@ _MASK_FREE = frozenset(
 
 
 def _packet(native: str) -> NativePacket | None:
+    if native == "nd2nz_pad":
+        # L1 fill and ND2NZ share MTE2 but can overlap execution. The fill
+        # must retire before the valid values overwrite its zero padding.
+        return NativePacket(native, internal_fences=("MTE2",))
     if native in _COUNT:
         return NativePacket(
             native,
@@ -157,7 +162,9 @@ def _packet(native: str) -> NativePacket | None:
     return None
 
 
-_AUDITED = {native: _packet(native) for native in _COUNT | _FULL | _PARTIAL | _MASK_FREE}
+_AUDITED = {
+    native: _packet(native) for native in _COUNT | _FULL | _PARTIAL | _MASK_FREE | {"nd2nz_pad"}
+}
 
 
 def audited_packet(native: str) -> NativePacket | None:

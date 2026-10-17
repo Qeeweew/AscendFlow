@@ -42,6 +42,7 @@ from .frontend.syntax import (
     serial,
     sqrt,
     sub,
+    tile_ranges,
     unroll,
 )
 
@@ -53,6 +54,15 @@ def prim_func(function=None, *, disjoint_external=False):
         return _capture(func, namespace=_sys.modules[__name__], disjoint_external=disjoint_external)
 
     return decorate if function is None else decorate(function)
+
+
+def inline(function):
+    """Capture a lexically scoped DSL helper; calls inline its AST, not Python.
+
+    Helpers accept DSL values, may return a scalar/view/tuple with one final
+    return, and share the caller's normal lowering and expansion budget.
+    """
+    return _capture(function, namespace=_sys.modules[__name__], inline=True)
 
 
 __all__ = [
@@ -81,6 +91,7 @@ __all__ = [
     "f32",
     "fill",
     "from_source",
+    "inline",
     "int64",
     "load_scalar",
     "matmul",
@@ -95,5 +106,6 @@ __all__ = [
     "serial",
     "sqrt",
     "sub",
+    "tile_ranges",
     "unroll",
 ]

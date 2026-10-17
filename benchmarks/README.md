@@ -48,6 +48,12 @@ vector、state、gemm、normalization runner 的每个 case 使用 `work` 字段
 
 ## 连续矩阵 GEMM 与 ACLNN
 
+标准连续 `C=A@B`、FP16/BF16 输入输出及尾块使用
+`benchmarks.gemm.run_matmul`，合同见 [matmul-target.md](../docs/matmul-target.md)。
+支持完整 FP64 oracle、halfway 舍入、非 32 B 对齐地址与长行步长验证；
+`compare_matmul` 对同 dtype ACLNN 执行严格的三批设备性能验收。
+构建同时保存 GEMM 主体和 L2 policy helper 的源码快照，校验内联 helper 的来源。
+
 `benchmarks.gemm.run_dense` 使用普通连续 FP16 A/Bt 和 FP32 C，默认两个
 128×128 列片共享 A，按 example 的 L2 预算决定输出缓存政策。合同和复现见
 [gemm-target.md](../docs/gemm-target.md)。`--build` 保存完整编译器源码快照和
@@ -75,7 +81,7 @@ python -m benchmarks.attention.run_policy --output build/attention/reference --b
 ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 python -m benchmarks.attention.run --output build/attention/generated --physical 6 --backend generated --cases 4096:4096 8192:8192 --scope sampled --warmup 5 --repeats 30
 ```
 
-`--backend aclnn`使用安装版对照；`--backend ascendc --reference-output build/attention/reference`使用手写参考。sampled当前按每head每128行取6行，必须如实标注；不能替代短域全输出检查、输入不变和guard检查。ACL stream interval包含host提交间隙，性能结论应同时使用msprof设备task时间。
+`--backend aclnn`使用安装版对照；`--backend ascendc --reference-output build/attention/reference`使用手写参考。sampled 的实际 query 行号保存在 `query_rows_per_head`，当前每 64 行取第 0、7、63 行，必须如实标注；不能替代短域全输出检查、输入不变和guard检查。ACL stream interval包含host提交间隙，性能结论应同时使用msprof设备task时间。
 
 profiling统一通过`benchmarks/profile.sh <模块名> <参数...>`调用，`ASCENDFLOW_PYTHON` 指向当前 Python 环境的解释器；物理映射等环境变量同样传给被profile进程。通用汇总入口为：
 
@@ -84,6 +90,38 @@ python -m benchmarks.profile_summary build/attention/profiles/trial-0/generated 
 ```
 
 原始profile必须与该源码/ASC/库和设备绑定，不能混用旧路径。主例使用4K/8K等稳态规模，固定政策，三后端交替有限批次；不无界调参。
+
+标准 GEMM 的完整采集示例如下；先完成全卡检查并选择健康空闲物理卡，
+这里的物理 2 仅为演示。`--build` 不初始化设备；后续 profile 复用同一产物。
+`gemm_profile_root` 必须是尚未使用的新目录。三个 trial 按 generated→aclnn、
+aclnn→generated、generated→aclnn 顺序采集，任一命令失败即停止。
+
+```bash
+set -euo pipefail
+export ASCENDFLOW_PYTHON="$PWD/../.venv/bin/python"
+export ASCEND_RT_VISIBLE_DEVICES=2 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1
+gemm_output="$PWD/build/gemm/nn-4096-f16"
+gemm_profile_root="$PWD/build/gemm/profiles/nn-4096-f16"
+test ! -e "$gemm_profile_root"
+"$ASCENDFLOW_PYTHON" -m benchmarks.gemm.run_matmul --build --output "$gemm_output" --m 4096 --n 4096 --k 4096 --dtype f16
+for gemm_trial in 0 1 2; do
+    gemm_backends=(generated aclnn)
+    if [ "$gemm_trial" -eq 1 ]; then gemm_backends=(aclnn generated); fi
+    for gemm_backend in "${gemm_backends[@]}"; do
+        gemm_profile="$gemm_profile_root/trial-$gemm_trial/$gemm_backend"
+        msprof --output="$gemm_profile" --aic-metrics=PipeUtilization --python-path="$ASCENDFLOW_PYTHON" \
+            benchmarks/profile.sh benchmarks.gemm.run_matmul --output "$gemm_output" \
+            --backend "$gemm_backend" --physical 2 --scope sampled --data normal \
+            --warmup 5 --repeats 30 --record "$gemm_profile/device/device.json"
+        "$ASCENDFLOW_PYTHON" -m benchmarks.profile_summary "$gemm_profile" --warmup 5 --repeats 30
+    done
+done
+"$ASCENDFLOW_PYTHON" -m benchmarks.gemm.compare_matmul "$gemm_profile_root" --output "$gemm_profile_root/comparison.json"
+```
+
+8192 或 BF16 使用独立的构建/profile 目录，并相应修改构建尺寸或 dtype；
+设备阶段读取构建中保存的合同。dense NT 使用 `run_dense` / `compare_dense`。
+当前已测范围与汇总见[性能与设备验证记录](../docs/performance-results.md)。
 
 FA的`benchmarks.attention.compare`读取每个profile目录下的`summary.json`和
 `device/device.json`。一次profile只运行一个`--cases Sq:Sk`，并用`--record`

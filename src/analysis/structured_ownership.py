@@ -36,6 +36,7 @@ class OwnerProof:
     accesses: tuple[MemoryAccess, ...]
     # None: stride is in bytes. Otherwise it is in cells of this ND tile grid.
     tile_shape: tuple[int, int] | None = None
+    grid_order: tuple[int, int, bool] | None = None
 
 
 def _affine(value, coordinate):
@@ -95,6 +96,25 @@ def _residual(value, cycle, facts):
     return value
 
 
+def _partition_split(value, coordinate, count, facts):
+    split = _affine(value, coordinate)
+    if split is not None:
+        return split
+    # A group-dependent loop lower bound may occur only inside a whole
+    # ownership cycle, e.g. group + groups * (ceildiv(begin-group,groups)+j).
+    # Removing those multiples preserves the address's residue exactly; it
+    # does not assume that a nonlinear group expression is affine.
+    coefficient = polynomial(value, facts).get((coordinate,), 0)
+    if coefficient <= 0 or getattr(coefficient, "denominator", 1) != 1:
+        return None
+    stride = literal(int(coefficient))
+    residue = _residual(value, expression("mul", stride, literal(count)), facts)
+    split = _affine(residue, coordinate)
+    if split is None or not equivalent(split[1], stride, facts):
+        return None
+    return split
+
+
 def _tiled_partition(uses, coordinate, count, facts):
     """Disjoint aligned rectangles through an injective ND tile-grid index.
 
@@ -103,12 +123,26 @@ def _tiled_partition(uses, coordinate, count, facts):
     original two-dimensional geometry, and retain a distinct owner residue.
     No temporal/value or asynchronous-completion fact follows from this rule.
     """
+    tile = uses[0][1].address.tile
+    if tile is None:
+        return None
+    for linearization in tile.linearizations:
+        proof = _tiled_partition_order(uses, coordinate, count, facts, linearization.order)
+        if proof is not None:
+            return proof
+    return None
+
+
+def _tiled_partition_order(uses, coordinate, count, facts, order):
     grid, stride, checked = None, None, []
     for template, access in uses:
         tile = access.address.tile
         if tile is None or grid is not None and grid != tile.grid:
             return None
-        split = _affine(tile.index, coordinate)
+        index = tile.index(order)
+        if index is None:
+            return None
+        split = _partition_split(index, coordinate, count, facts)
         if split is None:
             return None
         base, coefficient = split
@@ -128,7 +162,9 @@ def _tiled_partition(uses, coordinate, count, facts):
         checked.append(access)
     if grid is None:
         return None
-    return OwnerProof(checked[0].address.root, coordinate, count, stride, tuple(checked), grid[1])
+    return OwnerProof(
+        checked[0].address.root, coordinate, count, stride, tuple(checked), grid[1], order
+    )
 
 
 def admit_owners(memory):
@@ -166,9 +202,11 @@ def admit_owners(memory):
             checked = []
             for template, access in uses:
                 address = access.address
-                split = _affine(address.offset, coordinate)
+                split = _partition_split(address.offset, coordinate, count, facts)
                 if split is None:
-                    split = _affine(normalize(address.offset, facts), coordinate)
+                    split = _partition_split(
+                        normalize(address.offset, facts), coordinate, count, facts
+                    )
                 _require(
                     split is not None,
                     "written GM owner coordinate is not provably separable",

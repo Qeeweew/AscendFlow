@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from itertools import pairwise, product
+from itertools import combinations, pairwise, product
 from math import gcd, lcm
 from types import MappingProxyType
 
@@ -17,7 +17,7 @@ from xdsl.ir import Operation
 
 from ..diagnostics import CompileError, require
 from ..dialects.physical import TaskOp
-from ..indexing import arguments, equivalent, nonnegative, normalize, polynomial
+from ..indexing import arguments, equivalent, interval, nonnegative, normalize, polynomial
 from ..scalar import Expr, expression, literal, substitute
 from ..target.ascend910b import Actor
 from .native import AccessMode
@@ -170,6 +170,12 @@ class _Partitioner:
         Slot substitutions, contracted families and additional varying clocks
         need their own relational rules. They cannot borrow this identity.
         """
+        tile = projections[0].access.address.tile
+        return tile is not None and any(
+            self._separate_grid_order(projections, loop, item.order) for item in tile.linearizations
+        )
+
+    def _separate_grid_order(self, projections, loop, order):
         grid, index = None, None
         low = high = 0
         for projection in projections:
@@ -192,7 +198,10 @@ class _Partitioner:
             actual = expression("add", projection.origin, literal(projection.start))
             if not equivalent(actual, substitute(address.offset, bindings), self.facts):
                 return False
-            value = substitute(tile.index, bindings)
+            linear = tile.index(order)
+            if linear is None:
+                return False
+            value = substitute(linear, bindings)
             if any(
                 other.operation is not loop.operation and _depends(value, other.ordinal)
                 for other in projection.template.frame.loops()
@@ -211,6 +220,98 @@ class _Partitioner:
         shifted = substitute(index, {loop.ordinal: expression("add", loop.ordinal, literal(1))})
         delta = _normalize(expression("sub", shifted, index), self.facts)
         return nonnegative(expression("sub", delta, literal(high - low + 1)), self.facts)
+
+    def _separate_rectangles(self, projections, loop):
+        """A monotone row/column coordinate separates exact ND rectangles.
+
+        Ancestor coordinates are fixed during this loop. A chosen separating
+        axis may not depend on any descendant clock. Other axes can vary: a
+        disjoint row interval already separates every byte of those rows.
+        """
+        for axis in (0, 1):
+            anchor, extents = None, None
+            low = high = 0
+            valid = True
+            for projection in projections:
+                address = projection.access.address
+                rectangle, geometry = address.rectangle, address.geometry
+                if (
+                    rectangle is None
+                    or projection.slots
+                    or projection.contracted
+                    or projection.stop - projection.start != geometry.nbytes
+                    or projection.rows != geometry.rows
+                    or projection.row_stride != geometry.row_stride
+                    or extents is not None
+                    and extents != rectangle.extents
+                ):
+                    valid = False
+                    break
+                bindings = {
+                    self.memory.control.sid: literal(
+                        1 if projection.participant is Actor.AIV1 else 0
+                    )
+                }
+                actual = expression("add", projection.origin, literal(projection.start))
+                if not equivalent(actual, substitute(address.offset, bindings), self.facts):
+                    valid = False
+                    break
+                value = substitute(rectangle.origins[axis], bindings)
+                inside = False
+                for other in projection.template.frame.loops():
+                    if other.operation is loop.operation:
+                        inside = True
+                    elif inside and _depends(value, other.ordinal):
+                        valid = False
+                        break
+                if not inside or not valid:
+                    valid = False
+                    break
+                if anchor is None:
+                    anchor = value
+                    high = rectangle.widths[axis]
+                else:
+                    displacement = _normalize(expression("sub", value, anchor), self.facts).constant
+                    if displacement is None:
+                        valid = False
+                        break
+                    low = min(low, displacement)
+                    high = max(high, displacement + rectangle.widths[axis])
+                extents = rectangle.extents
+            if not valid or anchor is None:
+                continue
+            shifted = substitute(
+                anchor, {loop.ordinal: expression("add", loop.ordinal, literal(1))}
+            )
+            delta = expression("sub", shifted, anchor)
+            if nonnegative(expression("sub", delta, literal(high - low)), self.facts):
+                return True
+        return False
+
+    def _disjoint_origin_maps(self, left, right):
+        """Whole active-domain ND boxes separate these symbolic families."""
+        for a, b in product(left, right):
+            if not (a.access.mode.writes or b.access.mode.writes):
+                continue
+            ar, br = a.access.address.rectangle, b.access.address.rectangle
+            if ar is None or br is None or ar.extents != br.extents:
+                return False
+            separated = False
+            for axis in (0, 1):
+                al, ah = interval(ar.origins[axis], a.template.frame.domains(), self.facts)
+                bl, bh = interval(br.origins[axis], b.template.frame.domains(), self.facts)
+                if nonnegative(
+                    expression("sub", bl, expression("add", ah, literal(ar.widths[axis]))),
+                    self.facts,
+                ) or nonnegative(
+                    expression("sub", al, expression("add", bh, literal(br.widths[axis]))),
+                    self.facts,
+                ):
+                    separated = True
+                    break
+            if not separated:
+                return False
+        return True
 
     def _slots(self, template, access, participant):
         address = access.address
@@ -461,13 +562,16 @@ class _Partitioner:
         for (root, private, origin, conditions), projections in groups.items():
             origins.setdefault((root, private, conditions), []).append((origin, projections))
         for items in origins.values():
-            if len(items) > 1 and any(p.access.mode.writes for _, ps in items for p in ps):
-                # Different symbolic translations are not a non-alias proof.
-                self.issue(
-                    DependencyIssueKind.SYMBOLIC_ALIAS,
-                    items[0][1][0].template.operation,
-                    "different symbolic coordinate maps of one writable root need an explicit alias/coordinate proof",
-                )
+            for (_, left), (_, right) in combinations(items, 2):
+                if any(
+                    p.access.mode.writes for p in (*left, *right)
+                ) and not self._disjoint_origin_maps(left, right):
+                    # A different translation alone supplies no alias proof.
+                    self.issue(
+                        DependencyIssueKind.SYMBOLIC_ALIAS,
+                        left[0].template.operation,
+                        "different symbolic coordinate maps of one writable root need an explicit alias/coordinate proof",
+                    )
         for (root, private, origin, conditions), projections in groups.items():
             streaming = tuple(dict.fromkeys(loop for p in projections for loop in p.streaming))
             for loop_op in streaming:
@@ -485,6 +589,7 @@ class _Partitioner:
                     not nonnegative(expression("sub", delta, literal(span)), self.facts)
                     and any(p.access.mode.writes for p in projections)
                     and not self._separate_tiles(projections, loop)
+                    and not self._separate_rectangles(projections, loop)
                 ):
                     self.issue(
                         DependencyIssueKind.NONPERIODIC_REUSE,

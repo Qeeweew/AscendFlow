@@ -29,9 +29,7 @@ def reduction_gemm(
         a0 = T.alloc_l0a((2, M, BK), DTYPE, name="a0")
         b0 = T.alloc_l0b((2, BK, N), DTYPE, name="b0")
         c0 = T.alloc_l0c((M, N), T.f32, name="c0")
-        for k in T.Pipelined(
-            panels, stages=4, issue_order={"cube": ("export", "load", "operands", "compute")}
-        ):
+        for k in T.Pipelined(panels, stages=3):
             with T.Stage(0, name="load"):
                 av = T.copy(A[group, k, :, :], a1[k % 3, :, :])
                 bv = T.copy(B[group, k, :, :], b1[k % 3, :, :])
@@ -40,6 +38,5 @@ def reduction_gemm(
                 bb = T.copy(bv, b0[k % 2, :, :], transpose=TRANSPOSE_B)
             with T.Stage(2, name="compute"):
                 value = T.matmul(aa, bb, accum=c0[:, :], initialize=(k == 0))
-            with T.Stage(3, name="export"):
                 if k == panels - 1:
                     T.copy(value, C[group, :, :])

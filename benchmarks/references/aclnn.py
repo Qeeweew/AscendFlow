@@ -127,22 +127,54 @@ class SoftmaxReference(OperatorReference):
 class GemmReference(OperatorReference):
     interface = "aclnnMatmul; f16 A and Bt.T view, f32 C; cubeMathType=0"
 
-    def __init__(self, runtime, a, bt, c, m, n, reduction):
+    def __init__(
+        self,
+        runtime,
+        a,
+        bt,
+        c,
+        m,
+        n,
+        reduction,
+        *,
+        dtype="f16",
+        output_dtype="f32",
+        transpose_b=True,
+    ):
         super().__init__(runtime)
+        require(dtype in {"f16", "bf16"}, "GEMM reference needs b16 inputs")
+        require(output_dtype in {"f16", "bf16", "f32"}, "unsupported GEMM output dtype")
+        acl_types = {"f32": 0, "f16": 1, "bf16": 27}
+        tensors = [
+            self.tensor(a, (m, reduction), dtype=acl_types[dtype]),
+            self.tensor(
+                bt,
+                (reduction, n),
+                dtype=acl_types[dtype],
+                strides=(1, reduction) if transpose_b else (n, 1),
+                storage_shape=(n, reduction) if transpose_b else (reduction, n),
+            ),
+            self.tensor(c, (m, n), dtype=acl_types[output_dtype]),
+        ]
+        query = self.meta.aclGetDataType
+        query.argtypes, query.restype = [ct.c_void_p, ct.POINTER(ct.c_int)], ct.c_int32
+        self.tensor_dtypes = {}
+        for name, tensor in zip(("A", "B", "C"), tensors, strict=True):
+            actual = ct.c_int(-1)
+            require(query(tensor, ct.byref(actual)) == 0, "cannot query ACLNN tensor dtype")
+            self.tensor_dtypes[name] = actual.value
+        require(
+            self.tensor_dtypes
+            == {"A": acl_types[dtype], "B": acl_types[dtype], "C": acl_types[output_dtype]},
+            "ACLNN constructed tensor dtype differs",
+        )
+        self.interface = (
+            f"aclnnMatmul; {dtype} A and {'Bt.T view' if transpose_b else 'B'}, "
+            f"{output_dtype} C; cubeMathType=0"
+        )
         self.prepare(
             "aclnnMatmul",
-            [
-                self.tensor(a, (m, reduction), dtype=1),
-                self.tensor(
-                    bt,
-                    (reduction, n),
-                    dtype=1,
-                    strides=(1, reduction),
-                    storage_shape=(n, reduction),
-                ),
-                self.tensor(c, (m, n)),
-                0,
-            ],
+            [*tensors, 0],
             [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_int8],
         )
 

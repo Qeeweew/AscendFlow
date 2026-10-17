@@ -89,7 +89,12 @@ class Pipelined:
         _ast_only()
 
 
-def copy(source, destination, *, valid=None, transpose=False):
+def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
+    """Copy tiles; GM→L1 can zero-pad and L0C→GM converts to the output dtype.
+
+    ``pad_value=0`` explicitly defines the complete destination NZ plane.
+    A smaller GM destination exports the top-left accumulator rectangle.
+    """
     _ast_only()
 
 
@@ -167,6 +172,16 @@ def serial(*bounds):
 
 
 def unroll(*bounds):
+    _ast_only()
+
+
+def tile_ranges(extent, width):
+    """Specialize at most two (base, count, valid) ranges, omitting empty ones.
+
+    Whole tiles form one range; a clipped final tile forms the other. All
+    three fields are constexpr. Iterate count with serial or Pipelined to
+    retain device loops instead of expanding individual tiles.
+    """
     _ast_only()
 
 

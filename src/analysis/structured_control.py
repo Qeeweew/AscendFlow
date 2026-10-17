@@ -22,7 +22,7 @@ from xdsl.ir import Operation
 from ..diagnostics import ErrorKind, require
 from ..dialects.physical import CoreIdOp, KernelOp, MixedOp, RuntimeSizeOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
-from ..indexing import arguments, interval, nonnegative
+from ..indexing import arguments, equivalent, interval, nonnegative
 from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
 from ..target.ascend910b import Actor
 from .structured_addresses import ScalarEnvironment
@@ -79,6 +79,16 @@ def _division_iteration_range(lower, upper, induction, domains, facts):
     bias_lower, _ = interval(bias, domains, facts)
     coordinate = expression("add", bias, expression("mul", divisor, induction))
     coordinate_lower = expression("add", bias_lower, expression("mul", divisor, low))
+    if lower.kind == "ceildiv" and equivalent(lower.args[1], divisor, facts):
+        start = lower.args[0]
+        if start.kind == "max" and literal(0) in start.args:
+            start = next(value for value in start.args if value != literal(0))
+        start_uniform, start_varying = _uniform_parts(start, {})
+        if equivalent(start_varying, varying, facts):
+            # i >= ceildiv(max(0, begin-bias), d) gives bias+d*i >= begin.
+            # Retain the joint lower bound instead of independently losing
+            # the correlation between the group and its first iteration.
+            coordinate_lower = start_uniform
     gap = divisor if upper.kind == "floordiv" else literal(1)
     return ((coordinate, coordinate_lower, expression("sub", uniform, gap)),)
 

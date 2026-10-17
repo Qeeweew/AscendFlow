@@ -9,7 +9,9 @@
 
 - [循环与同步设计](docs/design.md)、[源码包结构](docs/source-layout.md)、[变换不变量](docs/compilation-invariants.md)。
 - [DSL](docs/dsl-multistage.md)、[算子示例](examples/README.md)、[FA合同](docs/attention-target.md)。
+- [FP16/BF16 通用 GEMM](docs/matmul-target.md)、[FP32 输出 NT GEMM](docs/gemm-target.md)。
 - [测试](tests/README.md)、[编译/设备工具](benchmarks/README.md)、[验收口径](docs/validation.md)。
+- [性能与设备验证记录](docs/performance-results.md)、[待处理的 PIPE_V 问题](docs/deferred-optimizations.md)。
 - [文档索引](docs/README.md)：设计与使用说明入口。
 
 ## 开发环境与入口
@@ -62,7 +64,7 @@ print(artifact.asc)
 | examples | 算法及显式政策，编译器不得导入它们来选择实现 |
 | tests | 语义反例、实际IR破坏、有限模型与复杂度回归 |
 | benchmarks | 编译计时、手写AscendC/ACLNN、数值与profiling工具 |
-| docs | 当前设计、合同和使用说明 |
+| docs | 当前设计、合同、使用说明和注明范围的验证记录 |
 
 生成产物和缓存不纳入 Git，文档中的源码链接均相对于本仓库。文件CLI/benchmark构建入口使用≤300s的进程组硬期限；直接调用Python `compile()`使用进程内协作预算，不能替代上述隔离构建入口。
 

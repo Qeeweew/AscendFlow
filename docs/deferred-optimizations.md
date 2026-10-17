@@ -21,6 +21,12 @@ Vector 完成前缀。相似片段在该产物的 375–378、384–387、391–
 CANN 9.1.0 的 2201 C API 将 `asc_sync_pipe_impl(pipe)` 定义为
 `pipe_barrier(pipe)`。
 
+同日将最终 O 写回合入 accumulate stage 后，默认 FA 的 ASC SHA256 为
+`29b38ccc6f2e1a2eb2c8e116d47cacfbb37cdc409b84e8ee3ecdd25dc5aa49ff`，
+仍有 28 个 PIPE_V 调用点，上述 452–458 行重叠屏障仍在。
+该产物位于 `build/gemm-simplify-20261017/terminal-stages/fa-256/`；本次 stage
+合并没有修改 fence 去重规则。
+
 当前 `src/passes/simplify_conditions.py::_packet` 只合并互斥条件中的相同
 通知，条件重叠时保留原指令次数；
 `src/analysis/structured_resources.py::_combine_actions` 同样保持逐 actor

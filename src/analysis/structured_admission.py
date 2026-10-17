@@ -373,8 +373,14 @@ def _configurations(memory):
                     if template.contract.native == "load3d_a"
                     else matching[0].b_width
                 )
+                source = template.accesses[0].address.geometry
+                actual_width = (
+                    source.row_stride // 32
+                    if not source.contiguous
+                    else template.contract.params[0]
+                )
                 _require(
-                    width.data == template.contract.params[0],
+                    width.data == actual_width,
                     "Load3D invariant FMATRIX width does not match the actual native",
                     template.operation,
                 )

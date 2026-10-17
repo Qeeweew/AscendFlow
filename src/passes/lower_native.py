@@ -29,6 +29,7 @@ from ..dialects.physical import (
     EndOp,
     FixConfigOp,
     KernelOp,
+    Load3DConfigOp,
     MixedOp,
     RuntimeSizeOp,
     TaskOp,
@@ -142,6 +143,17 @@ class _Lowerer:
         self.family_work = Counter()
         self.task_scopes = {}
         self.needs_fix = False
+        widths = {
+            width for op in source.walk() if (width := recipes.strided_b_width(op)) is not None
+        }
+        self.load3d_b_width = next(iter(widths)) if len(widths) == 1 else None
+        a_widths = {
+            width for op in source.walk() if (width := recipes.compact_a_width(op)) is not None
+        }
+        self.load3d_a_width = (
+            next(iter(a_widths)) if len(a_widths) == 1 and self.load3d_b_width is not None else None
+        )
+        self.needs_load3d = False
         self.work = Counter(source_operations=0, native_templates=0, expanded_iterations=0)
 
     def scalar(self, value, scope):
@@ -243,6 +255,7 @@ class _Lowerer:
 
         def emit(suffix, native, *refs, params=(), scalar=0.0, order_delta=0):
             self.needs_fix |= native in {"fix", "fix16"}
+            self.needs_load3d |= native in {"load3d_a", "load3d_b_nn"}
             if native in {"mad_first", "mad_cycle"}:
                 require(scope.pipeline is not None, "native reset needs its logical ordinal")
                 refs = (*refs, scope.values[scope.pipeline.body.block.args[0]])
@@ -275,6 +288,8 @@ class _Lowerer:
                 source, nbytes, append=scope.block.add_op, **kwargs
             ),
             emit,
+            self.load3d_b_width,
+            self.load3d_a_width,
         )
         if isinstance(op, CopyOp):
             result = recipes.lower_copy(op, context)
@@ -561,6 +576,16 @@ def lower_native_structure(source) -> NativeStructure:
         # reader, even when a containing runtime loop has zero iterations.
         # Its native packet includes the target S -> FIX readiness handshake.
         body.insert_op_before(FixConfigOp(), core)
+    if lowerer.needs_load3d:
+        body.insert_op_before(
+            Load3DConfigOp.build(
+                attributes={
+                    "a_width": IntAttr(lowerer.load3d_a_width or 1),
+                    "b_width": IntAttr(lowerer.load3d_b_width),
+                }
+            ),
+            core,
+        )
     body.add_op(EndOp())
     values, uses = bind_values(source, lowerer.results, lowerer.loops)
     # The constructors preserve structure from the admitted source. Developer

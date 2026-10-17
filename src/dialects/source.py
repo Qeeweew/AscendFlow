@@ -62,6 +62,31 @@ def _verify_dependencies(op, inputs):
             raise VerifyException("logical dependency type must match its consumed input")
 
 
+def copy_compatible(source, destination, *, transpose=False, zero_pad=False):
+    """Source copy contract, including explicit NZ padding and FIX conversion."""
+    route = source.memory.data, destination.memory.data
+    shape = tuple(n.data for n in source.shape)
+    target = tuple(n.data for n in destination.shape)
+    if zero_pad:
+        return (
+            not transpose
+            and route == ("GM", "L1")
+            and source.dtype == destination.dtype
+            and source.dtype.data in {"f16", "bf16"}
+            and len(shape) == len(target) == 2
+            and all(0 < a <= b and b % 16 == 0 for a, b in zip(shape, target, strict=True))
+        )
+    if route == ("L0C", "GM"):
+        return (
+            not transpose
+            and source.dtype.data == "f32"
+            and destination.dtype.data in {"f32", "f16", "bf16"}
+            and len(shape) == len(target) == 2
+            and all(0 < b <= a for a, b in zip(shape, target, strict=True))
+        )
+    return (shape[::-1] if transpose else shape) == target and source.dtype == destination.dtype
+
+
 @irdl_op_definition
 class YieldOp(IRDLOperation):
     name = "npu_source.yield"
@@ -469,6 +494,7 @@ class CopyOp(IRDLOperation):
     dependencies = var_operand_def(TileType)
     dependency_inputs = attr_def(ArrayAttr[IntAttr])
     transpose = opt_attr_def(IntAttr)
+    zero_pad = opt_attr_def(IntAttr)
     value = result_def(TileType)
     traits = traits_def(AsyncEffects())
 
@@ -483,16 +509,17 @@ class CopyOp(IRDLOperation):
             or len(self.source.type.shape) != 2
         ):
             raise VerifyException("transposed copy requires a complete L1→L0B matrix")
-        expected = (
-            ArrayAttr(reversed(self.source.type.shape.data))
-            if transpose
-            else self.source.type.shape
-        )
-        if (
-            expected != self.destination.type.shape
-            or self.source.type.dtype != self.destination.type.dtype
+        if self.zero_pad is not None and self.zero_pad.data != 1:
+            raise VerifyException("copy zero padding must be explicitly enabled")
+        if not copy_compatible(
+            self.source.type,
+            self.destination.type,
+            transpose=bool(transpose),
+            zero_pad=self.zero_pad is not None,
         ):
-            raise VerifyException("copy requires the same typed tile extent; use explicit cast")
+            raise VerifyException(
+                "copy requires compatible extents/types; use explicit cast or pad_value=0"
+            )
 
 
 @irdl_op_definition

@@ -66,11 +66,7 @@ def dense_gemm(
             index = group + tile * GROUPS
             row = (index // ntiles) * BM
             column = (index % ntiles) * BN * COL_PARTS
-            for panel in T.Pipelined(
-                ktiles,
-                stages=PREFETCH + 2,
-                issue_order={"cube": ("export", "load", "compute")},
-            ):
+            for panel in T.Pipelined(ktiles, stages=PREFETCH + 1):
                 k = panel * BK
                 with T.Stage(0, name="load"):
                     T.copy(A[row : row + BM, k : k + BK], a1[panel % A_SLOTS, :, :])
@@ -103,7 +99,6 @@ def dense_gemm(
                                 T.matmul(
                                     aa, bb, accum=c0[tile % C_SLOTS, part, :, :], initialize=False
                                 )
-                with T.Stage(PREFETCH + 1, name="export"):
                     if panel == ktiles - 1:
                         for part in T.unroll(COL_PARTS):
                             T.copy(

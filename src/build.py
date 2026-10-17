@@ -188,10 +188,18 @@ def build_file(path, output, *, entry=None, parameters=None, **options):
 
             return parse(path.read_text())
         import runpy
+        import sys
 
         from .frontend import PrimFunction
 
-        definition = runpy.run_path(str(path))[entry]
+        # Match `python -m`: source modules may import helpers from the
+        # invocation directory even when the console script lives in bin/.
+        search_path = sys.path[:]
+        sys.path.insert(0, str(Path.cwd()))
+        try:
+            definition = runpy.run_path(str(path))[entry]
+        finally:
+            sys.path[:] = search_path
         if not isinstance(definition, PrimFunction):
             raise TypeError("--entry must name a captured AST prim_func")
         return definition.specialize(**parameters)

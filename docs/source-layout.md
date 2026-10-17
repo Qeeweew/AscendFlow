@@ -90,6 +90,14 @@ build_file                               # 同一链路 + CANN，单次进程组
 `prove` 调用代替重构。
 
 算法和政策在 `examples/`；测量及独立 AscendC/ACLNN 在 `benchmarks/`。
+
+前端 `@T.inline` 只做保留词法作用域和源位置的 AST 内联；`T.tile_ranges`
+只拆 constexpr 整块/尾块区间。两者都直接形成原有 source IR，继续同一条
+native、bounds、ownership、同步和资源分配链，不是第二编译路径。
+
+标准连续 b16 `C=A@B` 与尾块的合同见 [matmul-target.md](matmul-target.md)。
+类型转换、补零及 strided NZ 几何经过相同 native/effects、bounds、ownership
+和同步链；封闭 packet 的内部顺序不提供外部异步完成保证。
 复现命令将运行产物和诊断写入已忽略的 `build/`，文档不依赖仓库外的实验目录。
 
 ## Pipeline 的最小表示

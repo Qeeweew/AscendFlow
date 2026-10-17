@@ -510,6 +510,25 @@ def native_contract(
             "statistics recipe needs aligned f32 words per row",
         )
         return "V", ("W",) if arity == 1 else ("R", "R", "W")
+    if native == "nd2nz_pad":
+        require(len(params) == 4, "padded ND2NZ requires valid and resident dimensions")
+        m, n, pm, pn = params
+        require(
+            1 <= m <= pm <= 256
+            and 1 <= n <= pn <= 256
+            and pm % 16 == pn % 16 == 0
+            and banks == ("GM", "L1")
+            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and layouts == ("linear", "NZ")
+            and refs[0].nbytes == n * 2
+            and refs[0].rows == m
+            and refs[0].row_stride % 2 == 0
+            and n <= refs[0].row_stride // 2
+            and refs[1].contiguous
+            and lengths == (m * n * 2, pm * pn * 2),
+            "padded ND2NZ needs exact GM rows and a complete b16 NZ destination",
+        )
+        return "MTE2", ("R", "W")
     if native in {"nd2nz", "load2d_a", "load2d_b_nt", "load2d_b_nn"}:
         require(len(params) == 2, "matrix DMA requires (rows, columns)")
         rows, cols = params
@@ -532,17 +551,25 @@ def native_contract(
                 and refs[0].rows == rows
                 and refs[0].nbytes == cols * 2
                 and refs[0].row_stride % 2 == 0
-                and cols <= refs[0].row_stride // 2 <= 65535
+                and cols <= refs[0].row_stride // 2
                 and refs[1].contiguous,
                 "ND2NZ needs precise GM rows, legal leading dimension and compact NZ output",
             )
             return "MTE2", ("R", "W")
         destination = "L0A" if native == "load2d_a" else "L0B"
         layout = "ZZ" if native == "load2d_a" else "ZN"
+        source = refs[0]
+        source_matches = source.contiguous or (
+            native in {"load2d_a", "load2d_b_nn"}
+            and source.nbytes == rows * 16 * 2
+            and source.rows == cols // 16
+            and source.row_stride % 512 == 0
+        )
         require(
             banks == ("L1", destination)
             and layouts == ("NZ", layout)
-            and all(r.contiguous for r in refs)
+            and source_matches
+            and refs[1].contiguous
             and (native == "load2d_a" or rows * cols // 256 <= 255),
             "Load2D requires complete compact fractals and a legal repeat count",
         )
@@ -570,21 +597,33 @@ def native_contract(
         )
         return "M", ("R", "R", "W" if native == "mad" and clear else "RW")
     if native == "fix":
-        require(len(params) == 2, "Fixpipe requires (M,N)")
-        m, n = params
+        require(len(refs) == 2, "Fixpipe requires a source and destination")
+        require(len(params) in {2, 3}, "Fixpipe requires (M,N[,source_M])")
+        m, n = params[:2]
+        source_m = params[2] if len(params) == 3 else m
+        itemsize = ITEMSIZE.get(dtypes[1], 0) if len(dtypes) == 2 else 0
+        source_matches = (
+            refs[0].nbytes == m * 16 * 4
+            and refs[0].rows == (n + 15) // 16
+            and refs[0].row_stride == source_m * 16 * 4
+            if len(params) == 3
+            else refs[0].contiguous and lengths[0] == m * n * 4
+        )
         require(
-            16 <= m <= 256
-            and 16 <= n <= 256
-            and m % 16 == n % 16 == 0
+            1 <= m <= source_m <= 256
+            and 1 <= n <= 256
+            and source_m % 16 == 0
+            and (len(params) == 3 or m % 16 == n % 16 == 0)
             and banks == ("L0C", "GM")
-            and dtypes == ("f32", "f32")
+            and dtypes[0] == "f32"
+            and dtypes[1] in {"f32", "f16", "bf16"}
             and layouts == ("NZ", "linear")
-            and lengths == (m * n * 4,) * 2
-            and refs[0].contiguous
+            and source_matches
             and refs[1].rows == m
-            and refs[1].nbytes == n * 4
-            and refs[1].row_stride % 4 == 0,
-            "Fixpipe requires the exact f32 NZ tile and ND destination rows",
+            and refs[1].nbytes == n * itemsize
+            and refs[1].row_stride % itemsize == 0
+            and 1 <= refs[1].row_stride // itemsize <= 4294967295,
+            "Fixpipe requires exact f32 NZ reads and f32/f16/bf16 ND destination rows",
         )
         return "FIX", ("R", "W")
     if native == "mad16":

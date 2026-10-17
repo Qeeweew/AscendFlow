@@ -218,12 +218,33 @@ def native_line(task, *, pointer_renderer, generation):
         else:
             call = f"asc_div({pp[2]}, {pp[0]}, {pp[1]}, uint32_t(1));"
         return f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ {call} }}"
-    if task.native == "nd2nz":
-        rows, cols = task.params
-        return (
-            f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, {rows}, {cols}, 0, "
-            f"{refs[0].row_stride // 2}, {rows}, 1, 0);"
-        )
+    if task.native in {"nd2nz", "nd2nz_pad"}:
+        rows, cols = task.params[:2]
+        padded = task.native == "nd2nz_pad"
+        resident_rows = task.params[2] if padded else rows
+        setup = ""
+        if padded:
+            setup = (
+                "{ asc_fill_value_config npu_zero = { .config = uint64_t(1) | "
+                f"(uint64_t({refs[1].total_nbytes // 32}) << 16) }}; "
+                f"asc_fill_l1({p[1]}, uint32_t(0), npu_zero); asc_sync_pipe(PIPE_MTE2); "
+            )
+        if refs[0].row_stride // 2 > 65535:
+            # The hardware source leading dimension is uint16. Row-wise
+            # descriptors retain exact byte effects without truncating it.
+            source = ptr(refs[0], extra=f"npu_row * {refs[0].row_stride}")
+            destination = ptr(refs[1], extra="npu_row * 32")
+            copy = (
+                f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ "
+                f"asc_copy_gm2l1_nd2nz({destination}, {source}, 1, 1, {cols}, 0, "
+                f"0, {resident_rows}, 1, 0); }}"
+            )
+        else:
+            copy = (
+                f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, {rows}, {cols}, 0, "
+                f"{refs[0].row_stride // 2}, {resident_rows}, 1, 0);"
+            )
+        return setup + copy + (" }" if padded else "")
     if task.native in {"load3d_a", "load3d_b_nn"}:
         rows, cols = task.params
         a = task.native == "load3d_a"
@@ -237,9 +258,10 @@ def native_line(task, *, pointer_renderer, generation):
         rows, cols = task.params
         src = ptr(refs[0], extra="npu_chunk * 512")
         dst = ptr(refs[1], extra=f"npu_chunk * {cols * 32}")
+        stride = refs[0].row_stride // 512 if not refs[0].contiguous else rows // 16
         return (
             f"for (int npu_chunk = 0; npu_chunk < {rows // 16}; ++npu_chunk) {{ "
-            f"asc_copy_l12l0a({dst}, {src}, 0, {cols // 16}, {rows // 16}, 0); }}"
+            f"asc_copy_l12l0a({dst}, {src}, 0, {cols // 16}, {stride}, 0); }}"
         )
     if task.native == "load2d_b_nt":
         rows, cols = task.params
@@ -248,13 +270,14 @@ def native_line(task, *, pointer_renderer, generation):
         rows, cols = task.params  # B[K,N] compact zN -> L0B ZN
         src = ptr(refs[0], extra="npu_chunk * 512")
         dst = ptr(refs[1], extra=f"npu_chunk * {cols * 32}")
+        stride = refs[0].row_stride // 512 if not refs[0].contiguous else rows // 16
         # CANN 9.1/2201's public asc_copy_l12l0b has no classic transpose
         # parameter; the similarly named *_transpose is a 3510 API. Use
         # the exact audited dav_c220 LoadData2D intrinsic with transpose=true,
         # not the distinct LoadDataWithTranspose instruction/footprint.
         return (
             f"for (int npu_chunk = 0; npu_chunk < {rows // 16}; ++npu_chunk) {{ "
-            f"load_cbuf_to_cb({dst}, {src}, 0, {cols // 16}, {rows // 16}, 0, 0, true, inc); }}"
+            f"load_cbuf_to_cb({dst}, {src}, 0, {cols // 16}, {stride}, 0, 0, true, inc); }}"
         )
     if task.native in {"mad", "mad_cycle", "mad_first"}:
         m, n, k = task.params[:3]
@@ -268,10 +291,17 @@ def native_line(task, *, pointer_renderer, generation):
         )
         return f"asc_mmad({p[2]}, {p[0]}, {p[1]}, {m}, {k}, {n}, 0, false, false, {flag});"
     if task.native == "fix":
-        m, n = task.params
+        m, n = task.params[:2]
+        source_m = task.params[2] if len(task.params) == 3 else m
+        dtype = refs[1].dtype
+        quant = {
+            "f32": "0",
+            "f16": "uint64_t(QuantMode_t::F322F16)",
+            "bf16": "uint64_t(QuantMode_t::F322BF16)",
+        }[dtype]
         return (
-            f"asc_copy_l0c2gm({p[1]}, {p[0]}, {n}, {m}, {refs[1].row_stride // 4}, "
-            f"{m}, 0, 0, 0, false, true);"
+            f"asc_copy_l0c2gm({p[1]}, {p[0]}, {n}, {m}, {refs[1].row_stride // ITEMSIZE[dtype]}, "
+            f"{source_m}, 0, {quant}, 0, false, true);"
         )
     if task.native == "mad16":
         clear = "true" if task.params[0] else "false"

@@ -149,6 +149,38 @@ def test_divided_loop_bound_keeps_joint_ancestor_bias_and_exact_active_range(div
     assert _division_iteration_range(literal(-1), upper, induction, [], facts) == ()
 
 
+@pytest.mark.parametrize("lower_bias,lower_divisor", [(1, 3), (2, 3), (1, 2)])
+def test_divided_lower_bound_preserves_only_the_matching_joint_coordinate(
+    lower_bias, lower_divisor
+):
+    end, owner, induction = (Expr("argument", (name,)) for name in ("end", "$owner", "$iv"))
+    facts = {"begin": Fact(), "end": Fact(), "$owner": Fact(maximum=6)}
+    for start in range(12):
+        lower = expression(
+            "ceildiv",
+            expression(
+                "max",
+                literal(0),
+                expression("sub", literal(start), expression("mul", literal(lower_bias), owner)),
+            ),
+            literal(lower_divisor),
+        )
+        upper = expression(
+            "ceildiv", expression("max", literal(0), expression("sub", end, owner)), literal(3)
+        )
+        ((joint, low, high),) = _division_iteration_range(
+            lower, upper, induction, [(owner, literal(0), literal(6))], facts
+        )
+        for stop in range(start, 19):
+            for lane in range(7):
+                values = {"begin": start, "end": stop, "$owner": lane}
+                for index in range(lower.evaluate(values), upper.evaluate(values)):
+                    actual = joint.evaluate(values | {"$iv": index})
+                    assert low.evaluate(values) <= actual <= high.evaluate(values)
+                    if lower_bias == 1 and lower_divisor == 3:
+                        assert low.evaluate(values) == start
+
+
 def test_complete_tiles_use_floor_bound_without_requiring_length_multiple():
     from ascendflow.analysis.structured_bounds import admit_memory_bounds
     from ascendflow.analysis.structured_memory import collect_native_memory

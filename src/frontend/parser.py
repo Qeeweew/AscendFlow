@@ -63,7 +63,17 @@ _CALLS = {
     "reduce_sum",
     "reduce_max",
 }
-_SYNTAX = {"serial", "unroll", "Pipelined", "ceildiv", "min", "max", "int64", "constexpr"}
+_SYNTAX = {
+    "serial",
+    "unroll",
+    "tile_ranges",
+    "Pipelined",
+    "ceildiv",
+    "min",
+    "max",
+    "int64",
+    "constexpr",
+}
 _CONSTANTS = {"f32", "f16", "bf16"}
 _BINARY = {
     ast.Add: operator.add,
@@ -92,11 +102,20 @@ def _constant(value):
 
 
 @dataclass(frozen=True)
-class PrimFunction:
+class _SourceFunction:
     source: str
     filename: str
     first_line: int
     environment: object
+
+
+@dataclass(frozen=True)
+class InlineFunction(_SourceFunction):
+    """Lexically captured DSL helper, interpreted at each call, never executed."""
+
+
+@dataclass(frozen=True)
+class PrimFunction(_SourceFunction):
     disjoint_external: bool = False
     specializations: tuple = ()
 
@@ -109,7 +128,7 @@ class PrimFunction:
         return replace(self, specializations=tuple(bound.items()))
 
 
-def capture(function, *, namespace, disjoint_external=False):
+def capture(function, *, namespace, disjoint_external=False, inline=False):
     require(type(disjoint_external) is bool, "disjoint_external must be a boolean contract")
     try:
         lines, first = inspect.getsourcelines(function)
@@ -126,6 +145,8 @@ def capture(function, *, namespace, disjoint_external=False):
         value = available[name]
         if value is namespace:
             environment[name] = _DSL_NAMESPACE
+        elif isinstance(value, InlineFunction):
+            environment[name] = value
         else:
             # Only names resolved from the host are frozen; parameters/local
             # bindings shadow them in the AST parser.
@@ -135,16 +156,18 @@ def capture(function, *, namespace, disjoint_external=False):
                 # Do not retain a callable/mutable object. A reference to this
                 # name will receive a source diagnostic at compilation.
                 environment[name] = _Symbol("unsupported host binding: " + name)
-    return PrimFunction(
+    arguments = (
         source,
         inspect.getsourcefile(function) or "<dsl>",
         first,
         MappingProxyType(environment),
-        disjoint_external,
     )
+    return InlineFunction(*arguments) if inline else PrimFunction(*arguments, disjoint_external)
 
 
-def from_source(source, *, constants=None, filename="<dsl>", disjoint_external=False):
+def from_source(
+    source, *, constants=None, functions=None, filename="<dsl>", disjoint_external=False
+):
     """Parse explicit source; this function does not use exec/eval or import it."""
     require(type(source) is str, "DSL source must be a string")
     require(type(disjoint_external) is bool, "disjoint_external must be a boolean contract")
@@ -152,6 +175,12 @@ def from_source(source, *, constants=None, filename="<dsl>", disjoint_external=F
     for name, value in (constants or {}).items():
         require(name not in {"N", "T"} and name.isidentifier(), "invalid captured constant name")
         environment[name] = _constant(value)
+    for name, value in (functions or {}).items():
+        require(name.isidentifier() and name not in environment, "invalid captured function name")
+        require(
+            isinstance(value, InlineFunction), "functions must contain captured DSL inline helpers"
+        )
+        environment[name] = value
     return PrimFunction(
         textwrap.dedent(source), filename, 1, MappingProxyType(environment), disjoint_external
     )
@@ -163,6 +192,7 @@ class _Parser:
         self.env = dict(definition.environment)
         self.trace = None
         self.steps = 0
+        self.inline_stack = []
 
     def fail(self, node, message):
         line = self.definition.first_line + getattr(node, "lineno", 1) - 1
@@ -176,24 +206,28 @@ class _Parser:
             IntAttr(node.col_offset + 1),
         )
 
-    def build(self):
+    def function(self, decorator_name):
         tree = ast.parse(self.definition.source, filename=self.definition.filename)
         require(sum(1 for _ in ast.walk(tree)) <= 10000, "DSL AST exceeds 10000-node budget")
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
         require(len(functions) == 1 and len(tree.body) == 1, "expected exactly one DSL function")
         func = functions[0]
         if len(func.decorator_list) > 1:
-            self.fail(func, "a DSL definition supports only its prim_func decorator")
+            self.fail(func, f"a DSL definition supports only its {decorator_name} decorator")
         for decorator in func.decorator_list:
             target = decorator.func if isinstance(decorator, ast.Call) else decorator
             if not (
                 isinstance(target, ast.Attribute)
-                and target.attr == "prim_func"
+                and target.attr == decorator_name
                 and self.expr(target.value) is _DSL_NAMESPACE
             ):
                 self.fail(decorator, "unsupported decorator; it will not be executed or ignored")
             if isinstance(decorator, ast.Call):
                 values, options = self.arguments(decorator)
+                if decorator_name == "inline":
+                    if values or options:
+                        self.fail(decorator, "inline accepts no options")
+                    continue
                 if values or set(options) - {"disjoint_external"}:
                     self.fail(decorator, "prim_func accepts only disjoint_external")
                 if "disjoint_external" in options and (
@@ -203,6 +237,10 @@ class _Parser:
                     self.fail(
                         decorator, "source decorator conflicts with the explicit input contract"
                     )
+        return func
+
+    def build(self):
+        func = self.function("prim_func")
         args = func.args
         if args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg or func.returns:
             self.fail(func, "use named tensor/scalar parameters; no variadic or return annotation")
@@ -220,6 +258,56 @@ class _Parser:
             return module
         finally:
             builders._current.reset(token)
+
+    def inline(self, definition, node, values, options):
+        self.steps += 1
+        if self.steps > 10000:
+            self.fail(node, "DSL expansion exceeds 10000-statement budget")
+        if len(self.inline_stack) >= 16 or any(definition is item for item in self.inline_stack):
+            self.fail(node, "inline recursion or depth exceeds the 16-call budget")
+        original = self.definition, self.env, self.trace.location
+        self.definition, self.env = definition, dict(definition.environment)
+        self.inline_stack.append(definition)
+        func = node
+        try:
+            func = self.function("inline")
+            args = func.args
+            if args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg or func.returns:
+                self.fail(
+                    func, "inline helpers require named parameters without return annotations"
+                )
+            if any(arg.annotation is not None for arg in args.args):
+                self.fail(func, "inline helper parameters take DSL values without annotations")
+            names = [arg.arg for arg in args.args]
+            if len(values) > len(names) or set(options) - set(names):
+                self.fail(func, "invalid inline arguments")
+            bound = dict(zip(names, values))
+            if bound.keys() & options.keys():
+                self.fail(func, "inline parameter supplied more than once")
+            bound.update(options)
+            defaults = dict(zip(names[len(names) - len(args.defaults) :], args.defaults))
+            for name in names:
+                if name not in bound:
+                    if name not in defaults:
+                        self.fail(func, f"missing inline argument {name}")
+                    bound[name] = self.expr(defaults[name])
+            self.env.update(bound)
+            result = func.body[-1] if isinstance(func.body[-1], ast.Return) else None
+            statements = func.body[:-1] if result is not None else func.body
+            if any(isinstance(item, ast.Return) for stmt in statements for item in ast.walk(stmt)):
+                self.fail(func, "inline helpers support only one final return")
+            self.body(statements)
+            if result is None or result.value is None:
+                return None
+            self.locate(result)
+            return self.expr(result.value)
+        except FrontendError:
+            raise
+        except (CompileError, TypeError, ValueError, ZeroDivisionError) as error:
+            self.fail(func, str(error))
+        finally:
+            self.inline_stack.pop()
+            self.definition, self.env, self.trace.location = original
 
     def signature(self, args):
         defaults = dict(zip([arg.arg for arg in args.args[-len(args.defaults) :]], args.defaults))
@@ -347,31 +435,63 @@ class _Parser:
             self.fail(node, f"unsupported device statement {type(node).__name__}")
 
     def loop(self, node):
-        if (
-            node.orelse
-            or not isinstance(node.target, ast.Name)
-            or not isinstance(node.iter, ast.Call)
-        ):
+        if node.orelse or not isinstance(node.iter, ast.Call):
             self.fail(node, "device for requires one index and no for/else")
         call = node.iter
         symbol = self.expr(call.func)
-        if not isinstance(symbol, _Symbol) or symbol.name not in {"Pipelined", "serial", "unroll"}:
-            self.fail(call, "use N.serial, N.Pipelined, or explicit N.unroll")
+        if not isinstance(symbol, _Symbol) or symbol.name not in {
+            "Pipelined",
+            "serial",
+            "unroll",
+            "tile_ranges",
+        }:
+            self.fail(call, "use T.serial, T.Pipelined, T.unroll, or T.tile_ranges")
+        if symbol.name != "tile_ranges" and not isinstance(node.target, ast.Name):
+            self.fail(node.target, "device for requires one index")
         args, kwargs = self.arguments(call)
         original = dict(self.env)
-        if symbol.name == "unroll":
-            if kwargs or not all(type(value) is int for value in args) or not 1 <= len(args) <= 3:
-                self.fail(call, "unroll requires constexpr integer range bounds")
-            iterations = range(*args)
-            if len(iterations) > 64:
-                self.fail(call, "unroll exceeds 64-iteration budget; retain a device loop")
-            for value in iterations:
-                self.env[node.target.id] = value
-                self.body(node.body)
-            if node.target.id in original:
-                self.env[node.target.id] = original[node.target.id]
+        if symbol.name in {"unroll", "tile_ranges"}:
+            if symbol.name == "unroll":
+                if (
+                    kwargs
+                    or not all(type(value) is int for value in args)
+                    or not 1 <= len(args) <= 3
+                ):
+                    self.fail(call, "unroll requires constexpr integer range bounds")
+                iterations = range(*args)
+                if len(iterations) > 64:
+                    self.fail(call, "unroll exceeds 64-iteration budget; retain a device loop")
+                targets = (node.target.id,)
             else:
-                self.env.pop(node.target.id, None)
+                if kwargs or len(args) != 2 or not all(type(value) is int for value in args):
+                    self.fail(call, "tile_ranges requires constexpr integer extent and tile width")
+                extent, width = args
+                if extent < 0 or width <= 0:
+                    self.fail(
+                        call, "tile_ranges requires nonnegative extent and positive tile width"
+                    )
+                if not (
+                    isinstance(node.target, ast.Tuple)
+                    and len(node.target.elts) == 3
+                    and all(isinstance(item, ast.Name) for item in node.target.elts)
+                    and len({item.id for item in node.target.elts}) == 3
+                ):
+                    self.fail(
+                        node.target, "tile_ranges binds three distinct names: base, count, valid"
+                    )
+                targets = tuple(item.id for item in node.target.elts)
+                whole, tail = divmod(extent, width)
+                iterations = ([(0, whole, width)] if whole else []) + (
+                    [(whole * width, 1, tail)] if tail else []
+                )
+            for value in iterations:
+                self.assign(node.target, value)
+                self.body(node.body)
+            for name in targets:
+                if name in original:
+                    self.env[name] = original[name]
+                else:
+                    self.env.pop(name, None)
             return
         if symbol.name == "Pipelined":
             if (
@@ -512,11 +632,23 @@ class _Parser:
             k.arg is None for k in node.keywords
         ):
             self.fail(node, "argument unpacking is not part of the DSL")
+        if len({k.arg for k in node.keywords}) != len(node.keywords):
+            self.fail(node, "call keywords cannot repeat")
         return [self.expr(arg) for arg in node.args], {
             k.arg: self.expr(k.value) for k in node.keywords
         }
 
     def expr(self, node):
+        if isinstance(node, ast.BoolOp):
+            # Specialization policies use Python's ordered short-circuiting.
+            # Device predicates remain explicit control regions.
+            for item in node.values:
+                value = self.expr(item)
+                if type(value) is not bool:
+                    self.fail(item, "boolean expressions require constexpr booleans")
+                if value == isinstance(node.op, ast.Or):
+                    return value
+            return value
         if isinstance(node, ast.Constant):
             return _constant(node.value)
         if isinstance(node, ast.Name):
@@ -590,6 +722,9 @@ class _Parser:
             return self.trace.index_op(arith.CmpiOp, lhs, rhs, comparison=name)
         if isinstance(node, ast.Call):
             symbol = self.expr(node.func)
+            if isinstance(symbol, InlineFunction):
+                args, kwargs = self.arguments(node)
+                return self.inline(symbol, node, args, kwargs)
             if not isinstance(symbol, _Symbol):
                 self.fail(node, "calling arbitrary Python functions is unsupported")
             args, kwargs = self.arguments(node)

@@ -292,9 +292,9 @@ class _PolynomialQuery:
         return result
 
 
-def polynomial(expr, facts, *, periodic=False):
+def polynomial(expr, facts, *, periodic=False, retained=False):
     """Exact rational polynomial whose public term atoms remain raw Exprs."""
-    return _PolynomialQuery(facts, periodic=periodic).visit(expr)
+    return _PolynomialQuery(facts, periodic=periodic, retained=retained).visit(expr)
 
 
 def equivalent(a, b, facts):

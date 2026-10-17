@@ -60,6 +60,11 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 
 ## 4. 物理、数值与硬件语义
 
+搬运按目标 native 区分对齐、步长单位与有效字节。普通 DMA 的 32 B 块约束
+不能外推到矩阵 ND2NZ/FIXPIPE，也不能用矩阵的元素对齐许可放宽普通 DMA。
+显式补零的封闭 packet 保留 fill→MTE2 fence→ND2NZ 次序；FIXPIPE 的 dtype
+转换只改变目标元素宽度，保留 FP32 累加器的实际 fractal 读取与退休关系。
+
 GM 缓存别名不创建新的物理存储身份。source 的 cache 提示随同一 root 保留到
 physical IR；bypass launcher 用目标 runtime 查询的地址别名绑定原始分配，查询
 失败直接返回错误。所有 byte bounds、alias、ownership、逻辑值和同步关系仍针对

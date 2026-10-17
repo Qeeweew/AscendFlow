@@ -30,7 +30,7 @@ def test_count_calls_are_closed_and_restore_only_normal_mode(native):
     assert packet.clobbers == {"VECTOR_MASK_MODE", "VECTOR_MASK"}
 
 
-@pytest.mark.parametrize("native", ["copy", "brcb8", "scalar_load", "fix", "load3d_a"])
+@pytest.mark.parametrize("native", ["copy", "brcb8", "scalar_load", "fix", "load3d_a", "nd2nz_pad"])
 def test_mask_free_packets_do_not_invent_mask_consumers(native):
     packet = audited_packet(native)
     assert packet is not None and packet.closed_mask
