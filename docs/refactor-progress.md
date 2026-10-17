@@ -34,8 +34,8 @@ xDSL 0.73.0 仍是底层 IR 框架依赖。
 当前独立 venv 已更新开发安装，`ascendflow` 与 `python -m ascendflow`
 都调用 `cli.main`；测试通过开发安装从当前 `src` 导入。旧安装、旧命令和旧包目录已移除，
 不保留兼容层。构建期限和 profiling 的环境变量统一为 `ASCENDFLOW_*`。
-旧 build、测试缓存、bytecode、egg-info 原样保存于外层
-`runs/ascendflow-rename/incoming/`；安装生成的 metadata 也留外层。
+更名时移出的旧 build、测试缓存、bytecode 与 egg-info 已在临时文件清理中删除；
+清单见外层 `runs/cleanup-20261017/manifest.json`。原有用户工作备份和验证产物保留。
 
 82 个原有产品模块经 namespace 替换后的 AST 核对一致，例外只涉及 CLI
 说明/程序名及包 docstring；新加 `__main__.py` 转到同一个入口。ASC 仅将
