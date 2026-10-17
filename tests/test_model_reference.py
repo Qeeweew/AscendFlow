@@ -37,7 +37,7 @@ def action(anchor, placement, kind, source, destination, participants, event=0):
         source,
         destination,
         literal(event),
-        protocol="manual finite reference fixture",
+        protocols=("manual finite reference fixture",),
     )
 
 

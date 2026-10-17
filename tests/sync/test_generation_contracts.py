@@ -28,7 +28,12 @@ from tests.fixtures.notification_cycles import (
     translated_child_route,
     translated_commands,
 )
-from tests.models.structured_events import EventModelError, _causality, check_structured_events
+from tests.models.structured_events import (
+    EventModelError,
+    _causality,
+    check_compiled_events,
+    check_structured_events,
+)
 from tests.support.structured import prepared, selected
 
 
@@ -194,7 +199,7 @@ def test_new_id_sharing_requires_a_real_consumption_handback():
     # storage credits can therefore share one ID via a *new* finite constraint.
     plan = synchronize_structure(finite_independent_cells(scalar=True))
     assert plan.resources.sharing
-    check_structured_events(plan.memory)
+    check_compiled_events(plan)
     # A queued MTE3 Wait has no corresponding handback to V. Lexical source
     # order and equal flag counts cannot justify overwriting its binary flag.
     with pytest.raises(CompileError, match="capacity 8"):
@@ -225,7 +230,7 @@ def test_a_finite_credit_fragment_cannot_license_sharing_its_later_loop():
         if a.notification not in channel.members
     )
     for count in (0, 1, 3):
-        check_structured_events(plan.memory, {"n": count}, invocations=2)
+        check_compiled_events(plan, {"n": count}, invocations=2)
 
 
 def test_a_proved_absent_domain_does_not_consume_finite_event_capacity():
@@ -245,7 +250,7 @@ def test_a_proved_absent_domain_does_not_consume_finite_event_capacity():
     plan = synchronize_structure(N.from_source(source, disjoint_external=True))
     assert plan.resources.assignments
     assert not any(a.ids for a in plan.resources.assignments)
-    assert not check_structured_events(plan.memory, {"n": 3}).natives
+    assert not check_compiled_events(plan, {"n": 3}).natives
 
 
 def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch):
@@ -290,6 +295,7 @@ def test_configuration_and_final_drain_have_explicit_unborrowed_bank_entries():
             if a.anchor is reservation.anchor
             and a.placement is Placement.EXIT
             and a.event == literal(reservation.event)
-            and (a.participants[0], a.source, a.destination) == reservation.bank
+            and reservation.bank[0] in a.participants
+            and (a.source, a.destination) == reservation.bank[1:]
         ]
         assert {a.kind for a in actions} == {SyncKind.LOCAL_SET, SyncKind.LOCAL_WAIT}

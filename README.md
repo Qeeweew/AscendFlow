@@ -3,43 +3,41 @@
 面向 Ascend 910B / dav-2201 的多阶段流水编译器，基于 xDSL 0.73.0 构建，输出 ASC，由 CANN 9.1 离线编译。
 用户表达计算、物理存储、缓冲和多阶段排步，编译器负责真实异步访问与资源复用同步。不引入MLIR工程或参考仓库构建依赖。
 
-自动同步使用[物理 cell credit 与分层派发规则](docs/generation-rules.md)，生成完整生命周期后交给有限 event 分配器。旧 Path/progress 求解器已删除，公共 DSL→IR→ASC 只有一条链路。当前资格、编译耗时与未解决项见[状态页](docs/refactor-progress.md)；规则接通不等于设备或性能验收。
+自动同步使用[物理 cell credit 与分层派发规则](docs/generation-rules.md)，生成完整生命周期后交给有限 event 分配器。公共 DSL→IR→ASC 只有一条链路；编译、数值与性能验证的口径见[验证说明](docs/validation.md)。
 
 ## 文档与代码入口
 
-- [重构计划](docs/refactor-plan.md)：具体阶段、旧职责退出和验收门槛。
 - [循环与同步设计](docs/design.md)、[源码包结构](docs/source-layout.md)、[变换不变量](docs/compilation-invariants.md)。
-- [当前状态](docs/refactor-progress.md)：代码身份、支持、测量及未解决问题。
 - [DSL](docs/dsl-multistage.md)、[算子示例](examples/README.md)、[FA合同](docs/attention-target.md)。
 - [测试](tests/README.md)、[编译/设备工具](benchmarks/README.md)、[验收口径](docs/validation.md)。
-- [文档索引](docs/README.md)：唯一权威入口与历史归档位置。
+- [文档索引](docs/README.md)：设计与使用说明入口。
 
 ## 开发环境与入口
 
-从 `/workspace/xdsl-910b` 使用独立 `.venv`。首次使用或切换包名后，安装当前产品的开发入口：
+以下命令均从本仓库根目录运行，使用已激活的独立 Python 环境。安装开发入口：
 
 ```bash
-.venv/bin/python -m pip install --no-deps --no-build-isolation -e AscendFlow
-.venv/bin/ascendflow --help
-.venv/bin/python -m ascendflow --help
+python -m pip install -e .
+ascendflow --help
+python -m ascendflow --help
 ```
 
 Python 包名、安装项目名和命令名均为 `ascendflow`。xDSL 是底层 Python IR 框架依赖，不是产品名。两个命令入口调用同一个编译流程。
 
 ## 示例
 
-从 `/workspace/xdsl-910b` 运行，使用已有 `.venv`，产物写到外层runs。功能产物包含 source、同步前后 IR 和 ASC：
+功能产物包含 source、同步前后 IR 和 ASC；下面将产物写入已忽略的 `build/`：
 
 ```bash
-PYTHONPATH=AscendFlow .venv/bin/python -m examples.vector.scale --output runs/quickstart/vector
+python -m examples.vector.scale --output build/quickstart/vector
 ```
 
-`PYTHONPATH=AscendFlow` 使示例和 benchmark 模块可导入；AscendFlow 包来自上述开发安装。示例输出 source/同步前后 IR、ASC 与报告，增加 `--shared` 可做 CANN 离线编译，不默认运行设备。
+示例和 benchmark 模块从仓库根目录导入；AscendFlow 包来自上述开发安装。示例输出 source/同步前后 IR、ASC 与报告，增加 `--shared` 可做 CANN 离线编译，不默认运行设备。
 
 直接编译 Python DSL 文件：
 
 ```bash
-.venv/bin/ascendflow --input AscendFlow/examples/vector/scale.py --entry scale --parameters '{"B":64}' --output runs/quickstart/vector-cli --timeout 300
+ascendflow --input examples/vector/scale.py --entry scale --parameters '{"B":64}' --output build/quickstart/vector-cli --timeout 300
 ```
 
 ```python
@@ -64,8 +62,8 @@ print(artifact.asc)
 | examples | 算法及显式政策，编译器不得导入它们来选择实现 |
 | tests | 语义反例、实际IR破坏、有限模型与复杂度回归 |
 | benchmarks | 编译计时、手写AscendC/ACLNN、数值与profiling工具 |
-| docs | 当前设计、合同、计划、状态和必要用户参考 |
+| docs | 当前设计、合同和使用说明 |
 
-AscendFlow 通过独立产品 Git 管理。外层环境、reference、历史报告、runs和缓存不纳入产品提交，不创建根Git。文件CLI/benchmark构建入口使用≤300s的进程组硬期限；直接调用Python `compile()`使用进程内协作预算，不能替代上述隔离构建入口。
+生成产物和缓存不纳入 Git，文档中的源码链接均相对于本仓库。文件CLI/benchmark构建入口使用≤300s的进程组硬期限；直接调用Python `compile()`使用进程内协作预算，不能替代上述隔离构建入口。
 
 设备运行前检查所有卡健康、进程、显存和利用率，选择健康空闲物理卡并显式映射逻辑0；不用/tmp锁，不reset或换卡绕过错误。CPU/IR通过不等于CANN或设备资格，历史证据不等于当前工作树已验证。

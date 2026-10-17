@@ -23,6 +23,7 @@ from ascendflow.dialects.physical import (
 )
 from ascendflow.dialects.source import CopyOp, PipelineOp
 from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
+from ascendflow.dialects.types import RefType
 from ascendflow.passes.lower_native import lower_native_structure
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
@@ -70,8 +71,7 @@ def interpret(block, values, arguments, trace):
         elif isinstance(op, scf.YieldOp):
             return tuple(values[value] for value in op.arguments)
         elif isinstance(op, PipelineLoopOp):
-            lower, upper, stride = (values[value] for value in op.operands)
-            iterations = list(range(lower, upper, stride))
+            iterations = list(range(max(0, values[op.count])))
             stages = [stage for stage in op.body.block.ops if isinstance(stage, PipelineStageOp)]
             if (
                 op.issue_order is not None
@@ -79,13 +79,11 @@ def interpret(block, values, arguments, trace):
             ):
                 by_name = {stage.label.data: stage for stage in stages}
                 stages = [by_name[label.data] for label in policy]
-            for clock in range(len(iterations) + op.schedule.horizon.data):
+            for clock in range(len(iterations) + op.horizon):
                 for stage in stages:
                     g = clock - stage.offset.data
                     if 0 <= g < len(iterations):
-                        local = values | dict(
-                            zip(stage.body.block.args, (g, iterations[g]), strict=True)
-                        )
+                        local = values | dict(zip(stage.body.block.args, (g,), strict=True))
                         interpret(stage.body.block, local, arguments, trace)
             result = ()
         elif isinstance(op, ActorDomainOp):
@@ -96,7 +94,7 @@ def interpret(block, values, arguments, trace):
         elif isinstance(op, AddressOp):
             result = ((values[op.source].sym_name.data, values[op.offset]),)
         elif isinstance(op, TaskOp):
-            refs = tuple(values[value] for value in op.refs)
+            refs = tuple(values[value] for value in op.refs[:3] if isinstance(value.type, RefType))
             trace.append((op.native.data, op.scalar.value.data, refs))
             result = (op,)
         elif isinstance(op, EndOp):

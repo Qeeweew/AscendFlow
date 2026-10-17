@@ -103,6 +103,7 @@ class Compilation:
                     "actions_printed": emission.actions_printed,
                     "output_bytes": emission.output_bytes,
                 },
+                "condition_simplification": asdict(plan.condition_work),
             },
             "native_templates": len(plan.memory.templates),
             "required_dependencies": len(plan.dependencies.required),

@@ -1,7 +1,7 @@
 # 自动同步生成合同
 
-本页对应 `generate_notifications` 的实现。资格和未完成项以
-`refactor-progress.md` 及实际构建记录为准；规则论证不替代 ASC/CANN 资格。
+本页对应 `generate_notifications` 的实现。规则论证不替代 ASC/CANN 或设备
+验证；验证方法见 [validation.md](validation.md)。
 
 ## 事实归属
 
@@ -111,13 +111,13 @@ handoff，其成员和 FIRST/LAST 边界才按需建立；已有普遍配对在�
 ## 5. 循环与首尾
 
 循环保留参数化 body。逻辑代次 `g` 在 physical step `j=g+stage` 执行且仅执行
-一次；原有 stage guard 处理 prologue、loop 和 epilogue。源地址、slot、guard、
+一次；输出为一个时钟循环，各stage用同一存在条件覆盖全部合法实例。源地址、slot、guard、
 metadata 与捕获值使用相同坐标变换。runtime 长度不展开。
 
 credit 的第一次 writer 在没有先前 reader 时不生成 Wait；release 只有在真实
 下一 writer 存在时才成对生成 Set/Wait。这是未 seed 的有限 credit 表达：N=0
 没有虚构通知，N=1 的 FIRST/LAST 重合不重复，最后没有无消费者的 release。
-不能为 P/L/E 分别建立独立 credit，也不在普通 loop exit 加 drain。
+不能为不同循环边界分别建立独立 credit，也不在普通 loop exit 加 drain。
 
 child exit 只结束控制派发，不说明 native 已完成。跨 child 和跨外层 invocation
 的依赖仍绑定实际最后 reader/首次 writer。MTE1 最后读 L1 后即可 release，MAD/FIX
@@ -139,7 +139,39 @@ mode-2 的十六个 base ID 来自安装 CANN 9.1 的 2201 `GetfftsConfig` 四�
 它们在所有 mode 间共用，超出 15 会 alias。使用真实 namespace 不是放宽 solver
 预算；不允许 overflow ID、忽略配置预留或静默重排。
 
+同一实际插入点的两个 AIV 使用相同有序指令序列时，代码只输出一份。比较包括
+指令种类、方向、已分配 ID 表达式及有序 guard，保留每个 actor 的原有顺序和
+重复次数；分析协议名仅作为诊断来源保留，不阻止共享。ID、guard 或顺序不同时
+保留原有参与者限制。这里共享的是代码，不合并私有 event bank 或 mode-2 贡献。
+
+`N.Vector() as lane` 的 lane 就是 runtime SID。共同动作直接在共享 Vector body
+执行；只有单 actor 动作才在物化时生成一次 SID 控制，且该控制先于 guard 和
+事件 ID 求值。最终 NotificationOp 的 eligible participants 与实际 SCF 控制取
+交集，因此物化后的指令采用所在 family 的参与者，不让后端再加第二层 SID 判断。
+
 物化只插入已确定的 native 前后通知及有序短路 guard，保持 native、地址和循环
-身份。后端只打印真实 IR。独立有限模型按实际字节、队列、二值消费、quorum 和
+身份。终端 `lower_execution` 随后将 count/stage 表示降低为实际 arith/scf，
+按每个 actor 的既定 issue order 映射控制与地址，移动原 native，保持双 AIV 共用代码。
+整数化简复用支配定义、源循环联合范围和实际 runtime/actor/loop/branch，
+折叠 min/max、仿射冗余及比较，并外提目标域内求值合法的不变量；
+除法定义性及全部 signed 中间量在目标域未知时不外提。
+原式定义性先于化简准入，未知或可能溢出的区间不支持折叠。
+
+`simplify_conditions`使用实际loop、祖先和分支前提保持`g`与`g-N`关联，合并
+连续指令的共同条件。仅当标量在共同入口完整可求值时才移动计算；通知专用
+二次幂余数可改为全定义的位掩码，地址及loop header依赖的原式保持不变。
+同种类/路由/参与者的连续通知在分支互斥时合并执行域和event ID表达式，
+重叠分支仍按原顺序贡献各次指令。诊断协议来源全部保留，不重新选择同步。
+event选择式在公共guard的剩余域内生成，内部不重复判断共同条件。
+有限bank slot的互补选择可化简为无条件指令，不枚举runtime迭代或循环阶段。
+
+后端只打印最终IR，每个pipeline/family只有一个物理时钟循环、一份stage body；
+相邻同offset的stage共享存在guard。ASC中无阶段枚举、阶段参数、stage lambda
+及独立的序言/稳态/收尾/短循环路径；N=0和短循环服从同一执行规则。首末轮、
+event slot和其他真实协议条件继续使用实际IR，不把循环退出当完成。
+launcher仅输出kernel调用及ABI返回，不生成尺寸/倍数/溢出/指针/对齐/alias
+运行时检查，不在其他入口补写检查。编译期仍验证输入合同声明、原始有序
+定义性和静态地址/同步前提；调用方满足kernel声明的输入与合法索引求值合同。
+独立有限模型按实际字节、队列、二值消费、quorum 和
 controller 阻塞检查输出；可另外提供独立 pre-sync snapshot 检查 native/地址/值版本
 保留。该模型是有界反例检查，不外推任意 N 的硬件正确性或设备性能。

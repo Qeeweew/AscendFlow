@@ -22,7 +22,11 @@ from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.analysis.test_event_parameter_cases import nested_slot_source
 from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
-from tests.models.structured_events import EventModelError, check_structured_events
+from tests.models.structured_events import (
+    EventModelError,
+    check_compiled_events,
+    check_structured_events,
+)
 
 
 def test_shared_l0c_packet_reuse_keeps_actual_read_versions_through_loop_boundaries():
@@ -33,7 +37,7 @@ def test_shared_l0c_packet_reuse_keeps_actual_read_versions_through_loop_boundar
     with limit(300):
         result = synchronize_structure(shared_l0c_qk_pv)
     for count in range(4):
-        execution = check_structured_events(result.memory, {"n": count})
+        execution = check_compiled_events(result, {"n": count})
         assert len(execution.natives) == 73 * count
 
 
@@ -447,7 +451,7 @@ def test_generated_actual_waits_and_retirement_captures_are_necessary(mutation):
     from ascendflow.passes.structured_sync import synchronize_structure
 
     plan = synchronize_structure(scale.specialize(B=64))
-    check_structured_events(plan.memory, {"tiles": 3})
+    check_compiled_events(plan, {"tiles": 3})
     wait = next(
         op
         for op in plan.module.walk()
@@ -502,4 +506,4 @@ def test_generated_actual_waits_and_retirement_captures_are_necessary(mutation):
         block.insert_ops_before(ordered, source)
     plan.module.verify()
     with pytest.raises(EventModelError, match="event|RAW|WAR|WAW"):
-        check_structured_events(plan.memory, {"tiles": 3})
+        check_compiled_events(plan, {"tiles": 3})

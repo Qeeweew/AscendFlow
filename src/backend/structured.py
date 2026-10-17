@@ -2,18 +2,18 @@
 
 No native admission, address decoding, dependency scan or synchronization
 selection occurs here. One shared AIV body uses the C API group/sid ABI.
-Pipeline templates print once with edge guards, avoiding exponential phase
-body duplication under nesting. This does not claim optimized steady code.
+Each pipeline has one physical clock loop. Adjacent stages at the same offset
+share one existence guard. Nested loop coordinates remain separate SSA bindings.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass, field
 
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerType
+from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr, IntegerType
 
+from ..analysis.scalar_uses import ScalarUses
 from ..analysis.structured_memory import NativeMemoryFacts
 from ..analysis.structured_schedule import SyncKind
 from ..diagnostics import ErrorKind, require
@@ -32,10 +32,7 @@ from ..dialects.structured import (
     ActorDomainOp,
     AddressOp,
     NotificationOp,
-    PipelineLoopOp,
-    PipelineStageOp,
 )
-from ..scalar import expression, literal
 from ..target.ascend910b import Actor
 from .native import QUALIFIER, load3d_init
 from .structured_native import format_native
@@ -46,7 +43,24 @@ _BINARY = {
     arith.MuliOp: "*",
     arith.DivUIOp: "/",
     arith.RemUIOp: "%",
+    arith.AndIOp: "&&",
+    arith.OrIOp: "||",
 }
+
+
+def _integer_constant(value):
+    owner = value.owner
+    if isinstance(owner, arith.ConstantOp) and isinstance(owner.value, IntegerAttr):
+        return owner.value.value.data
+    return None
+
+
+def _empty_region(region):
+    return all(
+        isinstance(op, scf.YieldOp) and not op.arguments
+        for block in region.blocks
+        for op in block.ops
+    )
 
 
 @dataclass(slots=True)
@@ -68,7 +82,7 @@ class _Context:
 
 
 class _Emitter:
-    def __init__(self, memory, work):
+    def __init__(self, memory, work, facts=None):
         require(
             isinstance(memory, NativeMemoryFacts), "structured emission needs owned memory facts"
         )
@@ -76,6 +90,8 @@ class _Emitter:
             memory.control.module is memory.module, "emission control belongs to another module"
         )
         self.memory, self.control, self.work = memory, memory.control, work
+        self.facts = facts
+        self.expression_cost = {}
         self.root = memory.module.body.block.first_op
         require(isinstance(self.root, (KernelOp, MixedOp)), "unsupported structured kernel root")
         self.mixed = isinstance(self.root, MixedOp)
@@ -85,22 +101,12 @@ class _Emitter:
         self.roots = {op.ref: f"npu_buffer_{i}" for i, op in enumerate(self.buffers)}
         self.externals = tuple(op for op in self.buffers if op.external.data)
         self.parameters = tuple(op for op in memory.module.walk() if isinstance(op, RuntimeSizeOp))
-        self.relevant = defaultdict(set)
-        for template in memory.templates:
-            for actor in template.participants:
-                self._mark(template.operation, "cube" if actor is Actor.AIC else "vector")
-        for operation in memory.module.walk():
-            if isinstance(operation, NotificationOp):
-                for participant in operation.participants:
-                    actor = Actor(participant.data)
-                    self._mark(operation, "cube" if actor is Actor.AIC else "vector")
+        uses = ScalarUses(memory)
+        self.relevant = uses.operations
+        self.scalar_uses = uses.values
+        self.scalar_reads = uses.reads
         self.serial = 0
         self.work.native_templates = len(memory.templates)
-
-    def _mark(self, operation, family):
-        while operation is not None:
-            self.relevant[operation].add(family)
-            operation = operation.parent_op()
 
     def fresh(self, prefix):
         result = f"npu_{prefix}_{self.serial}"
@@ -115,17 +121,23 @@ class _Emitter:
             if isinstance(owner.value, FloatAttr):
                 return repr(owner.value.value.data) + "f"
             constant = owner.value.value.data
+            if isinstance(value.type, IntegerType) and value.type.width.data == 1:
+                return "true" if constant else "false"
             return "INT64_MIN" if constant == -(1 << 63) else str(constant)
         require(
             False,
             "unbound structured SSA scalar at emission",
             kind=ErrorKind.UNSUPPORTED,
             phase="structured-ASC",
+            witness=(str(value), str(getattr(owner, "name", type(owner).__name__))),
         )
 
     def arithmetic(self, operation, context):
-        a, b = (self.scalar(operand, context) for operand in operation.operands)
-        if isinstance(operation, arith.CmpiOp):
+        operands = tuple(self.scalar(operand, context) for operand in operation.operands)
+        a, b = operands[:2]
+        if isinstance(operation, arith.SelectOp):
+            code = f"({a} ? {b} : {operands[2]})"
+        elif isinstance(operation, arith.CmpiOp):
             predicates = ("==", "!=", "<", "<=", ">", ">=", "<", "<=", ">", ">=")
             predicate = operation.predicate.value.data
             if predicate >= 6:
@@ -133,8 +145,23 @@ class _Emitter:
             code = f"({a} {predicates[predicate]} {b})"
         elif type(operation) in _BINARY:
             if isinstance(operation, (arith.DivUIOp, arith.RemUIOp)):
-                a, b = f"uint64_t({a})", f"uint64_t({b})"
-            code = f"({a} {_BINARY[type(operation)]} {b})"
+                ranges = {} if self.facts is None else self.facts.ranges
+                if (
+                    ranges.get(operation.lhs, (-1, 0))[0] < 0
+                    or ranges.get(operation.rhs, (0, 0))[0] <= 0
+                ):
+                    a, b = f"uint64_t({a})", f"uint64_t({b})"
+            operator = _BINARY[type(operation)]
+            if isinstance(operation, (arith.AndIOp, arith.OrIOp)) and not (
+                isinstance(operation.result.type, IntegerType)
+                and operation.result.type.width.data == 1
+            ):
+                operator = "&" if isinstance(operation, arith.AndIOp) else "|"
+            constant = _integer_constant(operation.rhs)
+            if isinstance(operation, arith.AddiOp) and constant is not None and constant < 0:
+                code = f"({a} - {-constant})"
+            else:
+                code = f"({a} {operator} {b})"
         elif isinstance(operation, (arith.MinSIOp, arith.MaxSIOp)):
             predicate = "<" if isinstance(operation, arith.MinSIOp) else ">"
             code = f"({a} {predicate} {b} ? {a} : {b})"
@@ -142,12 +169,37 @@ class _Emitter:
             assert isinstance(operation, arith.CeilDivUIOp)
             a, b = f"uint64_t({a})", f"uint64_t({b})"
             code = f"({a} / {b} + ({a} % {b} != 0))"
+        # Inline single-use integer SSA and small predicates at their actual
+        # use. Their operands are immutable SSA bindings in this lexical
+        # invocation; no load, floating arithmetic or effect is rematerialized.
+        result = operation.results[0]
+        own_cost = (
+            6
+            if isinstance(operation, (arith.DivUIOp, arith.RemUIOp, arith.CeilDivUIOp))
+            else 2
+            if isinstance(operation, (arith.SelectOp, arith.MinSIOp, arith.MaxSIOp))
+            else 1
+        )
+        cost = own_cost + sum(
+            self.expression_cost.get((value, context.family), 0) for value in operation.operands
+        )
+        uses = self.scalar_reads[result, context.family]
+        if (
+            (uses == 1 and cost <= 12)
+            or (uses == 2 and cost == 1)
+            or (isinstance(operation, arith.CmpiOp) and cost == 1)
+        ):
+            self.expression_cost[result, context.family] = cost
+            self.bind(operation.results[0], code, context)
+            return []
         name = self.fresh("scalar")
         self.bind(operation.results[0], name, context)
         return [f"const {self.ctype(operation.results[0])} {name} = {code};"]
 
     @staticmethod
     def ctype(value):
+        if isinstance(value.type, IntegerType) and value.type.width.data == 1:
+            return "bool"
         return "int64_t" if isinstance(value.type, (IndexType, IntegerType)) else "float"
 
     def bind(self, value, name, context):
@@ -187,15 +239,11 @@ class _Emitter:
             packet is not None and packet.closed_mask, "ASC needs an audited closed native packet"
         )
         local = context.child()
-        lines = ["{"]
-        stage = operation.parent_op()
-        while stage is not None and not isinstance(stage, PipelineStageOp):
-            stage = stage.parent_op()
-        require(
-            stage is not None or template.contract.native not in {"mad_first", "mad_cycle"},
-            "native initialization policy needs its actual pipeline ordinal SSA",
+        generation = (
+            self.scalar(operation.refs[-1], local)
+            if operation.native.data in {"mad_first", "mad_cycle"}
+            else "0"
         )
-        generation = "0" if stage is None else self.scalar(stage.body.block.args[0], local)
         code = format_native(
             template,
             render=lambda value: self.scalar(value, local),
@@ -203,8 +251,7 @@ class _Emitter:
             task_names=self.task_names,
             generation=generation,
         )
-        lines.extend("  " + line for line in code.splitlines())
-        lines.append("}")
+        lines = code.splitlines()
         if operation.value is not None:
             self.bind(operation.value, f"npu_value_{self.task_names[operation]}", context)
         self.work.native_prints += 1
@@ -213,102 +260,102 @@ class _Emitter:
 
     def loop(self, operation, context):
         local = context.child()
-        count, ordinal = self.fresh("count"), self.fresh("ordinal")
-        lower_value, upper_value = (
-            (operation.lower, operation.upper)
-            if isinstance(operation, PipelineLoopOp)
-            else (operation.lb, operation.ub)
-        )
+        clock = "npu.pipeline_clock" in operation.attributes
+        induction = self.fresh("step" if clock else "ordinal")
         lower, upper, step = (
-            self.scalar(value, context) for value in (lower_value, upper_value, operation.step)
+            self.scalar(value, context) for value in (operation.lb, operation.ub, operation.step)
         )
-        extent = f"({upper} - {lower})"
-        lines = [
-            f"const int64_t {count} = ({upper} > {lower} ? {extent} / {step} + ({extent} % {step} != 0) : 0);"
-        ]
-        carries = []
-        if isinstance(operation, scf.ForOp):
-            for initial, argument, result in zip(
-                operation.iter_args, operation.body.block.args[1:], operation.results, strict=True
-            ):
-                name = self.fresh("carry")
-                lines.append(f"{self.ctype(result)} {name} = {self.scalar(initial, context)};")
-                self.bind(argument, name, local)
-                self.bind(result, name, context)
-                carries.append(name)
-        static_lower, static_upper, static_step = (
-            value.owner for value in (lower_value, upper_value, operation.step)
-        )
-        static_count = None
-        if all(
-            isinstance(value, arith.ConstantOp)
-            for value in (static_lower, static_upper, static_step)
+        carries, lines = [], []
+        for initial, argument, result in zip(
+            operation.iter_args, operation.body.block.args[1:], operation.results, strict=True
         ):
-            difference = static_upper.value.value.data - static_lower.value.value.data
-            stride = static_step.value.value.data
-            static_count = max(0, difference) // stride + (max(0, difference) % stride != 0)
-        if static_count == 0:
+            name = self.fresh("carry")
+            lines.append(f"{self.ctype(result)} {name} = {self.scalar(initial, context)};")
+            self.bind(argument, name, local)
+            self.bind(result, name, context)
+            carries.append(name)
+        low, high = _integer_constant(operation.lb), _integer_constant(operation.ub)
+        if low is not None and high is not None and low >= high:
             return lines
-        horizon = operation.schedule.horizon.data if isinstance(operation, PipelineLoopOp) else 0
-        if horizon:
-            mode = (
-                "dynamic" if static_count is None else "short" if static_count < horizon else "long"
-            )
-            lines.append(f"// {mode} pipeline phases; one body, stage edge guards")
-        lines.append(
-            f"for (int64_t {ordinal} = 0; {ordinal} < {count} + {horizon}; ++{ordinal}) {{"
+        update = (
+            f"++{induction}" if _integer_constant(operation.step) == 1 else f"{induction} += {step}"
         )
-        if isinstance(operation, PipelineLoopOp):
-            stages = [
-                stage
-                for stage in operation.body.block.ops
-                if isinstance(stage, PipelineStageOp) and context.family in self.relevant[stage]
-            ]
-            if operation.issue_order is not None and context.family in operation.issue_order.data:
-                labels = [label.data for label in operation.issue_order.data[context.family]]
-                ranks = {label: rank for rank, label in enumerate(labels)}
-                stages.sort(key=lambda stage: ranks[stage.label.data])
-            for stage in stages:
-                nested = local.child()
-                g = self.fresh("generation")
-                lines += [
-                    f"  {{ // stage {stage.label.data}",
-                    f"    const int64_t {g} = {ordinal} - {stage.offset.data};",
-                    f"    if ({g} >= 0 && {g} < {count}) {{",
-                ]
-                iv = f"({lower} + {g} * {step})"
-                self.bind(stage.body.block.args[0], g, nested)
-                self.bind(stage.body.block.args[1], iv, nested)
-                lines.extend("      " + line for line in self.block(stage.body.block, nested))
-                lines += ["    }", "  }"]
-        else:
-            iv = f"({lower} + {ordinal} * {step})"
-            self.bind(operation.body.block.args[0], iv, local)
-            lines.extend("  " + line for line in self.block(operation.body.block, local))
-            yielded = operation.body.block.last_op
-            if carries:
-                temporaries = []
-                for value, carry in zip(yielded.arguments, carries, strict=True):
-                    temporary = self.fresh("next")
-                    lines.append(
-                        f"  const {self.ctype(value)} {temporary} = {self.scalar(value, local)};"
-                    )
-                    temporaries.append((carry, temporary))
-                lines.extend(f"  {carry} = {temporary};" for carry, temporary in temporaries)
-        lines.append("}")
-        return lines
+        lines.append(f"for (int64_t {induction} = {lower}; {induction} < {upper}; {update}) {{")
+        self.bind(operation.body.block.args[0], induction, local)
+        body = self.block(operation.body.block, local)
+        if not body and not carries:
+            return lines[:-1]
+        lines.extend("  " + line for line in body)
+        temporaries = []
+        for value, carry in zip(operation.body.block.last_op.arguments, carries, strict=True):
+            temporary = self.fresh("next")
+            lines.append(f"  const {self.ctype(value)} {temporary} = {self.scalar(value, local)};")
+            temporaries.append((carry, temporary))
+        lines.extend(f"  {carry} = {temporary};" for carry, temporary in temporaries)
+        return lines + ["}"]
 
     def conditional(self, operation, context):
+        condition = _integer_constant(operation.cond)
+        code = None if condition is not None else self.scalar(operation.cond, context)
+        if condition is not None:
+            region = operation.true_region if condition else operation.false_region
+            if not region.blocks:
+                return []
+            nested = context.child()
+            lines = self.block(region.block, nested)
+            for result, value in zip(
+                operation.results, region.block.last_op.arguments, strict=True
+            ):
+                self.bind(result, self.scalar(value, nested), context)
+            return lines
+        # A guarded chain has one ordered short-circuit condition. Prefix
+        # arithmetic can join it only when it emits no declaration/effect;
+        # its expression remains on the protected right side of &&.
+        while not operation.results and _empty_region(operation.false_region):
+            nested = context.child()
+            body = tuple(operation.true_region.block.ops)
+            inner = next((op for op in body if isinstance(op, scf.IfOp)), None)
+            if inner is None or inner.results or not _empty_region(inner.false_region):
+                break
+            if any(
+                not isinstance(op, (scf.YieldOp, arith.ConstantOp))
+                for op in body[body.index(inner) + 1 :]
+            ):
+                break
+            prefix = []
+            for op in body[: body.index(inner)]:
+                if isinstance(op, arith.ConstantOp):
+                    continue
+                if not isinstance(
+                    op,
+                    (
+                        *tuple(_BINARY),
+                        arith.CmpiOp,
+                        arith.SelectOp,
+                        arith.MinSIOp,
+                        arith.MaxSIOp,
+                        arith.CeilDivUIOp,
+                    ),
+                ):
+                    prefix.append("effect")
+                    break
+                prefix.extend(self.arithmetic(op, nested))
+            if prefix:
+                break
+            code = f"({code} && {self.scalar(inner.cond, nested)})"
+            operation, context = inner, nested
         results, lines = [], []
         for result in operation.results:
             name = self.fresh("choice")
             lines.append(f"{self.ctype(result)} {name};")
             self.bind(result, name, context)
             results.append(name)
-        lines.append(f"if ({self.scalar(operation.cond, context)}) {{")
+        lines.append(f"if ({code}) {{")
         regions = (operation.true_region, operation.false_region)
         for index, region in enumerate(regions):
             if not region.blocks:
+                continue
+            if index and not results and _empty_region(region):
                 continue
             if index:
                 lines.append("} else {")
@@ -336,7 +383,7 @@ class _Emitter:
                         nested,
                     )
                     lines.extend(self.block(operation.body.block, nested))
-            elif isinstance(operation, (PipelineLoopOp, scf.ForOp)):
+            elif isinstance(operation, scf.ForOp):
                 if context.family in self.relevant[operation] or operation.results:
                     lines.extend(self.loop(operation, context))
             elif isinstance(operation, scf.IfOp):
@@ -361,9 +408,17 @@ class _Emitter:
                 self.bind(operation.value, "npu_group", context)
             elif isinstance(
                 operation,
-                (*tuple(_BINARY), arith.CmpiOp, arith.MinSIOp, arith.MaxSIOp, arith.CeilDivUIOp),
+                (
+                    *tuple(_BINARY),
+                    arith.CmpiOp,
+                    arith.MinSIOp,
+                    arith.MaxSIOp,
+                    arith.CeilDivUIOp,
+                    arith.SelectOp,
+                ),
             ):
-                lines.extend(self.arithmetic(operation, context))
+                if context.family in self.relevant[operation]:
+                    lines.extend(self.arithmetic(operation, context))
             elif isinstance(
                 operation,
                 (
@@ -384,7 +439,7 @@ class _Emitter:
                 )
         return lines
 
-    def render(self, *, executable=False, host_launcher=False, host_expressions=()):
+    def render(self, *, executable=False, host_launcher=False):
         name = self.root.sym_name.data
         require(name.isascii() and name.isidentifier(), "kernel name is not a C identifier")
         signature = [f"__gm__ uint8_t* {self.roots[op.ref]}" for op in self.externals]
@@ -451,19 +506,25 @@ class _Emitter:
                 lines.append("  }")
         lines.append("}")
         if executable and host_launcher:
-            lines.extend(self.launcher(host_expressions))
+            lines.extend(self.launcher())
         result = "\n".join(lines) + "\n"
         self.work.output_bytes = len(result.encode())
         return result
 
-    def launcher(self, host_expressions):
-        return _launcher(self, host_expressions)
+    def launcher(self):
+        return _launcher(self)
 
 
 def emit_structure_debug(memory, *, work=None):
     """Explicit non-executable inspection; no launcher or completion claim."""
+    from ..passes.lower_execution import lower_execution
+    from ..passes.simplify_scalars import ScalarFacts, simplify_scalars
+
+    facts = ScalarFacts()
+    lower_execution(memory, facts)
+    simplify_scalars(memory.module, facts=facts)
     work = EmissionWork() if work is None else work
-    return _Emitter(memory, work).render()
+    return _Emitter(memory, work, facts).render()
 
 
 def _emit_owned(plan, *, host_launcher=True, work=None):
@@ -481,16 +542,14 @@ def _emit_owned(plan, *, host_launcher=True, work=None):
         "synchronization and memory belong to different owned structures",
     )
     work = EmissionWork() if work is None else work
-    return _Emitter(plan.memory, work).render(
+    return _Emitter(plan.memory, work, plan.scalar_facts).render(
         executable=True,
         host_launcher=host_launcher,
-        host_expressions=plan.admission.host_expressions,
     )
 
 
-def _launcher(emitter, host_expressions):
-    # Defined below the recursive printer so host checks cannot participate in
-    # address/control admission or change selected instruction placement.
+def _launcher(emitter):
+    """Emit only the shared-library ABI wrapper around one kernel launch."""
     root = emitter.root
     buffer_names = [buffer.sym_name.data for buffer in emitter.externals]
     require(
@@ -502,67 +561,11 @@ def _launcher(emitter, host_expressions):
     signature += [f"int64_t npu_size_{op.sym_name.data}" for op in emitter.parameters]
     arguments = [f"(uint8_t*)arg_{name}" for name in buffer_names]
     arguments += [f"npu_size_{op.sym_name.data}" for op in emitter.parameters]
-    lines = ["", f'extern "C" int launch_{root.sym_name.data}({", ".join(signature)}) {{']
-    names = {}
-    for parameter in emitter.parameters:
-        name = f"npu_size_{parameter.sym_name.data}"
-        names[emitter.control.environment.expression(parameter.value)] = name
-        lines.append(
-            f"  if ({name} < {parameter.minimum.data} || {name} % {parameter.multiple.data} != 0) return -1;"
-        )
-
-    def checked(value):
-        if value in names:
-            return names[value]
-        if value.constant is not None:
-            require(-(1 << 63) <= value.constant < (1 << 63), "host scalar constant exceeds int64")
-            return "INT64_MIN" if value.constant == -(1 << 63) else str(value.constant)
-        require(value.kind != "argument", "host check contains an unbound varying coordinate")
-        a, b = (checked(child) for child in value.args)
-        if value.kind in {"floordiv", "rem", "ceildiv"}:
-            lines.append(f"  if ({a} < 0 || {b} <= 0) return -1;")
-        symbol = f"npu_host_{len(names)}"
-        if value.kind in {"add", "mul"}:
-            code = f"(__int128)({a}) {'+' if value.kind == 'add' else '*'} (__int128)({b})"
-        else:
-            code = value.c(
-                names
-                | {child: rendered for child, rendered in zip(value.args, (a, b), strict=True)}
-            )
-        lines.append(f"  const __int128 {symbol}_wide = {code};")
-        lines.append(
-            f"  if ({symbol}_wide < INT64_MIN || {symbol}_wide > INT64_MAX) return -1; // scalar overflow"
-        )
-        lines.append(f"  const int64_t {symbol} = int64_t({symbol}_wide);")
-        names[value] = symbol
-        return symbol
-
-    for value in host_expressions:
-        checked(value)
-    for index, allocation in enumerate(emitter.externals):
-        size = literal(allocation.nbytes.data)
-        if allocation.extent_count is not None:
-            size = expression(
-                "mul",
-                emitter.control.environment.expression(allocation.extent_count),
-                literal(allocation.count_scale.data),
-            )
-        nbytes = checked(size)
-        lines += [
-            f"  const uint64_t npu_bytes_{index} = uint64_t({nbytes});",
-            f"  const uintptr_t npu_ptr_{index} = (uintptr_t)arg_{buffer_names[index]};",
-            f"  if (npu_bytes_{index} && (!npu_ptr_{index} || npu_ptr_{index} % 32 || npu_ptr_{index} > UINTPTR_MAX - npu_bytes_{index})) return -1;",
-        ]
-    if root.disjoint_external.data:
-        for i in range(len(emitter.externals)):
-            for j in range(i + 1, len(emitter.externals)):
-                lines.append(
-                    f"  if (npu_bytes_{i} && npu_bytes_{j} && npu_ptr_{i} < npu_ptr_{j} + npu_bytes_{j} && npu_ptr_{j} < npu_ptr_{i} + npu_bytes_{i}) return -1;"
-                )
     groups = 1 if root.blocks is None else root.blocks.data
-    lines += [
+    return [
+        "",
+        f'extern "C" int launch_{root.sym_name.data}({", ".join(signature)}) {{',
         f"  {root.sym_name.data}<<<{groups}, nullptr, stream>>>({', '.join(arguments)});",
         "  return 0;",
         "}",
     ]
-    return lines

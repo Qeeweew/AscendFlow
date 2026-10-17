@@ -87,7 +87,7 @@ class SyncAction:
     destination: Engine
     event: Expr | None = None
     guard: ActionGuard = ActionGuard()
-    protocol: str = ""
+    protocols: tuple[str, ...] = ()
 
     def __post_init__(self):
         require(isinstance(self.anchor, Operation), "sync placement needs its actual IR anchor")
@@ -114,8 +114,7 @@ class SyncAction:
         if local or self.kind is SyncKind.FENCE:
             require(
                 all(
-                    supports_engine(actor, self.source)
-                    and supports_engine(actor, self.destination)
+                    supports_engine(actor, self.source) and supports_engine(actor, self.destination)
                     for actor in self.participants
                 ),
                 "local sync route belongs to another participant",
@@ -134,6 +133,11 @@ class SyncAction:
             "a fence has one pipe and no ID; notifications require an event expression",
         )
         require(isinstance(self.guard, ActionGuard), "sync action needs a typed guard")
+        require(
+            isinstance(self.protocols, tuple)
+            and all(isinstance(name, str) for name in self.protocols),
+            "sync action protocol names are diagnostic origins, not instruction identity",
+        )
 
     def active_event(self, values):
         """Finite test helper; never evaluate guarded IDs on inactive paths."""

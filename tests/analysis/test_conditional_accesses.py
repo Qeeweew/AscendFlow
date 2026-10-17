@@ -58,6 +58,11 @@ def _retarget(structure, period):
         if isinstance(op, TaskOp) and op.native.data in {"mad", "mad_first"}
     )
     task.native = StringAttr("mad_cycle")
+    if len(task.refs) == 3:
+        stage = task.parent_op()
+        while not isinstance(stage, PipelineStageOp):
+            stage = stage.parent_op()
+        task.operands = (*task.refs, stage.body.block.args[0])
     task.params = ArrayAttr(
         IntAttr(value) for value in (*tuple(p.data for p in task.params)[:3], period)
     )

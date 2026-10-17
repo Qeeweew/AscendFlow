@@ -75,7 +75,7 @@ def _bindings(memory, block, before, container):
                 memo[logical.ordinal] = division.result
         elif isinstance(owner, PipelineStageOp):
             logical = control.loops[owner.parent_op()]
-            memo[logical.ordinal], memo[logical.induction] = current.args
+            memo[logical.ordinal] = current.args[0]
         for operation in current.ops:
             if operation is stop:
                 break
@@ -217,12 +217,21 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
                     operands=[event],
                     attributes={
                         "kind": StringAttr(action.kind.value),
+                        # Participant restrictions have already become the
+                        # surrounding SID control. The instruction executes in
+                        # that actual family region, with no second backend
+                        # participant filter. Shared actions need neither.
                         "participants": ArrayAttr(
-                            StringAttr(actor.value) for actor in action.participants
+                            StringAttr(actor.value)
+                            for actor in (
+                                (Actor.AIV0, Actor.AIV1)
+                                if isinstance(root, MixedOp) and family == "vector"
+                                else action.participants
+                            )
                         ),
                         "source": StringAttr(action.source.value),
                         "destination": StringAttr(action.destination.value),
-                        "protocol": StringAttr(action.protocol),
+                        "protocol": StringAttr(", ".join(action.protocols)),
                     },
                 )
             )

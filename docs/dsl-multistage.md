@@ -1,6 +1,6 @@
 # DSL：运行时循环、物理存储与多级流水
 
-本文说明现有公开语法和重构需保持的语言语义。**语法被识别、通过lowering、设备验证是不同资格。** 当前限制见下表，实际证据见[状态](refactor-progress.md)。
+本文说明现有公开语法和语言语义。**语法被识别、通过lowering、设备验证是不同资格。** 当前限制见下表，验证方法见[validation.md](validation.md)。
 
 ## 1. 用户负责表达什么
 
@@ -10,7 +10,7 @@
 |---|---|
 | `@T.prim_func` | 捕获源码、参数及位置 |
 | `T.Tensor` / `T.int64` | 外部tensor与runtime标量；长度不是constexpr |
-| `T.int64(minimum=1, multiple_of=B)` | runtime输入合同，launcher检查；不变成编译期常量 |
+| `T.int64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
 | `T.constexpr` | tile、dtype/layout、固定政策等显式特化参数 |
 | `assert` | 只接受constexpr布尔条件；不是运行时事实假设，即使Python -O也执行编译检查 |
 | `T.Kernel(groups, kind=...)` | launch域；mixed每组1 AIC/2 AIV |
@@ -49,23 +49,23 @@ FA的真实数学主体在[attention.py](../examples/flash_attention/attention.p
 
 数学块名称不是编译器内置attention API，也不是目前已有的通用函数宏。任意Python函数调用仍被拒绝。透明宏如后续加入，必须保留source位置、类型、scratch/effects、作用域和内部循环，不靠opaque Python回调隐藏原语；这不是本轮已经支持的能力。
 
-serial、pipeline、嵌套及循环前后操作使用统一控制与region接口，语义见[PLE与边界组合](design.md)。各实际示例的当前资格见[状态页](refactor-progress.md)；设计示意本身不构成可运行API。
+serial、pipeline、嵌套及循环前后操作使用统一控制与region接口，语义见[循环与边界组合](design.md)。示例源码列于[examples](../examples/README.md)；设计示意本身不构成可运行API。
 
 ## 4. 当前识别与lowering边界
 
-| 构造 | 当前情况 | 重构要求 |
+| 构造 | 当前情况 | 语义要求 |
 |---|---|---|
-| runtime局部pipeline、显式buffer、固定stage | 已实现，当前 IR/ASC/CANN 资格见状态页 | 保持政策和原语语义，取消结构专用同步分派 |
+| runtime局部pipeline、显式buffer、固定stage | 已实现，使用统一编译链 | 保持政策和原语语义，使用通用同步规则 |
 | 普通常量界 | 保留循环；只分析受物理容量约束的 slot 周期 | 普通循环不自动unroll，分析与N无关 |
 | serial中的标量carry | 保留 SCF carry；影响地址/循环界而无范围合同时拒绝 | 在统一admission明确诊断；需要完整carry合同后才开放 |
-| 外层serial + KV pipeline + fixed child | 默认 FA 使用递归生成规则；不设 query/KV 分派 | 改成普通递归组合，可有循环前后真实工作 |
+| 外层serial + KV pipeline + fixed child | 默认 FA 使用递归生成规则；不设 query/KV 分派 | 普通递归组合，保留循环前后真实工作 |
 | runtime child及更深任意嵌套 | 未普遍支持 | 逐合同接入，不设FA/query例外 |
 | FIRST/LAST/受限边界guard | 已有子集，组合限制存在 | 空/短/重合/孔洞的统一存在域 |
 | 数据相关分支、间接alias/owner、任意多时钟连续任务 | 未普遍支持 | 明确可验证输入合同或具体拒绝 |
 | prefix native 地址、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
 | opaque Python函数/任意宏 | 不支持 | 透明AST复用另列实现，不以增加原语名单替代 |
 
-重构把语法/admission与lowering能力对应起来；不能先接受一种构造，再以不相关的“需要KV/query”诊断拒绝。
+语法/admission与lowering能力应对应；不能先接受一种构造，再以不相关的“需要KV/query”诊断拒绝。
 
 ## 5. 地址、alias与数值合同
 

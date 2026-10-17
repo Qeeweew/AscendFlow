@@ -13,12 +13,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from xdsl.dialects.builtin import ModuleOp, f32
+from xdsl.dialects import scf
+from xdsl.dialects.builtin import IndexType, ModuleOp, f32
 from xdsl.ir import SSAValue
 
 from ..diagnostics import require
 from ..dialects.physical import TaskOp
-from ..dialects.structured import PipelineLoopOp, PipelineStageOp
+from ..dialects.structured import PipelineStageOp
 from ..dialects.types import RefType
 from ..scalar import expression, literal
 from ..target import native
@@ -65,16 +66,34 @@ class NativeMemoryFacts:
 def _conditional_reads(operation, contract, control):
     if not contract.read_resets:
         return {}
+    require(isinstance(operation.refs[-1].type, IndexType), "native reset needs an SSA ordinal")
+    ordinal = control.environment.expression(operation.refs[-1])
+    loops = control.frames[operation].loops()
     stage = operation.parent_op()
     while stage is not None and not isinstance(stage, PipelineStageOp):
         stage = stage.parent_op()
-    require(stage is not None, "native reset needs its actual pipeline stage ordinal")
-    loop = stage.parent_op()
-    require(
-        isinstance(loop, PipelineLoopOp) and loop in control.loops,
-        "native reset lost its actual pipeline clock",
-    )
-    ordinal = control.loops[loop].ordinal
+    if stage is not None:
+        loop = stage.parent_op()
+        require(
+            operation.refs[-1] is stage.body.block.args[0]
+            and any(item.operation is loop for item in loops),
+            "native reset needs its actual pipeline stage ordinal",
+        )
+    else:
+        # Terminal SCF retains the actual ordinal operand and clock origin;
+        # a nested serial loop must never replace its pipeline's reset clock.
+        clocks = [
+            item
+            for item in loops
+            if isinstance(item.operation, scf.ForOp)
+            and "npu.pipeline_clock" in item.operation.attributes
+        ]
+        matching = [item for item in clocks if item.ordinal.variables & ordinal.variables]
+        require(
+            clocks and (matching or ordinal.constant is not None),
+            "native reset needs its actual pipeline stage ordinal",
+        )
+        loop = (matching or clocks)[-1].operation
     result = {}
     for reset in contract.read_resets:
         value = (
@@ -116,6 +135,12 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             current = current.parent
         require(operation.stage.data == stage, "native stage disagrees with its actual loop scope")
         operands = tuple(operation.refs)
+        if operation.native.data in {"mad_first", "mad_cycle"}:
+            require(
+                len(operands) == 4 and isinstance(operands[-1].type, IndexType),
+                "native reset needs three references and an explicit index ordinal",
+            )
+            operands = operands[:-1]
         scalar_source = None
         if operation.native.data in {"scale_value", "sub_value"}:
             require(

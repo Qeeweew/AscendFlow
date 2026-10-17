@@ -1,6 +1,6 @@
 # 验证与编译、设备性能验收
 
-本页定义验收口径。生成规则已接入唯一 normal 链路，实际结果与缺口见[状态](refactor-progress.md)。本任务执行 CPU/IR、ASC 和 CANN 离线检查，不执行设备调优或压测。
+本页定义 CPU/IR、ASC、CANN 离线编译以及设备数值和性能的验收口径。生成规则使用唯一 normal 链路，各层结果分别记录。
 
 ## 1. 分层验证
 
@@ -55,11 +55,11 @@
 - source→ASC包含源码读取/构造、所有分析/化简/输出和内部快照。import、进程总时间、CANN、RSS另列，不能移动计时边界美化数字。
 - 五次p50≤5s、max≤10s；GEMM/scale/softmax/RMSNorm同时报告绝对值和是否回退。未达标就明确失败。
 
-复现冷编译工具（从工作区根目录运行，执行结果见状态页）：
+复现冷编译工具（从本仓库根目录、已激活的 Python 环境运行）：
 
 ```bash
-PYTHONPATH=AscendFlow .venv/bin/python -m benchmarks.compile --input AscendFlow/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output runs/structured-loops/fa-probe
-PYTHONPATH=AscendFlow .venv/bin/python -m benchmarks.compile --input AscendFlow/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 5 --timeout 300 --output runs/structured-loops/fa-cold
+python -m benchmarks.compile --input examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output build/compile/fa-probe
+python -m benchmarks.compile --input examples/flash_attention/attention.py --entry attention_target --mode normal --trials 5 --timeout 300 --output build/compile/fa-cold
 ```
 
 冻结源码、编译器Git加未提交diff身份、constexpr政策、版本、ASC SHA、命令及原始JSON。单次probe和带采样诊断不作为五次p50；当前 normal 使用生成规则的域、phase 和 credit 前提；不再执行旧 progress/path solver。`generated-lifetimes` 仅描述来源，不能作为独立证明。normal与额外结构验证的成本分开。无需清空OS文件cache，不允许跨编译结果缓存。

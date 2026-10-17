@@ -1,5 +1,6 @@
 """Scalar rewrites preserve the physical control and asynchronous program."""
 
+import pytest
 from xdsl.dialects import arith, func, scf
 from xdsl.dialects.builtin import (
     ArrayAttr,
@@ -11,6 +12,7 @@ from xdsl.dialects.builtin import (
     UnrealizedConversionCastOp,
     VectorType,
     f32,
+    i1,
     i32,
     i64,
 )
@@ -18,6 +20,7 @@ from xdsl.ir import Block, Region, SSAValue
 
 from ascendflow import compile
 from ascendflow import language as N
+from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import dump
 from ascendflow.dialects.physical import RuntimeSizeOp, TaskOp
 from ascendflow.dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
@@ -196,15 +199,41 @@ def test_division_and_remainder_stay_inside_their_original_short_circuit_regions
         division,
         remainder,
         ceiling,
-        unused_division,
         pair,
         result,
         guarded.last_op,
     )
-    assert all(op.parent is guarded for op in (division, remainder, ceiling, unused_division))
+    assert all(op.parent is guarded for op in (division, remainder, ceiling))
+    assert unused_division.parent is None
     assert isinstance(inner.cond.owner, arith.ConstantOp)
     assert inner.cond.owner.value.value.data != 0
     assert identity.parent is None
+
+
+def test_moving_a_definition_invalidates_its_original_guarded_range():
+    from ascendflow.passes.simplify_scalars import ScalarFacts
+
+    block = Block()
+    zero, one, two, four = (_constant(block, value) for value in (0, 1, 2, 4))
+    body = Block(arg_types=[IndexType()])
+    iv = body.args[0]
+    condition = arith.CmpiOp(iv, one, "sge")
+    guarded = Block()
+    difference = arith.SubiOp(iv, one)
+    remainder = arith.RemUIOp(difference, two)
+    use = UnrealizedConversionCastOp.get([remainder], [IndexType()])
+    guarded.add_ops([difference, remainder, use, scf.YieldOp()])
+    body.add_ops([condition, scf.IfOp(condition, [], Region(guarded), Region()), scf.YieldOp()])
+    loop = scf.ForOp(zero, four, one, [], body)
+    block.add_op(loop)
+    module = _function(block)
+    facts = ScalarFacts(ranges={difference.result: (0, 2)})
+    simplify_scalars(module, facts=facts)
+    module.verify()
+    assert difference.parent is body
+    assert facts.ranges[difference.result] == (-1, 2)
+    # The shifted value is negative on the newly exposed first iteration.
+    assert remainder.parent is guarded
 
 
 def _execute_i64(block, argument):
@@ -216,6 +245,18 @@ def _execute_i64(block, argument):
             value = operation.value.value.data
         elif isinstance(operation, arith.AddiOp):
             value = values[operation.lhs] + values[operation.rhs]
+        elif isinstance(operation, (arith.DivUIOp, arith.CeilDivUIOp, arith.RemUIOp)):
+            left, right = (values[operand] % (1 << 64) for operand in operation.operands)
+            quotient, remainder = divmod(left, right)
+            value = (
+                remainder
+                if isinstance(operation, arith.RemUIOp)
+                else quotient + int(isinstance(operation, arith.CeilDivUIOp) and remainder != 0)
+            )
+            if value > _MAX_I64:
+                value -= 1 << 64
+        elif isinstance(operation, arith.CmpiOp) and operation.predicate.value.data == 2:
+            value = -int(values[operation.lhs] < values[operation.rhs])
         else:
             raise TypeError(f"unexpected scalar instruction {operation.name}")
         assert -(1 << 63) <= value <= _MAX_I64, "new signed intermediate overflowed"
@@ -244,6 +285,234 @@ def test_integer_chains_do_not_reassociate_into_overflowing_constant_intermediat
     constant = block.last_op.arguments[1].owner
     assert isinstance(constant, arith.ConstantOp)
     assert constant.value.value.data == _MAX_I64 - 1
+
+
+def test_integer_cse_reuses_dominators_but_keeps_sibling_divisions_in_their_branches():
+    block = Block(arg_types=[IndexType(), IndexType(), i1])
+    numerator, denominator, condition = block.args
+    one = _constant(block, 1)
+    common = arith.AddiOp(numerator, one)
+    block.add_op(common)
+    regions, divisions = [], []
+    for _ in range(2):
+        duplicate_sum = arith.AddiOp(numerator, one)
+        first = arith.DivUIOp(duplicate_sum, denominator)
+        second = arith.DivUIOp(duplicate_sum, denominator)
+        branch = Block([duplicate_sum, first, second, scf.YieldOp(first, second)])
+        regions.append(Region(branch))
+        divisions.append((first, second))
+    choice = scf.IfOp(condition, [IndexType(), IndexType()], *regions)
+    block.add_op(choice)
+    module = _function(block, common, *choice.results)
+    control = _control_identity(module)
+
+    simplify_scalars(module)
+    module.verify()
+
+    assert _control_identity(module) == control
+    for region, (first, second) in zip(regions, divisions, strict=True):
+        assert first.parent is region.block and first.lhs is common.result
+        assert second.parent is None
+        assert tuple(region.block.last_op.arguments) == (first.result, first.result)
+    assert divisions[0][0].result is not divisions[1][0].result
+    once = dump(module)
+    simplify_scalars(module)
+    assert dump(module) == once
+
+
+def test_runtime_contract_and_actual_loop_bounds_simplify_ranges_without_changing_control():
+    from xdsl.dialects.builtin import IntAttr
+
+    block = Block()
+    size = RuntimeSizeOp.build(
+        result_types=[IndexType()],
+        attributes={"sym_name": StringAttr("n"), "minimum": IntAttr(2), "multiple": IntAttr(8)},
+    )
+    block.add_op(size)
+    zero, one, eight, sixteen = (_constant(block, value) for value in (0, 1, 8, 16))
+    nonnegative = arith.MaxSIOp(size.value, zero)
+    division = arith.DivUIOp(nonnegative, one)
+    minimum = arith.CmpiOp(size.value, eight, "sge")
+    runtime_uses = UnrealizedConversionCastOp.get(
+        [division.result, minimum.result], [IndexType(), i1]
+    )
+    block.add_ops([nonnegative, division, minimum, runtime_uses])
+    body = Block(arg_types=[IndexType()])
+    iv = body.args[0]
+    maximum = arith.MaxSIOp(iv, zero)
+    remainder = arith.RemUIOp(iv, sixteen)
+    quotient = arith.DivUIOp(iv, sixteen)
+    lower = arith.CmpiOp(iv, zero, "sge")
+    upper = arith.CmpiOp(iv, sixteen, "slt")
+    loop_uses = UnrealizedConversionCastOp.get(
+        [maximum.result, remainder.result, quotient.result, lower.result, upper.result],
+        [IndexType(), IndexType(), IndexType(), i1, i1],
+    )
+    body.add_ops([maximum, remainder, quotient, lower, upper, loop_uses, scf.YieldOp()])
+    block.add_op(scf.ForOp(zero, sixteen, one, [], body))
+    module = _function(block, size.value)
+    control = _control_identity(module)
+
+    simplify_scalars(module)
+    module.verify()
+
+    assert _control_identity(module) == control
+    assert runtime_uses.inputs[0] is size.value
+    assert runtime_uses.inputs[1].owner.value.value.data != 0
+    assert tuple(loop_uses.inputs[:3]) == (iv, iv, zero.result)
+    assert all(value.owner.value.value.data != 0 for value in loop_uses.inputs[3:])
+    once = dump(module)
+    simplify_scalars(module)
+    assert dump(module) == once
+
+
+def test_potentially_wrapping_range_does_not_establish_nonnegative_results():
+    block = Block()
+    zero, one, four, maximum = (_constant(block, value, i64) for value in (0, 1, 4, _MAX_I64))
+    body = Block(arg_types=[i64])
+    wrapped = arith.AddiOp(body.args[0], maximum)
+    clamp = arith.MaxSIOp(wrapped, zero)
+    comparison = arith.CmpiOp(wrapped, zero, "sge")
+    uses = UnrealizedConversionCastOp.get([clamp.result, comparison.result], [i64, i1])
+    body.add_ops([wrapped, clamp, comparison, uses, scf.YieldOp()])
+    block.add_op(scf.ForOp(zero, four, one, [], body))
+    module = _function(block)
+
+    simplify_scalars(module)
+    module.verify()
+
+    assert wrapped.parent is clamp.parent is comparison.parent is body
+    assert tuple(uses.inputs) == (clamp.result, comparison.result)
+
+
+def test_unsigned_guard_cannot_be_used_as_a_signed_nonnegative_premise():
+    block = Block(arg_types=[i64, i64])
+    zero = _constant(block, 0, i64)
+    condition = arith.CmpiOp(*block.args, "ult")
+    block.add_op(condition)
+    clamp = arith.MaxSIOp(block.args[0], zero)
+    guarded = Block([clamp, scf.YieldOp(clamp)])
+    choice = scf.IfOp(condition, [i64], Region(guarded), Region(Block([scf.YieldOp(zero)])))
+    block.add_op(choice)
+    module = _function(block, choice)
+
+    simplify_scalars(module)
+    module.verify()
+
+    assert clamp.parent is block
+    assert guarded.last_op.arguments[0] is clamp.result
+
+
+def test_shared_condition_is_folded_at_each_dominated_control_use():
+    block = Block(arg_types=[IndexType()])
+    zero, one = (_constant(block, number) for number in (0, 1))
+    comparison = arith.CmpiOp(block.args[0], zero, "sgt")
+    block.add_op(comparison)
+    branches, inner = [], []
+    for _ in range(2):
+        choice = scf.IfOp(
+            comparison,
+            [IndexType()],
+            Region(Block([scf.YieldOp(one)])),
+            Region(Block([scf.YieldOp(zero)])),
+        )
+        branches.append(Region(Block([choice, scf.YieldOp(choice)])))
+        inner.append(choice)
+    outer = scf.IfOp(comparison, [IndexType()], *branches)
+    block.add_op(outer)
+    module = _function(block, outer)
+    control = _control_identity(module)
+
+    simplify_scalars(module)
+    module.verify()
+
+    assert _control_identity(module) == control
+    assert outer.cond is comparison.result
+    assert isinstance(inner[0].cond.owner, arith.ConstantOp)
+    assert inner[0].cond.owner.value.value.data != 0
+    assert inner[1].cond.owner.value.value.data == 0
+
+
+def test_unsigned_unit_identities_and_remainder_bounds_hold_for_unknown_sign_bits():
+    block = Block(arg_types=[i64])
+    value = block.args[0]
+    one, eight = (_constant(block, number, i64) for number in (1, 8))
+    division = arith.DivUIOp(value, one)
+    ceiling = arith.CeilDivUIOp(value, one)
+    unit_remainder = arith.RemUIOp(value, one)
+    remainder = arith.RemUIOp(value, eight)
+    bounded = arith.CmpiOp(remainder, eight, "slt")
+    block.add_ops([division, ceiling, unit_remainder, remainder, bounded])
+    module = _function(block, division, ceiling, unit_remainder, remainder, bounded)
+    inputs = (-(1 << 63), -1, 0, 7, _MAX_I64)
+    expected = tuple(_execute_i64(block, number) for number in inputs)
+    assert expected == tuple((number, number, 0, number % 8, -1) for number in inputs)
+
+    simplify_scalars(module)
+    module.verify()
+
+    returned = block.last_op.arguments
+    assert tuple(returned[:2]) == (value, value)
+    assert returned[2].owner.value.value.data == 0
+    assert returned[3] is remainder.result
+    assert returned[4].owner.value.value.data != 0
+    assert tuple(_execute_i64(block, number) for number in inputs) == expected
+
+
+def test_public_admission_rejects_original_unsigned_expression_before_unit_folding(monkeypatch):
+    from ascendflow.passes import structured_sync
+
+    def forbidden(module):
+        pytest.fail("an invalid original expression reached final scalar simplification")
+
+    monkeypatch.setattr(structured_sync, "simplify_scalars", forbidden)
+    source = N.from_source("""
+        def invalid():
+            with N.Kernel():
+                x=N.alloc_ub((2,64))
+                for i in N.Pipelined(2,stages=1):
+                    N.fill(x[(i-1)//1,:],1.0)
+    """)
+    with pytest.raises(CompileError, match="nonnegative dividend"):
+        compile(source)
+
+
+@pytest.mark.parametrize("checked", [False, True])
+def test_nested_invariants_use_the_outer_iteration_and_checked_host_extrema(checked):
+    from xdsl.dialects.builtin import IntAttr
+
+    from ascendflow.scalar import Expr, expression, literal
+
+    block = Block()
+    size = RuntimeSizeOp.build(
+        result_types=[IndexType()],
+        attributes={"sym_name": StringAttr("n"), "minimum": IntAttr(0), "multiple": IntAttr(1)},
+    )
+    block.add_op(size)
+    zero, one, two, four, scale = (_constant(block, number) for number in (0, 1, 2, 4, 256))
+    outer = Block(arg_types=[IndexType()])
+    inner = Block(arg_types=[IndexType()])
+    coordinate = arith.MuliOp(outer.args[0], two)
+    extent = arith.MuliOp(size.value, scale)
+    uses = UnrealizedConversionCastOp.get([coordinate.result, extent.result], [IndexType()] * 2)
+    inner.add_ops([coordinate, extent, uses, scf.YieldOp()])
+    child = scf.ForOp(zero, size.value, one, [], inner)
+    outer.add_ops([child, scf.YieldOp()])
+    block.add_op(scf.ForOp(zero, four, one, [], outer))
+    module = _function(block)
+    control = _control_identity(module)
+    extrema = (expression("mul", Expr("argument", ("n",)), literal(512)),) if checked else ()
+
+    simplify_scalars(module, index_extrema=extrema)
+    module.verify()
+
+    assert _control_identity(module) == control
+    assert coordinate.parent is outer and coordinate.next_op is child
+    assert extent.parent is (block if checked else inner)
+    assert tuple(uses.inputs) == (coordinate.result, extent.result)
+    once = dump(module)
+    simplify_scalars(module, index_extrema=extrema)
+    assert dump(module) == once
 
 
 def test_floating_fastmath_and_vector_arithmetic_remain_outside_scalar_rewrites():
@@ -278,11 +547,21 @@ def test_public_compile_simplifies_final_ssa_once_after_notification_materializa
                     N.fill(x, 1.0)
     """)
     calls = []
+    condition_calls = []
+    original_conditions = structured_sync.simplify_conditions
 
-    def observed(module):
+    def observed_conditions(module, *, facts=None):
+        assert dump(module) == calls[0]
+        result = original_conditions(module, facts=facts)
+        condition_calls.append(dump(module))
+        return result
+
+    def observed(module, *, facts=None, finalize=True):
         control = _control_identity(module)
-        loop = next(op for op in module.walk() if isinstance(op, PipelineLoopOp))
-        original_upper = loop.upper
+        loop = next(op for op in module.walk() if isinstance(op, scf.ForOp))
+        original_upper = loop.ub
+        if isinstance(original_upper.owner, arith.MaxSIOp):
+            original_upper = original_upper.owner.lhs
         assert isinstance(original_upper.owner, RuntimeSizeOp)
         # Inject equivalent arithmetic only after synchronization has established
         # its facts, so this exercises the final owned-module pass connection.
@@ -294,16 +573,51 @@ def test_public_compile_simplifies_final_ssa_once_after_notification_materializa
         loop.operands[1] = multiplication.result
         notifications = tuple(op for op in module.walk() if isinstance(op, NotificationOp))
         assert notifications
-        simplify_scalars(module)
+        simplify_scalars(module, facts=facts, finalize=finalize)
         assert _control_identity(module) == control
-        assert loop.upper is original_upper
+        assert loop.ub is original_upper
         assert addition.parent is multiplication.parent is None
         assert tuple(op for op in module.walk() if isinstance(op, NotificationOp)) == notifications
         calls.append(dump(module))
 
     monkeypatch.setattr(structured_sync, "simplify_scalars", observed)
+    monkeypatch.setattr(structured_sync, "simplify_conditions", observed_conditions)
     result = compile(source)
     assert len(calls) == 1
-    assert result.plan_ir == calls[0]
+    assert len(condition_calls) == 1 and result.plan_ir == condition_calls[0]
     assert "arith.addi" not in result.plan_ir
     assert "arith.muli" not in result.plan_ir
+
+
+def test_scoped_range_query_visits_a_shared_dag_once_and_observes_later_guards(monkeypatch):
+    from ascendflow.passes import simplify_scalars as integers
+
+    block = Block(arg_types=[IndexType(), IndexType()])
+    value, unrelated = block.args
+    zero, two = (_constant(block, number) for number in (0, 2))
+    result = value
+    depth = 20
+    for _ in range(depth):
+        operation = arith.AddiOp(result, result)
+        block.add_op(operation)
+        result = operation.result
+    _function(block, result).verify()
+    parent = integers._Scope(ranges={value: (0, 3), unrelated: (0, 3)})
+    child = parent.child()
+    child.relation(unrelated, 5, zero.result)
+    visits = 0
+    original = integers._bounded_interval
+
+    def observed(*args, **kwargs):
+        nonlocal visits
+        visits += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(integers, "_bounded_interval", observed)
+    assert child.interval(result) == (0, 3 << depth)
+    child.relation(value, 5, two.result)
+    assert child.interval(result) == (2 << depth, 3 << depth)
+    sibling = parent.child()
+    sibling.relation(unrelated, 5, zero.result)
+    assert sibling.interval(result) == (0, 3 << depth)
+    assert visits <= 4 * depth

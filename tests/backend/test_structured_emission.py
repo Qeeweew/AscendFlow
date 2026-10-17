@@ -29,6 +29,7 @@ from ascendflow.dialects.io import dump
 from ascendflow.dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.materialize_structure import materialize_notifications
+from ascendflow.passes.simplify_scalars import simplify_scalars
 from ascendflow.passes.structured_sync import synchronize_structure
 from ascendflow.scalar import expression, literal
 from ascendflow.target.ascend910b import Actor, Engine
@@ -120,14 +121,35 @@ def test_nested_print_work_depends_on_templates_instead_of_iteration_counts():
         work = EmissionWork()
         asc = emit_structure_debug(facts, work=work)
         assert work.native_templates == work.native_prints == 7
-        assert asc.count("for (int64_t npu_ordinal_") == len(structure.loops) == 3
+        assert len(structure.loops) == 3
+        assert asc.count("for (int64_t npu_step_") == sum(
+            "npu.pipeline_clock" in op.attributes for op in facts.module.walk()
+        )
         assert all(prints == 1 for prints in work.task_prints.values())
         outputs.append(work.output_bytes)
     assert abs(outputs[1] - outputs[0]) < 100
 
 
-@pytest.mark.parametrize("count,mode,prints", [(0, None, 0), (1, "short", 1), (8, "long", 1)])
-def test_static_zero_short_and_long_pipeline_counts(count, mode, prints):
+@pytest.mark.parametrize("depth", [1, 2, 4])
+def test_nested_pipelines_have_one_clock_loop_and_no_phase_controllers(depth):
+    source = ["def nested(n:N.int64):", "    with N.Kernel():", "        x=N.alloc_ub((64,))"]
+    for level in range(depth):
+        indent = " " * (8 + 8 * level)
+        source += [
+            indent + f"for i{level} in N.Pipelined(n,stages=3):",
+            indent + "    with N.Stage(2,name='work'):",
+        ]
+    source.append(" " * (8 + 8 * depth) + "N.fill(x,1.0)")
+    _, facts = memory(N.from_source("\n".join(source)))
+    work = EmissionWork()
+    asc = emit_structure_debug(facts, work=work)
+    assert work.native_templates == work.native_prints == 1
+    assert asc.count("for (int64_t npu_step_") == depth
+    assert not re.search(r"NpuPipelinePhase|prologue|steady|epilogue|short|auto npu_stage_", asc)
+
+
+@pytest.mark.parametrize("count,prints", [(0, 0), (1, 1), (8, 1)])
+def test_static_empty_and_nonempty_pipelines_use_one_dispatch_rule(count, prints):
     _, facts = memory(
         N.from_source(f"""
         def fixed():
@@ -141,11 +163,11 @@ def test_static_zero_short_and_long_pipeline_counts(count, mode, prints):
     work = EmissionWork()
     asc = emit_structure_debug(facts, work=work)
     assert work.native_templates == 1 and work.native_prints == prints
-    if mode is None:
+    if count == 0:
         assert "for (int64_t" not in asc
     else:
-        assert f"// {mode} pipeline phases" in asc
-        assert asc.count("for (int64_t") == 1
+        assert asc.count("for (int64_t npu_step_") == 1
+    assert not re.search(r"NpuPipelinePhase|prologue|steady|epilogue|short|auto npu_stage_", asc)
     assert "asc_sync_" not in asc
 
 
@@ -169,20 +191,18 @@ def test_shared_aiv_abi_family_order_and_singleton_actions():
     assert asc.count("asc_mul_scalar(") == 1
     assert "const int64_t npu_group = asc_get_block_idx();" in asc
     assert "const int64_t npu_sid = asc_get_sub_block_id();" in asc
-    assert "npu_sid == 1" in asc and "npu_sid == 0" not in asc
-    assert "if (npu_sid == 1) { asc_sync_wait(PIPE_MTE2, PIPE_V, event_t(3)); }" in asc
-    assert asc.count("npu_sid") > 2 and "npu_group *" in asc
+    assert asc.count("npu_sid == 1") == 1 and "npu_sid == 0" not in asc
+    assert "asc_sync_wait(PIPE_MTE2, PIPE_V, event_t(3));" in asc
+    assert asc.count("npu_sid") > 2
+    assert "auto npu_stage_" not in asc and "operator()" not in asc
     _, cube = memory(batched_matmul)
     cube_asc = emit_structure_debug(cube)
-    assert [label for label in re.findall(r"// stage (\w+)", cube_asc)] == [
-        "export",
-        "load",
-        "operands",
-        "compute",
-    ]
+    assert cube_asc.index("asc_copy_l0c2gm(") < cube_asc.index("asc_copy_gm2l1_nd2nz(")
 
 
-def test_actions_surround_complete_packet_and_loop_invocation_with_ordered_guards():
+def test_actions_surround_complete_packet_and_loop_invocation_with_ordered_guards(tmp_path):
+    from tests.models.structured_events import _Interpret
+
     _, facts = memory(scale)
     loop = next(op for op in facts.control.loops if isinstance(op, PipelineLoopOp))
     logical = facts.control.loops[loop]
@@ -236,13 +256,51 @@ def test_actions_surround_complete_packet_and_loop_invocation_with_ordered_guard
         ),
     )
     exit_action = asc.index("asc_sync_block_arrive(")
-    assert entry < for_start < fence < native < after < exit_action
+    assert fence < native < after
+    assert entry < for_start < exit_action
     assert asc[entry:for_start].count("event_t(") == 1
     notifications = [op for op in facts.module.walk() if isinstance(op, NotificationOp)]
     for notification in (notifications[0], notifications[-1]):
         assert isinstance(notification.parent_op(), scf.IfOp)
-        assert notification.parent_op().parent is loop.parent
+        assert notification.parent_op().parent is facts.module.body.block.first_op.body.block
     assert asc.count("asc_sync_pipe(") == 1
+    shim = TRACE_SHIM.replace(
+        "void asc_sync_notify(int,int,int){} void asc_sync_wait(int,int,int){}",
+        'void asc_sync_notify(int,int,int id){std::cout<<"set "<<id<<"\\n";} '
+        'void asc_sync_wait(int,int,int id){std::cout<<"wait "<<id<<"\\n";}',
+    ).replace(
+        "void asc_sync_pipe(int){}",
+        'void asc_sync_pipe(int){std::cout<<"fence\\n";} '
+        'void asc_sync_block_arrive(int,int id){std::cout<<"arrive "<<id<<"\\n";}',
+    )
+    code = "\n".join(
+        line for line in asc.splitlines() if not line.startswith(("#include", "#error"))
+    )
+    binary = compile_cpp(
+        tmp_path,
+        shim
+        + code
+        + "int main(int argc,char**argv){scale((uint8_t*)1000000,(uint8_t*)2000000,std::atoll(argv[1]));}",
+        sanitize=True,
+    )
+    kinds = {"local_set": "set", "local_wait": "wait", "cross_set": "arrive", "fence": "fence"}
+    for count in (0, 1, 2, 3, 7):
+        interpreter = _Interpret(facts, {"tiles": count}, physical=True, maximum=1000)
+        interpreter.block(facts.module.body.block.first_op.body.block, {}, 0, 0, Actor.AIV0)
+        expected = [
+            (command.occurrence.operation.native.data, None)
+            if command.kind == "native"
+            else (kinds[command.kind], command.event)
+            for command in interpreter.commands
+        ]
+        result = subprocess.run(
+            [str(binary), str(count)], check=True, capture_output=True, text=True, timeout=5
+        )
+        actual = [
+            (parts[0], int(parts[1]) if parts[0] in {"set", "wait", "arrive"} else None)
+            for parts in (line.split() for line in result.stdout.splitlines())
+        ]
+        assert actual == expected
 
 
 def test_foreign_plan_module_and_unbound_address_symbols_are_rejected():
@@ -365,7 +423,7 @@ def test_controller_bounds_come_from_actual_ssa_instead_of_retained_logical_expr
     original_count = facts.control.loops[loop].count
     two = arith.ConstantOp.from_int_and_width(2, IndexType())
     loop.parent.insert_op_before(two, loop)
-    loop.operands = (loop.lower, two.result, loop.step)
+    loop.operands = (two.result,)
     assert facts.control.loops[loop].count is original_count
 
     def forbidden(*args, **kwargs):
@@ -373,8 +431,9 @@ def test_controller_bounds_come_from_actual_ssa_instead_of_retained_logical_expr
 
     monkeypatch.setattr(facts.control.environment, "expression", forbidden)
     asc = emit_structure_debug(facts)
-    assert re.search(r"npu_count_\d+ = \(2 > 0", asc)
-    assert "// long pipeline phases" in asc
+    assert re.search(r"npu_step_\d+ < 4;", asc)
+    assert asc.count("for (int64_t npu_step_") == 1
+    assert "prologue" not in asc and "epilogue" not in asc
 
 
 TRACE_SHIM = r"""
@@ -382,6 +441,7 @@ TRACE_SHIM = r"""
 #include <iostream>
 #include <cstdlib>
 #define __global__
+#define __aicore__
 #define __vector__
 #define __cube__
 #define __mix__(a,b)
@@ -427,7 +487,7 @@ def compile_cpp(tmp_path, source, *, sanitize=False):
     binary = tmp_path / "trace"
     flags = ["-fsanitize=undefined", "-fno-sanitize-recover=undefined"] if sanitize else []
     subprocess.run(
-        [compiler, "-std=c++17", "-O0", *flags, str(path), "-o", str(binary)],
+        [compiler, "-std=c++20", "-O0", *flags, str(path), "-o", str(binary)],
         check=True,
         capture_output=True,
         text=True,
@@ -436,10 +496,55 @@ def compile_cpp(tmp_path, source, *, sanitize=False):
     return binary
 
 
+@pytest.mark.parametrize("simplified", [False, True])
+def test_single_aiv_guard_precedes_an_id_undefined_on_the_other_lane(tmp_path, simplified):
+    _, facts = memory(N.from_source(SHARED, disjoint_external=True))
+    vector = next(template for template in facts.templates if template.contract.native == "muls")
+    materialize_notifications(
+        facts,
+        (
+            SyncAction(
+                vector.operation,
+                Placement.BEFORE,
+                (Actor.AIV1,),
+                SyncKind.LOCAL_WAIT,
+                Engine.MTE2,
+                Engine.V,
+                expression("floordiv", literal(3), facts.control.sid),
+            ),
+        ),
+    )
+    if simplified:
+        simplify_scalars(facts.module)
+    asc = emit_structure_debug(facts)
+    assert asc.count("npu_sid == 1") == 1
+    asc = "\n".join(
+        line for line in asc.splitlines() if not line.startswith(("#include", "#error"))
+    )
+    shim = TRACE_SHIM.replace(
+        "void asc_sync_notify(int,int,int){} void asc_sync_wait(int,int,int){}",
+        'void asc_sync_notify(int,int,int){} void asc_sync_wait(int,int,int id){std::cout<<"wait "<<trace_actor<<" "<<id<<"\\n";}',
+    )
+    binary = compile_cpp(
+        tmp_path,
+        shim
+        + asc
+        + "int main(){for(trace_actor=1;trace_actor<=2;++trace_actor)"
+        + "shared((uint8_t*)1000000,(uint8_t*)2000000,(uint8_t*)3000000,"
+        + "(uint8_t*)4000000,1);}",
+        sanitize=True,
+    )
+    result = subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=5)
+    assert [line for line in result.stdout.splitlines() if line.startswith("wait ")] == ["wait 2 3"]
+
+
 @pytest.mark.parametrize(
     "case", ["scale", "nested", "carry", "shared", "gemm", "cv_cube", "cv_vector"]
 )
-def test_actual_generated_control_and_gm_addresses_match_independent_ir_dispatch(case, tmp_path):
+@pytest.mark.parametrize("simplified", [False, True])
+def test_actual_generated_control_and_gm_addresses_match_independent_ir_dispatch(
+    case, simplified, tmp_path
+):
     sources = {
         "scale": scale,
         "nested": N.from_source(NESTED),
@@ -463,7 +568,14 @@ def test_actual_generated_control_and_gm_addresses_match_independent_ir_dispatch
     actor = "cube" if case in {"gemm", "cv_cube"} else "vector"
     cases = [
         (n, k, group % groups, sid)
-        for n, k, group, sid in [(0, 0, 0, 0), (1, 0, 0, 0), (2, 1, 1, 1), (5, 3, 2, 0)]
+        for n, k, group, sid in [
+            (0, 0, 0, 0),
+            (1, 0, 0, 0),
+            (2, 1, 1, 1),
+            (3, 2, 1, 0),
+            (5, 3, 2, 0),
+            (8, 5, 1, 1),
+        ]
     ]
     expected_dispatch = []
     for n, k, group, sid in cases:
@@ -491,6 +603,9 @@ def test_actual_generated_control_and_gm_addresses_match_independent_ir_dispatch
     facts.module.verify()
     retained = set(original_operations)
     assert tuple(op for op in facts.module.walk() if op in retained) == original_operations
+    if simplified:
+        simplify_scalars(facts.module)
+        facts.module.verify()
     asc = emit_structure_debug(facts)
     assert asc.count("asc_sync_pipe(") == 2 * len(facts.templates)
     # This test-only shim deliberately removes the debug artifact's hard error.
@@ -578,35 +693,105 @@ int main(int argc,char** argv){
         ]
 
 
-def test_checked_launcher_rejects_overflow_alias_and_bad_pointer_before_dispatch(tmp_path):
-    plan = synchronize_structure(scale)
-    asc = _emit_owned(plan)
+@pytest.mark.parametrize("case", ["scale", "nested"])
+def test_compact_native_and_sync_traces_match_the_actual_ir(case, tmp_path):
+    from tests.models.structured_events import _Interpret
+
+    plan = synchronize_structure(scale if case == "scale" else N.from_source(NESTED))
+    assert plan.condition_work.input_notifications > plan.condition_work.output_notifications
+    asc = _emit_owned(plan, host_launcher=False)
+    assert not re.search(r"NpuPipelinePhase|prologue|steady|epilogue|short|auto npu_stage_", asc)
+    code = "\n".join(line for line in asc.splitlines() if not line.startswith("#include"))
+    route = 'const char* engines[]={"S","MTE2","MTE1","M","FIX","V","MTE3"};'
+    shim = TRACE_SHIM.replace(
+        "void asc_sync_notify(int,int,int){} void asc_sync_wait(int,int,int){}",
+        route
+        + 'void asc_sync_notify(int a,int b,int id){std::cout<<"local_set "<<engines[a]<<" "<<engines[b]<<" "<<id<<"\\n";} '
+        + 'void asc_sync_wait(int a,int b,int id){std::cout<<"local_wait "<<engines[a]<<" "<<engines[b]<<" "<<id<<"\\n";}',
+    ).replace(
+        "void asc_sync_pipe(int){}",
+        'void asc_sync_pipe(int a){std::cout<<"fence "<<engines[a]<<" "<<engines[a]<<" -1\\n";}',
+    )
+    call = (
+        "scale((uint8_t*)1000000,(uint8_t*)2000000,n);"
+        if case == "scale"
+        else "nested((uint8_t*)1000000,n,k);"
+    )
+    binary = compile_cpp(
+        tmp_path,
+        shim
+        + code
+        + "int main(int argc,char**argv){int64_t n=std::atoll(argv[1]),k=std::atoll(argv[2]);"
+        + call
+        + "}",
+        sanitize=True,
+    )
+    for n, k in [(0, 0), (1, 1), (2, 1), (3, 2), (4, 3), (8, 5)]:
+        parameters = {"tiles": n} if case == "scale" else {"n": n, "k": k}
+        interpreter = _Interpret(plan.memory, parameters, physical=True, maximum=10000)
+        interpreter.block(plan.module.body.block.first_op.body.block, {}, 0, 0, Actor.AIV0)
+        expected = [
+            (
+                command.occurrence.operation.native.data,
+                command.occurrence.operation.scalar.value.data,
+            )
+            if command.kind == "native"
+            else (
+                command.kind,
+                command.source.value,
+                command.destination.value,
+                -1 if command.event is None else command.event,
+            )
+            for command in interpreter.commands
+        ]
+        result = subprocess.run(
+            [str(binary), str(n), str(k)], check=True, capture_output=True, text=True, timeout=5
+        )
+        actual = [
+            (parts[0], parts[1], parts[2], int(parts[3]))
+            if parts[0] in {"local_set", "local_wait", "fence"}
+            else (parts[0], float(parts[1]))
+            for parts in (line.split() for line in result.stdout.splitlines())
+        ]
+        assert actual == expected, (case, n, k)
+
+
+def test_launcher_forwards_stream_pointers_and_scalars_without_runtime_checks(tmp_path):
+    asc = _emit_owned(synchronize_structure(scale))
     launcher = asc[asc.index('extern "C" int launch_') :]
-    launcher = re.sub(r"  scale<<<[^\n]+", "  ++launches;", launcher)
-    source = "#include <cstdint>\n#include <climits>\n#include <cassert>\nint launches=0;\n"
-    source += (
-        launcher
+    assert not re.search(r"\b(if|for|while)\b|npu_host_|npu_bytes|npu_ptrs|overflow", launcher)
+    launcher = re.sub(
+        r"  scale<<<[^\n]+",
+        "  seen_stream = stream; seen_x = arg_X; seen_y = arg_Y; seen_tiles = npu_size_tiles; ++launches;",
+        launcher,
+    )
+    source = (
+        """#include <cstdint>
+#include <cassert>
+void *seen_stream, *seen_x, *seen_y;
+int64_t seen_tiles;
+int launches=0;
+"""
+        + launcher
         + r"""
-int main(){
- void* x=(void*)uintptr_t(4096); void* y=(void*)uintptr_t(8192);
- assert(launch_scale(nullptr,nullptr,nullptr,0)==0);
- assert(launch_scale(nullptr,x,y,1)==0 && launches==2);
- assert(launch_scale(nullptr,x,y,-1)==-1);
- assert(launch_scale(nullptr,x,y,INT64_MAX)==-1);
- assert(launch_scale(nullptr,x,y,INT64_MAX/256+1)==-1);
- assert(launch_scale(nullptr,x,x,1)==-1);
- assert(launch_scale(nullptr,(void*)uintptr_t(4097),y,1)==-1);
- assert(launch_scale(nullptr,nullptr,y,1)==-1);
- assert(launch_scale(nullptr,(void*)(UINTPTR_MAX-31),y,1)==-1);
- assert(launches==2);
+int main() {
+  void* stream=(void*)uintptr_t(4096);
+  void* x=(void*)uintptr_t(8192);
+  void* y=(void*)uintptr_t(16384);
+  for (int64_t n : {int64_t(0), int64_t(1), int64_t(31)}) {
+    assert(launch_scale(stream,x,y,n)==0);
+    assert(seen_stream==stream && seen_x==x && seen_y==y && seen_tiles==n);
+  }
+  assert(launches==3);
 }
 """
     )
-    binary = compile_cpp(tmp_path, source, sanitize=True)
+    binary = compile_cpp(tmp_path, "#include <initializer_list>\n" + source, sanitize=True)
     subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=5)
 
 
-def test_guarded_event_and_first_last_arithmetic_stay_inside_short_circuit(tmp_path):
+@pytest.mark.parametrize("simplified", [False, True])
+def test_guarded_event_and_first_last_arithmetic_stay_inside_short_circuit(tmp_path, simplified):
     from ascendflow.backend.structured import _Context, _Emitter
 
     _, facts = memory(
@@ -638,6 +823,8 @@ def test_guarded_event_and_first_last_arithmetic_stay_inside_short_circuit(tmp_p
     )
     materialize_notifications(facts, (action,))
     facts.module.verify()
+    if simplified:
+        simplify_scalars(facts.module)
     emitter = _Emitter(facts, EmissionWork())
     code = "\n".join(emitter.block(root.body.block, _Context({}, "vector")))
     assert "emit_actions" not in dir(emitter)
@@ -645,7 +832,13 @@ def test_guarded_event_and_first_last_arithmetic_stay_inside_short_circuit(tmp_p
         op for op in root.walk() if isinstance(op, arith.RemUIOp) and op.rhs is parameter.value
     )
     assert isinstance(division.parent_op(), scf.IfOp)
-    assert isinstance(division.parent_op().parent_op(), scf.IfOp)
+    if simplified:
+        condition = division.parent_op().cond.owner
+        assert isinstance(condition, arith.CmpiOp) and condition.predicate.value.data == 4
+        assert condition.lhs is parameter.value
+        assert condition.rhs.owner.value.value.data == 0
+    else:
+        assert isinstance(division.parent_op().parent_op(), scf.IfOp)
     source = (
         """
 #include <cstdint>
@@ -832,7 +1025,7 @@ def test_async_native_and_notification_operations_survive_generic_scalar_passes(
 def test_real_reduction_first_chunk_clear_uses_actual_stage_ordinal_ssa(tmp_path):
     _, facts = memory(reduction_gemm.specialize(M=16, N=16, BK=16, GROUPS=1))
     asc = emit_structure_debug(facts)
-    assert re.search(r"asc_mmad\([^\n]*\(npu_generation_\d+ == 0\)", asc)
+    assert re.search(r"asc_mmad\([^\n]*== 0\)", asc)
     assert not re.search(r"\bg\b", asc)
     asc = "\n".join(
         line for line in asc.splitlines() if not line.startswith(("#include", "#error"))

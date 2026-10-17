@@ -63,7 +63,7 @@ class _EventBanks:
         self.domains.work.allocated_cross_ids = len(self.cross_occupied)
         return StructuredEventPlan(
             selection=self.domains.selection,
-            actions=self._combine_actions(),
+            actions=_combine_actions(self.actions),
             assignments=tuple(self.assignments),
             leases=tuple(lifetimes.values()),
             reservations=tuple(self.reservations),
@@ -191,7 +191,7 @@ class _EventBanks:
                         notification.source_engine,
                         notification.destination_engine,
                         guard=bound.guard,
-                        protocol=notification.name,
+                        protocols=(notification.name,),
                     )
                 )
             return
@@ -225,7 +225,7 @@ class _EventBanks:
                             notification.destination_engine,
                             bound.expression(event),
                             ActionGuard(case.condition.comparisons + bound.guard.comparisons),
-                            notification.name,
+                            (notification.name,),
                         )
                     )
 
@@ -244,35 +244,47 @@ class _EventBanks:
                         source,
                         destination,
                         literal(reservation.event),
-                        protocol=f"final_{actor.value}_{source.value}",
+                        protocols=(f"final_{actor.value}_{source.value}",),
                     )
                 )
 
-    def _combine_actions(self):
-        combined, indices = [], {}
-        for action in self.actions:
-            # AIV bodies are represented once. Combining equal instructions
-            # retains both physical participants without cloning their body.
-            family = "cube" if action.participants == (Actor.AIC,) else "vector"
-            key = (
-                action.anchor,
-                action.placement,
-                action.kind,
-                action.source,
-                action.destination,
-                action.event,
-                action.guard,
-                action.protocol,
-                family,
-            )
-            index = indices.get(key)
-            if index is None:
-                indices[key] = len(combined)
-                combined.append(action)
-            else:
-                prior = combined[index]
-                combined[index] = replace(
-                    prior,
-                    participants=tuple(dict.fromkeys(prior.participants + action.participants)),
+
+def _combine_actions(actions):
+    """Share equal AIV instruction sequences without changing either actor's trace.
+
+    Placement determines the actual native/controller insertion point. Within
+    one point, every actor retains its ordered sequence, including duplicate
+    instructions. Equal sequences can be printed once for both participants;
+    asymmetric sequences keep their existing participant guards. Protocol names
+    retain provenance but cannot distinguish otherwise identical instructions.
+    This changes no allocated IDs, lifetimes or quorum contributions.
+    """
+    groups = {}
+    for action in actions:
+        family = "cube" if action.participants == (Actor.AIC,) else "vector"
+        groups.setdefault((action.anchor, action.placement, family), []).append(action)
+
+    def instruction(action):
+        return action.kind, action.source, action.destination, action.event, action.guard
+
+    combined = []
+    for (_, _, family), group in groups.items():
+        if family == "cube":
+            combined.extend(group)
+            continue
+        left = [action for action in group if Actor.AIV0 in action.participants]
+        right = [action for action in group if Actor.AIV1 in action.participants]
+        if len(left) != len(right) or any(
+            instruction(a) != instruction(b) for a, b in zip(left, right, strict=True)
+        ):
+            combined.extend(group)
+            continue
+        for a, b in zip(left, right, strict=True):
+            combined.append(
+                replace(
+                    a,
+                    participants=(Actor.AIV0, Actor.AIV1),
+                    protocols=tuple(dict.fromkeys(a.protocols + b.protocols)),
                 )
-        return tuple(combined)
+            )
+    return tuple(combined)

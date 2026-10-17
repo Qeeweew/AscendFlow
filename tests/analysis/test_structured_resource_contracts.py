@@ -255,7 +255,7 @@ def test_emitted_ring_ids_pair_each_actual_generation_across_clocks(source):
                             events = [
                                 event
                                 for action in plan.actions
-                                if action.protocol == notification.name
+                                if notification.name in action.protocols
                                 and action.kind is kind
                                 and action.anchor is point.operation
                                 and point.actor in action.participants

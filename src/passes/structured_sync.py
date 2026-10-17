@@ -22,9 +22,11 @@ from ..analysis.structured_memory import collect_native_memory
 from ..analysis.structured_protocols import SynchronizationSelection
 from ..diagnostics import require
 from ..dialects.io import dump
+from .lower_execution import lower_execution
 from .lower_native import NativeStructure, lower_native_structure
 from .materialize_structure import materialize_notifications
-from .simplify_scalars import simplify_scalars
+from .simplify_conditions import ConditionWork, simplify_conditions
+from .simplify_scalars import ScalarFacts, simplify_scalars
 
 if TYPE_CHECKING:
     from ..analysis.structured_resources import StructuredEventPlan
@@ -35,9 +37,10 @@ if TYPE_CHECKING:
 class StructuredSynchronization:
     """Final owned physical IR plus the facts established for its native body.
 
-    Controlled notification insertion preserves original native operations,
-    address operands and loop identities. The pre-sync snapshot is frozen
-    before insertion. No external verified flag can authorize this result.
+    Logical facts are established before terminal clock lowering. Native
+    identities survive projection; address/control SSA is explicitly remapped.
+    The independent pre-sync snapshot precedes notification insertion.
+    No external verified flag can authorize this result.
     """
 
     structure: NativeStructure
@@ -47,6 +50,8 @@ class StructuredSynchronization:
     resources: StructuredEventPlan
     before_ir: str
     generation: NotificationProgram
+    condition_work: ConditionWork
+    scalar_facts: ScalarFacts
     timings: tuple[tuple[str, float], ...]
 
     def __init__(self, *args, **kwargs):
@@ -79,15 +84,23 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
     frozen = perf_counter()
     module = materialize_notifications(admission.memory, resources.actions)
     require(module is structure.module, "notification insertion changed its owned physical module")
-    # Stock pure-integer rewrites preserve native/control/notification identity
-    # and their values. Retained execution facts therefore remain applicable.
+    # Terminal lowering preserves the admitted actor instruction trace and
+    # remaps control/address SSA. Subsequent passes use these actual domains;
+    # original logical facts remain analysis input, not final control handles.
     materialized = perf_counter()
-    simplify_scalars(module)
+    scalar_facts = ScalarFacts.from_control(admission.memory.control, admission.host_expressions)
+    lower_execution(admission.memory, scalar_facts)
+    lowered = perf_counter()
+    simplify_scalars(module, facts=scalar_facts, finalize=False)
     simplified = perf_counter()
+    conditions = simplify_conditions(module, facts=scalar_facts)
+    merged = perf_counter()
     timings += (
         ("before_snapshot", frozen - started),
         ("materialize", materialized - frozen),
-        ("scalar_simplification", simplified - materialized),
+        ("execution_lowering", lowered - materialized),
+        ("scalar_simplification", simplified - lowered),
+        ("condition_simplification", merged - simplified),
     )
     result = object.__new__(StructuredSynchronization)
     for name, value in (
@@ -98,6 +111,8 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
         ("resources", resources),
         ("before_ir", before_ir),
         ("generation", generation),
+        ("condition_work", conditions),
+        ("scalar_facts", scalar_facts),
         ("timings", timings),
     ):
         object.__setattr__(result, name, value)

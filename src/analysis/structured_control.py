@@ -203,13 +203,11 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
             )
             frame = ControlFrame(frame, operation, participants)
         elif isinstance(operation, (PipelineLoopOp, scf.ForOp)):
-            lower_value, upper_value = (
-                (operation.lower, operation.upper)
-                if isinstance(operation, PipelineLoopOp)
-                else (operation.lb, operation.ub)
-            )
-            lower, upper = scalar(lower_value), scalar(upper_value)
-            step = scalar(operation.step).constant
+            if isinstance(operation, PipelineLoopOp):
+                lower, upper, step = literal(0), scalar(operation.count), 1
+            else:
+                lower, upper = scalar(operation.lb), scalar(operation.ub)
+                step = scalar(operation.step).constant
             require(
                 step is not None and step > 0,
                 "structured loop needs a positive constant step",
@@ -250,8 +248,7 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                     unknown_scalar(value)
         elif isinstance(operation, PipelineStageOp):
             loop = loops[operation.parent_op()]
-            ordinal, induction = operation.body.block.args
-            bindings[ordinal], bindings[induction] = loop.ordinal, loop.induction
+            bindings[operation.body.block.args[0]] = loop.ordinal
             frame = ControlFrame(frame, operation, frame.participants)
         elif isinstance(operation, scf.IfOp):
             for value in operation.results:

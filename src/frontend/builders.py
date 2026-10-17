@@ -723,7 +723,7 @@ class Pipelined:
     def __init__(self, count, *, stages, order="source", issue_order=None):
         trace = _trace()
         require(
-            (type(count) is int and 0 <= count <= (1 << 31) - 1) or isinstance(count, _Dimension),
+            (type(count) is int and 0 <= count <= (1 << 63) - 1) or isinstance(count, _Dimension),
             "pipeline limit must be an integer or explicit runtime size",
         )
         if isinstance(count, _Dimension):

@@ -152,9 +152,8 @@ class _Interpret:
         spans = []
         for access in template.accesses:
             ref = operation.refs[access.operand_index]
-            _check(ref in self.memory.addresses, "actual operand has no admitted native geometry")
             root, offset, allocation = values[ref]
-            geometry = self.memory.addresses[ref].geometry
+            geometry = access.address.geometry
             address = ref.owner
             _check(
                 isinstance(address, AddressOp)
@@ -167,14 +166,9 @@ class _Interpret:
                 operation.native.data in {"mad_first", "mad_cycle"}
                 and access is template.accesses[-1]
             ):
-                ordinals = [g for loop, g in coordinates if isinstance(loop, PipelineLoopOp)]
-                _check(bool(ordinals), "MAD initialization has no actual pipeline coordinate")
+                ordinal = values[operation.refs[-1]]
                 period = 1 if operation.native.data == "mad_first" else template.contract.params[3]
-                if (
-                    ordinals[-1] == 0
-                    or operation.native.data == "mad_cycle"
-                    and ordinals[-1] % period == 0
-                ):
+                if ordinal == 0 or operation.native.data == "mad_cycle" and ordinal % period == 0:
                     mode = "W"
             private = root.ref.type.bank.data != "GM"
             for row in range(geometry.rows):
@@ -280,8 +274,17 @@ class _Interpret:
                         )
             elif isinstance(operation, scf.IfOp):
                 region = operation.true_region if values[operation.cond] else operation.false_region
+                nested_coordinates = coordinates
+                if "npu.stage_offset" in operation.attributes:
+                    loop, clock = coordinates[-1]
+                    nested_coordinates = (
+                        *coordinates[:-1],
+                        (loop, clock - operation.attributes["npu.stage_offset"].data),
+                    )
                 result = (
-                    self.block(region.block, dict(values), invocation, group, actor, coordinates)
+                    self.block(
+                        region.block, dict(values), invocation, group, actor, nested_coordinates
+                    )
                     if region.blocks
                     else ()
                 )
@@ -305,13 +308,19 @@ class _Interpret:
                         invocation,
                         group,
                         actor,
-                        (*coordinates, (operation, ordinal)),
+                        (
+                            *coordinates,
+                            (
+                                operation,
+                                induction - operation.attributes["npu.pipeline_clock"].data
+                                if "npu.pipeline_clock" in operation.attributes
+                                else ordinal,
+                            ),
+                        ),
                     )
                 values.update(zip(operation.results, state, strict=True))
             elif isinstance(operation, PipelineLoopOp):
-                lower, upper, step = (values[value] for value in operation.operands)
-                _check(step > 0, "actual pipeline step is not positive")
-                count = len(range(lower, upper, step))
+                count = max(0, values[operation.count])
                 _check(count <= self.maximum, "finite pipeline iteration budget exceeded")
                 stages = [
                     stage
@@ -326,7 +335,7 @@ class _Interpret:
                             for rank, label in enumerate(operation.issue_order.data[family])
                         }
                         stages.sort(key=lambda stage: ranks.get(stage.label.data, len(ranks)))
-                horizon = operation.schedule.horizon.data if self.physical else 0
+                horizon = operation.horizon if self.physical else 0
                 for clock in range(count + horizon):
                     for stage in stages:
                         ordinal = clock - stage.offset.data if self.physical else clock
@@ -334,7 +343,7 @@ class _Interpret:
                             local = values | dict(
                                 zip(
                                     stage.body.block.args,
-                                    (ordinal, lower + ordinal * step),
+                                    (ordinal,),
                                     strict=True,
                                 )
                             )
@@ -354,6 +363,10 @@ class _Interpret:
 
     @staticmethod
     def arithmetic(operation, values):
+        if isinstance(operation, arith.SelectOp):
+            condition, left, right = operation.operands
+            values[operation.results[0]] = values[left] if values[condition] else values[right]
+            return
         _check(len(operation.operands) == 2, f"unsupported actual scalar {operation.name}")
         a, b = (values[value] for value in operation.operands)
         if isinstance(operation, arith.CmpiOp):
@@ -373,6 +386,8 @@ class _Interpret:
                 arith.DivUIOp: lambda: a // b,
                 arith.RemUIOp: lambda: a % b,
                 arith.CeilDivUIOp: lambda: a // b + (a % b != 0),
+                arith.AndIOp: lambda: a & b,
+                arith.OrIOp: lambda: a | b,
             }
             _check(type(operation) in functions, f"unsupported actual scalar {operation.name}")
             if isinstance(operation, (arith.DivUIOp, arith.RemUIOp, arith.CeilDivUIOp)):
@@ -630,21 +645,32 @@ def _reference_correspondence(memory, reference):
 
     def loops(module):
         return [
-            (operation, tuple(op.uid.data for op in operation.walk() if isinstance(op, TaskOp)))
-            for operation in module.walk()
-            if isinstance(operation, (PipelineLoopOp, scf.ForOp))
-            and any(isinstance(op, TaskOp) for op in operation.walk())
+            op
+            for op in module.walk()
+            if isinstance(op, (PipelineLoopOp, scf.ForOp))
+            and any(isinstance(child, TaskOp) for child in op.walk())
         ]
 
     actual_loops, source_loops = loops(memory.module), loops(reference.module)
-    _check(
-        [(loop.name, native_uids) for loop, native_uids in actual_loops]
-        == [(loop.name, native_uids) for loop, native_uids in source_loops],
-        "logical reference native loop paths changed",
-    )
-    loop_map = {
-        source: actual for (source, _), (actual, _) in zip(source_loops, actual_loops, strict=True)
-    }
+    loop_map = {}
+    for source in source_loops:
+        source_id = source.attributes.get("npu.loop_id")
+        source_uids = frozenset(op.uid.data for op in source.walk() if isinstance(op, TaskOp))
+        candidates = [
+            actual
+            for actual in actual_loops
+            if (source_id is not None and actual.attributes.get("npu.loop_id") == source_id)
+            or (
+                source_id is None
+                and frozenset(op.uid.data for op in actual.walk() if isinstance(op, TaskOp))
+                == source_uids
+            )
+        ]
+        _check(bool(candidates), "logical reference native loop paths changed")
+        for task in (op for op in source.walk() if isinstance(op, TaskOp)):
+            containing = [actual for actual in candidates if tasks[task] in set(actual.walk())]
+            _check(len(containing) == 1, "logical reference native loop paths changed")
+            loop_map[source, task] = containing[0]
 
     def command(value):
         point = value.occurrence
@@ -653,12 +679,26 @@ def _reference_correspondence(memory, reference):
             occurrence=replace(
                 point,
                 operation=tasks[point.operation],
-                coordinates=tuple((loop_map[loop], ordinal) for loop, ordinal in point.coordinates),
+                coordinates=tuple(
+                    (loop_map[loop, point.operation], ordinal)
+                    for loop, ordinal in point.coordinates
+                ),
             ),
             spans=tuple(replace(span, root=roots[span.root]) for span in value.spans),
         )
 
     return command
+
+
+def check_compiled_events(compilation, parameters=None, **options):
+    """Use the independent pre-sync native snapshot for a terminal SCF plan."""
+    from ascendflow.analysis.structured_memory import collect_native_memory
+    from ascendflow.dialects.io import parse
+
+    original = collect_native_memory(parse(compilation.before_ir))
+    return check_structured_events(
+        compilation.memory, parameters, logical_reference=original, **options
+    )
 
 
 def check_structured_events(

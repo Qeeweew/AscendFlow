@@ -9,7 +9,10 @@ from ascendflow.dialects.structured import NotificationOp
 from ascendflow.passes.structured_sync import synchronize_structure
 from ascendflow.target.ascend910b import Engine, SyncKind
 from tests.fixtures.nested import shared_l0c_qk_pv
-from tests.models.structured_events import EventModelError, check_structured_events
+from tests.models.structured_events import (
+    EventModelError,
+    check_compiled_events,
+)
 from tests.support.structured import selected
 
 
@@ -40,13 +43,13 @@ def test_complete_private_lifetimes_follow_dispatch_without_rebinding_reads():
     raw = [n for n in result.dependencies.needs if n.kind is HazardKind.RAW]
     assert {(n.source.operation, n.consumer.operation) for n in raw} == {(a, ar), (b, br)}
     for n in range(5):
-        check_structured_events(result.memory, {"n": n})
+        check_compiled_events(result, {"n": n})
 
 
 def test_interleaved_copy_reads_keep_their_values_through_actual_engine_events():
     result = synchronize_structure(scratch(("a_fill", "b_fill", "a_read", "b_read")))
     for n in range(5):
-        check_structured_events(result.memory, {"n": n})
+        check_compiled_events(result, {"n": n})
 
 
 def test_shifted_private_packets_keep_values_through_fill_and_drain():
@@ -70,7 +73,7 @@ def test_shifted_private_packets_keep_values_through_fill_and_drain():
     assert len(result.dependencies.storage.packet_partitions) == 1
     a, ar, b, br = (t.operation for t in result.memory.templates)
     for n in range(5):
-        execution = check_structured_events(result.memory, {"n": n})
+        execution = check_compiled_events(result, {"n": n})
         expected = []
         for clock in range(n + 1):
             if clock < n:
@@ -122,7 +125,7 @@ def test_deleting_actual_store_release_leaves_an_unordered_war():
             disjoint_external=True,
         )
     )
-    baseline = check_structured_events(result.memory)
+    baseline = check_compiled_events(result)
     _, store, overwrite = (t.operation for t in result.memory.templates)
     assert any(
         hazard.kind == "WAR"
@@ -146,7 +149,7 @@ def test_deleting_actual_store_release_leaves_an_unordered_war():
         operation.parent.erase_op(operation)
     result.module.verify()
     with pytest.raises(EventModelError, match="unordered physical WAR"):
-        check_structured_events(result.memory)
+        check_compiled_events(result)
 
 
 def test_shared_l0c_uses_dispatch_neighbors_and_keeps_accumulation_raw():

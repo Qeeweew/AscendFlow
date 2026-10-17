@@ -2,7 +2,7 @@
 
 2026-10-17。本页规定必须保持的语义；已实现的生成规则及逐项事实归属见
 [generation-rules.md](generation-rules.md)。规则论证、有限反例、ASC/CANN 和
-设备资格分别记录，实际结果见[状态页](refactor-progress.md)。
+设备结果按[验证口径](validation.md)分别记录。
 
 ## 1. 编程模型与当前缺口
 

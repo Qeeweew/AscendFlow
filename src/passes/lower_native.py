@@ -241,6 +241,9 @@ class _Lowerer:
 
         def emit(suffix, native, *refs, params=(), scalar=0.0, order_delta=0):
             self.needs_fix |= native in {"fix", "fix16"}
+            if native in {"mad_first", "mad_cycle"}:
+                require(scope.pipeline is not None, "native reset needs its logical ordinal")
+                refs = (*refs, scope.values[scope.pipeline.body.block.args[0]])
             task = TaskOp.build(
                 operands=[refs],
                 attributes=task_attrs(
@@ -391,6 +394,7 @@ class _Lowerer:
             body,
         )
         loop.location = op.location
+        loop.attributes["npu.loop_id"] = StringAttr(f"loop{len(self.loops)}")
         scope.block.add_op(loop)
         self.loops[op] = loop
         self.block(
@@ -432,19 +436,17 @@ class _Lowerer:
         body = Block()
         loop = PipelineLoopOp.build(
             operands=[
-                scope.constant(0),
                 self.scalar(op.limit, scope)
                 if op.limit is not None
                 else scope.constant(op.count.data),
-                scope.constant(1),
             ],
             attributes={
-                "schedule": self.controls.by_operation[op].schedule,
                 "issue_order": op.issue_order,
             },
             regions=[Region(body)],
         )
         loop.location = op.location
+        loop.attributes["npu.loop_id"] = StringAttr(f"loop{len(self.loops)}")
         scope.block.add_op(loop)
         self.loops[op] = loop
         stages, ordinary, stage_families = [], [], {}
@@ -452,7 +454,7 @@ class _Lowerer:
 
         def stage(operations, offset, label):
             before = dict(self.family_work)
-            block = Block(arg_types=[IndexType(), IndexType()])
+            block = Block(arg_types=[IndexType()])
             physical = PipelineStageOp.build(
                 attributes={"offset": IntAttr(offset), "label": StringAttr(label)},
                 regions=[Region(block)],
@@ -460,7 +462,7 @@ class _Lowerer:
             body.add_op(physical)
             nested = loop_scope.child(
                 block,
-                [(op.body.block.args[0], block.args[1])],
+                [(op.body.block.args[0], block.args[0])],
                 stage=offset,
                 pipeline=op,
                 control=physical,

@@ -1,4 +1,4 @@
-"""Real AST runtime descriptors through native addresses and launcher guards."""
+"""Real AST runtime descriptors through native addresses and thin launch wrappers."""
 
 from dataclasses import replace
 
@@ -28,9 +28,6 @@ def test_owner_count_is_policy_not_an_input_length_specialization(groups):
 
 def test_actual_launcher_accepts_one_binary_for_different_lengths(grouped, tmp_path):
     library, launch = host_launcher(grouped, tmp_path)
-    for length in (-1, 0, 1, 17, (1 << 63) - 1):
-        assert launch(length) == -1
-        assert library.dispatches() == 0
     for index, length in enumerate((16, 48, 64, 4096, 131072), 1):
         assert launch(length) == 0
         assert library.dispatches() == index

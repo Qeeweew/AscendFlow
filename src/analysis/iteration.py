@@ -14,7 +14,6 @@ from xdsl.dialects.builtin import ModuleOp
 from xdsl.ir import Operation, SSAValue
 
 from ..diagnostics import CompileError, ErrorKind, require
-from ..dialects.loops import LoopScheduleAttr
 from ..dialects.source import PipelineOp
 
 Bound = int | SSAValue
@@ -54,7 +53,7 @@ class IterationDomain:
 class LoopControl:
     operation: PipelineOp | scf.ForOp
     domain: IterationDomain
-    schedule: LoopScheduleAttr
+    max_offset: int
     parent: LoopControl | None
     parent_stage: int
     depth: int
@@ -66,7 +65,7 @@ class LoopControl:
     def source_iteration(self, physical_step, stage, values):
         """Guard before computing addresses, including nonzero serial bounds."""
         require(
-            type(stage) is int and 0 <= stage <= self.schedule.horizon.data,
+            type(stage) is int and 0 <= stage <= self.max_offset,
             "stage is outside the loop schedule",
         )
         count = self.domain.trip_count(values)
@@ -85,14 +84,12 @@ class LoopControls:
     loops: tuple[LoopControl, ...]
     by_operation: Mapping[Operation, LoopControl]
     operations_visited: int
-    phase_descriptors: int
 
     @property
     def statistics(self):
         return {
             "operations_visited": self.operations_visited,
             "loop_templates": len(self.loops),
-            "phase_descriptors": self.phase_descriptors,
             "body_clones": 0,
             "expanded_iterations": 0,
             "maximum_depth": max((loop.depth for loop in self.loops), default=0),

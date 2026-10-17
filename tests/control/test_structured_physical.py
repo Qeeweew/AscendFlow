@@ -16,7 +16,6 @@ from xdsl.traits import Pure, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
 from ascendflow.dialects.io import dump, parse
-from ascendflow.dialects.loops import LoopScheduleAttr
 from ascendflow.dialects.physical import (
     BufferOp,
     CoreIdOp,
@@ -42,15 +41,15 @@ def stage(offset=1, *, arg_types=None):
             Region(
                 Block(
                     [EndOp()],
-                    arg_types=[IndexType(), IndexType()] if arg_types is None else arg_types,
+                    arg_types=[IndexType()] if arg_types is None else arg_types,
                 )
             )
         ],
     )
 
 
-def program(*, stages=None, lower=2, upper=11, step=3, horizon=2, mixed=False):
-    lower, upper, step = index(lower), index(upper), index(step)
+def program(*, stages=None, count=3, mixed=False):
+    count = index(count)
     root = BufferOp.build(
         operands=[None],
         attributes={
@@ -63,8 +62,7 @@ def program(*, stages=None, lower=2, upper=11, step=3, horizon=2, mixed=False):
     )
     stages = (stage(),) if stages is None else stages
     loop = PipelineLoopOp.build(
-        operands=[lower, upper, step],
-        attributes={"schedule": LoopScheduleAttr(IntAttr(horizon))},
+        operands=[count],
         regions=[Region(Block([*stages, EndOp()]))],
     )
     kernel = (MixedOp if mixed else KernelOp).build(
@@ -75,7 +73,7 @@ def program(*, stages=None, lower=2, upper=11, step=3, horizon=2, mixed=False):
             "disjoint_external": IntAttr(1),
             "blocks": IntAttr(1),
         },
-        regions=[Region(Block([root, lower, upper, step, loop, EndOp()]))],
+        regions=[Region(Block([root, count, loop, EndOp()]))],
     )
     return ModuleOp([kernel]), loop, stages[0] if stages else None, root
 
@@ -120,7 +118,7 @@ def address(
 def test_actual_structured_ir_round_trips_without_losing_ssa_or_native_effects():
     module, loop, work, root = program()
     scale = index(64)
-    offset = arith.MuliOp(work.body.block.args[1], scale.result)
+    offset = arith.MuliOp(work.body.block.args[0], scale.result)
     view = address(root.ref, offset.result, rows=2, row_stride=96)
     fill = TaskOp.create(
         operands=[view.ref], result_types=[TaskType()], attributes=task_attrs("fill", "fill", 1)
@@ -141,26 +139,22 @@ def test_actual_structured_ir_round_trips_without_losing_ssa_or_native_effects()
     assert restored_stage.parent_op() is restored_loop
     assert restored_address.source is restored_address.source.owner.ref
     assert isinstance(restored_address.source.owner, BufferOp)
-    assert restored_address.offset.owner.lhs is restored_stage.body.block.args[1]
+    assert restored_address.offset.owner.lhs is restored_stage.body.block.args[0]
     assert restored_address.ref.type == restored_address.source.type
 
 
 @pytest.mark.parametrize("upper", [1, 2, 3, 8, 11])
 def test_nonzero_lower_and_step_bind_stage_local_ordinal_and_iv(upper):
     stages = tuple(stage(offset) for offset in (2, 0, 1))
-    module, loop, _, _ = program(stages=stages, lower=2, upper=upper, step=3)
+    module, loop, _, _ = program(stages=stages, count=len(range(2, upper, 3)))
     module.verify()
     count = len(range(2, upper, 3))
     actual = []
-    for phase in loop.schedule.phases:
-        interval = phase.interval(count)
-        if interval is None:
-            continue
-        for physical_step in range(*interval):
-            for rank, work in enumerate(stages):
-                ordinal = physical_step - work.offset.data
-                if 0 <= ordinal < count:
-                    actual.append((physical_step, rank, ordinal, 2 + ordinal * 3))
+    for physical_step in range(count + loop.horizon):
+        for rank, work in enumerate(stages):
+            ordinal = physical_step - work.offset.data
+            if 0 <= ordinal < count:
+                actual.append((physical_step, rank, ordinal, 2 + ordinal * 3))
     expected = sorted(
         (ordinal + work.offset.data, rank, ordinal, iv)
         for rank, work in enumerate(stages)
@@ -172,23 +166,22 @@ def test_nonzero_lower_and_step_bind_stage_local_ordinal_and_iv(upper):
 
 
 def test_nested_pipeline_retains_independent_real_parent_and_child_coordinates():
-    module, loop, outer, root = program()
+    module, _, outer, root = program()
     child = stage(0)
     nested = PipelineLoopOp.build(
-        operands=[outer.body.block.args[1], loop.upper, loop.step],
-        attributes={"schedule": LoopScheduleAttr(IntAttr(0))},
+        operands=[outer.body.block.args[0]],
         regions=[Region(Block([child, EndOp()]))],
     )
-    combined = arith.AddiOp(outer.body.block.args[1], child.body.block.args[1])
+    combined = arith.AddiOp(outer.body.block.args[0], child.body.block.args[0])
     view = address(root.ref, combined.result)
     child.body.block.insert_ops_before([combined, view], child.body.block.last_op)
     outer.body.block.insert_op_before(nested, outer.body.block.last_op)
     module.verify()
     restored = parse(dump(module))
     assert sum(isinstance(op, PipelineLoopOp) for op in restored.walk()) == 2
-    assert nested.lower is outer.body.block.args[1]
-    assert combined.lhs is outer.body.block.args[1]
-    assert combined.rhs is child.body.block.args[1]
+    assert nested.count is outer.body.block.args[0]
+    assert combined.lhs is outer.body.block.args[0]
+    assert combined.rhs is child.body.block.args[0]
     assert combined.lhs is not combined.rhs
 
 
@@ -201,7 +194,9 @@ def test_scf_serial_carry_keeps_its_own_yield_and_unmodified_control():
     body = Block(arg_types=[IndexType(), IndexType()])
     update = arith.AddiOp(body.args[1], body.args[0])
     body.add_ops([loop, update, scf.YieldOp(update.result)])
-    serial = scf.ForOp(loop.lower, loop.upper, loop.step, [initial.result], body)
+    lower, upper, step = index(2), index(11), index(3)
+    block.insert_ops_before([lower, upper, step], block.last_op)
+    serial = scf.ForOp(lower, upper, step, [initial.result], body)
     block.insert_op_before(serial, block.last_op)
     module.verify()
     assert len(serial.iter_args) == len(serial.results) == 1
@@ -210,36 +205,39 @@ def test_scf_serial_carry_keeps_its_own_yield_and_unmodified_control():
     assert dump(parse(dump(module))) == dump(module)
 
 
-@pytest.mark.parametrize("step", [0, -1])
-def test_pipeline_step_requires_a_positive_integer_constant(step):
-    module, _, _, _ = program(step=step)
-    with pytest.raises(VerifyException, match="positive integer constant"):
+def test_pipeline_count_requires_an_actual_index_ssa():
+    module, loop, _, _ = program()
+    wrong = arith.ConstantOp.from_int_and_width(3, i32)
+    loop.parent.insert_op_before(wrong, loop)
+    loop.operands = (wrong.result,)
+    with pytest.raises(VerifyException):
         module.verify()
 
 
-def test_positive_runtime_step_cannot_silently_replace_the_constant_contract():
-    module, loop, _, _ = program()
+def test_runtime_count_is_retained_without_an_extra_stride_or_source_coordinate():
+    module, loop, work, _ = program()
     runtime = RuntimeSizeOp.build(
-        attributes={"sym_name": StringAttr("step"), "minimum": IntAttr(1), "multiple": IntAttr(1)},
+        attributes={"sym_name": StringAttr("count"), "minimum": IntAttr(0), "multiple": IntAttr(1)},
         result_types=[IndexType()],
     )
     loop.parent.insert_op_before(runtime, loop)
-    loop.operands = [loop.lower, loop.upper, runtime.value]
-    with pytest.raises(VerifyException, match="positive integer constant"):
-        module.verify()
+    loop.operands = (runtime.value,)
+    module.verify()
+    assert loop.count is runtime.value and len(loop.operands) == 1
+    assert len(work.body.block.args) == 1
 
 
-@pytest.mark.parametrize("offset", [-1, 3])
+@pytest.mark.parametrize("offset", [-1, 33])
 def test_stage_offset_must_be_inside_its_actual_loop_schedule(offset):
     module, _, _, _ = program(stages=(stage(offset),))
-    with pytest.raises(VerifyException, match="outside its loop schedule"):
+    with pytest.raises(VerifyException, match=r"stage offset must be"):
         module.verify()
 
 
-@pytest.mark.parametrize("types", [(), (IndexType(),), (IndexType(), i32), (IndexType(),) * 3])
-def test_stage_requires_two_index_block_arguments(types):
+@pytest.mark.parametrize("types", [(), (i32,), (IndexType(), IndexType()), (IndexType(),) * 3])
+def test_stage_requires_one_index_block_argument(types):
     module, _, _, _ = program(stages=(stage(arg_types=types),))
-    with pytest.raises(VerifyException, match="index ordinal and iv"):
+    with pytest.raises(VerifyException, match="one index ordinal"):
         module.verify()
 
 
@@ -277,7 +275,7 @@ def test_structured_bodies_must_use_existing_end_terminator(which):
 )
 def test_invalid_address_geometry_is_rejected(nbytes, rows, stride):
     module, _, work, root = program()
-    view = address(root.ref, work.body.block.args[1], nbytes=nbytes, rows=rows, row_stride=stride)
+    view = address(root.ref, work.body.block.args[0], nbytes=nbytes, rows=rows, row_stride=stride)
     work.body.block.insert_op_before(view, work.body.block.last_op)
     with pytest.raises(VerifyException, match="positive row width/count and non-overlapping rows"):
         module.verify()
@@ -285,13 +283,13 @@ def test_invalid_address_geometry_is_rejected(nbytes, rows, stride):
 
 def test_address_must_keep_original_root_and_reference_type():
     module, _, work, root = program()
-    view = address(root.ref, work.body.block.args[1])
-    alias = address(view.ref, work.body.block.args[1])
+    view = address(root.ref, work.body.block.args[0])
+    alias = address(view.ref, work.body.block.args[0])
     work.body.block.insert_ops_before([view, alias], work.body.block.last_op)
     with pytest.raises(VerifyException, match="original BufferOp allocation root"):
         module.verify()
     module, _, work, root = program()
-    changed = address(root.ref, work.body.block.args[1], result_type=ref_type("UB", "f16"))
+    changed = address(root.ref, work.body.block.args[0], result_type=ref_type("UB", "f16"))
     work.body.block.insert_op_before(changed, work.body.block.last_op)
     with pytest.raises(VerifyException, match="preserve its allocation reference type"):
         module.verify()
@@ -319,14 +317,14 @@ def test_axis_metadata_retains_real_ssa_and_source_geometry_after_roundtrip():
     module, _, work, root = program()
     extent0, extent1, pitch, itemsize = index(32), index(24), index(96), index(4)
     row = arith.MuliOp(work.body.block.args[0], pitch.result)
-    column = arith.MuliOp(work.body.block.args[1], itemsize.result)
+    column = arith.MuliOp(work.body.block.args[0], itemsize.result)
     offset = arith.AddiOp(row.result, column.result)
     view = address(
         root.ref,
         offset.result,
         rows=2,
         row_stride=96,
-        origins=work.body.block.args,
+        origins=(work.body.block.args[0],) * 2,
         extents=(extent0.result, extent1.result),
         widths=(2, 16),
         axes=(0, 1),
@@ -340,7 +338,7 @@ def test_axis_metadata_retains_real_ssa_and_source_geometry_after_roundtrip():
     assert dump(restored) == dump(module)
     restored_view = next(op for op in restored.walk() if isinstance(op, AddressOp))
     restored_stage = next(op for op in restored.walk() if isinstance(op, PipelineStageOp))
-    assert tuple(restored_view.origins) == tuple(restored_stage.body.block.args)
+    assert tuple(restored_view.origins) == tuple(restored_stage.body.block.args) * 2
     assert [value.owner.value.value.data for value in restored_view.extents] == [32, 24]
     assert [width.data for width in restored_view.widths] == [2, 16]
     assert [axis.data for axis in restored_view.axes] == [0, 1]
@@ -353,14 +351,14 @@ def test_axis_metadata_retains_real_ssa_and_source_geometry_after_roundtrip():
 def test_address_axis_metadata_must_be_complete_or_entirely_absent(missing):
     module, loop, work, root = program()
     metadata = {
-        "origins": work.body.block.args,
-        "extents": (loop.upper, loop.upper),
+        "origins": (work.body.block.args[0],) * 2,
+        "extents": (loop.count, loop.count),
         "widths": (1, 16),
         "axes": (1,),
         "displacement": 0,
     }
     metadata[missing] = () if missing in {"origins", "extents"} else None
-    view = address(root.ref, work.body.block.args[1], **metadata)
+    view = address(root.ref, work.body.block.args[0], **metadata)
     work.body.block.insert_op_before(view, work.body.block.last_op)
     with pytest.raises(VerifyException, match="complete or entirely absent"):
         module.verify()
@@ -384,14 +382,14 @@ def test_address_axis_metadata_has_consistent_static_rank_and_displacement(
 ):
     module, loop, work, root = program()
     metadata = {
-        "origins": work.body.block.args,
-        "extents": (loop.upper, loop.upper),
+        "origins": (work.body.block.args[0],) * 2,
+        "extents": (loop.count, loop.count),
         "widths": (1, 16),
         "axes": (1,),
         "displacement": 0,
     }
     metadata[field] = value
-    view = address(root.ref, work.body.block.args[1], **metadata)
+    view = address(root.ref, work.body.block.args[0], **metadata)
     work.body.block.insert_op_before(view, work.body.block.last_op)
     with pytest.raises(VerifyException, match=diagnostic):
         module.verify()
@@ -401,9 +399,9 @@ def test_axis_extents_require_one_real_index_ssa_per_original_axis():
     module, loop, work, root = program()
     view = address(
         root.ref,
-        work.body.block.args[1],
-        origins=work.body.block.args,
-        extents=(loop.upper,),
+        work.body.block.args[0],
+        origins=(work.body.block.args[0],) * 2,
+        extents=(loop.count,),
         widths=(1, 16),
         axes=(1,),
         displacement=0,
@@ -416,13 +414,13 @@ def test_axis_extents_require_one_real_index_ssa_per_original_axis():
 def test_subview_displacement_can_retain_the_original_axis_descriptors():
     module, loop, work, root = program()
     bias = index(32)
-    offset = arith.AddiOp(work.body.block.args[1], bias.result)
+    offset = arith.AddiOp(work.body.block.args[0], bias.result)
     view = address(
         root.ref,
         offset.result,
         nbytes=32,
-        origins=work.body.block.args,
-        extents=(loop.upper, loop.upper),
+        origins=(work.body.block.args[0],) * 2,
+        extents=(loop.count, loop.count),
         widths=(1, 16),
         axes=(1,),
         displacement=32,
@@ -430,8 +428,8 @@ def test_subview_displacement_can_retain_the_original_axis_descriptors():
     work.body.block.insert_ops_before([bias, offset, view], work.body.block.last_op)
     module.verify()
     assert view.source is root.ref
-    assert tuple(view.origins) == tuple(work.body.block.args)
-    assert tuple(view.extents) == (loop.upper, loop.upper)
+    assert tuple(view.origins) == tuple(work.body.block.args) * 2
+    assert tuple(view.extents) == (loop.count, loop.count)
     assert view.displacement.data == 32
     assert view.nbytes.data == 32
     assert dump(parse(dump(module))) == dump(module)
@@ -439,7 +437,7 @@ def test_subview_displacement_can_retain_the_original_axis_descriptors():
 
 def test_control_never_marks_async_work_pure_or_returns_completion_handles():
     module, loop, work, root = program()
-    view = address(root.ref, work.body.block.args[1])
+    view = address(root.ref, work.body.block.args[0])
     fill = TaskOp.create(
         operands=[view.ref], result_types=[TaskType()], attributes=task_attrs("fill", "fill", 1)
     )

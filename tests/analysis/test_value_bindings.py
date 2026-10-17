@@ -21,7 +21,6 @@ from ascendflow.analysis.value_bindings import (
     bind_values,
 )
 from ascendflow.diagnostics import CompileError, ErrorKind
-from ascendflow.dialects.loops import LoopScheduleAttr
 from ascendflow.dialects.physical import BufferOp, EndOp, TaskOp, task_attrs
 from ascendflow.dialects.source import CopyOp, DomainOp, ElementOp, PipelineOp, StageOp
 from ascendflow.dialects.structured import PipelineLoopOp
@@ -84,8 +83,7 @@ def anchors(module):
         count = arith.ConstantOp.from_int_and_width(operation.count.data, IndexType())
         one = arith.ConstantOp.from_int_and_width(1, IndexType())
         loop = PipelineLoopOp.build(
-            operands=[zero.result, count.result, one.result],
-            attributes={"schedule": LoopScheduleAttr(IntAttr(operation.stages.data - 1))},
+            operands=[count.result],
             regions=[Region(Block([EndOp()]))],
         )
         ModuleOp([zero, count, one, loop])

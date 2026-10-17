@@ -1,7 +1,7 @@
-"""Runtime input contracts through IR and CPU execution of generated host guards.
+"""Caller input preconditions through IR and CPU execution of thin launch wrappers.
 
 The CPU library below contains the actual emitted launcher. Its device launch
-line alone is replaced by a counter; this tests pre-dispatch checks, not NPU work.
+line alone is replaced by a counter; this tests ABI forwarding, not NPU work.
 """
 
 import ctypes
@@ -154,7 +154,7 @@ def test_forged_contract_is_rejected_by_ir_verification(local, kind, field, valu
 
 
 def host_launcher(artifact, directory):
-    """Compile actual generated guards, replacing only the device launch line."""
+    """Compile the actual wrapper, replacing only the device launch line."""
     marker = f'extern "C" int launch_{artifact.name}('
     launcher = artifact.asc[artifact.asc.index(marker) :]
     launcher, changed = re.subn(
@@ -163,7 +163,8 @@ def host_launcher(artifact, directory):
         launcher,
     )
     assert changed == 1
-    source = directory / "host_guards.cpp"
+    assert not re.search(r"\b(if|for|while)\b|npu_host_|overflow", launcher)
+    source = directory / "launcher.cpp"
     source.write_text(
         "#include <cstdint>\n#include <cstddef>\n"
         "static int npu_dispatches = 0;\n"
@@ -172,7 +173,7 @@ def host_launcher(artifact, directory):
     )
     compiler = shutil.which("c++")
     assert compiler is not None, "the CPU launcher-contract test requires a C++ compiler"
-    binary = directory / "host_guards.so"
+    binary = directory / "launcher.so"
     subprocess.run(
         [compiler, "-std=c++17", "-shared", "-fPIC", "-O2", str(source), "-o", str(binary)],
         check=True,
@@ -198,21 +199,16 @@ def launch_source_root_count(artifact):
 
 
 @pytest.mark.parametrize(
-    "fixture,valid,invalid",
+    "fixture,valid",
     [
-        ("local", [(4,), (8,), (16,), (1024,)], [(0,), (1,), (3,), (5,), (-1,), ((1 << 63) - 1,)]),
-        ("sequence", [(2, 0), (2, 3), (4, 6)], [(0, 0), (1, 3), (2, 1), (2, -1)]),
-        ("mixed", [(2,), (4,), (8,)], [(0,), (1,), (3,), (-1,)]),
+        ("local", [(4,), (8,), (16,), (1024,)]),
+        ("sequence", [(2, 0), (2, 3), (4, 6)]),
+        ("mixed", [(2,), (4,), (8,)]),
     ],
 )
-def test_actual_host_guards_reject_before_dispatch_and_reuse_one_binary(
-    request, tmp_path, fixture, valid, invalid
-):
+def test_thin_launcher_reuses_one_binary_for_runtime_inputs(request, tmp_path, fixture, valid):
     artifact = request.getfixturevalue(fixture)
     library, launch = host_launcher(artifact, tmp_path)
-    for values in invalid:
-        assert launch(*values) == -1
-        assert library.dispatches() == 0
     for count, values in enumerate(valid, 1):
         assert launch(*values) == 0
         assert library.dispatches() == count
@@ -229,8 +225,7 @@ def test_positive_input_contract_does_not_require_nonempty_kernel_work(tmp_path)
     """)
     )
     library, launch = host_launcher(artifact, tmp_path)
-    assert launch(0) == -1
-    assert library.dispatches() == 0
+    assert contracts(parse(artifact.plan_ir), RuntimeSizeOp) == {"n": (1, 1)}
     assert launch(1) == 0
     assert library.dispatches() == 1
 

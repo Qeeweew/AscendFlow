@@ -6,7 +6,7 @@ import pytest
 
 from ascendflow.passes.structured_sync import synchronize_structure
 from examples.state.shared_inputs import shared_state_sum
-from tests.models.structured_events import check_structured_events
+from tests.models.structured_events import check_compiled_events
 
 
 @pytest.fixture(scope="module")
@@ -18,8 +18,8 @@ def shared_structure():
 def test_actual_shared_input_and_partitioned_output_bytes_in_every_group(
     shared_structure, calls, tiles
 ):
-    check_structured_events(
-        shared_structure.memory,
+    check_compiled_events(
+        shared_structure,
         {"outputs": calls, "tiles": tiles},
         groups=(0, 1, 2, 3),
     )
@@ -35,4 +35,4 @@ def test_all_groups_can_read_the_same_gm_without_inventing_exclusive_frames():
     plan = synchronize_structure(
         replace(shared_state_sum, source=source).specialize(B=16, GROUPS=4)
     )
-    check_structured_events(plan.memory, {"outputs": 2, "tiles": 3}, groups=(0, 1, 2, 3))
+    check_compiled_events(plan, {"outputs": 2, "tiles": 3}, groups=(0, 1, 2, 3))

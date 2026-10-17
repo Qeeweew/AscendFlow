@@ -7,13 +7,11 @@ alignment, initialized data, buffer ownership, or asynchronous retirement.
 
 from collections import Counter
 
-from xdsl.dialects import arith
 from xdsl.dialects.builtin import (
     ArrayAttr,
     DictionaryAttr,
     IndexType,
     IntAttr,
-    IntegerAttr,
     StringAttr,
 )
 from xdsl.irdl import (
@@ -32,7 +30,6 @@ from xdsl.irdl import (
 from xdsl.traits import RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
-from .loops import LoopScheduleAttr
 from .types import AsyncEffects, RefType
 
 
@@ -75,10 +72,9 @@ class ActorDomainOp(IRDLOperation):
 class PipelineLoopOp(IRDLOperation):
     """One logical pipeline template, with explicit physical-step semantics.
 
-    Let count = ceildiv(max(upper-lower, 0), step). At physical step j, a
-    stage at offset s executes only if g = j-s satisfies 0 <= g < count.
-    Its two local coordinates are (g, lower + g*step). The canonical schedule
-    supplies the physical-step phases; exiting a phase or loop is no drain.
+    At physical step j, a stage at offset s executes only if g = j-s
+    satisfies 0 <= g < count. Its sole coordinate is g; a source induction
+    value is ordinary scalar arithmetic. Exiting the loop is no drain.
 
     In a mixed control tree, each actor controller runs its own physical step
     and projects its family's issue_order from this shared template. Equal j
@@ -88,10 +84,7 @@ class PipelineLoopOp(IRDLOperation):
     """
 
     name = "npu.pipeline_loop"
-    lower = operand_def(IndexType)
-    upper = operand_def(IndexType)
-    step = operand_def(IndexType)
-    schedule = attr_def(LoopScheduleAttr)
+    count = operand_def(IndexType)
     issue_order = opt_attr_def(DictionaryAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
@@ -99,14 +92,6 @@ class PipelineLoopOp(IRDLOperation):
     def verify_(self):
         from .physical import EndOp
 
-        self.schedule.verify()
-        constant = self.step.owner
-        if (
-            not isinstance(constant, arith.ConstantOp)
-            or not isinstance(constant.value, IntegerAttr)
-            or constant.value.value.data <= 0
-        ):
-            raise VerifyException("pipeline step must be a positive integer constant")
         block = self.body.block
         if block.args:
             raise VerifyException("pipeline loop body has no block arguments")
@@ -131,15 +116,17 @@ class PipelineLoopOp(IRDLOperation):
                         "pipeline issue_order must name existing unambiguous stages"
                     )
 
+    @property
+    def horizon(self):
+        return max(
+            (op.offset.data for op in self.body.block.ops if isinstance(op, PipelineStageOp)),
+            default=0,
+        )
+
 
 @irdl_op_definition
 class PipelineStageOp(IRDLOperation):
-    """A stage's logical ordinal and source induction value, with no results.
-
-    The block arguments are (ordinal, iv), bound by the enclosing pipeline's
-    guarded physical-step execution. They identify neither completion facts
-    nor values of another stage's current physical dispatch.
-    """
+    """One logical ordinal bound by the enclosing guarded clock execution."""
 
     name = "npu.pipeline_stage"
     offset = attr_def(IntAttr)
@@ -153,11 +140,11 @@ class PipelineStageOp(IRDLOperation):
         parent = self.parent_op()
         if not isinstance(parent, PipelineLoopOp):
             raise VerifyException("pipeline stage must belong directly to a pipeline loop")
-        if not 0 <= self.offset.data <= parent.schedule.horizon.data:
-            raise VerifyException("pipeline stage offset lies outside its loop schedule")
+        if not 0 <= self.offset.data <= 32:
+            raise VerifyException("pipeline stage offset must be in [0,32]")
         block = self.body.block
-        if len(block.args) != 2 or any(not isinstance(arg.type, IndexType) for arg in block.args):
-            raise VerifyException("pipeline stage needs index ordinal and iv block arguments")
+        if len(block.args) != 1 or not isinstance(block.args[0].type, IndexType):
+            raise VerifyException("pipeline stage needs one index ordinal block argument")
         if not isinstance(block.last_op, EndOp):
             raise VerifyException("pipeline stage body must end with npu.end")
 
@@ -231,6 +218,9 @@ class NotificationOp(IRDLOperation):
     """One selected instruction at an actual control insertion point.
 
     Guards are ordinary surrounding SCF control and IDs are scalar SSA values.
+    Participants are the instruction's eligible actors, intersected with that
+    actual control. Materialization lowers a singleton AIV restriction to SID
+    control and leaves the instruction eligible for its shared Vector family.
     This op is observable even without tensor results. Structural verification
     establishes neither matching partners nor progress or an event lease.
     """

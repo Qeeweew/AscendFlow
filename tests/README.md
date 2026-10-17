@@ -16,7 +16,7 @@
 | 依赖与同步选择 | `analysis/test_dependency_retirement_frontiers.py`、`test_structured_dependencies.py`、`sync/test_notification_selection.py` | 最后真实 reader、捕获/获取端点、实际代次与完整 CV quorum |
 | 资源与进展 | `analysis/test_event_*.py`、`test_structured_resource_contracts.py`、`sync/test_generation_contracts.py` | 精确激活、空/短循环、窗口投影、cell credit、消费回传、bank 预留与 child 边界 |
 | 最终 IR 与 ASC | `backend/test_structured_emission.py`、`sync/test_structured_pipeline.py` | 后端消费既有事实、实际 Notification/SCF/Address SSA 与生成调用 |
-| 数学、ABI 和测量记录 | `test_attention_math.py`、`test_runtime_contract.py`、`test_attention_runner.py`、`test_performance.py`、`test_work_inventory.py` | 数学参考、host guards、命名 ABI、证据身份、静态工作量与显式分析假设 |
+| 数学、ABI 和测量记录 | `test_attention_math.py`、`test_runtime_contract.py`、`test_attention_runner.py`、`test_performance.py`、`test_work_inventory.py` | 数学参考、输入声明、命名 ABI 转发、证据身份、静态工作量与显式分析假设 |
 
 旧硬件反例按职责保留在当前表示中：`sync/test_structured_event_semantics.py` 和 `models/structured_events.py` 包含 native end 非 FIFO、RAW/WAR/WAW、删 Wait、错 ID、过早 Set、跨 body 二元事件复用、Scalar controller 阻塞、双 AIV mode2 quorum、未消费容量与跨队列阻塞环。共享 GM 输入的有限字节检查使用同一 structured 模型。几何与 packet 合同直接使用当前静态对象或实际 SSA；native end 与退休的区别由实际事件模型检查。旧求解器的节点数量、缓存、路径搜索与旧 IR 布局断言不再作为产品合同。
 
@@ -32,14 +32,19 @@
 
 后端 C++ shim 仅执行 scalar 控制并记录调用与地址，不执行 tensor 数学、CANN 指令或异步设备队列。
 
+终端pipeline降低后，生成计划使用 `check_compiled_events` 对照独立的同步前
+native快照，不能把物理发射顺序当作算法的逻辑次序。模型直接执行最终arith/scf、
+通知和地址；loop/stage来源只用于对应逻辑实例。大整数边界、短/空/稀疏offset、
+嵌套及公共guard内的event剩余条件由实际SSA的有限执行检查。
+
 ## 运行纪律
 
-先执行小规模 Python/IR 检查，再考虑 ASC/CANN 离线编译。运行结果按实际提交及产物记录在 `docs/refactor-progress.md`，不把 collection 当作通过。可从工作区检查当前入口：
+先执行小规模 Python/IR 检查，再考虑 ASC/CANN 离线编译。运行结果绑定实际源码和产物，不把 collection 当作通过。从本仓库根目录、已激活的 Python 环境检查入口：
 
 ```bash
-.venv/bin/python -m pytest --collect-only -q AscendFlow/tests
+python -m pytest --collect-only -q tests
 ```
 
-collection 不执行 fixture 和测试体。完整 generated pipeline 用例仍需在资源及进展契约闭合后单独验证；现有手工 IR 模型和后端筛选结果不能外推完整 source 资格。
+collection 不执行 fixture 和测试体。完整 generated pipeline 用例检查真实 source 的资源及进展契约；手工 IR 模型和后端筛选结果不能替代完整 source 验证。
 
 单个进程/算子构建不超过 300 秒；失败停止后续候选并清理所属子进程。设备 runner 位于 `support/`，其运行须遵守工作区卡健康、进程、显存、利用率和显式物理映射要求。

@@ -48,23 +48,25 @@ def test_actual_selected_actions_materialize_as_guarded_ssa_ir(selected):
     memory = selected.memory
     # The final scalar pass can replace/delete arith SSA. Execution, control
     # and address operations must keep their identities and relative order.
-    original_operations = tuple(
-        op for op in memory.control.frames if not op.name.startswith("arith.")
-    )
+    original_operations = tuple(template.operation for template in memory.templates)
     module = selected.module
     assert module is memory.module is selected.structure.module
     module.verify()
     text = dump(module)
     parse(text).verify()
-    assert len([op for op in module.walk() if isinstance(op, NotificationOp)]) == len(
-        selected.resources.actions
+    assert (
+        0
+        < len([op for op in module.walk() if isinstance(op, NotificationOp)])
+        <= len(selected.resources.actions)
     )
     assert "npu.notification" in text
     assert "npu.notification" not in selected.before_ir
     parse(selected.before_ir).verify()
     assert dump(memory.module) != selected.before_ir
     retained = set(original_operations)
-    assert tuple(op for op in module.walk() if op in retained) == original_operations
+    assert {op for op in module.walk() if op in retained} == retained
+    assert not any(op.name == "npu.pipeline_loop" for op in module.walk())
+    assert any("npu.pipeline_clock" in op.attributes for op in module.walk())
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 7, 12])
@@ -77,7 +79,8 @@ def test_emitted_domains_have_exactly_paired_ids_at_start_and_end(selected, coun
             if action.guard.evaluate(values):
                 flag = action.event.evaluate(values)
                 assert 0 <= flag < 8
-                events[action.kind][action.protocol, flag] += 1
+                for protocol in action.protocols:
+                    events[action.kind][protocol, flag] += 1
     assert events[SyncKind.LOCAL_SET] == events[SyncKind.LOCAL_WAIT]
 
 

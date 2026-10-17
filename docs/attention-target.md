@@ -1,6 +1,6 @@
 # Flash Attention 示例合同
 
-源码：[examples/flash_attention/attention.py](../examples/flash_attention/attention.py)，入口 `attention_target`。算法与固定排步属于example，不属于编译器内部。统一编译路径已替换旧实现；本例的当前编译与设备资格只以[状态页](refactor-progress.md)为准。
+源码：[examples/flash_attention/attention.py](../examples/flash_attention/attention.py)，入口 `attention_target`。算法与固定排步属于example，不属于编译器内部。编译和设备验证使用[统一验收口径](validation.md)。
 
 ## 当前默认配置
 
@@ -19,23 +19,23 @@ Q/K/V/O与workspace的真实指针区间遵守外部disjoint合同；局部L1/L0
 
 QK产生FP32 score，online softmax保留FP32 m/l；denominator使用未舍入p32，P显式RN后进入PV。O在FP32 rescale/add，最后归一化并RN输出。FP32求和树允许按误差合同调整；其余算法/舍入边界不自动获得修改授权。
 
-默认AIC先新QK后旧PV、AIV先新softmax后旧update。QK子流水为load/MAD/operand/FIX，PV子流水为load/MAD/operand并在外部FIX。编译器重构应保留这些政策、早释放、缓冲复用与事件共享；本轮不调参。
+默认AIC先新QK后旧PV、AIV先新softmax后旧update。QK子流水为load/MAD/operand/FIX，PV子流水为load/MAD/operand并在外部FIX。编译器保持这些政策、早释放、缓冲复用与事件共享。
 
 ## 资格边界
 
-旧产物曾对默认政策完成CANN和设备数值验证：Sq:Sk为128:1024、384:3072、768:1024、512:2048，阈值rtol=0.002、atol=0.0002；4K/8K另有采样记录。这些是历史资格，不能用于证明当前编译器的设备结果，产品中不保留旧编译实现。
-
-历史4K同卡msprof摘要为生成代码605.780µs、ACLNN512.152µs，差18.3%，仍未达标。旧库、部分profiler原始数据和旧目录已经清理，需要重建后才能再次运行；历史报告与当前状态入口见[状态页](refactor-progress.md)。
+数值验收配置包括 Sq:Sk 为128:1024、384:3072、768:1024、512:2048等，
+误差阈值为rtol=0.002、atol=0.0002；4K/8K用于稳态性能比较。
+每次结论绑定本次生成的ASC和库、输入与设备，采样与全输出验证分别标明。
 
 runner能接受某些dtype/head/tile参数不代表其全部通过。causal、mask、tail、空序列、varlen、paged/sparse、persistent及continuous多时钟状态不在默认例资格内。后续变体应通过通用控制/访问合同表达，不创建attention专属pass。
 
 ## 复现入口
 
-从工作区根目录运行；以下命令说明接口，本轮文档整理未执行：
+从本仓库根目录、已激活的 Python 环境运行：
 
 ```bash
-PYTHONPATH=AscendFlow .venv/bin/python -m ascendflow --input AscendFlow/examples/flash_attention/attention.py --entry attention_target --compile --timeout 300 --output runs/structured-loops/cann-fa
-PYTHONPATH=AscendFlow .venv/bin/python -m benchmarks.attention.run --output runs/structured-loops/fa --build
+python -m ascendflow --input examples/flash_attention/attention.py --entry attention_target --compile --timeout 300 --output build/attention/cann
+python -m benchmarks.attention.run --output build/attention/generated --build
 ```
 
 独立手写AscendC/ACLNN、设备运行和profile见[benchmarks](../benchmarks/README.md)。手写参考通过不等于本DSL通过。每次构建总期限≤300s；设备运行需全卡检查、显式物理映射，失败立即停止。

@@ -10,10 +10,8 @@ from xdsl.utils.exceptions import VerifyException
 from ascendflow import language as N
 from ascendflow.diagnostics import CompileError, ErrorKind
 from ascendflow.dialects.io import create_context, dump, parse
-from ascendflow.dialects.loops import LoopScheduleAttr, PhaseKind
 from ascendflow.dialects.source import PipelineOp, StageOp
 from ascendflow.passes.lower_pipeline import (
-    SCHEDULE_ATTRIBUTE,
     LowerPipelinePass,
     normalize_loop_controls,
 )
@@ -21,68 +19,65 @@ from examples.vector.scale import scale
 
 
 @pytest.mark.parametrize("depth", (0, 1, 2, 4, 32))
-def test_phases_preserve_each_stage_instance_and_physical_issue_order(depth):
-    schedule = LoopScheduleAttr(IntAttr(depth))
+def test_shifted_domains_preserve_each_stage_instance_and_physical_issue_order(depth):
+    lines = [
+        "def stages(n:N.int64):",
+        "    with N.Kernel():",
+        "        x=N.alloc_ub((64,))",
+        f"        for g in N.Pipelined(n,stages={depth + 1}):",
+    ]
+    for offset in range(depth + 1):
+        lines += [
+            f"            with N.Stage({offset},name='s{offset}'):",
+            "                N.fill(x,1.0)",
+        ]
+    module = N.from_source("\n".join(lines)).to_ir()
+    (control,) = normalize_loop_controls(module).loops
     for count in sorted({0, 1, 2, depth, depth + 1, 2 * depth + 1}):
-        # Independent oracle: place every logical operation on its physical
-        # step, then sort by step and a deliberately non-stage-sorted policy.
         order = tuple(reversed(range(depth + 1)))
         expected = sorted(
-            (
-                (iteration + stage, rank, iteration, stage)
-                for rank, stage in enumerate(order)
-                for iteration in range(count)
-            )
+            (g + stage, rank, g, stage) for rank, stage in enumerate(order) for g in range(count)
         )
+        values = {control.domain.upper: count}
         actual = []
-        for phase in schedule.phases:
-            interval = phase.interval(count)
-            if interval is None:
-                continue
-            for step in range(*interval):
-                for rank, stage in enumerate(order):
-                    logical = step - stage
-                    if 0 <= logical < count:
-                        actual.append((step, rank, logical, stage))
+        for tick in range(count + control.max_offset):
+            for rank, stage in enumerate(order):
+                g = control.source_iteration(tick, stage, values)
+                if g is not None:
+                    actual.append((tick, rank, g, stage))
         assert actual == expected
         assert len(actual) == count * (depth + 1)
-        assert len(schedule.phases) <= 4
-
-
-def test_depth_and_trip_count_equal_has_empty_steady_identity():
-    schedule = LoopScheduleAttr(IntAttr(3))
-    main = next(p for p in schedule.phases if p.kind == PhaseKind.LOOP)
-    assert main.interval(3) == (3, 3)
-    assert all(phase.interval(0) is None for phase in schedule.phases)
 
 
 def test_stage_depth_does_not_remove_release_distance_boundary_guards():
-    schedule = LoopScheduleAttr(IntAttr(0))
+    module = N.from_source("""
+        def reuse(n:N.int64):
+            with N.Kernel():
+                for g in N.Pipelined(n,stages=1):
+                    pass
+    """).to_ir()
+    (control,) = normalize_loop_controls(module).loops
     for count in (0, 1, 2, 3, 8):
         generations = [
-            g
-            for phase in schedule.phases
-            if (interval := phase.interval(count)) is not None
-            for g in range(*interval)
+            control.source_iteration(g, 0, {control.domain.upper: count}) for g in range(count)
         ]
-        # Data reuse distance is two even though there is no stage filling.
-        sends = [g for g in generations if g + 2 < count]
-        waits = [g - 2 for g in generations if g >= 2]
-        assert sends == waits == list(range(max(0, count - 2)))
+        assert (
+            [g for g in generations if g + 2 < count]
+            == [g - 2 for g in generations if g >= 2]
+            == list(range(max(0, count - 2)))
+        )
 
 
-def test_schedule_attribute_round_trips_and_no_source_body_is_cloned():
+def test_control_collection_round_trips_without_mutating_or_cloning_source():
     module = scale.to_ir()
     before = tuple(module.walk())
+    text = dump(module)
     controls = normalize_loop_controls(module)
     assert tuple(module.walk()) == before
     assert controls.module is module
-    assert len(controls.loops) == 1
-    assert controls.loops[0].schedule.horizon.data == 2
+    assert len(controls.loops) == 1 and controls.loops[0].max_offset == 2
     assert controls.statistics["body_clones"] == 0
-    module.verify()
-    text = dump(module)
-    assert "#npu.loop_schedule<" in text
+    assert "loop_schedule" not in text
     assert dump(parse(text)) == text
     LowerPipelinePass().apply(create_context(), module)
     assert dump(module) == text
@@ -154,7 +149,7 @@ def test_nested_bodies_have_additive_phase_size_not_three_to_the_depth(depth):
     module = N.from_source("\n".join(source)).to_ir()
     controls = normalize_loop_controls(module)
     assert len(controls.loops) == depth
-    assert controls.phase_descriptors == 4 * depth
+    assert len(controls.by_operation) == depth
     assert controls.statistics["maximum_depth"] == depth
     assert sum(op.name == "npu_source.element" for op in module.walk()) == 1
     assert Counter(type(op) for op in module.walk())[StageOp] == depth
@@ -189,14 +184,14 @@ def test_dynamic_step_diagnostic_before_partial_mutation():
         normalize_loop_controls(module)
     assert failure.value.kind == ErrorKind.UNSUPPORTED
     assert failure.value.phase == "loop-control"
-    assert all(SCHEDULE_ATTRIBUTE not in op.attributes for op in module.walk())
+    assert all("npu.loop_schedule" not in op.attributes for op in module.walk())
 
 
-def test_stale_attribute_is_not_a_proof_and_invalid_depth_is_rejected():
+def test_declared_stage_limit_is_checked_by_source_and_actual_extent_is_derived():
     module = scale.to_ir()
     pipeline = next(op for op in module.walk() if isinstance(op, PipelineOp))
-    pipeline.attributes[SCHEDULE_ATTRIBUTE] = LoopScheduleAttr(IntAttr(0))
-    normalize_loop_controls(module)
-    assert pipeline.attributes[SCHEDULE_ATTRIBUTE].horizon.data == 2
-    with pytest.raises(VerifyException, match="stage offset"):
-        LoopScheduleAttr(IntAttr(33))
+    pipeline.stages = IntAttr(33)
+    assert normalize_loop_controls(module).loops[0].max_offset == 2
+    pipeline.stages = IntAttr(34)
+    with pytest.raises(VerifyException):
+        module.verify()

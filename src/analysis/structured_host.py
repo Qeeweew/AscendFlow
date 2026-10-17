@@ -1,6 +1,7 @@
-"""Host integer-safety contracts over the owned physical SSA structure.
+"""Compile-time uniform extrema over the owned physical SSA structure.
 
-This stage derives launch-time signed extrema. It consumes the same actual
+These extrema describe legal index evaluations without emitting input checks.
+This stage consumes the same actual
 control and allocation facts as address admission; it neither selects events
 nor reinterprets native memory effects. Each scope constructs its scalar-range
 DAG once. Uniform subexpressions need no loop elimination or polynomial query.
@@ -90,7 +91,7 @@ class _HostRanges:
 
 
 def build_host_expressions(memory, bounds):
-    """Uniform signed extrema of every actual retained index SSA intermediate."""
+    """Uniform signed extrema for the compile-time index-range hypotheses."""
     environment, facts = memory.control.environment, memory.control.environment.facts
     result = {}
     scopes = {}
@@ -133,9 +134,6 @@ def build_host_expressions(memory, bounds):
         include(loop.lower, parent, loop.operation)
         include(loop.upper, parent, loop.operation)
         include(loop.count, parent, loop.operation)
-        horizon = getattr(loop.operation, "schedule", None)
-        extent = 0 if horizon is None else horizon.horizon.data
-        include(expression("add", loop.count, literal(extent)), parent, loop.operation)
         if not frame.statically_empty:
             include(loop.induction, frame, loop.operation)
     pending, seen = list(result), set()

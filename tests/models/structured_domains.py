@@ -64,13 +64,13 @@ def actual_dispatch(selection, uniform, actor):
                 if operation.kind.data == family:
                     visit(operation.body.block, context, coordinates)
             elif isinstance(operation, PipelineLoopOp):
-                iterations = range(*(scalar(value, context) for value in operation.operands))
+                iterations = range(max(0, scalar(operation.count, context)))
                 stages = [op for op in operation.body.block.ops if isinstance(op, PipelineStageOp)]
                 if operation.issue_order is not None and family in operation.issue_order.data:
                     by_name = {stage.label.data: stage for stage in stages}
                     stages = [by_name[label.data] for label in operation.issue_order.data[family]]
                 symbol = memory.control.loops[operation].ordinal.args[0]
-                for clock in range(len(iterations) + operation.schedule.horizon.data):
+                for clock in range(len(iterations) + operation.horizon):
                     for stage in stages:
                         ordinal = clock - stage.offset.data
                         if 0 <= ordinal < len(iterations):

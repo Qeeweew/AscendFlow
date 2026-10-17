@@ -72,7 +72,7 @@ class Fact:
     """A nonnegative integer range whose values are multiples of ``multiple``.
 
     Bounds describe mathematical integers. Derived products may exceed int64;
-    the checked launcher rejects overflowing evaluations before dispatch.
+    legal kernel inputs must keep actual index evaluations representable.
     """
 
     minimum: int = 0

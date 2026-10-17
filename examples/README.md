@@ -1,8 +1,8 @@
 # 算子示例
 
-算法、数学主体与固定排步政策放在这里；通用编译器不根据示例名选择实现。运行/计时/profiling放在[benchmarks](../benchmarks/README.md)，硬件反例放tests。当前编译器重构尚未完成，算子优化暂停。
+算法、数学主体与固定排步政策放在这里；通用编译器不根据示例名选择实现。运行/计时/profiling放在[benchmarks](../benchmarks/README.md)，硬件反例放tests。
 
-下表列出 AST 源码入口；列出不等于全部获得编译资格。Vector、GEMM、嵌套 CV、默认 FA 的当前产物及设备边界见[状态页](../docs/refactor-progress.md)。
+下表列出 AST 源码入口；每次构建和设备结果按[验证口径](../docs/validation.md)记录。
 
 | 示例 | 表达的结构 | 工具入口 |
 |---|---|---|
@@ -22,12 +22,12 @@
 | [state/frame_snapshot.py](state/frame_snapshot.py) | snapshot、WAR、最后读取 | 同上，--frame-snapshot |
 | [flash_attention/attention.py](flash_attention/attention.py) | 输出Q块、KV及原生子流水，CV多阶段 | 通用CLI及benchmarks.attention.run |
 
-从工作区根目录使用已有环境：
+从本仓库根目录、已激活的 Python 环境运行：
 
 ```bash
-PYTHONPATH=AscendFlow .venv/bin/python -m examples.vector.scale --output runs/quickstart/vector
+python -m examples.vector.scale --output build/quickstart/vector
 ```
 
-FA只有一个正常数学主体`attention_target`。默认dense f16 B1/Hq8/Hkv8/D128及BQ128/BK1024/CK128/VR8的数学、workspace和历史资格见[FA合同](../docs/attention-target.md)。Sq/Sk是runtime；不把外层Q块当成编译器专属控制类型。
+FA只有一个正常数学主体`attention_target`。默认dense f16 B1/Hq8/Hkv8/D128及BQ128/BK1024/CK128/VR8的数学、workspace和验证要求见[FA合同](../docs/attention-target.md)。Sq/Sk是runtime；不把外层Q块当成编译器专属控制类型。
 
 runner参数存在不等于变体已验证。causal、tail、空序列、varlen、paged/sparse、persistent和continuous多时钟状态分别需要明确合同。设计中的数学块/宏不是可运行API，不在examples堆预期失败的方案文件或多份候选算子。

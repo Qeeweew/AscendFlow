@@ -171,7 +171,7 @@ class PipelineOp(IRDLOperation):
         _verify_yield(self)
         if (
             (self.count is None) == (self.limit is None)
-            or (self.count is not None and not 0 <= self.count.data <= (1 << 31) - 1)
+            or (self.count is not None and not 0 <= self.count.data <= (1 << 63) - 1)
             or not 1 <= self.stages.data <= 33
             or self.order.data != "source"
         ):

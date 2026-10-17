@@ -3,7 +3,7 @@
 The default configuration uses B1/Hq8/Hkv8/D128 and BQ128/BK1024/CK128/VR8.
 Score, P and PV are explicit double-buffered GM workspaces. Other constexpr
 variants have no current qualification. Historical device evidence does not
-qualify the refactored compiler; see docs/refactor-progress.md.
+establish device correctness or performance for those configurations.
 """
 
 from __future__ import annotations

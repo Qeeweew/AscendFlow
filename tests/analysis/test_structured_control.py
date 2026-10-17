@@ -44,7 +44,7 @@ def test_same_loop_stages_share_logical_ordinal_without_claiming_same_dispatch_s
     for stage in loop.body.block.ops:
         if isinstance(stage, PipelineStageOp):
             assert control.environment.expression(stage.body.block.args[0]) is logical.ordinal
-            assert control.environment.expression(stage.body.block.args[1]) is logical.induction
+            assert len(stage.body.block.args) == 1
     assert [s.offset.data for s in loop.body.block.ops if isinstance(s, PipelineStageOp)] == [
         0,
         1,

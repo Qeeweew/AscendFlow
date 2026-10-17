@@ -20,7 +20,6 @@ from xdsl.irdl import (
 )
 from xdsl.traits import IsTerminator, RecursiveMemoryEffect
 
-from .loops import LoopScheduleAttr
 from .structured import ActorDomainOp, AddressOp, NotificationOp, PipelineLoopOp, PipelineStageOp
 from .types import AsyncEffects, RefType, TaskType, verify_runtime_contract
 
@@ -145,7 +144,7 @@ NPU = Dialect(
         PipelineStageOp,
         NotificationOp,
     ],
-    [RefType, TaskType, LoopScheduleAttr],
+    [RefType, TaskType],
 )
 
 

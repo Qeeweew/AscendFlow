@@ -7,6 +7,9 @@ never execute.
 
 from dataclasses import dataclass
 
+from xdsl.dialects import arith
+from xdsl.dialects.builtin import IntegerAttr
+
 from ..analysis.structured_addresses import AddressFacts
 from ..diagnostics import require
 from ..dialects.structured import AddressOp
@@ -70,7 +73,13 @@ def format_native(template, *, render, roots, task_names, generation):
         operation = ref.operation
         offset = render(operation.offset)
         if extra:
-            offset = f"({offset} + {extra})"
+            owner = operation.offset.owner
+            zero = (
+                isinstance(owner, arith.ConstantOp)
+                and isinstance(owner.value, IntegerAttr)
+                and owner.value.value.data == 0
+            )
+            offset = extra if zero else f"({offset} + {extra})"
         return f"({QUALIFIER[ref.geometry.bank]} {CTYPE[ref.dtype]}*)({roots[operation.source]} + ({offset}))"
 
     operands = []
