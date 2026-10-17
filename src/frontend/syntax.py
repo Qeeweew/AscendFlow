@@ -37,6 +37,7 @@ class Tensor:
     shape: tuple[int, ...]
     dtype: DType | str
     access: str = "read"
+    cache: str = "normal"
 
 
 def _ast_only():

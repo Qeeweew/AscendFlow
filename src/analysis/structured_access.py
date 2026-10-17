@@ -164,6 +164,54 @@ class _Partitioner:
             self._issue_keys.add(key)
             self.issues.append(DependencyIssue(kind, operation, message, cell))
 
+    def _separate_tiles(self, projections, loop):
+        """A single streaming clock advances exact rectangles on one ND grid.
+
+        Slot substitutions, contracted families and additional varying clocks
+        need their own relational rules. They cannot borrow this identity.
+        """
+        grid, index = None, None
+        low = high = 0
+        for projection in projections:
+            address = projection.access.address
+            tile, geometry = address.tile, address.geometry
+            if (
+                tile is None
+                or projection.slots
+                or projection.contracted
+                or projection.stop - projection.start != geometry.nbytes
+                or projection.rows != geometry.rows
+                or projection.row_stride != geometry.row_stride
+                or grid is not None
+                and grid != tile.grid
+            ):
+                return False
+            bindings = {
+                self.memory.control.sid: literal(1 if projection.participant is Actor.AIV1 else 0)
+            }
+            actual = expression("add", projection.origin, literal(projection.start))
+            if not equivalent(actual, substitute(address.offset, bindings), self.facts):
+                return False
+            value = substitute(tile.index, bindings)
+            if any(
+                other.operation is not loop.operation and _depends(value, other.ordinal)
+                for other in projection.template.frame.loops()
+            ):
+                return False
+            if index is not None:
+                displacement = _normalize(expression("sub", value, index), self.facts).constant
+                if displacement is None:
+                    return False
+                low, high = min(low, displacement), max(high, displacement)
+            else:
+                index = value
+            grid = tile.grid
+        if index is None:
+            return False
+        shifted = substitute(index, {loop.ordinal: expression("add", loop.ordinal, literal(1))})
+        delta = _normalize(expression("sub", shifted, index), self.facts)
+        return nonnegative(expression("sub", delta, literal(high - low + 1)), self.facts)
+
     def _slots(self, template, access, participant):
         address = access.address
         bindings = {self.memory.control.sid: literal(1 if participant is Actor.AIV1 else 0)}
@@ -433,8 +481,10 @@ class _Partitioner:
                 span = max(p.stop + (p.rows - 1) * p.row_stride for p in projections) - min(
                     p.start for p in projections
                 )
-                if not nonnegative(expression("sub", delta, literal(span)), self.facts) and any(
-                    p.access.mode.writes for p in projections
+                if (
+                    not nonnegative(expression("sub", delta, literal(span)), self.facts)
+                    and any(p.access.mode.writes for p in projections)
+                    and not self._separate_tiles(projections, loop)
                 ):
                     self.issue(
                         DependencyIssueKind.NONPERIODIC_REUSE,

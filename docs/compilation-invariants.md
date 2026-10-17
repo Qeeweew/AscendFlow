@@ -60,6 +60,11 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 
 ## 4. 物理、数值与硬件语义
 
+GM 缓存别名不创建新的物理存储身份。source 的 cache 提示随同一 root 保留到
+physical IR；bypass launcher 用目标 runtime 查询的地址别名绑定原始分配，查询
+失败直接返回错误。所有 byte bounds、alias、ownership、逻辑值和同步关系仍针对
+同一 allocation，不能用不同虚地址规避真实重叠。
+
 Set只能捕获合法source里程碑，不能把后续发射也当已完成；Wait只取得真实配对贡献。普通queue Wait和Scalar/cross controller阻塞分别建模。数据顺序、flag空闲和无死锁是不同保证。
 
 release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继续；MTE2读完共享GM可以释放GM而Vector继续。不能以整个计算完成替代最后读取，不能因不同tensor名称忽略别名。

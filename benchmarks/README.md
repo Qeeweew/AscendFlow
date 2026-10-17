@@ -46,6 +46,16 @@ vector、state、gemm、normalization runner 的每个 case 使用 `work` 字段
 
 `ascendflow.performance` 只保留硬件快照、profile 证据绑定和基于显式输入的条件速率模型，不重新验证物理 plan 或遍历旧同步图。调用条件模型时仍须独立说明各输入的来源，算法 FLOPs 不能替代未取得的 native FLOPs。
 
+## 连续矩阵 GEMM 与 ACLNN
+
+`benchmarks.gemm.run_dense` 使用普通连续 FP16 A/Bt 和 FP32 C，默认两个
+128×128 列片共享 A，按 example 的 L2 预算决定输出缓存政策。合同和复现见
+[gemm-target.md](../docs/gemm-target.md)。`--build` 保存完整编译器源码快照和
+DSL/IR/ASC/库身份；单独选择 `--backend generated` 或 `aclnn`，不在复用产物
+时重新编译。标准/精确数据、全输出/采样 oracle、guard 和设备 task 计时的
+范围分别记录。原有 batched/reduction/hierarchical 仍是各自显式 tile/panel
+合同的验证工具，不作为普通大矩阵的性能结果。
+
 ## FA三方对照
 
 数学和workspace合同见[attention-target.md](../docs/attention-target.md)。当前工具能接受部分head/dtype/tile政策，但默认例的设备证据不能自动扩展到这些参数。独立AscendC参考是BQ128模板；BQ256等政策与它不具有相同排步，比较必须标注。

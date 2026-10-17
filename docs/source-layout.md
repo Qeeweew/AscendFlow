@@ -162,4 +162,6 @@ canonicalization，不反复运行整个标量/条件 pass。
 后端打印最终 `scf.for/scf.if` 和实际地址 SSA，不构造循环次数、stage 偏移
 或阶段状态机。表达式内联按运算代价和使用次数选择；共享的复杂谓词保留
 SSA 名称，`i1` 输出为 `bool`。只有已知 operands 非负且除数为正时才省略
-unsigned 除法/余数的显式转换。launcher 仍只有 kernel 调用和 `return 0`。
+unsigned 除法/余数的显式转换。普通缓存的 launcher 只有 kernel 调用和
+`return 0`；显式 GM cache bypass 先查询目标 runtime 的同一 allocation 地址
+别名，错误直接返回。它不改变物理 root 或在 kernel 中增加同步。

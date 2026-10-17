@@ -94,6 +94,13 @@ def _allocations(memory):
             continue
         bank, dtype = operation.ref.type.bank.data, operation.ref.type.dtype.data
         _require(
+            operation.cache is None
+            or operation.cache.data in {"normal", "bypass"}
+            and (operation.cache.data == "normal" or bank == "GM"),
+            "cache policy must be normal or GM bypass",
+            operation,
+        )
+        _require(
             bank in {*CAPACITY, "GM"} and dtype in ITEMSIZE,
             "allocation has an unknown physical bank or dtype",
             operation,
@@ -175,9 +182,14 @@ def _original_view(address: AddressFacts, facts):
     itemsize = ITEMSIZE[geometry.dtype]
     strides, stride = [], literal(itemsize)
     base = literal(0)
-    for origin, extent in reversed(tuple(zip(axes.origins, axes.extents, strict=True))):
+    pairs = tuple(zip(axes.origins, axes.extents, strict=True))
+    for axis in range(len(pairs) - 1, -1, -1):
+        origin, extent = pairs[axis]
         strides.insert(0, stride)
-        base = expression("add", base, expression("mul", origin, stride))
+        physical_stride = stride
+        if geometry.layout == "NZ" and axis == len(pairs) - 1:
+            physical_stride = expression("mul", stride, axes.extents[-2])
+        base = expression("add", base, expression("mul", origin, physical_stride))
         stride = expression("mul", stride, extent)
     expected = expression("add", base, literal(axes.displacement))
     if not equivalent(address.offset, expected, facts):
@@ -218,14 +230,18 @@ def _original_view(address: AddressFacts, facts):
     if geometry.layout != "linear":
         rank = len(axes.origins)
         extents = tuple(normalize(extent, facts).constant for extent in axes.extents[-2:])
+        column_slice = geometry.bank == "L1" and geometry.layout == "NZ"
         _require(
             rank >= 2
             and selected == (rank - 2, rank - 1)
-            and all(equivalent(origin, literal(0), facts) for origin in axes.origins[-2:])
+            and equivalent(axes.origins[-2], literal(0), facts)
+            and (column_slice or equivalent(axes.origins[-1], literal(0), facts))
             and all(extent is not None and extent > 0 and extent % 16 == 0 for extent in extents)
-            and tuple(axes.widths[-2:]) == extents
-            and pitch == width,
-            "fractal address needs its complete original matrix plane",
+            and axes.widths[-2] == extents[0]
+            and axes.widths[-1] % 16 == 0
+            and _multiple_of(axes.origins[-1], 16, facts)
+            and (column_slice or axes.widths[-1] == extents[1]),
+            "fractal address needs its complete matrix plane or an aligned full-row L1 NZ column slice",
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )
@@ -233,10 +249,11 @@ def _original_view(address: AddressFacts, facts):
             axes.displacement == 0
             and geometry.contiguous
             and geometry.total_nbytes == width * rows,
-            "fractal native subview must retain the complete original matrix plane",
+            "fractal native subview must retain the complete selected physical plane",
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )
+        return width * rows, 1, 0
     return width, rows, pitch
 
 

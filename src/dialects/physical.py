@@ -58,6 +58,7 @@ class BufferOp(IRDLOperation):
     initialized = attr_def(IntAttr)
     extent_count = opt_operand_def(IndexType)
     count_scale = opt_attr_def(IntAttr)
+    cache = opt_attr_def(StringAttr)
     ref = result_def(RefType)
     traits = traits_def(AsyncEffects())
 

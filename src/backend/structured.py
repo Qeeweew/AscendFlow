@@ -549,7 +549,7 @@ def _emit_owned(plan, *, host_launcher=True, work=None):
 
 
 def _launcher(emitter):
-    """Emit only the shared-library ABI wrapper around one kernel launch."""
+    """Bind cache aliases of the same GM allocations, then launch one kernel."""
     root = emitter.root
     buffer_names = [buffer.sym_name.data for buffer in emitter.externals]
     require(
@@ -560,11 +560,35 @@ def _launcher(emitter):
     signature = ["void* stream"] + [f"void* arg_{name}" for name in buffer_names]
     signature += [f"int64_t npu_size_{op.sym_name.data}" for op in emitter.parameters]
     arguments = [f"(uint8_t*)arg_{name}" for name in buffer_names]
+    bypass = {
+        i
+        for i, buffer in enumerate(emitter.externals)
+        if buffer.cache is not None and buffer.cache.data == "bypass"
+    }
+    cache_setup, declarations = [], []
+    if bypass:
+        declarations = [
+            'extern "C" int32_t rtGetDevice(int32_t*);',
+            'extern "C" int32_t rtGetL2CacheOffset(uint32_t, uint64_t*);',
+        ]
+        cache_setup = [
+            "  int32_t npu_device = 0;",
+            "  int32_t npu_status = rtGetDevice(&npu_device);",
+            "  if (npu_status != 0) return npu_status;",
+            "  uint64_t npu_l2_offset = 0;",
+            "  npu_status = rtGetL2CacheOffset(uint32_t(npu_device), &npu_l2_offset);",
+            "  if (npu_status != 0) return npu_status;",
+            "  if (npu_l2_offset == 0) return -1;",
+        ]
+        for i in bypass:
+            arguments[i] = f"(uint8_t*)(uintptr_t(arg_{buffer_names[i]}) + npu_l2_offset)"
     arguments += [f"npu_size_{op.sym_name.data}" for op in emitter.parameters]
     groups = 1 if root.blocks is None else root.blocks.data
     return [
         "",
+        *declarations,
         f'extern "C" int launch_{root.sym_name.data}({", ".join(signature)}) {{',
+        *cache_setup,
         f"  {root.sym_name.data}<<<{groups}, nullptr, stream>>>({', '.join(arguments)});",
         "  return 0;",
         "}",

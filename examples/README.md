@@ -15,6 +15,7 @@
 | [gemm/batched.py](gemm/batched.py) | L1/L0/MAD/FIX多缓冲 | benchmarks.gemm.run |
 | [gemm/reduction.py](gemm/reduction.py) | runtime K归约 | benchmarks.gemm.run_reduction |
 | [gemm/hierarchical.py](gemm/hierarchical.py) | 输出块循环嵌套K流水 | benchmarks.gemm.run_hierarchical |
+| [gemm/dense.py](gemm/dense.py) | 连续 NT 矩阵、配对列片与输出缓存政策 | benchmarks.gemm.run_dense |
 | [cv/nested.py](cv/nested.py) | 双缓冲 GM handoff、嵌套 Cube 与共享双 AIV body | 通用 CLI，entry=nested_cv |
 | [state/recurrence.py](state/recurrence.py) | 初始化、递推、导出 | benchmarks.state.run |
 | [state/grouped.py](state/grouped.py) | 两runtime轴、跨调用复用 | benchmarks.state.run_grouped |
@@ -28,6 +29,6 @@
 python -m examples.vector.scale --output build/quickstart/vector
 ```
 
-FA只有一个正常数学主体`attention_target`。默认dense f16 B1/Hq8/Hkv8/D128及BQ128/BK1024/CK128/VR8的数学、workspace和验证要求见[FA合同](../docs/attention-target.md)。Sq/Sk是runtime；不把外层Q块当成编译器专属控制类型。
+FA只有一个正常数学主体`attention_target`。默认dense f16 B1/Hq8/Hkv8/D128及BQ256/BK1024/CK128/VR8的数学、workspace和验证要求见[FA合同](../docs/attention-target.md)。Sq/Sk是runtime；不把外层Q块当成编译器专属控制类型。
 
 runner参数存在不等于变体已验证。causal、tail、空序列、varlen、paged/sparse、persistent和continuous多时钟状态分别需要明确合同。设计中的数学块/宏不是可运行API，不在examples堆预期失败的方案文件或多份候选算子。

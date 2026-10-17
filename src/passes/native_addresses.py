@@ -175,15 +175,17 @@ def lower_address(
     _require(selected[-1] == itemsize, "native tile columns must be contiguous", unsupported=True)
     contiguous = len(dimensions) == 1 or selected[0] == dimensions[1] * itemsize
     if typ.layout.data != "linear":
+        column_slice = typ.memory.data == "L1" and typ.layout.data == "NZ"
         _require(
             len(shape) >= 2
             and len(dimensions) == 2
             and axes == (len(shape) - 2, len(shape) - 1)
-            and dimensions == shape[-2:]
+            and dimensions[0] == shape[-2]
+            and (column_slice or dimensions[1] == shape[-1])
             and all(size > 0 and size % 16 == 0 for size in dimensions)
-            and all(_constant(origin) == 0 for origin in tuple(view.origins)[-2:])
-            and contiguous,
-            "fractal view must select a complete matrix plane; partial-plane slices need a layout mapping",
+            and _constant(view.origins[-2]) == 0
+            and (column_slice or _constant(view.origins[-1]) == 0),
+            "fractal view needs a complete matrix plane or an aligned full-row L1 NZ column slice",
             unsupported=True,
         )
     if len(dimensions) == 2 and typ.layout.data == "linear" and (matrix or not contiguous):
@@ -209,7 +211,12 @@ def lower_address(
     pairs = tuple(zip(origins, actual_extents, strict=True))
     for axis in range(len(pairs) - 1, -1, -1):
         origin, extent = pairs[axis]
-        offset = indices.binary(arith.AddiOp, offset, indices.binary(arith.MuliOp, origin, stride))
+        physical_stride = stride
+        if typ.layout.data == "NZ" and axis == len(pairs) - 1:
+            physical_stride = indices.binary(arith.MuliOp, stride, shape[-2])
+        offset = indices.binary(
+            arith.AddiOp, offset, indices.binary(arith.MuliOp, origin, physical_stride)
+        )
         if axis:
             stride = indices.binary(arith.MuliOp, extent, stride)
     address = AddressOp.build(

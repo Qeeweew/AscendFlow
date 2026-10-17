@@ -607,7 +607,7 @@ def _dependency_inputs(values):
     return _ints(i for i, value in enumerate(values) if isinstance(value, _Value))
 
 
-def _allocate(shape, dtype, memory, *, layout="linear", name=None, access="local"):
+def _allocate(shape, dtype, memory, *, layout="linear", name=None, access="local", cache="normal"):
     trace = _trace()
     shape = tuple(shape)
     require(
@@ -616,6 +616,12 @@ def _allocate(shape, dtype, memory, *, layout="linear", name=None, access="local
     )
     axes = [i for i, n in enumerate(shape) if isinstance(n, _Dimension)]
     require(not axes or memory == "GM", "local native tile shapes must be static")
+    require(
+        type(cache) is str
+        and cache in {"normal", "bypass"}
+        and (cache == "normal" or memory == "GM"),
+        "cache policy must be normal or GM bypass",
+    )
     require(
         len(axes) <= 8 and all(shape[i].scale == 1 for i in axes),
         "at most eight unscaled runtime tensor axes required",
@@ -631,6 +637,7 @@ def _allocate(shape, dtype, memory, *, layout="linear", name=None, access="local
             "access": StringAttr(access),
             "ring": IntAttr(0),
             "dynamic_axes": _ints(axes),
+            **({"cache": StringAttr(cache)} if cache != "normal" else {}),
         },
     )
     trace.add(op)

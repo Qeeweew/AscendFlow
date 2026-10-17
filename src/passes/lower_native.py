@@ -219,6 +219,8 @@ class _Lowerer:
             "external": IntAttr(int(op.ref.type.memory.data == "GM")),
             "initialized": IntAttr(int(op.access.data in {"read", "read_write"})),
         }
+        if op.cache is not None:
+            attrs["cache"] = op.cache
         if extent is not None:
             attrs["count_scale"] = IntAttr(size)
         buffer = BufferOp.build(

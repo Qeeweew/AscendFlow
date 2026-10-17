@@ -278,7 +278,7 @@ class _Parser:
             if not isinstance(typ, syntax.Tensor):
                 self.fail(arg, "expected Tensor shape/dtype/access annotation")
             self.env[arg.arg] = builders._allocate(
-                typ.shape, typ.dtype, "GM", name=arg.arg, access=typ.access
+                typ.shape, typ.dtype, "GM", name=arg.arg, access=typ.access, cache=typ.cache
             )
 
     def body(self, nodes):
@@ -580,6 +580,12 @@ class _Parser:
             lhs, rhs = self.expr(node.left), self.expr(node.comparators[0])
             name, compare = _COMPARE[type(node.ops[0])]
             if type(lhs) in {int, float, bool} and type(rhs) in {int, float, bool}:
+                return compare(lhs, rhs)
+            if (
+                type(lhs) is str
+                and type(rhs) is str
+                and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
+            ):
                 return compare(lhs, rhs)
             return self.trace.index_op(arith.CmpiOp, lhs, rhs, comparison=name)
         if isinstance(node, ast.Call):

@@ -103,10 +103,17 @@ class AllocationOp(IRDLOperation):
     ring = attr_def(IntAttr)
     dimensions = var_operand_def(IndexType)
     dynamic_axes = opt_attr_def(ArrayAttr[IntAttr])
+    cache = opt_attr_def(StringAttr)
     ref = result_def(TensorType)
     traits = traits_def(AsyncEffects())
 
     def verify_(self):
+        if self.cache is not None and (
+            self.cache.data not in {"normal", "bypass"}
+            or self.cache.data == "bypass"
+            and self.ref.type.memory.data != "GM"
+        ):
+            raise VerifyException("cache policy must be normal or GM bypass")
         typ = self.ref.type
         if (
             not typ.shape
