@@ -36,6 +36,21 @@ class FamilyCapture:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectedOrdinal:
+    """FIRST/LAST produced by the finite residue selection rule.
+
+    Binding establishes count <= the actual loop count. Under count > first,
+    value is a real member, not an arbitrary coordinate carrying a Boolean
+    verification tag. Ordered raw guard definedness is still checked later.
+    """
+
+    loop: Operation
+    count: Expr
+    first: Expr
+    value: Expr
+
+
+@dataclass(frozen=True, slots=True)
 class BoundPlacement:
     occurrence: AccessOccurrence
     placement: Placement
@@ -48,6 +63,7 @@ class BoundPlacement:
     # Actual ordinals expressed in the requirement's canonical coordinates.
     # Selection happens exactly once. Resource proofs consume these values.
     coordinates: tuple[tuple[Operation, Expr], ...]
+    selected: tuple[SelectedOrdinal, ...] = ()
 
     @property
     def operation(self):
@@ -81,6 +97,9 @@ class LogicalNotification:
     period: int
     distance: int | None
     domains: tuple[LoopDomain, ...] = ()
+    # The original adjacent lifetime/value edges of the selected real capture
+    # and acquire. Coverage can grow; these ownership edges do not change.
+    origins: tuple[StructuredNeed, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

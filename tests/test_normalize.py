@@ -19,13 +19,13 @@ def test_expert_policy_cannot_silently_drop_stage_constraints(labels):
     pipeline.attributes["issue_order"] = DictionaryAttr(
         {"vector": ArrayAttr(StringAttr(label) for label in labels)}
     )
-    with pytest.raises(CompileError, match="every active Stage"):
+    with pytest.raises(CompileError, match="every participating Stage exactly once"):
         compile(source)
 
 
 def test_reduction_scratch_alias_cannot_be_hidden_by_sync():
     source = rms_normalize.source.replace("scratch=partial", "scratch=y[slot, :64]")
-    with pytest.raises(CompileError, match="shifted in-place Vector alias"):
+    with pytest.raises(CompileError, match="native read/write aliases"):
         compile(from_source(source, disjoint_external=True))
 
 

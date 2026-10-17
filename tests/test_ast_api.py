@@ -89,7 +89,7 @@ def test_actor_local_allocation_cannot_escape_to_another_source_region():
         definition.to_ir()
 
 
-def test_allocation_may_be_used_inside_its_own_source_region():
+def test_source_local_allocation_does_not_grant_runtime_allocation_support():
     definition = N.from_source("""
         def local():
             with N.Kernel():
@@ -98,4 +98,6 @@ def test_allocation_may_be_used_inside_its_own_source_region():
                         x=N.alloc_ub((64,))
                         N.fill(x,0.0)
     """)
-    assert compile(definition).report["native_templates"] == 1
+    definition.to_ir().verify()  # Its source scope is valid.
+    with pytest.raises(CompileError, match="allocations must be declared at kernel entry"):
+        compile(definition)

@@ -37,6 +37,18 @@ def _scale(a, coefficient):
     return {term: c * coefficient for term, c in a.items() if c * coefficient}
 
 
+def _ratio(numerator, denominator):
+    """Exact coefficient division, retaining the common integer case.
+
+    Python int also implements Rational's numerator/denominator contract.
+    Never use int/int's floating point division in the proof representation.
+    """
+    if isinstance(numerator, int) and isinstance(denominator, int):
+        quotient, remainder = divmod(numerator, denominator)
+        return Fraction(numerator, denominator) if remainder else quotient
+    return numerator / denominator
+
+
 def _product(a, b):
     require(len(a) * len(b) <= MAX_TERMS, "index algebra product budget exceeded")
     result = {}
@@ -202,7 +214,7 @@ class _PolynomialQuery:
         if expr in self.memo:
             return self.memo[expr]
         if expr.kind == "constant":
-            result = {(): Fraction(expr.constant)} if expr.constant else {}
+            result = {(): expr.constant} if expr.constant else {}
         elif expr.kind in {"add", "mul"}:
             a, b = (self.visit(arg) for arg in expr.args)
             _charge(
@@ -216,7 +228,7 @@ class _PolynomialQuery:
             )
             result = _sum(a, b) if expr.kind == "add" else _product(a, b)
         elif self.retained:
-            result = {(self.atom(expr),): Fraction(1)}
+            result = {(self.atom(expr),): 1}
         elif expr.kind in {"floordiv", "rem"}:
             numerator, divisor = expr.args
             require(
@@ -232,7 +244,7 @@ class _PolynomialQuery:
                 and coordinate.kind == "argument"
                 and coordinate.args[0].startswith("$")
             ):
-                result = {(self.atom(expr),): Fraction(1)}
+                result = {(self.atom(expr),): 1}
             elif expr.kind == "rem":
                 quotient = self.visit(expression("floordiv", numerator, divisor))
                 result = _sum(
@@ -258,14 +270,14 @@ class _PolynomialQuery:
                                     (counts - needed).elements(), key=lambda atom: atom.order_key
                                 )
                             )
-                            candidate = {remaining: coefficient / dc}
+                            candidate = {remaining: _ratio(coefficient, dc)}
                             if _integral(candidate, self.facts):
                                 quotient = _sum(quotient, candidate)
                                 del remainder[term]
                 if not remainder:
                     result = quotient
-                elif remainder == {(): Fraction(-1)} and quotient:
-                    result = _sum(quotient, {(): Fraction(-1)})
+                elif remainder == {(): -1} and quotient:
+                    result = _sum(quotient, {(): -1})
                 else:
                     # Keep integral operand reconstruction for existing index
                     # identities. Congruence no longer depends on this spelling.
@@ -273,9 +285,9 @@ class _PolynomialQuery:
                         numerator = _to_expr(top)
                         divisor = _to_expr(bottom)
                     atom = expression("floordiv", numerator, divisor)
-                    result = {(self.atom(atom),): Fraction(1)}
+                    result = {(self.atom(atom),): 1}
         else:
-            result = {(self.atom(expr),): Fraction(1)}
+            result = {(self.atom(expr),): 1}
         self.memo[expr] = result
         return result
 
@@ -295,18 +307,9 @@ def normalize(expr, facts, *, identity=None):
 
 
 def arguments(expr):
-    result, seen, pending = set(), set(), [expr]
-    while pending:
-        current = pending.pop()
-        identity = id(current)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        if current.kind == "argument":
-            result.add(current.args[0])
-        else:
-            pending.extend(arg for arg in current.args if isinstance(arg, Expr))
-    return result
+    # Free variables are compositional expression facts, independent of any
+    # input range or guard. Establish them with each immutable node once.
+    return set(expr.variables)
 
 
 def physical_terms(expr, facts):
@@ -334,7 +337,7 @@ def nonnegative(expr, facts):
         return True
     if expr.kind == "min" and all(nonnegative(arg, facts) for arg in expr.args):
         return True
-    lower = Fraction(0)
+    lower = 0
     for term, coefficient in polynomial(expr, facts).items():
         if coefficient < 0 and term:
             return False
@@ -348,7 +351,7 @@ def nonnegative(expr, facts):
     return lower >= 0
 
 
-def _joint_affine_interval(expr, domains, facts):
+def _joint_affine_interval(expr, domains, facts, *, atomic=False):
     """Recover a proved joint coordinate after ordinary polynomial expansion.
 
     A captured address may spell ``tile*core + tile*groups*query`` rather
@@ -359,7 +362,7 @@ def _joint_affine_interval(expr, domains, facts):
     candidates = [
         (coordinate, lower, upper)
         for coordinate, lower, upper in domains
-        if coordinate.kind in {"add", "mul"}
+        if coordinate.kind in ({"argument", "add", "mul"} if atomic else {"add", "mul"})
         and any(name.startswith("$") for name in arguments(coordinate))
     ]
     if not candidates or expr.kind not in {"add", "mul"}:
@@ -382,7 +385,7 @@ def _joint_affine_interval(expr, domains, facts):
         right = varying(bottom)
         if not right or left.keys() != right.keys():
             continue
-        ratios = {left[term] / coefficient for term, coefficient in right.items()}
+        ratios = {_ratio(left[term], coefficient) for term, coefficient in right.items()}
         if len(ratios) != 1:
             continue
         (ratio,) = ratios

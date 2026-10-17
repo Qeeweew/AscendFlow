@@ -24,6 +24,7 @@ from ..analysis.structured_protocols import (
     NotificationCoverage,
     NotificationKind,
     OrderingWitness,
+    SelectedOrdinal,
     SynchronizationSelection,
     UnresolvedSynchronization,
     substitute,
@@ -179,7 +180,9 @@ def _restricted_family(family, need, memory):
     return family
 
 
-def _bind_endpoint(need, occurrence, memory, *, source):
+def _bind_endpoint(
+    need, occurrence, memory, *, source, consumer_coordinates=(), effective_guards=None
+):
     control, environment = memory.control, memory.control.environment
     template = next(item for item in memory.templates if item.operation is occurrence.operation)
     engine = template.contract.engine
@@ -192,6 +195,7 @@ def _bind_endpoint(need, occurrence, memory, *, source):
         [],
     )
     own_bindings = {binding.loop: binding.ordinal for binding in occurrence.bindings}
+    selections = []
     family_map = {domain.loop: domain for domain in occurrence.families}
     available = {control.group.args[0], control.sid.args[0]}
     available.update(name for name in environment.facts if not name.startswith("$"))
@@ -241,6 +245,27 @@ def _bind_endpoint(need, occurrence, memory, *, source):
             coordinate_guards.append((binding.loop, ActionGuard((activation,))))
             value = first if value.position is ResiduePosition.FIRST else last
         assert isinstance(value, Expr)
+        if selector:
+            scope_count = substitute(
+                logical.count,
+                {control.loops[loop].ordinal: coordinate for loop, coordinate in coordinates},
+            )
+
+            def contained(count, scope_count=scope_count):
+                if count == scope_count:
+                    return True
+                if count.kind == "min" and any(contained(part) for part in count.args):
+                    return True
+                return nonnegative(expression("sub", scope_count, count), environment.facts)
+
+            selection_count = family.count if binding.loop in family_map else count
+            require(
+                contained(selection_count),
+                "selected ordinal family exceeds the actual native loop count",
+                kind=ErrorKind.UNSUPPORTED,
+                phase="notification-binding",
+            )
+            selections.append(SelectedOrdinal(binding.loop, selection_count, first, value))
         if not selector and logical.ordinal.args[0] in arguments(value):
             difference = normalize(expression("sub", value, logical.ordinal), environment.facts)
             if difference.constant is not None:
@@ -259,6 +284,22 @@ def _bind_endpoint(need, occurrence, memory, *, source):
         coordinates.append((binding.loop, value))
         substitutions[logical.ordinal] = selected
         selector_tests.append(Comparison(logical.ordinal, "==", value))
+
+    # A finite selected source can be coordinate 0 while the need's canonical
+    # consumer coordinate is 1. Domain predicates still refer to that consumer;
+    # the source's actual selector equality keeps its own physical coordinate.
+    actual_substitutions = dict(substitutions)
+    if source:
+        consumer_coordinates = dict(consumer_coordinates)
+        for domain in need.domains:
+            ordinal = control.loops[domain.loop].ordinal
+            selected_consumer = consumer_coordinates.get(domain.loop)
+            if (
+                selected_consumer is not None
+                and ordinal in substitutions
+                and ordinal.args[0] not in arguments(selected_consumer)
+            ):
+                substitutions[ordinal] = substitute(selected_consumer, actual_substitutions)
 
     for domain in need.domains:
         logical = control.loops[domain.loop]
@@ -279,7 +320,12 @@ def _bind_endpoint(need, occurrence, memory, *, source):
         else:
             first, _ = _selected(domain.count, domain.period, domain.residue, lower)
             tests.append(Comparison(domain.count, ">", first))
-    tests.extend(_case_tests(_effective_guards(need, memory), environment))
+    tests.extend(
+        _case_tests(
+            _effective_guards(need, memory) if effective_guards is None else effective_guards,
+            environment,
+        )
+    )
 
     # Selector equalities compare the current actual ordinal, whereas every
     # other test is phrased in the requirement's logical consumer coordinates.
@@ -290,7 +336,7 @@ def _bind_endpoint(need, occurrence, memory, *, source):
     ]
     rendered.extend(_comparison(test, substitutions, environment.facts) for test in tests)
     rendered.extend(
-        Comparison(test.lhs, test.predicate, substitute(test.rhs, substitutions))
+        Comparison(test.lhs, test.predicate, substitute(test.rhs, actual_substitutions))
         for test in selector_tests
     )
     guard = _guard(rendered)
@@ -308,6 +354,7 @@ def _bind_endpoint(need, occurrence, memory, *, source):
         tuple(coordinate_guards),
         tuple(families),
         tuple(coordinates),
+        tuple(selections),
     )
 
 
@@ -351,6 +398,19 @@ class _IssueOrder:
         self.arithmetic = IntegerFacts(dispatch.memory.control.environment.facts)
         self._loop_order = {loop: index for index, loop in enumerate(dispatch.memory.control.loops)}
         self._premises = {}
+        self._guards = {}
+        self._positions = {}
+
+    def guards(self, need):
+        if need not in self._guards:
+            self._guards[need] = _effective_guards(need, self.dispatch.memory)
+        return self._guards[need]
+
+    def position(self, point):
+        key = point.operation, point.actor, point.coordinates
+        if key not in self._positions:
+            self._positions[key] = _dispatch_path(point, self.dispatch)
+        return self._positions[key]
 
     def premises(self, need):
         if need not in self._premises:
@@ -380,12 +440,10 @@ class _IssueOrder:
         if before.actor is not after.actor:
             return None
         premises = self.premises(need)
-        for a, b in zip(
-            _dispatch_path(before, self.dispatch), _dispatch_path(after, self.dispatch)
-        ):
+        for a, b in zip(self.position(before), self.position(after)):
             if a[0] is not b[0]:
                 return None
-            if self.arithmetic.prove(Comparison(a[1], "==", b[1]), premises):
+            if a[1] == b[1] or self.arithmetic.prove(Comparison(a[1], "==", b[1]), premises):
                 if a[2] != b[2]:
                     return -1 if a[2] < b[2] else 1
                 continue
@@ -445,99 +503,6 @@ def _effective_guards(need, memory):
     return tuple(result)
 
 
-def _remove_residue(point, domain, memory):
-    coordinate = memory.control.loops[domain.loop].ordinal
-    test = _comparison(
-        Comparison(
-            expression("rem", coordinate, literal(domain.period)), "==", _integer(domain.residue)
-        ),
-        dict(point.substitutions),
-        memory.control.environment.facts,
-    )
-    return replace(
-        point, guard=ActionGuard(tuple(other for other in point.guard.comparisons if other != test))
-    )
-
-
-def _complete_residues(values, period, facts):
-    """A full set of fixed modular translates, never a runtime clock scan."""
-    if len(values) != period:
-        return False
-    numerators = []
-    for value in values:
-        value = _integer(value)
-        if value.constant is not None:
-            numerators.append(value)
-        elif value.kind == "rem" and value.args[1].constant == period:
-            numerators.append(value.args[0])
-        else:
-            return False
-    differences = []
-    for value in numerators:
-        difference = normalize(expression("sub", value, numerators[0]), facts).constant
-        if difference is None:
-            return False
-        differences.append(difference % period)
-    return len(set(differences)) == period
-
-
-def _merge_residue_partitions(notifications, memory):
-    """Unite complete domain classes without changing first/count or packets.
-
-    FIRST/LAST fragments with different chosen coordinates cannot match this
-    key. In particular this cannot invent a whole-child readiness boundary.
-    """
-    selected = tuple(notifications)
-    for loop in memory.control.loops:
-        groups, rest = {}, []
-        for item in selected:
-            index = next(
-                (i for i, d in enumerate(item.domains) if d.loop is loop and d.period > 1), None
-            )
-            if index is None:
-                rest.append(item)
-                continue
-            domain = item.domains[index]
-            merged = replace(domain, period=1, residue=0)
-            domains = item.domains[:index] + (merged,) + item.domains[index + 1 :]
-            source = _remove_residue(item.sources[0], domain, memory)
-            consumer = _remove_residue(item.consumers[0], domain, memory)
-            key = (
-                _point_key(source),
-                _point_key(consumer),
-                item.source_engine,
-                item.destination_engine,
-                item.mechanism,
-                item.clock,
-                item.ordinal,
-                item.distance,
-                domains,
-                domain.period,
-            )
-            groups.setdefault(key, []).append((item, source, consumer, domains, domain))
-        for entries in groups.values():
-            if not _complete_residues(
-                tuple(e[4].residue for e in entries),
-                entries[0][4].period,
-                memory.control.environment.facts,
-            ):
-                rest.extend(e[0] for e in entries)
-                continue
-            item, source, consumer, domains, domain = entries[0]
-            rest.append(
-                replace(
-                    item,
-                    sources=(source,),
-                    consumers=(consumer,),
-                    domains=domains,
-                    period=1 if item.clock is domain.loop else item.period,
-                    requirements=tuple(n for e in entries for n in e[0].requirements),
-                )
-            )
-        selected = tuple(rest)
-    return selected
-
-
 def _clock(need, source, consumer, memory):
     if need.loop is not None:
         return need.loop
@@ -552,10 +517,19 @@ def _clock(need, source, consumer, memory):
     return None
 
 
-def _bind_notification(need, dispatch):
+def _bind_notification(need, dispatch, effective_guards):
     memory = dispatch.memory
-    source = _bind_endpoint(need, need.source, memory, source=True)
-    consumer = _bind_endpoint(need, need.consumer, memory, source=False)
+    consumer = _bind_endpoint(
+        need, need.consumer, memory, source=False, effective_guards=effective_guards
+    )
+    source = _bind_endpoint(
+        need,
+        need.source,
+        memory,
+        source=True,
+        consumer_coordinates=consumer.coordinates,
+        effective_guards=effective_guards,
+    )
     a, b = (dispatch.tasks[p.operation, p.actor] for p in (source, consumer))
     cross = source.actor is not consumer.actor
     require(
@@ -586,6 +560,7 @@ def _bind_notification(need, dispatch):
         need.period,
         need.distance,
         need.domains,
+        (need,),
     )
 
 
@@ -633,14 +608,12 @@ def _group_captures(notifications, order):
     return tuple(grouped.values())
 
 
-def _contains_activation(wide, narrow, memory):
+def _contains_activation(wide, narrow, order):
     if wide.clock is not narrow.clock:
         return False
-    facts = memory.control.environment.facts
+    facts = order.dispatch.memory.control.environment.facts
     needed = narrow.requirements[0]
-    if not set(_effective_guards(wide.requirements[0], memory)) <= set(
-        _effective_guards(needed, memory)
-    ):
+    if not set(order.guards(wide.requirements[0])) <= set(order.guards(needed)):
         return False
     domains = {domain.loop: domain for domain in narrow.domains}
     selected_families = {f.loop: f for point in wide.consumers for f in point.families}
@@ -696,7 +669,7 @@ def _reuse_acquisitions(notifications, order):
                 previous.source_engine is not item.source_engine
                 or previous.destination_engine is not item.destination_engine
                 or previous.sources[0].actor is not item.sources[0].actor
-                or not _contains_activation(previous, item, order.dispatch.memory)
+                or not _contains_activation(previous, item, order)
             ):
                 continue
             acquire = {
@@ -767,18 +740,23 @@ def _quorums(notifications):
             )
             continue
         local.append(
-            replace(first, sources=sources, consumers=consumers, requirements=requirements)
+            replace(
+                first,
+                sources=sources,
+                consumers=consumers,
+                requirements=requirements,
+                origins=tuple(n for item in items for n in item.origins),
+            )
         )
     return tuple(local), tuple(unresolved)
 
 
-def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
+def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     """Consume all finite recursive needs through one capture/acquire contract.
 
-    This establishes data coverage only. Pairing, event lifetimes, capacity
-    and progress remain explicit duties of the single resource stage.
-    This incomplete generation contract is the redesign entry point described
-    in docs/refactor-plan.md; coverage alone cannot authorize executable sync.
+    This internal step establishes coverage and preserves its original
+    ownership edges. generate_notifications then constructs pairing, phase
+    order and complete lifetimes. Coverage alone cannot authorize allocation.
     """
     require(isinstance(dependencies, StructuredDependencies), "selection needs actual dependencies")
     dependencies.require_closed()
@@ -788,16 +766,34 @@ def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
     )
     order = _IssueOrder(dispatch)
     notifications, coverage, unresolved = [], [], []
+    bundles = {}
     for need in dependencies.required:
+        key = (
+            need.source,
+            need.consumer,
+            need.loop,
+            need.distance,
+            need.period,
+            need.domains,
+            order.guards(need),
+            need.cell.root.type.bank,
+        )
+        bundles.setdefault(key, []).append(need)
+    for bundle in bundles.values():
+        need = bundle[0]
         if not isinstance(need.source, AccessOccurrence):
-            unresolved.append(UnresolvedSynchronization(need, "incoming memory port is not bound"))
+            unresolved.extend(
+                UnresolvedSynchronization(n, "incoming memory port is not bound") for n in bundle
+            )
             continue
         try:
-            item = _bind_notification(need, dispatch)
+            item = replace(
+                _bind_notification(need, dispatch, order.guards(need)), requirements=tuple(bundle)
+            )
             if rule := _implicit(item, order):
-                coverage.append(
+                coverage.extend(
                     NotificationCoverage(
-                        need,
+                        n,
                         rule,
                         ordering=OrderingWitness(
                             rule,
@@ -808,6 +804,7 @@ def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
                             ("same actor", "proved hierarchical issue order"),
                         ),
                     )
+                    for n in bundle
                 )
             elif (
                 item.mechanism is NotificationKind.PIPE_FENCE
@@ -822,8 +819,9 @@ def select_notifications(dependencies, dispatch) -> SynchronizationSelection:
                 notifications.append(item)
         except CompileError as error:
             unresolved.append(UnresolvedSynchronization(need, error.message))
-    grouped = _merge_residue_partitions(notifications, dependencies.memory)
-    grouped = _group_captures(grouped, order)
+    # Physical cells own binary credits. Keep disjoint slot residues here;
+    # allocation may unite their instruction spelling after assigning IDs.
+    grouped = _group_captures(notifications, order)
     grouped = _reuse_acquisitions(grouped, order)
     grouped, quorum_issues = _quorums(grouped)
     unresolved.extend(quorum_issues)

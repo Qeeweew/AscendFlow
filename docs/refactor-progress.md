@@ -1,58 +1,91 @@
-# 交接状态与证据
+# 当前实现、资格与未完成项
 
-2026-10-17。**用户已停止算法开发，要求重新设计Set/Wait生成。重构未完成。** 本次整理只保存代码、纠正文档并提供新agent prompt；不继续FA构建或算子优化。
+2026-10-17。同步生成已替换旧 Path/progress 链路，公共 DSL→IR→ASC 只有一条路径。
+**重构尚不能宣布完成：默认 FA 冷编译目标尚未达到。** 下面分别记录实现、离线编译和性能；没有设备验证或算子性能资格。
 
-## 1. 代码身份
+## 代码与用户工作
 
-| 版本 | 含义 |
-|---|---|
-| `475f49b` | 先前提交：共享AND/OR替换DNF，但仍提前组合区域路径 |
-| `1231f4f` | 停止时源码/测试快照：惰性Path、hidden图、三值查询和共享source搜索树；**未完成实验，不是认可的最终架构** |
-| 交接整理提交 | 在上述快照上纠正文档与源码说明；以`git log`查看实际HEAD，不修改同步算法 |
+接手 HEAD 为 `01ddce954b5bc269dc0d39e65d96bc1702164742`，实验快照为 `1231f4f`。
+接手已有的 `tests/models/structured_events.py` 修改、`tests/test_model_reference.py`
+和 `analysis/generation_order.py` 原文保存在外层
+`runs/generation-redesign/incoming/`。独立 pre-sync 对照已集成；临时 generation_order
+原型已由当前规则替换，没有复制进 legacy。实际提交身份以产品 Git 为准。
 
-没有回滚或隐藏已有工作；没有新增legacy目录、兼容入口或第二编译路径。后续agent可以直接替换失败设计，不必维护这些内部API。Git快照仅供溯源，不代表功能资格。
+外层没有 Git，未创建根 Git；reference、旧 TileLang 工作区和容器没有修改或重建。
+CATLASS、ops-transformer、ops-nn 的实际 HEAD 已再次核对，见 [source-notes.md](source-notes.md)。
 
-## 2. 必须重新处理的根因
+## 已实施
 
-`select_notifications` 的函数合同明确为data coverage only；普通编译接着在 `allocate_structured_events` 调用 `EventDomains`、`prove_progress`、`establish_lease`，分配ID时还可能调用事件路径覆盖/共享证明。通知选择尚未提供完整、可组合的协议进展和生命周期保证。
+- [生成规则及事实归属](generation-rules.md)：逐项输入、建立者、产出、消费者和失效条件。
+- 真实 native capture/acquire、有序 unsigned guard、坐标往返和完整 mode-2 quorum。
+- 分层 physical-step/phase 准入，拒绝匹配但互相先 Wait 的死锁；父层只消费实际边界。
+- 由相邻值/存储 lifetime 构造稳定 cell credit。非稳定地址使用有限使用或明确 queue handback。
+- credit 的全部成员进入有限 bank 台账；新 ID 共享检查全体成员，保留配置与最终 drain。
+- 两个 AIV 共用一份 Vector body，由 runtime sid 区分地址、私有 UB 和 quorum 贡献。
+- 物化不改变 native、地址、循环身份或 issue order；ASC 只打印最终 IR。
+- 已删除旧 `event_progress`、`event_paths`、`event_lifetimes`、`progress_*`、
+  `structured_event_sharing` 及其 solver 形状测试，无兼容入口或第二编译链。
 
-此前迭代主要优化上述后置求解器。缓存、factored公式、惰性路径和搜索树没有解决生成算法的职责缺口。新方向见[计划](refactor-plan.md)。不能直接关闭检查；也不能继续把当前Path方案写成已经确定的未来架构。
+`generated-lifetimes` 是来源标签，不能授权外部 physical IR，也不替代规则论证、
+独立模型或硬件证据。输入与规则前提检查保留，未把必要检查搬进 debug。
 
-`Compilation.report["verification_mode"]` 当前仍使用 `owned-construction` 标签；它描述产物来源/私有IR装配，**不能作为同步已由构造保证正确的证据**。相关消费点在`benchmarks/attention/run.py`和对应测试，后续应连同报告合同审查。
+## 独立回归
 
-## 3. 完整FA构建的实际结果
+实际最终 IR 模型检查队列、controller、二值消费、mode-2 四位 ID/十五贡献容量及字节 RAW/WAR/WAW。
+独立 pre-sync 快照提供预期 native、地址和读版本；生产生成器不提供 oracle 的预期边。
 
-默认`attention_target`：B=1、HQ=HKV=8、D=128、BQ=BM=128、BK=1024、CK=128、VR=8、GROUPS=20、f16；Sq/Sk为runtime参数。下表都是失败耗时，**不能用作成功编译提速比较**。
+默认 FA 模型使用原始默认政策，Sq/Sk 未特化，有限实例为
+`(128,1024)`、`(128,2048)`、`(128,3072)`、`(512,2048)`，检查 group 0 和 19，
+包含空 owner、两个 query invocation、双 AIV 和多 KV 复用。它不执行浮点运算，
+不外推所有输入或设备性能。`invocations` 表示 controller 原始 body 重入，
+不隐含 mixed kernel 的跨 actor launch 完成；顺序 launch 由 runtime 排序。
 
-| 源码状态 | 结果 | 证据 |
-|---|---|---|
-| `91eb40d` | 125.44秒，父区域DNF备选超限 | [scalar-cost](../../runs/scalar-cost/fa-default/build-result.json) |
-| `475f49b` | 56.87秒，父区域急切消元工作超限 | [factored-progress](../../runs/factored-progress/fa-default/build-result.json) |
-| Path接入、共享source搜索树之前 | 56.69秒，已进入finite progress查询，路径见证BFS触区域预算 | [lazy-progress结果](../../runs/lazy-progress/fa-default/build-result.json)、[日志](../../runs/lazy-progress/fa-default/build.log)、[源码指纹](../../runs/lazy-progress/build-source.json) |
+首轮全套为 1566 passed、29 failed、1 error（146.17 秒）。用原 HEAD 独立复现的
+相关旧测试为 51 passed、21 failed、1 error（15.47 秒），记录在
+`runs/generation-redesign/baseline-failures.log`：主要为旧诊断字符串和两项从未接通的
+positive 测试（prefix、循环内 allocation）。现已明确它们的拒绝边界，并修正
+一个未对齐 alias fixture，使其实际触发 alias 检查。没有把这些拒绝算成 DSL 支持。
 
-三次均未产生成功ASC/CANN产物。**最终`1231f4f`中的共享source搜索树之后，没有再次完整构建FA。** 不得把前一次失败或后续短测试当作该版本完整资格。
+最终全套回归和冻结产物记录正在生成，完成后在本页补齐。
 
-## 4. 停止前的局部证据
+## 当前编译证据与计时边界
 
-这些结果由上一轮执行，本次整理未重跑；各组有重叠，不能相加为独立覆盖率。
+默认 FA 政策保持 B1/Hq8/Hkv8/D128、BQ=BM128、BK1024、CK128、VR8、GROUPS20、f16。
+source→ASC 包含源码读取/构造、全部分析/化简/输出和内部快照；import、进程总耗时、
+文件发布和 CANN 分别记录。没有跨编译结果缓存。
 
-| 检查 | 实际结果 | 限制 |
-|---|---|---|
-| 端点/父子区域/进展集成 | 48通过，4.19秒 | 搜索树改动之前 |
-| 资源与公共Vector/Cube链路 | 46通过，26.35秒 | 不代表默认FA或当前CANN资格 |
-| 最后图、条件、case与接口小组 | 62通过，2.38秒 | 搜索树之后；有界/单元与小集成 |
-| 条件事实清理 | 7通过，0.52秒 | 删除无生产调用的union/subset等旧辅助入口 |
+冻结前的公共源码构建已取得四项 IR/ASC/对象/库（`runs/generation-redesign/qualification/`）：
 
-三节点全部边mask/hidden集合、七级diamond、非空自环、旧快照不变、双AIV贡献及guard次序等测试有保留价值；测试期待应是硬件/语义合同，不能要求重构后保留旧求解器形状或缓存结构。
+| 算子 | Python 内部编译 | CANN | 状态 |
+|---|---:|---:|---|
+| Vector scale，B64 | 0.307s | 5.348s | 离线编译通过 |
+| 默认 batched GEMM | 0.561s | 5.417s | 离线编译通过 |
+| examples/cv/nested.py | 0.954s | 5.696s | 离线编译通过 |
+| 默认 FA | 11.507s | 8.965s | 离线编译通过 |
 
-最近历史shared L0C模型/CANN记录为`4b2c432`，双AIV嵌套CV为`dbcef70`。它们只能说明对应历史源码，不代表本工作树已获CANN或设备资格。
+上述 Python 内部时间不包括源码构造，不能充当完整冷编译时间。之后修复了完整
+credit 台账、共享 view/实际位置事实和精确整数系数；最终资格将绑定保存后的提交。
 
-## 5. 可用的诊断资料
+完整 source→ASC 单次 probe `fa-coefficient-probe` 为 **10.6469s**；此前
+`fa-current-probe` 为 67.5209s（47.2971s 在旧的逐端点队列准入），均是各自源码的
+真实成功 ASC 构建。带 cProfile 的 74.5243s 仅作诊断，不能当冷编译成绩。
+当前未达到五次 p50≤5s、max≤10s，未执行五次，不降低门槛。
 
-外层`runs/factored-progress/`有实际父图与数学条件快照、拓扑重放、同形节点/消元顺序/吸收实验。固定输入曾为44 native、726 needs、221 notifications、142 cases、1 packet分区；父图284节点、2159条原边、150个隐藏节点。
+## 支持与具体拒绝
 
-这些资料说明后置求解成本如何产生，不要求新agent继续研究这些算法。纯拓扑或Boolean表示的结果只对相应抽象成立，不证明真实NPU程序正确；快照不能导入编译器充当已证明输入。运行数据、ASC、缓存和报告均留外层，不进入产品Git。
+支持的规则覆盖双缓冲 GM→UB→Vector→GM、真实最后 reader/WAR、slot/代次复用、
+Cube/Fixpipe、参数化嵌套和相邻循环、共享双 AIV CV 以及本页默认 FA 结构。
+数学/依赖前提、完整 quorum、phase rank 或有限资源不能建立时具体拒绝。
 
-## 6. 下一位agent的入口
+未知动态 alias/ownership 需要可验证输入合同；外部根的 disjoint pointer 合同保留。
+数据相关控制、无范围的 scalar carry、未封闭的多时钟/稀疏 activation、prefix native
+地址、循环内 allocation、continuous FA 状态边界仍不宣称支持。没有全局 barrier、
+额外搬运、减少 overlap、调大旧 solver 预算或 FA 名称/shape 特判。
 
-接手时先检查实际HEAD和未提交修改，再读[计划](refactor-plan.md)、[不变量](compilation-invariants.md)与[源码职责](source-layout.md)。先审计生成义务和复杂度，明确规则后直接实现；不默认恢复停止的后置证明器优化。
+## 历史失败只作溯源
+
+`91eb40d` 的 125.44s、`475f49b` 的 56.87s、Path 接入但共享树之前的 56.69s
+均是失败耗时，未产生 ASC/CANN，不能与成功构建作提速倍率。
+原证据在 `runs/scalar-cost/`、`runs/factored-progress/`、
+`runs/lazy-progress/fa-default/` 和 `runs/lazy-progress/build-source.json`。
+旧 `4b2c432` 的 shared L0C、`dbcef70` 的双 AIV 记录不提供当前资格。

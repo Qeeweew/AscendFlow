@@ -18,6 +18,7 @@ from xdsl_npu.analysis.structured_regions import AccessOccurrence, LoopBinding
 from xdsl_npu.analysis.structured_resources import allocate_structured_events
 from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison, Placement
 from xdsl_npu.diagnostics import CompileError
+from xdsl_npu.passes.generate_notifications import _complete_bindings
 from xdsl_npu.scalar import expression, literal
 from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
 
@@ -66,7 +67,9 @@ def test_single_use_requires_a_wait_for_every_set():
         ),
     )
     with pytest.raises(CompileError):
-        allocate_structured_events(replaced_notification(selection, original, changed))
+        allocate_structured_events(
+            _complete_bindings(replaced_notification(selection, original, changed))
+        )
 
 
 def test_valid_first_and_last_ports_do_not_hide_a_missing_middle_wait():
@@ -84,7 +87,9 @@ def test_valid_first_and_last_ports_do_not_hide_a_missing_middle_wait():
         ),
     )
     with pytest.raises(CompileError):
-        allocate_structured_events(replaced_notification(selection, original, changed))
+        allocate_structured_events(
+            _complete_bindings(replaced_notification(selection, original, changed))
+        )
 
 
 def test_event_binding_must_preserve_the_same_generation_at_both_ends():
@@ -102,7 +107,9 @@ def test_event_binding_must_preserve_the_same_generation_at_both_ends():
         ),
     )
     with pytest.raises(CompileError):
-        allocate_structured_events(replaced_notification(selection, original, changed))
+        allocate_structured_events(
+            _complete_bindings(replaced_notification(selection, original, changed))
+        )
 
 
 def finite_ports(*, at_most_one=False):
@@ -204,20 +211,20 @@ def test_parameter_dependent_blocking_order_cannot_be_dropped_from_progress():
     assert not actual_port_cycle(selection, 1)
     assert actual_port_cycle(selection, 2)
     with pytest.raises(CompileError):
-        allocate_structured_events(selection)
+        allocate_structured_events(_complete_bindings(selection))
 
 
 def test_restricting_the_finite_ports_to_one_iteration_removes_the_cycle():
     selection = finite_ports(at_most_one=True)
     assert not actual_port_cycle(selection, 1)
-    plan = allocate_structured_events(selection)
-    assert plan.progress.points
+    plan = allocate_structured_events(_complete_bindings(selection))
+    assert plan.order.root.points
 
 
 @pytest.mark.parametrize("source", [scale, nested_copy])
 def test_emitted_ring_ids_pair_each_actual_generation_across_clocks(source):
     selection = selected(source)
-    plan = allocate_structured_events(selection)
+    plan = allocate_structured_events(_complete_bindings(selection))
     memory = selection.dependencies.memory
     actors = {actor for _, actor in selection.dispatch.tasks}
     for count in (0, 1, 2, 3):

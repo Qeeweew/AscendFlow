@@ -123,40 +123,43 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
             "sync action needs a native packet or invocation boundary placement",
         )
 
+    # All actions at one real insertion point consume the same dominating
+    # original SSA environment. Build it once, then append actions in order.
+    # Contiguous common guard prefixes share their original short-circuit SCF.
+    groups = {}
+    for action in actions:
+        family = "cube" if action.participants == (Actor.AIC,) else "vector"
+        groups.setdefault((action.anchor, action.placement, family), []).append(action)
     after = {}
     entry_target = _entry_target(root)
-    for action in actions:
-        anchor = action.anchor
+    for (anchor, placement, family), group in groups.items():
         if anchor is root:
             block = root.body.block
-            before = entry_target if action.placement is Placement.ENTRY else block.last_op
-        elif action.placement in {Placement.BEFORE, Placement.ENTRY}:
+            before = entry_target if placement is Placement.ENTRY else block.last_op
+        elif placement in {Placement.BEFORE, Placement.ENTRY}:
             block, before = anchor.parent, anchor
         else:
             previous = after.get(anchor, anchor)
             block, before = previous.parent, previous.next_op
         assert block is not None
-        container = Block()
-        current = container
-        domain = block.parent_op()
+        container, domain = Block(), block.parent_op()
         while domain is not None and not isinstance(domain, ActorDomainOp):
             domain = domain.parent_op()
-        owner = None
+        current, owner, created_domain = container, None, False
         if isinstance(root, MixedOp) and domain is None:
             body = Block(arg_types=[IndexType()])
-            family = "cube" if action.participants == (Actor.AIC,) else "vector"
             domain = ActorDomainOp.build(
                 attributes={"kind": StringAttr(family)}, regions=[Region(body)]
             )
-            current.add_op(domain)
-            current = body
+            container.add_op(domain)
+            current, created_domain = body, True
             if family == "vector":
                 owner = body.args[0]
         memo = _bindings(memory, block, before, current)
         if owner is not None:
             memo[memory.control.sid] = owner
 
-        def scalar(expr, current, *, memo=memo):
+        def scalar(expr, current, memo):
             if expr in memo:
                 return memo[expr]
             if expr.constant is not None:
@@ -166,52 +169,67 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
                     expr.kind != "argument",
                     f"sync materialization has unbound symbol {expr.text()}",
                 )
-                operation = _BINARY[expr.kind](*(scalar(child, current) for child in expr.args))
+                operation = _BINARY[expr.kind](
+                    *(scalar(child, current, memo) for child in expr.args)
+                )
             current.add_op(operation)
             memo[expr] = operation.results[0]
             return operation.results[0]
 
-        def guard(lhs, rhs, predicate, *, current):
-            comparison = arith.CmpiOp(
-                scalar(lhs, current), scalar(rhs, current), _COMPARE[predicate]
-            )
-            current.add_op(comparison)
-            nested = Block()
-            current.add_op(scf.IfOp(comparison.result, [], Region(nested), Region()))
-            return nested
+        prefixes, scopes = [], [(current, memo)]
+        for action in group:
+            tests = action.guard.comparisons
+            if (
+                isinstance(root, MixedOp)
+                and len(action.participants) == 1
+                and action.participants[0] is not Actor.AIC
+            ):
+                from ..analysis.structured_schedule import Comparison
 
-        if (
-            isinstance(root, MixedOp)
-            and len(action.participants) == 1
-            and action.participants[0] is not Actor.AIC
-        ):
-            current = guard(
-                memory.control.sid,
-                literal(0 if action.participants[0] is Actor.AIV0 else 1),
-                "==",
-                current=current,
-            )
-        for test in action.guard.comparisons:
-            current = guard(test.lhs, test.rhs, test.predicate, current=current)
-        event = None if action.event is None else scalar(action.event, current)
-        current.add_op(
-            NotificationOp.build(
-                operands=[event],
-                attributes={
-                    "kind": StringAttr(action.kind.value),
-                    "participants": ArrayAttr(
-                        StringAttr(actor.value) for actor in action.participants
+                tests = (
+                    Comparison(
+                        memory.control.sid, "==", literal(int(action.participants[0] is Actor.AIV1))
                     ),
-                    "source": StringAttr(action.source.value),
-                    "destination": StringAttr(action.destination.value),
-                    "protocol": StringAttr(action.protocol),
-                },
+                ) + tests
+            common = 0
+            while common < min(len(prefixes), len(tests)) and prefixes[common] == tests[common]:
+                common += 1
+            while len(prefixes) > common:
+                scopes.pop()[0].add_op(scf.YieldOp())
+                prefixes.pop()
+            for test in tests[common:]:
+                current, memo = scopes[-1]
+                comparison = arith.CmpiOp(
+                    scalar(test.lhs, current, memo),
+                    scalar(test.rhs, current, memo),
+                    _COMPARE[test.predicate],
+                )
+                nested = Block()
+                current.add_ops(
+                    (comparison, scf.IfOp(comparison.result, [], Region(nested), Region()))
+                )
+                prefixes.append(test)
+                scopes.append((nested, dict(memo)))
+            current, memo = scopes[-1]
+            event = None if action.event is None else scalar(action.event, current, memo)
+            current.add_op(
+                NotificationOp.build(
+                    operands=[event],
+                    attributes={
+                        "kind": StringAttr(action.kind.value),
+                        "participants": ArrayAttr(
+                            StringAttr(actor.value) for actor in action.participants
+                        ),
+                        "source": StringAttr(action.source.value),
+                        "destination": StringAttr(action.destination.value),
+                        "protocol": StringAttr(action.protocol),
+                    },
+                )
             )
-        )
-        while current is not container:
-            owner = current.parent_op()
-            current.add_op(EndOp() if isinstance(owner, ActorDomainOp) else scf.YieldOp())
-            current = owner.parent
+        while len(scopes) > 1:
+            scopes.pop()[0].add_op(scf.YieldOp())
+        if created_domain:
+            scopes[0][0].add_op(EndOp())
         emitted = list(container.ops)
         for operation in emitted:
             container.detach_op(operation)
@@ -219,6 +237,6 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
             block.add_ops(emitted)
         else:
             block.insert_ops_before(emitted, before)
-        if anchor is not root and action.placement in {Placement.AFTER, Placement.EXIT}:
+        if anchor is not root and placement in {Placement.AFTER, Placement.EXIT}:
             after[anchor] = emitted[-1]
     return memory.module

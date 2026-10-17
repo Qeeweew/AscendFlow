@@ -1,11 +1,12 @@
 # 编译器文档入口
 
-2026-10-17。**自动同步生成需要重新设计，当前不是最后几项证明器优化的收尾阶段。** 用户已停止算法开发，本次只整理交接。下一位agent先读[实际状态](refactor-progress.md)和[新计划](refactor-plan.md)。
+2026-10-17。当前同步生成采用物理 cell credit、精确边界与分层派发规则。先读[实际状态](refactor-progress.md)、[生成规则](generation-rules.md)及[不变量](compilation-invariants.md)，区分实现、编译资格与设备证据。
 
 | 文档 | 职责 |
 |---|---|
 | [refactor-progress.md](refactor-progress.md) | Git身份、停止点、失败证据及资格边界 |
 | [refactor-plan.md](refactor-plan.md) | 生成职责审计、规则/组合重构及旧职责退出顺序 |
+| [generation-rules.md](generation-rules.md) | 具体规则、适用前提、归纳理由和事实归属 |
 | [design.md](design.md) | 必须保持的DSL、循环、硬件和同步语义目标 |
 | [compilation-invariants.md](compilation-invariants.md) | 输入前提、构造保证、保持/失效和独立验证的区别 |
 | [source-layout.md](source-layout.md) | 真实调用链、代码入口和替换边界 |

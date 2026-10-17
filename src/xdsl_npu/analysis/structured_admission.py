@@ -133,6 +133,8 @@ def _guards(frame, environment):
 
 
 def _same_guard(left, right, facts):
+    if left == right:
+        return True
     if len(left) != len(right):
         return False
     if len(left) == 2:
@@ -265,7 +267,9 @@ def _native_aliases(memory):
                 ):
                     continue
                 a, b = source.address, destination.address
-                if a.geometry == b.geometry and equivalent(a.offset, b.offset, facts):
+                if a.geometry == b.geometry and (
+                    a.offset == b.offset or equivalent(a.offset, b.offset, facts)
+                ):
                     continue
                 delta = normalize(expression("sub", b.offset, a.offset), facts)
                 low, high = interval(delta, template.frame.domains(), facts)
@@ -291,7 +295,7 @@ def _covers(spans, read, frame, facts, work):
         if (
             candidate.rows == read.rows
             and candidate.pitch == read.pitch
-            and equivalent(candidate.base, read.base, facts)
+            and (candidate.base == read.base or equivalent(candidate.base, read.base, facts))
             and nonnegative(expression("sub", candidate.width, read.width), facts)
         ):
             return True
@@ -472,6 +476,7 @@ def admit_structured_memory(
     configurations = _configurations(memory)
     _native_aliases(memory)
     partitions, reads, prior = {}, [], {}
+    defined_writes = set()
     templates = {item.operation: item for item in memory.templates}
     positions = {item.operation: index for index, item in enumerate(memory.templates)}
     selected_values = _selected_values(structure, memory, templates, facts)
@@ -528,7 +533,20 @@ def admit_structured_memory(
             for access in template.accesses:
                 if access.mode.writes:
                     key = partitions[template.operation, access.operand_index, actor]
-                    prior.setdefault(key, []).append((template, access, actor))
+                    # Numerical definedness is monotone. Repeating the exact
+                    # write in the same control block adds no initialized
+                    # bytes. Keep its first defining witness, independently
+                    # of the logical-value analysis's precise later versions.
+                    signature = (
+                        key,
+                        actor,
+                        template.frame.parent,
+                        access.address.offset,
+                        access.address.geometry,
+                    )
+                    if signature not in defined_writes:
+                        prior.setdefault(key, []).append((template, access, actor))
+                        defined_writes.add(signature)
     values = []
     for use, reader, selected, binding, substitutions in selected_values:
         assert isinstance(binding, TileDefinition)
@@ -623,6 +641,7 @@ def admit_structured_memory(
     work["configuration_writers"] = len(configurations)
     host_expressions = build_host_expressions(memory, bounds)
     work["host_expressions"] = len(host_expressions)
+    work["defined_write_frontier"] = len(defined_writes)
     return StructuredAdmission(
         structure,
         memory,

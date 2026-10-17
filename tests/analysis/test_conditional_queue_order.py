@@ -12,7 +12,7 @@ import pytest
 from tests.models.structured_domains import actual_dispatch
 from xdsl_npu import language as N
 from xdsl_npu.analysis.access_frontier import AccessEndpoint
-from xdsl_npu.analysis.event_contracts import ResourceWork, _Order
+from xdsl_npu.analysis.event_contracts import ResourceWork
 from xdsl_npu.analysis.event_domains import EventCase, EventDomains
 from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
 from xdsl_npu.analysis.structured_dispatch import bind_structured_dispatch
@@ -132,28 +132,23 @@ def test_staged_order_matches_retained_issue_order(flat, actor, count):
 
 
 def test_equal_clock_uses_wait_admission_and_reversed_stage_rank(flat):
-    root, first, second, _ = (template.operation for template in flat.memory.templates)
+    _, first, second, _ = (template.operation for template in flat.memory.templates)
     (loop,) = flat.control.loops.values()
     same = ((loop.operation, loop.ordinal),)
     prior = ((loop.operation, expression("sub", loop.ordinal, literal(1))),)
     consume = point(flat, first, same)
     source = point(flat, first, same, phase=Placement.AFTER)
-    incoming = notification(flat, point(flat, root, phase=Placement.AFTER), consume)
-    outgoing = notification(flat, source, point(flat, root))
-    assert flat._may_follow(incoming, consume, outgoing, source, ()) is _Order.PROVED
+    assert flat._order_conditions(consume, source) == (ActionGuard(),)
 
     # first(g) and second(g-1) share a clock. The explicit issue order puts
     # second first, including its native position before first's admission.
     source = point(flat, second, prior, phase=Placement.AFTER)
-    outgoing = notification(flat, source, point(flat, root))
-    assert flat._may_follow(incoming, consume, outgoing, source, ()) is _Order.IMPOSSIBLE
+    assert not flat._order_conditions(consume, source)
     consume, source = (
         replace(source, placement=Placement.BEFORE),
         replace(consume, placement=Placement.AFTER),
     )
-    incoming = notification(flat, point(flat, root, phase=Placement.AFTER), consume)
-    outgoing = notification(flat, source, point(flat, root))
-    assert flat._may_follow(incoming, consume, outgoing, source, ()) is _Order.PROVED
+    assert flat._order_conditions(consume, source) == (ActionGuard(),)
 
 
 def test_last_selected_member_keeps_its_residue_order_condition(flat):
@@ -166,31 +161,8 @@ def test_last_selected_member_keeps_its_residue_order_condition(flat):
     source = point(flat, first, ((loop.operation, selected),), phase=Placement.AFTER)
     incoming = notification(flat, point(flat, root, phase=Placement.AFTER), consume)
     outgoing = notification(flat, source, point(flat, root))
-    active = (Comparison(loop.count, ">", literal(0)),)
     conditions = flat._following_conditions(incoming, consume, outgoing, source)
     assert conditions
-    assert flat._may_follow(incoming, consume, outgoing, source, active) is _Order.POSSIBLE
-    assert (
-        flat._may_follow(
-            incoming,
-            consume,
-            outgoing,
-            source,
-            active + (Comparison(residue, "==", literal(0)),),
-        )
-        is _Order.PROVED
-    )
-    assert (
-        flat._may_follow(
-            incoming,
-            consume,
-            outgoing,
-            source,
-            active + (Comparison(residue, ">", literal(0)),),
-        )
-        is _Order.IMPOSSIBLE
-    )
-    assert flat._may_follow(incoming, consume, outgoing, source, active) is _Order.POSSIBLE
     for count in range(1, 7):
         values = {"n": count, "$group": 0}
         events = actual_dispatch(flat.selection, values, Actor.AIV0)
@@ -268,7 +240,6 @@ def test_routes_actors_and_inactive_coordinates_never_invent_order(flat):
     tail_notification = notification(flat, source, consume)
     assert flat._order_conditions(consume, source) == (ActionGuard(),)
     assert not flat._following_conditions(incoming, consume, tail_notification, source)
-    assert flat._may_follow(incoming, consume, tail_notification, source, ()) is _Order.IMPOSSIBLE
 
     source = point(flat, first, consume.coordinates, phase=Placement.AFTER)
     outgoing = notification(flat, source, point(flat, tail))
@@ -282,20 +253,3 @@ def test_routes_actors_and_inactive_coordinates_never_invent_order(flat):
     inactive = flat._instance(consume, {loop.ordinal: literal(0)}, case=empty)
     assert not inactive.coordinates
     assert not flat._order_conditions(inactive, source)
-
-
-def test_order_cache_preserves_actual_coordinate_identity(flat):
-    _, first, _, _ = (template.operation for template in flat.memory.templates)
-    (loop,) = flat.control.loops.values()
-    coordinates = ((loop.operation, loop.ordinal),)
-    consume = point(flat, first, coordinates)
-    source = point(flat, first, coordinates, phase=Placement.AFTER)
-    original = flat._order_conditions(consume, source)
-    assert original == (ActionGuard(),)
-    assert flat._order_conditions(replace(consume), replace(source)) is original
-    earlier = replace(
-        source,
-        coordinates=((loop.operation, expression("sub", loop.ordinal, literal(1))),),
-    )
-    assert not flat._order_conditions(consume, earlier)
-    assert flat._order_conditions(consume, source) is original

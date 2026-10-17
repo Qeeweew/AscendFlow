@@ -47,11 +47,15 @@ def test_block8_workspace_must_be_one_dimensional():
 @pytest.mark.parametrize("destination", [False, True])
 def test_block8_does_not_relax_native_in_place_overlap_rules(destination):
     source = definition(rows=1, workspace=144).source
+    # Keep the physical allocation aligned so the fixture reaches alias
+    # admission rather than failing the unrelated local capacity contract.
+    source = source.replace("statistic = N.alloc_ub((1,),", "statistic = N.alloc_ub((8,),")
+    source = source.replace("out=statistic", "out=statistic[:1]")
     if destination:
-        source = source.replace("out=statistic,", "out=workspace[i % 2, 128:129],")
+        source = source.replace("out=statistic[:1],", "out=workspace[i % 2, 128:129],")
     else:
         source = source.replace("scratch=workspace[i % 2, :]", "scratch=x[0, :144]")
-    with pytest.raises(CompileError, match="in-place Vector (alias|overlap)"):
+    with pytest.raises(CompileError, match="native read/write aliases"):
         compile(N.from_source(source, disjoint_external=True), timeout_s=10)
 
 
@@ -59,5 +63,5 @@ def test_block8_tracks_the_input_reader_and_final_value_producer():
     source = definition().source.replace(
         "reduced = N.reduce_sum", "N.fill(x, 0.0)\n            reduced = N.reduce_sum"
     )
-    with pytest.raises(CompileError, match="overwritten before.*partial"):
+    with pytest.raises(CompileError, match="overwrite before its actual native reader"):
         compile(N.from_source(source, disjoint_external=True), timeout_s=10)

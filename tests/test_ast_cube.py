@@ -40,7 +40,7 @@ def test_transpose_flag_does_not_license_other_dma_routes():
 
 def test_first_mad_cannot_accumulate_uninitialized_local_storage():
     source = batched_matmul.source.replace("initialize=True", "initialize=False")
-    with pytest.raises(CompileError, match="undefined first read"):
+    with pytest.raises(CompileError, match="without a proved initialized writer coverage"):
         compile(replace(batched_matmul, source=source))
 
 

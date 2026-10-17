@@ -35,7 +35,7 @@ def test_public_source_owns_and_preserves_its_input(monkeypatch):
     source.body.block.erase_op(source.body.block.first_op)
     assert result.source_ir == before
     assert result.report["pipeline"] == "structured-regions"
-    assert result.report["verification_mode"] == "owned-construction"
+    assert result.report["verification_mode"] == "generated-lifetimes"
     assert "npu.notification" not in result.before_ir
     assert "npu.notification" in result.plan_ir
 

@@ -1,14 +1,11 @@
-"""Compose event-domain, lifetime, progress and bank-allocation contracts.
+"""Allocate finite banks from generated credits and explicit new sharing.
 
-This is the current post-selection analysis pipeline. It orchestrates domain,
-progress and lease reasoning before bank allocation and materialization records;
-the selector does not yet supply their complete guarantees by construction.
-Do not disable these obligations before the redesign in docs/refactor-plan.md
-has established their replacements.
+No domain, memory or progress graph is rebuilt here. A cell credit's members
+already share one lifetime; other finite ID sharing adds a consume-to-Set
+constraint. Materialization receives the final IDs and real instruction sites.
 """
 
 from dataclasses import replace
-from functools import partial
 
 from ..diagnostics import require
 from ..dialects.physical import FixConfigOp, Load3DConfigOp
@@ -17,46 +14,41 @@ from ..target.ascend910b import Actor, Engine, SyncKind
 from .event_contracts import (
     LOCAL_CAPACITY,
     SUPPORTED_CROSS_IDS,
+    EventBankUsage,
     EventReservation,
-    ResourceWork,
     StructuredEventAssignment,
     StructuredEventPlan,
 )
-from .event_domains import EventDomains
-from .event_lifetimes import establish_lease
-from .event_paths import prove_event_path_cover
-from .event_progress import prove_progress
-from .structured_event_sharing import EventSharingContext, prove_finite_event_sharing
-from .structured_protocols import NotificationKind, SynchronizationSelection
+from .event_sharing import share_finite_events
+from .notification_lifetimes import HandbackRule
+from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard, Placement, SyncAction
 
 
-def allocate_structured_events(selection: SynchronizationSelection) -> StructuredEventPlan:
-    """Analyze selected notifications before allocating their hardware resources."""
-    work = ResourceWork(notifications=len(selection.notifications))
-    domains = EventDomains(selection, work)
-    progress = prove_progress(domains)
-    lifetimes = {
-        notification: establish_lease(domains, notification)
-        for notification in domains.notifications
-        if notification.mechanism is not NotificationKind.PIPE_FENCE
-    }
-    return _EventBanks(domains).allocate(lifetimes, progress)
+def allocate_structured_events(program) -> StructuredEventPlan:
+    """Consume generated lifetimes; establish only bank/ID/sharing constraints."""
+    from ..passes.generate_notifications import NotificationProgram
+
+    require(
+        isinstance(program, NotificationProgram),
+        "allocation requires generated notification lifetimes",
+    )
+    return _EventBanks(program.domains, program.channels).allocate(
+        {lease.notification: lease for lease in program.leases}, program.order
+    )
 
 
 class _EventBanks:
-    def __init__(self, domains):
+    def __init__(self, domains, channels):
         self.domains = domains
         self.actions, self.assignments, self.reservations, self.sharing = [], [], [], []
         self.occupied, self.cross_occupied = {}, {}
-        self.sharing_context = EventSharingContext(
-            domains.selection,
-            domains.cases,
-            domains._instance,
-            partial(prove_event_path_cover, domains),
-        )
+        self.handbacks = HandbackRule(domains)
+        self.channels = {member: channel for channel in channels for member in channel.members}
+        self.cell_channels = channels
+        self.channel_ids = {}
 
-    def allocate(self, lifetimes, progress):
+    def allocate(self, lifetimes, order):
         self._reserve()
         for notification in self.domains.notifications:
             if notification.mechanism is NotificationKind.PIPE_FENCE:
@@ -67,15 +59,22 @@ class _EventBanks:
             self.assignments.append(assignment)
             self._place(notification, assignment)
         self._drain()
+        self.domains.work.allocated_local_ids = sum(len(pool) for pool in self.occupied.values())
+        self.domains.work.allocated_cross_ids = len(self.cross_occupied)
         return StructuredEventPlan(
             selection=self.domains.selection,
             actions=self._combine_actions(),
             assignments=tuple(self.assignments),
             leases=tuple(lifetimes.values()),
             reservations=tuple(self.reservations),
-            progress=progress,
+            order=order,
             work=self.domains.work,
             sharing=tuple(self.sharing),
+            channels=self.cell_channels,
+            banks=tuple(
+                EventBankUsage(bank, tuple(sorted(pool))) for bank, pool in self.occupied.items()
+            )
+            + (EventBankUsage(None, tuple(sorted(self.cross_occupied))),),
         )
 
     def _reserve(self):
@@ -117,6 +116,19 @@ class _EventBanks:
                 )
             )
         )
+        channel = self.channels.get(notification)
+        members = (
+            (notification,)
+            if channel is None
+            else tuple(
+                member
+                for member in channel.members
+                if any(self.domains.active[member, c] for c in self.domains.cases[member])
+            )
+        )
+        if channel is not None and channel in self.channel_ids:
+            ids = self.channel_ids[channel]
+            return StructuredEventAssignment(notification, ids, banks, lease.cases)
         pools = (
             (self.cross_occupied,)
             if cross
@@ -132,23 +144,26 @@ class _EventBanks:
             for prior in priors:
                 if prior is None:
                     break  # Native initializer/final-drain reservations are never borrowed.
-                if self.domains._exclusive(prior, notification):
+                for member in members:
+                    if self.domains._exclusive(prior, member):
+                        continue
+                    witness = share_finite_events(self.domains, self.handbacks, prior, member)
+                    if witness is None:
+                        break
+                    witnesses.append(witness)
+                else:
                     continue
-                witness = prove_finite_event_sharing(
-                    prior, notification, context=self.sharing_context
-                )
-                if witness is None:
-                    break
-                witnesses.append(witness)
+                # Sharing introduces a constraint on the *whole* credit,
+                # including members materialized later in notification order.
+                # A handback for one finite fragment cannot license its loop.
+                break
             else:
                 self.sharing.extend(witnesses)
                 for pool in pools:
                     for flag in ids:
-                        pool.setdefault(flag, []).append(notification)
-                if cross:
-                    self.domains.work.assigned_cross_ids += width
-                else:
-                    self.domains.work.assigned_local_ids += width * len(banks)
+                        pool.setdefault(flag, []).extend(members)
+                if channel is not None and width:
+                    self.channel_ids[channel] = ids
                 return StructuredEventAssignment(notification, ids, banks, lease.cases)
         if cross:
             self.domains.fail(

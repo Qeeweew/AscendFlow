@@ -12,14 +12,14 @@ from xdsl_npu.analysis.event_domains import EventDomains
 from xdsl_npu.analysis.structured_dependencies import build_structured_dependencies
 from xdsl_npu.analysis.structured_memory import collect_native_memory
 from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.select_notifications import select_notifications
+from xdsl_npu.passes.notification_binding import bind_notifications
 
 
 def selected(source):
     structure = lower_native_structure(N.from_source(source) if isinstance(source, str) else source)
     memory = collect_native_memory(structure.module)
     dependencies = build_structured_dependencies(memory)
-    result = select_notifications(dependencies, dependencies.dispatch)
+    result = bind_notifications(dependencies, dependencies.dispatch)
     result.require_closed()
     return result
 

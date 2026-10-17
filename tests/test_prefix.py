@@ -8,11 +8,6 @@ from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.frontend import from_source
 
 
-@pytest.fixture(scope="module")
-def artifact():
-    return compile(scale_prefix)
-
-
 def test_incorrect_valid_expression_is_not_treated_as_padding():
     definition = from_source("""
         def invalid(X: N.Tensor((n,), N.f32), n: N.int64):
@@ -22,7 +17,7 @@ def test_incorrect_valid_expression_is_not_treated_as_padding():
                     valid = N.min(64, n - t * 64 - 1)
                     N.copy(X[t * 64:(t + 1) * 64], x[t % 2, :], valid=valid)
     """)
-    with pytest.raises(CompileError, match="valid must be"):
+    with pytest.raises(CompileError, match="valid prefix native addresses are not supported"):
         compile(definition)
 
 
@@ -38,9 +33,12 @@ def test_uniform_scalar_codegen_has_no_exponential_ternary_expansion():
     assert len(names[value]) < 30
 
 
-def test_equivalent_scalar_bound_does_not_change_tail_or_generated_code(artifact):
+def test_equivalent_scalar_bound_does_not_bypass_unsupported_prefix_contract():
     source = scale_prefix.source.replace(
         "N.ceildiv(length, B)", "N.min(N.ceildiv(length, B), N.ceildiv(length, B))"
     )
     equivalent = from_source(source, disjoint_external=True)
-    assert compile(equivalent).asc == artifact.asc
+    for definition in (scale_prefix, equivalent):
+        definition.to_ir().verify()
+        with pytest.raises(CompileError, match="valid prefix native addresses are not supported"):
+            compile(definition)

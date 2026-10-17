@@ -55,13 +55,14 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 
 | 构造 | 当前情况 | 重构要求 |
 |---|---|---|
-| runtime局部pipeline、显式buffer、固定stage | 已有examples和旧资格 | 保持政策和原语语义，取消结构专用同步分派 |
-| 普通常量界 | 默认保留循环；部分固定child分析仍展开访问 | 普通循环不自动unroll，分析与N无关 |
-| serial中的标量carry | 前端可构造scf.for，相关lowering拒绝 | 在统一admission明确诊断；需要完整carry合同后才开放 |
-| 外层serial + KV pipeline + fixed child | 现有FA路径，结构限制严格 | 改成普通递归组合，可有循环前后真实工作 |
+| runtime局部pipeline、显式buffer、固定stage | 已实现，当前 IR/ASC/CANN 资格见状态页 | 保持政策和原语语义，取消结构专用同步分派 |
+| 普通常量界 | 保留循环；只分析受物理容量约束的 slot 周期 | 普通循环不自动unroll，分析与N无关 |
+| serial中的标量carry | 保留 SCF carry；影响地址/循环界而无范围合同时拒绝 | 在统一admission明确诊断；需要完整carry合同后才开放 |
+| 外层serial + KV pipeline + fixed child | 默认 FA 使用递归生成规则；不设 query/KV 分派 | 改成普通递归组合，可有循环前后真实工作 |
 | runtime child及更深任意嵌套 | 未普遍支持 | 逐合同接入，不设FA/query例外 |
 | FIRST/LAST/受限边界guard | 已有子集，组合限制存在 | 空/短/重合/孔洞的统一存在域 |
 | 数据相关分支、间接alias/owner、任意多时钟连续任务 | 未普遍支持 | 明确可验证输入合同或具体拒绝 |
+| prefix native 地址、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
 | opaque Python函数/任意宏 | 不支持 | 透明AST复用另列实现，不以增加原语名单替代 |
 
 重构把语法/admission与lowering能力对应起来；不能先接受一种构造，再以不相关的“需要KV/query”诊断拒绝。

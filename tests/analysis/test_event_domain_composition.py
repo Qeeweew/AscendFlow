@@ -21,18 +21,25 @@ def nested(X:N.Tensor((n,2,64),N.f32),n:N.int64):
 
 @pytest.fixture(scope="module")
 def domains():
-    return prepared(selected(NESTED))
+    from xdsl_npu.analysis.event_families import build_event_family
+
+    result = prepared(selected(NESTED))
+    # Test the window rule explicitly. Stable cell credits in normal
+    # generation deliberately need pairing, not dense ordinal windows.
+    families = {n: build_event_family(result, n) for n in result.notifications if n in result.cases}
+    return result, families
 
 
 def test_child_membership_is_projected_once_before_parent_window(domains):
+    domains, families = domains
     projected = [
         case.projections
-        for cases in domains.cases.values()
+        for cases in families.values()
         for case in cases
         if len(case.projections) > 1
     ]
     assert projected
-    for case in (case for cases in domains.cases.values() for case in cases):
+    for case in (case for cases in families.values() for case in cases):
         projections, windows = case.projections, case.windows
         assert tuple(p.loop for p in projections) == tuple(w.loop for w in reversed(windows))
         for index, projection in enumerate(projections[:-1]):
@@ -41,7 +48,8 @@ def test_child_membership_is_projected_once_before_parent_window(domains):
 
 
 def test_small_exact_existence_matches_actual_member_enumeration(domains):
-    for case in (case for cases in domains.cases.values() for case in cases):
+    domains, families = domains
+    for case in (case for cases in families.values() for case in cases):
         windows = case.windows
         for count in (0, 1, 2, 3):
             for outer in range(4):
@@ -62,6 +70,7 @@ def test_small_exact_existence_matches_actual_member_enumeration(domains):
 
 
 def test_established_domain_identity_and_maps_are_read_only(domains):
+    domains, _ = domains
     with pytest.raises(FrozenInstanceError):
         domains.notifications = ()
     with pytest.raises(TypeError):

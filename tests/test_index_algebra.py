@@ -69,6 +69,19 @@ def test_nested_positive_quotients_and_last_index_have_exact_integer_identities(
         assert last.evaluate(values) == (left * right - 1) // left
 
 
+def test_large_rational_coefficients_never_pass_through_floating_point():
+    value, coefficient = argument("x"), (1 << 60) + 3
+    facts = {"x": Fact(multiple=3)}
+    divided = expression("floordiv", expression("mul", literal(coefficient), value), literal(3))
+    factored = expression("mul", literal(coefficient), expression("floordiv", value, literal(3)))
+    wrong = expression("floordiv", expression("mul", literal(coefficient + 1), value), literal(3))
+    assert equivalent(divided, factored, facts)
+    assert not equivalent(divided, wrong, facts)
+    for x in (3, 6, 15):
+        assert divided.evaluate({"x": x}) == factored.evaluate({"x": x}) == coefficient * x // 3
+        assert wrong.evaluate({"x": x}) != divided.evaluate({"x": x})
+
+
 def test_axis_bounds_preserve_each_mixed_radix_axis_and_complete_tiles():
     task, tiles = argument("$g"), argument("tiles")
     heads, batches, tile = literal(3), literal(2), literal(16)

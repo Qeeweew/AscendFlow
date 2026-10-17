@@ -1,19 +1,15 @@
-"""One owned source-to-synchronized-IR pipeline.
+"""One owned DSL -> native facts -> generated credits -> synchronized IR chain.
 
-All memory requirements use the same logical notification representation.
-Selection establishes capture/acquire coverage; one resource stage establishes
-pairing, reuse and progress across both finite and repeated invocations. Only
-then does materialization insert real notification operations in physical IR.
-The backend consumes that IR, never a second action-placement interpretation.
-
-This describes the current pipeline, not a proof-by-construction generator:
-normal compilation still invokes post-selection progress and lease analysis.
-The generation-contract redesign is specified in docs/refactor-plan.md.
+Generation checks its pairing/phase premises and constructs physical-cell or
+queue-handback lifetimes. Allocation consumes them and establishes bank/ID
+constraints. Materialization preserves native identities; the backend prints
+only actual IR, with no second action-placement interpretation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 from xdsl.dialects.builtin import ModuleOp
@@ -32,6 +28,7 @@ from .simplify_scalars import simplify_scalars
 
 if TYPE_CHECKING:
     from ..analysis.structured_resources import StructuredEventPlan
+    from .generate_notifications import NotificationProgram
 
 
 @dataclass(frozen=True, init=False)
@@ -49,6 +46,8 @@ class StructuredSynchronization:
     selection: SynchronizationSelection
     resources: StructuredEventPlan
     before_ir: str
+    generation: NotificationProgram
+    timings: tuple[tuple[str, float], ...]
 
     def __init__(self, *args, **kwargs):
         raise TypeError("use synchronize_structure to establish the executable contracts")
@@ -66,7 +65,8 @@ class StructuredSynchronization:
         return self.admission.bounds
 
 
-def _materialize_owned(structure, admission, dependencies, selection, resources):
+def _materialize_owned(structure, admission, dependencies, generation, resources, timings):
+    selection = generation.selection
     require(
         admission.structure is structure
         and dependencies.memory is admission.memory
@@ -74,12 +74,21 @@ def _materialize_owned(structure, admission, dependencies, selection, resources)
         and resources.selection is selection,
         "synchronization stages belong to different owned structures",
     )
+    started = perf_counter()
     before_ir = dump(structure.module)
+    frozen = perf_counter()
     module = materialize_notifications(admission.memory, resources.actions)
     require(module is structure.module, "notification insertion changed its owned physical module")
     # Stock pure-integer rewrites preserve native/control/notification identity
     # and their values. Retained execution facts therefore remain applicable.
+    materialized = perf_counter()
     simplify_scalars(module)
+    simplified = perf_counter()
+    timings += (
+        ("before_snapshot", frozen - started),
+        ("materialize", materialized - frozen),
+        ("scalar_simplification", simplified - materialized),
+    )
     result = object.__new__(StructuredSynchronization)
     for name, value in (
         ("structure", structure),
@@ -88,6 +97,8 @@ def _materialize_owned(structure, admission, dependencies, selection, resources)
         ("selection", selection),
         ("resources", resources),
         ("before_ir", before_ir),
+        ("generation", generation),
+        ("timings", timings),
     ):
         object.__setattr__(result, name, value)
     return result
@@ -100,14 +111,31 @@ def synchronize_structure(source) -> StructuredSynchronization:
     reports an unsupported contract when a required fact cannot be established.
     """
     from ..analysis.structured_resources import allocate_structured_events
-    from .select_notifications import select_notifications
+    from .generate_notifications import generate_notifications
 
-    structure = lower_native_structure(source)
-    memory = collect_native_memory(structure.module)
-    bounds = admit_memory_bounds(memory)
-    admission = admit_structured_memory(structure, memory, bounds)
-    dispatch = bind_structured_dispatch(memory)
-    dependencies = build_structured_dependencies(memory, admission=admission, dispatch=dispatch)
-    selection = select_notifications(dependencies, dispatch)
-    resources = allocate_structured_events(selection)
-    return _materialize_owned(structure, admission, dependencies, selection, resources)
+    timings = []
+
+    def stage(name, function, *args, **kwargs):
+        started = perf_counter()
+        result = function(*args, **kwargs)
+        timings.append((name, perf_counter() - started))
+        return result
+
+    structure = stage("native_lowering", lower_native_structure, source)
+    memory = stage("memory_collection", collect_native_memory, structure.module)
+    bounds = stage("bounds", admit_memory_bounds, memory)
+    admission = stage("admission", admit_structured_memory, structure, memory, bounds)
+    dispatch = stage("dispatch", bind_structured_dispatch, memory)
+    dependencies = stage(
+        "dependencies",
+        build_structured_dependencies,
+        memory,
+        admission=admission,
+        dispatch=dispatch,
+    )
+    program = generate_notifications(dependencies, dispatch)
+    timings.extend(program.timings)
+    resources = stage("event_banks", allocate_structured_events, program)
+    return _materialize_owned(
+        structure, admission, dependencies, program, resources, tuple(timings)
+    )

@@ -77,15 +77,25 @@ class Compilation:
         report = {
             "kernel": plan.module.body.block.first_op.sym_name.data,
             "pipeline": "structured-regions",
-            # Describes owned IR assembly, not synchronization correctness by
-            # construction: normal still runs post-selection resource analyses.
-            "verification_mode": "owned-construction",
+            "verification_mode": "generated-lifetimes",
             "debug_structural_verification": debug_verify,
             "analysis_work": {
                 "lowering": dict(plan.structure.work),
+                "bounds": {
+                    "accesses": plan.bounds.checked_accesses,
+                    "view_contracts": plan.bounds.view_contracts,
+                    "domain_contracts": plan.bounds.domain_contracts,
+                },
                 "admission": dict(plan.admission.work),
                 "dependencies": asdict(plan.dependencies.work),
                 "resources": asdict(plan.resources.work),
+                "generation": {
+                    **asdict(plan.generation.order.work),
+                    "cell_channels": len(plan.generation.channels),
+                    "cell_fragments": sum(len(c.members) for c in plan.generation.channels),
+                    "handback_rings": len(plan.generation.leases)
+                    - sum(len(c.members) for c in plan.generation.channels),
+                },
                 "emission": {
                     "native_templates": emission.native_templates,
                     "native_prints": emission.native_prints,
@@ -139,6 +149,7 @@ class Compilation:
         snapshots["_timings_json"] = json.dumps(
             {
                 "assembly_s": assembled - started,
+                "stages": dict(plan.timings),
                 "emission_s": emitted - assembled,
                 "snapshot_s": frozen - emitted,
                 "total_s": frozen - started,

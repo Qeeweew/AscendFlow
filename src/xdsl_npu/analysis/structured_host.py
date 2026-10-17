@@ -2,14 +2,14 @@
 
 This stage derives launch-time signed extrema. It consumes the same actual
 control and allocation facts as address admission; it neither selects events
-nor reinterprets native memory effects. This extraction preserves the existing
-proof algorithm, without caching or performance-specific changes.
+nor reinterprets native memory effects. Each scope constructs its scalar-range
+DAG once. Uniform subexpressions need no loop elimination or polynomial query.
 """
 
 from xdsl.dialects.builtin import IndexType
 
-from ..diagnostics import CompileError, ErrorKind, require
-from ..indexing import arguments, interval
+from ..diagnostics import ErrorKind, require
+from ..indexing import _joint_affine_interval, arguments, nonnegative
 from ..scalar import Expr, expression, literal, positive
 
 
@@ -24,61 +24,89 @@ def _require(condition, message, operation, *, kind=ErrorKind.UNSUPPORTED, witne
     )
 
 
-def _host_interval(value, domains, facts):
-    """Signed host extrema; unsigned operations retain their nonnegative domain.
+class _HostRanges:
+    """Owned scalar-range facts for one immutable lexical domain.
 
     Independent endpoint combinations can describe inactive owners as well.
     Clipping an unsigned dividend's extrema to zero keeps those empty-domain
     endpoints evaluable; source arithmetic and active address proofs establish
-    the real unsigned dividend premise separately.
+    the real unsigned dividend premise separately. Exact joint affine ranges
+    preserve cyclic owner/iteration correlation rather than treating them as
+    independent intervals. This stage does not authorize source arithmetic.
     """
-    try:
-        return interval(value, domains, facts)
-    except CompileError as error:
-        if error.message not in {
-            "index product has an unproven sign",
-            "unsigned index division has an unproven nonnegative dividend",
-        }:
-            raise
-    if value.kind in {"constant", "argument"}:
-        return value, value
-    a, b = value.args
-    al, ah = _host_interval(a, domains, facts)
-    bl, bh = _host_interval(b, domains, facts)
-    if value.kind in {"add", "min", "max"}:
-        return expression(value.kind, al, bl), expression(value.kind, ah, bh)
-    if value.kind == "mul":
-        products = tuple(expression("mul", x, y) for x in (al, ah) for y in (bl, bh))
-        low = high = products[0]
-        for product in products[1:]:
-            low, high = expression("min", low, product), expression("max", high, product)
-        return low, high
-    require(
-        value.kind in {"floordiv", "ceildiv", "rem"} and bl == bh and positive(b, facts),
-        "host extrema require a positive uniform divisor",
-        kind=ErrorKind.UNSUPPORTED,
-    )
-    if value.kind == "rem":
-        return literal(0), expression("sub", b, literal(1))
-    return tuple(
-        expression(value.kind, expression("max", literal(0), bound), b) for bound in (al, ah)
-    )
+
+    def __init__(self, domains, facts):
+        self.domains, self.facts, self.ranges = domains, facts, {}
+        for coordinate, lower, upper in domains:
+            self.ranges.setdefault(coordinate, (lower, upper))
+
+    def visit(self, value):
+        if value not in self.ranges:
+            self.ranges[value] = self._construct(value)
+        return self.ranges[value]
+
+    def _construct(self, value):
+        if not any(name.startswith("$") for name in arguments(value)):
+            return value, value
+        if value.kind in {"constant", "argument"}:
+            return value, value  # Unknown scalar carries remain unbounded.
+        joint = _joint_affine_interval(value, self.domains, self.facts, atomic=True)
+        if joint is not None:
+            return joint
+        a, b = value.args
+        (al, ah), (bl, bh) = self.visit(a), self.visit(b)
+        if value.kind in {"add", "min", "max"}:
+            return expression(value.kind, al, bl), expression(value.kind, ah, bh)
+        if value.kind == "mul":
+            for constant, low, high in ((a, bl, bh), (b, al, ah)):
+                if constant.constant is not None:
+                    if constant.constant < 0:
+                        low, high = high, low
+                    return expression("mul", constant, low), expression("mul", constant, high)
+            if nonnegative(al, self.facts) and nonnegative(bl, self.facts):
+                return expression("mul", al, bl), expression("mul", ah, bh)
+            products = tuple(expression("mul", x, y) for x in (al, ah) for y in (bl, bh))
+            low = high = products[0]
+            for product in products[1:]:
+                low, high = expression("min", low, product), expression("max", high, product)
+            return low, high
+        require(
+            value.kind in {"floordiv", "ceildiv", "rem"}
+            and b == bl == bh
+            and positive(b, self.facts),
+            "host extrema require a positive uniform divisor",
+            kind=ErrorKind.UNSUPPORTED,
+        )
+        if value.kind == "rem":
+            return literal(0), expression("sub", b, literal(1))
+        return tuple(
+            expression(
+                value.kind,
+                bound if nonnegative(bound, self.facts) else expression("max", literal(0), bound),
+                b,
+            )
+            for bound in (al, ah)
+        )
 
 
 def build_host_expressions(memory, bounds):
     """Uniform signed extrema of every actual retained index SSA intermediate."""
     environment, facts = memory.control.environment, memory.control.environment.facts
     result = {}
+    scopes = {}
 
     def include(value, frame, operation):
         lower = upper = value
         domains = frame.domains()
+        if domains not in scopes:
+            scopes[domains] = _HostRanges(domains, facts)
+        ranges = scopes[domains]
         for _ in range(len(domains) + 2):
             if not any(name.startswith("$") for name in arguments(lower) | arguments(upper)):
                 result[lower] = result[upper] = None
                 return
-            next_lower = _host_interval(lower, domains, facts)[0]
-            next_upper = _host_interval(upper, domains, facts)[1]
+            next_lower = ranges.visit(lower)[0]
+            next_upper = ranges.visit(upper)[1]
             if (next_lower, next_upper) == (lower, upper):
                 break
             lower, upper = next_lower, next_upper

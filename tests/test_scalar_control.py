@@ -75,7 +75,7 @@ def test_serial_loop_carries_ssa_through_if_and_preserves_zero_iteration_value(n
     assert interpret(source.body.block.first_op.body.block, {}, {"n": n}) == 7 + sum(
         i if i < 3 else 1 for i in range(n)
     )
-    with pytest.raises(CompileError, match="structured scf.for synchronization"):
+    with pytest.raises(CompileError, match="host integer safety lacks a uniform scalar range"):
         compile(definition)
 
 

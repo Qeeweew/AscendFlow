@@ -191,7 +191,7 @@ def publish(directory, *, backend="generated", source=None, policy=run.DEFAULT_P
         compilation = {"assembly_s": 0.01, "emission_s": 0.01, "snapshot_s": 0.01, "total_s": 0.03}
         report.update(
             pipeline="structured-regions",
-            verification_mode="owned-construction",
+            verification_mode="generated-lifetimes",
             debug_structural_verification=False,
             compilation=compilation,
             cann=manifest,
@@ -334,7 +334,7 @@ def test_reusing_generated_artifact_never_builds_and_records_its_own_identity(ar
     assert identity["contract"]["buffers"]["score"]["fixed_bytes"] == 20971520
     origin = identity["source_build"]
     assert origin["pipeline"] == "structured-regions"
-    assert origin["verification_mode"] == "owned-construction"
+    assert origin["verification_mode"] == "generated-lifetimes"
     assert origin["status"] == "passed"
     assert origin["verification_report_sha256"] == run.sha256(
         (artifact / "verification.json").read_bytes()

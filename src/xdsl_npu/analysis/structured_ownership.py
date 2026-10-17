@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from xdsl.ir import SSAValue
 
 from ..diagnostics import ErrorKind, require
-from ..indexing import arguments, equivalent, interval, nonnegative, normalize, polynomial
+from ..indexing import _ratio, arguments, equivalent, interval, nonnegative, normalize, polynomial
 from ..scalar import Expr, expression, infer, literal
 from ..target.ascend910b import Actor
 from .structured_memory import MemoryAccess
@@ -66,7 +66,7 @@ def _divisible(value, divisor, facts):
         have, need = Counter(atoms), Counter(required)
         if not need <= have:
             return False
-        ratio = coefficient / scale
+        ratio = _ratio(coefficient, scale)
         for atom in (have - need).elements():
             fact = infer(atom, facts)
             ratio *= 1 if fact is None else fact.multiple

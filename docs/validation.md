@@ -1,25 +1,25 @@
 # 验证与编译、设备性能验收
 
-本页定义验收口径，不表示生成合同或normal路径已完成。当前算法开发已停止交接，结果与缺口见[状态](refactor-progress.md)，新方向见[计划](refactor-plan.md)。本次交接不执行算子构建或设备测试；下述命令供后续实现后使用。
+本页定义验收口径。生成规则已接入唯一 normal 链路，实际结果与缺口见[状态](refactor-progress.md)。本任务执行 CPU/IR、ASC 和 CANN 离线检查，不执行设备调优或压测。
 
 ## 1. 分层验证
 
 | 层 | 验证对象 | 能说明什么 |
 |---|---|---|
 | 输入/IR | 类型、source合同、effects、别名、owner、结构 | 当前输入满足分析前提；不是同步正确性证明 |
-| 变换规则 | PLE实例映射、scope绑定、前沿更新、协议与资源合同 | 检查实现遵守已论证规则；目标normal消费保持的保证，当前后置分析尚待替换 |
+| 变换规则 | PLE实例映射、scope绑定、前沿更新、协议与资源合同 | 检查实现遵守已论证规则；normal 消费生成 credit 和保持的事实 |
 | 语义反例 | 旧read覆盖、WAR/WAW、短MAD、少一个AIV、错event ID、错误guard | 必须生成所需同步或给具体诊断；不能只测试成功例 |
 | 有限执行 | 小N、slot和分支下的实际指令/字节/event交错 | 有界范围正确；不外推任意N，不独立证明硬件前提 |
 | 真实DSL集成 | examples→source/physical IR→ASC | 公共接口接通；不是CANN/设备资格 |
 | CANN与设备 | 实际ASC、二进制、数值和profiling | 对该产物、配置与设备的实测资格 |
 
-区分三种现有“模型对照”：
+独立性的区别如下，后两类不能替代当前实际 IR 模型：
 
 1. 从实际IR解释原生指令、字节访问和硬件event的独立实现，检查生成计划；仍依赖声明的硬件合同。
 2. 读取生产native topology再独立BFS的有限差分，只独立检查求解器；不能发现双方共享的错误拓扑前提。
 3. full/compact共享转移函数的表示差分，只验证表示等价；不能称独立语义oracle。
 
-当前保留 `tests/models/structured_events.py` 的实际IR有限模型；新增progress图/BFS测试主要检查停止时的后置分析实验，不作为下一代生成算法必须保留的实现接口。`tests/support/structured.py` 是生产输入构造 helper，不能算独立 oracle。不能把测试总数当形式化证明。
+当前保留 `tests/models/structured_events.py` 的实际 IR 有限模型及独立 pre-sync 对照，旧 progress 图/BFS/Path 的表示测试已删除。`tests/support/structured.py` 是生产输入构造 helper，不能算独立 oracle。不能把测试总数当形式化证明。
 
 ## 2. 最小反例矩阵
 
@@ -55,14 +55,14 @@
 - source→ASC包含源码读取/构造、所有分析/化简/输出和内部快照。import、进程总时间、CANN、RSS另列，不能移动计时边界美化数字。
 - 五次p50≤5s、max≤10s；GEMM/scale/softmax/RMSNorm同时报告绝对值和是否回退。未达标就明确失败。
 
-复现当前工具（从工作区根目录运行，本轮未执行）：
+复现冷编译工具（从工作区根目录运行，执行结果见状态页）：
 
 ```bash
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output runs/structured-loops/fa-probe
 PYTHONPATH=compiler .venv/bin/python -m benchmarks.compile --input compiler/examples/flash_attention/attention.py --entry attention_target --mode normal --trials 5 --timeout 300 --output runs/structured-loops/fa-cold
 ```
 
-冻结源码、编译器Git加未提交diff身份、constexpr政策、版本、ASC SHA、命令及原始JSON。单次probe和带采样诊断不作为五次p50；当前normal仍含progress/lease等后置分析，必须记录这一事实；不能用owned-construction标签声称它们已被移除。normal与额外结构验证的成本分开。无需清空OS文件cache，不允许跨编译结果缓存。
+冻结源码、编译器Git加未提交diff身份、constexpr政策、版本、ASC SHA、命令及原始JSON。单次probe和带采样诊断不作为五次p50；当前 normal 使用生成规则的域、phase 和 credit 前提；不再执行旧 progress/path solver。`generated-lifetimes` 仅描述来源，不能作为独立证明。normal与额外结构验证的成本分开。无需清空OS文件cache，不允许跨编译结果缓存。
 
 ## 5. ASC与设备性能
 

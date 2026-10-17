@@ -81,7 +81,7 @@ def test_broadcast_reads_the_borrowed_statistic_before_it_is_overwritten():
         "T.fill(statistic, 0.0)\n                T.sub(x[slot, :, :], maximum[:, None]",
     )
     assert source != softmax.source
-    with pytest.raises(CompileError, match="overwritten before.*broadcast"):
+    with pytest.raises(CompileError, match="overwrite before its actual native reader"):
         compile(T.from_source(source, disjoint_external=True))
 
 

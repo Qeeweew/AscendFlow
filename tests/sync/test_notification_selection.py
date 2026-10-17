@@ -20,7 +20,7 @@ from xdsl_npu.analysis.structured_protocols import NotificationKind
 from xdsl_npu.analysis.structured_regions import AccessOccurrence
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.indexing import arguments
-from xdsl_npu.passes.select_notifications import select_notifications
+from xdsl_npu.passes.notification_binding import bind_notifications
 from xdsl_npu.target.ascend910b import Actor, Engine
 
 
@@ -103,6 +103,10 @@ def test_actual_captures_and_acquires_cover_sources_and_earliest_consumers(actua
                     continue
                 capture = next(p for p in notification.sources if p.actor is source[1])
                 acquire = next(p for p in notification.consumers if p.actor is consumer[1])
+                if notification.mechanism is NotificationKind.PIPE_FENCE:
+                    # The real fence captures the already-issued same-pipe
+                    # prefix at the acquire. There is no source-side Set.
+                    capture = acquire
                 a, b = point_key(capture, context, memory), point_key(acquire, context, memory)
                 assert a in positions and b in positions
                 assert positions[b] <= positions[consumer]
@@ -185,7 +189,7 @@ def test_incomplete_mode2_quorum_stays_explicitly_unresolved():
             if not (n.source.participant is Actor.AIV1 and n.consumer.participant is Actor.AIC)
         ),
     )
-    rejected = select_notifications(broken, result.dispatch)
+    rejected = bind_notifications(broken, result.dispatch)
     assert any("quorum" in issue.reason for issue in rejected.unresolved)
     with pytest.raises(CompileError, match="quorum"):
         rejected.require_closed()
@@ -219,6 +223,6 @@ def test_selection_reuses_owned_memory_dependency_and_native_facts(monkeypatch):
     modules = [(import_module(name), attribute) for name, attribute in targets]
     for module, attribute in modules:
         monkeypatch.setattr(module, attribute, forbidden)
-    again = select_notifications(result.dependencies, result.dispatch)
+    again = bind_notifications(result.dependencies, result.dispatch)
     again.require_closed()
     assert again == result

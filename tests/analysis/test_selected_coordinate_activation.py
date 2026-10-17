@@ -32,10 +32,10 @@ from xdsl_npu.analysis.structured_regions import (
     StorageCell,
     StructuredNeed,
 )
-from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison
+from xdsl_npu.analysis.structured_schedule import ActionGuard
 from xdsl_npu.diagnostics import CompileError
 from xdsl_npu.passes.lower_native import lower_native_structure
-from xdsl_npu.passes.select_notifications import _bind_endpoint, _IssueOrder
+from xdsl_npu.passes.notification_binding import _bind_endpoint, _IssueOrder
 from xdsl_npu.scalar import expression, literal
 from xdsl_npu.target.ascend910b import Actor, Engine
 
@@ -143,9 +143,12 @@ def test_selected_coordinate_has_an_ordered_nonempty_prerequisite(
     )
     guard = definedness(domains, bound, parent)
     (prerequisite,) = dict(bound.coordinate_guards)[child.operation].comparisons
-    assert guard.comparisons.index(prerequisite) < guard.comparisons.index(
-        Comparison(dict(bound.coordinates)[child.operation], ">=", literal(0))
-    )
+    selected = next(item for item in bound.selected if item.loop is child.operation)
+    assert selected.value == dict(bound.coordinates)[child.operation]
+    # The constructor supplies FIRST/LAST membership. The independent finite
+    # evaluations below still execute the raw selector, including unsigned
+    # arithmetic on empty fibers and translated parent coordinates.
+    assert prerequisite in guard.comparisons
     for count in (0, 1, 2):
         for canonical_parent in (1, 2, 3, 4):
             actual_parent = canonical_parent - 1

@@ -3,7 +3,7 @@
 面向Ascend 910B / dav-2201，使用xDSL 0.73.0 → 物理执行IR → ASC → CANN 9.1。
 用户表达计算、物理存储、缓冲和多阶段排步，编译器负责真实异步访问与资源复用同步。不引入MLIR工程或参考仓库构建依赖。
 
-**当前重构未完成，算法开发已停止并准备交接。** 现有normal链路在通知选择之后仍执行progress、lease与ID共享路径分析，尚未建立完整的、可组合的同步生成保证。接手请先读[重构计划](docs/refactor-plan.md)，不要默认继续优化当前后置求解器。源码/测试快照`1231f4f`是未完成实验；FA、CANN与设备资格只以[当前状态](docs/refactor-progress.md)的对应证据为准。
+自动同步使用[物理 cell credit 与分层派发规则](docs/generation-rules.md)，生成完整生命周期后交给有限 event 分配器。旧 Path/progress 求解器已删除，公共 DSL→IR→ASC 只有一条链路。当前资格、编译耗时与未解决项见[状态页](docs/refactor-progress.md)；规则接通不等于设备或性能验收。
 
 ## 文档与代码入口
 
@@ -32,7 +32,7 @@ artifact = compile(scale.specialize(B=64))
 print(artifact.asc)
 ```
 
-`tiles`是runtime参数，B是tile容量。`debug_verify=True`执行最终IR的结构检查，不能替代异步正确性证明；普通编译当前仍包含通知选择后的协议分析。旧`cube.task/vector.task`已删除，不恢复兼容。
+`tiles`是runtime参数，B是tile容量。`debug_verify=True`执行最终IR的结构检查，不能替代异步正确性证明；普通编译检查生成规则的输入、配对和排步前提，消费既有 credit；不重跑旧路径证明器。旧`cube.task/vector.task`已删除，不恢复兼容。
 
 ## 仓库边界
 

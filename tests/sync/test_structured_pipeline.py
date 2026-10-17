@@ -34,7 +34,7 @@ def test_actual_local_pipeline_has_one_owned_structure(selected):
     assert len(selected.selection.coverage) == len(selected.dependencies.required)
     assert selected.resources.selection is selected.selection
     assert selected.resources.leases
-    assert selected.resources.progress.points
+    assert selected.resources.order.root.points
     assert {action.kind for action in selected.resources.actions} == {
         SyncKind.LOCAL_SET,
         SyncKind.LOCAL_WAIT,

@@ -1,6 +1,8 @@
 # 同步生成设计要求
 
-2026-10-17。本页规定目标语义，**不宣称当前代码已经按构造保证同步正确**。当前实现和失败证据见[状态页](refactor-progress.md)；新的实施方向见[计划](refactor-plan.md)。
+2026-10-17。本页规定必须保持的语义；已实现的生成规则及逐项事实归属见
+[generation-rules.md](generation-rules.md)。规则论证、有限反例、ASC/CANN 和
+设备资格分别记录，实际结果见[状态页](refactor-progress.md)。
 
 ## 1. 编程模型与当前缺口
 
@@ -8,7 +10,10 @@
 
 循环长度为runtime值，普通常量界循环也不自动展开；只有显式unroll授权展开。算法、FA变体与分块政策留在examples，不进入编译器。
 
-当前链路先生成依赖覆盖通知，再依赖后续进展/生命周期分析得到可执行计划。这是需要改变的职责划分，不只是表示或Python性能问题。
+当前生成器先绑定覆盖与真实位置，检查域和 physical-step/phase 适用前提，
+然后以物理 cell credit 或有限 queue handback 建立生命周期。分配器消费
+完整 `NotificationProgram`，仅引入有限 bank、ID 和共享约束；它不重新建立
+依赖/进展图。父层只消费 child 的真实端口和 may-block cuts。
 
 ## 2. 规则正确性与输入前提
 

@@ -38,6 +38,7 @@ def parameter_domain(base, period):
         original,
         requirements=(),
         domains=(),
+        origins=(),
         sources=tuple(replace(b, guard=ActionGuard((predicate,))) for b in original.sources),
         consumers=tuple(replace(b, guard=ActionGuard((predicate,))) for b in original.consumers),
     )
@@ -91,6 +92,7 @@ def test_empty_intersection_does_not_hide_mismatched_endpoints(base):
         original,
         requirements=(),
         domains=(),
+        origins=(),
         sources=tuple(
             replace(b, guard=ActionGuard((Comparison(m, "==", literal(0)),)))
             for b in original.sources
@@ -140,7 +142,9 @@ def test_real_nested_slot_selection_preserves_actual_endpoint_domains():
                     actual = (
                         False
                         if case.empty
-                        else all(window.interval.evaluate(context) for window in case.windows)
+                        else domains._instance(
+                            notification.sources[0], {}, case=case
+                        ).guard.evaluate(context)
                     )
                     assert actual == original
 
@@ -152,7 +156,7 @@ def test_more_general_memory_frontier_remains_an_explicit_separate_boundary():
     # dependency frontier can represent every multi-residue access word.
     with pytest.raises(CompileError, match="multiple activation residues") as failure:
         selected(nested_slot_source(5))
-    assert failure.value.phase == "structured-dependencies"
+    assert failure.value.phase == "logical-valueflow"
 
 
 def test_endpoint_cannot_borrow_another_endpoints_division_prefix(base):
@@ -168,6 +172,7 @@ def test_endpoint_cannot_borrow_another_endpoints_division_prefix(base):
         original,
         requirements=(),
         domains=(),
+        origins=(),
         sources=tuple(
             replace(b, guard=ActionGuard((prerequisite, division))) for b in original.sources
         ),
@@ -199,6 +204,7 @@ def test_mathematically_empty_domain_does_not_hide_undefined_source_remainder(ba
         original,
         requirements=(),
         domains=(),
+        origins=(),
         sources=tuple(replace(b, guard=ActionGuard((bad,))) for b in original.sources),
         consumers=tuple(replace(b, guard=ActionGuard((bad,))) for b in original.consumers),
     )

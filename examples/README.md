@@ -2,19 +2,20 @@
 
 算法、数学主体与固定排步政策放在这里；通用编译器不根据示例名选择实现。运行/计时/profiling放在[benchmarks](../benchmarks/README.md)，硬件反例放tests。当前编译器重构尚未完成，算子优化暂停。
 
-下表列出当前AST源码入口。主干结构重构已提交，完整CV/FA资格仍未通过；各示例的当前编译与设备证据见[状态页](../docs/refactor-progress.md)。
+下表列出 AST 源码入口；列出不等于全部获得编译资格。Vector、GEMM、嵌套 CV、默认 FA 的当前产物及设备边界见[状态页](../docs/refactor-progress.md)。
 
 | 示例 | 表达的结构 | 工具入口 |
 |---|---|---|
 | [vector/scale.py](vector/scale.py) | 双缓冲GM→UB→Vector→GM | benchmarks.vector.run |
 | [vector/grouped.py](vector/grouped.py) | runtime BNSD商余、cyclic分组和空owner | 同上，--example grouped |
-| [vector/prefix.py](vector/prefix.py) | 两runtime长度及对齐prefix | benchmarks.vector.run_prefix |
+| [vector/prefix.py](vector/prefix.py) | 两 runtime 长度及对齐 prefix（native lowering 尚拒绝） | benchmarks.vector.run_prefix |
 | [vector/independent_rings.py](vector/independent_rings.py) | 独立输入/输出ring | benchmarks.vector.run_rings |
 | [normalization/rms_norm.py](normalization/rms_norm.py) | 归约、Scalar最后读取 | benchmarks.normalization.run |
 | [normalization/softmax.py](normalization/softmax.py) | 行统计、广播scratch、Vector流水 | 同上，--operator softmax |
 | [gemm/batched.py](gemm/batched.py) | L1/L0/MAD/FIX多缓冲 | benchmarks.gemm.run |
 | [gemm/reduction.py](gemm/reduction.py) | runtime K归约 | benchmarks.gemm.run_reduction |
 | [gemm/hierarchical.py](gemm/hierarchical.py) | 输出块循环嵌套K流水 | benchmarks.gemm.run_hierarchical |
+| [cv/nested.py](cv/nested.py) | 双缓冲 GM handoff、嵌套 Cube 与共享双 AIV body | 通用 CLI，entry=nested_cv |
 | [state/recurrence.py](state/recurrence.py) | 初始化、递推、导出 | benchmarks.state.run |
 | [state/grouped.py](state/grouped.py) | 两runtime轴、跨调用复用 | benchmarks.state.run_grouped |
 | [state/shared_inputs.py](state/shared_inputs.py) | 共享只读输入 | 同上，--shared-inputs |

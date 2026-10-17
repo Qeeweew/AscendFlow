@@ -218,8 +218,17 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                 location=str(operation.location),
             )
             ordinal = Expr("argument", (f"$loop{len(loops)}",))
-            extent = expression("max", literal(0), expression("sub", upper, lower))
-            count = expression("ceildiv", extent, literal(step))
+            difference = expression("sub", upper, lower)
+            # This count is a derived mathematical coordinate, not a rewrite
+            # of the original loop header. Preserve that header/SSA for its
+            # separate definedness checks; do not manufacture max/div-by-one
+            # wrappers around every already nonnegative unit-step extent.
+            extent = (
+                difference
+                if nonnegative(difference, facts)
+                else expression("max", literal(0), difference)
+            )
+            count = extent if step == 1 else expression("ceildiv", extent, literal(step))
             induction = expression("add", lower, expression("mul", ordinal, literal(step)))
             loop = LogicalLoop(operation, ordinal, induction, lower, upper, step, count)
             loops[operation] = loop

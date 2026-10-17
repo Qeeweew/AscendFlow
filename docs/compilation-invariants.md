@@ -1,6 +1,8 @@
 # 编译不变量与检查职责
 
-2026-10-17。**以下是重构必须落实的合同，不是当前实现已经完成的声明。** 当前普通编译仍执行通知选择后的progress、lease与共享路径分析。哪些检查能退出正常路径，必须由新的生成保证逐项接替，不能先关闭它们。
+2026-10-17。以下合同由当前唯一 source 链路保持。具体生成规则、前提及
+归纳理由见 [generation-rules.md](generation-rules.md)，资格和未完成项见
+[状态页](refactor-progress.md)。规则已经接通不等于设备或编译性能已验收。
 
 ## 1. 先区分五类工作
 
@@ -14,6 +16,12 @@
 
 每项义务记录输入、建立者、产出、消费者、保持条件及失效条件。不要把所有名为`prove`的函数一概删除；也不要用cache命中率证明职责设计已合理。不建设可伪造的verified标记或庞大通用proof框架。
 
+当前 bounds 按完全相同的 root、原始 axes、offset DAG 和 native geometry
+建立 view 合同；每个不同 active domain 仍有自己的义务。所有真实 AddressOp
+各自保留映射，不以相同扁平字节范围代替原轴检查。host 以不变 lexical domain
+构造标量范围 DAG，保留 owner/iteration 的联合区间；原始除法和源码算术仍独立
+检查。Expr 的 free variables 在节点构造时建立，不依赖 range/guard 环境。
+
 ## 2. 保证的目标归属与当前缺口
 
 | 不变量 | 目标建立职责 | 当前应核对的代码/缺口 |
@@ -23,9 +31,9 @@
 | alias/ownership | 物理访问与owner分析 | 保留root/view/范围/slot/generation及每个AIV的私有性 |
 | 逻辑值版本 | logical_valueflow | 精确RAW、条件KILL/UPDATE与未绑定输入，不能改绑到dispatch最近writer |
 | 物理复用 | storage_lifetimes与实际dispatch | 全部相关最后reader，不能以控制退出代替完成 |
-| ready/release覆盖 | 同步规则生成及组合 | selector目前只保证此类覆盖，不能冒充完整协议正确性 |
-| 配对与事件消费/复用 | 协议生成/循环组合 | 当前主要在EventDomains、lease/path阶段后置建立，需要前移适用条件与保证 |
-| 可进展 | 排步准入与可组合协议规则 | 当前在prove_progress重建阻塞关系；是主要重构缺口 |
+| ready/release覆盖 | notification binding | 真实 capture/acquire、独立覆盖及原始 ownership edges |
+| 配对与事件消费/复用 | 生成器的域、cell credit 与 handback 规则 | 域只检查一次；物理 lifetime 归纳或明确消费回传，rank 不提供消费证据 |
+| 可进展 | queue_order 的分层生成准入 | 零 step phase DAG、正 step 前进；父层只组合 child may-block 边界 |
 | bank/ID/width/quorum | 分配器消费已建生命周期，建立新增资源约束 | 不默认ID共享只是改名；不每候选重新搜索整套路径 |
 | 输出对应 | 物化与后端 | 不重选同步，不改native/控制/guard语义 |
 
@@ -77,4 +85,5 @@ release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继�
 
 规则论证和回归放在开发阶段。每程序必要的输入及适用前提检查保留，已建立事实由下游直接消费。独立有限执行模型、实际IR破坏、CANN与设备资格见[验证口径](validation.md)，各自不外推其证明范围。
 
-当前Path/三值/SCC/搜索树实现是停止时的后置分析实验，其内部预算、缓存或搜索树形状不构成新生成算法必须保留的接口。替换时保留其中有价值的语义反例；不要为维持旧内部测试而留下另一套算法。
+Path/三值/搜索树实验和相应内部形状测试已删除。实际死锁、unsigned
+定义性、祖先代次、event 消费及双 AIV 反例保留在当前表示中；不保留第二套算法。

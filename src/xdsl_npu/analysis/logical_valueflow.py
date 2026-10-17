@@ -234,7 +234,10 @@ class _Builder:
         return cells
 
     def _compose(self, left, right, scope, guards, **clock):
-        self.connections.append(RegionConnection(scope, left, right, guards, **clock))
+        # RAW binding below still visits every read. Only an incoming write
+        # can consume a physical retirement splice in storage_lifetimes.
+        if right.first_write is not None:
+            self.connections.append(RegionConnection(scope, left, right, guards, **clock))
         self.work.boundary_visits += len(right.head_reads) + len(left.tail_reads)
         bound = []
         for read in right.head_reads:

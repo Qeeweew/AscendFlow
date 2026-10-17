@@ -152,7 +152,7 @@ def _partition(domains, notification, loop, branch, unresolved):
 def build_event_family(domains, notification):
     from .event_domains import EventCase
 
-    clocks = domains._clocks(notification)
+    clocks = domains.clocks[notification]
     pending, result = [_Branch()], []
     constructions = 0
     # A fact is reusable only with the same complete premises and specialized

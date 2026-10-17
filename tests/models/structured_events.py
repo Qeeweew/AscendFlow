@@ -5,7 +5,9 @@ arbitrary N nor a numerical/device model. Admitted native modes, geometry and
 implicit-completion primitives are trusted; no selector, resource plan,
 production progress graph, Expr decoder or protocol name supplies an edge.
 
-The logical traversal binds source read versions. A separate actor projection
+An optional independent pre-sync native snapshot supplies the logical traversal
+and source read versions. Without it, both traversals read the final IR and do
+not check preservation of its native program. A separate actor projection
 executes actual SCF/stage guards and issue orders. Native ends have no FIFO
 edge. Sets capture earlier ends, waits consume real IDs, and only hardware
 blocking waits gate a controller. Repeating a body invents no host completion
@@ -15,7 +17,7 @@ edge, fresh local allocation identity or reset of an event/counter.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
@@ -153,6 +155,13 @@ class _Interpret:
             _check(ref in self.memory.addresses, "actual operand has no admitted native geometry")
             root, offset, allocation = values[ref]
             geometry = self.memory.addresses[ref].geometry
+            address = ref.owner
+            _check(
+                isinstance(address, AddressOp)
+                and (address.nbytes.data, address.rows.data, address.row_stride.data)
+                == (geometry.nbytes, geometry.rows, geometry.row_stride),
+                "actual operand changed its admitted native geometry",
+            )
             mode = access.mode.value
             if (
                 operation.native.data in {"mad_first", "mad_cycle"}
@@ -235,7 +244,9 @@ class _Interpret:
                     event = None if operation.event is None else values[operation.event]
                     kind = SyncKind(operation.kind.data)
                     if event is not None:
-                        limit = 8 if kind in {SyncKind.LOCAL_SET, SyncKind.LOCAL_WAIT} else 65536
+                        # dav-2201 GetfftsConfig retains four flag-ID bits.
+                        # IDs >=16 alias hardware resources, not extra slots.
+                        limit = 8 if kind in {SyncKind.LOCAL_SET, SyncKind.LOCAL_WAIT} else 16
                         _check(
                             type(event) is int and 0 <= event < limit,
                             "actual notification has an invalid event ID",
@@ -565,15 +576,108 @@ def _accesses(logical, physical, reach, order):
     return tuple(hazards), bytes_read, bytes_written
 
 
+def _reference_correspondence(memory, reference):
+    """Map independent snapshots; synchronization may only add scalar/sync IR.
+
+    Native UIDs and allocation symbols identify the retained source objects.
+    Loops have no UID, so match their ordered native-bearing nesting paths,
+    ignoring notification-only wrappers. This deliberately rejects native or
+    loop restructuring; such a transformation needs its own reference mapping.
+    """
+    _check(memory.module is not reference.module, "logical reference needs an independent snapshot")
+
+    def indexed(module, operation_type, name):
+        result = {}
+        for operation in module.walk():
+            if isinstance(operation, operation_type):
+                key = getattr(operation, name).data
+                _check(key not in result, f"ambiguous logical reference identity: {key}")
+                result[key] = operation
+        return result
+
+    actual_tasks = indexed(memory.module, TaskOp, "uid")
+    source_tasks = indexed(reference.module, TaskOp, "uid")
+    _check(actual_tasks.keys() == source_tasks.keys(), "logical reference native UID set changed")
+    tasks = {}
+    for uid, source in source_tasks.items():
+        actual = actual_tasks[uid]
+        _check(
+            all(
+                source.attributes[name] == actual.attributes[name]
+                for name in ("native", "params", "scalar")
+            )
+            and tuple(value.type for value in source.refs)
+            == tuple(value.type for value in actual.refs),
+            f"logical reference native contract changed: {uid}",
+        )
+        tasks[source] = actual
+
+    actual_roots = indexed(memory.module, BufferOp, "sym_name")
+    source_roots = indexed(reference.module, BufferOp, "sym_name")
+    _check(actual_roots.keys() == source_roots.keys(), "logical reference allocation roots changed")
+    roots = {}
+    for name, source in source_roots.items():
+        actual = actual_roots[name]
+        _check(
+            source.ref.type == actual.ref.type
+            and all(
+                source.attributes.get(attribute) == actual.attributes.get(attribute)
+                for attribute in ("nbytes", "external", "initialized", "count_scale")
+            ),
+            f"logical reference allocation contract changed: {name}",
+        )
+        roots[source] = actual
+
+    def loops(module):
+        return [
+            (operation, tuple(op.uid.data for op in operation.walk() if isinstance(op, TaskOp)))
+            for operation in module.walk()
+            if isinstance(operation, (PipelineLoopOp, scf.ForOp))
+            and any(isinstance(op, TaskOp) for op in operation.walk())
+        ]
+
+    actual_loops, source_loops = loops(memory.module), loops(reference.module)
+    _check(
+        [(loop.name, native_uids) for loop, native_uids in actual_loops]
+        == [(loop.name, native_uids) for loop, native_uids in source_loops],
+        "logical reference native loop paths changed",
+    )
+    loop_map = {
+        source: actual for (source, _), (actual, _) in zip(source_loops, actual_loops, strict=True)
+    }
+
+    def command(value):
+        point = value.occurrence
+        return replace(
+            value,
+            occurrence=replace(
+                point,
+                operation=tasks[point.operation],
+                coordinates=tuple((loop_map[loop], ordinal) for loop, ordinal in point.coordinates),
+            ),
+            spans=tuple(replace(span, root=roots[span.root]) for span in value.spans),
+        )
+
+    return command
+
+
 def check_structured_events(
     memory: NativeMemoryFacts,
     parameters: dict[str, int] | None = None,
     *,
+    logical_reference: NativeMemoryFacts | None = None,
     invocations: int = 1,
     groups: tuple[int, ...] = (0,),
     max_commands: int = 5000,
 ) -> FiniteExecution:
-    """Check only the explicitly supplied small runtime instances."""
+    """Check explicitly supplied finite instances, optionally against pre-sync IR.
+
+    ``logical_reference`` must own an independent native snapshot made before
+    synchronization, with stable UIDs, allocation symbols and retained loops.
+    It supplies expected native instances, byte addresses and read versions;
+    the actual final IR alone supplies queue/event causality. Both snapshots
+    still trust admitted native geometry and hardware completion contracts.
+    """
     _check(type(invocations) is int and invocations > 0, "finite invocations must be positive")
     root = memory.module.body.block.first_op
     _check(isinstance(root, (KernelOp, MixedOp)), "model requires one actual physical root")
@@ -591,12 +695,25 @@ def check_structured_events(
         if root.core.data == "aic"
         else (Actor.AIV0,)
     )
+    reference = memory if logical_reference is None else logical_reference
+    source_root = reference.module.body.block.first_op
+    _check(
+        type(source_root) is type(root)
+        and all(
+            source_root.attributes.get(name) == root.attributes.get(name)
+            for name in ("sym_name", "target", "core", "blocks", "disjoint_external")
+        ),
+        "logical reference physical invocation changed",
+    )
+    correspondence = (
+        None if logical_reference is None else _reference_correspondence(memory, reference)
+    )
     physical = _Interpret(memory, parameters or {}, physical=True, maximum=max_commands)
-    logical = _Interpret(memory, parameters or {}, physical=False, maximum=max_commands)
+    logical = _Interpret(reference, parameters or {}, physical=False, maximum=max_commands)
     for invocation in range(invocations):
         for group in groups:
             logical.block(
-                root.body.block,
+                source_root.body.block,
                 {},
                 invocation,
                 group,
@@ -604,6 +721,11 @@ def check_structured_events(
             )
             for actor in actors:
                 physical.block(root.body.block, {}, invocation, group, actor)
+    expected = (
+        logical.commands
+        if correspondence is None
+        else [correspondence(command) for command in logical.commands]
+    )
     reach, consumptions, order = _causality(physical.commands)
-    hazards, reads, writes = _accesses(logical.commands, physical.commands, reach, order)
+    hazards, reads, writes = _accesses(expected, physical.commands, reach, order)
     return FiniteExecution(tuple(physical.commands), consumptions, hazards, reach, reads, writes)

@@ -43,6 +43,8 @@ class MemoryBoundsFacts:
     addresses: Mapping[SSAValue, AddressBounds]
     local_bytes: Mapping[tuple[Actor, str], int]
     checked_accesses: int
+    view_contracts: int
+    domain_contracts: int
 
 
 def _require(condition, message, operation, *, kind=ErrorKind.INVALID, witness=()):
@@ -297,12 +299,23 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
             checked_accesses += 1
             if template.frame not in frames[access.operand]:
                 frames[access.operand].append(template.frame)
-    checker, admitted = StructuredAddresses(environment), {}
+    checker, admitted, views = StructuredAddresses(environment), {}, {}
     for value, address in memory.addresses.items():
         active_frames, alignment = tuple(frames[value]), requirements[value]
         admitted[value] = AddressBounds(address, alignment, active_frames)
         if not active_frames:
             continue
+        # Equal physical views have one bounds/alignment contract, even when
+        # lowering produced several SSA AddressOps. Include original axes and
+        # raw offset DAG, not just the flattened footprint. Each distinct
+        # active domain still adds its own obligation below.
+        key = address.root, address.offset, address.geometry, address.axes
+        views.setdefault(key, []).append(admitted[value])
+    domain_contracts = 0
+    for members in views.values():
+        address = members[0].address
+        alignment = max(item.alignment for item in members)
+        domains = dict.fromkeys(frame.domains() for item in members for frame in item.frames)
         operation = address.operation
         _require(
             address.root in allocations, "address has no actual declared allocation", operation
@@ -328,10 +341,10 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                     f"row_stride={address.geometry.row_stride}",
                 ),
             )
-            for frame in active_frames:
-                domains = frame.domains()
-                checker.check_axes(address, domains)
-                lower, upper = interval(address.offset, domains, facts)
+            for domain in domains:
+                domain_contracts += 1
+                checker.check_axes(address, domain)
+                lower, upper = interval(address.offset, domain, facts)
                 _nonnegative(lower, facts, operation, "native byte origin may be negative")
                 remaining = expression(
                     "sub", allocations[address.root], expression("add", upper, literal(span))
@@ -359,4 +372,6 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
         MappingProxyType(admitted),
         MappingProxyType(local_bytes),
         checked_accesses,
+        len(views),
+        domain_contracts,
     )

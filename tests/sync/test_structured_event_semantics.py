@@ -13,11 +13,13 @@ from xdsl.dialects.builtin import ArrayAttr, IndexType, StringAttr
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.analysis.test_event_parameter_cases import nested_slot_source
-from tests.fixtures.nested import shared_l0c_qk_pv
+from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
 from tests.models.structured_events import EventModelError, check_structured_events
 from xdsl_npu import compile
 from xdsl_npu import language as N
 from xdsl_npu.analysis.structured_memory import collect_native_memory
+from xdsl_npu.dialects.io import parse
+from xdsl_npu.dialects.physical import MixedOp
 from xdsl_npu.dialects.structured import ActorDomainOp, NotificationOp
 from xdsl_npu.passes.lower_native import lower_native_structure
 from xdsl_npu.target.ascend910b import Actor, Engine, SyncKind
@@ -178,6 +180,21 @@ def test_actual_final_ir_corruption_has_a_finite_counterexample(mutation):
         check_structured_events(facts)
 
 
+def test_mode2_ids_cannot_overflow_the_real_four_bit_namespace():
+    facts = empty(mixed=True)
+    domain = next(op for op in facts.module.walk() if isinstance(op, ActorDomainOp))
+    notify(
+        domain.body.block.last_op,
+        SyncKind.CROSS_SET,
+        Engine.FIX,
+        Engine.MTE2,
+        actors=(Actor.AIC,),
+        event=16,
+    )
+    with pytest.raises(EventModelError, match="invalid event ID"):
+        check_structured_events(facts)
+
+
 def test_oracle_never_calls_production_selection_resource_or_progress(monkeypatch):
     from importlib import import_module
 
@@ -187,12 +204,13 @@ def test_oracle_never_calls_production_selection_resource_or_progress(monkeypatc
         raise AssertionError("finite oracle consulted a production proof")
 
     for module, function in (
-        ("xdsl_npu.passes.select_notifications", "select_notifications"),
+        ("xdsl_npu.passes.notification_binding", "bind_notifications"),
         ("xdsl_npu.analysis.structured_resources", "allocate_structured_events"),
     ):
         monkeypatch.setattr(import_module(module), function, forbidden)
-    resources = import_module("xdsl_npu.analysis.structured_resources")
-    monkeypatch.setattr(resources, "prove_progress", forbidden)
+    generation = import_module("xdsl_npu.passes.generate_notifications")
+    monkeypatch.setattr(generation, "establish_queue_order", forbidden)
+    monkeypatch.setattr(generation, "generate_notifications", forbidden)
     for operation in facts.module.walk():
         if isinstance(operation, NotificationOp):
             operation.protocol = StringAttr("unrelated metadata")
@@ -363,15 +381,18 @@ def generated(request):
     from xdsl_npu.passes.structured_sync import synchronize_structure
 
     # One actual compiled IR is interpreted at every small runtime count.
-    return synchronize_structure(request.param)
+    plan = synchronize_structure(request.param)
+    return plan, collect_native_memory(parse(plan.before_ir))
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 3, 8])
 def test_generated_final_ir_preserves_finite_access_versions_and_event_consumption(
     generated, count
 ):
-    plan = generated
-    result = check_structured_events(plan.memory, {"tiles": count}, invocations=2)
+    plan, reference = generated
+    result = check_structured_events(
+        plan.memory, {"tiles": count}, logical_reference=reference, invocations=2
+    )
     assert len(result.natives) == 2 * count * len(plan.memory.templates)
     assert result.consumptions
     if count:
@@ -381,7 +402,7 @@ def test_generated_final_ir_preserves_finite_access_versions_and_event_consumpti
 @pytest.fixture(scope="module")
 def nested_slots_memory():
     artifact = compile(N.from_source(nested_slot_source(2)), timeout_s=300)
-    return collect_native_memory(artifact.plan)
+    return collect_native_memory(artifact.plan), collect_native_memory(parse(artifact.before_ir))
 
 
 @pytest.mark.parametrize("n", range(4))
@@ -389,9 +410,36 @@ def nested_slots_memory():
 def test_nested_slots_final_ir_preserves_event_consumption_and_byte_versions(
     nested_slots_memory, n, m
 ):
-    result = check_structured_events(nested_slots_memory, {"n": n, "m": m}, max_commands=2048)
+    memory, reference = nested_slots_memory
+    result = check_structured_events(
+        memory, {"n": n, "m": m}, logical_reference=reference, max_commands=2048
+    )
     assert len(result.natives) == 2 * n * m
     assert result.bytes_read == result.bytes_written == 2 * n * m * 64 * 4
+
+
+@pytest.fixture(scope="module", params=[nested_copy, nested_cv])
+def nested_credit(request):
+    from xdsl_npu.passes.structured_sync import synchronize_structure
+
+    plan = synchronize_structure(request.param)
+    return plan, collect_native_memory(parse(plan.before_ir))
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 7])
+def test_adjacent_child_and_parent_credits_preserve_the_pre_sync_native_reference(
+    nested_credit, count
+):
+    plan, reference = nested_credit
+    # ``invocations`` repeats raw controller bodies without a kernel-launch
+    # completion edge. Mixed kernels have no such cross-controller reentry
+    # contract; sequential launches are externally ordered by the runtime.
+    invocations = 1 if isinstance(plan.module.body.block.first_op, MixedOp) else 2
+    result = check_structured_events(
+        plan.memory, {"n": count}, logical_reference=reference, invocations=invocations
+    )
+    assert bool(result.natives) == bool(count)
+    assert all(len(bank.ids) <= 8 for bank in plan.resources.banks if bank.bank is not None)
 
 
 @pytest.mark.parametrize("mutation", ["delete_wait", "wrong_id", "early_set"])

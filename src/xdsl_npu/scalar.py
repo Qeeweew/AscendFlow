@@ -77,7 +77,7 @@ def _facts(names_or_facts):
     return {name: Fact(maximum=INT64_MAX) for name in names_or_facts}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Expr:
     kind: str
     args: tuple
@@ -85,6 +85,7 @@ class Expr:
     depth: int = field(init=False, compare=False, repr=False)
     order_key: tuple = field(init=False, compare=False, repr=False)
     _hash: int = field(init=False, compare=False, repr=False)
+    variables: frozenset[str] = field(init=False, compare=False, repr=False)
 
     def __post_init__(self):
         require(
@@ -127,6 +128,12 @@ class Expr:
         object.__setattr__(self, "_hash", hash((self.kind, self.args)))
         key = tuple(arg.order_key for arg in children) if children else self.args
         object.__setattr__(self, "order_key", (self.kind, key))
+        names = (
+            frozenset((self.args[0],))
+            if self.kind == "argument"
+            else frozenset().union(*(arg.variables for arg in children))
+        )
+        object.__setattr__(self, "variables", names)
 
     def __hash__(self):
         return self._hash
@@ -193,7 +200,12 @@ class Expr:
         raise CompileError(f"unsupported scalar expression kind: {self.kind}")
 
 
+_UNIT_LITERALS = tuple(Expr("constant", (value,)) for value in (-1, 0, 1))
+
+
 def literal(value):
+    if type(value) is int and -1 <= value <= 1:
+        return _UNIT_LITERALS[value + 1]
     return Expr("constant", (value,))
 
 
@@ -233,7 +245,24 @@ def expression(kind, a, b):
     if kind == "sub":
         return expression("add", a, expression("mul", literal(-1), b))
     if a.constant is not None and b.constant is not None:
-        return literal(Expr(kind, (a, b)).evaluate({}))
+        require(kind in BINARY, f"unsupported scalar expression kind: {kind}")
+        x, y = a.constant, b.constant
+        if kind in DIVISION:
+            require(y > 0, "scalar divisor must be positive")
+            require(x >= 0, "scalar division numerator must be nonnegative")
+        if kind == "add":
+            return literal(x + y)
+        if kind == "mul":
+            return literal(x * y)
+        if kind == "min":
+            return literal(min(x, y))
+        if kind == "max":
+            return literal(max(x, y))
+        if kind == "floordiv":
+            return literal(x // y)
+        if kind == "ceildiv":
+            return literal(x // y + int(x % y != 0))
+        return literal(x % y)
     if kind == "add":
         if a.constant == 0:
             return b

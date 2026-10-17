@@ -1,6 +1,6 @@
 # 源码依据与硬件合同边界
 
-2026-10-16重新记录实际checkout HEAD；本轮只审查源码和文档，没有pull、CANN构建或设备试验。以下仓库不是编译器构建依赖；报告里的历史固定链接可能与checkout不同。
+2026-10-17 再次核对 CATLASS、ops-transformer、ops-nn 的 HEAD 和工作树，均与下表一致且无修改，没有 pull。本轮已执行当前编译器的 CANN 离线构建，未执行设备试验；产物见状态页。以下仓库不是编译器构建依赖；报告里的历史固定链接可能与checkout不同。
 
 | 参考 | 实际HEAD |
 |---|---|
@@ -33,6 +33,7 @@
 
 - 各pipe的隐式顺序、native end、累计退休以及Set捕获使用真实原语合同；不能从SSA或源码顺序推断。
 - 本地二值flag按bank分配有限ID，消费先于复用；AscendC TPipe本身可能预置/占用event，手写参考与裸ASC分别记录。
+- 安装 CANN 的 `compiler/asc/impl/c_api/instr_impl/npu_arch_2201/sync_impl/asc_sync_block_arrive_impl.h` 中，`GetfftsConfig` 使用 mode=2 和 `flag_id & 0xf`，因此只分配 0..15，禁止 overflow alias。
 - mode2跨核通知、双AIV贡献及GM可见性属于具体硬件协议。`asc_sync_block_wait`在2201调用`wait_flag_dev`，阻塞控制器后续派发，不能按某一MTE queue wait处理。
 - GM→UB/UB→GM的burst/gap单位、L1→L0转置和Fixpipe配置以2201头文件为准；原生recipe精确effects必须涵盖内部展开。
 - ready、reader release、event credit、最终drain不是同一种里程碑。仅在原语有明确合同的情况下使用内部早读完成；默认不猜指令内部退休时间。

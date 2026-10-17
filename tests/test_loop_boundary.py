@@ -14,7 +14,7 @@ def test_first_clear_does_not_initialize_other_ring_slots():
     source = reduction_gemm.source.replace(
         "c0 = T.alloc_l0c((M, N)", "c0 = T.alloc_l0c((2, M, N)"
     ).replace("c0[:, :]", "c0[k % 2, :, :]")
-    with pytest.raises(CompileError, match="undefined first read"):
+    with pytest.raises(CompileError, match="without a proved initialized writer coverage"):
         compile(replace(reduction_gemm, source=source))
 
 
@@ -31,8 +31,8 @@ def test_conditional_clear_keeps_the_accumulator_numerical_reader():
 
 def test_unsupported_boundary_and_late_first_clear_are_not_assumed_safe():
     for original, changed, message in [
-        ("k == panels - 1", "k == panels - 2", "pipeline bound - 1"),
-        ("k == 0", "k == 1", "own generation == 0"),
+        ("k == panels - 1", "k == panels - 2", "activation-family closure"),
+        ("k == 0", "k == 1", "own pipeline's first logical iteration"),
     ]:
         with pytest.raises(CompileError, match=message):
             compile(
@@ -53,5 +53,5 @@ def test_terminal_writer_cannot_initialize_a_steady_first_read():
                         if t == n - 1:
                             N.fill(x, 0.0)
     """)
-    with pytest.raises(CompileError, match="undefined first read"):
+    with pytest.raises(CompileError, match="without a proved initialized writer coverage"):
         compile(definition)

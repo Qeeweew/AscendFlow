@@ -24,7 +24,7 @@ from xdsl_npu.analysis.structured_regions import (
 )
 from xdsl_npu.analysis.structured_schedule import ActionGuard, Comparison, Placement
 from xdsl_npu.indexing import arguments
-from xdsl_npu.passes.select_notifications import _IssueOrder
+from xdsl_npu.passes.notification_binding import _IssueOrder
 from xdsl_npu.scalar import Expr, expression, literal
 from xdsl_npu.target.ascend910b import Actor, Engine
 

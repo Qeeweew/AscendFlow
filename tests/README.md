@@ -1,10 +1,10 @@
 # 测试入口与验证边界
 
-使用工作区独立 `.venv`。当前产品只有 `compile` / `Compilation` 这一条 source 链路：实际控制与地址、内存 admission、依赖、通知选择、事件资源、progress，再生成最终物理 IR 与 ASC。导出的物理快照不能作为已证明的 source 编译输入。
+使用工作区独立 `.venv`。当前产品只有 `compile` / `Compilation` 这一条 source 链路：实际控制与地址、内存 admission、依赖、通知生成及 credit、事件资源，再生成最终物理 IR 与 ASC。导出的物理快照不能作为已证明的 source 编译输入。
 
 旧 planner、scope/query/sequence 求解器专属测试、旧局部同步实现和对应 IR 解释器已删除。测试目录不保留这些实现或兼容入口。删除旧 API 测试不等于当前完整链路获得资格；collection 成功也不表示测试体通过。
 
-停止时源码/测试已保存于`1231f4f`，当前新的生成设计见[重构计划](../docs/refactor-plan.md)。progress图、Path和搜索树测试仅说明该实验的局部性质，不要求新实现兼容这些内部API；保留有价值的语义反例，删除被替代solver的结构断言。
+旧实验保存在 Git 的 `1231f4f`。Path/搜索树及其内部形状测试已删除，语义反例已迁移到 `sync/test_generation_contracts.py` 等当前测试。规则见[生成合同](../docs/generation-rules.md)，不在测试中保留旧 solver。
 
 ## 当前职责
 
@@ -14,7 +14,7 @@
 | Native 与内存 | `analysis/test_native_geometry.py`、`test_native_packets.py`、`test_structured_*.py` | 静态 native 规则、issue packet、真实地址/footprint、bounds、owner、SPR、初始化和数值生产者 |
 | 值版本与生命周期 | `analysis/test_logical_valueflow.py`、`test_conditional_accesses.py`、`test_storage_word.py`、`test_storage_lifetimes.py` | 条件 clear/RMW、读版本、PLE 邻接和实际 IR 值保持 |
 | 依赖与同步选择 | `analysis/test_dependency_retirement_frontiers.py`、`test_structured_dependencies.py`、`sync/test_notification_selection.py` | 最后真实 reader、捕获/获取端点、实际代次与完整 CV quorum |
-| 资源与进展 | `analysis/test_event_*.py`、`test_progress_*.py`、`test_structured_resources.py`、`test_structured_resource_contracts.py`、`test_structured_event_sharing.py` | 精确激活、空/短循环、窗口投影、ID lease、最后消费、真实阻塞路径和 region 接口 |
+| 资源与进展 | `analysis/test_event_*.py`、`test_structured_resource_contracts.py`、`sync/test_generation_contracts.py` | 精确激活、空/短循环、窗口投影、cell credit、消费回传、bank 预留与 child 边界 |
 | 最终 IR 与 ASC | `backend/test_structured_emission.py`、`sync/test_structured_pipeline.py` | 后端消费既有事实、实际 Notification/SCF/Address SSA 与生成调用 |
 | 数学、ABI 和测量记录 | `test_attention_math.py`、`test_runtime_contract.py`、`test_attention_runner.py`、`test_performance.py`、`test_work_inventory.py` | 数学参考、host guards、命名 ABI、证据身份、静态工作量与显式分析假设 |
 
@@ -28,7 +28,7 @@
 
 `models/structured_domains.py` 复用已收集的 ControlFacts、Expr/LoopResidueSelection 求值、需求域/guard 描述与实际任务集合，直接解释有限控制和 issue order。它不从生产 order、rank、lifetime 或 progress 查询取得预期边。
 
-`models/structured_events.py` 读取实际最终 IR，复用已审计的 native footprint 和 target 规则，自行建立逻辑字节版本以及物理 actor/queue/event 执行关系。它不读取 selector、allocator 或 progress 的证明结果。给定参数和有限 body 调用次数的枚举不能代替任意 N 的符号证明。
+`models/structured_events.py` 读取实际最终 IR，复用已审计的 native footprint 和 target 规则，自行建立逻辑字节版本以及物理 actor/queue/event 执行关系。它不读取生成器、分配器或 queue_order 的结果；可以独立 pre-sync snapshot 提供预期 native、地址和读版本。`invocations` 表示原始 controller body 连续重入，不隐含跨 actor 的 kernel launch 完成边；mixed 程序的顺序 launch 由 runtime 外部排序。给定参数和有限 body 调用次数的枚举不能代替任意 N 的符号证明。
 
 后端 C++ shim 仅执行 scalar 控制并记录调用与地址，不执行 tensor 数学、CANN 指令或异步设备队列。
 

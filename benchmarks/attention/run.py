@@ -393,7 +393,7 @@ def load_backend(output, backend, *, reference_output=None, policy=DEFAULT_POLIC
     if backend == "generated":
         require(
             report.get("pipeline") == "structured-regions"
-            and report.get("verification_mode") == "owned-construction",
+            and report.get("verification_mode") == "generated-lifetimes",
             "generated attention artifact is not a current source compilation",
         )
         build_result = read_json(directory / "build-result.json")
