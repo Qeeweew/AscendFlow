@@ -12,6 +12,11 @@
 | `@T.inline` | 词法作用域的透明 AST 内联；不执行 Python helper |
 | `T.Tensor` / `T.int64` | 外部tensor与runtime标量；长度不是constexpr |
 | `T.int64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
+| `T.i64` | GM tensor 的 int64 元素类型；与 runtime 参数声明 `T.int64` 职责不同 |
+| `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 单个 int64 的 S 读取，返回 index SSA；inclusive 值合同不生成 clamp |
+| `T.load_scalar(view)` | f32 UB 或浮点 GM 单元素的 S 读取，返回 f32 SSA |
+| `T.broadcast(v[None,:], out=...)` / `v[:,None]` | 显式 f32 行/列展开；行展开需要 `(rows,8)` scratch |
+| `T.mul(k[None,:], v[:,None], out=..., scratch=...)` | 直接外积，保留列向量和 BRCB 行值的真实访问，不隐式复制完整列矩阵 |
 | `T.constexpr` | tile、dtype/layout、固定政策等显式特化参数 |
 | `assert` | 只接受constexpr布尔条件；不是运行时事实假设，即使Python -O也执行编译检查 |
 | `T.Kernel(groups, kind=...)` | launch域；mixed每组1 AIC/2 AIV |
@@ -107,6 +112,10 @@ Tensor 默认 `access="read"`，入口已初始化且禁止写；`write` 表示�
 内部 reader 的输出消除写间依赖。详见[内存合同](../development/memory-contracts.md)。
 
 runtime输入的minimum/multiple支持除数正性和整除推导；非法的原始除法不能因为后续乘0或相减化简而逃过admission。地址化简须说明数学整数、设备i64、溢出、除法和guard支配条件。调用方满足合法 int64 索引求值前提，launcher 不检查运行时溢出。
+
+`load_index` 的值范围可引用先前支配该读取的 index SSA；范围只对实际读取后的词法域有效，
+不是全局 host 参数，也不证明不同元数据取值互不相等。元数据在 kernel 内必须不可变。
+S 读取使用既有有序执行语义；条件 reader、异步 producer 和最后 reader 的完成仍由公共同步规则处理。
 
 `i < min(a,b)` 保留对两边的范围限制；`max` 的已知下限和余数的数学区间不豁免
 原始 unsigned 除法的定义性。原始轴 tile 的 Euclidean digit 排列及统一循环平移可

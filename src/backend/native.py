@@ -19,7 +19,7 @@ QUALIFIER = {
     "L0B": "__cb__",
     "L0C": "__cc__",
 }
-CTYPE = {"f32": "float", "f16": "half", "bf16": "bfloat16_t", "u8": "uint8_t"}
+CTYPE = {"f32": "float", "f16": "half", "bf16": "bfloat16_t", "u8": "uint8_t", "i64": "int64_t"}
 
 
 _MASKED_ELEMENTS = frozenset(
@@ -111,9 +111,28 @@ def native_line(task, *, pointer_renderer, generation):
         return f"asc_{task.native}({p[2]}, {p[0]}, {p[1]}, uint32_t({length(refs[0], 4)}));"
     if task.native in {"exp", "rsqrt", "sqrt"}:
         return f"asc_{task.native}({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
-    if task.native == "scalar_load":
-        source = ptr(refs[0]).replace("__ubuf__ float*", "__ubuf__ volatile float*")
-        return f"npu_value_{task.uid} = *({source});"
+    if task.native in {"scalar_load", "index_load"}:
+        element = CTYPE[refs[0].dtype]
+        source = ptr(refs[0]).replace(f"{element}*", f"volatile {element}*")
+        cast = "int64_t" if task.native == "index_load" else "float"
+        return f"npu_value_{task.uid} = {cast}(*({source}));"
+    if task.native in {"mul_columns", "add_columns", "broadcast_columns", "broadcast_rows"}:
+        rows, cols = task.params
+        dst = ptr(refs[-1], extra="npu_chunk * 256")
+        setup = "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
+        if task.native in {"mul_columns", "add_columns"}:
+            src = ptr(refs[0], extra="npu_chunk * 256")
+            vector = ptr(refs[1], extra="npu_chunk * 256")
+            call = f"asc_{task.native.removesuffix('_columns')}({dst}, {src}, {vector}, uint8_t({rows}), 1, 1, 1, {cols // 8}, {cols // 8}, 0);"
+        else:
+            src = p[0] if task.native == "broadcast_rows" else ptr(refs[0], extra="npu_chunk * 256")
+            dst = dst.replace("float*", "uint32_t*")
+            src = src.replace("float*", "uint32_t*")
+            strides = (0, 1) if task.native == "broadcast_rows" else (1, 0)
+            call = f"asc_copy({dst}, {src}, uint8_t({rows}), 1, {strides[0]}, {cols // 8}, {strides[1]});"
+        return (
+            setup + f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ {call} }}"
+        )
     if task.native in {"vector_copy", "brcb8", "broadcast_rows64"}:
         bits = [value.replace("float*", "uint32_t*") for value in p]
         if task.native == "vector_copy":
@@ -129,6 +148,16 @@ def native_line(task, *, pointer_renderer, generation):
         if task.native == "fill" and isinf(task.scalar):
             value = ("-" if task.scalar < 0 else "") + "__builtin_inff()"
         return f"asc_duplicate({p[0]}, {value}, uint32_t({length(refs[0], 4)}));"
+    if task.native == "mul_outer":
+        rows, cols = task.params
+        column = ptr(refs[0], extra="npu_chunk * 256")
+        dst = ptr(refs[2], extra="npu_chunk * 256")
+        return (
+            "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
+            f"for (int npu_chunk = 0; npu_chunk < {cols // 64}; ++npu_chunk) {{ "
+            f"asc_mul({dst}, {column}, {p[1]}, uint8_t({rows}), "
+            f"1, 1, 0, {cols // 8}, 0, 1); }}"
+        )
     if task.native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
         rows, cols = task.params
         function = task.native.removesuffix("_row_broadcast")

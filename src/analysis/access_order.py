@@ -573,15 +573,24 @@ class _Builder:
                 for cell, transfer in union.items():
                     varying = any(
                         not self.memory.control.invariant_over(value, loop)
-                        for p in transfer.first_writes + transfer.tail_writes
+                        for p in transfer.head_reads
+                        + transfer.tail_reads
+                        + transfer.first_writes
+                        + transfer.tail_writes
                         for test in self._activation(p)
                         for value in (test.lhs, test.rhs)
                     )
-                    if (
-                        transfer.first_writes
-                        and varying
+                    if varying and (
+                        transfer.head_reads
+                        or transfer.tail_reads
+                        or transfer.first_writes
                         and (cell, loop) not in self.iteration_writes
                     ):
+                        # A conditional reader can depend on an S value
+                        # defined after an earlier producer. The common
+                        # branch ports forward/acquire real queue prefixes
+                        # even when the read is skipped; no earlier Set is
+                        # guarded by that not-yet-defined value.
                         cells.update(self._envelope(operation, {cell: transfer}))
         else:
             children = [

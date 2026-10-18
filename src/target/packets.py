@@ -157,6 +157,11 @@ _COUNT = frozenset(
 )
 _FULL = frozenset(
     {
+        "mul_columns",
+        "mul_outer",
+        "add_columns",
+        "broadcast_columns",
+        "broadcast_rows",
         "broadcast_rows64",
         "mul_row_broadcast",
         "sub_row_broadcast",
@@ -189,6 +194,7 @@ _MASK_FREE = frozenset(
         "copy",
         "copy_rows",
         "scalar_load",
+        "index_load",
         "brcb8",
         "nd2nz",
         "nd2nz_pad",

@@ -415,13 +415,12 @@ def _joint_affine_interval(expr, domains, facts, *, atomic=False):
         if len(ratios) != 1:
             continue
         (ratio,) = ratios
-        if ratio <= 0 or ratio.denominator != 1:
+        if ratio == 0 or ratio.denominator != 1:
             continue
         bias = _to_expr(_sum(top, _scale(bottom, -ratio)))
         scale = literal(int(ratio))
-        return tuple(
-            expression("add", expression("mul", scale, bound), bias) for bound in (lower, upper)
-        )
+        selected = (lower, upper) if ratio > 0 else (upper, lower)
+        return tuple(expression("add", expression("mul", scale, bound), bias) for bound in selected)
     return None
 
 
@@ -453,20 +452,27 @@ def interval(expr, domains, facts):
     if expr.kind in {"add", "min", "max"}:
         return expression(expr.kind, al, bl), expression(expr.kind, ah, bh)
     if expr.kind == "mul":
-        if a.constant is not None and a.constant < 0:
-            return expression("mul", a, bh), expression("mul", a, bl)
-        if b.constant is not None and b.constant < 0:
-            return expression("mul", b, ah), expression("mul", b, al)
+        if a.constant is not None:
+            low, high = (bh, bl) if a.constant < 0 else (bl, bh)
+            return expression("mul", a, low), expression("mul", a, high)
+        if b.constant is not None:
+            low, high = (ah, al) if b.constant < 0 else (al, ah)
+            return expression("mul", b, low), expression("mul", b, high)
         require(
-            nonnegative(al, facts) and nonnegative(bl, facts),
+            domain_nonnegative(al, domains, facts) and domain_nonnegative(bl, domains, facts),
             "index product has an unproven sign",
+            witness=(
+                f"product={expr.text()}",
+                f"lower_left={al.text()}",
+                f"lower_right={bl.text()}",
+            ),
         )
         return expression("mul", al, bl), expression("mul", ah, bh)
     if expr.kind in {"floordiv", "ceildiv", "rem"}:
         from .scalar import positive
 
         require(
-            al == literal(0) or nonnegative(al, facts),
+            domain_nonnegative(al, domains, facts),
             "unsigned index division has an unproven nonnegative dividend",
         )
         require(al == ah or b == bl == bh, "index divisor is not uniform")
@@ -475,6 +481,24 @@ def interval(expr, domains, facts):
             return literal(0), expression("sub", b, literal(1))
         return expression(expr.kind, al, b), expression(expr.kind, ah, b)
     require(False, f"unsupported index range operation {expr.kind}")
+
+
+def domain_nonnegative(expr, domains, facts):
+    """Resolve lexical lower bounds without discarding their correlations.
+
+    An inner loop's lower bound may be a previously loaded metadata value.
+    Follow that value's earlier range only when its sign is needed; eagerly
+    replacing every bound would lose relations such as end >= begin.
+    """
+    seen = set()
+    for _ in range(len(domains) + 2):
+        if nonnegative(expr, facts):
+            return True
+        if expr in seen:
+            return False
+        seen.add(expr)
+        expr = interval(expr, domains, facts)[0]
+    return False
 
 
 def check_axis(origin, width, extent, domains, facts):
@@ -493,16 +517,17 @@ def check_axis(origin, width, extent, domains, facts):
         if expr.kind in {"floordiv", "rem", "ceildiv"}:
             lower, _ = interval(expr.args[0], domains, facts)
             require(
-                nonnegative(lower, facts),
+                domain_nonnegative(lower, domains, facts),
                 "unsigned index division has an unproven nonnegative dividend",
             )
 
     divisions(origin)
     lower, upper = interval(origin, domains, facts)
-    require(nonnegative(lower, facts), "logical axis origin may be negative")
+    require(domain_nonnegative(lower, domains, facts), "logical axis origin may be negative")
     remaining = expression("sub", extent, expression("add", upper, literal(width)))
     require(
-        nonnegative(remaining, facts), "logical axis access is not bounded by its tensor extent"
+        domain_nonnegative(remaining, domains, facts),
+        "logical axis access is not bounded by its tensor extent",
     )
 
 
@@ -516,8 +541,8 @@ def validate_source_arithmetic(program):
     from xdsl.dialects import arith, scf
 
     from .analysis.iteration import iteration_domain
-    from .dialects.source import DomainOp, PipelineOp
-    from .scalar import facts_from_sizes, from_ssa, positive
+    from .dialects.source import DomainOp, IndexReadOp, PipelineOp
+    from .scalar import Fact, facts_from_sizes, from_ssa, positive
 
     # Only unsigned divisions need these range premises. Keep all of them,
     # including dead expressions, but do not demand an access-bound formula
@@ -534,11 +559,31 @@ def validate_source_arithmetic(program):
     facts = facts_from_sizes(program.body.block.ops)
     owner = program.body.block.args[0]
     core = Expr("argument", ("$core",))
+    facts["$core"] = Fact(maximum=program.groups.data - 1)
     number = 0
 
     def walk(block, coordinates, domains):
         nonlocal number
         for op in block.ops:
+            if isinstance(op, IndexReadOp):
+                name = f"$metadata{number}"
+                number += 1
+                lower, upper = (
+                    from_ssa(v, coordinates=coordinates, facts=facts)
+                    for v in (op.minimum, op.maximum)
+                )
+                coordinates = coordinates | {op.value: name}
+                coordinate = Expr("argument", (name,))
+                domains = [
+                    *domains,
+                    (coordinate, lower, upper),
+                    (
+                        expression("sub", coordinate, lower),
+                        literal(0),
+                        expression("sub", upper, lower),
+                    ),
+                ]
+                continue
             if op not in relevant:
                 continue
             if isinstance(op, divisions):
@@ -547,6 +592,11 @@ def validate_source_arithmetic(program):
                 )
                 try:
                     lower, _ = interval(lhs, domains, facts)
+                    for _ in range(len(domains) + 1):
+                        bound = interval(lower, domains, facts)[0]
+                        if bound == lower:
+                            break
+                        lower = bound
                 except CompileError as error:
                     raise CompileError(
                         f"{op.location}: source unsigned division: {error}"
@@ -554,6 +604,8 @@ def validate_source_arithmetic(program):
                 require(
                     nonnegative(lower, facts),
                     "source unsigned division has an unproven nonnegative dividend",
+                    location=str(op.location),
+                    witness=(f"dividend={lhs.text()}", f"lower={lower.text()}"),
                 )
                 require(
                     positive(rhs, facts),

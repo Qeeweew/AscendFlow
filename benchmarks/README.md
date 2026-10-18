@@ -27,6 +27,7 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `vector/run_masks.py` | 通用mask示例：`--build`离线共享构建；`--artifact/--library`只校验已发布ASC/共享库/manifest，不重新编译；`--physical`按独立逻辑oracle运行 |
 | `vector/run_mask_rows.py` | 小行/列mask示例：单UB tile、`cols<hi`/`cols!=lo`/`rows>=cols-q` 三输出；同样`--build`或只校验复用`--library`，记录逐输出位精确证据 |
 | `profile.sh`、`profile_summary.py`、`artifacts.py` | msprof 应用包装、设备 task 汇总和产物身份检查 |
+| `kda/run.py`、`kda/profile.py`、`kda/compare.py` | KDA 全量数值验收、msprof op 指标、batch>=128 同输入/设备/官方 Triton wheel 身份比较；见[KDA](../docs/operators/kda.md) |
 | `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 | `references/` | 日常 ACLNN 适配器与独立 AscendC 参考 |
 

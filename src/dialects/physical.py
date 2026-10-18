@@ -97,7 +97,7 @@ class TaskOp(IRDLOperation):
     params = attr_def(ArrayAttr[IntAttr])
     scalar = attr_def(FloatAttr)
     task = result_def(TaskType)
-    value = opt_result_def(f32)
+    value = opt_result_def()
     traits = traits_def(AsyncEffects())
 
 

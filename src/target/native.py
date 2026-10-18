@@ -21,7 +21,7 @@ CAPACITY = {
 }
 
 
-ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2, "u8": 1}
+ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2, "u8": 1, "i64": 8}
 
 _CMP_KINDS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 _MASKED_UNARY = frozenset({"mask_muls", "mask_adds", "mask_exp", "mask_rsqrt", "mask_sqrt"})
@@ -284,14 +284,51 @@ def native_contract(
         return "V", ("R",) * (arity - 1) + ("W",)
     if native == "scalar_load":
         require(
-            banks == ("UB",)
-            and dtypes == ("f32",)
+            len(refs) == 1
+            and banks[0] in {"UB", "GM"}
+            and dtypes[0] in {"f32", "f16", "bf16"}
+            and (banks[0] == "GM" or dtypes == ("f32",))
             and layouts == ("linear",)
-            and lengths == (4,)
+            and lengths == (ITEMSIZE[dtypes[0]],)
             and not params,
-            "Scalar load requires one f32 UB word",
+            "Scalar load requires one f32 UB or floating GM element",
         )
         return "S", ("R",)
+    if native == "index_load":
+        require(
+            len(refs) == 1
+            and banks == ("GM",)
+            and dtypes == ("i64",)
+            and layouts == ("linear",)
+            and lengths == (8,)
+            and not params,
+            "index load requires exactly one immutable GM int64",
+        )
+        return "S", ("R",)
+    if native in {"mul_columns", "add_columns", "broadcast_columns", "broadcast_rows"}:
+        require(len(params) == 2, "broadcast needs (rows, columns)")
+        rows, cols = params
+        binary = native in {"mul_columns", "add_columns"}
+        arity = 3 if binary else 2
+        source_bytes = rows * 32 if native == "broadcast_rows" else cols * 4
+        require(
+            1 <= rows <= 255
+            and 64 <= cols <= 1984
+            and cols % 64 == 0
+            and len(refs) == arity
+            and banks == ("UB",) * arity
+            and dtypes == ("f32",) * arity
+            and layouts == ("linear",) * arity
+            and all(r.contiguous for r in refs)
+            and lengths
+            == (
+                (rows * cols * 4, cols * 4, rows * cols * 4)
+                if binary
+                else (source_bytes, rows * cols * 4)
+            ),
+            "broadcast needs exact contiguous f32 matrix/vector footprints",
+        )
+        return "V", ("R",) * (arity - 1) + ("W",)
     if native == "vector_copy":
         require(
             len(refs) == 2
@@ -425,6 +462,23 @@ def native_contract(
             "Vector fill needs a contiguous f32 UB destination",
         )
         return "V", ("W",)
+    if native == "mul_outer":
+        require(len(params) == 2, "outer product needs (rows,columns)")
+        rows, cols = params
+        require(
+            8 <= rows <= 248
+            and rows % 8 == 0
+            and 64 <= cols <= 1984
+            and cols % 64 == 0
+            and len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and all(r.contiguous for r in refs)
+            and lengths == (cols * 4, rows * 32, rows * cols * 4),
+            "outer product needs exact f32 column and BRCB row footprints",
+        )
+        return "V", ("R", "R", "W")
     if native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
         require(len(params) == 2, "row broadcast arithmetic needs (rows,columns)")
         rows, cols = params

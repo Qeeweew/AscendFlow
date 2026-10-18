@@ -497,11 +497,11 @@ class _Emitter:
                 )
             for template in self.memory.templates:
                 if (
-                    template.contract.native == "scalar_load"
+                    template.contract.native in {"scalar_load", "index_load"}
                     and family in self.relevant[template.operation]
                 ):
                     lines.append(
-                        f"{indent}float npu_value_{self.task_names[template.operation]} = 0.0f;"
+                        f"{indent}{'int64_t' if template.contract.native == 'index_load' else 'float'} npu_value_{self.task_names[template.operation]} = 0;"
                     )
             context = _Context({}, family)
             body = self.block(self.root.body.block, context)

@@ -20,9 +20,9 @@ from xdsl.dialects.builtin import IndexType, ModuleOp
 from xdsl.ir import Operation
 
 from ..diagnostics import ErrorKind, require
-from ..dialects.physical import CoreIdOp, KernelOp, MixedOp, RuntimeSizeOp
+from ..dialects.physical import CoreIdOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
-from ..indexing import arguments, equivalent, interval, nonnegative
+from ..indexing import arguments, domain_nonnegative, equivalent, interval, nonnegative
 from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
 from ..target.ascend910b import Actor
 from .structured_addresses import ScalarEnvironment
@@ -171,6 +171,11 @@ class ControlFacts:
         frame = self.frames.get(operation)
         if frame is not None and frame.parent is not None:
             names.update(loop.ordinal.args[0] for loop in frame.parent.loops())
+            names.update(
+                coordinate.args[0]
+                for coordinate, _, _ in frame.parent.domains()
+                if coordinate.kind == "argument"
+            )
         return arguments(value) <= names
 
 
@@ -216,6 +221,32 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
             bindings[operation.value] = Expr("argument", (name,))
         elif isinstance(operation, CoreIdOp):
             bindings[operation.value] = group
+        elif isinstance(operation, TaskOp) and operation.native.data == "index_load":
+            count = operation.attributes.get("address_count")
+            require(
+                count is not None
+                and count.data == 1
+                and len(operation.refs) == 3
+                and operation.value is not None
+                and isinstance(operation.value.type, IndexType),
+                "index metadata load lost its explicit bounds",
+            )
+            unknown_scalar(operation.value)
+            coordinate = bindings[operation.value]
+            lower, upper = scalar(operation.refs[1]), scalar(operation.refs[2])
+            frame = ControlFrame(
+                frame,
+                operation,
+                frame.participants,
+                (
+                    (coordinate, lower, upper),
+                    (
+                        expression("sub", coordinate, lower),
+                        literal(0),
+                        expression("sub", upper, lower),
+                    ),
+                ),
+            )
         elif isinstance(operation, ActorDomainOp):
             participants = (
                 (Actor.AIC,) if operation.kind.data == "cube" else (Actor.AIV0, Actor.AIV1)
@@ -245,7 +276,7 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
             # wrappers around every already nonnegative unit-step extent.
             extent = (
                 difference
-                if nonnegative(difference, facts)
+                if domain_nonnegative(difference, frame.domains(), facts)
                 else expression("max", literal(0), difference)
             )
             count = extent if step == 1 else expression("ceildiv", extent, literal(step))
@@ -283,8 +314,12 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                 else frame
             )
             for block in region.blocks:
+                local = child_frame
                 for child in block.ops:
-                    visit(child, child_frame)
+                    visited_frame = visit(child, local)
+                    if isinstance(child, TaskOp) and child.native.data == "index_load":
+                        local = visited_frame
+        return frame
 
     participants = () if mixed else (Actor.AIC,) if root.core.data == "aic" else (Actor.AIV0,)
     root_frame = ControlFrame(

@@ -19,6 +19,7 @@ from xdsl.ir import SSAValue
 
 from ..diagnostics import require
 from ..dialects.physical import TaskOp
+from ..dialects.source import _dominates
 from ..dialects.structured import PipelineStageOp
 from ..dialects.types import RefType
 from ..mask import (
@@ -226,6 +227,7 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
     decoder = StructuredAddresses(control.environment)
     templates, addresses = [], {}
     scalar_values = {}
+    scalar_positions, scalar_ancestors = {}, {}
     for operation in control.frames:
         if not isinstance(operation, TaskOp):
             continue
@@ -253,10 +255,7 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 "native scalar operand requires a preceding actual Scalar load",
             )
             scalar_source = scalar_values[atoms[0]]
-            require(
-                scalar_source.parent is operation.parent,
-                "Scalar capture needs the same physical scope; delayed values need storage",
-            )
+            _dominates(atoms[0], operation, scalar_positions, scalar_ancestors)
         if scalar_source is None:
             require(
                 all(isinstance(value.type, IndexType) for value in atoms),
@@ -297,11 +296,24 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             allow_infinity=operation.native.data in {"fill", "mask_fill"},
         )
         require(
-            (operation.value is not None) == (operation.native.data == "scalar_load"),
+            (operation.value is not None)
+            == (operation.native.data in {"scalar_load", "index_load"}),
             "only synchronous Scalar load may return a numerical SSA value",
         )
         if operation.value is not None:
-            scalar_values[operation.value] = operation
+            if operation.native.data == "index_load":
+                require(
+                    len(atoms) == 2 and isinstance(operation.value.type, IndexType),
+                    "index load needs its two bounds and an index result",
+                )
+                require(
+                    refs[0].root.owner.access is not None
+                    and refs[0].root.owner.access.data == "read",
+                    "index metadata must be immutable",
+                )
+            else:
+                require(operation.value.type == f32, "floating Scalar load must produce f32")
+                scalar_values[operation.value] = operation
         _check_mask_program(operation, refs, params)
         _check_mask_layout(operation)
         contract = NativeContract(operation.native.data, engine, modes, params, scalar)

@@ -152,6 +152,12 @@ class _Partitioner:
     def __init__(self, memory, admission):
         self.memory, self.admission = memory, admission
         self.facts = memory.control.environment.facts
+        self.indirect_values = frozenset(
+            name
+            for template in memory.templates
+            if template.operation.native.data == "index_load" and template.frame.loops()
+            for name in arguments(memory.control.environment.expression(template.operation.value))
+        )
         self.work = DependencyWork(native_templates=len(memory.templates))
         self.effects, self.patterns, self._origin_pool = {}, {}, {}
 
@@ -249,6 +255,11 @@ class _Partitioner:
 
     def _slots(self, template, access, participant):
         address = access.address
+        if arguments(address.offset) & self.indirect_values:
+            # Loaded indices describe actual addresses, not affine functions
+            # of a loop ordinal. Keep unknown overlap in the existing alias
+            # order domain; a later reload may return a different value.
+            return None
         bindings = {self.memory.control.sid: literal(1 if participant is Actor.AIV1 else 0)}
         # Keep remainder nodes until their finite image has been selected.
         # Polynomial normalization expands rem into x-d*floor(x/d), which

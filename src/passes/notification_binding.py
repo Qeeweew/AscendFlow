@@ -37,6 +37,7 @@ from ..analysis.structured_regions import (
 )
 from ..analysis.structured_schedule import ActionGuard, Comparison, Placement
 from ..diagnostics import CompileError, ErrorKind, require
+from ..dialects.physical import TaskOp
 from ..indexing import arguments, equivalent, nonnegative, normalize
 from ..scalar import Expr, expression, literal
 from ..target.ascend910b import Actor, Engine
@@ -207,6 +208,14 @@ def _bind_endpoint(
     family_map = {domain.loop: domain for domain in occurrence.families}
     available = {control.group.args[0], control.sid.args[0]}
     available.update(name for name in environment.facts if not name.startswith("$"))
+    for frame in occurrence.frame.ancestors():
+        operation = frame.operation
+        if isinstance(operation, TaskOp) and operation.native.data == "index_load":
+            if operation is occurrence.operation and not source:
+                continue
+            # This load dominates the actual insertion scope. Its SSA result
+            # may be consumed here; no reload or different iteration is used.
+            available.update(arguments(environment.expression(operation.value)))
     for binding in occurrence.bindings:
         logical = control.loops[binding.loop]
         available.add(logical.ordinal.args[0])
@@ -358,6 +367,11 @@ def _bind_endpoint(
         "notification retains another invocation's unbound coordinate",
         kind=ErrorKind.UNSUPPORTED,
         phase="notification-selection",
+        witness=tuple(
+            f"{test.lhs.text()} {test.predicate} {test.rhs.text()}"
+            for test in guard.comparisons
+            if not (arguments(test.lhs) | arguments(test.rhs) <= available)
+        ),
     )
     return BoundPlacement(
         occurrence,

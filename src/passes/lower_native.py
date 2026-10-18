@@ -41,6 +41,7 @@ from ..dialects.source import (
     CopyOp,
     DomainOp,
     ElementOp,
+    IndexReadOp,
     MaskCombineOp,
     MaskOp,
     MaterializeMaskOp,
@@ -298,7 +299,14 @@ class _Lowerer:
             task = TaskOp.build(
                 operands=[(*refs, *scalar_operands)],
                 attributes=attributes,
-                result_types=[TaskType(), f32 if native == "scalar_load" else None],
+                result_types=[
+                    TaskType(),
+                    f32
+                    if native == "scalar_load"
+                    else IndexType()
+                    if native == "index_load"
+                    else None,
+                ],
             )
             task.location = op.location
             scope.block.add_op(task)
@@ -334,6 +342,14 @@ class _Lowerer:
             result = recipes.lower_reduce(op, context)
         elif isinstance(op, ScalarReadOp):
             result = recipes.lower_scalar_read(op, context)
+            scope.values[op.value] = result.scalar_value
+        elif isinstance(op, IndexReadOp):
+            result = recipes.lower_index_read(
+                op,
+                context,
+                minimum=self.scalar(op.minimum, scope),
+                maximum=self.scalar(op.maximum, scope),
+            )
             scope.values[op.value] = result.scalar_value
         elif isinstance(op, ScaleOp):
             result = recipes.lower_scale(op, context, factor=self.scalar(op.factor, scope))
@@ -395,6 +411,7 @@ class _Lowerer:
                 ElementOp,
                 ReduceOp,
                 ScalarReadOp,
+                IndexReadOp,
                 ScaleOp,
                 CompareOp,
                 MaterializeMaskOp,

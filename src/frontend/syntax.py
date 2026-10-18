@@ -15,9 +15,11 @@ class DType(StrEnum):
     F32 = "f32"
     F16 = "f16"
     BF16 = "bf16"
+    I64 = "i64"
 
 
 f32, f16, bf16 = DType.F32, DType.F16, DType.BF16
+i64 = DType.I64
 
 
 class _ParameterType(StrEnum):
@@ -186,6 +188,20 @@ def div(lhs, rhs, *, out, scratch=None, mask=None):
 
 
 def load_scalar(source):
+    _ast_only()
+
+
+def load_index(source, *, minimum=0, maximum):
+    """Read one immutable GM int64 with an inclusive input value contract.
+
+    Bounds describe the caller's metadata, and may use preceding index loads.
+    They are not runtime clamps or promises of unique ownership.
+    """
+    _ast_only()
+
+
+def broadcast(source, *, out, scratch=None):
+    """Materialize an explicitly expanded row/column vector into an f32 tile."""
     _ast_only()
 
 

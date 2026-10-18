@@ -223,7 +223,9 @@ class AllocationOp(IRDLOperation):
         if (
             not typ.shape
             or any(n.data == 0 or n.data < -1 for n in typ.shape)
-            or typ.dtype.data not in {"f16", "bf16", "f32", "u8"}
+            or typ.dtype.data not in {"f16", "bf16", "f32", "u8", "i64"}
+            or typ.dtype.data == "i64"
+            and typ.memory.data != "GM"
             or typ.dtype.data == "u8"
             and typ.memory.data != "UB"
             or typ.memory.data not in {"GM", "UB", "L1", "L0A", "L0B", "L0C"}
@@ -411,6 +413,11 @@ def _verify_index_provenance(value, use, seen, active, positions, ancestors, dep
     if isinstance(owner, SizeOp):
         if not isinstance(owner.parent_op(), ProgramOp):
             raise VerifyException("view runtime size must be a uniform program parameter")
+        seen.add(value)
+        return
+    if isinstance(owner, IndexReadOp):
+        # A synchronous metadata value is an SSA definition. Its actual read
+        # and declared bounds are admitted later, together with every use.
         seen.add(value)
         return
     if not isinstance(
@@ -839,10 +846,69 @@ class ElementOp(IRDLOperation):
             "mul_rows": 2,
             "sub_rows": 2,
             "div_rows": 2,
+            "mul_columns": 2,
+            "mul_outer": 2,
+            "add_columns": 2,
+            "broadcast_columns": 1,
+            "broadcast_rows": 1,
         }
         if self.kind.data not in arity or len(self.inputs) != arity[self.kind.data]:
             raise VerifyException("unknown element operation or incorrect operand count")
-        if self.kind.data.endswith("_rows"):
+        if self.kind.data.endswith("_columns"):
+            shape = tuple(n.data for n in self.destination.type.shape)
+            vector = self.inputs[-1].type
+            if (
+                len(shape) != 2
+                or not 1 <= shape[0] <= 255
+                or shape[1] % 64
+                or not 64 <= shape[1] <= 2040
+                or tuple(n.data for n in vector.shape) != (shape[1],)
+                or len(self.inputs) == 2
+                and self.inputs[0].type.shape != self.destination.type.shape
+                or self.scratch is not None
+                or any(v.type.memory.data != "UB" for v in (*self.inputs, self.destination))
+            ):
+                raise VerifyException("column broadcast needs an f32 UB matrix and matching vector")
+        elif self.kind.data == "mul_outer":
+            shape = tuple(n.data for n in self.destination.type.shape)
+            if (
+                len(shape) != 2
+                or not 8 <= shape[0] <= 248
+                or shape[0] % 8
+                or not 64 <= shape[1] <= 1984
+                or shape[1] % 64
+                or tuple(n.data for n in self.inputs[0].type.shape) != (shape[1],)
+                or tuple(n.data for n in self.inputs[1].type.shape) != (shape[0],)
+                or self.scratch is None
+                or tuple(n.data for n in self.scratch.type.shape) != (shape[0], 8)
+                or any(
+                    v.type.memory.data != "UB" or v.type.dtype.data != "f32"
+                    for v in (*self.inputs, self.destination, self.scratch)
+                )
+            ):
+                raise VerifyException(
+                    "outer product needs f32 UB vectors, complete rows/columns and (rows,8) scratch"
+                )
+        elif self.kind.data == "broadcast_rows":
+            shape = tuple(n.data for n in self.destination.type.shape)
+            if (
+                len(shape) != 2
+                or not 8 <= shape[0] <= 248
+                or shape[0] % 8
+                or shape[1] % 64
+                or not 64 <= shape[1] <= 1024
+                or tuple(n.data for n in self.inputs[0].type.shape) != (shape[0],)
+                or self.scratch is None
+                or tuple(n.data for n in self.scratch.type.shape) != (shape[0], 8)
+                or any(
+                    v.type.memory.data != "UB"
+                    for v in (*self.inputs, self.destination, self.scratch)
+                )
+            ):
+                raise VerifyException(
+                    "row broadcast needs packed rows and explicit (rows,8) scratch"
+                )
+        elif self.kind.data.endswith("_rows"):
             shape = tuple(n.data for n in self.destination.type.shape)
             if (
                 len(shape) != 2
@@ -875,7 +941,7 @@ class ElementOp(IRDLOperation):
             if self.mask_storage is not None or self.mask_dependency is not None:
                 raise VerifyException("predicate storage requires an explicit mask")
             return
-        if self.kind.data.endswith("_rows") or self.kind.data == "cast":
+        if self.kind.data.endswith(("_rows", "_columns", "_outer")) or self.kind.data == "cast":
             raise VerifyException("masked row broadcast and conversion are not implemented")
         materialized = not isinstance(self.mask.owner, MaskOp)
         if self.scratch is not None and not materialized:
@@ -991,11 +1057,31 @@ class ScalarReadOp(IRDLOperation):
     def verify_(self):
         _verify_dependencies(self, [self.source])
         if (
-            self.source.type.memory.data != "UB"
-            or self.source.type.dtype.data != "f32"
+            self.source.type.memory.data not in {"UB", "GM"}
+            or self.source.type.dtype.data not in {"f32", "f16", "bf16"}
+            or self.source.type.memory.data == "UB"
+            and self.source.type.dtype.data != "f32"
             or any(n.data != 1 for n in self.source.type.shape)
         ):
-            raise VerifyException("Scalar read requires exactly one f32 UB element")
+            raise VerifyException("Scalar read requires one f32 UB or floating GM element")
+
+
+@irdl_op_definition
+class IndexReadOp(IRDLOperation):
+    name = "npu_source.index_read"
+    source = operand_def(TensorType)
+    minimum = operand_def(IndexType)
+    maximum = operand_def(IndexType)
+    value = result_def(IndexType)
+    traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        if (
+            self.source.type.memory.data != "GM"
+            or self.source.type.dtype.data != "i64"
+            or any(n.data != 1 for n in self.source.type.shape)
+        ):
+            raise VerifyException("index read requires exactly one immutable GM int64 element")
 
 
 @irdl_op_definition
@@ -1081,6 +1167,7 @@ SOURCE = Dialect(
         MaskCombineOp,
         WhereOp,
         ScalarReadOp,
+        IndexReadOp,
         ScaleOp,
         MatmulOp,
         YieldOp,

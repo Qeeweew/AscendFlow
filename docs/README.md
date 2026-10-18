@@ -19,6 +19,7 @@
 | [GEMM](operators/gemm.md) | 标准连续 `C=A@B`，FP16/BF16、尾块、数值和缓存政策 |
 | [Dense NT GEMM](operators/dense-gemm.md) | `C=A@Bt.T`，FP16 输入、FP32 输出及整块限制 |
 | [Flash Attention](operators/flash-attention.md) | dense/causal BNSD forward、online softmax、workspace、输入条件及数值容差 |
+| [KDA decode](operators/kda.md) | 三阶段 head 流水、运行时 tokens、S metadata、batch=128 与官方 Triton-Ascend 对照 |
 
 ## 当前结果与编译器开发
 

@@ -22,6 +22,7 @@ from ..dialects.source import (
     CopyOp,
     DomainOp,
     ElementOp,
+    IndexReadOp,
     MaskOp,
     MaterializeMaskOp,
     MatmulOp,
@@ -481,6 +482,10 @@ class _View:
     def __getitem__(self, indices):
         indices = indices if isinstance(indices, tuple) else (indices,)
         if any(index is None for index in indices):
+            if len(indices) == 2 and indices[0] is None:
+                source = self[indices[1]]
+                require(len(source.shape) == 1, "column broadcast requires one vector")
+                return _ColumnBroadcast(source)
             require(
                 indices[-1] is None and sum(index is None for index in indices) == 1,
                 "broadcast supports only one trailing new axis",
@@ -576,6 +581,9 @@ class _Value:
         return self.view.shape
 
     def __getitem__(self, indices):
+        if isinstance(indices, tuple) and indices == (None, slice(None)):
+            require(len(self.shape) == 1, "column broadcast requires one vector")
+            return _ColumnBroadcast(self)
         require(
             isinstance(indices, tuple)
             and len(indices) == 2
@@ -590,6 +598,11 @@ class _Value:
 
 @dataclass(frozen=True)
 class _RowBroadcast:
+    source: object
+
+
+@dataclass(frozen=True)
+class _ColumnBroadcast:
     source: object
 
 
@@ -1254,7 +1267,7 @@ def _mask_operands(mask, destination_shape, scratch, values):
 def _element(kind, values, out, scalar=None, valid=None, scratch=None, mask=None):
     dst, inputs = _view(out).bound(), [_view(value) for value in values]
     require(dst.buffer.op.access.data != "read", "arithmetic cannot write a read-only tensor")
-    if not kind.endswith("_rows"):
+    if not kind.endswith(("_rows", "_columns", "_outer")):
         require(
             all(v.shape == dst.shape for v in inputs),
             "elementwise operands require equal tile shape",
@@ -1274,7 +1287,7 @@ def _element(kind, values, out, scalar=None, valid=None, scratch=None, mask=None
         mask, dst.shape, scratch, values
     )
     temporary = None if scratch is None else _view(scratch).bound()
-    if temporary is not None and not kind.endswith("_rows"):
+    if temporary is not None and not kind.endswith(("_rows", "_outer")):
         require(
             temporary.buffer.op.access.data != "read" and temporary.shape == dst.shape,
             "scratch must be a writable same-shape tile",
@@ -1323,6 +1336,18 @@ def _rows(kind, lhs, rhs, out, scratch):
 
 
 def mul(lhs, rhs, *, out, valid=None, scratch=None, mask=None):
+    if isinstance(lhs, _RowBroadcast) and isinstance(rhs, _ColumnBroadcast):
+        lhs, rhs = rhs, lhs
+    if isinstance(lhs, _ColumnBroadcast) and isinstance(rhs, _RowBroadcast):
+        require(valid is None and mask is None, "masked outer products are not implemented")
+        require(scratch is not None, "outer product needs explicit (rows,8) UB scratch")
+        return _element("mul_outer", [lhs.source, rhs.source], out, scratch=scratch)
+    if isinstance(rhs, _ColumnBroadcast):
+        require(
+            valid is None and mask is None and scratch is None,
+            "column broadcast takes no mask or scratch",
+        )
+        return _element("mul_columns", [lhs, rhs.source], out)
     if isinstance(rhs, _RowBroadcast):
         require(valid is None and mask is None, "masked row broadcast is not implemented")
         return _rows("mul", lhs, rhs, out, scratch)
@@ -1348,6 +1373,9 @@ def mul(lhs, rhs, *, out, valid=None, scratch=None, mask=None):
 
 
 def add(lhs, rhs, *, out, mask=None, scratch=None):
+    if isinstance(rhs, _ColumnBroadcast):
+        require(mask is None and scratch is None, "column broadcast takes no mask or scratch")
+        return _element("add_columns", [lhs, rhs.source], out)
     return (
         _element("add_scalar", [lhs], out, rhs, mask=mask)
         if isinstance(rhs, (float, int))
@@ -1621,6 +1649,28 @@ def load_scalar(source):
     )
     _trace().add(op)
     return _Scalar(op.value)
+
+
+def load_index(source, *, minimum=0, maximum):
+    src = _view(source)
+    require(
+        src.buffer.op.access.data == "read", "index metadata must be immutable during the kernel"
+    )
+    op = IndexReadOp.build(
+        operands=[src.emit(), _trace().scalar(minimum), _trace().scalar(maximum)],
+        result_types=[IndexType()],
+    )
+    _trace().add(op)
+    return _Index(op.value)
+
+
+def broadcast(source, *, out, scratch=None):
+    require(
+        isinstance(source, (_ColumnBroadcast, _RowBroadcast)),
+        "broadcast requires [None,:] or [:,None]",
+    )
+    kind = "broadcast_columns" if isinstance(source, _ColumnBroadcast) else "broadcast_rows"
+    return _element(kind, [source.source], out, scratch=scratch)
 
 
 def _reduce(kind, source, *, axis, out, scratch, order):

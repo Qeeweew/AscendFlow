@@ -68,6 +68,8 @@ _CALLS = {
     "rsqrt",
     "div",
     "load_scalar",
+    "load_index",
+    "broadcast",
     "reduce_sum",
     "reduce_max",
 }
@@ -82,7 +84,7 @@ _SYNTAX = {
     "int64",
     "constexpr",
 }
-_CONSTANTS = {"f32", "f16", "bf16"}
+_CONSTANTS = {"f32", "f16", "bf16", "i64"}
 _BINARY = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -747,8 +749,8 @@ class _Parser:
             if type(lhs) in {int, float, bool} and type(rhs) in {int, float, bool}:
                 return compare(lhs, rhs)
             if (
-                type(lhs) is str
-                and type(rhs) is str
+                isinstance(lhs, (str, syntax.DType))
+                and isinstance(rhs, (str, syntax.DType))
                 and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
             ):
                 return compare(lhs, rhs)

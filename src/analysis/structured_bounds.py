@@ -18,7 +18,7 @@ from xdsl.ir import SSAValue
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import BufferOp, MixedOp
-from ..indexing import equivalent, interval, nonnegative, normalize, polynomial
+from ..indexing import domain_nonnegative, equivalent, interval, normalize, polynomial
 from ..scalar import Expr, Fact, expression, infer, literal
 from ..target.ascend910b import Actor, Engine
 from ..target.native import CAPACITY, ITEMSIZE
@@ -70,8 +70,8 @@ def _multiple_of(value: Expr, alignment: int, facts: Mapping[str, Fact]) -> bool
     return True
 
 
-def _nonnegative(value, facts, operation, message, *, witness=()):
-    if nonnegative(value, facts):
+def _nonnegative(value, facts, operation, message, *, witness=(), domains=()):
+    if domain_nonnegative(value, domains, facts):
         return
     constant = normalize(value, facts).constant
     _require(
@@ -321,7 +321,7 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                 if bank != "GM" and engine in {Engine.M, Engine.MTE1, Engine.FIX}
                 else ITEMSIZE[access.address.geometry.dtype]
                 if bank == "GM" and template.operation.native.data in {"nd2nz", "nd2nz_pad", "fix"}
-                else 4
+                else ITEMSIZE[access.address.geometry.dtype]
                 if engine is Engine.S
                 else 32
             )
@@ -375,7 +375,9 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                 domain_contracts += 1
                 checker.check_axes(address, domain)
                 lower, upper = interval(address.offset, domain, facts)
-                _nonnegative(lower, facts, operation, "native byte origin may be negative")
+                _nonnegative(
+                    lower, facts, operation, "native byte origin may be negative", domains=domain
+                )
                 remaining = expression(
                     "sub", allocations[address.root], expression("add", upper, literal(span))
                 )
@@ -384,6 +386,7 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                     facts,
                     operation,
                     "native byte footprint is not bounded by its allocation",
+                    domains=domain,
                     witness=(f"span={span}", f"allocation={allocations[address.root].text()}"),
                 )
         except CompileError as error:

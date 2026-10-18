@@ -18,6 +18,7 @@ from ..dialects.source import (
     CompareOp,
     CopyOp,
     ElementOp,
+    IndexReadOp,
     MaskCombineOp,
     MaskOp,
     MaterializeMaskOp,
@@ -237,7 +238,31 @@ def lower_element(op: ElementOp, context: RecipeContext) -> RecipeResult:
         "div": "div",
         "maximum": "max",
     }.get(op.kind.data)
-    if op.kind.data.endswith("_rows"):
+    if op.kind.data.endswith("_columns"):
+        rows, cols = source_shape(op.destination)
+        task = context.emit(
+            "_columns",
+            op.kind.data,
+            *(context.view(value) for value in (*op.inputs, op.destination)),
+            params=(rows, cols),
+        )
+        return RecipeResult(
+            (task,),
+            task,
+            len(op.inputs),
+            tuple(NativeRead(i, task, i) for i in range(len(op.inputs))),
+        )
+    if op.kind.data == "broadcast_rows":
+        rows, cols = source_shape(op.destination)
+        source, temporary, destination = (
+            context.view(value) for value in (op.inputs[0], op.scratch, op.destination)
+        )
+        first = context.emit("_expand", "brcb8", source, temporary, params=(rows,))
+        last = context.emit(
+            "_rows", "broadcast_rows", temporary, destination, params=(rows, cols), order_delta=1
+        )
+        return RecipeResult((first, last), last, 1, (NativeRead(0, first, 0),))
+    if op.kind.data.endswith("_rows") or op.kind.data == "mul_outer":
         require(op.scratch is not None, "row broadcast requires scratch")
         rows, cols = source_shape(op.destination)
         source, statistic, destination = (
@@ -247,7 +272,9 @@ def lower_element(op: ElementOp, context: RecipeContext) -> RecipeResult:
         broadcast = context.emit("_broadcast", "brcb8", statistic, temporary, params=(rows,))
         task = context.emit(
             "_" + op.kind.data,
-            op.kind.data.removesuffix("_rows") + "_row_broadcast",
+            "mul_outer"
+            if op.kind.data == "mul_outer"
+            else op.kind.data.removesuffix("_rows") + "_row_broadcast",
             source,
             temporary,
             destination,
@@ -518,6 +545,14 @@ def lower_reduce(op: ReduceOp, context: RecipeContext) -> RecipeResult:
 def lower_scalar_read(op: ScalarReadOp, context: RecipeContext) -> RecipeResult:
     task = context.emit("_capture", "scalar_load", context.view(op.source))
     require(task.value is not None, "native Scalar reader must produce its actual f32 SSA value")
+    return RecipeResult((task,), task, None, (NativeRead(0, task, 0),), task.value)
+
+
+def lower_index_read(op: IndexReadOp, context: RecipeContext, *, minimum, maximum) -> RecipeResult:
+    require(source_allocation(op.source).access.data == "read", "index metadata must be immutable")
+    task = context.emit(
+        "_index", "index_load", context.view(op.source), operands=(minimum, maximum)
+    )
     return RecipeResult((task,), task, None, (NativeRead(0, task, 0),), task.value)
 
 
