@@ -9,3 +9,6 @@ dist/
 *.o
 *.aibin
 *.asc
+
+# Generated measurement summaries stay local.
+/docs/reports/*.json

@@ -46,4 +46,4 @@
 
 平台配置、实际芯片核心数、频率和数据类型决定理论算力条件；字节流量分清GM请求、L2命中和HBM实流量。配置中的未知rate单位和HBM MHz不能直接当GB/s；不同profiler replay组的时间不能相加分解延迟。
 
-日常 msprof 流程见[测试指南](../guide/testing.md)。AscendC/ACLNN、PMU 和理论下界仅用于专项诊断，其边界见[验证方法](validation.md)。
+日常 msprof 流程见[测试指南](../guide/testing.md)。ACLNN 用于日常对照；AscendC、PMU 和理论下界用于专项诊断，其边界见[验证方法](validation.md)。

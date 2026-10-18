@@ -37,7 +37,7 @@ FIXPIPE，不为只执行一次的写回增加 export stage。MAD→FIX 与 accu
 [`CalcTile` / `DoL2CacheTiling`](https://gitcode.com/cann/ops-nn/blob/a7539b121effe3c7b32a1e5e38de5b620b2e4ac9/matmul/mat_mul_v3/op_host/op_tiling/matmul_v3_base_tiling.cpp)、
 [`UpdateBlockCnt` / `CalcGMOffset`](https://gitcode.com/cann/ops-nn/blob/a7539b121effe3c7b32a1e5e38de5b620b2e4ac9/matmul/mat_mul_v3/op_kernel/mat_mul_base_block.h)。
 复用其两层分块和映射思路；没有复刻 `UpdateBasicIndex` 的完整错位策略。不依赖参考
-工程或调用其 kernel。日常 kernel time 只采集当前生成 kernel；ACLNN 参考用于专项诊断。
+工程或调用其 kernel。日常性能对照使用当前生成 kernel 与安装版 ACLNN，具体版本以实际库身份为准。
 
 ```python
 from examples.gemm.matmul import gemm
@@ -129,7 +129,9 @@ oracle 精确相等，没有因尾块失败而放宽容差。
 一行，检查这些行全部 N 列；另检查完整输出有限性/hash、输入不变、前后
 各 512 B guard。地址可额外偏移 0–15 个 b16 元素。
 
-日常性能记录固定为默认 4096×4096×4096 FP16、正态输入，各采集一次默认
-msprof；具体命令与预热/执行次数见[测试指南](../guide/testing.md)，当前 kernel time
-见[性能报告](../reports/performance.md)。原有 ACLNN 三批比较器保留作专项诊断，
-不是日常验收步骤。任意正尺寸的正确性支持与某一配置的性能记录分别限定范围。
+日常性能使用 1K/2K/4K/8K 方阵及两组矩形，FP16、正态输入；每个 shape 的
+生成代码与安装版 ACLNN 各采集一次默认 msprof。保留 example 的默认 `OUTPUT_CACHE="auto"`，
+实际 C 缓存政策随记录保存；`normal` 指正态数据。具体命令和预热/执行次数见
+[测试指南](../guide/testing.md)，时间、加速比与 `2*M*N*K` 算法 TFLOPS 见
+[性能报告](../reports/performance.md)。三批比较器保留作专项诊断，日常不要求运行。
+任意正尺寸的正确性支持与各配置的性能记录分别限定范围。

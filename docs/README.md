@@ -9,7 +9,7 @@
 |---|---|
 | [快速上手](guide/quickstart.md) | 环境、首个 kernel、CLI/Python API、产物、运行与排错 |
 | [DSL](guide/dsl.md) | runtime/constexpr、执行域、物理存储、流水、多级 CV 和支持边界 |
-| [测试与 profiling](guide/testing.md) | CPU 回归、所有示例编译/运行、两个关键用例的一次 msprof 采集 |
+| [测试与 profiling](guide/testing.md) | CPU 回归、所有示例编译/运行、FA/GEMM 多 shape 的默认 msprof、ACLNN 对照与 TFLOPS |
 | [可运行示例](../examples/README.md) | 按算法查找入口、运行器和检查范围 |
 
 ## 算子合同
@@ -22,7 +22,7 @@
 
 ## 当前结果与编译器开发
 
-- [性能报告](reports/performance.md)：仅 Flash Attention 和 GEMM normal 的 kernel time。
+- [性能报告](reports/performance.md)：Flash Attention 和 GEMM normal 多 shape 的 ACLNN 时间、加速比与 TFLOPS。
 - [示例验证](reports/examples.md)：全部公开示例的编译与设备数值检查。
 - [开发入口](development/README.md)：编译链、生成规则、不变量、验证方法和硬件来源。
 

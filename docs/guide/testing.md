@@ -1,7 +1,7 @@
 # 测试与 profiling
 
 所有命令从仓库根目录、激活独立环境后执行。当前日常流程为：Python/IR 回归 →
-示例 CANN 编译与设备数值检查 → 两个关键用例各采集一次 msprof。
+示例 CANN 编译与设备数值检查 → Flash Attention / GEMM 多 shape 的 AscendFlow、ACLNN 各采集一次 msprof。
 
 ## Python/IR 回归
 
@@ -45,32 +45,44 @@ python -m benchmarks.check_examples --output build/examples-device --physical 2
 未支持的动态 `valid=` prefix 地址仅保留在[拒绝测试](../../tests/test_prefix.py)，
 不作为可运行示例。`schedule.py` 是被 GEMM 使用的 inline helper，随 GEMM 检查。
 
-## 两个关键用例：一次默认 msprof
+## FA / GEMM 多 shape：ACLNN 对照与 TFLOPS
 
-性能只记录当前 AscendFlow 生成 kernel，固定两项：
+性能只覆盖 Flash Attention 与标准连续 GEMM，两者均为 FP16，固定默认分块与排步：
 
-| 用例 | 配置 |
+| 算子 | 默认 shape 矩阵 |
 |---|---|
-| Flash Attention | Sq=Sk=4096，B1/Hq8/Hkv8/D128，FP16，默认 BQ256/BK1024 政策 |
-| GEMM normal | M=N=K=4096，连续 NN，FP16 输入输出，正态数据，默认缓存政策（此尺寸为 normal） |
+| Flash Attention | Sq:Sk=1024:1024、2048:2048、4096:4096、8192:8192、4096:8192、8192:4096；B1/Hq8/Hkv8/D128、dense 非 causal |
+| GEMM normal | M:N:K=1024³、2048³、4096³、8192³、2048:8192:4096、8192:2048:4096；连续 NN，正态输入 |
 
-在完成卡状态检查和映射后：
+每个 shape 在同一卡上先采集 AscendFlow，再采集安装版 ACLNN；每个后端只调用
+一次默认参数 msprof，不覆盖采集选项。标准 GEMM 的 A/B/C 同为 FP16，ACLNN
+使用 `aclnnMatmul`、`cubeMathType=0`；FA 使用 `aclnnFlashAttentionScore`，
+保持相同布局、head、scale 和非 causal 合同。未加入其他 example 的性能测量。
+
+在完成全卡状态检查和物理卡映射后：
 
 ```bash
-python -m benchmarks.profile_defaults --output build/kernel-times --physical 2
+python -m benchmarks.profile_defaults --list
+python -m benchmarks.profile_defaults --output build/kernel-comparison --physical 2
 ```
 
-脚本构建两份产物，然后**每项只调用一次 `msprof --output=... <application>`**。
-不覆盖 msprof 的采集参数，不加 PMU replay 或其他指标组，不运行 ACLNN/AscendC 对照，
-不做 shape/dtype 搜索。原始 CSV、数值记录和 kernel time 汇总位于
-`<用例>/profile/`，总表为 `results.json`。
+默认共 12 个 shape、24 次 msprof。FA 的 Sq/Sk 为 runtime，六个 shape 复用一次
+CANN 构建；GEMM 为 constexpr，每个 shape 单独构建，仍有覆盖全部构建阶段的
+300 秒硬期限。错误立即停止，不继续后续 shape。输出目录须是新目录。
+需要检查单项时可用 `--only gemm-normal-4096x4096x4096`，该记录仅覆盖选中项。
 
-msprof 的“一次采集”和 kernel 的执行次数分开：沿用运行器默认次数，FA 预热 1 次、
-执行 3 次，GEMM 预热 5 次、执行 30 次。按固定顺序排除预热，kernel time 为剩余
-设备 task 时长的中位数，单位 µs；同一次采集的重复执行不称独立试验。
-多个设备 task 构成一次 launch 时相加。数值使用 sampled oracle，完整输出有限性、
-输入和 guard 另检查；采样不能称全输出数值验证。
+原始记录位于 `<shape>/<generated|aclnn>/`；构建在 `artifacts/`，总表为
+`results.json`，可直接查看的比较表为 `tables.md`。汇总会检查成对的实际 shape、
+dtype、输入 hash、采样行、容差、物理卡和平台身份，并校验库和原始 CSV。
+时间、加速比和 TFLOPS 均从本次原始记录计算。
 
-[当前性能报告](../reports/performance.md)只列两行和复现、证据位置。ACL stream
-interval 含 host 提交间隙，不作为 kernel time。旧的三批对照、性能门槛、PMU 与
-roofline 工具保留作专项诊断，日常报告不要求它们；它们的历史结果通过 Git 查阅。
+msprof 的“一次采集”和 kernel 执行次数分开：沿用运行器默认次数，FA 预热 1 次、
+执行 3 次，GEMM 预热 5 次、执行 30 次，两个后端相同。排除预热后取设备 task 时长
+中位数；一次 launch 含多个设备 task 时相加。ACL stream interval 含 host 提交间隙，
+不作为 kernel time。采样 oracle、完整输出有限性、输入不变和 guard 分别检查，
+采样不称全输出验证。
+
+[性能报告](../reports/performance.md)列出 shape、两个实现的时间、加速比和算法
+TFLOPS，并说明 FLOPs 公式。加速比为 `ACLNN 时间 / AscendFlow 时间`，大于 1 表示
+本次 AscendFlow 更快。每个后端只有一次采集，不据此宣称通过历史三批严格门槛。
+AscendC、PMU 和 roofline 工具保留作专项诊断。

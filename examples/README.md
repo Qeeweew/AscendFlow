@@ -43,6 +43,6 @@ python -m ascendflow --input examples/cv/nested.py --entry nested_cv --shared --
 数值边界与限制见[FA 合同](../docs/operators/flash-attention.md)。
 
 当前逐项编译/运行证据见[示例验证](../docs/reports/examples.md)。性能仅测默认
-Flash Attention 与 GEMM normal，见[性能报告](../docs/reports/performance.md)。
+Flash Attention 与 GEMM normal 的多 shape ACLNN 对照及 TFLOPS，见[性能报告](../docs/reports/performance.md)。
 动态 `valid=` prefix 地址等未支持形式保留在拒绝测试中，不作为 runnable example；
 runner 接受某个参数不代表该变体已经设备验证。

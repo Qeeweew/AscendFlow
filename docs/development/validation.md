@@ -71,7 +71,7 @@ CV 派发、事件映射和返回 drain。不能增加全局 barrier 或静默 f
 CPU/IR 通过、CANN 编译通过和设备数值通过各自记录。
 
 日常验证采用[测试指南](../guide/testing.md)的统一入口：16 个公开示例编译/运行，
-仅 Flash Attention 和 GEMM normal 各采集一次默认 msprof。记录实际 DSL/IR/ASC/库、
+仅 Flash Attention 和 GEMM normal 的固定 shape 矩阵，AscendFlow 与 ACLNN 每组各采集一次默认 msprof。记录实际 DSL/IR/ASC/库、
 编译选项、输入、设备、预热/执行次数和原始 CSV；kernel time 采用设备 task 时长。
 full 与 sampled 分开，ACL stream interval 不当作 kernel time。
 
@@ -79,7 +79,7 @@ full 与 sampled 分开，ACL stream interval 不当作 kernel time。
 卡到逻辑 0。设备错误立即停止，不 reset、不换卡规避。输入声明由调用方满足，薄
 launcher 不执行 shape/alias/对齐检查；非法输入不得发到设备测试 host 拒绝。
 
-独立 AscendC、ACLNN、PMU 与理论下界只在明确开展专项比较或归因时使用。比较需
+安装版 ACLNN 用于日常多 shape 对照；独立 AscendC、PMU 与理论下界用于专项诊断。比较需
 保持数学、dtype/layout、输入和设备一致；参考政策不同时说明差异。PMU replay 组
 不能相加分解时间，GM 请求不等于 HBM 实流量。日常 kernel time 报告不宣称完成
 历史三批门槛、性能无损证明或冷编译资格。历史结果通过 Git 查阅。

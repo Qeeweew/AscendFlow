@@ -24,7 +24,7 @@ CANN 共享库。环境安装、首个 kernel、设备运行和常见错误见[�
 | 安装、编译并运行第一个算子 | [快速上手](docs/guide/quickstart.md) |
 | 编写 kernel，理解 runtime、buffer 和 stage | [DSL 使用说明](docs/guide/dsl.md) |
 | 查找可运行算法及参数 | [示例目录](examples/README.md)、[GEMM](docs/operators/gemm.md)、[Flash Attention](docs/operators/flash-attention.md) |
-| 检查所有示例，采集两个关键用例的 kernel time | [测试与 profiling](docs/guide/testing.md) |
+| 检查所有示例，比较 FA/GEMM 与 ACLNN，计算 TFLOPS | [测试与 profiling](docs/guide/testing.md) |
 | 查看当前实测结果 | [性能报告](docs/reports/performance.md)、[示例验证](docs/reports/examples.md) |
 | 修改编译器或同步规则 | [开发入口](docs/development/README.md) |
 

@@ -42,9 +42,9 @@ Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
 ## 资格边界
 
 数值容差为 rtol=0.002、atol=0.0002。当前日常检查对 256:1024 和 768:3072
-进行全输出 oracle；性能只采集 Sq=Sk=4096 的默认政策。预热和执行次数、一次默认
-msprof 的步骤见[测试指南](../guide/testing.md)，实际结果分别见
-[示例验证](../reports/examples.md)与[性能报告](../reports/performance.md)。
+进行全输出 oracle；性能覆盖 1K/2K/4K/8K 等长和两组不等长序列，保持默认政策，
+每个 shape 的生成代码与 ACLNN 各采集一次默认 msprof。预热和执行次数见[测试指南](../guide/testing.md)，实际结果分别见
+[示例验证](../reports/examples.md)与[性能报告](../reports/performance.md)。FA 的 TFLOPS 只计 QK/PV 两次矩阵乘法的算法 FLOPs。
 
 这些记录只覆盖对应配置和产物；BQ128 及其他政策的历史记录不代替当前默认配置。
 连续 fence 合并的规则见[同步优化边界](../development/sync-optimizations.md)。
