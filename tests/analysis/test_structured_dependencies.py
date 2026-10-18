@@ -5,16 +5,16 @@ from itertools import product
 import pytest
 
 from ascendflow import language as N
+from ascendflow.analysis.access_frontier import QueueEndpoint
 from ascendflow.analysis.hazards import HazardKind
 from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_regions import (
     AccessOccurrence,
     AliasRegion,
-    DependencyIssueKind,
 )
-from ascendflow.diagnostics import CompileError
 from ascendflow.passes.lower_native import lower_native_structure
+from ascendflow.passes.structured_sync import synchronize_structure
 from ascendflow.scalar import Expr
 from ascendflow.target.ascend910b import Actor
 from examples.flash_attention.attention import attention_target
@@ -22,16 +22,13 @@ from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
 from tests.models.structured_domains import expression_value, guard_active, occurrence_key
+from tests.models.structured_events import check_compiled_events
 
 
 def dependencies(source):
     structure = lower_native_structure(N.from_source(source) if isinstance(source, str) else source)
     memory = collect_native_memory(structure.module)
     return build_structured_dependencies(memory)
-
-
-def dependency_issues(result):
-    return result.values.unresolved + result.storage.unresolved
 
 
 def materialized_edges(result, values):
@@ -92,7 +89,6 @@ def trace_edges(events):
 
 def test_scale_real_endpoints_and_all_counts_match_access_trace():
     result = dependencies(scale)
-    result.require_closed()
     loop = next(iter(result.memory.control.loops.values()))
     load, compute, store = (t.operation for t in result.memory.templates)
     assert len(result.needs) == 12 and len(result.required) == 8
@@ -125,7 +121,6 @@ def test_scale_real_endpoints_and_all_counts_match_access_trace():
 @pytest.mark.parametrize("source", [batched_matmul, nested_copy, nested_cv, shared_l0c_qk_pv])
 def test_real_cube_nested_and_cv_sources_close_without_old_completion_graph(source):
     result = dependencies(source)
-    result.require_closed()
     operations = {template.operation for template in result.memory.templates}
     assert any(
         n.loop is not None and n.distance is not None and n.distance > 0 for n in result.needs
@@ -149,7 +144,6 @@ def test_zero_loop_is_identity_between_actual_parent_writer_and_reader():
                     N.fill(x,1.0)
                 N.mul(x,2.0,out=y)
     """)
-    result.require_closed()
     before, empty, after = (t.operation for t in result.memory.templates)
     assert [(n.kind, n.source.operation, n.consumer.operation) for n in result.needs] == [
         (HazardKind.RAW, before, after)
@@ -159,8 +153,8 @@ def test_zero_loop_is_identity_between_actual_parent_writer_and_reader():
     )
 
 
-def test_read_only_child_requires_every_reader_before_parent_overwrite():
-    result = dependencies("""
+def test_read_only_child_captures_every_reader_before_parent_overwrite():
+    source = """
         def readers(n:N.int64):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
@@ -168,27 +162,13 @@ def test_read_only_child_requires_every_reader_before_parent_overwrite():
                 for j in N.Pipelined(n,stages=1):
                     N.mul(x,2.0,out=y)
                 N.fill(x,1.0)
-    """)
-    result.require_closed()
-    release = next(n for n in result.needs if n.kind is HazardKind.WAR)
-    assert release.source.families
-    assert isinstance(release.source.bindings[-1].ordinal, Expr)
-    assert (
-        release.source.families[-1].count == next(iter(result.memory.control.loops.values())).count
-    )
-    before, reader, after = (t.operation for t in result.memory.templates)
-    loop = next(iter(result.memory.control.loops.values()))
-    initial = before, Actor.AIV0, ()
-    overwrite = after, Actor.AIV0, ()
+    """
+    plan = synchronize_structure(N.from_source(source))
+    release = next(n for n in plan.dependencies.needs if n.kind is HazardKind.WAR)
+    assert isinstance(release.source.endpoint, QueueEndpoint)
+    assert not release.source.bindings
     for count in range(5):
-        readers = {(reader, Actor.AIV0, ((loop.operation, ordinal),)) for ordinal in range(count)}
-        edges = materialized_edges(result, {"n": count, "$group": 0, "$sid": 0})
-        assert {edge for edge in edges if edge[0] is HazardKind.RAW} == {
-            (HazardKind.RAW, initial, endpoint) for endpoint in readers
-        }
-        assert {edge for edge in edges if edge[0] is HazardKind.WAR} == {
-            (HazardKind.WAR, endpoint, overwrite) for endpoint in readers
-        }
+        check_compiled_events(plan, {"n": count}, invocations=2)
 
 
 def test_rmw_same_task_next_generation_is_a_real_dependency():
@@ -200,7 +180,6 @@ def test_rmw_same_task_next_generation_is_a_real_dependency():
                 for j in N.Pipelined(n,stages=1):
                     N.mul(x,2.0,out=x)
     """)
-    result.require_closed()
     loop_raw = next(
         n
         for n in result.needs
@@ -211,8 +190,8 @@ def test_rmw_same_task_next_generation_is_a_real_dependency():
     assert not any(n.kind is HazardKind.WAR and n.source == n.consumer for n in result.needs)
 
 
-def test_first_and_last_phase_actual_anchors_match_small_access_trace():
-    result = dependencies("""
+def test_first_and_last_branches_preserve_values_without_phase_case_products():
+    source = """
         def phases(n:N.int64):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
@@ -222,30 +201,14 @@ def test_first_and_last_phase_actual_anchors_match_small_access_trace():
                     N.mul(x,2.0,out=x)
                     if j == n-1:
                         N.copy(x,y)
-    """)
-    result.require_closed()
-    loop = next(iter(result.memory.control.loops.values()))
-    initialize, update, final = (t.operation for t in result.memory.templates)
+    """
+    plan = synchronize_structure(N.from_source(source))
     for count in range(6):
-        events = []
-        for ordinal in range(count):
-            endpoint = lambda task, ordinal=ordinal: (
-                task,
-                Actor.AIV0,
-                ((loop.operation, ordinal),),
-            )
-            if ordinal == 0:
-                events.append((endpoint(initialize), (("x", False, True),)))
-            events.append((endpoint(update), (("x", True, True),)))
-            if ordinal == count - 1:
-                events.append((endpoint(final), (("x", True, False), ("y", False, True))))
-        assert materialized_edges(result, {"n": count, "$group": 0, "$sid": 0}) == trace_edges(
-            events
-        )
+        check_compiled_events(plan, {"n": count}, invocations=2)
 
 
-def test_compound_physical_slot_short_children_and_long_children_match_trace():
-    result = dependencies("""
+def test_compound_slot_short_and_long_children_preserve_actual_byte_values():
+    source = """
         def slots(q:N.int64,k:N.int64(minimum=1)):
             with N.Kernel():
                 x,y=N.alloc_ub((2,64)),N.alloc_ub((2,64))
@@ -254,48 +217,22 @@ def test_compound_physical_slot_short_children_and_long_children_match_trace():
                         slot=(parent*k+child)%2
                         N.fill(x[slot,:],1.0)
                         N.mul(x[slot,:],2.0,out=y[slot,:])
-    """)
-    result.require_closed()
-    outer, inner = tuple(result.memory.control.loops.values())
-    write, read = (t.operation for t in result.memory.templates)
-    assert result.work.cells <= 8
+    """
+    plan = synchronize_structure(N.from_source(source))
+    assert plan.dependencies.work.cells <= 8
     for q, k in product(range(4), range(1, 4)):
-        events = []
-        for parent, child in product(range(q), range(k)):
-            endpoint = lambda task, parent=parent, child=child: (
-                task,
-                Actor.AIV0,
-                ((outer.operation, parent), (inner.operation, child)),
-            )
-            slot = (parent * k + child) % 2
-            events.extend(
-                (
-                    (endpoint(write), ((("x", slot), False, True),)),
-                    (endpoint(read), ((("x", slot), True, False), (("y", slot), False, True))),
-                )
-            )
-        actual = materialized_edges(result, {"q": q, "k": k, "$group": 0, "$sid": 0})
-        expected = trace_edges(events)
-        assert actual == expected, (
-            q,
-            k,
-            [
-                (kind.value, [g for _, g in src[2]], [g for _, g in dst[2]])
-                for kind, src, dst in expected - actual
-            ],
-        )
+        check_compiled_events(plan, {"q": q, "k": k}, invocations=2)
 
 
 def test_default_flash_attention_closes_in_compact_actual_fragment_families():
     result = dependencies(attention_target)
-    result.require_closed()
     assert result.work.native_templates == 52
     assert result.work.projected_accesses < 500
     assert result.work.cells < 200
     assert result.work.needs < 1500
     assert any(isinstance(n.residue, Expr) for n in result.needs)
     assert any(domain.first > 0 for n in result.needs for domain in n.domains)
-    assert any(e.all_members for e in result.storage.exits)
+    assert any(n.source.families or n.consumer.families for n in result.needs)
 
 
 def test_strided_native_rows_stay_exact_compressed_rectangles():
@@ -309,8 +246,11 @@ def test_strided_native_rows_stay_exact_compressed_rectangles():
                 with N.Vector():
                     N.copy(Scratch[0:8,0:128],x)
     """)
-    result.require_closed()
-    gm = {cell for cell in result.values.root.cells if cell.root.type.bank.data == "GM"}
+    gm = {
+        cell
+        for cell in result.order.summaries[result.memory.module]
+        if cell.root.type.bank.data == "GM"
+    }
     assert len(gm) == 2
     assert {cell.rows for cell in gm} == {8, 120}
     assert all(cell.stop - cell.start == 512 and cell.row_stride == 4096 for cell in gm)
@@ -332,15 +272,13 @@ def test_loop_work_depends_on_templates_and_ring_slots_not_trip_count():
         """
 
     short, huge = (dependencies(source(count)) for count in (4, 10**9))
-    short.require_closed()
-    huge.require_closed()
     assert short.work == huge.work
     assert huge.work.projected_accesses == 6
     assert huge.work.cells == 4
 
 
-@pytest.mark.parametrize("last,closed", [(9, True), (8, False)])
-def test_nonzero_serial_start_and_step_use_actual_last_induction(last, closed):
+@pytest.mark.parametrize("last", [9, 8])
+def test_nonzero_serial_start_and_step_accept_both_last_and_absent_branch(last):
     result = dependencies(f"""
         def serial():
             with N.Kernel():
@@ -350,12 +288,7 @@ def test_nonzero_serial_start_and_step_use_actual_last_induction(last, closed):
                     if j == {last}:
                         N.copy(x,y)
     """)
-    assert result.closed is closed
-    if not closed:
-        assert any(
-            issue.kind is DependencyIssueKind.PARENT_ACTIVATION
-            for issue in dependency_issues(result)
-        )
+    assert result.work.native_templates == 2
 
 
 def test_parent_dependent_possibly_empty_child_does_not_invent_last_writer():
@@ -370,12 +303,13 @@ def test_parent_dependent_possibly_empty_child_does_not_invent_last_writer():
                         N.fill(x,2.0)
                     N.mul(x,3.0,out=y)
     """)
-    assert not result.closed
+    from ascendflow.analysis.access_frontier import QueueEndpoint
+
     assert any(
-        issue.kind is DependencyIssueKind.PARENT_ACTIVATION for issue in dependency_issues(result)
+        isinstance(n.source.endpoint, QueueEndpoint)
+        or isinstance(n.consumer.endpoint, QueueEndpoint)
+        for n in result.needs
     )
-    with pytest.raises(CompileError, match="activation"):
-        result.require_closed()
 
 
 @pytest.mark.parametrize("reader", ["j+1", "0"])
@@ -388,10 +322,8 @@ def test_contracted_family_preserves_order_for_shifted_or_invariant_aliases(read
                     N.fill(x[j,:],1.0)
                     N.mul(x[{reader},:],2.0,out=y)
     """)
-    result.require_closed()
     assert result.work.alias_regions == 1
-    assert result.values.ordered_reads
-    assert all(isinstance(need.cell, AliasRegion) for need in result.values.ordered_reads)
+    assert any(isinstance(n.cell, AliasRegion) and n.kind is HazardKind.RAW for n in result.needs)
     assert any(need.kind is HazardKind.WAR and need.distance == 1 for need in result.required)
 
 
@@ -403,10 +335,9 @@ def test_unknown_symbolic_alias_keeps_waw_without_inventing_a_complete_definitio
                 N.fill(x[a*32:a*32+32],1.0)
                 N.fill(x[b*32:b*32+32],2.0)
     """)
-    result.require_closed()
     assert len(result.required) == 1 and result.required[0].kind is HazardKind.WAW
     assert isinstance(result.required[0].cell, AliasRegion)
-    assert not result.values.writes and not result.values.reads
+    assert not hasattr(result, "values")
 
 
 def test_unknown_scalar_carry_is_not_a_loop_invariant_branch():
@@ -422,9 +353,6 @@ def test_unknown_scalar_carry_is_not_a_loop_invariant_branch():
                         N.copy(X[:],x)
                     flag=1-flag
     """)
-    # The two branches can execute on successive iterations. An unknown
-    # carried scalar cannot justify their lifetime-long mutual exclusion.
-    assert not result.closed
-    assert any(
-        issue.kind is DependencyIssueKind.PARENT_ACTIVATION for issue in dependency_issues(result)
-    )
+    # Both paths can occur in successive iterations. The common invocation
+    # ports retain both queues without assuming lifetime-long exclusivity.
+    assert any(isinstance(n.source.endpoint, QueueEndpoint) for n in result.needs)

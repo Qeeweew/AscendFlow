@@ -33,37 +33,31 @@ write_disjoint 不保证每次写完整 tensor、全部输出都被写到、初�
 代数逆。同一 tensor 若还被读取，保留保守源码顺序，包括 RAW/WAR。输出声明
 不传播到临时 UB/L1/L0、共享 workspace 或其他 pointer，物理复用照常分析。
 
-## 两种依赖事实
+## 访问顺序与数值定义
 
-structured_access 保留真实 native footprint。静态 slot、矩形与轴 grid 只是
-可选精度，不能建立分区时保留可能别名的源码内存顺序。
+`structured_access` 是实际 native footprint 的唯一输入。StorageCell 表示可选的
+精确字节区域；AliasRegion 表示无法排除重叠的同一存储实例。两者都由
+`access_order` 建立可能冲突的 RAW/WAR/WAW；RAW 在这里是顺序义务，不宣称
+某个 writer 是唯一数值 producer。初始化、源 Tile 借用与原式定义性由 admission
+独立负责，部分写不能代替完整初始化。
 
-- StorageCell 是精确字节区域。logical_valueflow.reads 绑定数值定义；
-  LogicalWrite.KILL/UPDATE 仍依赖真实覆盖与读写语义。
-- AliasRegion 是同一存储实例的可能别名访问域，没有伪造的字节包络。
-  ordered_reads 表示源码顺序前驱，不声称该 writer 就是数值生产者。
-  WAR/WAW 由同一递归前沿和 storage_lifetimes 连接。
+`AccessTransfer` 保存 head reader、首次可能写、尾部可能写和未退休 reader。
+条件写取静态候选的并集，保留输入 writer/reader；不构造条件摘要的笛卡尔积。
+无条件写只更新顺序前沿，意味着先前访问已通过 WAW/WAR 接入，不能被用于
+给未覆盖的字节建立数值定义。
 
-部分写不能因此成为完整初始化。并行 Vector peers 各自保留源访问域，AIC
-的可能共享访问进入每个域，不能以一个 AIV 替代 quorum。AliasRegion 不进入
-private packet 重排或稳定物理 cell 的 credit 归纳；其事件消费复用仍由有限
-使用或实际 queue handback 建立。
+重复 body 若没有每代必有的写，又存在变化的条件写，就使用共同 invocation
+队列端口传递旧前缀，不能只连接相邻代的可选 writer 而丢掉中间空档。
+动态空 child 使用同一实际 loop 调用的 ENTRY/EXIT。入口 Wait 获取相关前序，
+出口 Set 捕获该 engine 已发射的真实前缀；空 child 也有平衡协议，不构造 native
+LAST，不把退出视作完成。多个 reader engine 和两个 AIV 始终保留独立贡献。
+
+已知非空、控制稳定的有限 loop 可保留窄 native FIRST/LAST。它们只是精度优化，
+不是同步生成的全程序门禁。只有局部完整的私有 packet 才可按实际 dispatch
+重排物理复用；可能别名、streaming、外部状态和未完整定义的 packet 保持源码顺序。
+AliasRegion 和控制端口都不直接使用稳定物理 cell credit；它们继续建立有限
+使用或实际 queue handback，包含消费先于复用的关系。
 
 未知区域关系可能减少可用并行性。固定排步不兼容、事件容量不足或控制协议
-不能组合时仍具体拒绝，不自动加全局 barrier 或改排步。bounds、原始算术
-定义性、初始化、native alias 限制与借用 Tile 生命周期继续独立检查。
-
-## 当前范围
-
-本批移除了 structured_ownership 全局 group/SID 分离准入及 OwnerProof。
-admission 记录实际 StorageInstance，保留 pointer alias、初始化与借用 Tile
-合同。两种区域均进入原有通知生成、事件分配、物化与 ASC，没有第二编译路径。
-
-任意父代次条件激活、动态空 child 的 family closure 与全局通信尚未重写。
-现有 FIRST/LAST、原式定义性、queue_order、cell credit 和 handback 保留。
-工作量分别报告 cells、alias_regions、disjoint_writes；保守顺序不代表没有性能代价。
-
-循环实现只使用一份递推组合规则：普通循环和 FIRST/LAST 之间的中间区间共用
-`logical_valueflow._repeat`；边界条件按本次 memory snapshot 分类并复用。
-没有新增激活区间、周期切分或循环前沿求解器。这是既有实现去重，不是通用
-动态控制模型重构完成；上述未支持边界保持具体诊断。
+不能组合时具体拒绝，不加全局 barrier 或改排步。普通 loop 出口没有统一 drain；
+kernel 最终退休仍独立保留。

@@ -34,7 +34,6 @@ def test_disjoint_output_contract_accepts_symbolic_permutations_and_keeps_ub_rel
     source = N.from_source(PERMUTED, disjoint_external=True)
     memory = collect_native_memory(lower_native_structure(source).module)
     dependencies = build_structured_dependencies(memory)
-    dependencies.require_closed()
     assert dependencies.work.disjoint_writes == 1
     assert not any(need.cell.root.owner.sym_name.data == "Y" for need in dependencies.needs)
     assert any(need.kind is HazardKind.WAR for need in dependencies.required)
@@ -54,6 +53,25 @@ def test_disjoint_write_declaration_does_not_assert_its_own_truth():
         check_structured_events(collect_native_memory(result.plan), {"p": 0}, groups=(0, 1, 2))
 
 
+def test_unknown_output_permutation_keeps_order_without_a_grid_inverse():
+    source = N.from_source(PERMUTED.replace(",write_disjoint=True", ""), disjoint_external=True)
+    dependencies = build_structured_dependencies(
+        collect_native_memory(lower_native_structure(source).module)
+    )
+    assert dependencies.work.alias_regions
+    assert any(
+        n.kind is HazardKind.WAW and n.cell.root.owner.sym_name.data == "Y"
+        for n in dependencies.required
+    )
+    artifact = compile(source)
+    final = collect_native_memory(artifact.plan)
+    original = collect_native_memory(parse(artifact.before_ir))
+    for p in (0, 1, 2, 7):
+        check_structured_events(
+            final, {"p": p}, logical_reference=original, groups=(0, 1, 2), invocations=2
+        )
+
+
 def test_disjoint_writes_do_not_remove_raw_or_war_on_a_read_write_tensor():
     source = N.from_source(
         """
@@ -70,7 +88,6 @@ def test_disjoint_writes_do_not_remove_raw_or_war_on_a_read_write_tensor():
     )
     memory = collect_native_memory(lower_native_structure(source).module)
     dependencies = build_structured_dependencies(memory)
-    dependencies.require_closed()
     assert dependencies.work.disjoint_writes == 0
     assert {n.kind for n in dependencies.required if n.cell.root.owner.sym_name.data == "Y"} >= {
         HazardKind.RAW,

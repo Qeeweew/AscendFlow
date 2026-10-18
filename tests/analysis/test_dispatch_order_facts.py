@@ -8,20 +8,17 @@ These comparisons supply no native completion or retirement evidence.
 from dataclasses import replace
 
 import pytest
-from xdsl.dialects import scf
 
 from ascendflow.analysis.access_frontier import AccessEndpoint
 from ascendflow.analysis.structured_protocols import BoundPlacement
 from ascendflow.analysis.structured_regions import (
     AccessOccurrence,
-    BranchGuard,
     CountRelation,
     LoopBinding,
     LoopCountGuard,
     LoopDomain,
 )
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement
-from ascendflow.indexing import arguments
 from ascendflow.passes.notification_binding import _IssueOrder
 from ascendflow.scalar import Expr, expression, literal
 from ascendflow.target.ascend910b import Actor, Engine
@@ -52,26 +49,23 @@ def test_real_compound_two_slot_source_reaches_notification_selection(minimum):
         item.source_engine is Engine.V and item.destination_engine is Engine.MTE2
         for item in selection.notifications
     )
-    guards = [
-        test
-        for item in selection.notifications
-        for bound in item.sources + item.consumers
-        for _, guard in bound.coordinate_guards
-        for test in guard.comparisons
-    ]
-    parent = next(iter(selection.dependencies.memory.control.loops.values()))
+    # Unknown short residues are captured at real invocation boundaries;
+    # selection need not reconstruct a selected native LAST guard.
+    from ascendflow.analysis.access_frontier import QueueEndpoint
+
     assert any(
-        test.predicate == ">"
-        and "m" in arguments(test.lhs)
-        and parent.ordinal.args[0] in arguments(test.rhs)
-        for test in guards
-    ), guards
+        isinstance(p.occurrence.endpoint, QueueEndpoint)
+        for n in selection.notifications
+        for p in n.sources + n.consumers
+    )
     memory = selection.dependencies.memory
     for count in range(minimum, 4):
         uniform = {"n": 3, "m": count, "$group": 0, "$sid": 0}
         positions = {
             key: index
-            for index, (key, _) in enumerate(actual_dispatch(selection, uniform, Actor.AIV0))
+            for index, (key, _) in enumerate(
+                actual_dispatch(selection, uniform, Actor.AIV0, ports=True)
+            )
         }
         for coverage in selection.coverage:
             need, notification = coverage.requirement, coverage.notification
@@ -232,16 +226,15 @@ def test_real_branch_premise_is_not_reused_after_its_removal():
     """)
     memory = selection.dependencies.memory
     loop = next(iter(memory.control.loops.values()))
-    branch = next(
-        operation for operation in memory.control.frames if isinstance(operation, scf.IfOp)
-    )
     need = next(
         need
         for need in selection.dependencies.required
         if need.source.operation is memory.templates[0].operation
         and need.consumer.operation is memory.templates[1].operation
     )
-    assert BranchGuard(branch, 0) in need.guards
+    assert any(
+        g.comparison == Comparison(Expr("argument", ("n",)), ">=", literal(3)) for g in need.guards
+    )
     before = point(selection, loop, 0, literal(1), Placement.AFTER)
     after = point(selection, loop, 1, expression("sub", loop.count, literal(1)), Placement.BEFORE)
     order = _IssueOrder(selection.dispatch)

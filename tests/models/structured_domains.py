@@ -10,8 +10,9 @@ edge. Finite enumeration here is not a general symbolic proof.
 
 from xdsl.dialects import arith, scf
 
-from ascendflow.analysis.access_frontier import LoopResidueSelection
+from ascendflow.analysis.access_frontier import LoopResidueSelection, QueueEndpoint
 from ascendflow.analysis.structured_regions import BranchGuard, LoopCountGuard, LoopOrdinalGuard
+from ascendflow.analysis.structured_schedule import Placement
 from ascendflow.dialects.physical import TaskOp
 from ascendflow.dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ascendflow.target.ascend910b import Actor
@@ -45,10 +46,15 @@ def occurrence_key(occurrence, values, memory):
         assert ordinal is not None
         assert 0 <= ordinal < logical.count.evaluate(values)
         bound.append((binding.loop, ordinal))
-    return occurrence.operation, occurrence.participant, tuple(bound)
+    key = occurrence.operation, occurrence.participant, tuple(bound)
+    return (
+        key + (occurrence.endpoint.placement,)
+        if isinstance(occurrence.endpoint, QueueEndpoint)
+        else key
+    )
 
 
-def actual_dispatch(selection, uniform, actor):
+def actual_dispatch(selection, uniform, actor, *, ports=False):
     """Independent lexical/physical-step interpreter; no production rank helper."""
     memory, events = selection.dependencies.memory, []
     environment = memory.control.environment
@@ -60,6 +66,9 @@ def actual_dispatch(selection, uniform, actor):
 
     def visit(block, context, coordinates):
         for operation in block.ops:
+            boundary = isinstance(operation, (PipelineLoopOp, scf.ForOp, scf.IfOp))
+            if ports and boundary:
+                events.append(((operation, actor, coordinates, Placement.ENTRY), dict(context)))
             if isinstance(operation, ActorDomainOp):
                 if operation.kind.data == family:
                     visit(operation.body.block, context, coordinates)
@@ -110,6 +119,8 @@ def actual_dispatch(selection, uniform, actor):
                     visit(region.block, context, coordinates)
             elif isinstance(operation, TaskOp) and (operation, actor) in selection.dispatch.tasks:
                 events.append(((operation, actor, coordinates), dict(context)))
+            if ports and boundary:
+                events.append(((operation, actor, coordinates, Placement.EXIT), dict(context)))
 
     visit(memory.module.body.block.first_op.body.block, base, ())
     return events
@@ -149,4 +160,5 @@ def point_key(point, context, memory):
         | {"$sid": int(point.actor is Actor.AIV1)}
     )
     assert point.guard.evaluate(actual)
-    return point.operation, point.actor, coordinates
+    key = point.operation, point.actor, coordinates
+    return key + (point.placement,) if isinstance(point.occurrence.endpoint, QueueEndpoint) else key

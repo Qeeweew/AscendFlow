@@ -10,8 +10,8 @@
 | native effects、真实访问 | 原语、地址、layout、padding、scratch、SPR | native lowering / memory facts | admission、依赖、后端 | 改 native、地址、参与者、layout |
 | bounds、初始化与存储实例 | 输入合同和完整 effects | bounds / admission；group/peer并行独立性是源程序前提 | 值与存储分析 | 改 alias、范围、guard、参与者 |
 | 可能别名的源码内存顺序 | 原始次序与实际访问 | AliasRegion；不授权数值KILL或精确producer | 存储、通知；不用稳定cell credit | 改访问、guard、循环或并行合同 |
-| 精确逻辑 RAW | 原始程序次序、cell、条件 KILL/UPDATE | logical_valueflow；writer/代次及输入端口 | storage、通知绑定 | 改算法次序、定义、guard、循环 |
-| 物理 WAR/WAW、全部最后 reader | 值版本、真实 dispatch、closed packet 规则 | storage_lifetimes；邻接 lifetime 及尾 reader | 生成器的 credit 规则 | 改 slot、dispatch、实际读取、packet 前提 |
+| 可能冲突的 RAW/WAR/WAW | 实际访问、源控制和可选精确分区 | access_order；输入要求、pending reader 与共同 queue 端口 | 通知绑定与生命周期规则 | 改访问、guard、循环、slot 或 dispatch |
+| 私有 packet 的物理复用 | 局部完整写入、内部读绑定及实际 stage 顺序 | storage_packets / storage_word；局部完整 packet 的实际邻接 | access_order | 改 native 覆盖、slot、dispatch、packet 前提 |
 | 真实 Set/Wait 位置和覆盖 | 上述必要依赖 | notification binding；保留原始 ownership edge，可增加 coverage | 域、阶段序、credit | 改捕获/等待位置或 activation |
 | 存在域、配对、原式定义性 | 实际位置、祖先坐标、有序 guard | EventDomains；一次建立的 cases/windows | credit、资源和物化 | 改位置、坐标、guard、ordinal |
 | 无循环等待 | actual physical step、queue/controller 路由 | queue_order；每层 phase rank 和 child may-block cuts | credit 构造及输出合同 | 改排步、路由、参与者、Wait 位置 |
@@ -27,12 +27,13 @@ bounded dense reader prefix 的空间联合可按 count 的有限上界保守覆
 tile，但 native 字节范围不变，reader family 保留原始 count。捕获实际 LAST 前，
 按从外到内已解析的祖先 FIRST/LAST 坐标特化 child count；不使用未选祖先或
 上界代次代替真实最后读取。计算 LAST 的 Expr 同样解析 selected ancestor；
-canonical occurrence 已有的 j-d 祖先平移不重做。这不开放一般父代次条件激活的 family 闭合。
+canonical occurrence 已有的 j-d 祖先平移不重做。变化的 child 通过共同控制端口组合，不要求该 family 精确闭合。
 
 ## 1. 捕获与获取
 
-每个 retained need 绑定真正的 native：Set 在 source 之后，Wait 在 consumer
-之前。Set 捕获该 source engine 的已发射完成前缀；普通本地 Wait 只阻塞目标
+每个 retained need 绑定实际位置：native 的 Set 在 source 之后、Wait 在 consumer
+之前；控制端口允许在真实 loop/if 调用的 ENTRY/EXIT 插入。控制端口没有 native
+完成里程碑，只是发射位置。Set 捕获该 source engine 的已发射完成前缀；普通本地 Wait 只阻塞目标
 queue，S Wait 及 2201 `wait_flag_dev(flag)` 阻塞 controller。SSA use-def 不提供
 这些完成关系。只有明确声明 implicit completion 的 native 才能省对应事件；
 Vector 等同 pipe 依赖保留实际 pipe fence。
@@ -71,7 +72,8 @@ child 只导出 actor/queue/controller 输入到输出的 **可能阻塞**关系
 
 前提：cell 的物理 origin 在 kernel group invocation 中不变；如果 cell 是
 某个 dense 子流的联合区域，通知不能在该被联合的内部时钟上重复使用它。
-origin 必须是绑定自身保留的精确值/邻接 lifetime edge。不同 role、私有 actor
+origin 必须是绑定自身保留的精确物理访问/邻接 lifetime edge。控制端口不使用
+此规则，必须建立实际 queue handback。不同 role、私有 actor
 及物理 cell 保持各自 credit。
 
 同一物理 cell、role 和路由的首末/循环分片，可跨不同 native reader/writer
@@ -121,6 +123,11 @@ handoff，其成员和 FIRST/LAST 边界才按需建立；已有普遍配对在�
 已建立的边界 cases 随 `NotificationProgram.boundaries` 传给分配器，原式、
 坐标和成员未变时直接消费。分配新共享关系所需的新增边界在分配器内只建立一次。
 
+如果旧 Wait 与返回发布对应同一个实际 native 或控制位置，优先复用已建立的
+坐标映射和配对，将返回端直接绑定到该 occurrence，不恢复整个 child 的成员
+FIRST/LAST。对应相等条件仍由真实复用域覆盖。可选 relay 的额外精确边界不支持
+时只放弃该候选；必需通道、配对和生命周期均保留，无可用回传仍具体拒绝。
+
 ## 5. 循环与首尾
 
 循环保留参数化 body。逻辑代次 `g` 在 physical step `j=g+stage` 执行且仅执行
@@ -132,8 +139,9 @@ credit 的第一次 writer 在没有先前 reader 时不生成 Wait；release �
 没有虚构通知，N=1 的 FIRST/LAST 重合不重复，最后没有无消费者的 release。
 不能为不同循环边界分别建立独立 credit，也不在普通 loop exit 加 drain。
 
-child exit 只结束控制派发，不说明 native 已完成。跨 child 和跨外层 invocation
-的依赖仍绑定实际最后 reader/首次 writer。MTE1 最后读 L1 后即可 release，MAD/FIX
+child exit 只结束控制派发，不说明 native 已完成。变化空 child 的外层连接消费
+实际队列入口/出口端口，Set/Wait 对同一调用的前缀建立完成与获取；不会反求
+最后一次活跃 child。非空稳定 loop 可使用窄的 native reader/writer。MTE1 最后读 L1 后即可 release，MAD/FIX
 可以继续；MTE2 最后读 GM 后即可 release，Vector 可以继续。
 
 kernel 返回才执行每个实际异步 engine 的 Set→S Wait drain；配置 ID 和 drain ID
@@ -162,7 +170,7 @@ mode-2 的十六个 base ID 来自安装 CANN 9.1 的 2201 `GetfftsConfig` 四�
 事件 ID 求值。最终 NotificationOp 的 eligible participants 与实际 SCF 控制取
 交集，因此物化后的指令采用所在 family 的参与者，不让后端再加第二层 SID 判断。
 
-物化只插入已确定的 native 前后通知及有序短路 guard，保持 native、地址和循环
+物化只插入已确定的 native 前后、loop/if ENTRY/EXIT 通知及有序短路 guard，保持 native、地址和循环
 身份。终端 `lower_execution` 随后将 count/stage 表示降低为实际 arith/scf，
 按每个 actor 的既定 issue order 映射控制与地址，移动原 native，保持双 AIV 共用代码。
 整数化简复用支配定义、源循环联合范围和实际 runtime/actor/loop/branch，

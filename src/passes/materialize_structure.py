@@ -118,7 +118,7 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
         require(
             isinstance(action.anchor, TaskOp)
             and action.placement in {Placement.BEFORE, Placement.AFTER}
-            or isinstance(action.anchor, (KernelOp, MixedOp, PipelineLoopOp, scf.ForOp))
+            or isinstance(action.anchor, (KernelOp, MixedOp, PipelineLoopOp, scf.ForOp, scf.IfOp))
             and action.placement in {Placement.ENTRY, Placement.EXIT},
             "sync action needs a native packet or invocation boundary placement",
         )

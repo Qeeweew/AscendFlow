@@ -53,10 +53,9 @@ def packet_case(request):
     )
     memory = collect_native_memory(structure.module)
     result = build_structured_dependencies(memory)
-    result.require_closed()
     partitions = [
         partition
-        for partition in result.storage.packet_partitions
+        for partition in result.order.packet_partitions
         if partition.cell.root.owner.sym_name.data == "scratch"
     ]
     assert len(partitions) == 1
@@ -97,7 +96,11 @@ def test_boundary_and_steady_storage_edges_share_canonical_parent_bindings(packe
     result, partition = packet_case
     loop = partition.loop
     logical = result.memory.control.loops[loop]
-    storage = [need for need in result.storage.needs if need.cell == partition.cell]
+    storage = [
+        need
+        for need in result.needs
+        if need.cell == partition.cell and need.kind is not HazardKind.RAW
+    ]
     assert storage and {need.kind for need in storage} == {HazardKind.WAR, HazardKind.WAW}
     singleton, steady = [], []
     for need in storage:

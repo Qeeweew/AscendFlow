@@ -12,7 +12,6 @@ from tests.analysis.test_structured_dependencies import materialized_edges
 def dependencies(source):
     structure = lower_native_structure(N.from_source(source, disjoint_external=True))
     result = build_structured_dependencies(collect_native_memory(structure.module))
-    result.require_closed()
     return result
 
 

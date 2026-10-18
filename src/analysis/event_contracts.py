@@ -71,6 +71,7 @@ class EventBankUsage:
 @dataclass(slots=True)
 class ResourceWork:
     notifications: int = 0
+    optional_relay_declines: int = 0
     endpoint_guard_sets: int = 0
     binding_roundtrips: int = 0
     pairing_implications: int = 0

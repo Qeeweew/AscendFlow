@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 
 from ..indexing import arguments
 from ..scalar import literal, substitute
+from .access_frontier import QueueEndpoint
 from .event_contracts import CaseLease, StructuredEventLease
 from .guard_cover import opposite
 from .structured_protocols import NotificationKind
@@ -39,6 +40,8 @@ def owns_stable_cell(notification, control, common_clocks):
     root = control.module.body.block.first_op
     return bool(notification.origins) and all(
         isinstance(n.cell, StorageCell)
+        and not isinstance(n.source.endpoint, QueueEndpoint)
+        and not isinstance(n.consumer.endpoint, QueueEndpoint)
         and control.invariant_over(n.cell.origin, root)
         and not set(n.cell.streaming).intersection(common_clocks)
         for n in notification.origins
@@ -46,9 +49,7 @@ def owns_stable_cell(notification, control, common_clocks):
 
 
 def _actual_tests(domains, point, case):
-    coordinates = tuple(
-        (loop.operation, loop.ordinal) for loop in domains.control.frames[point.operation].loops()
-    )
+    coordinates = tuple((loop.operation, loop.ordinal) for loop in point.occurrence.frame.loops())
     actual = replace(point, coordinates=coordinates, coordinate_guards=())
     return case.condition.comparisons + tuple(
         type(t)(case.specialize(t.lhs), t.predicate, case.specialize(t.rhs))

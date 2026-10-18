@@ -41,7 +41,7 @@ compile / Compilation
     lower_native_structure                # DSL→source、原式检查、native lowering
     collect_native_memory
     bounds → admission → dispatch
-    logical_valueflow + storage_lifetimes → dependencies
+    access_order → dependencies             # 可能冲突顺序、region 队列端口和局部 packet
     generate_notifications
       bind_notifications                 # 覆盖、真实位置及原始 ownership edges
       EventDomains                       # 有序原式定义性、坐标往返、配对
@@ -68,8 +68,8 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/footprint/effects、目标 native 合同 |
 | `analysis/structured_bounds.py`、`structured_admission.py`、`structured_host.py` | bounds、外部别名、实际存储实例、初始化、借用 Tile 及整数范围前提；group/peer 独立性属于源程序合同 |
 | `analysis/structured_access.py`、`structured_regions.py` | 可选精确 cell 与可能别名的 AliasRegion；保留实际 native 访问，不将 may-write 当完整定义 |
-| `analysis/logical_valueflow.py`、`storage_word.py`、`storage_lifetimes.py`、`structured_dependencies.py` | 精确 RAW 与独立的源码内存顺序、条件 KILL/UPDATE、相邻 lifetime、全部最后 reader |
-| `analysis/structured_dispatch.py` | 实际 actor、stage、issue_order、嵌套调用位置 |
+| `analysis/access_order.py`、`storage_packets.py`、`storage_word.py`、`structured_dependencies.py` | 可能冲突的 RAW/WAR/WAW、条件访问的并集、共同队列端口、局部完整 packet 的实际复用 |
+| `analysis/structured_dispatch.py` | 实际 actor、stage、issue_order、native 与控制入口/出口的位置 |
 | `passes/notification_binding.py`、`analysis/structured_protocols.py` | capture/acquire 覆盖；保留自身 origin，不将新增 coverage 当作 ownership |
 | `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期 |
 | `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |

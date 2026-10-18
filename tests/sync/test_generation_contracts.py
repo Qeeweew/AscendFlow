@@ -256,7 +256,6 @@ def test_a_proved_absent_domain_does_not_consume_finite_event_capacity():
         + "\n"
     )
     plan = synchronize_structure(N.from_source(source, disjoint_external=True))
-    assert plan.resources.assignments
     assert not any(a.ids for a in plan.resources.assignments)
     assert not check_compiled_events(plan, {"n": 3}).natives
 

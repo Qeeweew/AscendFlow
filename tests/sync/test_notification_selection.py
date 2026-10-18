@@ -83,7 +83,7 @@ def test_actual_captures_and_acquires_cover_sources_and_earliest_consumers(actua
             "$group": 0,
             "$sid": 0,
         }
-        traces = {actor: actual_dispatch(result, uniform, actor) for actor in actors}
+        traces = {actor: actual_dispatch(result, uniform, actor, ports=True) for actor in actors}
         positions = {
             key: index for actor, events in traces.items() for index, (key, _) in enumerate(events)
         }
@@ -132,7 +132,7 @@ def test_selected_set_and_wait_existence_is_exact_for_empty_short_and_reentry(ac
             "$group": group,
             "$sid": 0,
         }
-        traces = {actor: actual_dispatch(result, uniform, actor) for actor in actors}
+        traces = {actor: actual_dispatch(result, uniform, actor, ports=True) for actor in actors}
         for notification in result.notifications:
             if notification.mechanism is NotificationKind.PIPE_FENCE:
                 continue
@@ -176,9 +176,8 @@ def test_first_count_and_dynamic_residues_are_not_replaced_by_unbounded_activati
     assert dynamic
     assert any(d.first > 0 for n in result.dependencies.required for d in n.domains)
     assert any(p.families for n in result.notifications for p in n.sources)
-    frames = result.dependencies.memory.control.frames
     assert all(
-        bool(p.coordinates) == bool(tuple(frames[p.operation].loops()))
+        bool(p.coordinates) == bool(p.occurrence.frame.loops())
         for n in result.notifications
         for p in (*n.sources, *n.consumers)
     )

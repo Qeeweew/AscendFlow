@@ -29,15 +29,19 @@ def test_conditional_clear_keeps_the_accumulator_numerical_reader():
     assert result.asc.count("asc_mmad(") == 2
 
 
-def test_unsupported_boundary_and_late_first_clear_are_not_assumed_safe():
-    for original, changed, message in [
-        ("k == panels - 1", "k == panels - 2", "activation-family closure"),
-        ("k == 0", "k == 1", "own pipeline's first logical iteration"),
-    ]:
-        with pytest.raises(CompileError, match=message):
-            compile(
-                replace(reduction_gemm, source=reduction_gemm.source.replace(original, changed))
-            )
+def test_nonterminal_export_is_supported_while_late_first_clear_remains_invalid():
+    source = reduction_gemm.source.replace("k == panels - 1", "k == panels - 2")
+    result = compile(replace(reduction_gemm, source=source))
+    from ascendflow.analysis.structured_memory import collect_native_memory
+    from ascendflow.dialects.io import parse
+    from tests.models.structured_events import check_structured_events
+
+    final = collect_native_memory(result.plan)
+    original = collect_native_memory(parse(result.before_ir))
+    for panels in (0, 1, 2, 3, 5):
+        check_structured_events(final, {"panels": panels}, logical_reference=original)
+    with pytest.raises(CompileError, match="own pipeline's first logical iteration"):
+        compile(replace(reduction_gemm, source=reduction_gemm.source.replace("k == 0", "k == 1")))
 
 
 def test_terminal_writer_cannot_initialize_a_steady_first_read():

@@ -114,7 +114,11 @@ class Compilation:
                     "source": getattr(coverage.requirement.source, "operation", None).uid.data
                     if hasattr(getattr(coverage.requirement.source, "operation", None), "uid")
                     else None,
-                    "consumer": coverage.requirement.consumer.operation.uid.data,
+                    "consumer": (
+                        coverage.requirement.consumer.operation.uid.data
+                        if hasattr(coverage.requirement.consumer.operation, "uid")
+                        else coverage.requirement.consumer.operation.name
+                    ),
                     "hazard": coverage.requirement.kind.value,
                     "distance": coverage.requirement.distance,
                     "rule": coverage.rule,

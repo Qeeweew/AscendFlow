@@ -90,14 +90,13 @@ L1 NZ 支持按 16 对齐的二维矩形。物理起点为
 
 二维 ND rectangle 身份在地址解码时建立。streaming 分离使用真实坐标的
 单调行/列间隔；不同区域使用完整 active domain 的矩形范围。带 group 的
-serial 起点只在保持真实 ownership residue 后组合。不同循环名、不同
-tensor 名或构造器本身都不提供分离或完成保证；碰撞、错位与未知范围仍拒绝。
+serial 起点和逻辑代次保持原始含义。不同循环名、不同 tensor 名或构造器本身
+都不提供分离或完成保证；未知区域按 AliasRegion 保留源码访问顺序。
 
-ND grid 的高低位拆分保留原始 div/rem 原子；只有低位范围及完整 radix
-都成立时，才建立对应 digit permutation 的单射坐标。ownership 和 streaming
-分离使用跨访问一致的排列，不能混用各访问的不同编号。原轴 bounds、原始
-unsigned 定义性、真实字节访问和最后 reader 仍独立检查；swizzle 参数本身
-不是正确性凭据。
+L2 swizzle 属于 example 的遍历算法，编译器不生成它的逆映射、digit 排列或
+tile-grid 单射证明。不同 group 的输出独立性由源 SPMD 合同承担；原轴 bounds、
+原始 unsigned 定义性、真实字节访问与 reader 退休继续检查。有限执行测试保留
+碰撞反例，不能将合法 swizzle 参数当作算法正确性的凭据。
 
 ## 缓存政策
 

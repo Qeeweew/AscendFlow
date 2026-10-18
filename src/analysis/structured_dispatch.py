@@ -18,8 +18,10 @@ from xdsl.ir import Operation
 from ..diagnostics import require
 from ..dialects.physical import KernelOp, MixedOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
-from ..target.ascend910b import Actor
+from ..target.ascend910b import Actor, Engine
+from .access_frontier import QueueEndpoint
 from .structured_memory import MemoryTemplate, NativeMemoryFacts
+from .structured_schedule import Placement
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +62,21 @@ class StructuredTask:
         return self.template.contract.native
 
 
+@dataclass(frozen=True, slots=True)
+class IssueSite:
+    """Controller position; its existence supplies no queue completion."""
+
+    scope: DispatchScope
+    stage: int
+    lexical: int
+    engine: Engine
+    implicit_completion: bool = False
+
+    @property
+    def actor(self):
+        return self.scope.actor
+
+
 @dataclass(frozen=True)
 class StructuredDispatch:
     memory: NativeMemoryFacts
@@ -67,12 +84,30 @@ class StructuredDispatch:
     tasks: Mapping[tuple[TaskOp, Actor], StructuredTask]
     bodies: Mapping[DispatchScope, tuple[StructuredTask, ...]]
     projected_operations: int
+    boundaries: Mapping[tuple[Operation, Actor], tuple[DispatchScope, int, int, int]]
+
+    def site(self, point):
+        occurrence = getattr(point, "occurrence", point)
+        endpoint = occurrence.endpoint
+        if isinstance(endpoint, QueueEndpoint):
+            scope, stage, entry, exit = self.boundaries[endpoint.operation, endpoint.participant]
+            lexical = entry * 3 if endpoint.placement is Placement.ENTRY else exit * 3 + 2
+            return IssueSite(scope, stage, lexical, endpoint.engine)
+        task = self.tasks[occurrence.operation, occurrence.participant]
+        placement = getattr(point, "placement", Placement.BEFORE)
+        return IssueSite(
+            task.scope,
+            task.stage,
+            task.lexical * 3 + int(placement is Placement.AFTER),
+            task.engine,
+            task.implicit_completion,
+        )
 
 
 def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:
     root = memory.module.body.block.first_op
     templates = {template.operation: template for template in memory.templates}
-    scopes, tasks, bodies = {}, {}, {}
+    scopes, tasks, bodies, boundaries = {}, {}, {}, {}
     projected = 0
     actors = (
         (Actor.AIC, Actor.AIV0, Actor.AIV1)
@@ -109,8 +144,12 @@ def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:
             if isinstance(operation, (PipelineLoopOp, scf.ForOp)):
                 lexical = positions.get(scope, 0)
                 positions[scope] = lexical + 1
+                boundaries[operation, actor] = (scope, stage, lexical, lexical)
                 scope = scope_for(operation, actor, scope, stage, lexical)
                 stage = 0
+            elif isinstance(operation, scf.IfOp):
+                entry = positions.get(scope, 0)
+                positions[scope] = entry + 1
             elif isinstance(operation, PipelineStageOp):
                 stage = operation.offset.data
             if isinstance(operation, PipelineLoopOp):
@@ -149,6 +188,10 @@ def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:
                     for block in region.blocks:
                         for child in block.ops:
                             visit(child, scope, stage)
+            if isinstance(operation, scf.IfOp):
+                exit = positions.get(scope, 0)
+                positions[scope] = exit + 1
+                boundaries[operation, actor] = (scope, stage, entry, exit)
 
         visit(root, scope_for(root, actor))
     require(
@@ -161,4 +204,5 @@ def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:
         MappingProxyType(tasks),
         MappingProxyType({scope: tuple(body) for scope, body in bodies.items()}),
         projected,
+        MappingProxyType(boundaries),
     )

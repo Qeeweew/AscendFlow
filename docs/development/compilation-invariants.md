@@ -22,10 +22,10 @@
 构造标量范围 DAG，保留 owner/iteration 的联合区间；原始除法和源码算术仍独立
 检查。Expr 的 free variables 在节点构造时建立，不依赖 range/guard 环境。
 
-原始轴 grid 的几何与混合基数坐标在地址解码时建立一次，streaming 精度分析
-复用同一事实；每个 active domain 仍须建立低位 digit 的真实范围。统一的
-`(x+c)%N` 平移只有在 c 为 uniform 输入、实际 `0<=x<N` 时可反解成证明坐标。
-rank/digit 均最多 4，不展开 runtime tile；实际原轴范围与字节地址不替换。
+地址解码保留原始 axes、真实字节 footprint 和可选 ND 矩形几何；bounds 按实际
+active domain 检查。编译器不反解 GEMM swizzle、排列 mixed-radix digit 或搜索
+tile-grid 的逆坐标。简单矩形分离不能排除冲突时保留 AliasRegion 及必要访问
+顺序；write_disjoint 仅按源声明使用，真实原轴范围与字节地址不变。
 
 公共编译在独立 expression scope 内驻留完全相同的原始 `(kind, args)` 节点，
 退出、异常或取消时释放节点表，嵌套 scope 恢复外层。它不保存 range、guard、
@@ -44,8 +44,8 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 | 类型与runtime输入合同 | frontend/admission；输入条件由调用方满足 | 编译器检查合同声明；生成的kernel和launcher不验证调用方输入 |
 | 完整effects | native lowering/目标原语合同 | 包括scratch、padding、SPR、读写及真实退休 |
 | 存储实例与alias | 物理访问、pointer合同与可选分区分析 | group/peer独立性属于源语义；保留root/view/slot/generation及AIV私有性，未知区域保留源码内存顺序 |
-| 逻辑值版本 | logical_valueflow | 精确RAW、条件KILL/UPDATE与未绑定输入，不能改绑到dispatch最近writer |
-| 物理复用 | storage_lifetimes与实际dispatch | 全部相关最后reader，不能以控制退出代替完成 |
+| 源值语义 | frontend/Tile 与 admission、局部 packet 合同 | 不要求全程序精确 writer 闭合；dispatch 不能改变原读取值；may-write 不宣称完整定义 |
+| 物理复用 | access_order 与局部 packet 的实际 dispatch word | 保留全部 pending reader；控制端口只提供插入位置，真实 Set/Wait 才捕获/获取前缀 |
 | ready/release覆盖 | notification binding | 真实 capture/acquire、独立覆盖及原始 ownership edges |
 | 配对与事件消费/复用 | 生成器的域、cell credit 与 handback 规则 | 域只检查一次；物理 lifetime 归纳或明确消费回传，rank 不提供消费证据 |
 | 可进展 | queue_order 的分层生成准入 | 零 step phase DAG、正 step 前进；父层只组合 child may-block 边界 |

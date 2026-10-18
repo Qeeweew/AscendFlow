@@ -1,6 +1,6 @@
 # 同步生成设计要求
 
-2026-10-17。本页规定必须保持的语义；已实现的生成规则及逐项事实归属见
+2026-10-18。本页规定必须保持的语义；已实现的生成规则及逐项事实归属见
 [generation-rules.md](generation-rules.md)。规则论证、有限反例、ASC/CANN 和
 设备结果按[验证口径](validation.md)分别记录。
 
@@ -12,7 +12,7 @@
 
 group/Vector peer 的并行独立性属于[源内存合同](memory-contracts.md)，不再以
 全局地址分离证明准入。未知区域关系进入 AliasRegion，保留源码内存顺序；
-精确数值 RAW、初始化和物理复用仍各自保持。外部 write_disjoint 输出合同
+源读取值、初始化和物理复用仍各自保持；同步不以全程序精确 writer 闭合为前提。外部 write_disjoint 输出合同
 不传播给 scratch，也不提供 ready、release 或事件消费保证。
 
 当前生成器先绑定覆盖与真实位置，检查域和 physical-step/phase 适用前提，
@@ -32,7 +32,7 @@ group/Vector peer 的并行独立性属于[源内存合同](memory-contracts.md)
 
 对N次逻辑迭代，stage偏移s在物理step j对应`g=j-s`，存在条件为`0<=g<N`。归一后的最大偏移为S：
 
-- N=0：没有body native及其配对通知，原有边界状态透传。
+- N=0：没有 body native 及其内部通知；共同调用端口仍可生成平衡的 Set/Wait，传递真实队列前缀与旧状态。
 - 0<N<S：使用带存在条件的短片段，避免重复的fill/drain。
 - N>=S且N>0：prologue为`[0,S)`，loop为`[S,N)`，epilogue为`[N,N+S)`。
 
@@ -46,14 +46,15 @@ group/Vector peer 的并行独立性属于[源内存合同](memory-contracts.md)
 
 | 事实 | 含义与边界 |
 |---|---|
-| 逻辑值依赖 | read对应哪个writer/代次；SSA use-def不是异步完成 |
+| 源值身份 | Tile SSA、递推状态与局部完整 packet 保持原读取值；SSA use-def 不是异步完成 |
+| 可能冲突的访问顺序 | RAW/WAR/WAW 保留所有相关先行访问；may-write 不表示唯一数值定义或初始化 |
 | 物理访问 | root、alias、subview、layout、范围、slot及owner；不同名字不保证不别名 |
 | ready | 所需写已完成并对consumer可见 |
 | release/credit | 目标buffer的全部相关最后reader已退休，可进入下一覆盖；不必等待整个计算结束 |
 | event消费 | 旧Wait已消费通知，才能复用对应硬件状态；与buffer复用分别保证 |
 | 最终drain | kernel返回所需收尾；不能替代普通循环的局部生命周期 |
 
-精确RAW和条件KILL/UPDATE不能因物理重排而改绑。WAR/WAW基于给定dispatch和物理生命周期。递推状态、累计/舍入边界保持原语义；FA的FP32求和顺序许可不推广成任意数值变换许可。
+物理排步不能将读取改绑为“当前最近 writer”。源状态保持必要访问顺序；仅完整私有 packet 可以按给定 dispatch 连接存储复用。条件写和空 child 保留旧状态与 pending reader，控制出口本身没有完成含义。递推状态、累计/舍入边界保持原语义；FA 的 FP32 求和顺序许可不推广成任意数值变换许可。
 
 Scalar、Vector、MTE1/2/3、Cube和Fixpipe使用dav-2201的真实契约。Set覆盖的退休不能扩展到后续发射，不能泛化同pipe的隐式完成顺序。跨AIC/AIV还须保持GM可见性、controller阻塞和两个AIV的AND quorum；它们不能由OR可达路径替代。
 

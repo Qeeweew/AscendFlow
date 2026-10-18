@@ -1,21 +1,20 @@
-"""Join immutable logical values with dispatch-owned storage retirement.
+"""One may-conflict order interface for native, region and storage obligations.
 
-Source traversal selects read versions exactly once. Physical storage analysis
-then connects adjacent admitted lifetimes. Neither stage allocates events or
-supplies asynchronous completion merely from a logical value edge.
+Source values and initialization belong to source/admission facts. Sync does
+not require whole-program exact valueflow closure. Closed private packets are
+local optional precision; all other states retain conservative source order.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..diagnostics import require
-from .logical_valueflow import LogicalValueFlow, build_logical_valueflow
-from .storage_lifetimes import StorageLifetimes, build_storage_lifetimes
+from .access_order import AccessOrder, build_access_order
 from .structured_dispatch import StructuredDispatch, bind_structured_dispatch
 from .structured_memory import NativeMemoryFacts
-from .structured_regions import AccessOccurrence, DependencyWork, StructuredNeed
+from .structured_regions import DependencyWork, StructuredNeed
 
 if TYPE_CHECKING:
     from .structured_admission import StructuredAdmission
@@ -26,39 +25,16 @@ class StructuredDependencies:
     memory: NativeMemoryFacts
     admission: StructuredAdmission | None
     dispatch: StructuredDispatch
-    values: LogicalValueFlow
-    storage: StorageLifetimes
+    order: AccessOrder
     needs: tuple[StructuredNeed, ...]
     required: tuple[StructuredNeed, ...]
     work: DependencyWork
 
-    @property
-    def closed(self):
-        return self.values.closed and self.storage.closed
 
-    def require_closed(self):
-        self.values.require_closed()
-        self.storage.require_closed()
-
-
-def build_structured_dependencies(
-    memory: NativeMemoryFacts,
-    *,
-    admission: StructuredAdmission | None = None,
-    dispatch: StructuredDispatch | None = None,
-) -> StructuredDependencies:
+def build_structured_dependencies(memory, *, admission=None, dispatch=None):
     dispatch = bind_structured_dispatch(memory) if dispatch is None else dispatch
     require(dispatch.memory is memory, "storage dispatch belongs to another memory snapshot")
-    values = build_logical_valueflow(memory, admission=admission)
-    storage = build_storage_lifetimes(values, dispatch)
-    reads = tuple(need for need in values.reads if isinstance(need.source, AccessOccurrence))
-    needs = reads + values.ordered_reads + storage.needs
-    required = reads + values.ordered_reads + storage.required
-    work = replace(
-        values.work,
-        needs=len(needs),
-        loop_carries=sum(n.loop is not None and n.distance not in (None, 0) for n in needs),
-    )
+    order = build_access_order(memory, dispatch, admission=admission)
     return StructuredDependencies(
-        memory, admission, dispatch, values, storage, needs, required, work
+        memory, admission, dispatch, order, order.needs, order.required, order.work
     )

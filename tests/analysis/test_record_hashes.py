@@ -26,5 +26,3 @@ def test_hashed_notification_records_remain_structural_keys_after_replacement():
     changed_need = replace(need, period=need.period + 1)
     for record, changed in ((placement, changed_placement), (need, changed_need)):
         assert {changed: "changed"}[replace(changed)] == "changed"
-    # instance_of remains provenance, excluded from semantic equality/hash.
-    assert {need: "same"}[replace(need, instance_of=need)] == "same"

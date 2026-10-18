@@ -13,13 +13,15 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from xdsl.dialects import scf
+from xdsl.ir import Operation
 
 from ..diagnostics import require
 from ..dialects.physical import TaskOp
 from ..dialects.structured import PipelineLoopOp
 from ..scalar import Expr
-from ..target.ascend910b import Actor, Milestone
+from ..target.ascend910b import Actor, Engine, Milestone, supports_engine
 from .structured_control import ControlFrame
+from .structured_schedule import Placement
 
 if TYPE_CHECKING:
     from .structured_memory import MemoryTemplate
@@ -48,8 +50,32 @@ class AccessEndpoint:
 
 
 @dataclass(frozen=True, slots=True)
+class QueueEndpoint:
+    """A real invocation insertion position on one participant's queue.
+
+    This is an issue site, never a native effect or a completed access. Only
+    a materialized Set captures the queue prefix and only its Wait acquires
+    it. The frame is the surrounding invocation, including on an empty path.
+    """
+
+    operation: Operation
+    participant: Actor
+    frame: ControlFrame
+    engine: Engine
+    placement: Placement
+
+    def __post_init__(self):
+        require(
+            isinstance(self.operation, (PipelineLoopOp, scf.ForOp, scf.IfOp))
+            and self.placement in (Placement.ENTRY, Placement.EXIT)
+            and supports_engine(self.participant, self.engine),
+            "queue endpoint needs a real region boundary and participant queue",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AccessCut:
-    endpoint: AccessEndpoint
+    endpoint: AccessEndpoint | QueueEndpoint
     milestone: Milestone
 
 

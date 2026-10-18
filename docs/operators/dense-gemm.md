@@ -11,10 +11,9 @@ FIX 退休点。L1 384 KiB，L0A/B 各 64 KiB，L0C 128 KiB，无 GM workspace�
 仅最后一个 K panel 写回，FIXPIPE 位于 compute 末尾的 LAST 条件内，
 与 compute 共用 stage；pipeline horizon 为 `PREFETCH+1`。
 
-普通 ND 输出 tile 的核间 ownership 和跨迭代分离使用通用的 tile-grid 坐标
-合同：实际二维 footprint 与 axes/offset 一致、原点按 tile 宽度对齐、所有
-访问采用同一 grid，再证明 owner residue 和 streaming cell 家族互不重叠。
-该几何事实在地址解码时建立，下游复用；不提供完成或逻辑值版本的保证。
+输出 tile 的核间独立性属于源 SPMD 算法前提，编译器不求解遍历的全局单射。
+实际二维 footprint、axes 和 offset 保留并检查 bounds；简单矩形规则无法
+排除冲突时，按 AliasRegion 保留源码访问顺序。异步完成和物理槽复用分别处理。
 L1 NZ 的全行、16 列对齐切片保留原轴范围，物理列偏移为
 `column * full_rows * itemsize`；仍经独立 bounds、alignment 和生命周期检查。
 

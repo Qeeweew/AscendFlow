@@ -18,10 +18,9 @@ from xdsl.utils.exceptions import VerifyException
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.structured import AddressOp
-from ..indexing import check_axis, normalize
-from ..scalar import Expr, Fact, expression, from_ssa
-from ..target.native import NativeGeometry
-from .structured_tiles import NDGridCell, NDRectangle, axis_grid_cell, nd_grid_cell, nd_rectangle
+from ..indexing import check_axis, equivalent, normalize
+from ..scalar import Expr, Fact, expression, from_ssa, literal
+from ..target.native import ITEMSIZE, NativeGeometry
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +35,50 @@ class AxisFacts:
 
 
 @dataclass(frozen=True, slots=True)
+class NDRectangle:
+    extents: tuple[int, int]
+    widths: tuple[int, int]
+    origins: tuple[Expr, Expr]
+
+
+def nd_rectangle(offset, geometry, axes, facts):
+    """Retain an actual ND box; never derive a tile traversal or its inverse."""
+    if (
+        geometry.bank != "GM"
+        or geometry.layout != "linear"
+        or axes is None
+        or len(axes.origins) != 2
+        or axes.axes != (0, 1)
+        or axes.displacement != 0
+    ):
+        return None
+    extents = tuple(normalize(value, facts).constant for value in axes.extents)
+    widths = axes.widths
+    if any(
+        width <= 0 or size is None or size < width
+        for size, width in zip(extents, widths, strict=True)
+    ):
+        return None
+    _, columns = extents
+    itemsize = ITEMSIZE[geometry.dtype]
+    if (
+        geometry.rows != widths[0]
+        or geometry.nbytes != widths[1] * itemsize
+        or geometry.row_stride != columns * itemsize
+    ):
+        return None
+    row, column = axes.origins
+    actual = expression(
+        "mul",
+        expression("add", expression("mul", row, literal(columns)), column),
+        literal(itemsize),
+    )
+    if not equivalent(offset, actual, facts):
+        return None
+    return NDRectangle(extents, widths, axes.origins)
+
+
+@dataclass(frozen=True, slots=True)
 class AddressFacts:
     """An actual retained address, without any admission certificate."""
 
@@ -44,9 +87,7 @@ class AddressFacts:
     offset: Expr
     geometry: NativeGeometry
     axes: AxisFacts | None
-    tile: NDGridCell | None
     rectangle: NDRectangle | None
-    axis_tile: NDGridCell | None = None
 
 
 class ScalarEnvironment:
@@ -146,9 +187,7 @@ class StructuredAddresses:
             offset,
             geometry,
             axes,
-            nd_grid_cell(rectangle, self.environment.facts),
             rectangle,
-            axis_grid_cell(offset, geometry, axes, self.environment.facts),
         )
         self._addresses[ref] = result
         return result

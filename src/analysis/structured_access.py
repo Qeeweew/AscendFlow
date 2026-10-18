@@ -62,9 +62,7 @@ class CellEffect:
 class PartitionedAccesses:
     memory: NativeMemoryFacts
     effects: Mapping[TaskOp, Mapping[StorageCell | AliasRegion, tuple[CellEffect, ...]]]
-    patterns: Mapping[
-        tuple[StorageCell | AliasRegion, Operation], frozenset[tuple[int, int | Expr]]
-    ]
+    patterns: Mapping[tuple[StorageCell | AliasRegion, Operation], tuple[int, int | Expr]]
     work: DependencyWork
 
 
@@ -156,97 +154,6 @@ class _Partitioner:
         self.facts = memory.control.environment.facts
         self.work = DependencyWork(native_templates=len(memory.templates))
         self.effects, self.patterns, self._origin_pool = {}, {}, {}
-
-    def _separate_tiles(self, projections, loop):
-        """A single streaming clock advances exact rectangles on one ND grid.
-
-        Slot substitutions, contracted families and additional varying clocks
-        need their own relational rules. They cannot borrow this identity.
-        """
-        return any(
-            tile is not None
-            and any(
-                self._separate_grid_order(projections, loop, item.order, axis=axis)
-                for item in tile.linearizations
-            )
-            for axis, tile in (
-                (False, projections[0].access.address.tile),
-                (True, projections[0].access.address.axis_tile),
-            )
-        )
-
-    def _separate_grid_order(self, projections, loop, order, *, axis=False):
-        grid, index = None, None
-        low = high = 0
-        for projection in projections:
-            address = projection.access.address
-            tile, geometry = address.axis_tile if axis else address.tile, address.geometry
-            contracted = projection.contracted if axis else ()
-            exact = (
-                projection.stop - projection.start == geometry.nbytes
-                and projection.rows == geometry.rows
-                and projection.row_stride == geometry.row_stride
-            )
-            if (
-                tile is None
-                or projection.slots
-                or projection.contracted
-                and not axis
-                or not exact
-                and not contracted
-                or grid is not None
-                and grid != tile.grid
-            ):
-                return False
-            bindings = {
-                self.memory.control.sid: literal(1 if projection.participant is Actor.AIV1 else 0)
-            }
-            multiplicity, extra = 1, 0
-            linear = tile.bounded_index(order, projection.template.frame.domains(), self.facts)
-            if linear is None:
-                return False
-            for child in projection.template.frame.loops():
-                if child.operation not in contracted:
-                    continue
-                count = _normalize(child.count, self.facts).constant
-                shifted = substitute(
-                    linear, {child.ordinal: expression("add", child.ordinal, literal(1))}
-                )
-                delta = _normalize(expression("sub", shifted, linear), self.facts).constant
-                if count is None or count <= 0 or delta is None or delta < 0:
-                    return False
-                bindings[child.ordinal] = literal(0)
-                multiplicity *= count
-                extra += delta * (count - 1)
-            if (
-                contracted
-                and (projection.stop - projection.start) * projection.rows
-                != geometry.total_nbytes * multiplicity
-            ):
-                return False
-            actual = expression("add", projection.origin, literal(projection.start))
-            if not equivalent(actual, substitute(address.offset, bindings), self.facts):
-                return False
-            value = substitute(linear, bindings)
-            if any(
-                other.operation is not loop.operation and _depends(value, other.ordinal)
-                for other in projection.template.frame.loops()
-            ):
-                return False
-            if index is not None:
-                displacement = _normalize(expression("sub", value, index), self.facts).constant
-                if displacement is None:
-                    return False
-                low, high = min(low, displacement), max(high, displacement + extra)
-            else:
-                index = value
-                high = extra
-            grid = tile.grid
-        if index is None:
-            return False
-        shifted = substitute(index, {loop.ordinal: expression("add", loop.ordinal, literal(1))})
-        delta = _normalize(expression("sub", shifted, index), self.facts)
-        return nonnegative(expression("sub", delta, literal(high - low + 1)), self.facts)
 
     def _separate_rectangles(self, projections, loop):
         """A monotone row/column coordinate separates exact ND rectangles.
@@ -623,7 +530,6 @@ class _Partitioner:
                 if (
                     not nonnegative(expression("sub", delta, literal(span)), self.facts)
                     and any(p.access.mode.writes for p in projections)
-                    and not self._separate_tiles(projections, loop)
                     and not self._separate_rectangles(projections, loop)
                 ):
                     ordered.add((root, private))
@@ -770,6 +676,13 @@ class _Partitioner:
 
     def build(self):
         self._project()
+        # Unresolved/multiple-residue partitions were already retained as
+        # AliasRegion above. Consumers receive one optional precision fact,
+        # never a new frontier-closure obligation.
+        require(
+            all(len(value) == 1 for value in self.patterns.values()),
+            "access partition retained ambiguous precision instead of an alias region",
+        )
         return PartitionedAccesses(
             self.memory,
             MappingProxyType(
@@ -778,6 +691,6 @@ class _Partitioner:
                     for operation, cells in self.effects.items()
                 }
             ),
-            MappingProxyType({key: frozenset(value) for key, value in self.patterns.items()}),
+            MappingProxyType({key: next(iter(value)) for key, value in self.patterns.items()}),
             self.work,
         )

@@ -71,14 +71,14 @@ def test_alias_regions_are_ordering_facts_not_exact_kills_or_private_packet_cred
 
     memory = collect_native_memory(lower_native_structure(N.from_source(ALIASES)).module)
     dependencies = build_structured_dependencies(memory)
-    dependencies.require_closed()
-    assert dependencies.values.ordered_reads
-    assert all(isinstance(n.cell, AliasRegion) for n in dependencies.values.ordered_reads)
-    assert all(not isinstance(w.cell, AliasRegion) for w in dependencies.values.writes)
+    assert any(
+        isinstance(n.cell, AliasRegion) and n.kind is HazardKind.RAW for n in dependencies.required
+    )
+    assert not hasattr(dependencies, "values")
     assert any(
         isinstance(n.cell, AliasRegion) and n.kind is HazardKind.WAR for n in dependencies.required
     )
-    assert all(not isinstance(p.cell, AliasRegion) for p in dependencies.storage.packet_partitions)
+    assert all(not isinstance(p.cell, AliasRegion) for p in dependencies.order.packet_partitions)
 
 
 def test_shifted_ring_reads_preserve_the_previous_iteration_value():

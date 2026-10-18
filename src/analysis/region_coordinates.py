@@ -14,12 +14,8 @@ from ..indexing import normalize
 from ..scalar import Expr, expression, infer, literal, substitute
 from .access_frontier import LoopResidueSelection, ResiduePosition
 from .structured_regions import (
-    AccessOccurrence,
-    BoundaryPort,
     BranchGuard,
-    CellSummary,
     CountRelation,
-    DependencyIssueKind,
     LoopCountGuard,
     LoopDomain,
     LoopOrdinalGuard,
@@ -41,22 +37,14 @@ def normalize_coordinate(value, facts):
 
 
 class RegionCoordinates:
-    """One owned coordinate environment shared by value and storage stages."""
+    """One coordinate environment for access order and local packet precision."""
 
-    def __init__(self, memory, patterns, issue):
-        self.memory, self.patterns, self.issue = memory, patterns, issue
+    def __init__(self, memory, patterns):
+        self.memory, self.patterns = memory, patterns
         self.facts = memory.control.environment.facts
 
     def pattern(self, cell, loop):
-        patterns = self.patterns.get((cell, loop), {(1, 0)})
-        if len(patterns) != 1:
-            self.issue(
-                DependencyIssueKind.MULTI_RESIDUE,
-                loop,
-                "one cell has multiple activation residues; finite word closure is not implemented",
-                cell,
-            )
-        return max(patterns, key=repr)
+        return self.patterns.get((cell, loop), (1, 0))
 
     def domains(self, cell, occurrence):
         return tuple(
@@ -214,33 +202,6 @@ class RegionCoordinates:
         ) + (() if family is None else (family,))
         return replace(occurrence, bindings=bindings, families=families)
 
-    def map_summary(self, transfer, transform, scope, guards):
-        bindings = {}
-
-        def occurrence(value):
-            return transform(value) if isinstance(value, AccessOccurrence) else value
-
-        def need(value):
-            key = id(value)
-            if key not in bindings:
-                bindings[key] = replace(
-                    value,
-                    source=occurrence(value.source),
-                    consumer=occurrence(value.consumer),
-                    scope=scope,
-                    guards=guards,
-                    instance_of=value.instance_of or value,
-                )
-            return bindings[key]
-
-        return CellSummary(
-            transfer.cell,
-            tuple(need(r) for r in transfer.head_reads),
-            transform(transfer.first_write),
-            transform(transfer.last_write),
-            tuple(need(r) for r in transfer.tail_reads),
-        )
-
     def need(
         self,
         cell,
@@ -262,7 +223,7 @@ class RegionCoordinates:
         if loop is None:
             if consumer.bindings and isinstance(consumer.bindings[-1].ordinal, Expr):
                 candidate = consumer.bindings[-1]
-                if isinstance(source, BoundaryPort) or (
+                if (
                     source.bindings
                     and source.bindings[-1].loop is candidate.loop
                     and isinstance(source.bindings[-1].ordinal, Expr)
@@ -276,17 +237,11 @@ class RegionCoordinates:
                             literal(candidate.ordinal.constant + 1),
                         )
                     if distance is None:
-                        distance = (
-                            0
-                            if isinstance(source, BoundaryPort)
-                            else normalize_coordinate(
-                                expression("sub", candidate.ordinal, source.bindings[-1].ordinal),
-                                self.facts,
-                            ).constant
-                        )
-            elif not consumer.bindings and (
-                isinstance(source, BoundaryPort) or not source.bindings
-            ):
+                        distance = normalize_coordinate(
+                            expression("sub", candidate.ordinal, source.bindings[-1].ordinal),
+                            self.facts,
+                        ).constant
+            elif not consumer.bindings and not source.bindings:
                 distance = 0
         if loop is not None:
             default_period, default_residue = self.pattern(cell, loop)

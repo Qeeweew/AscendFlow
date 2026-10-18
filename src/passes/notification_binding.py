@@ -13,7 +13,7 @@ from math import gcd, lcm
 
 from xdsl.dialects import arith
 
-from ..analysis.access_frontier import LoopResidueSelection, ResiduePosition
+from ..analysis.access_frontier import LoopResidueSelection, QueueEndpoint, ResiduePosition
 from ..analysis.integer_facts import IntegerFacts
 from ..analysis.structured_dependencies import StructuredDependencies
 from ..analysis.structured_dispatch import StructuredDispatch
@@ -184,8 +184,16 @@ def _bind_endpoint(
     need, occurrence, memory, *, source, consumer_coordinates=(), effective_guards=None
 ):
     control, environment = memory.control, memory.control.environment
-    template = next(item for item in memory.templates if item.operation is occurrence.operation)
-    engine = template.contract.engine
+    endpoint = occurrence.endpoint
+    engine = (
+        endpoint.engine
+        if isinstance(endpoint, QueueEndpoint)
+        else next(
+            item.contract.engine
+            for item in memory.templates
+            if item.operation is occurrence.operation
+        )
+    )
     substitutions, coordinate_guards, tests, families, selector_tests, coordinates = (
         {},
         [],
@@ -353,7 +361,11 @@ def _bind_endpoint(
     )
     return BoundPlacement(
         occurrence,
-        Placement.AFTER if source else Placement.BEFORE,
+        endpoint.placement
+        if isinstance(endpoint, QueueEndpoint)
+        else Placement.AFTER
+        if source
+        else Placement.BEFORE,
         guard,
         tuple(substitutions.items()),
         tuple(coordinate_guards),
@@ -365,7 +377,7 @@ def _bind_endpoint(
 
 def _dispatch_path(placement, dispatch):
     """Actual hierarchical controller issue positions, in canonical coordinates."""
-    task = dispatch.tasks[placement.operation, placement.actor]
+    task = dispatch.site(placement)
     coordinates = dict(placement.coordinates)
     scopes, scope = [], task.scope
     while scope.parent is not None:
@@ -379,7 +391,7 @@ def _dispatch_path(placement, dispatch):
             (
                 parent.operation,
                 expression("add", ordinal, literal(child.parent_stage)),
-                child.parent_lexical,
+                child.parent_lexical * 3 + 1,
             )
         )
     ordinal = coordinates.get(task.scope.operation, literal(0))
@@ -412,7 +424,7 @@ class _IssueOrder:
         return self._guards[need]
 
     def position(self, point):
-        key = point.operation, point.actor, point.coordinates
+        key = point.operation, point.actor, point.placement, point.coordinates
         if key not in self._positions:
             self._positions[key] = _dispatch_path(point, self.dispatch)
         return self._positions[key]
@@ -535,7 +547,7 @@ def _bind_notification(need, dispatch, effective_guards):
         consumer_coordinates=consumer.coordinates,
         effective_guards=effective_guards,
     )
-    a, b = (dispatch.tasks[p.operation, p.actor] for p in (source, consumer))
+    a, b = (dispatch.site(p) for p in (source, consumer))
     cross = source.actor is not consumer.actor
     require(
         not cross or need.cell.root.type.bank.data == "GM",
@@ -576,8 +588,8 @@ def _implicit(notification, order):
         or order.compare(source, consumer, notification.requirements[0]) != -1
     ):
         return None
-    native = order.dispatch.tasks[source.operation, source.actor]
-    if native.engine is Engine.S:
+    native = order.dispatch.site(source)
+    if native.engine is Engine.S and not isinstance(source.occurrence.endpoint, QueueEndpoint):
         return "synchronous Scalar native end before controller dispatch"
     if native.engine is notification.destination_engine and native.implicit_completion:
         return "qualified native completion before later same-engine admission"
@@ -657,10 +669,10 @@ def _reuse_acquisitions(notifications, order):
     """
 
     def key(item):
-        task = order.dispatch.tasks[item.consumers[0].operation, item.consumers[0].actor]
+        task = order.dispatch.site(item.consumers[0])
         steps, scope = [(task.stage, task.lexical)], task.scope
         while scope.parent is not None:
-            steps.append((scope.parent_stage, scope.parent_lexical))
+            steps.append((scope.parent_stage, scope.parent_lexical * 3 + 1))
             scope = scope.parent
         return task.actor.value, tuple(reversed(steps)), item.source_engine.value
 
@@ -803,7 +815,6 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     order and complete lifetimes. Coverage alone cannot authorize allocation.
     """
     require(isinstance(dependencies, StructuredDependencies), "selection needs actual dependencies")
-    dependencies.require_closed()
     require(
         isinstance(dispatch, StructuredDispatch) and dispatch.memory is dependencies.memory,
         "selection and dispatch belong to different owned memory facts",

@@ -163,11 +163,14 @@ class _OrderConstruction:
             for index, test in enumerate(tests)
         )
 
-    def _inside(self, operation, region):
+    def _inside(self, point, region):
+        frame = (
+            self.control.frames[point.operation]
+            if point.bound is None
+            else point.bound.occurrence.frame
+        )
         return region is self.root or region in tuple(
-            frame.loop.operation
-            for frame in self.control.frames[operation].ancestors()
-            if frame.loop is not None
+            frame.loop.operation for frame in frame.ancestors() if frame.loop is not None
         )
 
     def _ancestor(self, ancestor, region):
@@ -178,7 +181,7 @@ class _OrderConstruction:
         paths = tuple(
             tuple(
                 frame.loop.operation
-                for frame in self.control.frames[bound.operation].ancestors()
+                for frame in bound.occurrence.frame.ancestors()
                 if frame.loop is not None
             )
             for bound in bounds
@@ -206,9 +209,9 @@ class _OrderConstruction:
         scope = (
             self.dispatch.scopes[point.operation, point.actor]
             if point.bound is None
-            else self.dispatch.tasks[point.operation, point.actor].scope
+            else self.dispatch.site(point.bound).scope
         )
-        task = None if point.bound is None else self.dispatch.tasks[point.operation, point.actor]
+        task = None if point.bound is None else self.dispatch.site(point.bound)
         if scope.operation is region:
             if task is None:
                 return _Position(0, 0, None)
@@ -217,7 +220,7 @@ class _OrderConstruction:
             scope = scope.parent
         if scope.parent is None:
             self._fail(region, "generation boundary is outside its actual dispatch scope", (point,))
-        return _Position(scope.parent_stage, scope.parent_lexical, scope.operation)
+        return _Position(scope.parent_stage, scope.parent_lexical * 3 + 1, scope.operation)
 
     def _context(self, point, region):
         """Rebase strict ancestor translations to this actual invocation.
@@ -436,7 +439,7 @@ class _OrderConstruction:
             point
             for point in self.endpoints
             if self._ancestor(self.owners[point.notification], region)
-            and self._inside(point.operation, region)
+            and self._inside(point, region)
         ]
         for child in children:
             points.extend(point for point in child.ports + child.cuts if point not in points)

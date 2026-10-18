@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from ascendflow.analysis.structured_addresses import nd_rectangle
 from ascendflow.analysis.structured_admission import admit_structured_memory
 from ascendflow.analysis.structured_bounds import admit_memory_bounds
 from ascendflow.analysis.structured_memory import collect_native_memory
-from ascendflow.analysis.structured_tiles import nd_rectangle
 from ascendflow.build import build_file
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import parse
@@ -60,8 +60,7 @@ def test_tiled_geometry_retains_every_actual_access_without_owner_admission():
         for a in t.accesses
         if a.address.geometry.bank == "GM" and a.mode.writes
     )
-    cell = access.tile
-    assert cell.extents == (64, 80)
+    assert access.rectangle.extents == (64, 80)
     # Geometry identity must not trust axes independently of real bytes.
     facts = memory.control.environment.facts
     assert (

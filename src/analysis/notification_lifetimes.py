@@ -9,6 +9,7 @@ including outer reentry. A finite upper bound can instead give one ID per use.
 
 from dataclasses import dataclass
 
+from ..diagnostics import CompileError, ErrorKind
 from ..scalar import expression, literal, substitute
 from .event_contracts import CROSS_BACKLOG, LOCAL_CAPACITY, CaseLease, StructuredEventLease
 from .guard_cover import opposite, prove_guard_cover
@@ -45,6 +46,7 @@ class HandbackRule:
         )
         self.at_native = {}
         self.boundary_cases = dict(boundaries)
+        self.declined_boundaries = {}
         for peer in self.peers:
             for source in peer.sources:
                 self.at_native.setdefault((source.operation, source.actor), []).append(
@@ -73,13 +75,28 @@ class HandbackRule:
                 # Cell credits need no dense ordinal. A streaming caller can
                 # additionally require exact invocation boundary membership.
                 # Universal pairing survives this domain specialization.
-                self.boundary_cases[peer] = build_event_family(self.domains, peer)
+                try:
+                    cases = build_event_family(self.domains, peer)
+                except CompileError as error:
+                    if error.kind is not ErrorKind.UNSUPPORTED or error.phase not in {
+                        "event-parameter-cases",
+                        "event-window-membership",
+                    }:
+                        raise
+                    # This is optional relay precision, not the peer's own
+                    # pairing/lifetime. An unavailable exact child boundary
+                    # supplies no handback. Required channels are never
+                    # removed and must still acquire a complete lease.
+                    self.declined_boundaries[peer] = error
+                    self.domains.work.optional_relay_declines += 1
+                    cases = ()
+                self.boundary_cases[peer] = cases
             return self.boundary_cases[peer]
         return cases
 
     def _step(self, bound, loop):
         d = self.domains
-        task = d.dispatch.tasks[bound.operation, bound.actor]
+        task = d.dispatch.site(bound)
         scope, stage = task.scope, task.stage
         while scope.operation is not loop and scope.parent is not None:
             stage, scope = scope.parent_stage, scope.parent
@@ -96,6 +113,39 @@ class HandbackRule:
 
     def candidates(self, peers, loop, delta, *, reentry, old, target):
         d = self.domains
+        # Pairing already maps both ends of a channel. At an actual native
+        # admission, bind a returning publication directly to that same
+        # occurrence. No FIRST/LAST member or child-existence projection is
+        # needed to identify a native we already have in hand.
+        actual = {d.control.loops[l].ordinal: value for l, value in old.coordinates}
+        for peer in peers:
+            for source in peer.sources:
+                if source.operation is not old.operation or source.actor is not old.actor:
+                    continue
+                bindings = {
+                    ordinal: substitute(source.expression(ordinal), actual) for ordinal in actual
+                }
+                for case in d.cases[peer]:
+                    if case.empty:
+                        continue
+                    sources = tuple(d._instance(p, bindings, case=case) for p in peer.sources)
+                    consumers = tuple(d._instance(p, bindings, case=case) for p in peer.consumers)
+                    anchor = d._instance(source, bindings, case=case)
+                    matches = tuple(
+                        Comparison(value, "==", dict(anchor.coordinates)[l])
+                        for l, value in old.coordinates
+                        if l in dict(anchor.coordinates)
+                    )
+                    # Retain these correspondence premises on the candidate;
+                    # the handback must cover them under the caller's actual
+                    # reuse domain, rather than assuming equality.
+                    from dataclasses import replace
+
+                    sources = tuple(
+                        replace(p, guard=ActionGuard(p.guard.comparisons + matches))
+                        for p in sources
+                    )
+                    yield peer, sources, consumers
         if loop is None:
             for peer in peers:
                 for case in self._cases(peer):
@@ -157,6 +207,20 @@ class HandbackRule:
             p
             for p in self.peers
             if p is not channel and self._eligible(channel, old, target_channel, target, p)
+        )
+        # A consume before native admission can return on that native's
+        # already-required publication. Try this local rule first: it has
+        # the exact issue-site correspondence, without accumulating guards
+        # from unrelated queue handoffs in the containing kernel.
+        peers = tuple(
+            sorted(
+                peers,
+                key=lambda p: (
+                    not any(
+                        s.operation is old.operation and s.actor is old.actor for s in p.sources
+                    )
+                ),
+            )
         )
         for peer, sources, consumers in self.candidates(
             peers, loop, delta, reentry=reentry, old=old, target=target
@@ -319,6 +383,10 @@ class HandbackRule:
                     channel,
                     "queue handback rule cannot establish consumption before reuse within event capacity",
                     phase="notification-generation-lifetime",
+                    witness=tuple(
+                        f"optional relay {n.name}: {e.phase}"
+                        for n, e in self.declined_boundaries.items()
+                    ),
                 )
             width *= candidate
             rings.insert(0, (window, candidate))

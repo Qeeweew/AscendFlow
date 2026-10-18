@@ -19,6 +19,7 @@ from ..diagnostics import CompileError, ErrorKind, require
 from ..indexing import arguments
 from ..scalar import Expr, Fact, expression, literal
 from ..target.ascend910b import Actor, Engine
+from .access_frontier import QueueEndpoint
 from .event_contracts import ResourceWork
 from .event_windows import EventWindow, WindowExistence
 from .integer_facts import IntegerFacts
@@ -137,20 +138,23 @@ class EventDomains:
             )
             require(
                 all(
-                    (bound.operation, bound.actor) in self.dispatch.tasks
+                    (bound.operation, bound.actor)
+                    in (
+                        self.dispatch.boundaries
+                        if isinstance(bound.occurrence.endpoint, QueueEndpoint)
+                        else self.dispatch.tasks
+                    )
                     for bound in notification.sources + notification.consumers
                 ),
                 "selected endpoint belongs to another physical dispatch",
             )
             require(
                 all(
-                    self.dispatch.tasks[bound.operation, bound.actor].engine
-                    is notification.source_engine
+                    self.dispatch.site(bound).engine is notification.source_engine
                     for bound in notification.sources
                 )
                 and all(
-                    self.dispatch.tasks[bound.operation, bound.actor].engine
-                    is notification.destination_engine
+                    self.dispatch.site(bound).engine is notification.destination_engine
                     for bound in notification.consumers
                 ),
                 "selected route differs from its actual native queues",
@@ -158,8 +162,16 @@ class EventDomains:
             from .structured_schedule import Placement
 
             require(
-                all(p.placement is Placement.AFTER for p in notification.sources)
-                and all(p.placement is Placement.BEFORE for p in notification.consumers),
+                all(
+                    p.placement is p.occurrence.endpoint.placement
+                    if isinstance(p.occurrence.endpoint, QueueEndpoint)
+                    else p.placement is expected
+                    for points, expected in (
+                        (notification.sources, Placement.AFTER),
+                        (notification.consumers, Placement.BEFORE),
+                    )
+                    for p in points
+                ),
                 "a publication must follow its native capture and an acquire must precede its native",
             )
             if notification.mechanism is NotificationKind.CROSS_EVENT:
@@ -352,7 +364,7 @@ class EventDomains:
         # Coordinate prerequisites are already canonical; applying the actual
         # coordinate map again would translate a previous invocation twice.
         canonical = {self.control.sid: bindings[self.control.sid]}
-        for frame in self.control.frames[placement.operation].ancestors():
+        for frame in placement.occurrence.frame.ancestors():
             if frame.loop is not None:
                 prerequisite = coordinate_guards.get(frame.loop.operation)
                 if prerequisite is not None:
@@ -523,10 +535,7 @@ class EventDomains:
         )
         if key in self._order_facts:
             return self._order_facts[key]
-        a = self.dispatch.tasks.get((before.operation, before.actor))
-        b = self.dispatch.tasks.get((after.operation, after.actor))
-        if a is None or b is None:
-            return ()
+        a, b = self.dispatch.site(before), self.dispatch.site(after)
         ap, bp = self._path(a), self._path(b)
         ac, bc = dict(before.coordinates), dict(after.coordinates)
         if any(
@@ -544,10 +553,10 @@ class EventDomains:
             coordinate = coordinates.get(owner.operation, literal(0))
             if task.scope is owner:
                 stage, lexical = task.stage, task.lexical
-                phase = 1 if native else 0
+                phase = 0
             else:
                 child = path[index + 1]
-                stage, lexical, phase = child.parent_stage, child.parent_lexical, 1
+                stage, lexical, phase = child.parent_stage, child.parent_lexical * 3 + 1, 0
             return expression("add", coordinate, literal(stage)), (lexical, phase)
 
         conditions, prefix = [], ()
