@@ -12,6 +12,9 @@ from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_regions import (
     AccessOccurrence,
     AliasRegion,
+    CountRelation,
+    LoopCountGuard,
+    StorageCell,
 )
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.structured_sync import synchronize_structure
@@ -207,20 +210,46 @@ def test_first_and_last_branches_preserve_values_without_phase_case_products():
         check_compiled_events(plan, {"n": count}, invocations=2)
 
 
-def test_compound_slot_short_and_long_children_preserve_actual_byte_values():
-    source = """
-        def slots(q:N.int64,k:N.int64(minimum=1)):
+@pytest.mark.parametrize("width", [2, 3])
+def test_compound_slot_short_and_long_children_preserve_actual_byte_values(width):
+    source = f"""
+        def slots(q:N.int64,k:N.int64):
             with N.Kernel():
-                x,y=N.alloc_ub((2,64)),N.alloc_ub((2,64))
+                x,y=N.alloc_ub(({width},64)),N.alloc_ub(({width},64))
                 for parent in N.serial(q):
                     for child in N.Pipelined(k,stages=1):
-                        slot=(parent*k+child)%2
+                        slot=(parent*k+child)%{width}
                         N.fill(x[slot,:],1.0)
                         N.mul(x[slot,:],2.0,out=y[slot,:])
     """
     plan = synchronize_structure(N.from_source(source))
-    assert plan.dependencies.work.cells <= 8
-    for q, k in product(range(4), range(1, 4)):
+    assert plan.dependencies.work.cells <= 2 * width**2
+    child = next(
+        loop
+        for loop, logical in plan.memory.control.loops.items()
+        if logical.count == Expr("argument", ("k",))
+    )
+    long_cells = [
+        transfer
+        for cell, transfer in plan.dependencies.order.summaries[child].items()
+        if isinstance(cell, StorageCell)
+        and any(
+            isinstance(guard, LoopCountGuard)
+            and guard.relation is CountRelation.MORE
+            and guard.threshold == width - 1
+            for guard in cell.conditions
+        )
+    ]
+    if width == 2:
+        assert long_cells
+    # Every residue is populated under the cell's existing k >= width guard.
+    # Export actual accesses rather than queue-wide ENTRY/EXIT drains.
+    assert all(
+        not isinstance(point.endpoint, QueueEndpoint)
+        for transfer in long_cells
+        for point in transfer.first_writes + transfer.tail_reads
+    )
+    for q, k in product(range(4), range(2 * width + 1)):
         check_compiled_events(plan, {"q": q, "k": k}, invocations=2)
 
 

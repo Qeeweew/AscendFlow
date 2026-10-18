@@ -420,6 +420,32 @@ class _Builder:
                 expression("sub", logical.count, expression("add", threshold, literal(1))),
                 self.facts,
             )
+            if not populated and isinstance(cell, StorageCell):
+                # Compound-slot partitioning already separates uniform short
+                # and long extents. Keep those premises when selecting a
+                # boundary; forgetting them needlessly drains every queue.
+                root = self.memory.module.body.block.first_op
+                uniform = tuple(
+                    guard
+                    for guard in cell.conditions
+                    if isinstance(guard, LoopCountGuard)
+                    and self.memory.control.invariant_over(guard.count, root)
+                    and (
+                        type(guard.threshold) is int
+                        or self.memory.control.invariant_over(guard.threshold, root)
+                    )
+                )
+                populated = (
+                    self.coordinates.guards(
+                        uniform,
+                        (
+                            LoopCountGuard(
+                                operation, logical.count, CountRelation.AT_MOST, threshold
+                            ),
+                        ),
+                    )
+                    is None
+                )
             stable = all(
                 self.memory.control.invariant_over(value, operation)
                 for point in transfer.head_reads

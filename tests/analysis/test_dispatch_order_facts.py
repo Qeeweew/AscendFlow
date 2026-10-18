@@ -49,17 +49,15 @@ def test_real_compound_two_slot_source_reaches_notification_selection(minimum):
         item.source_engine is Engine.V and item.destination_engine is Engine.MTE2
         for item in selection.notifications
     )
-    # Unknown short residues are captured at real invocation boundaries;
-    # selection need not reconstruct a selected native LAST guard.
-    from ascendflow.analysis.access_frontier import QueueEndpoint
-
-    assert any(
-        isinstance(p.occurrence.endpoint, QueueEndpoint)
+    # Uniform extent partitions establish populated residues, so captures
+    # remain at actual native accesses instead of draining the invocation.
+    assert all(
+        isinstance(p.occurrence.endpoint, AccessEndpoint)
         for n in selection.notifications
         for p in n.sources + n.consumers
     )
     memory = selection.dependencies.memory
-    for count in range(minimum, 4):
+    for count in range(minimum, 6):
         uniform = {"n": 3, "m": count, "$group": 0, "$sid": 0}
         positions = {
             key: index
