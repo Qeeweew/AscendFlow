@@ -8,7 +8,8 @@
 
 `B=1, Hq=Hkv=8, D=128`，BNSD、dense、非 causal、无 dropout，默认 BQ256/BM128/BK1024/CK128/VR8，20 组（每组 1 AIC / 2 AIV）。
 ACLNN 使用 `aclnnFlashAttentionScore`（keepProb=1、innerPrecise=0、sparseMode=0），两边 scale 均为 `FP32(1/sqrt(128))`。
-shape 列为 `Sq×Sk`；六组使用同一份 AscendFlow 二进制，Sq/Sk 保持 runtime 参数。
+shape 列为 `Sq×Sk`；表内四组使用同一份 AscendFlow 二进制，Sq/Sk 保持 runtime 参数。
+causal 与非 causal 的默认性能验收统一只取 1K/2K/4K/8K 正方形。
 
 | shape | AscendFlow µs | ACLNN µs | 加速比 | AscendFlow TFLOPS | ACLNN TFLOPS |
 |---|---:|---:|---:|---:|---:|
@@ -16,8 +17,6 @@ shape 列为 `Sq×Sk`；六组使用同一份 AscendFlow 二进制，Sq/Sk 保�
 | 2048×2048 | 164.240 | 165.640 | 1.009× | 104.60 | 103.72 |
 | 4096×4096 | 505.472 | 525.668 | 1.040× | 135.95 | 130.73 |
 | 8192×8192 | 1756.556 | 1887.140 | 1.074× | 156.49 | 145.66 |
-| 4096×8192 | 938.160 | 1031.100 | 1.099× | 146.50 | 133.29 |
-| 8192×4096 | 945.656 | 955.980 | 1.011× | 145.34 | 143.77 |
 
 ## GEMM normal
 
@@ -37,7 +36,7 @@ shape 列为 `M×N×K`；AscendFlow 使用默认 BM128/BN128/BK256/CK128、两�
 `normal` 指正态输入。保留 example 的 `OUTPUT_CACHE="auto"`：本次 8192³ 的 C 为 bypass，
 其余五组为 normal，A/B 均为 normal。ACLNN 使用其自身分块和缓存策略。
 
-本次 FA 加速比为 0.983–1.099×，其中 1K 为 0.983×；GEMM 为 1.025–1.373×。
+表内 FA 加速比为 0.983–1.074×，其中 1K 为 0.983×；GEMM 为 1.025–1.373×。
 大于 1 表示本次 AscendFlow 更快，小于 1 表示更慢；接近 1 的差异仅作本次观测。
 
 ## TFLOPS 计算口径
@@ -60,7 +59,8 @@ FA 的分子不计 softmax、指数、归约、online 状态更新和数据搬�
 排除预热，取设备 task 时长中位数；一次 launch 有多个 task 时相加。进程内复用同一 allocation，
 不 flush 缓存。ACL stream interval 包含 host 提交间隙，不作为表中时间。
 
-12 组 shape、24 次后端采集（每 shape/backend 各一次）均通过 sampled 数值 oracle、完整输出有限性、输入不变及 guard 检查。
+表内 10 组 shape 均通过 sampled 数值 oracle、完整输出有限性、输入不变及 guard 检查。
+原始归档保留当时全部 12 组 shape、24 次后端采集；其中两组不等长 FA 不再属于默认性能验收，本次未重新测量。
 FA runner 对完整输出执行 `np.isfinite(actual).all()`，原始记录与汇总中的 `finite_elements` 为全输出计数；GEMM 记录 `finite_output=true`。
 FA 的实际 `softmax_scale_f32` 和小端 FP32 字节 `softmax_scale_f32_bits` 同时保存在汇总中。
 FA 容差 rtol=0.002、atol=0.0002；GEMM 对实际 FP16 输入使用独立 FP64 oracle，

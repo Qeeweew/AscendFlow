@@ -91,8 +91,6 @@ CASES = tuple(
         (2048, 2048),
         (4096, 4096),
         (8192, 8192),
-        (4096, 8192),
-        (8192, 4096),
     )
 ) + tuple(
     ProfileCase("gemm-normal", shape)
@@ -105,9 +103,7 @@ CASES = tuple(
         (8192, 2048, 4096),
     )
 )
-CAUSAL_CASES = tuple(
-    replace(case, causal=True) for case in CASES if case.attention and len(set(case.shape)) == 1
-)
+CAUSAL_CASES = tuple(replace(case, causal=True) for case in CASES if case.attention)
 
 
 def digest(path):

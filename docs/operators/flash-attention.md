@@ -79,7 +79,7 @@ score 缩放后、reduce_max 前调用通用 `N.fill_upper` 将 `j>i` 的 FP32 l
 ## 资格边界
 
 数值容差为 rtol=0.002、atol=0.0002。当前日常检查对 256:1024 和 768:3072
-进行全输出 oracle；性能覆盖 1K/2K/4K/8K 等长和两组不等长序列，保持默认政策，
+进行全输出 oracle；causal 与非 causal 的性能验收都只覆盖 1K/2K/4K/8K 等长正方形，保持默认政策，
 每个 shape 的生成代码与 ACLNN 各采集一次默认 msprof。预热和执行次数见[测试指南](../guide/testing.md)，实际结果分别见
 [示例验证](../reports/examples.md)与[性能报告](../reports/performance.md)。FA 的 TFLOPS 只计 QK/PV 两次矩阵乘法的算法 FLOPs。
 

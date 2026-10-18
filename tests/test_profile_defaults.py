@@ -133,12 +133,22 @@ def test_comparison_rejects_unmatched_evidence(change, tmp_path):
         profile.compare_pair(spec, records, {backend: {"median_us": 10} for backend in records})
 
 
-def test_default_matrix_includes_square_and_rectangular_cases():
-    assert len(profile.CASES) == len({case.name for case in profile.CASES}) == 12
-    for operator in ("flash-attention", "gemm-normal"):
-        shapes = [case.shape for case in profile.CASES if case.operator == operator]
-        assert len(shapes) == 6
-        assert sum(len(set(shape)) > 1 for shape in shapes) == 2
+def test_default_matrix_uses_square_attention_and_retains_gemm_shapes():
+    assert len(profile.CASES) == len({case.name for case in profile.CASES}) == 10
+    assert [case.shape for case in profile.CASES if case.attention] == [
+        (1024, 1024),
+        (2048, 2048),
+        (4096, 4096),
+        (8192, 8192),
+    ]
+    assert [case.shape for case in profile.CASES if not case.attention] == [
+        (1024, 1024, 1024),
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+        (8192, 8192, 8192),
+        (2048, 8192, 4096),
+        (8192, 2048, 4096),
+    ]
 
 
 def test_causal_acceptance_matrix_uses_the_requested_equal_lengths():

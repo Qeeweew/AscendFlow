@@ -11,8 +11,9 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 ```
 
 `check_examples` 检查所有公开示例；`profile_defaults` 对 Flash Attention 和 GEMM normal
-固定的 12 个 shape，分别采集 AscendFlow 与 ACLNN，各一次默认 msprof，计算时间、加速比和 TFLOPS。
-`--causal` 改为 1K/2K/4K/8K 四个等长 causal FA shape，使用 example 中三组显式分块；
+固定的 10 个 shape（4 个等长非 causal FA、6 个 GEMM），分别采集 AscendFlow 与 ACLNN，
+各一次默认 msprof，计算时间、加速比和 TFLOPS。FA 两种模式都只按 1K/2K/4K/8K 正方形验收。
+`--causal` 单独采集这四个等长 causal FA shape，使用 example 中三组显式分块；
 `--require-no-slower` 在任一 shape 慢于 ACLNN 时返回失败，数值通过不代表性能通过。
 输出目录须是新目录。运行环境、卡选择和
 输入合同见[快速上手](../docs/guide/quickstart.md)，结果见[示例验证](../docs/reports/examples.md)

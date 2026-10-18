@@ -51,7 +51,7 @@ python -m benchmarks.check_examples --output build/examples-device --physical 2
 
 | 算子 | 默认 shape 矩阵 |
 |---|---|
-| Flash Attention | Sq:Sk=1024:1024、2048:2048、4096:4096、8192:8192、4096:8192、8192:4096；B1/Hq8/Hkv8/D128、dense 非 causal |
+| Flash Attention | Sq=Sk=1024、2048、4096、8192；B1/Hq8/Hkv8/D128；causal 与非 causal 都只按正方形验收 |
 | GEMM normal | M:N:K=1024³、2048³、4096³、8192³、2048:8192:4096、8192:2048:4096；连续 NN，正态输入 |
 
 每个 shape 在同一卡上先采集 AscendFlow，再采集安装版 ACLNN；每个后端只调用
@@ -67,7 +67,7 @@ python -m benchmarks.profile_defaults --output build/kernel-comparison --physica
 python -m benchmarks.profile_defaults --causal --require-no-slower --output build/causal-comparison --physical 2
 ```
 
-默认共 12 个 shape、24 次 msprof。FA 的 Sq/Sk 为 runtime，六个 shape 复用一次
+默认采集非 causal FA 与 GEMM，共 10 个 shape、20 次 msprof。FA 的 Sq/Sk 为 runtime，四个 shape 复用一次
 CANN 构建；GEMM 为 constexpr，每个 shape 单独构建，仍有覆盖全部构建阶段的
 300 秒硬期限。错误立即停止，不继续后续 shape。输出目录须是新目录。
 需要检查单项时可用 `--only gemm-normal-4096x4096x4096`，该记录仅覆盖选中项。
