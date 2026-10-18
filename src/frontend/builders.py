@@ -21,6 +21,7 @@ from ..dialects.source import (
     CopyOp,
     DomainOp,
     ElementOp,
+    FillUpperOp,
     MatmulOp,
     PipelineOp,
     PredicateOp,
@@ -608,7 +609,17 @@ def _dependency_inputs(values):
     return _ints(i for i, value in enumerate(values) if isinstance(value, _Value))
 
 
-def _allocate(shape, dtype, memory, *, layout="linear", name=None, access="local", cache="normal"):
+def _allocate(
+    shape,
+    dtype,
+    memory,
+    *,
+    layout="linear",
+    name=None,
+    access="local",
+    cache="normal",
+    write_disjoint=False,
+):
     trace = _trace()
     shape = tuple(shape)
     require(
@@ -622,6 +633,11 @@ def _allocate(shape, dtype, memory, *, layout="linear", name=None, access="local
         and cache in {"normal", "bypass"}
         and (cache == "normal" or memory == "GM"),
         "cache policy must be normal or GM bypass",
+    )
+    require(
+        type(write_disjoint) is bool
+        and (not write_disjoint or memory == "GM" and access in {"write", "read_write"}),
+        "write_disjoint must be boolean and requires a writable external tensor",
     )
     require(
         len(axes) <= 8 and all(shape[i].scale == 1 for i in axes),
@@ -639,6 +655,7 @@ def _allocate(shape, dtype, memory, *, layout="linear", name=None, access="local
             "ring": IntAttr(0),
             "dynamic_axes": _ints(axes),
             **({"cache": StringAttr(cache)} if cache != "normal" else {}),
+            **({"write_disjoint": IntAttr(1)} if write_disjoint else {}),
         },
     )
     trace.add(op)
@@ -667,6 +684,8 @@ def alloc_l0c(shape, dtype=f32, *, name=None):
 
 
 class Kernel:
+    """Launch independent SPMD groups; mappings obey the source parallel contract."""
+
     def __init__(self, groups=1, *, kind="vector"):
         self.groups, self.kind = groups, kind
 
@@ -893,6 +912,27 @@ def sub(lhs, rhs, *, out, scratch=None):
 
 def maximum(lhs, rhs, *, out):
     return _element("maximum", [lhs, rhs], out)
+
+
+def fill_upper(destination, value, *, row_start=0, col_start=0):
+    dst = _view(destination).bound()
+    require(dst.buffer.op.access.data != "read", "upper fill writes a read-only tensor")
+    op = FillUpperOp.build(
+        operands=[
+            dst.emit(),
+            _trace().scalar(row_start),
+            _trace().scalar(col_start),
+            _deps([destination]),
+        ],
+        result_types=[_tile(dst)],
+        attributes={
+            "scalar": FloatAttr(round_f32(value, allow_infinity=True), ir_f32),
+            "dependency_inputs": _dependency_inputs([destination]),
+        },
+    )
+    _trace().add(op)
+    _trace().record(op.value)
+    return _Value(dst, op.value)
 
 
 def exp(source, *, out):

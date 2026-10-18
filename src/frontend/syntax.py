@@ -34,10 +34,17 @@ int64, constexpr = _ParameterType.INT64, _ParameterType.CONSTEXPR
 
 @dataclass(frozen=True)
 class Tensor:
+    """External tensor permissions and source memory contracts.
+
+    write_disjoint declares pairwise disjoint writes within one kernel launch;
+    it does not describe scratch slots, input/output aliasing or later launches.
+    """
+
     shape: tuple[int, ...]
     dtype: DType | str
     access: str = "read"
     cache: str = "normal"
+    write_disjoint: bool = False
 
 
 def _ast_only():
@@ -155,6 +162,11 @@ def cast(source, *, out):
 
 
 def fill(destination, value):
+    _ast_only()
+
+
+def fill_upper(destination, value, *, row_start=0, col_start=0):
+    """Fill where col_start+c > row_start+r; preserve the other f32 UB lanes."""
     _ast_only()
 
 

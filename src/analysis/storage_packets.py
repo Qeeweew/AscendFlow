@@ -79,7 +79,12 @@ def _guard_invariant(guard, logical, memory):
 
 
 def certify_packets(values, dispatch, coordinates, loop, cell):
-    if cell.private is None or cell.streaming or coordinates.pattern(cell, loop) != (1, 0):
+    if (
+        not isinstance(cell, StorageCell)
+        or cell.private is None
+        or cell.streaming
+        or coordinates.pattern(cell, loop) != (1, 0)
+    ):
         return None
     stages = tuple(op for op in loop.body.block.ops if isinstance(op, PipelineStageOp))
     stages = tuple(stage for stage in stages if cell in values.summaries[stage].cells)

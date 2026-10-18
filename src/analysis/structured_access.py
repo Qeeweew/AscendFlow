@@ -1,8 +1,8 @@
-"""Project owned physical access geometry into exact storage fragments.
+"""Keep exact storage fragments where available, otherwise source memory order.
 
-This stage owns slot/coordinate interpretation and rectangle partitioning.
-Its immutable result is consumed by recursive dependence composition; it
-creates neither RAW/WAR/WAW relations nor event/completion state.
+Slot/coordinate and rectangle analyses are optional precision. An uncertain
+mapping retains a source-order AliasRegion and the original native accesses.
+The result creates neither dependencies nor event/completion state.
 """
 
 from __future__ import annotations
@@ -18,14 +18,13 @@ from xdsl.ir import Operation
 from ..diagnostics import CompileError, require
 from ..dialects.physical import TaskOp
 from ..indexing import arguments, equivalent, interval, nonnegative, normalize, polynomial
-from ..scalar import Expr, expression, literal, substitute
+from ..scalar import Expr, expression, infer, literal, substitute
 from ..target.ascend910b import Actor
 from .native import AccessMode
 from .structured_memory import MemoryAccess, MemoryTemplate, NativeMemoryFacts
 from .structured_regions import (
+    AliasRegion,
     CountRelation,
-    DependencyIssue,
-    DependencyIssueKind,
     DependencyWork,
     Guard,
     LoopCountGuard,
@@ -36,10 +35,10 @@ from .structured_regions import (
 
 @dataclass(frozen=True)
 class CellEffect:
-    """One actual instruction's operands covering an exact storage cell.
+    """One actual instruction's operands in a cell or may-alias ordering domain.
 
-    The union is a physical footprint. Conditional numerical reads remain on
-    each operand, so an initialization cannot acquire a fictitious old value.
+    Physical footprints and conditional numerical reads stay on each operand.
+    An ordering domain never turns a partial write into an initialization.
     """
 
     template: MemoryTemplate
@@ -62,9 +61,10 @@ class CellEffect:
 @dataclass(frozen=True)
 class PartitionedAccesses:
     memory: NativeMemoryFacts
-    effects: Mapping[TaskOp, Mapping[StorageCell, tuple[CellEffect, ...]]]
-    patterns: Mapping[tuple[StorageCell, Operation], frozenset[tuple[int, int | Expr]]]
-    issues: tuple[DependencyIssue, ...]
+    effects: Mapping[TaskOp, Mapping[StorageCell | AliasRegion, tuple[CellEffect, ...]]]
+    patterns: Mapping[
+        tuple[StorageCell | AliasRegion, Operation], frozenset[tuple[int, int | Expr]]
+    ]
     work: DependencyWork
 
 
@@ -155,14 +155,7 @@ class _Partitioner:
         self.memory, self.admission = memory, admission
         self.facts = memory.control.environment.facts
         self.work = DependencyWork(native_templates=len(memory.templates))
-        self.issues, self.effects, self.patterns = [], {}, {}
-        self._origin_pool, self._issue_keys = {}, set()
-
-    def issue(self, kind, operation, message, cell=None):
-        key = (kind, operation, cell)
-        if key not in self._issue_keys:
-            self._issue_keys.add(key)
-            self.issues.append(DependencyIssue(kind, operation, message, cell))
+        self.effects, self.patterns, self._origin_pool = {}, {}, {}
 
     def _separate_tiles(self, projections, loop):
         """A single streaming clock advances exact rectangles on one ND grid.
@@ -170,24 +163,37 @@ class _Partitioner:
         Slot substitutions, contracted families and additional varying clocks
         need their own relational rules. They cannot borrow this identity.
         """
-        tile = projections[0].access.address.tile
-        return tile is not None and any(
-            self._separate_grid_order(projections, loop, item.order) for item in tile.linearizations
+        return any(
+            tile is not None
+            and any(
+                self._separate_grid_order(projections, loop, item.order, axis=axis)
+                for item in tile.linearizations
+            )
+            for axis, tile in (
+                (False, projections[0].access.address.tile),
+                (True, projections[0].access.address.axis_tile),
+            )
         )
 
-    def _separate_grid_order(self, projections, loop, order):
+    def _separate_grid_order(self, projections, loop, order, *, axis=False):
         grid, index = None, None
         low = high = 0
         for projection in projections:
             address = projection.access.address
-            tile, geometry = address.tile, address.geometry
+            tile, geometry = address.axis_tile if axis else address.tile, address.geometry
+            contracted = projection.contracted if axis else ()
+            exact = (
+                projection.stop - projection.start == geometry.nbytes
+                and projection.rows == geometry.rows
+                and projection.row_stride == geometry.row_stride
+            )
             if (
                 tile is None
                 or projection.slots
                 or projection.contracted
-                or projection.stop - projection.start != geometry.nbytes
-                or projection.rows != geometry.rows
-                or projection.row_stride != geometry.row_stride
+                and not axis
+                or not exact
+                and not contracted
                 or grid is not None
                 and grid != tile.grid
             ):
@@ -195,11 +201,31 @@ class _Partitioner:
             bindings = {
                 self.memory.control.sid: literal(1 if projection.participant is Actor.AIV1 else 0)
             }
+            multiplicity, extra = 1, 0
+            linear = tile.bounded_index(order, projection.template.frame.domains(), self.facts)
+            if linear is None:
+                return False
+            for child in projection.template.frame.loops():
+                if child.operation not in contracted:
+                    continue
+                count = _normalize(child.count, self.facts).constant
+                shifted = substitute(
+                    linear, {child.ordinal: expression("add", child.ordinal, literal(1))}
+                )
+                delta = _normalize(expression("sub", shifted, linear), self.facts).constant
+                if count is None or count <= 0 or delta is None or delta < 0:
+                    return False
+                bindings[child.ordinal] = literal(0)
+                multiplicity *= count
+                extra += delta * (count - 1)
+            if (
+                contracted
+                and (projection.stop - projection.start) * projection.rows
+                != geometry.total_nbytes * multiplicity
+            ):
+                return False
             actual = expression("add", projection.origin, literal(projection.start))
             if not equivalent(actual, substitute(address.offset, bindings), self.facts):
-                return False
-            linear = tile.index(order)
-            if linear is None:
                 return False
             value = substitute(linear, bindings)
             if any(
@@ -211,9 +237,10 @@ class _Partitioner:
                 displacement = _normalize(expression("sub", value, index), self.facts).constant
                 if displacement is None:
                     return False
-                low, high = min(low, displacement), max(high, displacement)
+                low, high = min(low, displacement), max(high, displacement + extra)
             else:
                 index = value
+                high = extra
             grid = tile.grid
         if index is None:
             return False
@@ -321,13 +348,15 @@ class _Partitioner:
         # would hide exactly the storage-period contract needed here.
         offset = substitute(address.offset, bindings)
         variants = self._compound_slots(template, offset)
-        return tuple(
-            projection
-            for value, slots, conditions in variants
-            for projection in self._slots_plain(
-                template, access, participant, value, slots, conditions
-            )
-        )
+        if variants is None:
+            return None
+        result = []
+        for value, slots, conditions in variants:
+            projected = self._slots_plain(template, access, participant, value, slots, conditions)
+            if projected is None:
+                return None
+            result.extend(projected)
+        return tuple(result)
 
     def _compound_slots(self, template, offset):
         loops = template.frame.loops()
@@ -350,23 +379,13 @@ class _Partitioner:
         numerator, modulus = atom.args
         period = modulus.constant
         if period > self.MAX_PROJECTIONS:
-            self.issue(
-                DependencyIssueKind.BUDGET,
-                template.operation,
-                "compound storage-slot period exceeds dependency proof budget",
-            )
-            return ()
+            return None
         shifted = substitute(
             numerator, {inner.ordinal: expression("add", inner.ordinal, literal(1))}
         )
         delta = _normalize(expression("sub", shifted, numerator), self.facts).constant
         if delta != 1 or len(active) != 2:
-            self.issue(
-                DependencyIssueKind.SYMBOLIC_ALIAS,
-                template.operation,
-                "compound modulo needs a unit-stride innermost coordinate map",
-            )
-            return ((offset, (), ()),)
+            return None
         base = substitute(numerator, {inner.ordinal: literal(0)})
         variants = []
         for slot in range(period):
@@ -399,13 +418,7 @@ class _Partitioner:
                     )
                     concrete = _normalize(concrete, self.facts)
                     if concrete.constant is None:
-                        if self._guards(conditions) is not None:
-                            self.issue(
-                                DependencyIssueKind.SYMBOLIC_ALIAS,
-                                template.operation,
-                                "short child slot visits need an exact parent-coordinate mapping",
-                            )
-                        continue
+                        return None
                     visits = [j for j in range(count) if (concrete.constant + j) % period == slot]
                     if len(visits) == 1:
                         variants.append(
@@ -434,6 +447,13 @@ class _Partitioner:
             if not _depends(offset, loop.ordinal) or _period(offset, loop.ordinal) is not None:
                 continue
             count = _normalize(loop.count, self.facts).constant
+            if count is None and access.mode is AccessMode.READ:
+                # A bounded dense reader prefix has a fixed spatial union,
+                # but retirement still ranges over its actual loop.count.
+                # Do not apply this union to conditional writes or invent a
+                # maximum-count LAST occurrence.
+                bound = infer(loop.count, self.facts)
+                count = None if bound is None else bound.maximum
             if count is None or count <= 0:
                 continue
             shifted = substitute(
@@ -470,12 +490,7 @@ class _Partitioner:
                     streaming.append(loop.operation)
                     continue
             if period > self.MAX_PROJECTIONS:
-                self.issue(
-                    DependencyIssueKind.BUDGET,
-                    template.operation,
-                    "storage-slot period exceeds dependency proof budget",
-                )
-                return ()
+                return None
             choices.append((loop, period))
         combinations = 1
         for _, period in choices:
@@ -484,12 +499,7 @@ class _Partitioner:
             combinations * self.work.projected_accesses > self.MAX_PROJECTIONS**2
             or combinations > self.MAX_PROJECTIONS
         ):
-            self.issue(
-                DependencyIssueKind.BUDGET,
-                template.operation,
-                "storage-coordinate image exceeds dependency proof budget",
-            )
-            return ()
+            return None
         if geometry.contiguous:
             geometry = replace(geometry, nbytes=geometry.total_nbytes, rows=1, row_stride=0)
         projected = []
@@ -539,40 +549,65 @@ class _Partitioner:
         return tuple(projected)
 
     def _project(self):
-        groups = {}
+        groups, instances, ordered = {}, {}, set()
+        readers = {
+            access.address.root
+            for template in self.memory.templates
+            if not template.frame.statically_empty
+            for access in template.accesses
+            if access.mode.reads
+        }
         for template in self.memory.templates:
             if template.frame.statically_empty:
                 continue
             for participant in template.participants:
                 for access in template.accesses:
+                    # The source contract relates external writes only. If
+                    # this kernel also reads the tensor, retain its memory
+                    # order: a preceding write is not necessarily its producer.
+                    # Real native effects, output completion and all UB input
+                    # retirements remain in the owned memory snapshot.
+                    if (
+                        access.mode.writes
+                        and access.address.root not in readers
+                        and access.address.root.owner.write_disjoint is not None
+                    ):
+                        self.work.disjoint_writes += 1
+                        continue
                     private = participant if access.address.geometry.bank != "GM" else None
                     if self.admission is not None:
-                        partition = self.admission.partitions[
+                        instance = self.admission.instances[
                             (template.operation, access.operand_index, participant)
                         ]
                         require(
-                            partition.root is access.address.root
-                            and partition.participant is private,
-                            "dependency partition disagrees with actual access",
+                            instance.root is access.address.root
+                            and instance.participant is private,
+                            "dependency instance disagrees with actual access",
                         )
-                    for projected in self._slots(template, access, participant):
+                    identity = access.address.root, private
+                    instances.setdefault(identity, {}).setdefault(
+                        (template.operation, participant), (template, [])
+                    )[1].append(access)
+                    projections = self._slots(template, access, participant)
+                    if projections is None:
+                        ordered.add(identity)
+                        continue
+                    for projected in projections:
                         key = (access.address.root, private, projected.origin, projected.conditions)
                         groups.setdefault(key, []).append(projected)
         origins = {}
         for (root, private, origin, conditions), projections in groups.items():
             origins.setdefault((root, private, conditions), []).append((origin, projections))
-        for items in origins.values():
+        for (root, private, _), items in origins.items():
             for (_, left), (_, right) in combinations(items, 2):
                 if any(
                     p.access.mode.writes for p in (*left, *right)
                 ) and not self._disjoint_origin_maps(left, right):
-                    # A different translation alone supplies no alias proof.
-                    self.issue(
-                        DependencyIssueKind.SYMBOLIC_ALIAS,
-                        left[0].template.operation,
-                        "different symbolic coordinate maps of one writable root need an explicit alias/coordinate proof",
-                    )
+                    ordered.add((root, private))
+        fragments = {}
         for (root, private, origin, conditions), projections in groups.items():
+            if (root, private) in ordered:
+                continue
             streaming = tuple(dict.fromkeys(loop for p in projections for loop in p.streaming))
             for loop_op in streaming:
                 loop = self.memory.control.loops[loop_op]
@@ -591,20 +626,29 @@ class _Partitioner:
                     and not self._separate_tiles(projections, loop)
                     and not self._separate_rectangles(projections, loop)
                 ):
-                    self.issue(
-                        DependencyIssueKind.NONPERIODIC_REUSE,
-                        loop_op,
-                        "streaming coordinate is not proved to separate successive full storage fragments",
-                    )
-            for start, stop, rows, stride, covered in self._cell_regions(projections):
-                cell = StorageCell(
-                    root, private, origin, start, stop, streaming, rows, stride, conditions
-                )
-                self.work.cells += 1
-                # Dense family unions do not identify per-iteration cells.
-                # A shifted/invariant access inside the same loop needs a
-                # relational coordinate map; never turn it into same-j RAW
-                # or suppress its real cross-iteration WAR.
+                    ordered.add((root, private))
+            regions = self._cell_regions(projections)
+            if regions is None:
+                ordered.add((root, private))
+                continue
+            fragments[root, private, origin, conditions] = regions
+            for _, _, _, _, covered in regions:
+                patterns = {}
+                for p in covered:
+                    for loop in p.template.frame.loops():
+                        slot = next(
+                            (d for d in p.slots if d.loop is loop.operation),
+                            LoopDomain(loop.operation, loop.count),
+                        )
+                        patterns.setdefault(loop.operation, set()).add((slot.period, slot.residue))
+                if any(len(choices) > 1 for choices in patterns.values()):
+                    ordered.add((root, private))
+                actors = {p.participant for p in covered}
+                if {Actor.AIV0, Actor.AIV1} <= actors and any(
+                    p.participant in {Actor.AIV0, Actor.AIV1} and p.access.mode.writes
+                    for p in covered
+                ):
+                    ordered.add((root, private))
                 contracted = {loop for p in covered for loop in p.contracted}
                 for loop in contracted:
                     coordinates = [
@@ -616,12 +660,41 @@ class _Partitioner:
                         not equivalent(coordinates[0][0], coordinate, self.facts)
                         for coordinate, _ in coordinates[1:]
                     ):
-                        self.issue(
-                            DependencyIssueKind.NONPERIODIC_REUSE,
-                            loop,
-                            "contracted families have different per-occurrence coordinates; relational overlap is not closed",
-                            cell,
-                        )
+                        ordered.add((root, private))
+        # A may-alias domain has no invented byte envelope or logical KILL.
+        # All native operands remain exact; only their source memory order is
+        # conservatively composed. This uses the same loop and event path.
+        for (root, private), natives in instances.items():
+            if (root, private) not in ordered:
+                continue
+            actors = {participant for _, participant in natives}
+            peers = (
+                (Actor.AIV0, Actor.AIV1)
+                if private is None and {Actor.AIV0, Actor.AIV1} <= actors
+                else (None,)
+            )
+            for peer in peers:
+                cell = AliasRegion(root, private, peer)
+                self.work.alias_regions += 1
+                for (operation, participant), (template, accesses) in natives.items():
+                    if peer is not None and participant not in {Actor.AIC, peer}:
+                        continue
+                    self.effects.setdefault(operation, {}).setdefault(cell, []).append(
+                        CellEffect(template, participant, tuple(accesses))
+                    )
+        for (root, private, origin, conditions), regions in fragments.items():
+            if (root, private) in ordered:
+                continue
+            streaming = tuple(
+                dict.fromkeys(
+                    loop for p in groups[root, private, origin, conditions] for loop in p.streaming
+                )
+            )
+            for start, stop, rows, stride, covered in regions:
+                cell = StorageCell(
+                    root, private, origin, start, stop, streaming, rows, stride, conditions
+                )
+                self.work.cells += 1
                 natives = {}
                 for projection in covered:
                     key = (projection.template.operation, projection.participant)
@@ -653,12 +726,7 @@ class _Partitioner:
                 width = projection.stop - projection.start
                 if projection.rows > 1:
                     if projection.row_stride != pitch or column + width > pitch:
-                        self.issue(
-                            DependencyIssueKind.FRAGMENT_MAPPING,
-                            projection.template.operation,
-                            "strided native families need a common exact row-coordinate map",
-                        )
-                        return
+                        return None
                     rectangles.append((row, row + projection.rows, column, column + width, index))
                     continue
                 end_row, end_column = divmod(projection.stop, pitch)
@@ -675,6 +743,7 @@ class _Partitioner:
         else:
             rectangles = [(0, 1, p.start, p.stop, i) for i, p in enumerate(projections)]
         row_cuts = sorted({point for r in rectangles for point in r[:2]})
+        regions = []
         for row_start, row_stop in pairwise(row_cuts):
             active = [r for r in rectangles if r[0] <= row_start and row_stop <= r[1]]
             starts, stops, coverage = {}, {}, {}
@@ -688,13 +757,16 @@ class _Partitioner:
                 for index in starts.get(start, ()):
                     coverage[index] = projections[index]
                 if coverage:
-                    yield (
-                        row_start * pitch + start,
-                        row_start * pitch + stop,
-                        row_stop - row_start,
-                        pitch,
-                        tuple(coverage.values()),
+                    regions.append(
+                        (
+                            row_start * pitch + start,
+                            row_start * pitch + stop,
+                            row_stop - row_start,
+                            pitch,
+                            tuple(coverage.values()),
+                        )
                     )
+        return tuple(regions)
 
     def build(self):
         self._project()
@@ -707,6 +779,5 @@ class _Partitioner:
                 }
             ),
             MappingProxyType({key: frozenset(value) for key, value in self.patterns.items()}),
-            tuple(self.issues),
             self.work,
         )

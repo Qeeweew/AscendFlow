@@ -283,6 +283,24 @@ def native_contract(
             "bitwise Vector copy needs equal contiguous f32 UB footprints",
         )
         return "V", ("R", "W")
+    if native == "fill_upper":
+        require(len(params) == 2, "upper fill needs its physical row/column counts")
+        rows, cols = params
+        require(
+            1 <= rows <= 255
+            and 64 <= cols <= 4096
+            and cols % 64 == 0
+            and len(refs) == 1
+            and banks == ("UB",)
+            and dtypes == ("f32",)
+            and layouts == ("linear",)
+            and refs[0].contiguous
+            and lengths == (rows * cols * 4,),
+            "upper fill requires complete aligned f32 UB rows",
+        )
+        # Masked Dup preserves the old, unselected lanes. This is an update,
+        # never an unconditional initialization of the complete footprint.
+        return "V", ("RW",)
     if native in {"fill", "fill_neg_inf"}:
         require(
             len(refs) == 1

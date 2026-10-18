@@ -337,18 +337,44 @@ def nonnegative(expr, facts):
         return True
     if expr.kind == "min" and all(nonnegative(arg, facts) for arg in expr.args):
         return True
-    lower = 0
-    for term, coefficient in polynomial(expr, facts).items():
-        if coefficient < 0 and term:
-            return False
-        value = coefficient
-        for atom in term:
-            inferred = infer(atom, facts)
-            if inferred is None:
+
+    def sufficient(terms):
+        lower = 0
+        for term, coefficient in terms.items():
+            if coefficient < 0 and term:
                 return False
-            value *= inferred.minimum
-        lower += value
-    return lower >= 0
+            value = coefficient
+            for atom in term:
+                inferred = infer(atom, facts)
+                if inferred is None:
+                    return False
+                value *= inferred.minimum
+            lower += value
+        return lower >= 0
+
+    terms = polynomial(expr, facts)
+    if sufficient(terms):
+        return True
+    # min(a,b)<=a,b and max(a,b)>=a,b give direct lower bounds.
+    # Try one linear bound at a time; this is not a recursive case search.
+    for term, coefficient in terms.items():
+        if len(term) != 1:
+            continue
+        (atom,) = term
+        if not (atom.kind == "min" and coefficient < 0 or atom.kind == "max" and coefficient > 0):
+            continue
+        remaining = _sum(terms, {term: -coefficient})
+        pending, seen = list(atom.args), set()
+        while pending:
+            arg = pending.pop()
+            if arg in seen:
+                continue
+            seen.add(arg)
+            if arg.kind == atom.kind:
+                pending.extend(arg.args)
+            elif sufficient(_sum(remaining, _product({(): coefficient}, polynomial(arg, facts)))):
+                return True
+    return False
 
 
 def _joint_affine_interval(expr, domains, facts, *, atomic=False):
@@ -406,9 +432,16 @@ def interval(expr, domains, facts):
     coordinate such as core + g*groups, preserving cyclic ownership information
     which separate core/g intervals would lose.
     """
+    matched = None
     for coordinate, lower, upper in domains:
         if equivalent(expr, coordinate, facts):
-            return lower, upper
+            matched = (
+                (lower, upper)
+                if matched is None
+                else (expression("max", matched[0], lower), expression("min", matched[1], upper))
+            )
+    if matched is not None:
+        return matched
     correlated = _joint_affine_interval(expr, domains, facts)
     if correlated is not None:
         return correlated

@@ -19,6 +19,7 @@ from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.control.test_shared_aiv import SHARED
+from tests.models.structured_events import EventModelError, check_structured_events
 
 
 def _inputs(source):
@@ -105,10 +106,10 @@ def test_real_dsl_admission_keeps_owned_facts_and_reuses_native_address_control(
     )
     assert not hasattr(admission, "completion") and not hasattr(admission, "asc")
     with pytest.raises(TypeError):
-        admission.partitions[next(iter(admission.partitions))] = None
-    for (operation, operand, actor), partition in admission.partitions.items():
-        assert partition.root is operation.refs[operand].owner.source
-        assert partition.participant is (None if partition.root.type.bank.data == "GM" else actor)
+        admission.instances[next(iter(admission.instances))] = None
+    for (operation, operand, actor), instance in admission.instances.items():
+        assert instance.root is operation.refs[operand].owner.source
+        assert instance.participant is (None if instance.root.type.bank.data == "GM" else actor)
 
 
 @pytest.mark.parametrize(
@@ -225,7 +226,9 @@ def test_last_tile_is_rejected_when_a_later_writer_in_its_selected_iteration_clo
         admit_structured_memory(*_inputs(_last_source(1, overwritten=True)))
 
 
-def test_distinct_groups_cannot_write_one_unpartitioned_gm_tile():
+def test_group_independence_is_a_source_contract_checked_by_the_finite_model():
+    from ascendflow import compile
+
     text = """
         def overlapping(Y:N.Tensor((64,),N.f32,access="write")):
             with N.Kernel(2) as group:
@@ -233,12 +236,15 @@ def test_distinct_groups_cannot_write_one_unpartitioned_gm_tile():
                 N.fill(x,1.0)
                 N.copy(x,Y)
     """
-    with pytest.raises(CompileError, match="positive owner stride"):
-        _admit(text)
+    result = compile(N.from_source(text, disjoint_external=True))
+    with pytest.raises(EventModelError, match="unordered physical WAW"):
+        check_structured_events(collect_native_memory(result.plan), groups=(0, 1))
 
 
-@pytest.mark.parametrize("partitioned,accepted", [(False, False), (True, True)])
-def test_shared_aiv_writes_need_an_actual_sid_partition(partitioned, accepted):
+@pytest.mark.parametrize("partitioned", [False, True])
+def test_parallel_aiv_peers_keep_private_ub_and_their_actual_shared_gm_effects(partitioned):
+    from ascendflow import compile
+
     destination = "Y[sid*64:sid*64+64]" if partitioned else "Y[0:64]"
     text = f"""
         def lanes(Y:N.Tensor((128,),N.f32,access="write")):
@@ -248,20 +254,22 @@ def test_shared_aiv_writes_need_an_actual_sid_partition(partitioned, accepted):
                     N.fill(x,1.0)
                     N.copy(x,{destination})
     """
-    if accepted:
-        admission = _admit(text)
-        assert any(
-            proof.coordinate is admission.memory.control.sid for proof in admission.owner_proofs
-        )
-        ub = [
-            partition
-            for partition in admission.partitions.values()
-            if partition.root.type.bank.data == "UB"
-        ]
-        assert {partition.participant for partition in ub} == {Actor.AIV0, Actor.AIV1}
+    admission = _admit(text)
+    ub = [
+        instance
+        for instance in admission.instances.values()
+        if instance.root.type.bank.data == "UB"
+    ]
+    assert {instance.participant for instance in ub} == {Actor.AIV0, Actor.AIV1}
+    # The source body is SPMD. Peer writes must be independent; this is not
+    # permission to invent a sequential AIV0 -> AIV1 memory definition.
+    result = compile(N.from_source(text, disjoint_external=True))
+    memory = collect_native_memory(result.plan)
+    if partitioned:
+        check_structured_events(memory)
     else:
-        with pytest.raises(CompileError, match="positive owner stride"):
-            _admit(text)
+        with pytest.raises(EventModelError, match="unordered physical WAW"):
+            check_structured_events(memory)
 
 
 def test_native_partial_overlap_requires_an_audited_alias_contract():

@@ -22,6 +22,7 @@
 | `T.Stage(s, name=...)` | 当前pipeline的逻辑偏移，不是完成边界 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理容量、布局、slot与别名 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
+| `fill_upper(x, value, row_start=..., col_start=...)` | 保留 `col_start+c <= row_start+r` 的 lane，只填严格上三角；已初始化 f32 UB 矩阵的读写更新 |
 
 stage数、buffer slot数、event width互不等同。`cube.task/vector.task`已经移除且不恢复兼容。内部physical Task IR不属于旧公开语法。
 
@@ -76,8 +77,9 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 | 普通常量界 | 保留循环；只分析受物理容量约束的 slot 周期 | 普通循环不自动unroll，分析与N无关 |
 | serial中的标量carry | 保留 SCF carry；影响地址/循环界而无范围合同时拒绝 | 在统一admission明确诊断；需要完整carry合同后才开放 |
 | 外层serial + KV pipeline + fixed child | 默认 FA 使用递归生成规则；不设 query/KV 分派 | 普通递归组合，保留循环前后真实工作 |
-| runtime child及更深任意嵌套 | 未普遍支持 | 逐合同接入，不设FA/query例外 |
+| runtime child及更深任意嵌套 | 已有 clamped 正长度、bounded read prefix 子集，未普遍支持 | 保留实际 child 次数及 LAST；父代次内条件激活仍可能明确拒绝 |
 | FIRST/LAST/受限边界guard | 已有子集，组合限制存在 | 空/短/重合/孔洞的统一存在域 |
+| 可能重叠的符号地址、错位 ring 访问 | 按源码内存顺序处理 | 不虚构精确 producer 或完整覆盖；仍须满足现有控制与事件规则 |
 | 数据相关分支、间接alias/owner、任意多时钟连续任务 | 未普遍支持 | 明确可验证输入合同或具体拒绝 |
 | prefix native 地址、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
 | 透明 `@T.inline` helper / 静态尾块区间 | 已实现 | 同一 AST、native lowering、访问检查和同步链；不引入设备 call |
@@ -89,7 +91,28 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 
 source view保留root、原始轴、SSA坐标、宽度和父view约束。先检查每个轴，再转字节地址：扁平地址未越界不能授权`head=H`落入下一batch。subview/recast不创建独立allocation，不同名字不证明不别名。
 
+普通 Kernel 的 group 独立性属于源程序并行合同，编译器不再证明任意任务映射
+的全局唯一性。Vector peers 共用 body、私有 UB，普通内存访问不能依赖未声明
+的跨 peer 通信；AIC/AIV 共享 GM 的双参与者交接仍自动同步。
+Tensor 默认 `access="read"`，入口已初始化且禁止写；`write` 表示入口未初始化，
+可以读取本 kernel 已定义区域；`read_write` 允许更新已有数据。
+外部输出可声明 `N.Tensor(shape,dtype,access="write",write_disjoint=True)`，
+承诺一次 launch 内所有实际写入互不重叠，包括 group/SID/迭代。它不授权输入
+别名、scratch 复用或 reader 提前退休。声明由算法和调用方满足，当前只对没有
+内部 reader 的输出消除写间依赖。详见[内存合同](../development/memory-contracts.md)。
+
 runtime输入的minimum/multiple支持除数正性和整除推导；非法的原始除法不能因为后续乘0或相减化简而逃过admission。地址化简须说明数学整数、设备i64、溢出、除法和guard支配条件。调用方满足合法 int64 索引求值前提，launcher 不检查运行时溢出。
+
+`i < min(a,b)` 保留对两边的范围限制；`max` 的已知下限和余数的数学区间不豁免
+原始 unsigned 除法的定义性。原始轴 tile 的 Euclidean digit 排列及统一循环平移可
+作为可选 streaming 分离坐标，仍检查实际轴、字节几何和当前作用域内的 digit 范围。
+无法恢复分离坐标时保留可能别名的源码内存顺序，不将未知当作无冲突。
+
+`fill_upper` 目前要求 1..255 行、64..4096 列且列数为 64 的倍数，f32 UB。
+row/column 起点是普通 runtime index，与地址无关；负差和极端 int64 起点饱和处理。
+未填 lane 保留原值，因此调用前必须初始化完整矩阵。native packet 的填充分支恢复
+普通全 mask，全可见路径不触碰 mask；各路径独立封闭，其读写、异步 load/store 次序
+仍参与普通同步。
 
 cyclic任务按 `flat=group+task*GROUPS` 绑定owner；空owner没有任务。动态 frame、valid prefix、mixed 及父 view 组合按当前实现分别限制，不从单个grouped例推断全部支持。未知alias不可用任意barrier掩盖。
 

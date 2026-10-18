@@ -30,6 +30,13 @@
 | ops-transformer：grouped matmul / SwiGLU quant | 全行scale/reduce及量化边界，不为统一表示移动舍入 |
 | ops-transformer：flash attention score | 核间通信tile与核内tile不同；安装ACLNN版本不等于研究版本 |
 
+causal FA 参考 `attention/flash_attention_score/op_kernel/arch22/flash_attention_score_s1s2_bn2gs1.h`：
+`s2EndIdx=min((s1Idx+1)*s1BaseSize,s2Size)` 裁剪未来 KV，`sparseStartIdx` 平衡三角任务。
+AscendFlow 在 example 表达裁剪、对角 mask 和任务顺序，通用编译器保持真实访问和同步。
+实际对照调用本机 CANN 9.1.0 `aclnnFlashAttentionScore`，使用左上 causal
+`sparseMode=2`、2048² 压缩 bool mask；记录 `libopapi.so`/`libnnopbase.so` hash。
+上游研究 commit 不能当作本机二进制的源码构建身份。
+
 ## dav-2201的可信前提
 
 - 各pipe的隐式顺序、native end、累计退休以及Set捕获使用真实原语合同；不能从SSA或源码顺序推断。

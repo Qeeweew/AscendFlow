@@ -39,6 +39,43 @@ denominator归约之前，归约继续读取原始FP32 work，不读取转换后
 归一化、RN cast 和 GM 写回在 accumulate 末尾的同一个 LAST 条件内执行；
 Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
 
+## Causal 模式
+
+同一入口用 `CAUSAL=True` 特化，runner 使用 `--causal`。语义为左上对齐
+`j <= i`，对角线保留，query 起点为 0；不是带 KV cache offset 的右下对齐。
+当 Sq>Sk 时，后面的 query 行可以读取全部 Sk 个 key；Sq<Sk 时跳过未来 KV 块。
+输入输出、FP32 online 状态、P/O 的 RN 边界和数值容差与 dense 保持一致。
+
+`causal_policy(Sq, Sk)` 是 example 中显式的 host 分块政策：
+
+| `min(Sq, Sk)` | BK | VR |
+|---|---:|---:|
+| <2048 | 256 | 16 |
+| 2048..8191 | 512 | 16 |
+| ≥8192 | 1024 | 8 |
+
+BQ256/BM128/CK128、20 组不变。每份产物内 Sq/Sk 仍为 runtime，要求
+`Sq>0, Sq%256==0, Sk>=2*BK, Sk%1024==0`。显式指定其他参数不取得同等资格。
+编译器没有按 attention 或 shape 选择政策。
+
+每个 query 块只遍历 `min(Sk/BK, max(2, ceildiv(query_row+BQ, BK)))` 个 KV 块。
+保留最少两次迭代使每个父代次都访问两个交接槽；必要时多算一个全 mask KV 块，
+不改变输出。去掉该下限会需要父循环条件激活 family 的闭合，当前仍明确拒绝。
+PV 的子循环再按实际可见列裁剪，最少保留两个 CK 槽；QK/softmax 保持完整 BK。
+读取前缀的物理 footprint 不变，GM 槽由实际最后 reader 释放。
+
+score 缩放后、reduce_max 前调用通用 `N.fill_upper` 将 `j>i` 的 FP32 lane
+填为负无穷。全可见块不触碰向量 mask，全不可见块整片填充，部分可见块按行设置 mask；
+有填充的路径恢复普通全 mask 状态。它仍是需要初始化的读写操作，不是隐藏 mask workspace。
+
+任务按 head 优先分配，根据有效 K 前缀和计算量已饱和的 query 尾段统一循环平移，
+分散长短任务。所有原始轴 bounds、owner 和双 AIV quorum 检查保留。
+最后归一化/写回位于最后 KV 的 update 末尾，与逐行 accumulate 同一 stage；
+使用一个输出 UB 槽，为 VR16 留出容量，复用等待实际 MTE3 最后读取。
+
+编译器新增的是通用三角更新、clamped 整数范围、原始轴网格坐标及有界 reader family
+支持；没有 attention 专属 pass。设备和性能资格见[causal 验收](../reports/causal-attention.md)。
+
 ## 资格边界
 
 数值容差为 rtol=0.002、atol=0.0002。当前日常检查对 256:1024 和 768:3072
@@ -49,7 +86,7 @@ Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
 这些记录只覆盖对应配置和产物；BQ128 及其他政策的历史记录不代替当前默认配置。
 连续 fence 合并的规则见[同步优化边界](../development/sync-optimizations.md)。
 
-runner能接受某些dtype/head/tile参数不代表其全部通过。causal、mask、tail、空序列、varlen、paged/sparse、persistent及continuous多时钟状态不在默认例资格内。后续变体应通过通用控制/访问合同表达，不创建attention专属pass。
+runner能接受某些dtype/head/tile参数不代表其全部通过。causal 的资格单独记录；任意外部 mask、tail、空序列、varlen、paged/sparse、persistent及continuous多时钟状态不在上述资格内。后续变体应通过通用控制/访问合同表达，不创建attention专属pass。
 
 ## 复现入口
 
@@ -58,6 +95,7 @@ runner能接受某些dtype/head/tile参数不代表其全部通过。causal、ma
 ```bash
 python -m ascendflow --input examples/flash_attention/attention.py --entry attention_target --compile --timeout 300 --output build/attention/cann
 python -m benchmarks.attention.run --output build/attention/generated --build
+python -m benchmarks.attention.run --output build/attention/causal --causal --build
 ```
 
 独立手写AscendC/ACLNN、设备运行和profile见[benchmarks](../../benchmarks/README.md)。手写参考通过不等于本DSL通过。每次构建总期限≤300s；设备运行需全卡检查、显式物理映射，失败立即停止。

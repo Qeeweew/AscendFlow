@@ -149,14 +149,19 @@ def test_real_nested_slot_selection_preserves_actual_endpoint_domains():
                     assert actual == original
 
 
-def test_more_general_memory_frontier_remains_an_explicit_separate_boundary():
-    from ascendflow.diagnostics import CompileError
+def test_more_general_memory_frontier_keeps_source_order_without_exact_residue_claims():
+    from ascendflow import compile
+    from ascendflow import language as N
+    from ascendflow.analysis.structured_memory import collect_native_memory
+    from ascendflow.dialects.io import parse
+    from tests.models.structured_events import check_structured_events
 
-    # Event-window multi-residue support does not claim the earlier memory
-    # dependency frontier can represent every multi-residue access word.
-    with pytest.raises(CompileError, match="multiple activation residues") as failure:
-        selected(nested_slot_source(5))
-    assert failure.value.phase == "logical-valueflow"
+    result = compile(N.from_source(nested_slot_source(5)))
+    final = collect_native_memory(result.plan)
+    original = collect_native_memory(parse(result.before_ir))
+    for n in (0, 1, 3):
+        for m in (0, 1, 2, 5, 7):
+            check_structured_events(final, {"n": n, "m": m}, logical_reference=original)
 
 
 def test_endpoint_cannot_borrow_another_endpoints_division_prefix(base):

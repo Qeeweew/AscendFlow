@@ -32,7 +32,34 @@ def stages(module):
 
 
 def test_both_organizations_share_actual_algorithm_and_explicit_operations():
-    assert list(stages(tree(False))) == list(stages(tree(True)))
+    # Query initialization moves to FIRST stage guards in the unsupported
+    # continuous fixture; every actual primitive and its operands are retained.
+    primitives = {
+        "copy",
+        "fill",
+        "mul",
+        "div",
+        "sub",
+        "add",
+        "cast",
+        "exp",
+        "maximum",
+        "reduce_sum",
+        "reduce_max",
+        "matmul",
+        "fill_upper",
+    }
+
+    def operations(module):
+        return Counter(
+            ast.dump(node, include_attributes=False)
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in primitives
+        )
+
+    assert operations(tree(False)) == operations(tree(True))
     for mode in (False, True):
         names = [
             node.func.attr

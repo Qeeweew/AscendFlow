@@ -129,13 +129,30 @@ class StorageCell:
 
 
 @dataclass(frozen=True, slots=True)
+class AliasRegion:
+    """Possibly overlapping accesses to one actual storage instance.
+
+    This is an ordering domain, not a byte footprint or a complete definition.
+    Actual footprints stay on MemoryAccess. A write cannot KILL this region,
+    and it cannot authorize physical-cell credit or private packet reordering.
+    """
+
+    root: SSAValue
+    private: Actor | None
+    # Shared GM is one allocation. Independent Vector peers have distinct
+    # source access domains; an AIC access participates in every such domain.
+    # This preserves both AIV contributions without inventing peer ordering.
+    peer: Actor | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class BoundaryPort:
-    cell: StorageCell
+    cell: StorageCell | AliasRegion
 
 
 @dataclass(frozen=True, slots=True)
 class StructuredNeed:
-    cell: StorageCell
+    cell: StorageCell | AliasRegion
     kind: HazardKind
     source: AccessOccurrence | BoundaryPort
     consumer: AccessOccurrence
@@ -212,7 +229,13 @@ class LogicalWrite:
 
 @dataclass(frozen=True, slots=True)
 class CellSummary:
-    cell: StorageCell
+    """Exact value frontier or source-order frontier, according to region type.
+
+    For AliasRegion, writer fields are ordering predecessors only. They do
+    not claim complete coverage or select a read's numerical definition.
+    """
+
+    cell: StorageCell | AliasRegion
     head_reads: tuple[StructuredNeed, ...] = ()
     first_write: AccessOccurrence | None = None
     last_write: AccessOccurrence | None = None
@@ -252,12 +275,12 @@ class GuardedCellSummary:
 @dataclass(frozen=True, slots=True)
 class ScopeSummary:
     operation: Operation
-    cells: Mapping[StorageCell, tuple[GuardedCellSummary, ...]]
+    cells: Mapping[StorageCell | AliasRegion, tuple[GuardedCellSummary, ...]]
 
 
 @dataclass(frozen=True, slots=True)
 class ExitObligation:
-    cell: StorageCell
+    cell: StorageCell | AliasRegion
     access: AccessOccurrence
     writer: bool
     guards: tuple[Guard, ...]
@@ -269,13 +292,10 @@ class ExitObligation:
 
 
 class DependencyIssueKind(str, Enum):
-    SYMBOLIC_ALIAS = "symbolic-alias"
-    NONPERIODIC_REUSE = "nonperiodic-reuse"
     MULTI_RESIDUE = "multi-residue-frontier"
     PARENT_ACTIVATION = "parent-dependent-activation"
     CONTROL = "unsupported-control"
     BUDGET = "storage-proof-budget"
-    FRAGMENT_MAPPING = "fragment-coordinate-map"
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,7 +303,7 @@ class DependencyIssue:
     kind: DependencyIssueKind
     operation: Operation
     message: str
-    cell: StorageCell | None = None
+    cell: StorageCell | AliasRegion | None = None
 
 
 @dataclass(slots=True)
@@ -295,3 +315,5 @@ class DependencyWork:
     boundary_visits: int = 0
     needs: int = 0
     loop_carries: int = 0
+    alias_regions: int = 0
+    disjoint_writes: int = 0

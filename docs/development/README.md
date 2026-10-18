@@ -12,6 +12,7 @@
 | 5 | [验证方法](validation.md) | 输入检查、有限模型、CANN 与设备分别证明什么？ |
 | 6 | [硬件与源码依据](source-notes.md) | dav-2201 的可信前提来自哪里？ |
 | 7 | [同步优化边界](sync-optimizations.md) | fence 合并的适用条件和不可跨越的边界是什么？ |
+| 8 | [内存合同](memory-contracts.md) | 并行前提、读写权限、write_disjoint 与可能别名分别由谁负责？ |
 
 日常命令和两项性能采集统一在[测试指南](../guide/testing.md)，测试目录职责见
 [tests](../../tests/README.md)。不要恢复历史 solver、旧公开 task API 或第二条编译路径。

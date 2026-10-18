@@ -64,6 +64,18 @@ def _division_iteration_range(lower, upper, induction, domains, facts):
     ancestor bias and losing their correlation. This is an integer loop rule,
     independent of task names, tensor layouts, group counts, or operators.
     """
+    if upper.kind == "min":
+        # Active i < min(a,b) entails both upper bounds. Retain the individual
+        # division relations as well as their joint min; no bound is assumed
+        # on the zero-iteration path or outside this invocation.
+        return tuple(
+            item
+            for bound in upper.args
+            for item in (
+                (induction, lower, expression("sub", bound, literal(1))),
+                *_division_iteration_range(lower, bound, induction, domains, facts),
+            )
+        )
     if upper.kind not in {"ceildiv", "floordiv"}:
         return ()
     numerator, divisor = upper.args

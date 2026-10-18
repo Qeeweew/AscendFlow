@@ -96,6 +96,14 @@ class YieldOp(IRDLOperation):
 
 @irdl_op_definition
 class ProgramOp(IRDLOperation):
+    """SPMD groups with source-defined, independent non-atomic GM accesses.
+
+    The program supplies the inter-group independence precondition. Lowering
+    preserves its addresses; AutoSync orders work within each actual group.
+    Vector peers likewise execute one shared body with private UB. Shared GM
+    handoffs between Cube and Vector remain explicit memory effects.
+    """
+
     name = "npu_source.program"
     sym_name = attr_def(StringAttr)
     kind = attr_def(StringAttr)
@@ -129,10 +137,17 @@ class AllocationOp(IRDLOperation):
     dimensions = var_operand_def(IndexType)
     dynamic_axes = opt_attr_def(ArrayAttr[IntAttr])
     cache = opt_attr_def(StringAttr)
+    write_disjoint = opt_attr_def(IntAttr)
     ref = result_def(TensorType)
     traits = traits_def(AsyncEffects())
 
     def verify_(self):
+        if self.write_disjoint is not None and (
+            self.write_disjoint.data != 1
+            or self.ref.type.memory.data != "GM"
+            or self.access.data not in {"write", "read_write"}
+        ):
+            raise VerifyException("write_disjoint requires a writable external tensor")
         if self.cache is not None and (
             self.cache.data not in {"normal", "bypass"}
             or self.cache.data == "bypass"
@@ -663,6 +678,40 @@ class ReduceOp(IRDLOperation):
 
 
 @irdl_op_definition
+class FillUpperOp(IRDLOperation):
+    """Fill columns strictly above the global diagonal, preserving other lanes.
+
+    The complete destination is an initialized read/write tile. Row/column
+    origins are ordinary index SSA operands, independent of storage addresses.
+    """
+
+    name = "npu_source.fill_upper"
+    destination = operand_def(TensorType)
+    row_start = operand_def(IndexType)
+    col_start = operand_def(IndexType)
+    dependencies = var_operand_def(TileType)
+    dependency_inputs = attr_def(ArrayAttr[IntAttr])
+    scalar = attr_def(FloatAttr[f32])
+    value = result_def(TileType)
+    traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        _verify_result(self, self.destination)
+        _verify_dependencies(self, [self.destination])
+        typ = self.destination.type
+        shape = tuple(n.data for n in typ.shape)
+        if (
+            typ.memory.data != "UB"
+            or typ.dtype.data != "f32"
+            or len(shape) != 2
+            or not 1 <= shape[0] <= 255
+            or not 64 <= shape[1] <= 4096
+            or shape[1] % 64
+        ):
+            raise VerifyException("upper fill requires f32 UB rows and 64-aligned columns")
+
+
+@irdl_op_definition
 class ScalarReadOp(IRDLOperation):
     name = "npu_source.scalar_read"
     source = operand_def(TensorType)
@@ -758,6 +807,7 @@ SOURCE = Dialect(
         CopyOp,
         ElementOp,
         ReduceOp,
+        FillUpperOp,
         ScalarReadOp,
         ScaleOp,
         MatmulOp,

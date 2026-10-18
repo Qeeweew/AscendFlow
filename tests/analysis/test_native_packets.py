@@ -63,3 +63,10 @@ def test_native_admission_rejects_missing_or_incoming_mask_packets(monkeypatch, 
     )
     with pytest.raises(CompileError, match="audited closed instruction packet"):
         collect_native_memory(lower_native_structure(scale).module)
+
+
+def test_each_conditional_mask_path_must_close_without_another_paths_setup():
+    packet = audited_packet("fill_upper")
+    assert packet.closed_mask
+    changed = replace(packet, alternate_mask_steps=((MaskStep.VECTOR_READ,),))
+    assert not changed.closed_mask

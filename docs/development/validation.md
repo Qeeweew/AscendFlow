@@ -35,7 +35,8 @@
 | guard孔洞/branch | 缺席分支保留输入状态；Set/Wait存在域及event ordinal一致 |
 | 双AIV与CV | required quorum齐全，GM可见性真实，控制器Wait不形成派发死锁 |
 | event跨段/跨调用复用 | 旧Wait消费先于新Set；配置占用、borrow、seed/drain保留 |
-| 动态别名/ownership | 可验证输入合同或具体拒绝，不以barrier隐藏未知 |
+| 动态别名 | 保留源码内存顺序与全部真实reader；不以barrier隐藏未知，不把may-write当初始化 |
+| 并行与write_disjoint合同 | 独立有限模型发现具体输入下的重复写与跨group竞争；normal不重新证明算法全局唯一性 |
 
 ## 3. 测试组织和时间纪律
 

@@ -10,6 +10,11 @@
 
 循环长度为runtime值，普通常量界循环也不自动展开；只有显式unroll授权展开。算法、FA变体与分块政策留在examples，不进入编译器。
 
+group/Vector peer 的并行独立性属于[源内存合同](memory-contracts.md)，不再以
+全局地址分离证明准入。未知区域关系进入 AliasRegion，保留源码内存顺序；
+精确数值 RAW、初始化和物理复用仍各自保持。外部 write_disjoint 输出合同
+不传播给 scratch，也不提供 ready、release 或事件消费保证。
+
 当前生成器先绑定覆盖与真实位置，检查域和 physical-step/phase 适用前提，
 然后以物理 cell credit 或有限 queue handback 建立生命周期。分配器消费
 完整 `NotificationProgram`，仅引入有限 bank、ID 和共享约束；它不重新建立

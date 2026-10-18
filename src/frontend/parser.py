@@ -55,6 +55,7 @@ _CALLS = {
     "exp",
     "cast",
     "fill",
+    "fill_upper",
     "matmul",
     "sqrt",
     "rsqrt",
@@ -366,7 +367,13 @@ class _Parser:
             if not isinstance(typ, syntax.Tensor):
                 self.fail(arg, "expected Tensor shape/dtype/access annotation")
             self.env[arg.arg] = builders._allocate(
-                typ.shape, typ.dtype, "GM", name=arg.arg, access=typ.access, cache=typ.cache
+                typ.shape,
+                typ.dtype,
+                "GM",
+                name=arg.arg,
+                access=typ.access,
+                cache=typ.cache,
+                write_disjoint=typ.write_disjoint,
             )
 
     def body(self, nodes):

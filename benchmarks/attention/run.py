@@ -26,7 +26,7 @@ from ascendflow.device import ACL, health_snapshot
 from ascendflow.diagnostics import require
 from ascendflow.dialects.io import parse
 from ascendflow.dialects.physical import BufferOp, KernelOp, MixedOp, RuntimeSizeOp
-from ascendflow.dialects.source import AllocationOp, ElementOp, ProgramOp, SizeOp
+from ascendflow.dialects.source import AllocationOp, ElementOp, FillUpperOp, ProgramOp, SizeOp
 from ascendflow.dialects.structured import ActorDomainOp
 from ascendflow.performance import hardware_snapshot
 from benchmarks.attention.contract import DEFAULT_POLICY, AttentionPolicy
@@ -247,13 +247,17 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
         "compiled attention source policy differs from the selected runner policy",
     )
     local_bytes = local_contract(program, root, policy)
+    require(
+        sum(isinstance(op, FillUpperOp) for op in logical.walk()) == int(policy.causal),
+        "compiled attention causal mask differs from selected policy",
+    )
     scale_operations = [
         op
         for op in logical.walk()
         if isinstance(op, ElementOp)
         and op.kind.data == "mul_scalar"
         and op.scalar is not None
-        and tuple(n.data for n in op.destination.type.shape) == (8, 1024)
+        and tuple(n.data for n in op.destination.type.shape) == (policy.vector_rows, policy.kv_tile)
     ]
     require(
         scale_operations
@@ -282,7 +286,8 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
     require(
         sizes.keys() == source_sizes.keys() == {"Sq", "Sk"}
         and all(
-            dimension[name].minimum.data == 1 and dimension[name].multiple.data == multiple
+            dimension[name].minimum.data == (policy.minimum_sk if name == "Sk" else 1)
+            and dimension[name].multiple.data == multiple
             for dimension in (sizes, source_sizes)
             for name, multiple in (("Sq", policy.query_tile), ("Sk", 1024))
         ),
@@ -459,9 +464,9 @@ def case_shape(value):
     if match is None:
         raise argparse.ArgumentTypeError("cases must be positive Sq:Sk")
     sq, sk = map(int, match.groups())
-    if sq % 128 or sk % 1024 or max(sq, sk) > 2**63 - 1:
+    if sq % 128 or sk % 256 or max(sq, sk) > 2**63 - 1:
         raise argparse.ArgumentTypeError(
-            "cases require complete BQ128/BK1024 tiles within int64 extents"
+            "cases require complete BQ128/BK256 tiles within int64 extents"
         )
     return sq, sk
 
@@ -485,8 +490,13 @@ def parse_args(argv=None):
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--timeout", type=float, default=300)
     for key, value in DEFAULT_POLICY.as_dict().items():
+        if key == "causal":
+            parser.add_argument("--causal", action="store_true")
+            continue
         parser.add_argument(
-            "--" + key.replace("_", "-"), type=str if key == "dtype" else int, default=value
+            "--" + key.replace("_", "-"),
+            type=str if key == "dtype" else int,
+            default=None if key in {"kv_tile", "vector_rows"} else value,
         )
     args = parser.parse_args(argv)
     require(args.warmup >= 1 and args.repeats > 0, "warmup >=1 and repeats >0 are required")
@@ -495,15 +505,30 @@ def parse_args(argv=None):
         math.isfinite(args.timeout) and 0 < args.timeout <= 300,
         "one build must finish within 300 seconds",
     )
+    if args.kv_tile is None:
+        if args.causal:
+            from examples.flash_attention.attention import causal_policy
+
+            chosen = min(args.cases, key=lambda shape: min(shape)) if args.cases else (256, 1024)
+            args.kv_tile = causal_policy(*chosen)["kv_tile"]
+        else:
+            args.kv_tile = DEFAULT_POLICY.kv_tile
+    if args.vector_rows is None:
+        args.vector_rows = 16 if args.causal and args.kv_tile <= 512 else DEFAULT_POLICY.vector_rows
     args.policy = AttentionPolicy(**{key: getattr(args, key) for key in DEFAULT_POLICY.as_dict()})
     if args.cases is None:
         bq = args.policy.query_tile
-        args.cases = [(bq, 1024), (3 * bq, 3072), (6 * bq, 1024), (4 * bq, 2048)]
+        sk = max(1024, args.policy.minimum_sk)
+        args.cases = [(bq, sk), (3 * bq, 3 * sk), (6 * bq, sk), (4 * bq, 2 * sk)]
     for sq, sk in args.cases:
         args.policy.validate_case(sq, sk)
     require(
         args.backend != "ascendc" or args.reference_output is not None,
         "AscendC requires --reference-output",
+    )
+    require(
+        args.backend != "ascendc" or not args.causal and args.kv_tile == 1024,
+        "the independent AscendC reference supports only dense BK1024",
     )
     require(
         not args.build or args.backend == "generated", "--build compiles only the generated example"
@@ -562,7 +587,7 @@ def run(args):
         "contract_sha256": sha256(read_bytes(Path(__file__).with_name("contract.py"))),
         "oracle_sha256": sha256(read_bytes(attention_validation.__file__)),
         "timing_scope": TIMING_SCOPE,
-        "comparison_scope": "declared dense noncausal BNSD policy; artifact validation checks published build provenance without independently validating synchronization and grants no device qualification; sampled checks remain sampled; device results apply only to this selected policy and artifacts",
+        "comparison_scope": "declared BNSD policy and explicit causal alignment; artifact validation checks published build provenance without independently validating synchronization and grants no device qualification; sampled checks remain sampled; device results apply only to this selected policy and artifacts",
     }
     if args.physical is None:
         if args.record is not None:
@@ -619,6 +644,7 @@ def run(args):
                     policy.shape(sq, sk),
                     policy.dtype,
                     policy.scale,
+                    causal=policy.causal,
                 )
 
             arguments = (
@@ -691,7 +717,7 @@ def run(args):
                 "layout": "BNSD",
                 "softmax_scale_f32": policy.scale,
                 "softmax_scale_f32_bits": struct.pack("<f", policy.scale).hex(),
-                "causal": False,
+                "causal": policy.causal,
                 "query_start": 0,
                 "data_case": args.data_case,
                 "oracle_scope": args.scope,

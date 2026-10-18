@@ -1,7 +1,8 @@
-"""Bind source reads to their exact logical cell definitions.
+"""Compose exact source values and conservative source memory order separately.
 
 One recursive frontier owns source value versions, guarded writes and loop
-bindings. It generates RAW bindings only. Actual dispatch storage lifetimes,
+bindings. Exact cells generate RAW bindings; AliasRegion generates ordered
+read predecessors without claiming a numerical definition. Dispatch lifetimes,
 WAR/WAW ordering, completion and notification resources belong to later stages.
 Runtime loop counts are never enumerated; child boundaries retain FIRST/LAST
 selections and complete reader families rather than execution histories.
@@ -29,6 +30,7 @@ from .structured_access import PartitionedAccesses, partition_accesses
 from .structured_memory import NativeMemoryFacts
 from .structured_regions import (
     AccessOccurrence,
+    AliasRegion,
     BoundaryPort,
     BranchGuard,
     CellSummary,
@@ -46,6 +48,7 @@ from .structured_regions import (
     LoopOrdinalGuard,
     RegionConnection,
     ScopeSummary,
+    StorageCell,
     StructuredNeed,
 )
 
@@ -61,6 +64,7 @@ class LogicalValueFlow:
     summaries: Mapping[Operation, ScopeSummary]
     root: ScopeSummary
     reads: tuple[StructuredNeed, ...]
+    ordered_reads: tuple[StructuredNeed, ...]
     writes: tuple[LogicalWrite, ...]
     connections: tuple[RegionConnection, ...]
     entries: tuple[StructuredNeed, ...]
@@ -104,12 +108,13 @@ class _Builder:
         self.facts = memory.control.environment.facts
         access = self.accesses = partition_accesses(memory, admission)
         self.work = access.work
-        self.reads, self.writes, self.connections = [], [], []
-        self.issues = list(access.issues)
+        self.reads, self.ordered_reads, self.writes, self.connections = [], [], [], []
+        self.issues = []
         self.summaries = {}
         self.effects = access.effects
         self.coordinates = RegionCoordinates(memory, access.patterns, self.issue)
-        self._issue_keys = {(issue.kind, issue.operation, issue.cell) for issue in access.issues}
+        self._issue_keys = set()
+        self._boundary_branches = {}
 
     def issue(self, kind, operation, message, cell=None):
         key = (kind, operation, cell)
@@ -120,7 +125,10 @@ class _Builder:
     def _read(self, cell, source, consumer, scope, guards, *, emit=True, **clock):
         need = self.coordinates.need(cell, HazardKind.RAW, source, consumer, scope, guards, **clock)
         if emit and isinstance(source, AccessOccurrence):
-            self.reads.append(need)
+            # An alias predecessor preserves source memory order. It does not
+            # identify the numerical definition reached by this actual read.
+            target = self.ordered_reads if isinstance(cell, AliasRegion) else self.reads
+            target.append(need)
             self.work.needs += 1
         return need
 
@@ -158,7 +166,8 @@ class _Builder:
     def _native(self, operation):
         cells = {}
         for cell, effects in self.effects.get(operation, {}).items():
-            cases = (GuardedCellSummary(cell.conditions, CellSummary(cell)),)
+            conditions = cell.conditions if isinstance(cell, StorageCell) else ()
+            cases = (GuardedCellSummary(conditions, CellSummary(cell)),)
             for effect in effects:
                 template, participant = effect.template, effect.participant
                 occurrence = AccessOccurrence(
@@ -169,7 +178,7 @@ class _Builder:
                 )
                 alternatives = []
                 for mode, predicates in self._effect_cases(effect):
-                    guards = self.coordinates.guards(cell.conditions, predicates)
+                    guards = self.coordinates.guards(conditions, predicates)
                     if guards is None:
                         continue
                     reads = ()
@@ -185,7 +194,7 @@ class _Builder:
                             ),
                         )
                     write = occurrence if mode is not None and mode.writes else None
-                    if write is not None:
+                    if write is not None and isinstance(cell, StorageCell):
                         activation = self.coordinates.guards(
                             guards,
                             tuple(
@@ -304,87 +313,57 @@ class _Builder:
                 return True
         return False
 
-    def _first_branch(self, guard, logical):
-        if isinstance(guard, LoopOrdinalGuard):
-            if guard.loop is not logical.operation or guard.comparison.predicate not in {
-                "==",
-                "!=",
-            }:
-                return None
-            test = guard.comparison
-            if any(
-                equivalent(a, logical.ordinal, self.facts) and equivalent(b, literal(0), self.facts)
-                for a, b in ((test.lhs, test.rhs), (test.rhs, test.lhs))
-            ):
-                return test.predicate == "=="
-            return None
-        if not isinstance(guard, BranchGuard) or not isinstance(
-            guard.operation.cond.owner, arith.CmpiOp
-        ):
-            return None
-        comparison = guard.operation.cond.owner
-        if comparison.predicate.value.data not in {0, 1}:
-            return None
-        try:
-            lhs, rhs = (self.memory.control.environment.expression(v) for v in comparison.operands)
-        except CompileError:
-            return None
-        first = any(
-            equivalent(a, logical.induction, self.facts)
-            and equivalent(b, logical.lower, self.facts)
-            or equivalent(a, logical.ordinal, self.facts)
-            and equivalent(b, literal(0), self.facts)
-            for a, b in ((lhs, rhs), (rhs, lhs))
-        )
-        if not first:
-            return None
-        first_branch = 0 if comparison.predicate.value.data == 0 else 1
-        return guard.branch == first_branch
+    def _boundary_branch(self, guard, logical):
+        key = guard, logical.operation
+        if key not in self._boundary_branches:
+            self._boundary_branches[key] = self._classify_boundary(guard, logical)
+        return self._boundary_branches[key]
 
-    def _last_branch(self, guard, logical):
+    def _classify_boundary(self, guard, logical):
+        # This is a source-control classification, not a search for an active
+        # iteration. Unrecognized changing predicates remain unsupported.
         if isinstance(guard, LoopOrdinalGuard):
-            if guard.loop is not logical.operation or guard.comparison.predicate not in {
-                "==",
-                "!=",
-            }:
-                return None
             test = guard.comparison
-            last = expression("sub", logical.count, literal(1))
-            if any(
-                equivalent(a, logical.ordinal, self.facts) and equivalent(b, last, self.facts)
-                for a, b in ((test.lhs, test.rhs), (test.rhs, test.lhs))
-            ):
-                return test.predicate == "=="
-            return None
-        if not isinstance(guard, BranchGuard) or not isinstance(
-            guard.operation.cond.owner, arith.CmpiOp
+            if guard.loop is not logical.operation or test.predicate not in {"==", "!="}:
+                return None
+            lhs, rhs, positive = test.lhs, test.rhs, test.predicate == "=="
+            first = ((logical.ordinal, literal(0)),)
+        elif isinstance(guard, BranchGuard) and isinstance(
+            comparison := guard.operation.cond.owner, arith.CmpiOp
         ):
-            return None
-        comparison = guard.operation.cond.owner
-        if comparison.predicate.value.data not in {0, 1}:
-            return None
-        try:
-            lhs, rhs = (self.memory.control.environment.expression(v) for v in comparison.operands)
-        except CompileError:
+            if comparison.predicate.value.data not in {0, 1}:
+                return None
+            try:
+                lhs, rhs = (
+                    self.memory.control.environment.expression(v) for v in comparison.operands
+                )
+            except CompileError:
+                return None
+            positive = guard.branch == comparison.predicate.value.data
+            first = ((logical.induction, logical.lower), (logical.ordinal, literal(0)))
+        else:
             return None
         last_ordinal = expression("sub", logical.count, literal(1))
-        last_induction = expression(
-            "add", logical.lower, expression("mul", last_ordinal, literal(logical.step))
-        )
-        candidates = (last_induction,)
-        if logical.step == 1:
-            candidates += (expression("sub", logical.upper, literal(1)),)
-        last = any(
-            equivalent(a, logical.induction, self.facts)
-            and any(equivalent(b, last, self.facts) for last in candidates)
-            or equivalent(a, logical.ordinal, self.facts)
-            and equivalent(b, last_ordinal, self.facts)
-            for a, b in ((lhs, rhs), (rhs, lhs))
-        )
-        if not last:
-            return None
-        last_branch = 0 if comparison.predicate.value.data == 0 else 1
-        return guard.branch == last_branch
+        last = ((logical.ordinal, last_ordinal),)
+        if isinstance(guard, BranchGuard):
+            last += (
+                (
+                    logical.induction,
+                    expression(
+                        "add", logical.lower, expression("mul", last_ordinal, literal(logical.step))
+                    ),
+                ),
+            )
+            if logical.step == 1:
+                last += ((logical.induction, expression("sub", logical.upper, literal(1))),)
+        for phase, candidates in (("first", first), ("last", last)):
+            if any(
+                equivalent(a, coordinate, self.facts) and equivalent(b, boundary, self.facts)
+                for a, b in ((lhs, rhs), (rhs, lhs))
+                for coordinate, boundary in candidates
+            ):
+                return phase, positive
+        return None
 
     def _phase_cases(self, cases, logical):
         phases = {"single": [], "first": [], "middle": [], "last": []}
@@ -392,14 +371,12 @@ class _Builder:
         for case in cases:
             constraints, guards = [], []
             for guard in case.guards:
-                first = self._first_branch(guard, logical)
-                last = self._last_branch(guard, logical) if first is None else None
-                if first is not None:
-                    has_first = True
-                    constraints.append(("first", first))
-                elif last is not None:
-                    has_last = True
-                    constraints.append(("last", last))
+                boundary = self._boundary_branch(guard, logical)
+                if boundary is not None:
+                    phase, truth = boundary
+                    has_first |= phase == "first"
+                    has_last |= phase == "last"
+                    constraints.append((phase, truth))
                 elif self._guard_depends(guard, logical):
                     return None
                 else:
@@ -414,67 +391,38 @@ class _Builder:
                     phases[phase].append(GuardedCellSummary(tuple(guards), case.transfer))
         return phases, has_first, has_last
 
-    def _repeat_window(self, operation, transfer, lower, upper, guards, has_last):
+    def _repeat(self, operation, transfer, guards, *, family, boundaries, again, **clock):
+        """One recurrence rule for a nonempty source interval.
+
+        The caller supplies its lexical boundary selections and existence
+        predicates. The same frontier splice handles a complete loop and its
+        middle interval. A read-only/streaming frontier exports every member;
+        a reused cell exports its actual first writer and final readers.
+        """
         logical = self.memory.control.loops[operation]
-        if transfer.first_write is None or operation in transfer.cell.streaming:
-            family = LoopDomain(operation, upper, first=lower)
+
+        def bind(ordinal, active=guards, *, family=None):
             return self.coordinates.map_summary(
                 transfer,
-                lambda value: self.coordinates.bind(
-                    value, operation, logical.ordinal, family=family
-                ),
+                lambda value: self.coordinates.bind(value, operation, ordinal, family=family),
                 operation,
-                guards,
+                active,
             )
-        repeated = self.coordinates.guards(
-            guards,
-            (
-                LoopCountGuard(
-                    operation, logical.count, CountRelation.MORE, lower + int(has_last) + 1
-                ),
-            ),
-        )
+
+        if transfer.first_write is None or (
+            isinstance(transfer.cell, StorageCell) and operation in transfer.cell.streaming
+        ):
+            return bind(logical.ordinal, family=family)
+        repeated = self.coordinates.guards(guards, (again,))
         if repeated is not None:
-            previous = self.coordinates.map_summary(
-                transfer,
-                lambda value: self.coordinates.bind(
-                    value, operation, expression("sub", logical.ordinal, literal(1))
-                ),
-                operation,
-                repeated,
+            previous = bind(
+                expression("sub", logical.ordinal, literal(clock["distance"])), repeated
             )
-            current = self.coordinates.map_summary(
-                transfer,
-                lambda value: self.coordinates.bind(value, operation, logical.ordinal),
-                operation,
-                repeated,
-            )
+            current = bind(logical.ordinal, repeated)
             before = len(self.reads)
-            self._compose(
-                previous,
-                current,
-                operation,
-                repeated,
-                loop=operation,
-                distance=1,
-                first=lower + 1,
-                limit=upper,
-            )
+            self._compose(previous, current, operation, repeated, loop=operation, **clock)
             self.work.loop_carries += len(self.reads) - before
-        head = self.coordinates.map_summary(
-            transfer,
-            lambda value: self.coordinates.bind(value, operation, literal(lower)),
-            operation,
-            guards,
-        )
-        tail = self.coordinates.map_summary(
-            transfer,
-            lambda value: self.coordinates.bind(
-                value, operation, expression("sub", upper, literal(1))
-            ),
-            operation,
-            guards,
-        )
+        head, tail = (bind(selection) for selection in boundaries)
         return CellSummary(
             transfer.cell,
             head.head_reads,
@@ -554,8 +502,21 @@ class _Builder:
                         live,
                     )
                 if populated:
-                    repeat = self._repeat_window(
-                        operation, middle.transfer, lower, upper, live, has_last
+                    repeat = self._repeat(
+                        operation,
+                        middle.transfer,
+                        live,
+                        family=LoopDomain(operation, upper, first=lower),
+                        boundaries=(literal(lower), expression("sub", upper, literal(1))),
+                        again=LoopCountGuard(
+                            operation,
+                            logical.count,
+                            CountRelation.MORE,
+                            lower + int(has_last) + 1,
+                        ),
+                        distance=1,
+                        first=lower + 1,
+                        limit=upper,
                     )
                     transfer = self._compose(transfer, repeat, operation, live, first=lower)
                 if has_last:
@@ -576,15 +537,7 @@ class _Builder:
         result = {}
         for cell, cases in body.items():
             period, residue = self.coordinates.pattern(cell, operation)
-            if (
-                any(
-                    self._first_branch(guard, logical) is not None
-                    or self._last_branch(guard, logical) is not None
-                    for case in cases
-                    for guard in case.guards
-                )
-                and (phase_cases := self._close_phases(operation, cell, cases)) is not None
-            ):
+            if (phase_cases := self._close_phases(operation, cell, cases)) is not None:
                 result[cell] = phase_cases
                 continue
             closed = []
@@ -611,83 +564,29 @@ class _Builder:
                 if active is None:
                     continue
                 transfer = case.transfer
-                family = LoopDomain(operation, logical.count, period, residue)
-                if operation in cell.streaming or transfer.first_write is None:
-                    # Distinct streaming cells or read-only native families:
-                    # no final native end can retire all prior members.
-                    mapped = self.coordinates.map_summary(
-                        transfer,
-                        lambda value, family=family: self.coordinates.bind(
-                            value, operation, logical.ordinal, family=family
-                        ),
-                        operation,
-                        active,
-                    )
-                    closed.append(GuardedCellSummary(active, mapped))
-                    continue
-                carry_guards = self.coordinates.guards(
-                    active,
-                    (
-                        LoopCountGuard(
-                            operation,
-                            logical.count,
-                            CountRelation.MORE,
-                            residue + period
-                            if type(residue) is int
-                            else expression("add", residue, literal(period)),
-                        ),
-                    ),
-                )
-                if carry_guards is not None:
-                    previous = self.coordinates.map_summary(
-                        transfer,
-                        lambda value, period=period: self.coordinates.bind(
-                            value, operation, expression("sub", logical.ordinal, literal(period))
-                        ),
-                        operation,
-                        carry_guards,
-                    )
-                    current = self.coordinates.map_summary(
-                        transfer,
-                        lambda value: self.coordinates.bind(value, operation, logical.ordinal),
-                        operation,
-                        carry_guards,
-                    )
-                    before = len(self.reads)
-                    self._compose(
-                        previous,
-                        current,
-                        operation,
-                        carry_guards,
-                        loop=operation,
-                        distance=period,
-                        period=period,
-                        residue=residue,
-                    )
-                    self.work.loop_carries += len(self.reads) - before
-                first = LoopResidueSelection(operation, period, residue, ResiduePosition.FIRST)
-                last = LoopResidueSelection(operation, period, residue, ResiduePosition.LAST)
-                head = self.coordinates.map_summary(
-                    transfer,
-                    lambda value, first=first: self.coordinates.bind(value, operation, first),
-                    operation,
-                    active,
-                )
-                tail = self.coordinates.map_summary(
-                    transfer,
-                    lambda value, last=last: self.coordinates.bind(value, operation, last),
-                    operation,
-                    active,
-                )
                 closed.append(
                     GuardedCellSummary(
                         active,
-                        CellSummary(
-                            cell,
-                            head.head_reads,
-                            head.first_write,
-                            tail.last_write,
-                            tail.tail_reads,
+                        self._repeat(
+                            operation,
+                            transfer,
+                            active,
+                            family=LoopDomain(operation, logical.count, period, residue),
+                            boundaries=tuple(
+                                LoopResidueSelection(operation, period, residue, position)
+                                for position in (ResiduePosition.FIRST, ResiduePosition.LAST)
+                            ),
+                            again=LoopCountGuard(
+                                operation,
+                                logical.count,
+                                CountRelation.MORE,
+                                residue + period
+                                if type(residue) is int
+                                else expression("add", residue, literal(period)),
+                            ),
+                            distance=period,
+                            period=period,
+                            residue=residue,
                         ),
                     )
                 )
@@ -750,7 +649,11 @@ class _Builder:
         for cell, cases in cells.items():
             for case in cases:
                 transfer = case.transfer
-                entries.extend(replace(read, guards=case.guards) for read in transfer.head_reads)
+                # Incoming memory-order ports are not numerical definitions.
+                if isinstance(cell, StorageCell):
+                    entries.extend(
+                        replace(read, guards=case.guards) for read in transfer.head_reads
+                    )
                 if transfer.last_write is not None:
                     exits.append(ExitObligation(cell, transfer.last_write, True, case.guards))
                 exits.extend(
@@ -764,6 +667,7 @@ class _Builder:
             MappingProxyType(self.summaries),
             root,
             tuple(self.reads) + tuple(entries),
+            tuple(self.ordered_reads),
             tuple(self.writes),
             tuple(self.connections),
             tuple(entries),

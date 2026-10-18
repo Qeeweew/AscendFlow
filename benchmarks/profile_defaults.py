@@ -8,7 +8,7 @@ import math
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
@@ -18,16 +18,23 @@ from ascendflow.diagnostics import require
 from ascendflow.runtime.process import bounded_process
 from benchmarks.artifacts import verified_source
 from benchmarks.check_examples import ROOT, run_device
+from examples.flash_attention.attention import causal_policy
 
 
 @dataclass(frozen=True)
 class ProfileCase:
     operator: str
     shape: tuple[int, ...]
+    causal: bool = False
 
     @property
     def name(self):
-        return self.operator + "-" + "x".join(map(str, self.shape))
+        return (
+            self.operator
+            + ("-causal" if self.causal else "")
+            + "-"
+            + "x".join(map(str, self.shape))
+        )
 
     @property
     def attention(self):
@@ -39,12 +46,24 @@ class ProfileCase:
 
     @property
     def artifact_key(self):
-        # Sq/Sk remain runtime parameters; all attention cases share one build.
-        return self.operator if self.attention else self.name
+        # Sq/Sk stay runtime within each explicit tiling policy.
+        if self.causal:
+            policy = causal_policy(*self.shape)
+            return f"{self.operator}-causal-bk{policy['kv_tile']}-vr{policy['vector_rows']}"
+        return self.operator + ("-causal" if self.causal else "") if self.attention else self.name
 
     @property
     def build_options(self):
         if self.attention:
+            if self.causal:
+                policy = causal_policy(*self.shape)
+                return (
+                    "--causal",
+                    "--kv-tile",
+                    str(policy["kv_tile"]),
+                    "--vector-rows",
+                    str(policy["vector_rows"]),
+                )
             return ()
         return tuple(
             value
@@ -55,7 +74,9 @@ class ProfileCase:
     @property
     def run_options(self):
         return (
-            ("--cases", ":".join(map(str, self.shape))) if self.attention else ("--data", "normal")
+            ("--cases", ":".join(map(str, self.shape)), *self.build_options)
+            if self.attention
+            else ("--data", "normal")
         )
 
     @property
@@ -84,13 +105,16 @@ CASES = tuple(
         (8192, 2048, 4096),
     )
 )
+CAUSAL_CASES = tuple(
+    replace(case, causal=True) for case in CASES if case.attention and len(set(case.shape)) == 1
+)
 
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def algorithm_flops(operator, shape):
+def algorithm_flops(operator, shape, *, causal=False):
     """Useful matrix FLOPs, FMA=2; FA excludes softmax and online-state work."""
     require(all(type(size) is int and size > 0 for size in shape), "invalid problem dimensions")
     if operator == "gemm-normal":
@@ -99,7 +123,9 @@ def algorithm_flops(operator, shape):
         return 2 * m * n * k
     require(operator == "flash-attention" and len(shape) == 6, "unknown FLOP contract")
     batch, heads, _, sq, sk, dim = shape
-    return 4 * batch * heads * sq * sk * dim
+    prefix = min(sq, sk)
+    pairs = prefix * (prefix + 1) // 2 + max(sq - sk, 0) * sk if causal else sq * sk
+    return 4 * batch * heads * pairs * dim
 
 
 def tflops(flops, duration_us):
@@ -137,12 +163,18 @@ def case_contract(spec, record, backend):
             shape == [1, 8, 8, *spec.shape, 128]
             and case["dtype"] == "f16"
             and case["layout"] == "BNSD"
-            and not case["causal"]
+            and case["causal"] == spec.causal
             and case["query_start"] == 0
             and case["data_case"] == "standard"
             and case["oracle_scope"] == "sampled",
             "attention policy or shape differs",
         )
+        if spec.causal:
+            policy = causal_policy(*spec.shape)
+            require(
+                all(record["policy"][key] == value for key, value in policy.items()),
+                "attention tiling policy differs from the selected example policy",
+            )
         inputs = {key: case["argument_sha256"][key] for key in ("q", "k", "v")}
         numerical = {
             key: case[key]
@@ -228,7 +260,7 @@ def compare_pair(spec, records, timings):
     generated = case_contract(spec, records["generated"], "generated")
     aclnn = case_contract(spec, records["aclnn"], "aclnn")
     require(generated == aclnn, "generated/ACLNN inputs, math, oracle or device differ")
-    flops = algorithm_flops(spec.operator, generated["shape"])
+    flops = algorithm_flops(spec.operator, generated["shape"], causal=spec.causal)
     result = {
         "shape": generated["shape"],
         "flops": flops,
@@ -274,11 +306,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--physical", type=int)
-    parser.add_argument("--only", nargs="+", choices=[case.name for case in CASES])
+    parser.add_argument("--causal", action="store_true", help="causal FA 1K/2K/4K/8K square matrix")
+    parser.add_argument("--require-no-slower", action="store_true")
+    parser.add_argument(
+        "--only", nargs="+", choices=[case.name for case in (*CASES, *CAUSAL_CASES)]
+    )
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
+    cases = CAUSAL_CASES if args.causal else CASES
+    if args.only:
+        cases = tuple(case for case in (*CASES, *CAUSAL_CASES) if case.name in args.only)
     if args.list:
-        for spec in CASES:
+        for spec in cases:
             print(spec.name)
         return 0
     if args.output is None or args.physical is None:
@@ -295,7 +334,7 @@ def main():
         "method": "one default msprof collection per shape/backend; generated then installed ACLNN",
         "tflops_convention": {
             "gemm-normal": "2*M*N*K",
-            "flash-attention": "4*B*Hq*Sq*Sk*D (QK + PV)",
+            "flash-attention": "4*B*Hq*valid_pairs*D (QK + PV); causal pairs satisfy j<=i",
             "units": "FLOPs / (device_time_us * 1e6); FMA=2; useful matrix FLOPs",
         },
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -312,7 +351,7 @@ def main():
     save()
     try:
         report["health_before"] = health_snapshot(args.physical, directory)
-        for spec in CASES:
+        for spec in cases:
             if args.only and spec.name not in args.only:
                 continue
             artifact = directory / "artifacts" / spec.artifact_key
@@ -384,7 +423,12 @@ def main():
             (directory / "tables.md").write_text(render_tables(report))
             save()
         report["health_after"] = health_snapshot(args.physical, directory / "after")
-        report["status"] = "passed"
+        report["performance_passed"] = all(row["speedup"] >= 1 for row in report["cases"])
+        report["status"] = (
+            "performance_failed"
+            if args.require_no_slower and not report["performance_passed"]
+            else "passed"
+        )
     except Exception as error:  # noqa: BLE001 - preserve failure and stop later cases
         report.update(status="failed", error=f"{type(error).__name__}: {error}")
         if report["cases"]:

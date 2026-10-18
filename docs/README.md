@@ -18,11 +18,13 @@
 |---|---|
 | [GEMM](operators/gemm.md) | 标准连续 `C=A@B`，FP16/BF16、尾块、数值和缓存政策 |
 | [Dense NT GEMM](operators/dense-gemm.md) | `C=A@Bt.T`，FP16 输入、FP32 输出及整块限制 |
-| [Flash Attention](operators/flash-attention.md) | dense BNSD forward、online softmax、workspace、输入条件及数值容差 |
+| [Flash Attention](operators/flash-attention.md) | dense/causal BNSD forward、online softmax、workspace、输入条件及数值容差 |
 
 ## 当前结果与编译器开发
 
 - [性能报告](reports/performance.md)：Flash Attention 和 GEMM normal 多 shape 的 ACLNN 时间、加速比与 TFLOPS。
+- [Causal Attention](reports/causal-attention.md)：因果模式的实现、数值和 ACLNN 对照范围。
+- [内存合同重构](reports/memory-refactor.md)：源并行前提、可能别名、Tensor 写入合同及首批回归与设备验收。
 - [示例验证](reports/examples.md)：全部公开示例的编译与设备数值检查。
 - [开发入口](development/README.md)：编译链、生成规则、不变量、验证方法和硬件来源。
 

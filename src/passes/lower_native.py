@@ -40,6 +40,7 @@ from ..dialects.source import (
     CopyOp,
     DomainOp,
     ElementOp,
+    FillUpperOp,
     MatmulOp,
     PipelineOp,
     PredicateOp,
@@ -230,7 +231,10 @@ class _Lowerer:
             "nbytes": IntAttr(size),
             "external": IntAttr(int(op.ref.type.memory.data == "GM")),
             "initialized": IntAttr(int(op.access.data in {"read", "read_write"})),
+            "access": op.access,
         }
+        if op.write_disjoint is not None:
+            attrs["write_disjoint"] = op.write_disjoint
         if op.cache is not None:
             attrs["cache"] = op.cache
         if extent is not None:
@@ -302,6 +306,13 @@ class _Lowerer:
             scope.values[op.value] = result.scalar_value
         elif isinstance(op, ScaleOp):
             result = recipes.lower_scale(op, context, factor=self.scalar(op.factor, scope))
+        elif isinstance(op, FillUpperOp):
+            result = recipes.lower_fill_upper(
+                op,
+                context,
+                row_start=self.scalar(op.row_start, scope),
+                col_start=self.scalar(op.col_start, scope),
+            )
         else:
             result = recipes.lower_matmul(
                 op, context, initialization=self.initialization(op, scope)
@@ -345,7 +356,9 @@ class _Lowerer:
             scope.values[op.value] = size.value
         elif isinstance(op, AllocationOp):
             self.allocation(op, scope)
-        elif isinstance(op, (CopyOp, ElementOp, ReduceOp, ScalarReadOp, ScaleOp, MatmulOp)):
+        elif isinstance(
+            op, (CopyOp, ElementOp, ReduceOp, ScalarReadOp, ScaleOp, FillUpperOp, MatmulOp)
+        ):
             self.primitive(op, scope)
         elif isinstance(op, PipelineOp):
             self.pipeline(op, scope)

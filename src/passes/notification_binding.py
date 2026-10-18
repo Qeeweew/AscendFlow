@@ -204,6 +204,20 @@ def _bind_endpoint(
         available.add(logical.ordinal.args[0])
         value = binding.ordinal
         selector = isinstance(value, LoopResidueSelection)
+        # Ancestors are resolved in lexical order, including FIRST/LAST.
+        # Raw headers use their actual parent coordinates; occurrence Exprs
+        # already carry ordinary parent translations from region binding.
+        outer = {control.loops[loop].ordinal: coordinate for loop, coordinate in coordinates}
+        selected_outer = {
+            ordinal: coordinate
+            for ordinal, coordinate in outer.items()
+            if ordinal.args[0] not in arguments(coordinate)
+        }
+        if isinstance(value, Expr):
+            # A computed LAST can already be an Expr, rather than a residue
+            # selector. Its selected ancestors must resolve before recording
+            # coordinates used by ordered endpoint activation.
+            value = substitute(value, selected_outer)
         if binding.loop in family_map:
             require(
                 isinstance(value, Expr) and equivalent(value, logical.ordinal, environment.facts),
@@ -232,13 +246,7 @@ def _bind_endpoint(
             selector = True
         elif selector:
             assert isinstance(value, LoopResidueSelection)
-            count = logical.count
-            outer = {
-                control.loops[loop].ordinal: ordinal
-                for loop, ordinal in own_bindings.items()
-                if loop is not binding.loop and isinstance(ordinal, Expr)
-            }
-            count = substitute(count, outer)
+            count = substitute(logical.count, outer)
             first, last = _selected(count, value.period, value.residue)
             activation = Comparison(count, ">", first)
             tests.append(activation)
@@ -246,10 +254,7 @@ def _bind_endpoint(
             value = first if value.position is ResiduePosition.FIRST else last
         assert isinstance(value, Expr)
         if selector:
-            scope_count = substitute(
-                logical.count,
-                {control.loops[loop].ordinal: coordinate for loop, coordinate in coordinates},
-            )
+            scope_count = substitute(logical.count, outer)
 
             def contained(count, scope_count=scope_count):
                 if count == scope_count:

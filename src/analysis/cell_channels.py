@@ -15,6 +15,7 @@ from ..scalar import literal, substitute
 from .event_contracts import CaseLease, StructuredEventLease
 from .guard_cover import opposite
 from .structured_protocols import NotificationKind
+from .structured_regions import StorageCell
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +38,8 @@ def owns_stable_cell(notification, control, common_clocks):
     """
     root = control.module.body.block.first_op
     return bool(notification.origins) and all(
-        control.invariant_over(n.cell.origin, root)
+        isinstance(n.cell, StorageCell)
+        and control.invariant_over(n.cell.origin, root)
         and not set(n.cell.streaming).intersection(common_clocks)
         for n in notification.origins
     )

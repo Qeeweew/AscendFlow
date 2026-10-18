@@ -135,6 +135,12 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             current = current.parent
         require(operation.stage.data == stage, "native stage disagrees with its actual loop scope")
         operands = tuple(operation.refs)
+        if operation.native.data == "fill_upper":
+            require(
+                len(operands) == 3 and all(isinstance(v.type, IndexType) for v in operands[-2:]),
+                "upper fill needs one reference and two explicit index origins",
+            )
+            operands = operands[:-2]
         if operation.native.data in {"mad_first", "mad_cycle"}:
             require(
                 len(operands) == 4 and isinstance(operands[-1].type, IndexType),
@@ -183,7 +189,8 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             )
         require(operation.scalar.type == f32, "native Vector scalar literals must be f32")
         scalar = round_f32(
-            operation.scalar.value.data, allow_infinity=operation.native.data == "fill"
+            operation.scalar.value.data,
+            allow_infinity=operation.native.data in {"fill", "fill_upper"},
         )
         require(
             (operation.value is not None) == (operation.native.data == "scalar_load"),
@@ -205,6 +212,24 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             MemoryAccess(operand, index, ref, AccessMode(mode), conditions.get(index))
             for index, (operand, ref, mode) in enumerate(zip(operands, refs, modes, strict=True))
         )
+        for access in accesses:
+            buffer = access.address.root.owner
+            require(
+                buffer.access is None or buffer.access.data != "read" or not access.mode.writes,
+                "native writes a read-only tensor",
+                phase="structured-memory",
+                location=str(operation.location),
+            )
+            require(
+                buffer.write_disjoint is None
+                or buffer.write_disjoint.data == 1
+                and buffer.external.data == 1
+                and buffer.access is not None
+                and buffer.access.data in {"write", "read_write"},
+                "write_disjoint requires a writable external tensor",
+                phase="structured-memory",
+                location=str(operation.location),
+            )
         templates.append(MemoryTemplate(operation, frame, contract, accesses, scalar_source))
     return NativeMemoryFacts(
         module, control, tuple(templates), MappingProxyType(addresses), len(templates)

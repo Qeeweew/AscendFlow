@@ -21,7 +21,7 @@ from ..dialects.structured import AddressOp
 from ..indexing import check_axis, normalize
 from ..scalar import Expr, Fact, expression, from_ssa
 from ..target.native import NativeGeometry
-from .structured_tiles import NDGridCell, NDRectangle, nd_grid_cell, nd_rectangle
+from .structured_tiles import NDGridCell, NDRectangle, axis_grid_cell, nd_grid_cell, nd_rectangle
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +46,7 @@ class AddressFacts:
     axes: AxisFacts | None
     tile: NDGridCell | None
     rectangle: NDRectangle | None
+    axis_tile: NDGridCell | None = None
 
 
 class ScalarEnvironment:
@@ -147,6 +148,7 @@ class StructuredAddresses:
             axes,
             nd_grid_cell(rectangle, self.environment.facts),
             rectangle,
+            axis_grid_cell(offset, geometry, axes, self.environment.facts),
         )
         self._addresses[ref] = result
         return result

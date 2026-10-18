@@ -107,4 +107,7 @@ def format_native(template, *, render, roots, task_names, generation):
         task_names[template.operation],
         None if scalar_source is None else task_names[scalar_source],
     )
-    return native_line(task, pointer_renderer=pointer, generation=generation)
+    indices = (
+        tuple(render(value) for value in operation.refs[-2:]) if task.native == "fill_upper" else ()
+    )
+    return native_line(task, pointer_renderer=pointer, generation=generation, indices=indices)

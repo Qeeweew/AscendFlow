@@ -55,7 +55,10 @@ def online_attention(
 def inputs_and_oracle(policy, sq, sk, *, scope="full", data_case="standard"):
     import numpy as np
 
-    require(sq >= 0 and sq % 128 == 0 and sk > 0 and sk % 1024 == 0, "complete FA tiles required")
+    block_kv = policy.get("kv_tile", 1024)
+    require(
+        sq >= 0 and sq % 128 == 0 and sk > 0 and sk % block_kv == 0, "complete FA tiles required"
+    )
     require(
         scope in {"full", "sampled"} and data_case in {"standard", "uniform", "sharp"},
         "unknown numerical validation policy",
@@ -94,12 +97,14 @@ def inputs_and_oracle(policy, sq, sk, *, scope="full", data_case="standard"):
                     arrays["q"][b, h, rows],
                     arrays["k"][b, h // (heads // kh)],
                     arrays["v"][b, h // (heads // kh)],
-                    block_kv=1024,
+                    block_kv=block_kv,
                     dtype=dtype,
+                    causal=policy.get("causal", False),
+                    query_positions=rows,
                     scale=np.float32(1 / np.sqrt(128)),
                 )
     raw["o"] = b"\xff\x7f" * (batch * heads * sq * 128)
-    raw["score"] = b"\xcd" * (policy["groups"] * 2 * 128 * 1024 * 4)
-    raw["p"] = b"\xcd" * (policy["groups"] * 2 * 128 * 1024 * 2)
+    raw["score"] = b"\xcd" * (policy["groups"] * 2 * 128 * block_kv * 4)
+    raw["p"] = b"\xcd" * (policy["groups"] * 2 * 128 * block_kv * 2)
     raw["pv"] = b"\xcd" * (policy["groups"] * 2 * 128 * 128 * 4)
     return raw, expected, selected, perf_counter() - start

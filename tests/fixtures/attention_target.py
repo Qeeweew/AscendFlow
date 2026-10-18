@@ -1,8 +1,8 @@
 """The supported nested example and its unsupported continuous design policy.
 
 The sole mathematical body belongs to examples.flash_attention.attention.
-Continuous control is derived by changing only the two outer loop headers;
-its runtime-cycle first/last predicates remain unsupported by lowering.
+Continuous control rebinds the real descriptors and moves each query's
+initialization to its first stage. Runtime-cycle predicates remain unsupported.
 """
 
 import ast
@@ -28,9 +28,44 @@ def target_source(*, continuous=False):
             and isinstance(query.iter.func, ast.Attribute)
             and query.iter.func.attr == "serial"
         ):
-            if len(query.body) != 1 or not isinstance(query.body[0], ast.For):
-                raise ValueError("continuous fixture needs the example's actual query/KV loops")
-            kv = query.body[0]
+            kv = next(node for node in query.body if isinstance(node, ast.For))
+            prefix = query.body[: query.body.index(kv)]
+            suffix = query.body[query.body.index(kv) + 1 :]
+            initial = {"qk": [], "softmax": [], "update": []}
+            descriptors = []
+            for node in prefix:
+                if isinstance(node, ast.With) and isinstance(node.items[0].context_expr, ast.Call):
+                    call = node.items[0].context_expr
+                    if isinstance(call.func, ast.Attribute) and call.func.attr == "Cube":
+                        initial["qk"].extend(node.body)
+                        continue
+                    if isinstance(call.func, ast.Attribute) and call.func.attr == "Vector":
+                        for fill in node.body:
+                            name = fill.value.args[0].id
+                            initial["update" if name == "o" else "softmax"].append(fill)
+                        continue
+                descriptors.append(node)
+            for stage in kv.body:
+                if not isinstance(stage, ast.With):
+                    continue
+                for item in stage.items:
+                    call = item.context_expr
+                    if (
+                        not isinstance(call, ast.Call)
+                        or not isinstance(call.func, ast.Attribute)
+                        or call.func.attr != "Stage"
+                    ):
+                        continue
+                    name = next(k.value.value for k in call.keywords if k.arg == "name")
+                    if name in initial:
+                        stage.body.insert(
+                            0,
+                            ast.If(
+                                test=ast.parse("kv == 0", mode="eval").body,
+                                body=initial[name],
+                                orelse=[],
+                            ),
+                        )
             expected = ast.parse("task = query * kv_tiles + kv").body[0]
             if ast.dump(kv.body[0], include_attributes=False) != ast.dump(
                 expected, include_attributes=False
@@ -38,8 +73,28 @@ def target_source(*, continuous=False):
                 raise ValueError("continuous fixture needs the example's actual task ordinal")
             kv.target = ast.Name(id="task", ctx=ast.Store())
             kv.iter.args[0] = ast.parse("local_queries * kv_tiles", mode="eval").body
-            kv.body = ast.parse("query = task // kv_tiles\nkv = task % kv_tiles").body + kv.body[1:]
+            orders = [
+                n.value
+                for n in ast.walk(ast.Module(body=prefix, type_ignores=[]))
+                if isinstance(n, ast.Assign)
+                and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id == "kv_order"
+            ]
+            next(k for k in kv.iter.keywords if k.arg == "issue_order").value = orders[-1]
+            kv.body = (
+                ast.parse("query = task // kv_tiles\nkv = task % kv_tiles").body
+                + descriptors
+                + kv.body[1:]
+                + suffix
+            )
             kernel.body[index] = kv
+            kernel.body.insert(
+                0,
+                ast.Assert(
+                    test=ast.parse("CAUSAL == False", mode="eval").body,
+                    msg=ast.Constant("continuous fixture is dense only"),
+                ),
+            )
             return ast.unparse(ast.fix_missing_locations(module)) + "\n"
     raise ValueError("continuous fixture needs the example's actual serial query loop")
 
@@ -72,11 +127,24 @@ def activation_trace(queries, kv_tiles, *, continuous=False):
     result = {"cube": [], "vector": []}
     # Use the example's policy; this finite dispatch model must not retain a
     # previous issue order after a source policy experiment.
-    policy = next(
-        value
-        for node in ast.walk(ast.parse(target_source(continuous=continuous)))
-        if isinstance(node, ast.keyword) and node.arg == "issue_order"
-        if set(value := ast.literal_eval(node.value)) == {"cube", "vector"}
+    tree = ast.parse(target_source(continuous=continuous))
+    policies = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "kv_order"
+        and isinstance(node.value, ast.Dict)
+    ]
+    policy = (
+        ast.literal_eval(policies[-1])
+        if policies
+        else next(
+            value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.keyword) and node.arg == "issue_order"
+            if set(value := ast.literal_eval(node.value)) == {"cube", "vector"}
+        )
     )
     offsets = {"qk": 0, "softmax": 1, "pv": 1, "update": 2}
     lengths = [queries * kv_tiles] if continuous else [kv_tiles] * queries

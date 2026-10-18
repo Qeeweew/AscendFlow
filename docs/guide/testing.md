@@ -64,12 +64,18 @@ python -m benchmarks.check_examples --output build/examples-device --physical 2
 ```bash
 python -m benchmarks.profile_defaults --list
 python -m benchmarks.profile_defaults --output build/kernel-comparison --physical 2
+python -m benchmarks.profile_defaults --causal --require-no-slower --output build/causal-comparison --physical 2
 ```
 
 默认共 12 个 shape、24 次 msprof。FA 的 Sq/Sk 为 runtime，六个 shape 复用一次
 CANN 构建；GEMM 为 constexpr，每个 shape 单独构建，仍有覆盖全部构建阶段的
 300 秒硬期限。错误立即停止，不继续后续 shape。输出目录须是新目录。
 需要检查单项时可用 `--only gemm-normal-4096x4096x4096`，该记录仅覆盖选中项。
+
+`--causal` 单独采集 1K/2K/4K/8K 四个等长左上因果 FA；双方均为 `j<=i`，
+ACLNN 使用 `sparseMode=2`。三组显式 BK/VR 政策见[算子合同](../operators/flash-attention.md)，
+每份产物内长度仍为 runtime。`--require-no-slower` 要求每项加速比≥1，否则总表为
+`performance_failed` 并返回非零；数值状态和性能状态分别保留。有效 FLOPs 只计可见 key 对。
 
 原始记录位于 `<shape>/<generated|aclnn>/`；构建在 `artifacts/`，总表为
 `results.json`，可直接查看的比较表为 `tables.md`。汇总会检查成对的实际 shape、

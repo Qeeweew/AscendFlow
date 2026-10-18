@@ -8,7 +8,8 @@
 | 义务 | 输入 | 唯一建立者 / 产出 | 消费者 | 失效条件 |
 |---|---|---|---|---|
 | native effects、真实访问 | 原语、地址、layout、padding、scratch、SPR | native lowering / memory facts | admission、依赖、后端 | 改 native、地址、参与者、layout |
-| bounds、初始化、alias/ownership | 输入合同和完整 effects | bounds / admission；逐 actor 的物理分区 | 值与存储分析 | 改 alias、范围、guard、owner |
+| bounds、初始化与存储实例 | 输入合同和完整 effects | bounds / admission；group/peer并行独立性是源程序前提 | 值与存储分析 | 改 alias、范围、guard、参与者 |
+| 可能别名的源码内存顺序 | 原始次序与实际访问 | AliasRegion；不授权数值KILL或精确producer | 存储、通知；不用稳定cell credit | 改访问、guard、循环或并行合同 |
 | 精确逻辑 RAW | 原始程序次序、cell、条件 KILL/UPDATE | logical_valueflow；writer/代次及输入端口 | storage、通知绑定 | 改算法次序、定义、guard、循环 |
 | 物理 WAR/WAW、全部最后 reader | 值版本、真实 dispatch、closed packet 规则 | storage_lifetimes；邻接 lifetime 及尾 reader | 生成器的 credit 规则 | 改 slot、dispatch、实际读取、packet 前提 |
 | 真实 Set/Wait 位置和覆盖 | 上述必要依赖 | notification binding；保留原始 ownership edge，可增加 coverage | 域、阶段序、credit | 改捕获/等待位置或 activation |
@@ -21,6 +22,12 @@
 初始化准入不是 RAW 的重复证明。RAW 绑定不能代替异步完成。数学化简不授权
 提前求值 unsigned LAST/rem；原 guard 的定义性先检查，数学集合推理才可使用其
 完整条件。没有 `verified=True` 输入，公共 compile 只接受 DSL/source。
+
+bounded dense reader prefix 的空间联合可按 count 的有限上界保守覆盖完整 producer
+tile，但 native 字节范围不变，reader family 保留原始 count。捕获实际 LAST 前，
+按从外到内已解析的祖先 FIRST/LAST 坐标特化 child count；不使用未选祖先或
+上界代次代替真实最后读取。计算 LAST 的 Expr 同样解析 selected ancestor；
+canonical occurrence 已有的 j-d 祖先平移不重做。这不开放一般父代次条件激活的 family 闭合。
 
 ## 1. 捕获与获取
 

@@ -8,7 +8,6 @@ import pytest
 from ascendflow.analysis.structured_admission import admit_structured_memory
 from ascendflow.analysis.structured_bounds import admit_memory_bounds
 from ascendflow.analysis.structured_memory import collect_native_memory
-from ascendflow.analysis.structured_ownership import admit_owners
 from ascendflow.analysis.structured_tiles import nd_rectangle
 from ascendflow.build import build_file
 from ascendflow.diagnostics import CompileError
@@ -16,7 +15,7 @@ from ascendflow.dialects.io import parse
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.scalar import expression, literal
 from examples.gemm.dense import dense_gemm
-from tests.models.structured_events import check_structured_events
+from tests.models.structured_events import EventModelError, check_structured_events
 
 EXAMPLE = Path(__file__).parents[1] / "examples/gemm/dense.py"
 
@@ -46,7 +45,7 @@ def test_contiguous_nt_gemm_keeps_byte_versions_and_actual_event_consumption(tmp
     assert trace.bytes_read and trace.bytes_written and trace.consumptions
 
 
-def test_tiled_owner_proof_uses_grid_cells_and_retains_every_actual_access():
+def test_tiled_geometry_retains_every_actual_access_without_owner_admission():
     source = dense_gemm.specialize(
         M=64, N=80, K=16, BM=16, BN=16, BK=16, CK=16, COL_PARTS=1, GROUPS=3
     )
@@ -54,10 +53,13 @@ def test_tiled_owner_proof_uses_grid_cells_and_retains_every_actual_access():
     memory = collect_native_memory(structure.module)
     bounds = admit_memory_bounds(memory)
     admitted = admit_structured_memory(structure, memory, bounds)
-    (proof,) = admitted.owner_proofs
-    assert proof.tile_shape == (16, 16) and proof.stride.constant == 1
-    assert all(access.address.root is proof.root for access in proof.accesses)
-    access = proof.accesses[0].address
+    assert admitted.memory is memory
+    access = next(
+        a.address
+        for t in memory.templates
+        for a in t.accesses
+        if a.address.geometry.bank == "GM" and a.mode.writes
+    )
     cell = access.tile
     assert cell.extents == (64, 80)
     # Geometry identity must not trust axes independently of real bytes.
@@ -101,17 +103,19 @@ def test_rectangular_output_and_single_accumulator_retirement(tmp_path, prefetch
 
 
 @pytest.mark.parametrize("mapping", ["group % 2 + tile * 3", "group + tile * 2"])
-def test_aliasing_owner_maps_remain_rejected(mapping):
+def test_aliasing_owner_maps_violate_the_source_parallel_contract(mapping):
+    from ascendflow import compile
     from ascendflow import language as T
 
-    text = EXAMPLE.read_text().replace("index = group + tile * GROUPS", "index = " + mapping)
+    text = EXAMPLE.read_text().replace(
+        "index = group + tile * GROUPS", "index = (" + mapping + ") % tiles"
+    )
     text = text[text.index("def dense_gemm(") :]
     source = T.from_source(text, disjoint_external=True)
     source = source.specialize(M=64, N=80, K=16, BM=16, BN=16, BK=16, CK=16, COL_PARTS=1, GROUPS=3)
-    structure = lower_native_structure(source)
-    memory = collect_native_memory(structure.module)
-    with pytest.raises(CompileError, match="owner"):
-        admit_owners(memory)
+    memory = collect_native_memory(compile(source).plan)
+    with pytest.raises(EventModelError, match="unordered physical WAW"):
+        check_structured_events(memory, groups=(0, 1, 2))
 
 
 def test_nz_column_slice_needs_fractal_alignment_even_when_bytes_are_aligned():

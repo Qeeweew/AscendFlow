@@ -17,6 +17,7 @@ from ..dialects.source import (
     AllocationOp,
     CopyOp,
     ElementOp,
+    FillUpperOp,
     MatmulOp,
     ReduceOp,
     ScalarReadOp,
@@ -336,6 +337,23 @@ def lower_scale(op: ScaleOp, context: RecipeContext, *, factor: SSAValue) -> Rec
         "_scale", "scale_value", context.view(op.source), context.view(op.destination), factor
     )
     return RecipeResult((task,), task, 1, (NativeRead(0, task, 0),))
+
+
+def lower_fill_upper(op: FillUpperOp, context: RecipeContext, *, row_start, col_start):
+    require(
+        source_allocation(op.destination).access.data != "read",
+        "upper fill writes a read-only buffer",
+    )
+    task = context.emit(
+        "_fill_upper",
+        "fill_upper",
+        context.view(op.destination),
+        row_start,
+        col_start,
+        params=source_shape(op.destination),
+        scalar=op.scalar.value.data,
+    )
+    return RecipeResult((task,), task, 0, (NativeRead(0, task, 0),))
 
 
 Initialization = int | Literal["first"]

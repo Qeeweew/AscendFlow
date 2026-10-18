@@ -66,8 +66,9 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `frontend/`、`dialects/source.py`、`language.py` | TileLang 风格 AST、typed source、逻辑 Tile 和显式 buffer |
 | `passes/lower_pipeline.py`、`lower_native.py`、`native_recipes.py`、`native_addresses.py` | 参数化控制及 native recipe；尚未建立异步完成 |
 | `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/footprint/effects、目标 native 合同 |
-| `analysis/structured_bounds.py`、`structured_ownership.py`、`structured_admission.py`、`structured_host.py` | bounds、别名、逐 actor ownership、初始化、借用 Tile 及编译期整数范围前提；不生成host输入检查 |
-| `analysis/logical_valueflow.py`、`storage_word.py`、`storage_lifetimes.py`、`structured_dependencies.py` | 精确 RAW、条件 KILL/UPDATE、相邻存储 lifetime、全部最后 reader |
+| `analysis/structured_bounds.py`、`structured_admission.py`、`structured_host.py` | bounds、外部别名、实际存储实例、初始化、借用 Tile 及整数范围前提；group/peer 独立性属于源程序合同 |
+| `analysis/structured_access.py`、`structured_regions.py` | 可选精确 cell 与可能别名的 AliasRegion；保留实际 native 访问，不将 may-write 当完整定义 |
+| `analysis/logical_valueflow.py`、`storage_word.py`、`storage_lifetimes.py`、`structured_dependencies.py` | 精确 RAW 与独立的源码内存顺序、条件 KILL/UPDATE、相邻 lifetime、全部最后 reader |
 | `analysis/structured_dispatch.py` | 实际 actor、stage、issue_order、嵌套调用位置 |
 | `passes/notification_binding.py`、`analysis/structured_protocols.py` | capture/acquire 覆盖；保留自身 origin，不将新增 coverage 当作 ownership |
 | `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期 |

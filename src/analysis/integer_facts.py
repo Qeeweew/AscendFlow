@@ -213,12 +213,40 @@ class IntegerFacts:
         return self._bounds(value, self._context(assumptions))
 
     @_query
+    def _contains_unsigned(self, value):
+        return value.kind in DIVISION or any(
+            self._contains_unsigned(child) for child in value.args if isinstance(child, Expr)
+        )
+
+    @_query
+    def _unsigned_defined(self, value, context):
+        if not self._contains_unsigned(value):
+            return True
+        if not all(
+            self._unsigned_defined(child, context)
+            for child in value.args
+            if isinstance(child, Expr)
+        ):
+            return False
+        if value.kind in DIVISION:
+            numerator, divisor = value.args
+            lower = self._bounds(numerator, context)[0]
+            positive = self._bounds(divisor, context)[0]
+            return lower is not None and lower >= 0 and positive is not None and positive > 0
+        return True
+
+    @_query
     def _bounds(self, value, context: _PremiseContext):
         self._check_context(context)
         assumptions = context.tests
         # Preserve factors/clamps for interval reasoning. Polynomial expansion
         # is for equivalence queries: expanding (g-1)*k to g*k-k would lose
         # the fact that the complete first factor is nonnegative.
+        # Algebraic remainder/clamp ranges are conditional on the original
+        # unsigned operands being defined. Derive these bounds recursively
+        # instead of accepting a complete inferred interval before its domain.
+        if not self._unsigned_defined(value, context):
+            return None, None
         fact = self.infer(value)
         lower, upper = (None, None) if fact is None else (fact.minimum, fact.maximum)
         for test in assumptions:

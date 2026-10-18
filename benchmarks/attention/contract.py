@@ -56,6 +56,9 @@ class AttentionPolicy:
     groups: int = 20
     dtype: str = "f16"
     query_tile: int = 256
+    kv_tile: int = 1024
+    vector_rows: int = 8
+    causal: bool = False
 
     def __post_init__(self):
         require(
@@ -68,6 +71,8 @@ class AttentionPolicy:
                     self.dim,
                     self.groups,
                     self.query_tile,
+                    self.kv_tile,
+                    self.vector_rows,
                 )
             ),
             "attention policy requires positive integer dimensions, not bool",
@@ -82,6 +87,11 @@ class AttentionPolicy:
         )
         require(self.heads % self.kv_heads == 0, "attention policy requires HQ divisible by HKV")
         require(self.kv_heads in {8, 2, 1}, declared)
+        require(
+            type(self.causal) is bool and self.kv_tile in {128, 256, 512, 1024},
+            "attention requires a boolean causal policy and BK128/256/512/1024",
+        )
+        require(self.vector_rows in {8, 16}, "attention policy requires VR8/16")
 
     def as_dict(self):
         return asdict(self)
@@ -94,13 +104,18 @@ class AttentionPolicy:
             "D": self.dim,
             "BQ": self.query_tile,
             "BM": 128,
-            "BK": 1024,
+            "BK": self.kv_tile,
             "CK": 128,
-            "VR": 8,
+            "VR": self.vector_rows,
             "GROUPS": self.groups,
             "DTYPE": self.dtype,
             "SCALE": 0.08838834764831845,
+            "CAUSAL": self.causal,
         }
+
+    @property
+    def minimum_sk(self):
+        return 2 * self.kv_tile if self.causal else 1
 
     @property
     def scale(self):
@@ -117,15 +132,17 @@ class AttentionPolicy:
             TensorContract("K", "k", (self.batch, self.kv_heads, -1, self.dim), self.dtype, "Sk"),
             TensorContract("V", "v", (self.batch, self.kv_heads, -1, self.dim), self.dtype, "Sk"),
             TensorContract("O", "o", (self.batch, self.heads, -1, self.dim), self.dtype, "Sq"),
-            TensorContract("Score", "score", (self.groups, 2, self.query_tile, 1024), "f32"),
-            TensorContract("P", "p", (self.groups, 2, self.query_tile, 1024), self.dtype),
+            TensorContract(
+                "Score", "score", (self.groups, 2, self.query_tile, self.kv_tile), "f32"
+            ),
+            TensorContract("P", "p", (self.groups, 2, self.query_tile, self.kv_tile), self.dtype),
             TensorContract("PV", "pv", (self.groups, 2, self.query_tile, self.dim), "f32"),
         )
 
     @property
     def local_footprints(self):
         """Declared source allocations; UB storage is private to each AIV."""
-        bq, bm, dtype = self.query_tile, 128, self.dtype
+        bq, bm, bk, vr, dtype = self.query_tile, 128, self.kv_tile, self.vector_rows, self.dtype
         return (
             ((bm, 128) if bq == bm else (bq // bm, bm, 128), dtype, "L1", "NZ"),
             ((2, 128, 128), dtype, "L1", "NZ"),
@@ -138,18 +155,18 @@ class AttentionPolicy:
             ),
             ((2, 128, 128), dtype, "L0B", "ZN"),
             ((2, bm, 128), "f32", "L0C", "NZ"),
-            ((2, 8, 1024), "f32", "UB", "linear"),
-            *((((8, 1024), "f32", "UB", "linear"),) if bq == bm else ()),
-            ((2, 8, 1024), dtype, "UB", "linear"),
-            ((2, 8, 128), "f32", "UB", "linear"),
-            ((2, 8, 128), dtype, "UB", "linear"),
+            ((2, vr, bk), "f32", "UB", "linear"),
+            *((((vr, bk), "f32", "UB", "linear"),) if bq == bm else ()),
+            ((2, vr, bk), dtype, "UB", "linear"),
+            ((2, vr, 128), "f32", "UB", "linear"),
+            ((1 if self.causal else 2, vr, 128), dtype, "UB", "linear"),
             ((bq // 2,), "f32", "UB", "linear"),
             ((bq // 2,), "f32", "UB", "linear"),
             ((bq // 2, 128), "f32", "UB", "linear"),
             ((2, bq // 2), "f32", "UB", "linear"),
-            ((1152,), "f32", "UB", "linear"),
-            *(((8,), "f32", "UB", "linear"),) * 4,
-            ((8, 8), "f32", "UB", "linear"),
+            ((vr * (bk // 8 + (bk // 64 if bk > 512 else 0)),), "f32", "UB", "linear"),
+            *(((vr,), "f32", "UB", "linear"),) * 4,
+            ((vr, 8), "f32", "UB", "linear"),
             ((bq // 2, 8), "f32", "UB", "linear"),
         )
 
@@ -158,9 +175,9 @@ class AttentionPolicy:
             type(sq) is int
             and type(sk) is int
             and sq > 0
-            and sk > 0
+            and sk >= self.minimum_sk
             and sq % self.query_tile == sk % 1024 == 0,
-            f"attention cases require positive complete BQ{self.query_tile}/BK1024 tiles",
+            f"attention cases require positive complete BQ{self.query_tile}/Sk1024 tiles",
         )
         require(
             all(tensor.nbytes(sq, sk) <= 2**63 - 1 for tensor in self.tensors),
@@ -177,7 +194,9 @@ class AttentionPolicy:
 
     def reference_parameters(self):
         return {
-            key: value for key, value in self.as_dict().items() if key not in {"dim", "query_tile"}
+            key: value
+            for key, value in self.as_dict().items()
+            if key not in {"dim", "query_tile", "kv_tile", "vector_rows", "causal"}
         }
 
 

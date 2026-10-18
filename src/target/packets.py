@@ -15,6 +15,7 @@ class MaskStep(str, Enum):
     SET_COUNT = "set-mask-from-count-argument"
     SET_FULL = "set-mask-full-f32"
     SET_PARTIALS = "set-mask-from-partials-parameter"
+    SET_UPPER = "set-mask-from-row-and-column-origins"
     VECTOR_READ = "vector-read-mode-and-mask"
     RESTORE_NORMAL = "restore-mode-normal"
 
@@ -27,14 +28,27 @@ class NativePacket:
     # this complete sequence, rather than one setup surrounding all rows.
     each_count_call: bool = False
     internal_fences: tuple[str, ...] = ()
+    # An audited conditional packet must close every path independently.
+    alternate_mask_steps: tuple[tuple[MaskStep, ...], ...] = ()
 
     @property
     def closed_mask(self):
+        return all(
+            self._closed_mask(steps) for steps in (self.mask_steps, *self.alternate_mask_steps)
+        )
+
+    @staticmethod
+    def _closed_mask(steps):
         mode = mask = False
-        for step in self.mask_steps:
+        for step in steps:
             if step in {MaskStep.SET_COUNTER, MaskStep.SET_NORMAL, MaskStep.RESTORE_NORMAL}:
                 mode = True
-            elif step in {MaskStep.SET_COUNT, MaskStep.SET_FULL, MaskStep.SET_PARTIALS}:
+            elif step in {
+                MaskStep.SET_COUNT,
+                MaskStep.SET_FULL,
+                MaskStep.SET_PARTIALS,
+                MaskStep.SET_UPPER,
+            }:
                 mask = True
             elif step is MaskStep.VECTOR_READ and not (mode and mask):
                 return False
@@ -45,16 +59,26 @@ class NativePacket:
         # Restore-to-normal is a defined write, not preservation of an
         # arbitrary incoming mode. None of the current packets saves mask.
         result = set()
-        for step in self.mask_steps:
+        for step in (
+            step for steps in (self.mask_steps, *self.alternate_mask_steps) for step in steps
+        ):
             if step in {MaskStep.SET_COUNTER, MaskStep.SET_NORMAL, MaskStep.RESTORE_NORMAL}:
                 result.add("VECTOR_MASK_MODE")
-            elif step in {MaskStep.SET_COUNT, MaskStep.SET_FULL, MaskStep.SET_PARTIALS}:
+            elif step in {
+                MaskStep.SET_COUNT,
+                MaskStep.SET_FULL,
+                MaskStep.SET_PARTIALS,
+                MaskStep.SET_UPPER,
+            }:
                 result.add("VECTOR_MASK")
         return frozenset(result)
 
     @property
     def restores_normal_mode(self):
-        return MaskStep.RESTORE_NORMAL in self.mask_steps
+        return all(
+            MaskStep.RESTORE_NORMAL in steps
+            for steps in (self.mask_steps, *self.alternate_mask_steps)
+        )
 
 
 _COUNT = frozenset(
@@ -133,6 +157,31 @@ _MASK_FREE = frozenset(
 
 
 def _packet(native: str) -> NativePacket | None:
+    if native == "fill_upper":
+        return NativePacket(
+            native,
+            (
+                MaskStep.SET_NORMAL,
+                MaskStep.SET_UPPER,
+                MaskStep.VECTOR_READ,
+                MaskStep.SET_FULL,
+                MaskStep.VECTOR_READ,
+                MaskStep.RESTORE_NORMAL,
+                MaskStep.SET_FULL,
+            ),
+            alternate_mask_steps=(
+                (
+                    MaskStep.SET_NORMAL,
+                    MaskStep.SET_COUNTER,
+                    MaskStep.SET_COUNT,
+                    MaskStep.VECTOR_READ,
+                    MaskStep.RESTORE_NORMAL,
+                    MaskStep.RESTORE_NORMAL,
+                    MaskStep.SET_FULL,
+                ),
+                (),  # A fully visible tile does not touch mask state.
+            ),
+        )
     if native == "nd2nz_pad":
         # L1 fill and ND2NZ share MTE2 but can overlap execution. The fill
         # must retire before the valid values overwrite its zero padding.
@@ -163,7 +212,8 @@ def _packet(native: str) -> NativePacket | None:
 
 
 _AUDITED = {
-    native: _packet(native) for native in _COUNT | _FULL | _PARTIAL | _MASK_FREE | {"nd2nz_pad"}
+    native: _packet(native)
+    for native in _COUNT | _FULL | _PARTIAL | _MASK_FREE | {"nd2nz_pad", "fill_upper"}
 }
 
 

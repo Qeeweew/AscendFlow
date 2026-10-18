@@ -22,6 +22,11 @@
 构造标量范围 DAG，保留 owner/iteration 的联合区间；原始除法和源码算术仍独立
 检查。Expr 的 free variables 在节点构造时建立，不依赖 range/guard 环境。
 
+原始轴 grid 的几何与混合基数坐标在地址解码时建立一次，streaming 精度分析
+复用同一事实；每个 active domain 仍须建立低位 digit 的真实范围。统一的
+`(x+c)%N` 平移只有在 c 为 uniform 输入、实际 `0<=x<N` 时可反解成证明坐标。
+rank/digit 均最多 4，不展开 runtime tile；实际原轴范围与字节地址不替换。
+
 公共编译在独立 expression scope 内驻留完全相同的原始 `(kind, args)` 节点，
 退出、异常或取消时释放节点表，嵌套 scope 恢复外层。它不保存 range、guard、
 alias 或完成证据；数学等价的不同原式不会在此合并。所有原始 SSA 使用仍检查
@@ -38,7 +43,7 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 |---|---|---|
 | 类型与runtime输入合同 | frontend/admission；输入条件由调用方满足 | 编译器检查合同声明；生成的kernel和launcher不验证调用方输入 |
 | 完整effects | native lowering/目标原语合同 | 包括scratch、padding、SPR、读写及真实退休 |
-| alias/ownership | 物理访问与owner分析 | 保留root/view/范围/slot/generation及每个AIV的私有性 |
+| 存储实例与alias | 物理访问、pointer合同与可选分区分析 | group/peer独立性属于源语义；保留root/view/slot/generation及AIV私有性，未知区域保留源码内存顺序 |
 | 逻辑值版本 | logical_valueflow | 精确RAW、条件KILL/UPDATE与未绑定输入，不能改绑到dispatch最近writer |
 | 物理复用 | storage_lifetimes与实际dispatch | 全部相关最后reader，不能以控制退出代替完成 |
 | ready/release覆盖 | notification binding | 真实 capture/acquire、独立覆盖及原始 ownership edges |
@@ -57,6 +62,8 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 - 循环控制退出不证明native完成。跨loop的旧reader与未消费event仍通过对应端口传递，不加统一loop drain。
 - 每个pipeline输出一个物理时钟循环，stage以`g=j-offset`及其存在条件执行。首末条件属于同一生命周期，不能独立seed/drain。kernel最终收尾单独处理。
 - buffer slot数、stage偏移、event width互不代替；跨AIC/AIV使用实际参与者与GM可见性，不能丢掉第二个AIV贡献。
+- 选择 child FIRST/LAST 时，先用已解析的全部祖先坐标特化 child header，包括祖先自身的 FIRST/LAST；已经写为 Expr 的计算 LAST 也要解析 selected ancestor。已由 region binding 处理的普通 j-d 平移不能再应用一次。
+- 有界 dense read prefix 可用 count 上界形成保守空间联合；native 仍读取真实分块，family、LAST 和 release 使用实际 count。不能用于动态写或假设上界代次被执行。
 
 ## 4. 物理、数值与硬件语义
 
@@ -64,6 +71,11 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 不能外推到矩阵 ND2NZ/FIXPIPE，也不能用矩阵的元素对齐许可放宽普通 DMA。
 显式补零的封闭 packet 保留 fill→MTE2 fence→ND2NZ 次序；FIXPIPE 的 dtype
 转换只改变目标元素宽度，保留 FP32 累加器的实际 fractal 读取与退休关系。
+
+三角 `fill_upper` 是已初始化矩阵的 RW 更新，不能作为整片初始化。封闭 packet
+保留未写 lane，有填充的路径退出恢复普通全向量 mask，全可见路径不触碰 mask。
+各路径独立检查封闭性；极端 signed 起点差采用无符号距离和有界饱和，不能让索引
+相减溢出或 shift-by-64。
 
 GM 缓存别名不创建新的物理存储身份。source 的 cache 提示随同一 root 保留到
 physical IR；bypass launcher 用目标 runtime 查询的地址别名绑定原始分配，查询
@@ -76,7 +88,11 @@ release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继�
 
 条件首clear和后续RMW保持各自读写合同。private packet的独立性须由精确cell、已定义读、跨代RAW及外部可见状态等前提建立；private或admission成功本身不够。只允许已经论证独立的生命周期按给定dispatch组织。
 
-分支合流不能拼接互斥路径的完成证据。零次路径保留进入前已有的RAW/WAR/WAW。动态alias/ownership无法证明时要求可验证输入合同或诊断拒绝。
+分支合流不能拼接互斥路径的完成证据。零次路径保留进入前已有的RAW/WAR/WAW。
+区域关系未知时 AliasRegion 保留源码内存顺序，不声称精确 RAW/KILL，也不进入
+稳定 cell credit 或 private packet 重排。外部 write_disjoint 合同只用于没有
+内部 reader 的输出，不免除 scratch 复用、输入退休或双 AIV quorum。
+完整合同见[memory-contracts.md](memory-contracts.md)。
 
 ## 5. 保持与失效
 

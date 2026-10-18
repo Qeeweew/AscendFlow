@@ -572,6 +572,11 @@ def _accesses(logical, physical, reach, order):
         hazards.append(Hazard(kind, source, consumer, storage[0], start, end))
 
     for cell, versions in writes.items():
+        if cell[0][0].write_disjoint is not None:
+            _check(
+                len({key.invocation for key in versions}) == len(versions),
+                "write_disjoint contract violated by actual overlapping writes",
+            )
         # Independent clears may occupy a slot in a different order from
         # source traversal. Actual causal write order must still be total;
         # source RAW bindings below forbid any intervening wrong version.

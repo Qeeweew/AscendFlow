@@ -536,7 +536,7 @@ def test_explicit_build_uses_the_new_example_and_one_total_deadline(artifact, mo
 
 @pytest.mark.parametrize("policy", POLICIES)
 def test_immutable_policy_drives_seven_shapes_bytes_and_reference_parameters(policy):
-    assert len(policy.parameters()) == 12
+    assert len(policy.parameters()) == 13
     assert policy.parameters() == {
         **run.CONSTANTS,
         "HKV": policy.kv_heads,
@@ -855,7 +855,7 @@ def mock_execution(monkeypatch, policy, *, actual_value=1.25, expected_value=1.2
     class Reference:
         interface = "CPU mock ACLNN wiring only"
 
-        def __init__(self, runtime, q, k, v, o, shape, dtype, scale):
+        def __init__(self, runtime, q, k, v, o, shape, dtype, scale, *, causal=False):
             state["reference"].append((shape, dtype, scale))
             self.runtime, self.output = runtime, o
             self.workspace_size = ct.c_uint64(0)

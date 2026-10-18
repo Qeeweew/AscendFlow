@@ -45,7 +45,7 @@ def device_record(spec, backend, tmp_path):
             shape_b_hq_hkv_sq_sk_d=[1, 8, 8, *spec.shape, 128],
             dtype="f16",
             layout="BNSD",
-            causal=False,
+            causal=spec.causal,
             query_start=0,
             data_case="standard",
             oracle_scope="sampled",
@@ -76,6 +76,7 @@ def device_record(spec, backend, tmp_path):
         "health": {"physical_device": 2, "logical_device": 0},
         "hardware": {"physical_device": 2, "platform_sha256": "same platform"},
         "artifact" if spec.attention else "backend": identity,
+        **({"policy": profile.causal_policy(*spec.shape)} if spec.causal else {}),
     }
 
 
@@ -86,6 +87,22 @@ def test_algorithm_flops_and_microsecond_conversion():
     # Query heads, rather than KV heads, determine both dense matrix products.
     assert profile.algorithm_flops("flash-attention", (2, 16, 4, 256, 1024, 64)) == 2147483648
     assert profile.tflops(2_000_000_000, 20) == 100
+
+
+@pytest.mark.parametrize("sq,sk", [(256, 1024), (1024, 256), (1024, 1024)])
+def test_causal_flops_count_actual_visible_pairs(sq, sk):
+    pairs = sum(min(i + 1, sk) for i in range(sq))
+    assert profile.algorithm_flops("flash-attention", (1, 8, 8, sq, sk, 128), causal=True) == (
+        4 * 8 * 128 * pairs
+    )
+
+
+def test_causal_comparison_rejects_a_different_explicit_policy(tmp_path):
+    spec = profile.ProfileCase("flash-attention", (2048, 2048), causal=True)
+    record = device_record(spec, "generated", tmp_path)
+    record["policy"]["kv_tile"] = 256
+    with pytest.raises(CompileError, match="tiling policy differs"):
+        profile.case_contract(spec, record, "generated")
 
 
 @pytest.mark.parametrize("duration", [0, -1, math.nan, math.inf])
@@ -122,6 +139,15 @@ def test_default_matrix_includes_square_and_rectangular_cases():
         shapes = [case.shape for case in profile.CASES if case.operator == operator]
         assert len(shapes) == 6
         assert sum(len(set(shape)) > 1 for shape in shapes) == 2
+
+
+def test_causal_acceptance_matrix_uses_the_requested_equal_lengths():
+    assert [case.shape for case in profile.CAUSAL_CASES] == [
+        (1024, 1024),
+        (2048, 2048),
+        (4096, 4096),
+        (8192, 8192),
+    ]
 
 
 def test_build_failure_stops_before_profiling_or_next_shape(monkeypatch, tmp_path):
@@ -181,7 +207,12 @@ def test_timing_counts_all_kernels_and_rejects_wrong_card(physical, tmp_path):
         assert len(summary["operators"]) == 2
 
 
-def test_paired_collections_reuse_runtime_build_and_extract_actual_csv(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "strict,generated_us,status", [(False, 10, "passed"), (True, 30, "performance_failed")]
+)
+def test_paired_collections_reuse_runtime_build_and_extract_actual_csv(
+    monkeypatch, tmp_path, strict, generated_us, status
+):
     specs = (
         profile.ProfileCase("flash-attention", (1024, 1024)),
         profile.ProfileCase("flash-attention", (2048, 2048)),
@@ -229,7 +260,7 @@ def test_paired_collections_reuse_runtime_build_and_extract_actual_csv(monkeypat
                         "Task Start Time(us)": i * 1000,
                         "Task Duration(us)": 999
                         if i < warmup
-                        else 10
+                        else generated_us
                         if backend == "generated"
                         else 20,
                         "Block Num": 20,
@@ -239,18 +270,27 @@ def test_paired_collections_reuse_runtime_build_and_extract_actual_csv(monkeypat
     monkeypatch.setattr(profile, "bounded_process", build)
     monkeypatch.setattr(profile, "run_device", collect)
     monkeypatch.setattr(
-        sys, "argv", ["profile_defaults", "--output", str(tmp_path / "profiles"), "--physical", "2"]
+        sys,
+        "argv",
+        ["profile_defaults", "--output", str(tmp_path / "profiles"), "--physical", "2"]
+        + (["--require-no-slower"] if strict else []),
     )
-    assert profile.main() == 0
+    assert profile.main() == (0 if status == "passed" else 1)
     assert len(builds) == 2  # one runtime-parameterized FA, one constexpr GEMM
     assert collected == [
         (spec.name, backend) for spec in specs for backend in ("generated", "aclnn")
     ]
     report = json.loads((tmp_path / "profiles/results.json").read_text())
-    assert report["status"] == "passed"
+    assert report["status"] == status
+    assert report["performance_passed"] == (generated_us <= 20)
     assert all(
-        row["generated_us"] == 10 and row["aclnn_us"] == 20 and row["speedup"] == 2
+        row["generated_us"] == generated_us
+        and row["aclnn_us"] == 20
+        and row["speedup"] == 20 / generated_us
         for row in report["cases"]
     )
-    assert all(row["generated_tflops"] == 2 * row["aclnn_tflops"] for row in report["cases"])
-    assert "2.000×" in (tmp_path / "profiles/tables.md").read_text()
+    assert all(
+        row["generated_tflops"] == pytest.approx((20 / generated_us) * row["aclnn_tflops"])
+        for row in report["cases"]
+    )
+    assert f"{20 / generated_us:.3f}×" in (tmp_path / "profiles/tables.md").read_text()

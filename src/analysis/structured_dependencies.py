@@ -52,8 +52,8 @@ def build_structured_dependencies(
     values = build_logical_valueflow(memory, admission=admission)
     storage = build_storage_lifetimes(values, dispatch)
     reads = tuple(need for need in values.reads if isinstance(need.source, AccessOccurrence))
-    needs = reads + storage.needs
-    required = reads + storage.required
+    needs = reads + values.ordered_reads + storage.needs
+    required = reads + values.ordered_reads + storage.required
     work = replace(
         values.work,
         needs=len(needs),

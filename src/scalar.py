@@ -423,6 +423,16 @@ def infer(expr, facts):
             lhs, rhs = expr.args
             a, b = visit(lhs), visit(rhs)
             result = None
+            if expr.kind == "max" and (a is None) != (b is None):
+                # max(known nonnegative, unknown signed) keeps the known
+                # lower bound; no upper bound or divisibility is implied.
+                known = b if a is None else a
+                result = Fact(known.minimum)
+            if expr.kind == "rem" and b is not None and b.minimum > 0 and a is None:
+                # Euclidean remainder has this range even when its dividend's
+                # interval is unknown. Original unsigned definedness is still
+                # checked independently at every actual SSA use.
+                result = Fact(0, 1, None if b.maximum is None else b.maximum - 1)
             if a is not None and b is not None:
                 maximum = None
                 if expr.kind == "add":

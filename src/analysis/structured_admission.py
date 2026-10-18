@@ -1,4 +1,4 @@
-"""Memory ownership, defined reads, and borrowed Tile admission.
+"""Storage instances, defined reads, and borrowed Tile admission.
 
 All inputs are owned facts from the same recursive lowering invocation. This
 pass uses symbolic byte regions and finite native row geometry, never runtime
@@ -26,7 +26,6 @@ from .structured_bounds import MemoryBoundsFacts
 from .structured_control import LogicalLoop
 from .structured_host import build_host_expressions
 from .structured_memory import MemoryAccess, MemoryTemplate, NativeMemoryFacts
-from .structured_ownership import OwnerProof, admit_owners
 from .value_bindings import LastTile, TileDefinition, TileUse
 
 if TYPE_CHECKING:
@@ -34,7 +33,13 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryPartition:
+class StorageInstance:
+    """A real allocation in one group, private to an actor unless it is GM.
+
+    Group independence is a source parallel-program precondition. It is not
+    an address-injectivity theorem reconstructed by memory admission.
+    """
+
     root: SSAValue
     participant: Actor | None
 
@@ -61,8 +66,7 @@ class StructuredAdmission:
     structure: NativeStructure
     memory: NativeMemoryFacts
     bounds: MemoryBoundsFacts
-    partitions: Mapping[tuple[TaskOp, int, Actor], MemoryPartition]
-    owner_proofs: tuple[OwnerProof, ...]
+    instances: Mapping[tuple[TaskOp, int, Actor], StorageInstance]
     reads: tuple[ReadAdmission, ...]
     values: tuple[TileAdmission, ...]
     configurations: tuple[FixConfigOp | Load3DConfigOp, ...]
@@ -290,6 +294,20 @@ def _native_aliases(memory):
 def _covers(spans, read, frame, facts, work):
     """Unite exact static row intervals only after proving their translations."""
     needed_span = expression("add", read.width, literal((read.rows - 1) * read.pitch))
+
+    def contained(base, start, stop):
+        delta = expression("sub", read.base, base)
+        reduced = normalize(delta, facts)
+        for form in dict.fromkeys((reduced, delta)):
+            # Cancellation exposes common translations; the original form
+            # also retains rem ranges that polynomial expansion can obscure.
+            low, high = interval(form, frame.domains(), facts)
+            if nonnegative(expression("sub", low, start), facts) and nonnegative(
+                expression("sub", stop, expression("add", high, needed_span)), facts
+            ):
+                return True
+        return False
+
     for candidate in spans:
         work["coverage_checks"] += 1
         if (
@@ -299,16 +317,8 @@ def _covers(spans, read, frame, facts, work):
             and nonnegative(expression("sub", candidate.width, read.width), facts)
         ):
             return True
-        if candidate.rows == 1:
-            low, high = interval(
-                normalize(expression("sub", read.base, candidate.base), facts),
-                frame.domains(),
-                facts,
-            )
-            if nonnegative(low, facts) and nonnegative(
-                expression("sub", candidate.width, expression("add", high, needed_span)), facts
-            ):
-                return True
+        if candidate.rows == 1 and contained(candidate.base, literal(0), candidate.width):
+            return True
     for anchor in spans:
         intervals = []
         for candidate in spans:
@@ -331,13 +341,8 @@ def _covers(spans, read, frame, facts, work):
                 merged[-1] = merged[-1][0], max(stop, merged[-1][1])
             else:
                 merged.append((start, stop))
-        low, high = interval(
-            normalize(expression("sub", read.base, anchor.base), facts), frame.domains(), facts
-        )
         for start, stop in merged:
-            if nonnegative(expression("sub", low, literal(start)), facts) and nonnegative(
-                expression("sub", literal(stop), expression("add", high, needed_span)), facts
-            ):
+            if contained(anchor.base, literal(start), literal(stop)):
                 return True
     return False
 
@@ -478,10 +483,29 @@ def admit_structured_memory(
             root.owner,
             kind=ErrorKind.INVALID,
         )
-    owner_proofs = admit_owners(memory)
+    external = {
+        access.address.root
+        for template in memory.templates
+        if not template.frame.statically_empty
+        for access in template.accesses
+        if access.address.geometry.bank == "GM"
+    }
+    writes_external = any(
+        access.mode.writes and access.address.geometry.bank == "GM"
+        for template in memory.templates
+        if not template.frame.statically_empty
+        for access in template.accesses
+    )
+    _require(
+        not writes_external
+        or len(external) <= 1
+        or memory.module.body.block.first_op.disjoint_external.data == 1,
+        "distinct external roots need the launch's disjoint pointer contract",
+        memory.module.body.block.first_op,
+    )
     configurations = _configurations(memory)
     _native_aliases(memory)
-    partitions, reads, prior = {}, [], {}
+    instances, reads, prior = {}, [], {}
     defined_writes = set()
     templates = {item.operation: item for item in memory.templates}
     positions = {item.operation: index for index, item in enumerate(memory.templates)}
@@ -498,10 +522,10 @@ def admit_structured_memory(
             continue
         for actor in template.participants:
             for access in template.accesses:
-                partition = MemoryPartition(
+                instance = StorageInstance(
                     access.address.root, None if access.address.geometry.bank == "GM" else actor
                 )
-                partitions[template.operation, access.operand_index, actor] = partition
+                instances[template.operation, access.operand_index, actor] = instance
                 work["accesses"] += 1
                 if not access.mode.reads:
                     continue
@@ -517,7 +541,7 @@ def admit_structured_memory(
                     continue
                 candidates = []
                 writers = []
-                for writer, output, participant in prior.get(partition, ()):
+                for writer, output, participant in prior.get(instance, ()):
                     span = _writer_span(writer, output, participant, template, memory)
                     if span is not None:
                         candidates.append(span)
@@ -538,7 +562,7 @@ def admit_structured_memory(
         for actor in template.participants:
             for access in template.accesses:
                 if access.mode.writes:
-                    key = partitions[template.operation, access.operand_index, actor]
+                    key = instances[template.operation, access.operand_index, actor]
                     # Numerical definedness is monotone. Repeating the exact
                     # write in the same control block adds no initialized
                     # bytes. Keep its first defining witness, independently
@@ -643,7 +667,7 @@ def admit_structured_memory(
                 )
         values.append(TileAdmission(use, binding, tuple(selected)))
     work["read_proofs"], work["tile_uses"] = len(reads), len(values)
-    work["owner_proofs"], work["partitions"] = len(owner_proofs), len(partitions)
+    work["storage_instances"] = len(instances)
     work["configuration_writers"] = len(configurations)
     host_expressions = build_host_expressions(memory, bounds)
     work["host_expressions"] = len(host_expressions)
@@ -652,8 +676,7 @@ def admit_structured_memory(
         structure,
         memory,
         bounds,
-        MappingProxyType(partitions),
-        owner_proofs,
+        MappingProxyType(instances),
         tuple(reads),
         tuple(values),
         configurations,

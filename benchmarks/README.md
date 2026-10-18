@@ -7,10 +7,13 @@ python -m benchmarks.check_examples --list
 python -m benchmarks.check_examples --output build/examples-cann
 # 检查全部卡并显式映射后，增加 --physical 进行数值验证。
 python -m benchmarks.profile_defaults --output build/kernel-times --physical 2
+python -m benchmarks.profile_defaults --causal --require-no-slower --output build/causal-times --physical 2
 ```
 
 `check_examples` 检查所有公开示例；`profile_defaults` 对 Flash Attention 和 GEMM normal
 固定的 12 个 shape，分别采集 AscendFlow 与 ACLNN，各一次默认 msprof，计算时间、加速比和 TFLOPS。
+`--causal` 改为 1K/2K/4K/8K 四个等长 causal FA shape，使用 example 中三组显式分块；
+`--require-no-slower` 在任一 shape 慢于 ACLNN 时返回失败，数值通过不代表性能通过。
 输出目录须是新目录。运行环境、卡选择和
 输入合同见[快速上手](../docs/guide/quickstart.md)，结果见[示例验证](../docs/reports/examples.md)
 和[性能报告](../docs/reports/performance.md)。

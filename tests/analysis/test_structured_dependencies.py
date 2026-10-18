@@ -10,6 +10,7 @@ from ascendflow.analysis.structured_dependencies import build_structured_depende
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_regions import (
     AccessOccurrence,
+    AliasRegion,
     DependencyIssueKind,
 )
 from ascendflow.diagnostics import CompileError
@@ -378,7 +379,7 @@ def test_parent_dependent_possibly_empty_child_does_not_invent_last_writer():
 
 
 @pytest.mark.parametrize("reader", ["j+1", "0"])
-def test_contracted_family_cannot_erase_shifted_or_invariant_aliases(reader):
+def test_contracted_family_preserves_order_for_shifted_or_invariant_aliases(reader):
     result = dependencies(f"""
         def shifted():
             with N.Kernel():
@@ -387,13 +388,14 @@ def test_contracted_family_cannot_erase_shifted_or_invariant_aliases(reader):
                     N.fill(x[j,:],1.0)
                     N.mul(x[{reader},:],2.0,out=y)
     """)
-    assert not result.closed
-    assert any(
-        issue.kind is DependencyIssueKind.NONPERIODIC_REUSE for issue in dependency_issues(result)
-    )
+    result.require_closed()
+    assert result.work.alias_regions == 1
+    assert result.values.ordered_reads
+    assert all(isinstance(need.cell, AliasRegion) for need in result.values.ordered_reads)
+    assert any(need.kind is HazardKind.WAR and need.distance == 1 for need in result.required)
 
 
-def test_unknown_symbolic_alias_fails_closed_instead_of_disjoint_fallback():
+def test_unknown_symbolic_alias_keeps_waw_without_inventing_a_complete_definition():
     result = dependencies("""
         def aliases(a:N.int64(minimum=1),b:N.int64(minimum=1)):
             with N.Kernel():
@@ -401,12 +403,10 @@ def test_unknown_symbolic_alias_fails_closed_instead_of_disjoint_fallback():
                 N.fill(x[a*32:a*32+32],1.0)
                 N.fill(x[b*32:b*32+32],2.0)
     """)
-    assert not result.closed
-    assert any(
-        issue.kind is DependencyIssueKind.SYMBOLIC_ALIAS for issue in dependency_issues(result)
-    )
-    with pytest.raises(CompileError, match="coordinate"):
-        result.require_closed()
+    result.require_closed()
+    assert len(result.required) == 1 and result.required[0].kind is HazardKind.WAW
+    assert isinstance(result.required[0].cell, AliasRegion)
+    assert not result.values.writes and not result.values.reads
 
 
 def test_unknown_scalar_carry_is_not_a_loop_invariant_branch():
