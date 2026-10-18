@@ -14,6 +14,29 @@ import types
 from pathlib import Path
 
 
+def verify_provenance(reference, official_release):
+    """Verify the measured reference and installation against the official wheel."""
+    import json
+
+    from ascendflow.diagnostics import require
+    from benchmarks.kda.run import digest
+
+    release = json.loads(official_release.read_text())
+    for path, sha256 in reference["runtime_files"].items():
+        require(digest(path) == sha256, "Triton runtime changed after profiling")
+    for relative, sha256 in reference["files"].items():
+        require(
+            digest(Path(reference["checkout"]) / relative) == sha256, "reference source changed"
+        )
+    require(
+        reference["status"] == ""
+        and reference["distribution"] == release["tag"].removeprefix("v")
+        and reference["installation"]["archive_info"]["hashes"]["sha256"] == release["sha256"]
+        and release["asset"]["digest"] == "sha256:" + release["sha256"],
+        "Triton does not match the official release or vllm-ascend checkout is modified",
+    )
+
+
 def load_reference(checkout):
     import triton
     import triton.language as tl

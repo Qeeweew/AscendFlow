@@ -104,6 +104,12 @@ receiver 都消费，release 要两个实际 reader 都贡献。少一个成员�
 consumer 前的 queue Wait。两个 AIV 的原始 lifetime edges 全部保留；配对、阶段序
 和 cell credit 仍检查合并后的实际位置，无法比较顺序或缺少参与者仍拒绝。
 
+已经完整的 quorum 还可在相同 physical stage、相同 ActorDomain body、激活域、
+坐标与边界 family 内合并前缀：逐 actor 选择最后真实 capture 和最早 acquire，
+并保留全部原始 requirements/origins。不能跨不同 C/V body 拼接前缀；后续配对、
+进展、cell lifetime 与事件资源约束仍正常生成。有限执行与缺第二 AIV 贡献的反例
+见 `tests/sync/test_quorum_prefixes.py`。
+
 ## 4. 无稳定 cell 的通知
 
 真正 streaming 地址之间没有物理 slot 可提供上述归纳。它们使用明确的有限使用

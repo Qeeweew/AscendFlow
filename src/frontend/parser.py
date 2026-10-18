@@ -68,6 +68,7 @@ _CALLS = {
     "rsqrt",
     "div",
     "load_scalar",
+    "store_scalar",
     "load_index",
     "broadcast",
     "reduce_sum",

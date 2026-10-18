@@ -249,7 +249,7 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 "native reset needs an explicit index ordinal after its references",
             )
         scalar_source = None
-        if operation.native.data in {"scale_value", "sub_value"}:
+        if operation.native.data in {"scale_value", "sub_value", "scalar_store"}:
             require(
                 len(atoms) == 1 and atoms[0] in scalar_values,
                 "native scalar operand requires a preceding actual Scalar load",

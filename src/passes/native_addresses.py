@@ -17,7 +17,7 @@ from ..diagnostics import ErrorKind, require
 from ..dialects.physical import BufferOp
 from ..dialects.source import AllocationOp, ViewOp, _constant_index
 from ..dialects.structured import AddressOp
-from ..target.native import ITEMSIZE
+from ..target.native import ITEMSIZE, nz_columns
 
 Index = int | SSAValue
 Append = Callable[[Operation], None]
@@ -189,10 +189,11 @@ def lower_address(
             unsupported=True,
         )
     if typ.layout.data == "NZ" and dimensions[0] != shape[-2]:
+        c0 = nz_columns(typ.memory.data, typ.dtype.data)
         nbytes, rows, row_stride = (
-            dimensions[0] * 16 * itemsize,
-            dimensions[1] // 16,
-            shape[-2] * 16 * itemsize,
+            dimensions[0] * c0 * itemsize,
+            dimensions[1] // c0,
+            shape[-2] * c0 * itemsize,
         )
     elif len(dimensions) == 2 and typ.layout.data == "linear" and (matrix or not contiguous):
         rows, columns = dimensions
@@ -221,7 +222,7 @@ def lower_address(
         if typ.layout.data == "NZ" and axis == len(pairs) - 1:
             physical_stride = indices.binary(arith.MuliOp, stride, shape[-2])
         elif typ.layout.data == "NZ" and axis == len(pairs) - 2:
-            physical_stride = 16 * itemsize
+            physical_stride = nz_columns(typ.memory.data, typ.dtype.data) * itemsize
         offset = indices.binary(
             arith.AddiOp, offset, indices.binary(arith.MuliOp, origin, physical_stride)
         )

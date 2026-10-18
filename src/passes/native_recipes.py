@@ -25,6 +25,7 @@ from ..dialects.source import (
     MatmulOp,
     ReduceOp,
     ScalarReadOp,
+    ScalarWriteOp,
     ScaleOp,
     ViewOp,
     WhereOp,
@@ -131,7 +132,9 @@ def strided_b_width(op):
     width = source_allocation(op.source).ref.type.shape.data[-2].data
     # Load3D handles this strided zN rectangle in one instruction. Complete
     # planes and one-fractal dimensions keep their existing Load2D recipe.
-    return width if 16 < rows < width and cols > 16 else None
+    return (
+        width if (16 < rows < width and cols > 16) or op.source.type.dtype.data == "f32" else None
+    )
 
 
 def compact_a_width(op):
@@ -142,6 +145,8 @@ def compact_a_width(op):
     ):
         return None
     rows, _ = source_shape(op.source)
+    if op.source.type.dtype.data == "f32":
+        return source_allocation(op.source).ref.type.shape.data[-2].data
     return (
         rows
         if rows > 16 and source_allocation(op.source).ref.type.shape.data[-2].data == rows
@@ -175,10 +180,20 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
         )
     elif banks in {("L1", "L0A"), ("L1", "L0B")}:
         transpose = op.transpose is not None and op.transpose.data
-        native = "load2d_a" if banks[1] == "L0A" else "load2d_b_nt" if transpose else "load2d_b_nn"
+        native = (
+            ("load2d_a_t" if transpose else "load2d_a")
+            if banks[1] == "L0A"
+            else "load2d_b_nt"
+            if transpose
+            else "load2d_b_nn"
+        )
         if context.load3d_b_width is not None and strided_b_width(op) == context.load3d_b_width:
             native = "load3d_b_nn"
-        if context.load3d_a_width is not None and compact_a_width(op) == context.load3d_a_width:
+        if (
+            not transpose
+            and context.load3d_a_width is not None
+            and compact_a_width(op) == context.load3d_a_width
+        ):
             native = "load3d_a"
         task = context.emit(
             "_copy",
@@ -546,6 +561,13 @@ def lower_scalar_read(op: ScalarReadOp, context: RecipeContext) -> RecipeResult:
     task = context.emit("_capture", "scalar_load", context.view(op.source))
     require(task.value is not None, "native Scalar reader must produce its actual f32 SSA value")
     return RecipeResult((task,), task, None, (NativeRead(0, task, 0),), task.value)
+
+
+def lower_scalar_write(
+    op: ScalarWriteOp, context: RecipeContext, *, value: SSAValue
+) -> RecipeResult:
+    task = context.emit("_store", "scalar_store", context.view(op.destination), operands=(value,))
+    return RecipeResult((task,), task, 0, ())
 
 
 def lower_index_read(op: IndexReadOp, context: RecipeContext, *, minimum, maximum) -> RecipeResult:

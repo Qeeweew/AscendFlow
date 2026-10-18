@@ -23,6 +23,12 @@ CAPACITY = {
 
 ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2, "u8": 1, "i64": 8}
 
+
+def nz_columns(bank, dtype):
+    """L1 NZ uses one 32-byte C0; FP32 L0C keeps its 16-column fractal."""
+    return 32 // ITEMSIZE[dtype] if bank == "L1" else 16
+
+
 _CMP_KINDS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 _MASKED_UNARY = frozenset({"mask_muls", "mask_adds", "mask_exp", "mask_rsqrt", "mask_sqrt"})
 _MASKED_ELEMENTS = frozenset(
@@ -135,6 +141,9 @@ def native_read_resets(native: str, params: tuple[int, ...]) -> tuple[NativeRead
 
 
 def implicit_completion(task: NativeInstruction) -> bool:
+    if task.native == "scalar_store":
+        # Ordered Scalar issue does not publish the UB write to Vector.
+        return False
     if task.pipe in IMPLICIT_COMPLETION:
         return True
     if task.pipe != "M":
@@ -163,6 +172,22 @@ def native_contract(
         "native contract needs static NativeGeometry operands",
     )
     if native in {"load3d_a", "load3d_b_nn"}:
+        if refs and refs[0].dtype == "f32":
+            require(len(params) == 2, "FP32 Load3D requires matrix dimensions")
+            rows, cols = params
+            require(
+                all(16 <= d <= 256 and d % 16 == 0 for d in params)
+                and len(refs) == 2
+                and refs[1].dtype == "f32"
+                and (refs[0].bank, refs[1].bank) == ("L1", "L0A" if native == "load3d_a" else "L0B")
+                and (refs[0].layout, refs[1].layout)
+                == ("NZ", "ZZ" if native == "load3d_a" else "ZN")
+                and refs[0].total_nbytes == refs[1].total_nbytes == rows * cols * 4
+                and refs[0].contiguous
+                and refs[1].contiguous,
+                "FP32 Load3D requires complete compact f32 fractal planes",
+            )
+            return "MTE1", ("R", "W")
         # Complete b16 matrix, unit filters/strides, zero padding. Layout and
         # byte footprints are identical to the corresponding audited Load2D.
         return native_contract(
@@ -294,6 +319,17 @@ def native_contract(
             "Scalar load requires one f32 UB or floating GM element",
         )
         return "S", ("R",)
+    if native == "scalar_store":
+        require(
+            len(refs) == 1
+            and banks == ("UB",)
+            and dtypes == ("f32",)
+            and layouts == ("linear",)
+            and lengths == (4,)
+            and not params,
+            "Scalar store requires one f32 UB element",
+        )
+        return "S", ("W",)
     if native == "index_load":
         require(
             len(refs) == 1
@@ -484,8 +520,8 @@ def native_contract(
         rows, cols = params
         require(
             1 <= rows <= 255
-            and 64 <= cols <= 1024
-            and cols % 64 == 0
+            and 8 <= cols <= 1024
+            and (cols % 64 == 0 or cols < 64 and cols % 8 == 0)
             and len(refs) == 3
             and banks == ("UB",) * 3
             and dtypes == ("f32",) * 3
@@ -712,7 +748,7 @@ def native_contract(
             "padded ND2NZ needs exact GM rows and a complete b16 NZ destination",
         )
         return "MTE2", ("R", "W")
-    if native in {"nd2nz", "load2d_a", "load2d_b_nt", "load2d_b_nn"}:
+    if native in {"nd2nz", "load2d_a", "load2d_a_t", "load2d_b_nt", "load2d_b_nn"}:
         require(len(params) == 2, "matrix DMA requires (rows, columns)")
         rows, cols = params
         require(
@@ -723,8 +759,10 @@ def native_contract(
         )
         require(
             len(refs) == 2
-            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
-            and lengths == (rows * cols * 2,) * 2,
+            and dtypes[0]
+            == dtypes[1]
+            in ({"f16", "bf16", "f32"} if native in {"nd2nz", "load2d_b_nt"} else {"f16", "bf16"})
+            and lengths == (rows * cols * ITEMSIZE[dtypes[0]],) * 2,
             "matrix DMA must expose the full source and destination tile",
         )
         if native == "nd2nz":
@@ -732,15 +770,15 @@ def native_contract(
                 banks == ("GM", "L1")
                 and layouts == ("linear", "NZ")
                 and refs[0].rows == rows
-                and refs[0].nbytes == cols * 2
-                and refs[0].row_stride % 2 == 0
-                and cols <= refs[0].row_stride // 2
+                and refs[0].nbytes == cols * ITEMSIZE[dtypes[0]]
+                and refs[0].row_stride % ITEMSIZE[dtypes[0]] == 0
+                and cols <= refs[0].row_stride // ITEMSIZE[dtypes[0]]
                 and refs[1].contiguous,
                 "ND2NZ needs precise GM rows, legal leading dimension and compact NZ output",
             )
             return "MTE2", ("R", "W")
-        destination = "L0A" if native == "load2d_a" else "L0B"
-        layout = "ZZ" if native == "load2d_a" else "ZN"
+        destination = "L0A" if native in {"load2d_a", "load2d_a_t"} else "L0B"
+        layout = "ZZ" if native in {"load2d_a", "load2d_a_t"} else "ZN"
         source = refs[0]
         source_matches = source.contiguous or (
             native in {"load2d_a", "load2d_b_nn"}
@@ -753,7 +791,7 @@ def native_contract(
             and layouts == ("NZ", layout)
             and source_matches
             and refs[1].contiguous
-            and (native == "load2d_a" or rows * cols // 256 <= 255),
+            and (native == "load2d_a" or rows * cols * ITEMSIZE[dtypes[0]] // 512 <= 255),
             "Load2D requires complete compact fractals and a legal repeat count",
         )
         return "MTE1", ("R", "W")
@@ -771,10 +809,10 @@ def native_contract(
                 or (clear in {0, 1} if native == "mad" else 1 <= clear <= MAX_MAD_CYCLE)
             )
             and banks == ("L0A", "L0B", "L0C")
-            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and dtypes[0] == dtypes[1] in {"f16", "bf16", "f32"}
             and dtypes[2] == "f32"
             and layouts == ("ZZ", "ZN", "NZ")
-            and lengths == (m * k * 2, n * k * 2, m * n * 4)
+            and lengths == (m * k * ITEMSIZE[dtypes[0]], n * k * ITEMSIZE[dtypes[0]], m * n * 4)
             and all(r.contiguous for r in refs),
             "MAD requires exact b16 operand tiles and an f32 accumulator, without padding",
         )

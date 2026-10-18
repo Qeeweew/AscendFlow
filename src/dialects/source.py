@@ -792,10 +792,11 @@ class CopyOp(IRDLOperation):
         if transpose not in {0, 1}:
             raise VerifyException("copy transpose policy must be boolean")
         if transpose and (
-            (self.source.type.memory.data, self.destination.type.memory.data) != ("L1", "L0B")
+            self.source.type.memory.data != "L1"
+            or self.destination.type.memory.data not in {"L0A", "L0B"}
             or len(self.source.type.shape) != 2
         ):
-            raise VerifyException("transposed copy requires a complete L1→L0B matrix")
+            raise VerifyException("transposed copy requires a complete L1→L0A/L0B matrix")
         if self.zero_pad is not None and self.zero_pad.data != 1:
             raise VerifyException("copy zero padding must be explicitly enabled")
         if not copy_compatible(
@@ -1046,6 +1047,24 @@ class ReduceOp(IRDLOperation):
 
 
 @irdl_op_definition
+class ScalarWriteOp(IRDLOperation):
+    name = "npu_source.scalar_write"
+    source = operand_def(f32)
+    destination = operand_def(TensorType)
+    value = result_def(TileType)
+    traits = traits_def(AsyncEffects())
+
+    def verify_(self):
+        _verify_result(self, self.destination)
+        if (
+            self.destination.type.memory.data != "UB"
+            or self.destination.type.dtype.data != "f32"
+            or any(n.data != 1 for n in self.destination.type.shape)
+        ):
+            raise VerifyException("Scalar store requires one f32 UB element")
+
+
+@irdl_op_definition
 class ScalarReadOp(IRDLOperation):
     name = "npu_source.scalar_read"
     source = operand_def(TensorType)
@@ -1141,10 +1160,10 @@ class MatmulOp(IRDLOperation):
             raise VerifyException("matmul extents disagree")
         if (
             self.a.type.dtype != self.b.type.dtype
-            or self.a.type.dtype.data not in {"f16", "bf16"}
+            or self.a.type.dtype.data not in {"f16", "bf16", "f32"}
             or self.accumulator.type.dtype.data != "f32"
         ):
-            raise VerifyException("matmul requires b16 operands and f32 accumulator")
+            raise VerifyException("matmul requires equal floating operands and f32 accumulator")
 
 
 SOURCE = Dialect(
@@ -1167,6 +1186,7 @@ SOURCE = Dialect(
         MaskCombineOp,
         WhereOp,
         ScalarReadOp,
+        ScalarWriteOp,
         IndexReadOp,
         ScaleOp,
         MatmulOp,

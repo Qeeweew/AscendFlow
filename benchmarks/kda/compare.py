@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from ascendflow.diagnostics import require
+from benchmarks.kda.reference import verify_provenance
 from benchmarks.kda.run import digest
 
 
@@ -41,15 +42,16 @@ def read_profile(directory, backend):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ascendflow", required=True, type=Path)
-    parser.add_argument("--triton", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--official-release", required=True, type=Path)
-    args = parser.parse_args()
-    generated, ours = read_profile(args.ascendflow, "ascendflow")
-    original, theirs = read_profile(args.triton, "triton")
+def compare(ascendflow, triton, official_release):
+    generated, ours = read_profile(ascendflow, "ascendflow")
+    original, theirs = read_profile(triton, "triton")
+    modes = [
+        json.loads((directory / "metrics.json").read_text())["provenance"].get(
+            "aic_metrics", "Default"
+        )
+        for directory in (ascendflow, triton)
+    ]
+    require(modes[0] == modes[1], "profiling configurations differ")
     keys = (
         "shapes",
         "lengths",
@@ -69,8 +71,8 @@ def main():
         "device or platform differs",
     )
     require(
-        len(generated["lengths"]) >= 128 and set(generated["lengths"]) == {1},
-        "comparison requires batch>=128 single-token decode",
+        len(generated["lengths"]) > 0 and set(generated["lengths"]) == {1},
+        "comparison requires a positive batch of single-token decode",
     )
     artifact = generated["generated"]
     root = Path(artifact["directory"])
@@ -80,33 +82,32 @@ def main():
         and digest(root / f"{kernel}.so") == artifact["shared_sha256"],
         "compiled artifact changed",
     )
-    release = json.loads(args.official_release.read_text())
     reference = original["reference"]
-    for path, sha256 in reference["runtime_files"].items():
-        require(digest(path) == sha256, "Triton runtime changed after profiling")
-    for relative, sha256 in reference["files"].items():
-        require(
-            digest(Path(reference["checkout"]) / relative) == sha256, "reference source changed"
-        )
-    require(
-        reference["status"] == ""
-        and reference["distribution"] == release["tag"].removeprefix("v")
-        and reference["installation"]["archive_info"]["hashes"]["sha256"] == release["sha256"]
-        and release["asset"]["digest"] == "sha256:" + release["sha256"],
-        "Triton does not match the official release or vllm-ascend checkout is modified",
-    )
+    verify_provenance(reference, official_release)
     report = {
         "status": "passed",
-        "scope": "single-token decode; one msprof op Default collection per backend",
+        "scope": f"single-token decode; one msprof op {modes[0]} collection per backend",
+        "aic_metrics": modes[0],
         "ascendflow": ours,
         "triton": theirs,
         "speedup": theirs["kernel_us"] / ours["kernel_us"],
         "configuration": {key: generated[key] for key in keys},
         "physical_device": generated["health"]["physical_device"],
         "reference": reference,
-        "official_release": str(args.official_release.resolve()),
-        "official_release_sha256": digest(args.official_release),
+        "official_release": str(official_release.resolve()),
+        "official_release_sha256": digest(official_release),
     }
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ascendflow", required=True, type=Path)
+    parser.add_argument("--triton", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--official-release", required=True, type=Path)
+    args = parser.parse_args()
+    report = compare(args.ascendflow, args.triton, args.official_release)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(

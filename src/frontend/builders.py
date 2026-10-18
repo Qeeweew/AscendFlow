@@ -31,6 +31,7 @@ from ..dialects.source import (
     ProgramOp,
     ReduceOp,
     ScalarReadOp,
+    ScalarWriteOp,
     ScaleOp,
     SizeOp,
     StageOp,
@@ -1199,10 +1200,11 @@ def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
     )
     if transpose:
         require(
-            (src.buffer.memory, dst.buffer.memory) == ("L1", "L0B")
+            src.buffer.memory == "L1"
+            and dst.buffer.memory in {"L0A", "L0B"}
             and len(src.shape) == 2
             and valid is None,
-            "transposed copy currently requires a complete L1→L0B matrix",
+            "transposed copy requires a complete L1→L0A/L0B matrix",
         )
     require(
         copy_compatible(
@@ -1651,6 +1653,16 @@ def load_scalar(source):
     return _Scalar(op.value)
 
 
+def store_scalar(value, *, out):
+    require(isinstance(value, _Scalar), "store_scalar requires a loaded f32 scalar")
+    dst = _view(out).bound()
+    require(dst.buffer.op.access.data != "read", "store_scalar requires writable storage")
+    op = ScalarWriteOp.build(operands=[value.value, dst.emit()], result_types=[_tile(dst)])
+    _trace().add(op)
+    _trace().record(op.value)
+    return _Value(dst, op.value)
+
+
 def load_index(source, *, minimum=0, maximum):
     src = _view(source)
     require(
@@ -1735,9 +1747,9 @@ def _matmul(a, b, accumulator, *, initialize):
     require(k == bk and cv.shape == (m, n), "matmul matrix extents do not agree")
     require(
         av.buffer.dtype == bv.buffer.dtype
-        and av.buffer.dtype in {f16, bf16}
+        and av.buffer.dtype in {f16, bf16, f32}
         and cv.buffer.dtype == f32,
-        "matmul requires b16 operands and f32 accumulator",
+        "matmul requires equal floating operands and f32 accumulator",
     )
     initialization = _predicate(initialize)
     inputs = [a, b] if initialize is True else [a, b, accumulator]

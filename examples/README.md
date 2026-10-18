@@ -44,6 +44,10 @@ python -m ascendflow --input examples/cv/nested.py --entry nested_cv --shared --
 [整块合同](../docs/operators/dense-gemm.md)。FA 的 runtime Sq/Sk、workspace、
 数值边界与限制见[FA 合同](../docs/operators/flash-attention.md)。
 
+KDA 使用专用多阶段构建与对照 runner，尚未纳入上表的统一示例检查：
+[decode](../docs/operators/kda.md) 提供 batch 1–64 的 Triton 性能矩阵；
+[prefill](../docs/operators/kda-prefill.md) 包括 IEEE FP32 Cube、块逆及混合流水。
+
 当前逐项编译/运行证据见[示例验证](../docs/reports/examples.md)。性能仅测默认
 Flash Attention 与 GEMM normal 的多 shape ACLNN 对照及 TFLOPS，见[性能报告](../docs/reports/performance.md)。
 动态 `valid=` prefix 地址等未支持形式保留在拒绝测试中，不作为 runnable example；

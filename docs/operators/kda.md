@@ -17,7 +17,7 @@ Cu 单调，区间满足 `0 <= bos <= eos <= TOKENS` 且 `eos-bos <= 1`。
 元数据在 S pipe 有序读取；没有引入新的同步协议。
 
 其他 constexpr/dtype 组合需要重新满足 UB 容量及 native 几何合同，并获得自己的设备资格。
-本页不声明 chunk/prefill 已实现或验证。[recurrent.py](../../examples/kda/recurrent.py)
+prefill 实现、精度和设备对照见 [KDA prefill](kda-prefill.md)。[recurrent.py](../../examples/kda/recurrent.py)
 保留早期 token 顺序、FP32 carry 与独立快照的源码；其 speculative 等选项未获得完整设备资格。
 
 ## 计算与流水
@@ -76,6 +76,32 @@ torch_npu 2.7.1.post10。两边使用相同 shape、dtype、seed=42 的逐字节
 - `comparison-b128.json`：验证输入、设备、官方 wheel、参考 checkout 与产物身份后生成的比较。
 
 ## 复现
+
+### batch 1–64 的 BasicInfo 矩阵
+
+同一 HEAD_GROUPS=8、BV=64、两槽三阶段政策；H=HV=32、K=V=128，每序列一 token。
+物理卡 2，1800 MHz，两边逐字节相同输入，每点每后端采集一次 BasicInfo，均通过完整数值检查。
+
+| Batch | AscendFlow (μs) | 原始 Triton (μs) | Triton / AscendFlow |
+|---:|---:|---:|---:|
+| 1 | 18.800 | 24.600 | 1.31× |
+| 2 | 20.040 | 39.200 | 1.96× |
+| 4 | 22.840 | 70.320 | 3.08× |
+| 8 | 39.420 | 136.300 | 3.46× |
+| 16 | 68.140 | 266.400 | 3.91× |
+| 32 | 115.680 | 527.360 | 4.56× |
+| 64 | 212.480 | 1050.080 | 4.94× |
+
+证据为 `build/kda/matrix-basic-b1-64-01/{matrix.json,matrix.md}` 与每个 batch 下的
+产物、输入 hash、数值记录、原始 CSV 和 comparison.json。单次采集不代表统计置信区间。
+该矩阵没有重测 batch=128。
+
+```bash
+python -m benchmarks.kda.matrix --output build/kda/matrix --physical 2 \
+  --official-release /workspace/xdsl-910b/materials/triton-official/release.json
+```
+
+### 单点比较
 
 从产品仓库执行，使用独立工作区 venv。安装的 Triton wheel 必须与官方 Release 记录匹配。
 

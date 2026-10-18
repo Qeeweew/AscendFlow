@@ -38,6 +38,7 @@ from ..analysis.structured_regions import (
 from ..analysis.structured_schedule import ActionGuard, Comparison, Placement
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import TaskOp
+from ..dialects.structured import ActorDomainOp
 from ..indexing import arguments, equivalent, nonnegative, normalize
 from ..scalar import Expr, expression, literal
 from ..target.ascend910b import Actor, Engine
@@ -603,7 +604,18 @@ def _implicit(notification, order):
     ):
         return None
     native = order.dispatch.site(source)
-    if native.engine is Engine.S and not isinstance(source.occurrence.endpoint, QueueEndpoint):
+    if native.engine is Engine.S and notification.destination_engine is Engine.S:
+        # Hierarchical issue order also orders a completed loop's Scalar
+        # memory instructions before the following Scalar access. PIPE_S is
+        # not an asynchronous queue that needs a pipe_barrier. In particular,
+        # do not materialize PIPE_S fences for a Scalar store/load through a
+        # loop output port. Publication to Vector still needs S->V below.
+        return "ordered Scalar memory instructions before later Scalar admission"
+    if (
+        native.engine is Engine.S
+        and native.implicit_completion
+        and not isinstance(source.occurrence.endpoint, QueueEndpoint)
+    ):
         return "synchronous Scalar native end before controller dispatch"
     if native.engine is notification.destination_engine and native.implicit_completion:
         return "qualified native completion before later same-engine admission"
@@ -821,6 +833,74 @@ def _quorums(notifications, order):
     return tuple(local), tuple(unresolved)
 
 
+def _quorum_prefixes(notifications, order):
+    """Share a complete quorum's capture/acquire within one physical phase.
+
+    Every actor retains its own actual source prefix and first controller
+    acquire. Activation, coordinates, boundary families and physical stages
+    must match exactly. Pairing, progress and new cell lifetimes are then
+    constructed normally for the combined original ownership requirements.
+    """
+    selected, groups = [], {}
+
+    def phase(point):
+        task = order.dispatch.site(point)
+        actor_scope = point.operation.parent_op()
+        while actor_scope is not None and not isinstance(actor_scope, ActorDomainOp):
+            actor_scope = actor_scope.parent_op()
+        return (
+            point.actor,
+            point.placement,
+            point.guard,
+            point.coordinates,
+            point.coordinate_guards,
+            point.families,
+            task.scope,
+            task.stage,
+            actor_scope if actor_scope is not None else point.operation,
+        )
+
+    for item in notifications:
+        if item.mechanism is not NotificationKind.CROSS_EVENT:
+            selected.append(item)
+            continue
+        key = (
+            item.source_engine,
+            item.destination_engine,
+            _domain_key(item),
+            tuple(phase(p) for p in sorted(item.sources, key=lambda p: p.actor.value)),
+            tuple(phase(p) for p in sorted(item.consumers, key=lambda p: p.actor.value)),
+        )
+        groups.setdefault(key, []).append(item)
+    for items in groups.values():
+        requirements = tuple(need for item in items for need in item.requirements)
+        endpoints = []
+        for source in (True, False):
+            participants = {}
+            for item in items:
+                for point in item.sources if source else item.consumers:
+                    participants.setdefault(point.actor, []).append(point)
+            endpoints.append(
+                tuple(
+                    _quorum_cube_point(points, requirements, order, source=source)
+                    for points in participants.values()
+                )
+            )
+        if any(point is None for points in endpoints for point in points):
+            selected.extend(items)
+        else:
+            selected.append(
+                replace(
+                    items[0],
+                    sources=endpoints[0],
+                    consumers=endpoints[1],
+                    requirements=requirements,
+                    origins=tuple(origin for item in items for origin in item.origins),
+                )
+            )
+    return tuple(selected)
+
+
 def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     """Consume all finite recursive needs through one capture/acquire contract.
 
@@ -893,6 +973,7 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     grouped = _group_captures(notifications, order)
     grouped = _reuse_acquisitions(grouped, order)
     grouped, quorum_issues = _quorums(grouped, order)
+    grouped = _quorum_prefixes(grouped, order)
     unresolved.extend(quorum_issues)
     selected = tuple(replace(item, name=f"notification_{i}") for i, item in enumerate(grouped))
     for item in selected:

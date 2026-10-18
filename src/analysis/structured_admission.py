@@ -16,9 +16,17 @@ from typing import TYPE_CHECKING
 from xdsl.dialects import arith
 from xdsl.ir import SSAValue
 
-from ..diagnostics import ErrorKind, require
+from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import FixConfigOp, Load3DConfigOp, TaskOp
-from ..indexing import arguments, equivalent, interval, nonnegative, normalize, polynomial
+from ..indexing import (
+    arguments,
+    domain_nonnegative,
+    equivalent,
+    interval,
+    nonnegative,
+    normalize,
+    polynomial,
+)
 from ..scalar import Expr, expression, literal, substitute
 from ..target.ascend910b import Actor
 from .native import ConditionalRead
@@ -301,15 +309,38 @@ def _covers(spans, read, frame, facts, work):
         for form in dict.fromkeys((reduced, delta)):
             # Cancellation exposes common translations; the original form
             # also retains rem ranges that polynomial expansion can obscure.
-            low, high = interval(form, frame.domains(), facts)
-            if nonnegative(expression("sub", low, start), facts) and nonnegative(
-                expression("sub", stop, expression("add", high, needed_span)), facts
-            ):
-                return True
+            try:
+                if domain_nonnegative(
+                    expression("sub", form, start), frame.domains(), facts
+                ) and domain_nonnegative(
+                    expression("sub", stop, expression("add", form, needed_span)),
+                    frame.domains(),
+                    facts,
+                ):
+                    return True
+            except CompileError as error:
+                # A candidate translation is a mathematical comparison, not
+                # a source address. A normalized division may lack a sign
+                # outside this candidate's region; it supplies no coverage.
+                # Required original-address definedness was checked by bounds.
+                if error.message != "unsigned index division has an unproven nonnegative dividend":
+                    raise
         return False
 
     for candidate in spans:
         work["coverage_checks"] += 1
+        if candidate.pitch == read.pitch and read.pitch > 0:
+            # A smaller rectangle may select some rows of a strided writer.
+            # Its holes are not reads and need no initializer. Only accept
+            # an exact, constant translation after common origins cancel;
+            # every selected row and column must stay inside the writer.
+            shift = normalize(expression("sub", read.base, candidate.base), facts).constant
+            width = candidate.width.constant
+            needed_width = read.width.constant
+            if shift is not None and width is not None and needed_width is not None and shift >= 0:
+                row, column = divmod(shift, read.pitch)
+                if row + read.rows <= candidate.rows and column + needed_width <= width:
+                    return True
         if (
             candidate.rows == read.rows
             and candidate.pitch == read.pitch
@@ -362,7 +393,26 @@ def _configurations(memory):
                 "native register configuration must execute at kernel entry",
                 operation,
             )
+            if isinstance(operation, Load3DConfigOp):
+                _require(
+                    operation.fp32 is None or operation.fp32.data == 1,
+                    "only IEEE FP32 Cube mode is supported",
+                    operation,
+                )
         for template in memory.templates:
+            float_mad = (
+                kind is Load3DConfigOp
+                and template.contract.native in {"mad", "mad_first", "mad_cycle"}
+                and template.accesses[0].address.geometry.dtype == "f32"
+            )
+            if float_mad:
+                _require(
+                    bool(matching)
+                    and matching[0].fp32 is not None
+                    and positions[matching[0]] < positions[template.operation],
+                    "FP32 MAD requires a preceding IEEE mode configuration",
+                    template.operation,
+                )
             if template.contract.native not in (
                 {"fix", "fix16"} if kind is FixConfigOp else {"load3d_a", "load3d_b_nn"}
             ):

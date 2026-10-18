@@ -15,6 +15,7 @@
 | `T.i64` | GM tensor 的 int64 元素类型；与 runtime 参数声明 `T.int64` 职责不同 |
 | `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 单个 int64 的 S 读取，返回 index SSA；inclusive 值合同不生成 clamp |
 | `T.load_scalar(view)` | f32 UB 或浮点 GM 单元素的 S 读取，返回 f32 SSA |
+| `T.store_scalar(value, out=view)` | 将已读取的 f32 SSA 写入单个 f32 UB 元素，保留真实 4 B S 写入效果 |
 | `T.broadcast(v[None,:], out=...)` / `v[:,None]` | 显式 f32 行/列展开；行展开需要 `(rows,8)` scratch |
 | `T.mul(k[None,:], v[:,None], out=..., scratch=...)` | 直接外积，保留列向量和 BRCB 行值的真实访问，不隐式复制完整列矩阵 |
 | `T.constexpr` | tile、dtype/layout、固定政策等显式特化参数 |
@@ -116,6 +117,17 @@ runtime输入的minimum/multiple支持除数正性和整除推导；非法的原
 `load_index` 的值范围可引用先前支配该读取的 index SSA；范围只对实际读取后的词法域有效，
 不是全局 host 参数，也不证明不同元数据取值互不相等。元数据在 kernel 内必须不可变。
 S 读取使用既有有序执行语义；条件 reader、异步 producer 和最后 reader 的完成仍由公共同步规则处理。
+S store→S load 按已证明的发射顺序执行，跨循环端口也不生成硬件不支持的
+`PIPE_S` barrier。Scalar 写入 UB 后交给 Vector/MTE3 仍需实际的跨管线发布；
+不能用 Scalar 读的同步返回合同替代写入完成。
+
+`N.matmul` 的 L0A/L0B 输入支持 FP16、BF16 和 FP32，累加器为 FP32。
+FP32 路径设置 IEEE 模式并建立 S→M ready，不先将操作数转成 b16/HF32。
+FP32 L1 NZ 每列组为 8 个元素；FP32 L0C 仍使用 16 列 fractal。
+当前 Load3D 配置在 kernel 入口保持不变，不支持一个 kernel 中任意切换 resident width。
+GM→L1、L1→L0 的实际 tile、转置和 FIX 写回仍满足各自 native 几何及访问合同。
+`mul/sub/div` 的行广播支持 8 的倍数且小于 64 的窄行，以及既有完整 64 列块；
+窄行按精确列数设置 Normal mask，行起点保持 32 B 对齐，scratch 仍为 `(rows,8)`。
 
 `i < min(a,b)` 保留对两边的范围限制；`max` 的已知下限和余数的数学区间不豁免
 原始 unsigned 除法的定义性。原始轴 tile 的 Euclidean digit 排列及统一循环平移可

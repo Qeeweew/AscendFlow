@@ -116,6 +116,9 @@ def native_line(task, *, pointer_renderer, generation):
         source = ptr(refs[0]).replace(f"{element}*", f"volatile {element}*")
         cast = "int64_t" if task.native == "index_load" else "float"
         return f"npu_value_{task.uid} = {cast}(*({source}));"
+    if task.native == "scalar_store":
+        destination = p[0].replace("float*", "volatile float*")
+        return f"*({destination}) = npu_value_{task.scalar_source};"
     if task.native in {"mul_columns", "add_columns", "broadcast_columns", "broadcast_rows"}:
         rows, cols = task.params
         dst = ptr(refs[-1], extra="npu_chunk * 256")
@@ -161,6 +164,16 @@ def native_line(task, *, pointer_renderer, generation):
     if task.native in {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"}:
         rows, cols = task.params
         function = task.native.removesuffix("_row_broadcast")
+        if cols < 64:
+            # Each narrow row has a 32-byte aligned origin. Mask the exact
+            # columns before repeating across rows; neither reads nor writes
+            # touch the next row's lanes or allocation padding.
+            return (
+                "asc_set_mask_norm(); "
+                f"asc_set_vector_mask(0, UINT64_C({(1 << cols) - 1})); "
+                f"asc_{function}({p[2]}, {p[0]}, {p[1]}, uint8_t({rows}), "
+                f"1, 1, 0, {cols // 8}, {cols // 8}, 1);"
+            )
         if rows < cols // 64:
             # Repeat across the columns of one row. The eight identical
             # scalar words stay fixed (block/repeat strides 0/0); the full
@@ -299,7 +312,8 @@ def native_line(task, *, pointer_renderer, generation):
                 f"(uint64_t({refs[1].total_nbytes // 32}) << 16) }}; "
                 f"asc_fill_l1({p[1]}, uint32_t(0), npu_zero); asc_sync_pipe(PIPE_MTE2); "
             )
-        if refs[0].row_stride // 2 > 65535:
+        itemsize = ITEMSIZE[refs[0].dtype]
+        if refs[0].row_stride // itemsize > 65535:
             # The hardware source leading dimension is uint16. Row-wise
             # descriptors retain exact byte effects without truncating it.
             source = ptr(refs[0], extra=f"npu_row * {refs[0].row_stride}")
@@ -312,7 +326,7 @@ def native_line(task, *, pointer_renderer, generation):
         else:
             copy = (
                 f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, {rows}, {cols}, 0, "
-                f"{refs[0].row_stride // 2}, {resident_rows}, 1, 0);"
+                f"{refs[0].row_stride // itemsize}, {resident_rows}, 1, 0);"
             )
         return setup + copy + (" }" if padded else "")
     if task.native in {"load3d_a", "load3d_b_nn"}:
@@ -333,9 +347,12 @@ def native_line(task, *, pointer_renderer, generation):
             f"for (int npu_chunk = 0; npu_chunk < {rows // 16}; ++npu_chunk) {{ "
             f"asc_copy_l12l0a({dst}, {src}, 0, {cols // 16}, {stride}, 0); }}"
         )
+    if task.native == "load2d_a_t":
+        rows, cols = task.params
+        return f"load_cbuf_to_ca({p[1]}, {p[0]}, 0, {rows * cols // 256}, 1, 0, 0, true, inc);"
     if task.native == "load2d_b_nt":
         rows, cols = task.params
-        return f"asc_copy_l12l0b({p[1]}, {p[0]}, 0, {rows * cols // 256}, 1, 0);"
+        return f"asc_copy_l12l0b({p[1]}, {p[0]}, 0, {rows * cols * ITEMSIZE[refs[0].dtype] // 512}, 1, 0);"
     if task.native == "load2d_b_nn":
         rows, cols = task.params  # B[K,N] compact zN -> L0B ZN
         src = ptr(refs[0], extra="npu_chunk * 512")

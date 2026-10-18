@@ -10,7 +10,7 @@ python -m benchmarks.profile_defaults --output build/kernel-times --physical 2
 python -m benchmarks.profile_defaults --causal --require-no-slower --output build/causal-times --physical 2
 ```
 
-`check_examples` 检查所有公开示例；`profile_defaults` 对 Flash Attention 和 GEMM normal
+`check_examples` 检查统一清单内的公开示例；`profile_defaults` 对 Flash Attention 和 GEMM normal
 固定的 10 个 shape（4 个等长非 causal FA、6 个 GEMM），分别采集 AscendFlow 与 ACLNN，
 各一次默认 msprof，计算时间、加速比和 TFLOPS。FA 两种模式都只按 1K/2K/4K/8K 正方形验收。
 `--causal` 单独采集这四个等长 causal FA shape，使用 example 中三组显式分块；
@@ -27,7 +27,9 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `vector/run_masks.py` | 通用mask示例：`--build`离线共享构建；`--artifact/--library`只校验已发布ASC/共享库/manifest，不重新编译；`--physical`按独立逻辑oracle运行 |
 | `vector/run_mask_rows.py` | 小行/列mask示例：单UB tile、`cols<hi`/`cols!=lo`/`rows>=cols-q` 三输出；同样`--build`或只校验复用`--library`，记录逐输出位精确证据 |
 | `profile.sh`、`profile_summary.py`、`artifacts.py` | msprof 应用包装、设备 task 汇总和产物身份检查 |
-| `kda/run.py`、`kda/profile.py`、`kda/compare.py` | KDA 全量数值验收、msprof op 指标、batch>=128 同输入/设备/官方 Triton wheel 身份比较；见[KDA](../docs/operators/kda.md) |
+| `kda/run.py`、`kda/profile.py`、`kda/compare.py`、`kda/matrix.py` | KDA decode 全量数值验收、BasicInfo、batch 1–64 同输入/设备/官方 Triton wheel 比较；见[decode](../docs/operators/kda.md) |
+| `kda/prefill.py`、`kda/profile_prefill.py`、`kda/compare_prefill.py` | KDA prefill 多 kernel 完整构建、独立 CPU 递推数值验收、BasicInfo 总时间及原始 Triton 对照；见[prefill](../docs/operators/kda-prefill.md) |
+| `kda/audit_prefill.py`、`gemm/run_fp32.py` | 原始 dot 两侧输入精度离线审计、FP32 Cube 随机输入设备检查 |
 | `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 | `references/` | 日常 ACLNN 适配器与独立 AscendC 参考 |
 

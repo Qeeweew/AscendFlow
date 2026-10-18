@@ -26,6 +26,7 @@ CANN 共享库。环境安装、首个 kernel、设备运行和常见错误见[�
 | 查找可运行算法及参数 | [示例目录](examples/README.md)、[GEMM](docs/operators/gemm.md)、[Flash Attention](docs/operators/flash-attention.md) |
 | 检查所有示例，比较 FA/GEMM 与 ACLNN，计算 TFLOPS | [测试与 profiling](docs/guide/testing.md) |
 | 查看当前实测结果 | [性能报告](docs/reports/performance.md)、[示例验证](docs/reports/examples.md) |
+| 实现 KDA、核对 dot 输入精度并对照 Triton | [decode 性能矩阵](docs/operators/kda.md)、[prefill](docs/operators/kda-prefill.md) |
 | 修改编译器或同步规则 | [开发入口](docs/development/README.md) |
 
 完整目录见[文档索引](docs/README.md)。安装包和命令名为 `ascendflow`；

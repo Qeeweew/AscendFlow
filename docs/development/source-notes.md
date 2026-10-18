@@ -46,6 +46,12 @@ AscendFlow 在 example 表达裁剪、对角 mask 和任务顺序，通用编译
 - GM→UB/UB→GM的burst/gap单位、L1→L0转置和Fixpipe配置以2201头文件为准；原生recipe精确effects必须涵盖内部展开。
 - ready、reader release、event credit、最终drain不是同一种里程碑。仅在原语有明确合同的情况下使用内部早读完成；默认不猜指令内部退休时间。
 - kernel初始化、控制寄存器状态及返回drain保留已有必要合同；局部循环边界不引入PIPE_ALL。
+- CANN 9.1 `asc/impl/basic_api/kernel_reg.h` 明确禁止 `PipeBarrier<PIPE_S>`。
+  同一 actor 的 S store→S load 使用已证明的有序发射，跨循环端口也不发 S barrier；
+  S 写 UB 向 Vector/MTE3 发布仍有真实跨管线通知，不能借 Scalar load 的返回完成语义省略。
+- FP32 Cube 使用 CANN 2201 的 `asc_set_fp32_mode()` 和 float MAD/Load3D 接口，
+  IEEE 配置有 S→M ready 与 ID 预留。L1 FP32 NZ 的 C0=8，L0C FP32 为 16 列；
+  设备随机 FP32 输入证据与 KDA dot 输入精度见[审计](../operators/kda-prefill-precision.md)。
 
 模型和测试共用这些硬件前提，不能反过来把图验证当成它们的独立证明。新原语或新设备行为仍需源码、CANN和必要设备证据。
 

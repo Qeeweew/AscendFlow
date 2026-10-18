@@ -398,6 +398,12 @@ class _Emitter:
                     ]
             elif isinstance(operation, Load3DConfigOp):
                 if context.family == "cube":
+                    if operation.fp32 is not None:
+                        lines += [
+                            "asc_set_fp32_mode();",
+                            "asc_sync_notify(PIPE_S, PIPE_M, event_t(0));",
+                            "asc_sync_wait(PIPE_S, PIPE_M, event_t(0));",
+                        ]
                     lines.extend(
                         line.strip()
                         for line in load3d_init((operation.a_width.data, operation.b_width.data))

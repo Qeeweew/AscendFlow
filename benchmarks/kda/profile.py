@@ -41,7 +41,7 @@ COLUMNS = {
 }
 
 
-def summarize(directory, backend="ascendflow"):
+def summarize(directory, backend="ascendflow", metrics="Default"):
     record = json.loads((directory / "device/results.json").read_text())
     require(record["status"] == "passed", "profiling runner failed numerical validation")
     kernel = (
@@ -52,6 +52,8 @@ def summarize(directory, backend="ascendflow"):
     require(set(record["results"]) == {backend}, "profile runner backend differs")
     result = {}
     for name, columns in COLUMNS.items():
+        if metrics == "BasicInfo" and name != "OpBasicInfo":
+            continue
         files = list((directory / "raw").rglob(name + ".csv"))
         require(len(files) == 1, f"expected one completed {name} CSV, found {len(files)}")
         path = files[0]
@@ -73,6 +75,7 @@ def summarize(directory, backend="ascendflow"):
         result[name] = table
     result["provenance"] = {
         "backend": backend,
+        "aic_metrics": metrics,
         "device_record": str((directory / "device/results.json").resolve()),
         "device_record_sha256": digest(directory / "device/results.json"),
         "counter_scope": "means across logical blocks; pipe ratios are not whole-device utilization",
@@ -95,6 +98,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--physical", required=True, type=int)
     parser.add_argument("--backend", choices=("ascendflow", "triton"), default="ascendflow")
+    parser.add_argument("--metrics", choices=("BasicInfo", "Default"), default="BasicInfo")
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args()
     directory = args.output.resolve()
@@ -131,12 +135,12 @@ def main():
             "--application=" + shlex.join(application),
             "--output=" + str(directory / "raw"),
             "--kernel-name=" + kernel,
-            "--aic-metrics=Default",
+            "--aic-metrics=" + args.metrics,
             "--launch-count=1",
             "--warm-up=0",
         ]
         bounded_process(command, directory / "watchdog", timeout_s=300)
-    result = summarize(directory, args.backend)
+    result = summarize(directory, args.backend, args.metrics)
     print(json.dumps(result, indent=2))
 
 

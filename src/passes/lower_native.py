@@ -51,6 +51,7 @@ from ..dialects.source import (
     ProgramOp,
     ReduceOp,
     ScalarReadOp,
+    ScalarWriteOp,
     ScaleOp,
     SizeOp,
     StageOp,
@@ -149,6 +150,9 @@ class _Lowerer:
         self.family_work = Counter()
         self.task_scopes = {}
         self.needs_fix = False
+        self.needs_fp32 = any(
+            isinstance(op, MatmulOp) and op.a.type.dtype.data == "f32" for op in source.walk()
+        )
         widths = {
             width for op in source.walk() if (width := recipes.strided_b_width(op)) is not None
         }
@@ -157,7 +161,9 @@ class _Lowerer:
             width for op in source.walk() if (width := recipes.compact_a_width(op)) is not None
         }
         self.load3d_a_width = (
-            next(iter(a_widths)) if len(a_widths) == 1 and self.load3d_b_width is not None else None
+            next(iter(a_widths))
+            if len(a_widths) == 1 and (self.load3d_b_width is not None or self.needs_fp32)
+            else None
         )
         self.needs_load3d = False
         self.work = Counter(source_operations=0, native_templates=0, expanded_iterations=0)
@@ -343,6 +349,8 @@ class _Lowerer:
         elif isinstance(op, ScalarReadOp):
             result = recipes.lower_scalar_read(op, context)
             scope.values[op.value] = result.scalar_value
+        elif isinstance(op, ScalarWriteOp):
+            result = recipes.lower_scalar_write(op, context, value=self.scalar(op.source, scope))
         elif isinstance(op, IndexReadOp):
             result = recipes.lower_index_read(
                 op,
@@ -411,6 +419,7 @@ class _Lowerer:
                 ElementOp,
                 ReduceOp,
                 ScalarReadOp,
+                ScalarWriteOp,
                 IndexReadOp,
                 ScaleOp,
                 CompareOp,
@@ -659,7 +668,8 @@ def lower_native_structure(source) -> NativeStructure:
             Load3DConfigOp.build(
                 attributes={
                     "a_width": IntAttr(lowerer.load3d_a_width or 1),
-                    "b_width": IntAttr(lowerer.load3d_b_width),
+                    "b_width": IntAttr(lowerer.load3d_b_width or 1),
+                    **({"fp32": IntAttr(1)} if lowerer.needs_fp32 else {}),
                 }
             ),
             core,

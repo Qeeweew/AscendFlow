@@ -18,10 +18,10 @@ from xdsl.ir import SSAValue
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import BufferOp, MixedOp
-from ..indexing import domain_nonnegative, equivalent, interval, normalize, polynomial
+from ..indexing import domain_nonnegative, equivalent, normalize, polynomial
 from ..scalar import Expr, Fact, expression, infer, literal
 from ..target.ascend910b import Actor, Engine
-from ..target.native import CAPACITY, ITEMSIZE
+from ..target.native import CAPACITY, ITEMSIZE, nz_columns
 from .structured_addresses import AddressFacts, StructuredAddresses
 from .structured_control import ControlFrame
 from .structured_memory import NativeMemoryFacts
@@ -190,7 +190,7 @@ def _original_view(address: AddressFacts, facts):
         if geometry.layout == "NZ" and axis == len(pairs) - 1:
             physical_stride = expression("mul", stride, axes.extents[-2])
         elif geometry.layout == "NZ" and axis == len(pairs) - 2:
-            physical_stride = literal(16 * itemsize)
+            physical_stride = literal(nz_columns(geometry.bank, geometry.dtype) * itemsize)
         base = expression("add", base, expression("mul", origin, physical_stride))
         stride = expression("mul", stride, extent)
     expected = expression("add", base, literal(axes.displacement))
@@ -259,10 +259,11 @@ def _original_view(address: AddressFacts, facts):
             kind=ErrorKind.UNSUPPORTED,
         )
         if geometry.layout == "NZ" and axes.widths[-2] != extents[0]:
+            c0 = nz_columns(geometry.bank, geometry.dtype)
             return (
-                axes.widths[-2] * 16 * itemsize,
-                axes.widths[-1] // 16,
-                extents[0] * 16 * itemsize,
+                axes.widths[-2] * c0 * itemsize,
+                axes.widths[-1] // c0,
+                extents[0] * c0 * itemsize,
             )
         return width * rows, 1, 0
     return width, rows, pitch
@@ -374,12 +375,17 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
             for domain in domains:
                 domain_contracts += 1
                 checker.check_axes(address, domain)
-                lower, upper = interval(address.offset, domain, facts)
                 _nonnegative(
-                    lower, facts, operation, "native byte origin may be negative", domains=domain
+                    address.offset,
+                    facts,
+                    operation,
+                    "native byte origin may be negative",
+                    domains=domain,
                 )
                 remaining = expression(
-                    "sub", allocations[address.root], expression("add", upper, literal(span))
+                    "sub",
+                    allocations[address.root],
+                    expression("add", address.offset, literal(span)),
                 )
                 _nonnegative(
                     remaining,

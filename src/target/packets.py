@@ -21,6 +21,7 @@ class MaskStep(str, Enum):
     SET_COUNT = "set-mask-from-count-argument"
     SET_FULL = "set-mask-full-f32"
     SET_PARTIALS = "set-mask-from-partials-parameter"
+    SET_COLUMNS = "set-mask-from-min64-columns-parameter"
     SET_COORD = "set-mask-bits-from-lane-predicate"
     SET_CMPMASK = "set-selection-cmpmask-from-packed-predicate"
     VECTOR_READ = "vector-read-mode-and-mask"
@@ -69,6 +70,8 @@ class NativePacket:
                 state = _MaskState(state.mode, "full", state.cmp)
             elif step is MaskStep.SET_PARTIALS:
                 state = _MaskState(state.mode, "partials", state.cmp)
+            elif step is MaskStep.SET_COLUMNS:
+                state = _MaskState(state.mode, "columns", state.cmp)
             elif step is MaskStep.SET_COORD:
                 state = _MaskState(state.mode, "coordinate", state.cmp)
             elif step is MaskStep.SET_CMPMASK:
@@ -96,6 +99,7 @@ class NativePacket:
                 MaskStep.SET_COUNT,
                 MaskStep.SET_FULL,
                 MaskStep.SET_PARTIALS,
+                MaskStep.SET_COLUMNS,
                 MaskStep.SET_COORD,
             }:
                 result.add("VECTOR_MASK")
@@ -163,15 +167,13 @@ _FULL = frozenset(
         "broadcast_columns",
         "broadcast_rows",
         "broadcast_rows64",
-        "mul_row_broadcast",
-        "sub_row_broadcast",
-        "div_row_broadcast",
         "mul_columns64",
         "fma_columns64",
         "reduce_tile_sum64",
         "reduce_tile_max64",
     }
 )
+_COLUMNS = frozenset({"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"})
 _MASKED = frozenset(
     {
         "mask_fill",
@@ -194,11 +196,13 @@ _MASK_FREE = frozenset(
         "copy",
         "copy_rows",
         "scalar_load",
+        "scalar_store",
         "index_load",
         "brcb8",
         "nd2nz",
         "nd2nz_pad",
         "load2d_a",
+        "load2d_a_t",
         "load2d_b_nt",
         "load2d_b_nn",
         "load3d_a",
@@ -274,12 +278,14 @@ def _packet(native: str) -> NativePacket | None:
             ),
             each_count_call=True,
         )
-    if native in _FULL | _PARTIAL:
+    if native in _FULL | _PARTIAL | _COLUMNS:
         return NativePacket(
             native,
             (
                 MaskStep.SET_NORMAL,
-                MaskStep.SET_FULL if native in _FULL else MaskStep.SET_PARTIALS,
+                MaskStep.SET_FULL
+                if native in _FULL
+                else (MaskStep.SET_COLUMNS if native in _COLUMNS else MaskStep.SET_PARTIALS),
                 MaskStep.VECTOR_READ,
             ),
         )
@@ -289,7 +295,8 @@ def _packet(native: str) -> NativePacket | None:
 
 
 _AUDITED = {
-    native: _packet(native) for native in _COUNT | _FULL | _MASKED | _SELECT | _PARTIAL | _MASK_FREE
+    native: _packet(native)
+    for native in _COUNT | _FULL | _COLUMNS | _MASKED | _SELECT | _PARTIAL | _MASK_FREE
 }
 
 

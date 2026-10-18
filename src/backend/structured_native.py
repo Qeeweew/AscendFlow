@@ -106,7 +106,9 @@ def format_native(template, *, render, roots, task_names, generation):
     count = len(operation.refs) if count is None else count.data
     atoms = tuple(operation.refs[count:])
     scalar_source = (
-        atoms[0].owner if operation.native.data in {"scale_value", "sub_value"} else None
+        atoms[0].owner
+        if operation.native.data in {"scale_value", "sub_value", "scalar_store"}
+        else None
     )
     program = None
     if "nodes" in operation.attributes:

@@ -490,6 +490,71 @@ def domain_nonnegative(expr, domains, facts):
     Follow that value's earlier range only when its sign is needed; eagerly
     replacing every bound would lose relations such as end >= begin.
     """
+    # Eliminate affine coordinates from the innermost lexical range first.
+    # Independent intervals of start and row lose row < length <= T-start.
+    # A substitution is monotone only when this coordinate occurs as one
+    # linear term, with no hidden occurrence inside another polynomial atom.
+    current = expr
+    ordered = tuple(reversed(domains))
+
+    def replace_coordinate(terms, coordinate, lower, upper):
+        axis = polynomial(coordinate, facts, retained=True)
+        variables = {term: c for term, c in axis.items() if term}
+        if not variables or any(len(term) != 1 or term[0].kind != "argument" for term in variables):
+            return None
+        ratios = {_ratio(terms.get(term, 0), c) for term, c in variables.items()}
+        if len(ratios) != 1:
+            return None
+        (coefficient,) = ratios
+        if not coefficient or coefficient.denominator != 1:
+            return None
+        remainder = _sum(terms, _scale(axis, -coefficient))
+        if any(arguments(atom) & arguments(coordinate) for term in remainder for atom in term):
+            return None
+        bound = lower if coefficient > 0 else upper
+        return expression(
+            "add", _to_expr(remainder), expression("mul", literal(int(coefficient)), bound)
+        )
+
+    for position, (coordinate, lower, upper) in enumerate(ordered):
+        if nonnegative(current, facts):
+            return True
+        terms = polynomial(current, facts, retained=True)
+        # One min/max inequality may remove a correlated coordinate before
+        # ordinary extrema are taken (T-start-min(BT,T-start), for example).
+        # This is a single linear bound, never a recursive case search.
+        if all(c.denominator == 1 and len(term) <= 1 for term, c in terms.items()):
+            for term, coefficient in terms.items():
+                if len(term) != 1:
+                    continue
+                (atom,) = term
+                if not (
+                    atom.kind == "min" and coefficient < 0 or atom.kind == "max" and coefficient > 0
+                ):
+                    continue
+                remainder = _sum(terms, {term: -coefficient})
+                for bound in atom.args:
+                    candidate = _to_expr(
+                        _sum(
+                            remainder, _scale(polynomial(bound, facts, retained=True), coefficient)
+                        )
+                    )
+                    if nonnegative(interval(candidate, domains, facts)[0], facts):
+                        return True
+        # The induction range immediately precedes its derived zero-based
+        # ordinal range. Prefer the real induction when lower != 0; its
+        # exact upper bound avoids losing the active-loop relation to max(0,count).
+        replacement = None
+        if coordinate.kind == "argument" and position + 1 < len(ordered):
+            candidate = ordered[position + 1]
+            if candidate[0].kind != "argument" and arguments(coordinate) <= arguments(candidate[0]):
+                replacement = replace_coordinate(terms, *candidate)
+        if replacement is None:
+            replacement = replace_coordinate(terms, coordinate, lower, upper)
+        if replacement is not None:
+            current = replacement
+    if nonnegative(current, facts):
+        return True
     seen = set()
     for _ in range(len(domains) + 2):
         if nonnegative(expr, facts):
@@ -522,9 +587,12 @@ def check_axis(origin, width, extent, domains, facts):
             )
 
     divisions(origin)
-    lower, upper = interval(origin, domains, facts)
-    require(domain_nonnegative(lower, domains, facts), "logical axis origin may be negative")
-    remaining = expression("sub", extent, expression("add", upper, literal(width)))
+    lower, _ = interval(origin, domains, facts)
+    require(
+        domain_nonnegative(origin, domains, facts) or domain_nonnegative(lower, domains, facts),
+        "logical axis origin may be negative",
+    )
+    remaining = expression("sub", extent, expression("add", origin, literal(width)))
     require(
         domain_nonnegative(remaining, domains, facts),
         "logical axis access is not bounded by its tensor extent",

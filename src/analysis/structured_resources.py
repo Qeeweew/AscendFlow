@@ -93,6 +93,12 @@ class _EventBanks:
                 self.reservations.append(
                     EventReservation(bank, 0, "native configuration packet notify/wait", operation)
                 )
+                if isinstance(operation, Load3DConfigOp) and operation.fp32 is not None:
+                    precision_bank = (Actor.AIC, Engine.S, Engine.M)
+                    self.occupied.setdefault(precision_bank, {})[0] = [None]
+                    self.reservations.append(
+                        EventReservation(precision_bank, 0, "IEEE FP32 Cube mode", operation)
+                    )
         for task in self.domains.dispatch.tasks.values():
             if task.engine is Engine.S:
                 continue

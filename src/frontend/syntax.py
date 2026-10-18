@@ -191,6 +191,11 @@ def load_scalar(source):
     _ast_only()
 
 
+def store_scalar(value, *, out):
+    """Store a loaded f32 scalar to one UB element through the ordered S pipe."""
+    _ast_only()
+
+
 def load_index(source, *, minimum=0, maximum):
     """Read one immutable GM int64 with an inclusive input value contract.
 

@@ -108,6 +108,7 @@ class Load3DConfigOp(IRDLOperation):
     name = "npu.init_load3d"
     a_width = attr_def(IntAttr)
     b_width = attr_def(IntAttr)
+    fp32 = opt_attr_def(IntAttr)
     traits = traits_def(AsyncEffects())
 
 
