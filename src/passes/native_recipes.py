@@ -15,21 +15,37 @@ from ..diagnostics import require
 from ..dialects.physical import TaskOp
 from ..dialects.source import (
     AllocationOp,
+    CompareOp,
     CopyOp,
     ElementOp,
-    FillUpperOp,
+    MaskCombineOp,
+    MaskOp,
+    MaterializeMaskOp,
     MatmulOp,
     ReduceOp,
     ScalarReadOp,
     ScaleOp,
     ViewOp,
+    WhereOp,
     block8_reduction_widths,
     copy_compatible,
+    mask_chunks,
+)
+from ..mask import (
+    MASK_REPEAT_POLICY,
+    Program,
+    iteration_strategy,
+    scalar_operand_count,
+    word_strategy,
 )
 
 
 class SourceView(Protocol):
     def __call__(self, value: SSAValue, *, matrix: bool = False) -> SSAValue: ...
+
+
+class ScalarOperand(Protocol):
+    def __call__(self, value: SSAValue) -> SSAValue: ...
 
 
 class PhysicalSubview(Protocol):
@@ -53,6 +69,11 @@ class NativeEmitter(Protocol):
         params: tuple[int, ...] = (),
         scalar: float = 0.0,
         order_delta: int = 0,
+        operands: tuple[SSAValue, ...] = (),
+        mask: Program | None = None,
+        mask_word: str | None = None,
+        mask_repeat: str | None = None,
+        mask_layout: str | None = None,
     ) -> TaskOp: ...
 
 
@@ -61,6 +82,7 @@ class RecipeContext:
     view: SourceView
     subview: PhysicalSubview
     emit: NativeEmitter
+    operand: "ScalarOperand | None" = None
     load3d_b_width: int | None = None
     load3d_a_width: int | None = None
 
@@ -244,6 +266,9 @@ def lower_element(op: ElementOp, context: RecipeContext) -> RecipeResult:
         require(source_dtype != destination_dtype, "identity cast needs no conversion operation")
         native = "convert_f32" if destination_dtype == "f32" else "convert_rn"
     require(native is not None, f"unsupported typed element operation {op.kind.data}")
+    if op.mask is not None:
+        return lower_masked_element(op, context, native)
+    require(op.scratch is None, "scratch requires a data predicate or row broadcast")
     refs = [context.view(value) for value in (*op.inputs, op.destination)]
     task = context.emit(
         "_" + op.kind.data,
@@ -257,6 +282,173 @@ def lower_element(op: ElementOp, context: RecipeContext) -> RecipeResult:
         len(op.inputs),
         tuple(NativeRead(i, task, i) for i in range(len(op.inputs))),
     )
+
+
+@dataclass(frozen=True)
+class MaskInfo:
+    """One resolved predicate operand, before native selection."""
+
+    materialized: bool
+    shape: tuple[int, ...]
+    chunks: int
+    program: Program | None = None
+    scalars: tuple[SSAValue, ...] = ()
+
+
+def resolve_mask(value, context):
+    require(context.operand is not None, "predicate lowering needs actual scalar bindings")
+    producer = value.owner
+    if isinstance(producer, MaskOp):
+        program = producer.program()
+        count = scalar_operand_count(program.nodes)
+        require(count == len(producer.scalars), "predicate scalar atoms lost their operands")
+        scalars = tuple(context.operand(item) for item in producer.scalars)
+        return MaskInfo(False, program.shape, program.lanes // 64, program, scalars)
+    if isinstance(producer, (CompareOp, MaterializeMaskOp, MaskCombineOp)):
+        shape = source_shape(value)
+        return MaskInfo(True, shape, mask_chunks(shape))
+    require(False, "mask operand lost its symbolic or materialized producer")
+    raise AssertionError("unreachable")
+
+
+def lower_masked_element(op: ElementOp, context: RecipeContext, native: str) -> RecipeResult:
+    info = resolve_mask(op.mask, context)
+    scalar = 0.0 if op.scalar is None else op.scalar.value.data
+    inputs = tuple(context.view(value) for value in op.inputs)
+    destination = context.view(op.destination)
+    if not info.materialized:
+        task = context.emit(
+            "_" + op.kind.data,
+            "mask_" + native,
+            *inputs,
+            destination,
+            scalar=scalar,
+            operands=info.scalars,
+            mask=info.program,
+            mask_word=word_strategy(info.program),
+            mask_repeat=MASK_REPEAT_POLICY,
+            mask_iteration=iteration_strategy(info.program),
+        )
+        return RecipeResult(
+            (task,),
+            task,
+            len(inputs),
+            tuple(NativeRead(i, task, i) for i in range(len(inputs))),
+        )
+    require(op.scratch is not None, "data-predicate update needs an explicit scratch tile")
+    scratch = context.view(op.scratch)
+    compute = context.emit(
+        "_" + op.kind.data,
+        native,
+        *inputs,
+        scratch,
+        scalar=scalar,
+    )
+    select = context.emit(
+        "_select",
+        "select_masked_update",
+        context.view(op.mask_storage),
+        scratch,
+        destination,
+        params=(info.chunks,),
+        order_delta=1,
+        mask_layout="packed32_block_read",
+    )
+    readers = tuple(NativeRead(i, compute, i) for i in range(len(inputs))) + (
+        NativeRead(len(inputs), select, 0),
+    )
+    return RecipeResult((compute, select), select, 2, readers)
+
+
+def lower_compare(op: CompareOp, context: RecipeContext) -> RecipeResult:
+    shape = source_shape(op.source)
+    chunks = mask_chunks(shape)
+    scalar = 0.0 if op.scalar is None else op.scalar.value.data
+    native = ("compare_" if op.other is not None else "compare_scalar_") + op.kind.data
+    refs = [context.view(op.source)]
+    if op.other is not None:
+        refs.append(context.view(op.other))
+    out_index = len(refs)
+    block = context.view(op.out)
+    # Packed padding is initialized by real declared work: one count-mode
+    # Vector Dup over the whole 32-byte block. The compare then writes only
+    # the 64-bit lane word, so the same-Vector WAW between the two actual
+    # tasks is a required dependency of ordinary analysis, not a hidden store
+    # or an emitter barrier.
+    zero = context.emit("_mask_zero", "mask_zero", block, params=(chunks * 16,))
+    refs.append(block)
+    task = context.emit(
+        "_compare",
+        native,
+        *refs,
+        params=(chunks,),
+        scalar=scalar,
+        order_delta=1,
+        mask_layout="packed32_zeroed",
+    )
+    return RecipeResult(
+        (zero, task),
+        task,
+        out_index,
+        tuple(NativeRead(i, task, i) for i in range(out_index)),
+    )
+
+
+def lower_materialize_mask(op: MaterializeMaskOp, context: RecipeContext) -> RecipeResult:
+    producer = op.mask.owner
+    require(isinstance(producer, MaskOp), "materialization lost its symbolic program")
+    program = producer.program()
+    require(scalar_operand_count(program.nodes) == len(producer.scalars), "lost predicate scalars")
+    scalars = tuple(context.operand(item) for item in producer.scalars)
+    chunks = mask_chunks(program.shape)
+    task = context.emit(
+        "_mask_bits",
+        "mask_bits",
+        context.view(op.out),
+        params=(chunks,),
+        operands=scalars,
+        mask=program,
+        mask_word=word_strategy(program),
+    )
+    return RecipeResult((task,), task, 0, ())
+
+
+def lower_mask_combine(op: MaskCombineOp, context: RecipeContext) -> RecipeResult:
+    shape = source_shape(op.result)
+    chunks = mask_chunks(shape)
+    refs = [context.view(op.lhs_storage)]
+    if op.rhs_storage is not None:
+        refs.append(context.view(op.rhs_storage))
+    out_index = len(refs)
+    refs.append(context.view(op.out))
+    task = context.emit(
+        "_mask_" + op.kind.data,
+        "mask_" + op.kind.data,
+        *refs,
+        params=(chunks * 16,),
+    )
+    return RecipeResult(
+        (task,),
+        task,
+        out_index,
+        tuple(NativeRead(i, task, i) for i in range(out_index)),
+    )
+
+
+def lower_where(op: WhereOp, context: RecipeContext) -> RecipeResult:
+    shape = source_shape(op.destination)
+    chunks = mask_chunks(shape)
+    task = context.emit(
+        "_select",
+        "select_masked",
+        context.view(op.mask_storage),
+        context.view(op.x),
+        context.view(op.y),
+        context.view(op.destination),
+        params=(chunks,),
+        mask_layout="packed32_block_read",
+    )
+    return RecipeResult((task,), task, 3, (NativeRead(0, task, 0),))
 
 
 def lower_reduce(op: ReduceOp, context: RecipeContext) -> RecipeResult:
@@ -334,26 +526,13 @@ def lower_scale(op: ScaleOp, context: RecipeContext, *, factor: SSAValue) -> Rec
         source_allocation(op.destination).access.data != "read", "scale writes a read-only buffer"
     )
     task = context.emit(
-        "_scale", "scale_value", context.view(op.source), context.view(op.destination), factor
+        "_scale",
+        "scale_value",
+        context.view(op.source),
+        context.view(op.destination),
+        operands=(factor,),
     )
     return RecipeResult((task,), task, 1, (NativeRead(0, task, 0),))
-
-
-def lower_fill_upper(op: FillUpperOp, context: RecipeContext, *, row_start, col_start):
-    require(
-        source_allocation(op.destination).access.data != "read",
-        "upper fill writes a read-only buffer",
-    )
-    task = context.emit(
-        "_fill_upper",
-        "fill_upper",
-        context.view(op.destination),
-        row_start,
-        col_start,
-        params=source_shape(op.destination),
-        scalar=op.scalar.value.data,
-    )
-    return RecipeResult((task,), task, 0, (NativeRead(0, task, 0),))
 
 
 Initialization = int | Literal["first"]

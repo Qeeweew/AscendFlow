@@ -64,9 +64,17 @@ BQ256/BM128/CK128、20 组不变。每份产物内 Sq/Sk 仍为 runtime，要求
 PV 的子循环再按实际可见列裁剪，最少保留两个 CK 槽；QK/softmax 保持完整 BK。
 读取前缀的物理 footprint 不变，GM 槽由实际最后 reader 释放。
 
-score 缩放后、reduce_max 前调用通用 `N.fill_upper` 将 `j>i` 的 FP32 lane
-填为负无穷。全可见块不触碰向量 mask，全不可见块整片填充，部分可见块按行设置 mask；
-有填充的路径恢复普通全 mask 状态。它仍是需要初始化的读写操作，不是隐藏 mask workspace。
+score 缩放后、reduce_max 前用普通逻辑lane坐标表达causal条件
+`(kv*BK + c) > (query_row + g + r)`，并调用通用masked `N.fill` 将选中lane
+填为负无穷。编译器按目标64-lane块计算局部bitmap：全不可见块跳过native，全可见块
+合并repeat，部分可见块使用自己的bitmap；不为三角条件设置专用opcode或native。
+该条件的lane系数为±1，word由有符号128位区间一次算出（不做二分搜索）。emit出的
+affine重放还按当前runtime标量计算整块保守区间：全可见块直接发全1 bitmap的repeat
+运行、全不可见块不发element调用；区间不能判定时，单个±1 lane系数的比较按逻辑行
+用裁剪prefix/suffix区间发出（每行最多leading partial + ≤255 repeat full运行 +
+trailing partial），不再逐64-lane块扫描。这些都是通用affine事实，不按attention或
+shape选择路径。
+masked fill仍是需要初始化目标的读写更新，不是隐藏mask workspace。
 
 任务按 head 优先分配，根据有效 K 前缀和计算量已饱和的 query 尾段统一循环平移，
 分散长短任务。所有原始轴 bounds、owner 和双 AIV quorum 检查保留。

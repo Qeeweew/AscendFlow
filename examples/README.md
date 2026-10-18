@@ -14,6 +14,8 @@ python -m benchmarks.check_examples --output build/examples-cann
 | `scale` | [vector/scale.py](vector/scale.py) · `scale` | GM→UB→Vector→GM 双缓冲 |
 | `grouped-scale` | [vector/grouped.py](vector/grouped.py) · `grouped_scale` | runtime BNSD、循环分组、空 owner |
 | `rings` | [vector/independent_rings.py](vector/independent_rings.py) · `independent_rings` | 输入/输出独立的 5/7 槽环 |
+| `masks` | [vector/masks.py](vector/masks.py) · `masks` | interval XOR 64-lane periodic + runtime origin、masked更新、compare/where；runner按已发布shape运行 |
+| `mask-rows` | [vector/mask_rows.py](vector/mask_rows.py) · `mask_rows` | 单 tile 行/列 mask：`cols<hi` 前缀、`cols!=lo` 补集、`rows>=cols-q` 行前缀；三个独立拷贝输出 |
 | `rms` | [normalization/rms_norm.py](normalization/rms_norm.py) · `rms_normalize` | 归约、Scalar 最后读取 |
 | `softmax` | [normalization/softmax.py](normalization/softmax.py) · `softmax` | 行统计、广播 scratch、Vector 流水 |
 | `batched-gemm` | [gemm/batched.py](gemm/batched.py) · `batched_matmul` | 多级 L1/L0/MAD/FIX 环 |

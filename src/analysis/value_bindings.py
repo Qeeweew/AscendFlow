@@ -148,7 +148,9 @@ def bind_values(
         for reader in recipe.readers:
             readers.setdefault(reader.source_input, []).append(reader)
         for dependency, source_index in zip(
-            operation.dependencies, operation.dependency_inputs, strict=True
+            getattr(operation, "dependencies", ()),
+            getattr(operation, "dependency_inputs", ()),
+            strict=True,
         ):
             origin = resolve(dependency)
             matching = readers.get(source_index.data, ())

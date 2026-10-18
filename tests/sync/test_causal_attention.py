@@ -39,4 +39,5 @@ def test_causal_parent_lengths_and_slot_releases_match_actual_source(
     assert checked.bytes_read and checked.bytes_written and checked.consumptions
     assert asc.count("if ASC_IS_AIV") == 1
     assert "npu_sid ==" not in asc
-    assert sum(t.contract.native == "fill_upper" for t in final.templates) == 1
+    assert sum(t.contract.native == "mask_fill" for t in final.templates) == 1
+    assert "PIPE_ALL" not in asc

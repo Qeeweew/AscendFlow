@@ -4,11 +4,14 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType, IntAttr, ModuleOp, StringAttr, f32
 from xdsl.ir import Block
 
+from ascendflow import compile
 from ascendflow import language as N
+from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.dialects.physical import BufferOp, TaskOp, task_attrs
 from ascendflow.dialects.source import ElementOp, ReduceOp, ScalarReadOp, ScaleOp
 from ascendflow.dialects.structured import AddressOp
 from ascendflow.dialects.types import TaskType, ref_type
+from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.native_recipes import (
     RecipeContext,
     lower_element,
@@ -67,11 +70,14 @@ class Insertion:
         self.block.add_ops((byte_offset, view))
         return view.ref
 
-    def emit(self, suffix, native, *refs, params=(), scalar=0.0, order_delta=0):
+    def emit(self, suffix, native, *refs, params=(), scalar=0.0, order_delta=0, operands=()):
         task = TaskOp.create(
-            operands=refs,
+            operands=[*refs, *operands],
             result_types=[TaskType(), f32] if native == "scalar_load" else [TaskType()],
-            attributes=task_attrs(f"native{len(self.tasks)}{suffix}", native, 0, params, scalar),
+            attributes={
+                **task_attrs(f"native{len(self.tasks)}{suffix}", native, 0, params, scalar),
+                "address_count": IntAttr(len(refs)),
+            },
         )
         self.block.add_op(task)
         self.tasks.append(task)
@@ -182,6 +188,35 @@ def test_scalar_result_is_the_actual_ssa_operand_of_its_consumer():
     assert captured.definition_ref is None
     assert tuple(captured.definition.refs) == (statistic,)
     assert tuple(result.definition.refs) == (value, destination, captured.scalar_value)
+    assert result.definition.attributes["address_count"].data == 2
+    assert tuple(result.definition.refs[2:]) == (captured.scalar_value,)
     assert result.readers[0].operation is result.definition
     assert result.readers[0].ref_index == 0
     target.finish()
+
+
+def test_scale_value_segment_keeps_scalar_load_as_an_atom_not_an_address():
+    source = N.from_source("""
+        def scalar_scale(n: N.int64):
+            with N.Kernel():
+                statistic=N.alloc_ub((8,))
+                x=N.alloc_ub((64,))
+                out=N.alloc_ub((64,))
+                for i in N.Pipelined(n,stages=1):
+                    N.fill(statistic,1.0)
+                    N.fill(x,2.0)
+                    factor=N.load_scalar(statistic[:1])
+                    N.mul(x,factor,out=out)
+    """)
+    structure = lower_native_structure(source)
+    tasks = tuple(op for op in structure.module.walk() if isinstance(op, TaskOp))
+    load = next(op for op in tasks if op.native.data == "scalar_load")
+    scale = next(op for op in tasks if op.native.data == "scale_value")
+    count = scale.attributes["address_count"].data
+    assert count == 2 and len(scale.refs) == 3
+    assert tuple(scale.refs[count:]) == (load.value,)
+    memory = collect_native_memory(structure.module)
+    scale_fact = next(item for item in memory.templates if item.contract.native == "scale_value")
+    assert scale_fact.scalar_source is load
+    asc = compile(source).asc
+    assert "asc_mul_scalar" in asc

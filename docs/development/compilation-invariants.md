@@ -72,10 +72,21 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 显式补零的封闭 packet 保留 fill→MTE2 fence→ND2NZ 次序；FIXPIPE 的 dtype
 转换只改变目标元素宽度，保留 FP32 累加器的实际 fractal 读取与退休关系。
 
-三角 `fill_upper` 是已初始化矩阵的 RW 更新，不能作为整片初始化。封闭 packet
-保留未写 lane，有填充的路径退出恢复普通全向量 mask，全可见路径不触碰 mask。
-各路径独立检查封闭性；极端 signed 起点差采用无符号距离和有界饱和，不能让索引
-相减溢出或 shift-by-64。
+通用 `mask=` 更新是已初始化目标的 RW 更新，不能作为整片初始化。坐标谓词在目标
+每个64 lane计算局部bitmap：全0块不调用native、连续全1块合并repeat、部分块使用
+自己的bitmap；不发出空mask，也不把一行的bitmap复用于不同行/块。数据谓词使用
+显式packed UB存储、packet局部CMPMASK和已审计的局部`PIPE_V`。封闭packet分别
+记录Normal/Counter模式、bitmap/count含义和CMPMASK是否在包内建立；`count_end`
+只恢复Normal模式，不恢复mask位值。packed谓词块每64 lane占32 B，只有低8 B是逻辑
+位，其余24 B是有定义但不作为lane的padding；padding由真实count-mode Vector Dup
+（`mask_zero`）定义，并与mask-free packed compare形成required same-V RAW/WAW，由
+通用同步产生实际`PIPE_V`。compare目的view是保守整块`RW` preserve update：只写低8 B
+lane word，R表示保留旧padding并依赖真实initializer的ordinary read admission，不让
+单次compare单独授权未初始化packed读取。packed NOT是真实count-mode Vector `vnot`，
+engine/effects/packet与实际调用一致。不能把scalar清零或其它引擎的工作藏进声明为
+Vector的task。
+谓词按有界128位精确整数求值，极端signed起点
+不溢出、不shift-by-64；`mask=False` lane保留旧值，不构成完整定义。
 
 GM 缓存别名不创建新的物理存储身份。source 的 cache 提示随同一 root 保留到
 physical IR；bypass launcher 用目标 runtime 查询的地址别名绑定原始分配，查询

@@ -151,7 +151,7 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
         )
     logical.append(
         f'%scaled = "npu_source.element"(%score_work, %score_work) {{kind="mul_scalar", '
-        f"dependency_inputs=[], scalar={run.SCALE} : f32, operandSegmentSizes=array<i32: 1, 1, 0, 0>}} "
+        f"dependency_inputs=[], scalar={run.SCALE} : f32, operandSegmentSizes=array<i32: 1, 1, 0, 0, 0, 0, 0>}} "
         f': ({score_type}, {score_type}) -> !npu_source.tile<[#builtin.int<8>, #builtin.int<1024>], "f32">'
     )
     before = (

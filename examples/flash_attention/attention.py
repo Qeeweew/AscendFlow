@@ -238,8 +238,16 @@ def attention_target(
                                 work = score_in[row % 2, :, :]
                             N.mul(score_in[row % 2, :, :], SCALE, out=work)
                             if CAUSAL:
-                                N.fill_upper(
-                                    work, NEG_INF, row_start=query_row + g, col_start=kv * BK
+                                # Ordinary logical lane coordinates, not a
+                                # triangular primitive: lane (r, c) is masked
+                                # when its global key column is after the
+                                # query row. Work is already fully initialized.
+                                rows = N.arange(VR)[:, None]
+                                cols = N.arange(BK)[None, :]
+                                N.fill(
+                                    work,
+                                    NEG_INF,
+                                    mask=(kv * BK + cols) > (query_row + g + rows),
                                 )
                             N.reduce_max(
                                 work,

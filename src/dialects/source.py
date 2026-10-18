@@ -4,6 +4,8 @@ Logical tile results express data dependence. Their SSA identity does not
 promise asynchronous completion; lowering supplies actual physical effects.
 """
 
+from math import prod
+
 from xdsl.dialects.builtin import (
     ArrayAttr,
     DictionaryAttr,
@@ -32,7 +34,7 @@ from xdsl.irdl import (
 from xdsl.traits import IsTerminator, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
-from .types import AsyncEffects, TensorType, TileType, verify_runtime_contract
+from .types import AsyncEffects, MaskType, TensorType, TileType, verify_runtime_contract
 
 
 def _verify_yield(op):
@@ -60,6 +62,69 @@ def _verify_dependencies(op, inputs):
         typ = inputs[index.data].type
         if value.type.shape != typ.shape or value.type.dtype != typ.dtype:
             raise VerifyException("logical dependency type must match its consumed input")
+
+
+def _ints(values):
+    return ArrayAttr(IntAttr(value) for value in values)
+
+
+def _shapes(rows):
+    return ArrayAttr(_ints(row) for row in rows)
+
+
+def mask_chunks(shape):
+    """One 32-byte packed mask block per 64 f32 lanes."""
+    lanes = prod(shape)
+    if lanes % 64:
+        raise VerifyException("packed predicates need a whole 64-lane block")
+    return lanes // 64
+
+
+def _mask_storage(value):
+    """The mask allocation identity behind an explicit packed storage view."""
+    owner = value.owner
+    if not isinstance(owner, ViewOp):
+        raise VerifyException("predicate storage needs an explicit source view")
+    allocation = owner.source.owner
+    if not isinstance(allocation, AllocationOp):
+        raise VerifyException("predicate storage needs one allocation identity")
+    return allocation
+
+
+def _verify_materialized_mask(mask, storage, dependency, *, message="predicate"):
+    if isinstance(mask.owner, MaskOp):
+        raise VerifyException(f"{message} requires materialized predicate storage")
+    chunks = mask_chunks(tuple(size.data for size in mask.type.shape))
+    typ = storage.type
+    if (
+        typ.memory.data != "UB"
+        or typ.dtype.data != "u8"
+        or prod(size.data for size in typ.shape) != chunks * 32
+    ):
+        raise VerifyException(f"{message} needs exact packed 32-byte predicate blocks")
+    producer = dependency.owner
+    if not isinstance(producer, (CompareOp, MaterializeMaskOp, MaskCombineOp)):
+        raise VerifyException(f"{message} dependency must name the predicate writer")
+    if _mask_storage(storage) is not _mask_storage(producer.out):
+        raise VerifyException(f"{message} storage view does not belong to its writer")
+    return chunks
+
+
+def _verify_mask_operand(op, destination_shape):
+    """Common masked-update shape and storage contract for one element op."""
+    if op.mask is None:
+        if op.mask_storage is not None or op.mask_dependency is not None:
+            raise VerifyException("predicate storage requires an explicit mask")
+        return
+    shape = tuple(size.data for size in op.mask.type.shape)
+    if shape != tuple(destination_shape):
+        raise VerifyException("masked update needs a predicate of the destination shape")
+    materialized = not isinstance(op.mask.owner, MaskOp)
+    if materialized != (op.mask_storage is not None and op.mask_dependency is not None):
+        raise VerifyException("materialized predicates need explicit storage and dependence")
+    if not materialized:
+        return
+    _verify_materialized_mask(op.mask, op.mask_storage, op.mask_dependency)
 
 
 def copy_compatible(source, destination, *, transpose=False, zero_pad=False):
@@ -158,7 +223,9 @@ class AllocationOp(IRDLOperation):
         if (
             not typ.shape
             or any(n.data == 0 or n.data < -1 for n in typ.shape)
-            or typ.dtype.data not in {"f16", "bf16", "f32"}
+            or typ.dtype.data not in {"f16", "bf16", "f32", "u8"}
+            or typ.dtype.data == "u8"
+            and typ.memory.data != "UB"
             or typ.memory.data not in {"GM", "UB", "L1", "L0A", "L0B", "L0C"}
             or typ.layout.data not in {"linear", "NZ", "ZZ", "ZN"}
         ):
@@ -502,6 +569,204 @@ class PredicateOp(IRDLOperation):
 
 
 @irdl_op_definition
+class MaskOp(IRDLOperation):
+    """An exact boolean predicate over logical lane coordinates.
+
+    The program's leaves are static constants, uniform index SSA operands and
+    lane coordinates of the predicate's own static lane domain. It is a
+    symbolic value: materialization needs explicit packed UB storage.
+    """
+
+    name = "npu_source.mask"
+    scalars = var_operand_def(IndexType)
+    shape = attr_def(ArrayAttr[IntAttr])
+    node_shapes = attr_def(ArrayAttr[ArrayAttr[IntAttr]])
+    nodes = attr_def(ArrayAttr[ArrayAttr[IntAttr]])
+    value = result_def(MaskType)
+
+    def program(self):
+        from ..mask import MaskError, Node, Program, scalar_operand_count
+
+        nodes = tuple(
+            Node(row.data[0].data, tuple(value.data for value in row.data[1:]))
+            for row in self.nodes
+        )
+        shape = tuple(value.data for value in self.shape)
+        shapes = tuple(tuple(value.data for value in row) for row in self.node_shapes)
+        try:
+            program = Program(shape, shapes, nodes)
+            count = scalar_operand_count(nodes)
+        except MaskError as error:
+            raise VerifyException(str(error)) from error
+        if count != len(self.scalars):
+            raise VerifyException("predicate scalar atom count must equal its operand list")
+        return program
+
+    def verify_(self):
+        program = self.program()
+        if tuple(size.data for size in self.value.type.shape) != program.shape:
+            raise VerifyException("predicate result shape must match its lane domain")
+
+
+@irdl_op_definition
+class CompareOp(IRDLOperation):
+    """An actual UB data comparison packed into explicit predicate storage.
+
+    The comparison is one real read/compute; its result binds this write and
+    is never deferred or recomputed after the source tile changes.
+    """
+
+    name = "npu_source.compare"
+    source = operand_def(TensorType)
+    other = opt_operand_def(TensorType)
+    out = operand_def(TensorType)
+    kind = attr_def(StringAttr)
+    scalar = opt_attr_def(FloatAttr[f32])
+    value = result_def(TileType)
+    mask = result_def(MaskType)
+    irdl_options = (AttrSizedOperandSegments(),)
+
+    def verify_(self):
+        from ..mask import CMP_KINDS
+
+        if self.kind.data not in CMP_KINDS:
+            raise VerifyException("compare requires a supported f32 comparison kind")
+        if (self.other is not None) == (self.scalar is not None):
+            raise VerifyException("compare needs exactly one tensor or scalar right operand")
+        shape = tuple(size.data for size in self.source.type.shape)
+        if self.other is not None and (tuple(size.data for size in self.other.type.shape) != shape):
+            raise VerifyException("data comparison operands require equal tile shapes")
+        if any(
+            value.type.memory.data != "UB" or value.type.dtype.data != "f32"
+            for value in (self.source, *(() if self.other is None else (self.other,)))
+        ):
+            raise VerifyException("packed data comparison currently requires f32 UB sources")
+        chunks = mask_chunks(shape)
+        if (
+            self.out.type.memory.data != "UB"
+            or self.out.type.dtype.data != "u8"
+            or tuple(size.data for size in self.out.type.shape) != (chunks * 32,)
+            or tuple(size.data for size in self.value.type.shape) != (chunks * 32,)
+            or self.value.type.dtype.data != "u8"
+        ):
+            raise VerifyException("data comparison needs explicit 32-byte packed predicate blocks")
+        if tuple(size.data for size in self.mask.type.shape) != shape:
+            raise VerifyException("predicate shape must match the compared tile")
+
+
+@irdl_op_definition
+class MaterializeMaskOp(IRDLOperation):
+    """Write a symbolic coordinate predicate into explicit packed storage."""
+
+    name = "npu_source.materialize_mask"
+    mask = operand_def(MaskType)
+    out = operand_def(TensorType)
+    value = result_def(TileType)
+    result = result_def(MaskType)
+
+    def verify_(self):
+        if not isinstance(self.mask.owner, MaskOp):
+            raise VerifyException("only symbolic coordinate predicates need materialization")
+        shape = tuple(size.data for size in self.mask.type.shape)
+        chunks = mask_chunks(shape)
+        if (
+            self.out.type.memory.data != "UB"
+            or self.out.type.dtype.data != "u8"
+            or tuple(size.data for size in self.out.type.shape) != (chunks * 32,)
+            or tuple(size.data for size in self.value.type.shape) != (chunks * 32,)
+            or self.value.type.dtype.data != "u8"
+            or tuple(size.data for size in self.result.type.shape) != shape
+        ):
+            raise VerifyException("predicate materialization needs explicit 32-byte packed blocks")
+
+
+@irdl_op_definition
+class MaskCombineOp(IRDLOperation):
+    """A bitwise boolean combination of materialized packed predicates."""
+
+    name = "npu_source.mask_combine"
+    kind = attr_def(StringAttr)
+    lhs = operand_def(MaskType)
+    rhs = opt_operand_def(MaskType)
+    lhs_storage = operand_def(TensorType)
+    rhs_storage = opt_operand_def(TensorType)
+    out = operand_def(TensorType)
+    dependencies = var_operand_def(TileType)
+    dependency_inputs = attr_def(ArrayAttr[IntAttr])
+    value = result_def(TileType)
+    result = result_def(MaskType)
+    irdl_options = (AttrSizedOperandSegments(),)
+
+    def verify_(self):
+        if self.kind.data not in {"and", "or", "not"}:
+            raise VerifyException("mask combination requires and/or/not")
+        binary = self.kind.data != "not"
+        if binary != (self.rhs is not None and self.rhs_storage is not None):
+            raise VerifyException("mask combination operand pack disagrees with its kind")
+        operands = [self.lhs_storage]
+        masks = [self.lhs]
+        if binary:
+            operands.append(self.rhs_storage)
+            masks.append(self.rhs)
+        _verify_dependencies(self, operands)
+        shape = tuple(size.data for size in self.result.type.shape)
+        chunks = mask_chunks(shape)
+        for position, (mask, storage) in enumerate(zip(masks, operands, strict=True)):
+            _verify_materialized_mask(mask, storage, self.dependencies[position])
+            if tuple(size.data for size in mask.type.shape) != shape:
+                raise VerifyException("combined predicates require equal lane shapes")
+        if (
+            self.out.type.memory.data != "UB"
+            or self.out.type.dtype.data != "u8"
+            or tuple(size.data for size in self.out.type.shape) != (chunks * 32,)
+            or tuple(size.data for size in self.value.type.shape) != (chunks * 32,)
+            or self.value.type.dtype.data != "u8"
+            or tuple(size.data for size in self.result.type.shape) != shape
+        ):
+            raise VerifyException("mask combination needs explicit packed result blocks")
+        if _mask_storage(self.out) in {_mask_storage(storage) for storage in operands}:
+            raise VerifyException("mask combination output needs distinct predicate storage")
+
+
+@irdl_op_definition
+class WhereOp(IRDLOperation):
+    """Select two legal input branches per element using packed predicate bits."""
+
+    name = "npu_source.where"
+    mask = operand_def(MaskType)
+    mask_storage = operand_def(TensorType)
+    mask_dependency = operand_def(TileType)
+    x = operand_def(TensorType)
+    y = operand_def(TensorType)
+    destination = operand_def(TensorType)
+    dependencies = var_operand_def(TileType)
+    dependency_inputs = attr_def(ArrayAttr[IntAttr])
+    value = result_def(TileType)
+
+    def verify_(self):
+        _verify_result(self, self.destination)
+        _verify_dependencies(self, [self.mask_storage])
+        if self.mask_dependency not in self.dependencies:
+            raise VerifyException("where needs its actual predicate writer dependence")
+        lanes = _verify_materialized_mask(
+            self.mask, self.mask_storage, self.mask_dependency, message="where"
+        )
+        if tuple(size.data for size in self.mask.type.shape) != tuple(
+            size.data for size in self.destination.type.shape
+        ):
+            raise VerifyException("where predicate must match its output shape")
+        if not self.destination.type.shape:
+            raise VerifyException("where requires a non-empty tile shape")
+        for value in (self.x, self.y, self.destination):
+            if value.type.shape != self.destination.type.shape:
+                raise VerifyException("where requires equal tile shapes")
+            if value.type.memory.data != "UB" or value.type.dtype.data != "f32":
+                raise VerifyException("where currently requires f32 UB operands")
+        if lanes != mask_chunks(tuple(size.data for size in self.destination.type.shape)):
+            raise VerifyException("where predicate block count disagrees with its output")
+
+
+@irdl_op_definition
 class CopyOp(IRDLOperation):
     name = "npu_source.copy"
     source = operand_def(TensorType)
@@ -547,13 +812,17 @@ class ElementOp(IRDLOperation):
     dependency_inputs = attr_def(ArrayAttr[IntAttr])
     kind = attr_def(StringAttr)
     scalar = opt_attr_def(FloatAttr[f32])
+    mask = opt_operand_def(MaskType)
+    mask_storage = opt_operand_def(TensorType)
+    mask_dependency = opt_operand_def(TileType)
     value = result_def(TileType)
     irdl_options = (AttrSizedOperandSegments(),)
     traits = traits_def(AsyncEffects())
 
     def verify_(self):
         _verify_result(self, self.destination)
-        _verify_dependencies(self, self.inputs)
+        storage_inputs = () if self.mask_storage is None else (self.mask_storage,)
+        _verify_dependencies(self, [*self.inputs, *storage_inputs])
         arity = {
             "fill": 0,
             "mul_scalar": 1,
@@ -592,7 +861,7 @@ class ElementOp(IRDLOperation):
                 for v in (*self.inputs, self.destination, self.scratch)
             ):
                 raise VerifyException("row broadcast requires f32 UB views")
-        elif self.scratch is not None:
+        elif self.scratch is not None and self.mask is None:
             raise VerifyException("only row broadcast arithmetic uses scratch")
         elif any(v.type.shape != self.destination.type.shape for v in self.inputs):
             raise VerifyException("element operands require equal tile shape")
@@ -602,6 +871,39 @@ class ElementOp(IRDLOperation):
             v.type.dtype.data != "f32" for v in (*self.inputs, self.destination)
         ):
             raise VerifyException("arithmetic currently requires explicit f32 operands")
+        if self.mask is None:
+            if self.mask_storage is not None or self.mask_dependency is not None:
+                raise VerifyException("predicate storage requires an explicit mask")
+            return
+        if self.kind.data.endswith("_rows") or self.kind.data == "cast":
+            raise VerifyException("masked row broadcast and conversion are not implemented")
+        materialized = not isinstance(self.mask.owner, MaskOp)
+        if self.scratch is not None and not materialized:
+            raise VerifyException("coordinate masks need no temporary result tile")
+        if materialized:
+            if self.scratch is None:
+                raise VerifyException(
+                    "data-predicate updates need an explicit same-shape f32 scratch tile"
+                )
+            if (
+                self.scratch.type.shape != self.destination.type.shape
+                or self.scratch.type.memory.data != "UB"
+                or self.scratch.type.dtype.data != "f32"
+                or self.mask_dependency not in self.dependencies
+            ):
+                raise VerifyException(
+                    "data-predicate updates need a same-shape f32 scratch and predicate dependence"
+                )
+            if self.mask_dependency not in self.dependencies:
+                raise VerifyException("masked update lost its predicate writer dependence")
+            carried = [
+                index.data
+                for dependency, index in zip(self.dependencies, self.dependency_inputs, strict=True)
+                if dependency is self.mask_dependency
+            ]
+            if carried != [len(self.inputs)]:
+                raise VerifyException("predicate dependence must name the packed storage operand")
+        _verify_mask_operand(self, tuple(size.data for size in self.destination.type.shape))
 
 
 def block8_reduction_widths(columns: int) -> tuple[int, ...]:
@@ -675,40 +977,6 @@ class ReduceOp(IRDLOperation):
             for v in (self.source, self.scratch, self.destination)
         ):
             raise VerifyException("reduction requires f32 UB views")
-
-
-@irdl_op_definition
-class FillUpperOp(IRDLOperation):
-    """Fill columns strictly above the global diagonal, preserving other lanes.
-
-    The complete destination is an initialized read/write tile. Row/column
-    origins are ordinary index SSA operands, independent of storage addresses.
-    """
-
-    name = "npu_source.fill_upper"
-    destination = operand_def(TensorType)
-    row_start = operand_def(IndexType)
-    col_start = operand_def(IndexType)
-    dependencies = var_operand_def(TileType)
-    dependency_inputs = attr_def(ArrayAttr[IntAttr])
-    scalar = attr_def(FloatAttr[f32])
-    value = result_def(TileType)
-    traits = traits_def(AsyncEffects())
-
-    def verify_(self):
-        _verify_result(self, self.destination)
-        _verify_dependencies(self, [self.destination])
-        typ = self.destination.type
-        shape = tuple(n.data for n in typ.shape)
-        if (
-            typ.memory.data != "UB"
-            or typ.dtype.data != "f32"
-            or len(shape) != 2
-            or not 1 <= shape[0] <= 255
-            or not 64 <= shape[1] <= 4096
-            or shape[1] % 64
-        ):
-            raise VerifyException("upper fill requires f32 UB rows and 64-aligned columns")
 
 
 @irdl_op_definition
@@ -804,14 +1072,18 @@ SOURCE = Dialect(
         DomainOp,
         ViewOp,
         PredicateOp,
+        MaskOp,
         CopyOp,
         ElementOp,
         ReduceOp,
-        FillUpperOp,
+        CompareOp,
+        MaterializeMaskOp,
+        MaskCombineOp,
+        WhereOp,
         ScalarReadOp,
         ScaleOp,
         MatmulOp,
         YieldOp,
     ],
-    [TensorType, TileType],
+    [TensorType, TileType, MaskType],
 )

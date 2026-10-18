@@ -26,7 +26,7 @@ from ascendflow.device import ACL, health_snapshot
 from ascendflow.diagnostics import require
 from ascendflow.dialects.io import parse
 from ascendflow.dialects.physical import BufferOp, KernelOp, MixedOp, RuntimeSizeOp
-from ascendflow.dialects.source import AllocationOp, ElementOp, FillUpperOp, ProgramOp, SizeOp
+from ascendflow.dialects.source import AllocationOp, ElementOp, ProgramOp, SizeOp
 from ascendflow.dialects.structured import ActorDomainOp
 from ascendflow.performance import hardware_snapshot
 from benchmarks.attention.contract import DEFAULT_POLICY, AttentionPolicy
@@ -248,7 +248,8 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
     )
     local_bytes = local_contract(program, root, policy)
     require(
-        sum(isinstance(op, FillUpperOp) for op in logical.walk()) == int(policy.causal),
+        sum(isinstance(op, ElementOp) and op.mask is not None for op in logical.walk())
+        == int(policy.causal),
         "compiled attention causal mask differs from selected policy",
     )
     scale_operations = [

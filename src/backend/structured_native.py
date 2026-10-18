@@ -13,6 +13,7 @@ from xdsl.dialects.builtin import IntegerAttr
 from ..analysis.structured_addresses import AddressFacts
 from ..diagnostics import require
 from ..dialects.structured import AddressOp
+from ..mask import Program
 from ..target.native import NativeGeometry
 from .native import CTYPE, QUALIFIER, native_line
 
@@ -66,6 +67,11 @@ class PrintTask:
     scalar: float
     uid: str
     scalar_source: str | None
+    operands: tuple[str, ...]
+    mask: object | None
+    mask_word: str | None
+    mask_repeat: str | None
+    mask_iteration: str | None
 
 
 def format_native(template, *, render, roots, task_names, generation):
@@ -96,9 +102,17 @@ def format_native(template, *, render, roots, task_names, generation):
             )
         )
     operation = template.operation
+    count = operation.attributes.get("address_count")
+    count = len(operation.refs) if count is None else count.data
+    atoms = tuple(operation.refs[count:])
     scalar_source = (
-        operation.refs[-1].owner if operation.native.data in {"scale_value", "sub_value"} else None
+        atoms[0].owner if operation.native.data in {"scale_value", "sub_value"} else None
     )
+    program = None
+    if "nodes" in operation.attributes:
+        program = Program.decode(
+            {name: operation.attributes[name] for name in ("shape", "node_shapes", "nodes")}
+        )
     task = PrintTask(
         operation.native.data,
         tuple(operands),
@@ -106,8 +120,14 @@ def format_native(template, *, render, roots, task_names, generation):
         operation.scalar.value.data,
         task_names[template.operation],
         None if scalar_source is None else task_names[scalar_source],
+        tuple(render(value) for value in atoms),
+        program,
+        None if "mask_word" not in operation.attributes else operation.attributes["mask_word"].data,
+        None
+        if "mask_repeat" not in operation.attributes
+        else operation.attributes["mask_repeat"].data,
+        None
+        if "mask_iteration" not in operation.attributes
+        else operation.attributes["mask_iteration"].data,
     )
-    indices = (
-        tuple(render(value) for value in operation.refs[-2:]) if task.native == "fill_upper" else ()
-    )
-    return native_line(task, pointer_renderer=pointer, generation=generation, indices=indices)
+    return native_line(task, pointer_renderer=pointer, generation=generation)

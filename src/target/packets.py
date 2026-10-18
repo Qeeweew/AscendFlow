@@ -3,6 +3,12 @@
 Each packet stays inside one actual TaskOp. Its mask steps describe the
 retained CANN call order; they are not independently movable instructions.
 The execution engines of the mask setters remain deliberately unspecified.
+
+The packet state below distinguishes the actual VECTOR_MASK mode, what the
+configured bits mean (a repeat bitmap, a Counter element count, or a full
+mask) and whether a selection CMPMASK was established in this packet. It is a
+path-local description of one audited call sequence, not a new latch model:
+``count_end`` only restores normal mode and restores no bit values.
 """
 
 from dataclasses import dataclass
@@ -15,9 +21,18 @@ class MaskStep(str, Enum):
     SET_COUNT = "set-mask-from-count-argument"
     SET_FULL = "set-mask-full-f32"
     SET_PARTIALS = "set-mask-from-partials-parameter"
-    SET_UPPER = "set-mask-from-row-and-column-origins"
+    SET_COORD = "set-mask-bits-from-lane-predicate"
+    SET_CMPMASK = "set-selection-cmpmask-from-packed-predicate"
     VECTOR_READ = "vector-read-mode-and-mask"
+    SELECT_READ = "vector-select-reads-full-mask-and-cmpmask"
     RESTORE_NORMAL = "restore-mode-normal"
+
+
+@dataclass(frozen=True)
+class _MaskState:
+    mode: str | None = None
+    mask: str | None = None
+    cmp: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +42,9 @@ class NativePacket:
     # A row loop may call a count C API repeatedly. Each such call contains
     # this complete sequence, rather than one setup surrounding all rows.
     each_count_call: bool = False
+    # A masked native configures a fresh mode and repeat bitmap for every
+    # chunk it issues; one bitmap never covers a tile with changing lanes.
+    each_mask_call: bool = False
     internal_fences: tuple[str, ...] = ()
     # An audited conditional packet must close every path independently.
     alternate_mask_steps: tuple[tuple[MaskStep, ...], ...] = ()
@@ -39,25 +57,35 @@ class NativePacket:
 
     @staticmethod
     def _closed_mask(steps):
-        mode = mask = False
+        state = _MaskState()
         for step in steps:
-            if step in {MaskStep.SET_COUNTER, MaskStep.SET_NORMAL, MaskStep.RESTORE_NORMAL}:
-                mode = True
-            elif step in {
-                MaskStep.SET_COUNT,
-                MaskStep.SET_FULL,
-                MaskStep.SET_PARTIALS,
-                MaskStep.SET_UPPER,
-            }:
-                mask = True
-            elif step is MaskStep.VECTOR_READ and not (mode and mask):
+            if step is MaskStep.SET_COUNTER:
+                state = _MaskState(mode="counter", mask=state.mask, cmp=state.cmp)
+            elif step in {MaskStep.SET_NORMAL, MaskStep.RESTORE_NORMAL}:
+                state = _MaskState(mode="normal", mask=state.mask, cmp=state.cmp)
+            elif step is MaskStep.SET_COUNT:
+                state = _MaskState(state.mode, "count", state.cmp)
+            elif step is MaskStep.SET_FULL:
+                state = _MaskState(state.mode, "full", state.cmp)
+            elif step is MaskStep.SET_PARTIALS:
+                state = _MaskState(state.mode, "partials", state.cmp)
+            elif step is MaskStep.SET_COORD:
+                state = _MaskState(state.mode, "coordinate", state.cmp)
+            elif step is MaskStep.SET_CMPMASK:
+                state = _MaskState(state.mode, state.mask, True)
+            elif step is MaskStep.VECTOR_READ:
+                if state.mode is None or state.mask is None:
+                    return False
+            elif step is MaskStep.SELECT_READ and (
+                state.mode != "normal" or state.mask != "full" or not state.cmp
+            ):
                 return False
         return True
 
     @property
     def clobbers(self):
         # Restore-to-normal is a defined write, not preservation of an
-        # arbitrary incoming mode. None of the current packets saves mask.
+        # arbitrary incoming mode. No current packet saves mask or CMPMASK.
         result = set()
         for step in (
             step for steps in (self.mask_steps, *self.alternate_mask_steps) for step in steps
@@ -68,9 +96,11 @@ class NativePacket:
                 MaskStep.SET_COUNT,
                 MaskStep.SET_FULL,
                 MaskStep.SET_PARTIALS,
-                MaskStep.SET_UPPER,
+                MaskStep.SET_COORD,
             }:
                 result.add("VECTOR_MASK")
+            elif step is MaskStep.SET_CMPMASK:
+                result.add("CMPMASK")
         return frozenset(result)
 
     @property
@@ -119,6 +149,10 @@ _COUNT = frozenset(
         "add_bias",
         "stat_fill",
         "stat_div",
+        "mask_and",
+        "mask_or",
+        "mask_not",
+        "mask_zero",
     }
 )
 _FULL = frozenset(
@@ -133,6 +167,22 @@ _FULL = frozenset(
         "reduce_tile_max64",
     }
 )
+_MASKED = frozenset(
+    {
+        "mask_fill",
+        "mask_muls",
+        "mask_adds",
+        "mask_add",
+        "mask_mul",
+        "mask_sub",
+        "mask_div",
+        "mask_max",
+        "mask_exp",
+        "mask_rsqrt",
+        "mask_sqrt",
+    }
+)
+_SELECT = frozenset({"select_masked", "select_masked_update"})
 _PARTIAL = frozenset({"merge_sum_packed", "merge_max_packed"})
 _MASK_FREE = frozenset(
     {
@@ -141,6 +191,7 @@ _MASK_FREE = frozenset(
         "scalar_load",
         "brcb8",
         "nd2nz",
+        "nd2nz_pad",
         "load2d_a",
         "load2d_b_nt",
         "load2d_b_nn",
@@ -152,35 +203,55 @@ _MASK_FREE = frozenset(
         "mad16",
         "fix",
         "fix16",
+        "compare_eq",
+        "compare_ne",
+        "compare_lt",
+        "compare_le",
+        "compare_gt",
+        "compare_ge",
+        "compare_scalar_eq",
+        "compare_scalar_ne",
+        "compare_scalar_lt",
+        "compare_scalar_le",
+        "compare_scalar_gt",
+        "compare_scalar_ge",
+        "mask_bits",
     }
 )
 
 
 def _packet(native: str) -> NativePacket | None:
-    if native == "fill_upper":
+    if native in _MASKED:
+        # Normal mode plus a fresh repeat bitmap selected from the lane
+        # predicate for each emitted chunk. Full chunks reuse one all-ones
+        # bitmap through a repeat count; no zero bitmap is ever issued.
+        # The admitted whole-tile coverage chooses one closed path: `mixed`
+        # replays the per-chunk coordinate bitmap, `full` sets one all-ones
+        # bitmap per bounded repeat group, and `empty` issues no element call
+        # (its declared RW footprint still requires an initialized
+        # destination).
+        return NativePacket(
+            native,
+            (MaskStep.SET_NORMAL, MaskStep.SET_COORD, MaskStep.VECTOR_READ),
+            each_mask_call=True,
+            alternate_mask_steps=(
+                (MaskStep.SET_NORMAL, MaskStep.SET_FULL, MaskStep.VECTOR_READ),
+                (MaskStep.SET_NORMAL,),
+            ),
+        )
+    if native in _SELECT:
+        # CMPMASK is loaded from packed UB and the audited local PIPE_V
+        # barrier separates that setup from vsel. CMPMASK is a distinct state
+        # from VECTOR_MASK_MODE/VECTOR_MASK.
         return NativePacket(
             native,
             (
                 MaskStep.SET_NORMAL,
-                MaskStep.SET_UPPER,
-                MaskStep.VECTOR_READ,
                 MaskStep.SET_FULL,
-                MaskStep.VECTOR_READ,
-                MaskStep.RESTORE_NORMAL,
-                MaskStep.SET_FULL,
+                MaskStep.SET_CMPMASK,
+                MaskStep.SELECT_READ,
             ),
-            alternate_mask_steps=(
-                (
-                    MaskStep.SET_NORMAL,
-                    MaskStep.SET_COUNTER,
-                    MaskStep.SET_COUNT,
-                    MaskStep.VECTOR_READ,
-                    MaskStep.RESTORE_NORMAL,
-                    MaskStep.RESTORE_NORMAL,
-                    MaskStep.SET_FULL,
-                ),
-                (),  # A fully visible tile does not touch mask state.
-            ),
+            internal_fences=("V",),
         )
     if native == "nd2nz_pad":
         # L1 fill and ND2NZ share MTE2 but can overlap execution. The fill
@@ -212,8 +283,7 @@ def _packet(native: str) -> NativePacket | None:
 
 
 _AUDITED = {
-    native: _packet(native)
-    for native in _COUNT | _FULL | _PARTIAL | _MASK_FREE | {"nd2nz_pad", "fill_upper"}
+    native: _packet(native) for native in _COUNT | _FULL | _MASKED | _SELECT | _PARTIAL | _MASK_FREE
 }
 
 

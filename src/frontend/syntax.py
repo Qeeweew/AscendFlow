@@ -55,6 +55,11 @@ def alloc_ub(shape, dtype=f32, *, name=None):
     _ast_only()
 
 
+def alloc_mask(shape, *, name=None):
+    """Explicit packed predicate storage: 32 bytes per whole 64-lane block."""
+    _ast_only()
+
+
 def alloc_l1(shape, dtype=f16, *, name=None):
     _ast_only()
 
@@ -105,35 +110,78 @@ def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
     _ast_only()
 
 
-def mul(lhs, rhs, *, out, valid=None, scratch=None):
+def arange(extent):
+    """A logical lane-coordinate vector of one static tile axis.
+
+    The coordinate values are exact integers 0..extent-1, not a stored index
+    table. Comparisons and ``& | ~`` form predicates; every other use is a
+    source diagnostic.
+    """
     _ast_only()
 
 
-def add(lhs, rhs, *, out):
+def compare(source, threshold, *, kind="gt", out):
+    """Pack an f32 per-lane comparison into explicit predicate storage.
+
+    ``kind`` is one of eq/ne/lt/le/gt/ge. ``threshold`` is a scalar literal or
+    a same-shape f32 UB tile. The comparison is one actual read/compute; its
+    predicate binds this result and is never recomputed after ``source``
+    changes.
+    """
     _ast_only()
 
 
-def sub(lhs, rhs, *, out, scratch=None):
+def materialize(mask, *, out):
+    """Write a symbolic coordinate predicate into explicit packed storage."""
     _ast_only()
 
 
-def maximum(lhs, rhs, *, out):
+def mask_and(lhs, rhs, *, out):
     _ast_only()
 
 
-def exp(source, *, out):
+def mask_or(lhs, rhs, *, out):
     _ast_only()
 
 
-def sqrt(source, *, out):
+def mask_not(value, *, out):
     _ast_only()
 
 
-def rsqrt(source, *, out):
+def where(mask, x, y, *, out):
+    """Select two legal, already-defined f32 UB branches per predicate element."""
     _ast_only()
 
 
-def div(lhs, rhs, *, out, scratch=None):
+def mul(lhs, rhs, *, out, valid=None, scratch=None, mask=None):
+    _ast_only()
+
+
+def add(lhs, rhs, *, out, mask=None, scratch=None):
+    _ast_only()
+
+
+def sub(lhs, rhs, *, out, scratch=None, mask=None):
+    _ast_only()
+
+
+def maximum(lhs, rhs, *, out, mask=None, scratch=None):
+    _ast_only()
+
+
+def exp(source, *, out, mask=None, scratch=None):
+    _ast_only()
+
+
+def sqrt(source, *, out, mask=None, scratch=None):
+    _ast_only()
+
+
+def rsqrt(source, *, out, mask=None, scratch=None):
+    _ast_only()
+
+
+def div(lhs, rhs, *, out, scratch=None, mask=None):
     _ast_only()
 
 
@@ -157,16 +205,18 @@ def reduce_max(source, *, axis, out, scratch, order):
     _ast_only()
 
 
-def cast(source, *, out):
+def cast(source, *, out, mask=None, scratch=None):
     _ast_only()
 
 
-def fill(destination, value):
-    _ast_only()
+def fill(destination, value, *, mask=None, scratch=None):
+    """Fill a complete f32 UB tile, or its predicate-selected lanes only.
 
-
-def fill_upper(destination, value, *, row_start=0, col_start=0):
-    """Fill where col_start+c > row_start+r; preserve the other f32 UB lanes."""
+    ``mask=False`` lanes keep their old destination value, so masked fills and
+    masked arithmetic require an already initialized destination. Coordinate
+    masks need no scratch; materialized data predicates need an explicit
+    same-shape scratch tile for the value.
+    """
     _ast_only()
 
 

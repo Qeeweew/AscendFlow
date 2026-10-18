@@ -19,14 +19,55 @@ QUALIFIER = {
     "L0B": "__cb__",
     "L0C": "__cc__",
 }
-CTYPE = {"f32": "float", "f16": "half", "bf16": "bfloat16_t"}
+CTYPE = {"f32": "float", "f16": "half", "bf16": "bfloat16_t", "u8": "uint8_t"}
 
 
-def native_line(task, *, pointer_renderer, generation, indices=()):
+_MASKED_ELEMENTS = frozenset(
+    {
+        "mask_fill",
+        "mask_muls",
+        "mask_adds",
+        "mask_add",
+        "mask_mul",
+        "mask_sub",
+        "mask_div",
+        "mask_max",
+        "mask_exp",
+        "mask_rsqrt",
+        "mask_sqrt",
+    }
+)
+
+
+def native_line(task, *, pointer_renderer, generation):
     """Format an admitted native using final IR operand addresses."""
     ptr = pointer_renderer
     refs = task.refs
     p = [ptr(ref) for ref in refs]
+    if task.native in _MASKED_ELEMENTS:
+        from . import vector_mask
+
+        return "\n".join(vector_mask.masked_element_lines(task, p))
+    if task.native == "mask_bits":
+        from . import vector_mask
+
+        return "\n".join(vector_mask.mask_bits_lines(task, p))
+    if task.native == "mask_zero":
+        from . import vector_mask
+
+        return "\n".join(vector_mask.mask_zero_lines(task, p))
+    if task.native in {"mask_and", "mask_or", "mask_not"}:
+        from . import vector_mask
+
+        return "\n".join(vector_mask.combine_lines(task, p))
+    if task.native in {"select_masked", "select_masked_update"}:
+        from . import vector_mask
+
+        return "\n".join(vector_mask.select_lines(task, p))
+    if task.native.startswith("compare_"):
+        from . import vector_mask
+
+        return "\n".join(vector_mask.compare_lines(task, p))
 
     def length(ref, unit=1):
         return str(ref.total_nbytes // unit)
@@ -82,40 +123,6 @@ def native_line(task, *, pointer_renderer, generation, indices=()):
         return (
             "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
             f"asc_copy({bits[1]}, {bits[0]}, uint8_t({task.params[0]}), 1, 0, 8, 1);"
-        )
-    if task.native == "fill_upper":
-        rows, cols = task.params
-        row_start, col_start = indices
-        value = (
-            ("-" if task.scalar < 0 else "") + "__builtin_inff()"
-            if isinf(task.scalar)
-            else f"float({task.scalar!r})"
-        )
-        dst = ptr(refs[0], extra=f"npu_mask_row * {cols * 4} + npu_mask_chunk * 4")
-        # Row/chunk offsets preserve the tile's proved 32-byte alignment.
-        # Mask shifts are restricted to [0,63], including empty/full prefixes.
-        return (
-            "{\n"
-            f"bool npu_mask_before = ({row_start}) < ({col_start});\n"
-            f"uint64_t npu_mask_gap = npu_mask_before ? uint64_t({col_start}) - uint64_t({row_start}) : uint64_t({row_start}) - uint64_t({col_start});\n"
-            f"int64_t npu_mask_delta = npu_mask_before ? -int64_t(npu_mask_gap > {rows} ? {rows} : npu_mask_gap) : int64_t(npu_mask_gap > {cols} ? {cols} : npu_mask_gap);\n"
-            f"if (npu_mask_delta < {cols - 1}) {{\nasc_set_mask_norm();\n"
-            f"if (npu_mask_delta <= -{rows}) {{\n"
-            f"asc_duplicate({p[0]}, {value}, uint32_t({rows * cols}));\n"
-            "} else {\n"
-            f"for (int npu_mask_row = 0; npu_mask_row < {rows}; ++npu_mask_row) {{\n"
-            "  int64_t npu_keep = npu_mask_delta + npu_mask_row + 1;\n"
-            f"  npu_keep = npu_keep < 0 ? 0 : (npu_keep > {cols} ? {cols} : npu_keep);\n"
-            "  int npu_mask_chunk = int(npu_keep / 64) * 64;\n"
-            "  int npu_prefix = int(npu_keep % 64);\n"
-            "  if (npu_prefix) {\n"
-            "    asc_set_vector_mask(0, UINT64_MAX << npu_prefix);\n"
-            f"    asc_duplicate({dst}, {value}, uint8_t(1), 1, 8);\n"
-            "    npu_mask_chunk += 64;\n  }\n"
-            f"  if (npu_mask_chunk < {cols}) {{\n"
-            "    asc_set_vector_mask(0, UINT64_MAX);\n"
-            f"    asc_duplicate({dst}, {value}, uint8_t(({cols} - npu_mask_chunk) / 64), 1, 8);\n"
-            "  }\n}\n}\nasc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX);\n}\n}"
         )
     if task.native in {"fill", "fill_neg_inf"}:
         value = "-__builtin_inff()" if task.native == "fill_neg_inf" else f"float({task.scalar!r})"

@@ -459,6 +459,10 @@ class _Emitter:
         ]
         if not executable:
             lines.append('#error "Unsynchronized structured intermediate: debug output only"')
+        from .vector_mask import helper_lines, needs_helpers
+
+        if needs_helpers(self.memory.templates):
+            lines.extend([""] + helper_lines())
         lines.extend(
             [
                 "",

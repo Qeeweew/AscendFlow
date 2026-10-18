@@ -22,7 +22,12 @@
 | `T.Stage(s, name=...)` | 当前pipeline的逻辑偏移，不是完成边界 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理容量、布局、slot与别名 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
-| `fill_upper(x, value, row_start=..., col_start=...)` | 保留 `col_start+c <= row_start+r` 的 lane，只填严格上三角；已初始化 f32 UB 矩阵的读写更新 |
+| `alloc_mask(shape)` | 显式 UB packed predicate 存储，64 lane 一个 32 B 块 |
+| `arange(n)`、比较、`& \| ~` | 精确整数逻辑 lane 坐标与带shape谓词，支持singleton轴广播 |
+| `compare(x, threshold, kind=..., out=...)` | f32逐lane比较写入packed predicate；结果绑定该次实际读写 |
+| `materialize/mask_and/mask_or/mask_not(..., out=...)` | 显式物化与packed位布尔组合；mask_and/mask_or/mask_not的out需独立存储 |
+| `where(p, x, y, out=...)` | 两路均已定义的完整选择，不短路非法load |
+| `fill/mul/add/sub/div/maximum/exp/sqrt/rsqrt(..., mask=p)` | 显式谓词更新；mask=False lane保留目标旧值 |
 
 stage数、buffer slot数、event width互不等同。`cube.task/vector.task`已经移除且不恢复兼容。内部physical Task IR不属于旧公开语法。
 
@@ -108,11 +113,73 @@ runtime输入的minimum/multiple支持除数正性和整除推导；非法的原
 作为可选 streaming 分离坐标，仍检查实际轴、字节几何和当前作用域内的 digit 范围。
 无法恢复分离坐标时保留可能别名的源码内存顺序，不将未知当作无冲突。
 
-`fill_upper` 目前要求 1..255 行、64..4096 列且列数为 64 的倍数，f32 UB。
-row/column 起点是普通 runtime index，与地址无关；负差和极端 int64 起点饱和处理。
-未填 lane 保留原值，因此调用前必须初始化完整矩阵。native packet 的填充分支恢复
-普通全 mask，全可见路径不触碰 mask；各路径独立封闭，其读写、异步 load/store 次序
-仍参与普通同步。
+谓词是通用能力，不是三角或attention特化。`N.arange(n)` 产生逻辑 lane 坐标
+（精确整数，不分配索引表）；比较与 `& | ~` 组合出带shape谓词，比较和布尔组合按
+NumPy尾部对齐规则广播singleton轴。区间、窗口、尾部、周期（`%`/`//`，要求
+不变量lane表达式）和布尔组合都用同一形式；坐标差/和用有界128位精确整数求值，
+极端int64起点不溢出、不shift-by-64。没有为三角、带状或任何shape增加识别分支。
+
+`mask=`的语义是更新集合：谓词为真的lane参与计算，其余lane保留目标旧值。因此
+第一版masked update要求目标view已完整初始化；部分写不构成初始化，仍由ordinary
+initialization coverage检查。坐标谓词直接使用Normal repeat bitmap，不需要存储；
+`alloc_mask`显式分配packed数据谓词存储（每64个f32 lane一个32 B块，bit lane存放，
+不是每lane一字节）。`compare`是一次真实读写，结果绑定该次写入，不会在其源tile
+更新后延迟重算。`where`要求显式materialized谓词且两路输入均已定义，提供完整输出，
+不把无效地址变成合法load，不做短路。
+
+坐标谓词在目标每64 lane计算局部bitmap：全0块跳过native（绝不发出空mask），连续
+全1块合并repeat，部分块设置自己的bitmap；不同行/块不共用一张tile bitmap。
+数据谓词使用packed compare、packet局部CMPMASK与`vsel`，并在`set_cmpmask`后保留
+已审计的局部`PIPE_V`。`count_end`只恢复Normal模式，不恢复mask位值；每个packet
+自己配置所需状态，不消费incoming mask。packed谓词块是每64个f32 lane一个32 B块：
+只有低8字节是逻辑lane位，其余24字节是padding；padding字节有定义但不被当作额外lane
+解释。padding由单独的`mask_zero` native定义：它是一个真实的count-mode Vector
+`Dup(0)`，覆盖声明中的整个u8块，并按ordinary RAW/WAR/WAW与compare形成required
+same-V RAW/WAW，由通用同步生成实际的`PIPE_V` fence，而不是emitter在task内插入
+scalar清零或全局barrier。`compare_*`保持audited mask-free Vector packet，只发出
+`vcmpv/vcmpvs`调用；其目的view声明为保守的整块preserve update（`RW`）：`vcmpv`
+只写低8字节lane word并保留另24字节padding，`R`表示保留旧padding并让“整块已定义”
+由真实的前置`mask_zero` writer提供，不代表硬件读取padding，也不让单独一次compare
+凭空产生完整初始化事实。因此未初始化packed块上的standalone compare会被ordinary
+read admission拒绝。`mask_not`是真实的count-mode Vector `vnot`（`asc_not`），其
+packet与实际调用序列一致，输出整块（包括反转后的padding）都有定义。因此
+`mask_and/mask_or`、CMPMASK加载和谓词存储复用看到的都是完整定义的块；这些引擎、
+effects和字节几何全部在同步分析前可见，不是emitter隐藏的memory effect。
+coordinate/affine或lane-scan word recipe、以及“连续全1块最多255 repeat合并”的政策
+在lowering选择并记录到native task事实中，emission只重放该选择，不在分析后另选实现。
+对affine形式，emission在同一份program DAG上为每个value节点发出当前runtime标量
+原子与编译期per-axis lane系数决定的精确有符号128位区间，再按(全真,全假)保守三元
+组合：运行时全真直接走全1 bitmap的repeat运行，全假不发任何element调用，未能证明
+（或lane系数相关）时进入同一段逐块重放。这不是整程序证明，也不保存运行时数组；
+`//`/`%`等非affine节点不产生该运行时区间，lane64 recipe保持原逐lane重放。
+单元lane系数±1的word由有符号128位阈值区间一次构造，先把阈值钳到可移位的范围内
+再做int64转换，其余常数系数保留二分搜索回退；两种路径都做同一个精确128位求值。
+若被admit的谓词是单个比较（可含shape-only BROADCAST）且差异的最后一个轴lane系数为
+±1、最后轴为整64，lowering还会选择`mask_iteration=rows`：每个逻辑行用当前runtime
+标量原子与其余轴仿射项算出精确128位阈值，把选中列表达为裁剪后的prefix/suffix（`eq`
+为单点、`ne`为补点两段），每段最多一个leading partial bitmap、≤255 repeat的full运行
+和一个trailing partial bitmap，同一64-lane块只写一次；`-1`系数按取负+flip比较种类
+处理。布尔组合、非unit/periodic谓词保留`chunks`重放，不建覆盖证明状态。
+`where`/masked data update的`scratch`必须是显式同shape f32 UB，且不能与目标同一
+allocation（包括同一buffer的另一view），否则完整scratch写会破坏保留的false lane。
+`copy`/DMA与reduction不因同名`mask=`自动获得同一语义；masked reduction、DMA mask和
+masked cast/row-broadcast当前明确拒绝。masked谓词存储和scratch都是真实UB内存，
+参与普通RAW/WAR/WAW、初始化覆盖、最后reader和事件资源检查；不使用全局barrier或
+静默fallback。
+
+坐标整数合同：比较值用有符号128位精确求值；lane系数的绝对值不超过2^61，从而
+两个系数差不超过2^63且`int64`常量与取负都有定义；`//`/`%`只接受无scalar原子的
+lane表达式和`1..2^63-1`的正int64除数，emission使用floor语义helper，与Python
+`//`/`%`一致；INT64_MIN常量按`(-9223372036854775807LL - 1)`发出。比较两侧的
+精确值幅度和受2^126限制，所有中间差、128位加乘和回退搜索都在该范围内，超出时
+在source/admission明确拒绝而不是截断或发出非法字面量。极端int64常量起点（包括
+INT64_MIN）与runtime非负int64 origin都保持精确。
+
+完整示例见[masks.py](../../examples/vector/masks.py)（interval、相邻64 lane不同的periodic、
+两者的XOR与非平凡runtime origin `(cols+q)>rows`、全/空/部分、`q=INT64_MAX`、
+更新/未更新旧值保留、count op穿插、compare/where/not/or/and、源覆盖后继续使用早期
+compare），设备oracle是独立NumPy/Python逻辑；runner只复用带manifest/source快照
+校验的已发布产物，`--build`才调用编译器与CANN。
 
 cyclic任务按 `flat=group+task*GROUPS` 绑定owner；空owner没有任务。动态 frame、valid prefix、mixed 及父 view 组合按当前实现分别限制，不从单个grouped例推断全部支持。未知alias不可用任意barrier掩盖。
 

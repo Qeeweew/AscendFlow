@@ -21,6 +21,13 @@ from ..diagnostics import require
 from ..dialects.physical import TaskOp
 from ..dialects.structured import PipelineStageOp
 from ..dialects.types import RefType
+from ..mask import (
+    ITERATION_VALUES,
+    MASK_REPEAT_POLICY,
+    Program,
+    iteration_strategy,
+    word_strategy,
+)
 from ..scalar import expression, literal
 from ..target import native
 from ..target.ascend910b import Actor, Engine, supports_engine
@@ -63,11 +70,31 @@ class NativeMemoryFacts:
     native_contract_calls: int
 
 
+def _operand_count(operation):
+    """Leading reference operands; later operands are scalar/predicate atoms."""
+    count = operation.attributes.get("address_count")
+    if count is None:
+        return len(operation.refs)
+    require(
+        0 <= count.data <= len(operation.refs),
+        "native address operand count exceeds its actual operands",
+    )
+    return count.data
+
+
+def scalar_operands(operation):
+    return tuple(operation.refs[_operand_count(operation) :])
+
+
 def _conditional_reads(operation, contract, control):
     if not contract.read_resets:
         return {}
-    require(isinstance(operation.refs[-1].type, IndexType), "native reset needs an SSA ordinal")
-    ordinal = control.environment.expression(operation.refs[-1])
+    operands = scalar_operands(operation)
+    require(
+        len(operands) == 1 and isinstance(operands[0].type, IndexType),
+        "native reset needs an SSA ordinal",
+    )
+    ordinal = control.environment.expression(operands[0])
     loops = control.frames[operation].loops()
     stage = operation.parent_op()
     while stage is not None and not isinstance(stage, PipelineStageOp):
@@ -75,7 +102,7 @@ def _conditional_reads(operation, contract, control):
     if stage is not None:
         loop = stage.parent_op()
         require(
-            operation.refs[-1] is stage.body.block.args[0]
+            operands[0] is stage.body.block.args[0]
             and any(item.operation is loop for item in loops),
             "native reset needs its actual pipeline stage ordinal",
         )
@@ -108,6 +135,85 @@ def _conditional_reads(operation, contract, control):
     return result
 
 
+def _check_mask_program(operation, refs, params):
+    """Consume the same lane-predicate facts the emitter will replay."""
+    attributes = operation.attributes
+    if "nodes" not in attributes:
+        return
+    require(
+        {"shape", "node_shapes", "nodes"} <= set(attributes),
+        "masked native lost part of its lane-predicate program",
+    )
+    program = Program.decode({name: attributes[name] for name in ("shape", "node_shapes", "nodes")})
+    require(
+        program.lanes == program.lanes // 64 * 64,
+        "lane predicate must cover whole 64-lane blocks",
+    )
+    chunks = program.lanes // 64
+    require(
+        operation.native.data in {"mask_bits"} or operation.native.data.startswith("mask_"),
+        "lane-predicate program belongs to another native",
+    )
+    word = attributes.get("mask_word")
+    require(
+        word is not None and word.data == word_strategy(program),
+        "masked native word recipe differs from the admitted predicate program",
+    )
+    if operation.native.data == "mask_bits":
+        require(
+            attributes.get("mask_iteration") is None,
+            "predicate materialization has no element iteration recipe",
+        )
+        require(
+            params == (chunks,) and refs[0].geometry.total_nbytes == chunks * 32,
+            "predicate materialization must write exactly its packed blocks",
+        )
+        require(
+            attributes.get("mask_repeat") is None,
+            "predicate materialization emits no repeated native calls",
+        )
+    else:
+        require(
+            refs[-1].geometry.total_nbytes == chunks * 256,
+            "masked native destination must match its predicate lane domain",
+        )
+        if operation.native.data != "mask_fill":
+            require(
+                all(ref.geometry.total_nbytes == chunks * 256 for ref in refs),
+                "masked native operand must match its predicate lane domain",
+            )
+        repeat = attributes.get("mask_repeat")
+        require(
+            repeat is not None and repeat.data == MASK_REPEAT_POLICY,
+            "masked native needs the admitted full-run repeat policy",
+        )
+        iteration = attributes.get("mask_iteration")
+        require(
+            iteration is not None
+            and iteration.data in ITERATION_VALUES
+            and iteration.data == iteration_strategy(program),
+            "masked native iteration recipe differs from the admitted predicate program",
+        )
+
+
+def _check_mask_layout(operation):
+    """Packed predicate byte contracts selected before memory/sync analysis."""
+    native, attributes = operation.native.data, operation.attributes
+    expected = (
+        "packed32_zeroed"
+        if native.startswith("compare_")
+        else "packed32_block_read"
+        if native in {"select_masked", "select_masked_update"}
+        else None
+    )
+    recorded = attributes.get("mask_layout")
+    require(
+        (expected is None) == (recorded is None)
+        and (recorded is None or recorded.data == expected),
+        "packed predicate native lost its selected byte-layout recipe",
+    )
+
+
 def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = None):
     """Consume one owned module and retain original operations and roots.
 
@@ -134,31 +240,29 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 break
             current = current.parent
         require(operation.stage.data == stage, "native stage disagrees with its actual loop scope")
-        operands = tuple(operation.refs)
-        if operation.native.data == "fill_upper":
-            require(
-                len(operands) == 3 and all(isinstance(v.type, IndexType) for v in operands[-2:]),
-                "upper fill needs one reference and two explicit index origins",
-            )
-            operands = operands[:-2]
+        atoms = scalar_operands(operation)
         if operation.native.data in {"mad_first", "mad_cycle"}:
             require(
-                len(operands) == 4 and isinstance(operands[-1].type, IndexType),
-                "native reset needs three references and an explicit index ordinal",
+                len(atoms) == 1 and isinstance(atoms[0].type, IndexType),
+                "native reset needs an explicit index ordinal after its references",
             )
-            operands = operands[:-1]
         scalar_source = None
         if operation.native.data in {"scale_value", "sub_value"}:
             require(
-                len(operands) == 3 and operands[-1] in scalar_values,
+                len(atoms) == 1 and atoms[0] in scalar_values,
                 "native scalar operand requires a preceding actual Scalar load",
             )
-            scalar_source = scalar_values[operands[-1]]
+            scalar_source = scalar_values[atoms[0]]
             require(
                 scalar_source.parent is operation.parent,
                 "Scalar capture needs the same physical scope; delayed values need storage",
             )
-            operands = operands[:-1]
+        if scalar_source is None:
+            require(
+                all(isinstance(value.type, IndexType) for value in atoms),
+                "native scalar/predicate operands must retain index types",
+            )
+        operands = tuple(operation.refs[: _operand_count(operation)])
         require(
             all(isinstance(value.type, RefType) for value in operands),
             "native memory operands must retain reference types",
@@ -190,7 +294,7 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
         require(operation.scalar.type == f32, "native Vector scalar literals must be f32")
         scalar = round_f32(
             operation.scalar.value.data,
-            allow_infinity=operation.native.data in {"fill", "fill_upper"},
+            allow_infinity=operation.native.data in {"fill", "mask_fill"},
         )
         require(
             (operation.value is not None) == (operation.native.data == "scalar_load"),
@@ -198,6 +302,8 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
         )
         if operation.value is not None:
             scalar_values[operation.value] = operation
+        _check_mask_program(operation, refs, params)
+        _check_mask_layout(operation)
         contract = NativeContract(operation.native.data, engine, modes, params, scalar)
         require(
             contract.packet is not None

@@ -37,10 +37,13 @@ from ..dialects.physical import (
 )
 from ..dialects.source import (
     AllocationOp,
+    CompareOp,
     CopyOp,
     DomainOp,
     ElementOp,
-    FillUpperOp,
+    MaskCombineOp,
+    MaskOp,
+    MaterializeMaskOp,
     MatmulOp,
     PipelineOp,
     PredicateOp,
@@ -51,6 +54,7 @@ from ..dialects.source import (
     SizeOp,
     StageOp,
     ViewOp,
+    WhereOp,
     YieldOp,
 )
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
@@ -257,17 +261,43 @@ class _Lowerer:
         )
         number = len(self.results)
 
-        def emit(suffix, native, *refs, params=(), scalar=0.0, order_delta=0):
+        def emit(
+            suffix,
+            native,
+            *refs,
+            params=(),
+            scalar=0.0,
+            order_delta=0,
+            operands=(),
+            mask=None,
+            mask_word=None,
+            mask_repeat=None,
+            mask_iteration=None,
+            mask_layout=None,
+        ):
             self.needs_fix |= native in {"fix", "fix16"}
             self.needs_load3d |= native in {"load3d_a", "load3d_b_nn"}
+            scalar_operands = tuple(operands)
             if native in {"mad_first", "mad_cycle"}:
                 require(scope.pipeline is not None, "native reset needs its logical ordinal")
-                refs = (*refs, scope.values[scope.pipeline.body.block.args[0]])
-            task = TaskOp.build(
-                operands=[refs],
-                attributes=task_attrs(
-                    f"native_{number}{suffix}", native, scope.stage, params, scalar
+                scalar_operands = (
+                    *scalar_operands,
+                    scope.values[scope.pipeline.body.block.args[0]],
+                )
+            attributes = {
+                **task_attrs(f"native_{number}{suffix}", native, scope.stage, params, scalar),
+                "address_count": IntAttr(len(refs)),
+                **({} if mask is None else mask.encode()),
+                **({} if mask_word is None else {"mask_word": StringAttr(mask_word)}),
+                **({} if mask_repeat is None else {"mask_repeat": StringAttr(mask_repeat)}),
+                **(
+                    {} if mask_iteration is None else {"mask_iteration": StringAttr(mask_iteration)}
                 ),
+                **({} if mask_layout is None else {"mask_layout": StringAttr(mask_layout)}),
+            }
+            task = TaskOp.build(
+                operands=[(*refs, *scalar_operands)],
+                attributes=attributes,
                 result_types=[TaskType(), f32 if native == "scalar_load" else None],
             )
             task.location = op.location
@@ -292,8 +322,9 @@ class _Lowerer:
                 source, nbytes, append=scope.block.add_op, **kwargs
             ),
             emit,
-            self.load3d_b_width,
-            self.load3d_a_width,
+            operand=lambda value: self.scalar(value, scope),
+            load3d_b_width=self.load3d_b_width,
+            load3d_a_width=self.load3d_a_width,
         )
         if isinstance(op, CopyOp):
             result = recipes.lower_copy(op, context)
@@ -306,13 +337,14 @@ class _Lowerer:
             scope.values[op.value] = result.scalar_value
         elif isinstance(op, ScaleOp):
             result = recipes.lower_scale(op, context, factor=self.scalar(op.factor, scope))
-        elif isinstance(op, FillUpperOp):
-            result = recipes.lower_fill_upper(
-                op,
-                context,
-                row_start=self.scalar(op.row_start, scope),
-                col_start=self.scalar(op.col_start, scope),
-            )
+        elif isinstance(op, CompareOp):
+            result = recipes.lower_compare(op, context)
+        elif isinstance(op, MaterializeMaskOp):
+            result = recipes.lower_materialize_mask(op, context)
+        elif isinstance(op, MaskCombineOp):
+            result = recipes.lower_mask_combine(op, context)
+        elif isinstance(op, WhereOp):
+            result = recipes.lower_where(op, context)
         else:
             result = recipes.lower_matmul(
                 op, context, initialization=self.initialization(op, scope)
@@ -357,9 +389,25 @@ class _Lowerer:
         elif isinstance(op, AllocationOp):
             self.allocation(op, scope)
         elif isinstance(
-            op, (CopyOp, ElementOp, ReduceOp, ScalarReadOp, ScaleOp, FillUpperOp, MatmulOp)
+            op,
+            (
+                CopyOp,
+                ElementOp,
+                ReduceOp,
+                ScalarReadOp,
+                ScaleOp,
+                CompareOp,
+                MaterializeMaskOp,
+                MaskCombineOp,
+                WhereOp,
+                MatmulOp,
+            ),
         ):
             self.primitive(op, scope)
+        elif isinstance(op, MaskOp):
+            # A symbolic predicate owns no native until it is materialized or
+            # consumed by a picked masked recipe.
+            op.program()
         elif isinstance(op, PipelineOp):
             self.pipeline(op, scope)
         elif isinstance(op, scf.ForOp):

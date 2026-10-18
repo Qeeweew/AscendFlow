@@ -47,7 +47,7 @@ def test_both_organizations_share_actual_algorithm_and_explicit_operations():
         "reduce_sum",
         "reduce_max",
         "matmul",
-        "fill_upper",
+        "arange",
     }
 
     def operations(module):

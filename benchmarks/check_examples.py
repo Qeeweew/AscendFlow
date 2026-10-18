@@ -41,6 +41,40 @@ def examples():
             "run_rings",
             ("--counts", "0", "1", "7", "35", "--repeats", "1"),
         ),
+        (
+            "masks",
+            "masks",
+            "masks",
+            "run_masks",
+            (
+                "--cases",
+                "0:0:0",
+                "7:0:0",
+                "0:32:96",
+                "7:32:96",
+                "0:0:1000000000",
+                "9223372036854775807:0:0",
+                "12345:64:64",
+                "3:0:1000000000",
+                "--repeats",
+                "1",
+            ),
+        ),
+        (
+            "mask-rows",
+            "mask_rows",
+            "mask_rows",
+            "run_mask_rows",
+            (
+                "--cases",
+                "3:100:127",
+                "129:65:65",
+                "0:0:0",
+                "300:1000000:1000000",
+                "--repeats",
+                "1",
+            ),
+        ),
     ):
         source = f"examples/vector/{filename}.py"
         result.append(

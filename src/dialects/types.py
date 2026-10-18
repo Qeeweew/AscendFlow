@@ -57,3 +57,11 @@ class TileType(ParametrizedAttribute, TypeAttribute):
     name = "npu_source.tile"
     shape: ArrayAttr[IntAttr]
     dtype: StringAttr
+
+
+@irdl_attr_definition
+class MaskType(ParametrizedAttribute, TypeAttribute):
+    """A logical boolean element domain, independent of its packing."""
+
+    name = "npu_source.mask"
+    shape: ArrayAttr[IntAttr]

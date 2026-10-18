@@ -18,10 +18,12 @@ from xdsl.ir import Block, OpResult, Region, SSAValue, SSAValues
 from ..diagnostics import require
 from ..dialects.source import (
     AllocationOp,
+    CompareOp,
     CopyOp,
     DomainOp,
     ElementOp,
-    FillUpperOp,
+    MaskOp,
+    MaterializeMaskOp,
     MatmulOp,
     PipelineOp,
     PredicateOp,
@@ -36,6 +38,30 @@ from ..dialects.source import (
     copy_compatible,
 )
 from ..dialects.types import TensorType, TileType
+from ..mask import (
+    ADD,
+    AND,
+    BROADCAST,
+    CMP,
+    CMP_KINDS,
+    CONST,
+    DIVC,
+    LANE,
+    MODC,
+    MULC,
+    NEG,
+    NOT,
+    OR,
+    SCALAR,
+    SUB,
+    Node,
+    Program,
+    append_boolean,
+    broadcast_shapes,
+    rebase,
+    shift,
+    validate,
+)
 from ..target.scalars import round_f32
 from .contracts import _Dimension, _ExtentProduct
 from .syntax import DType, bf16, f16, f32
@@ -48,7 +74,7 @@ def _ints(values):
 def _type(shape, dtype, memory, layout):
     return TensorType(
         _ints(-1 if isinstance(n, _Dimension) else n for n in shape),
-        StringAttr(DType(dtype).value),
+        StringAttr(dtype.value if isinstance(dtype, DType) else dtype),
         StringAttr(memory),
         StringAttr(layout),
     )
@@ -74,6 +100,8 @@ class _Index:
     constant: int = 0
 
     def __add__(self, other):
+        if isinstance(other, _Coord):
+            return other._binary(self, ADD)
         other = _index(other)
         value = self.value if other.value is None else other.value
         if self.value is not None and other.value is not None:
@@ -112,6 +140,8 @@ class _Index:
     def __sub__(self, other):
         from xdsl.dialects import arith
 
+        if isinstance(other, _Coord):
+            return _coord(self)._binary(other, SUB)
         other = _index(other)
         if self.value is other.value:
             return _Index(constant=self.constant - other.constant)
@@ -601,6 +631,356 @@ def _tile(view):
     return TileType(_ints(view.shape), StringAttr(view.buffer.dtype.value))
 
 
+def _mask_type(shape):
+    from ..dialects.types import MaskType
+
+    return MaskType(_ints(shape))
+
+
+@dataclass(frozen=True)
+class _MaskBuffer:
+    """Explicit packed predicate storage; one 32-byte block per 64 lanes."""
+
+    buffer: _Buffer
+    shape: tuple[int, ...]
+
+    def __post_init__(self):
+        require(self.buffer.dtype == "u8", "predicate storage must use packed u8 bytes")
+        require(
+            self.chunks * 32 == self.buffer.shape[0],
+            "predicate storage needs exact 32-byte blocks",
+        )
+
+    @property
+    def chunks(self):
+        from math import prod
+
+        return prod(self.shape) // 64
+
+    @property
+    def view(self):
+        return self.buffer._full()
+
+
+@dataclass(frozen=True)
+class _MaskStorage:
+    view: _View
+    chunks: int
+    tile: _Value
+
+
+@dataclass(frozen=True, eq=False)
+class _Mask:
+    """A logical predicate value with exactly one actual producer."""
+
+    shape: tuple[int, ...]
+    value: SSAValue
+    storage: _MaskStorage | None = None
+
+    @property
+    def materialized(self):
+        return self.storage is not None
+
+    def __and__(self, other):
+        return _mask_binary(self, other, "and")
+
+    def __or__(self, other):
+        return _mask_binary(self, other, "or")
+
+    def __invert__(self):
+        require(
+            not self.materialized,
+            "predicate negation needs explicit storage: use N.mask_not(mask, out=...)",
+        )
+        op = self.value.owner
+        require(isinstance(op, MaskOp), "symbolic predicate lost its source program")
+        program = op.program()
+        nodes, shapes = append_boolean(
+            list(program.nodes), list(program.node_shapes), NOT, [len(program.nodes) - 1]
+        )
+        return _emit_mask(program.shape, nodes, shapes, tuple(op.scalars))
+
+
+def _emit_mask(shape, nodes, shapes, scalars):
+    program = Program(tuple(shape), tuple(shapes), tuple(nodes))
+    validate(program.nodes, program.node_shapes, program.shape)
+    trace = _trace()
+    op = MaskOp.build(
+        operands=[list(scalars)],
+        result_types=[_mask_type(program.shape)],
+        attributes=program.encode(),
+    )
+    trace.add(op)
+    return _Mask(program.shape, op.value)
+
+
+def _merge_coords(left, right):
+    """Shared scalar operand list plus rebased node lists."""
+    scalars = list(left.scalars)
+    index = {value: position for position, value in enumerate(scalars)}
+    right_map = []
+    for value in right.scalars:
+        if value not in index:
+            index[value] = len(scalars)
+            scalars.append(value)
+        right_map.append(index[value])
+    left_map = [index[value] for value in left.scalars]
+    return (
+        rebase(left.nodes, left_map),
+        rebase(right.nodes, right_map),
+        tuple(scalars),
+        index,
+    )
+
+
+def _coord(value):
+    if isinstance(value, _Coord):
+        return value
+    if isinstance(value, (_Dimension, _ExtentProduct, _Index)) or (
+        type(value) is int and not isinstance(value, bool)
+    ):
+        return _Coord.from_index(_index(value))
+    require(False, "coordinate expressions require N.arange, integer constants or index scalars")
+    raise AssertionError("unreachable")
+
+
+@dataclass(frozen=True, eq=False)
+class _Coord:
+    """Exact logical lane coordinates with broadcasting arithmetic."""
+
+    shape: tuple[int, ...]
+    nodes: tuple[Node, ...]
+    shapes: tuple[tuple[int, ...], ...]
+    scalars: tuple[SSAValue, ...]
+
+    @classmethod
+    def from_index(cls, index):
+        nodes, shapes, scalars = [], [], []
+
+        def constant(value):
+            nodes.append(Node(CONST, (int(value),)))
+            shapes.append(())
+            return len(nodes) - 1
+
+        def scalar(value):
+            if value not in scalars:
+                scalars.append(value)
+            nodes.append(Node(SCALAR, (scalars.index(value),)))
+            shapes.append(())
+            return len(nodes) - 1
+
+        roots = []
+        if index.constant:
+            roots.append(constant(index.constant))
+        if index.value is not None:
+            roots.append(scalar(index.value))
+        if not roots:
+            roots.append(constant(0))
+        while len(roots) > 1:
+            right = roots.pop()
+            left = roots.pop()
+            nodes.append(Node(ADD, (left, right)))
+            shapes.append(())
+            roots.append(len(nodes) - 1)
+        return cls((), tuple(nodes), tuple(shapes), tuple(scalars))
+
+    @classmethod
+    def arange(cls, extent):
+        require(type(extent) is int and 0 < extent <= (1 << 22), "N.arange needs a bounded integer")
+        return cls((extent,), (Node(LANE, (0,)),), ((extent,),), ())
+
+    def __getitem__(self, indices):
+        indices = indices if isinstance(indices, tuple) else (indices,)
+        require(len(self.shape) == 1, "coordinate new axes apply to one-dimensional N.arange")
+        if indices == (slice(None),):
+            return self
+        patterns = ((slice(None), None), (None, slice(None)))
+        require(
+            any(
+                len(indices) == len(pattern)
+                and all(
+                    (item is None and expected is None)
+                    or (item == expected and expected is not None)
+                    for item, expected in zip(indices, pattern, strict=True)
+                )
+                for pattern in patterns
+            ),
+            "logical lane coordinates support only [:, None] and [None, :] new axes",
+        )
+        inserted = 0 if indices[0] is None else 1
+        axis = 1 - inserted
+        new_shape = (1, self.shape[0]) if inserted == 0 else (self.shape[0], 1)
+        nodes, shapes = [], []
+        for node, stored in zip(self.nodes, self.shapes, strict=True):
+            if node.op == LANE:
+                node, stored = Node(LANE, (axis,)), new_shape
+            elif stored:
+                stored = (1, stored[0]) if inserted == 0 else (stored[0], 1)
+            nodes.append(node)
+            shapes.append(stored)
+        return _Coord(new_shape, tuple(nodes), tuple(shapes), self.scalars)
+
+    def _binary(self, other, op):
+        other = _coord(other)
+        shape = broadcast_shapes(self.shape, other.shape)
+        require(shape is not None, "coordinate shapes do not broadcast")
+        left_nodes, right_nodes, scalars, _ = _merge_coords(self, other)
+        right_nodes = shift(right_nodes, len(left_nodes))
+        nodes = (*left_nodes, *right_nodes)
+        shapes = (*self.shapes, *other.shapes, shape)
+        nodes = (*nodes, Node(op, (len(left_nodes) - 1, len(nodes) - 1)))
+        return _Coord(shape, nodes, shapes, scalars)
+
+    def _constant(self, other, op):
+        other = _coord(other)
+        require(
+            not other.scalars and other.shape == (),
+            "coordinate scaling and division require an integer constant",
+        )
+        factor = _fold_constant(other)
+        nodes = (*self.nodes, Node(op, (len(self.nodes) - 1, factor)))
+        return _Coord(self.shape, nodes, (*self.shapes, self.shape), self.scalars)
+
+    def __add__(self, other):
+        return self._binary(other, ADD)
+
+    __radd__ = __add__
+
+    def __sub__(self, other):
+        return self._binary(other, SUB)
+
+    def __rsub__(self, other):
+        return _coord(other)._binary(self, SUB)
+
+    def __mul__(self, other):
+        if isinstance(other, int) and not isinstance(other, bool):
+            return self._constant(other, MULC)
+        require(False, "coordinate multiplication currently requires an integer constant")
+
+    __rmul__ = __mul__
+
+    def __floordiv__(self, other):
+        require(type(other) is int and other > 0, "coordinate division needs a positive constant")
+        return self._constant(other, DIVC)
+
+    def __mod__(self, other):
+        require(type(other) is int and other > 0, "coordinate modulo needs a positive constant")
+        return self._constant(other, MODC)
+
+    def __neg__(self):
+        return _Coord(
+            self.shape,
+            (*self.nodes, Node(NEG, (len(self.nodes) - 1,))),
+            (*self.shapes, self.shape),
+            self.scalars,
+        )
+
+    def _compare(self, other, kind):
+        other = _coord(other)
+        shape = broadcast_shapes(self.shape, other.shape)
+        require(shape is not None, "compared coordinate shapes do not broadcast")
+        left_nodes, right_nodes, scalars, _ = _merge_coords(self, other)
+        right_nodes = shift(right_nodes, len(left_nodes))
+        nodes = (*left_nodes, *right_nodes)
+        shapes = (*self.shapes, *other.shapes, shape)
+        code = CMP_KINDS.index(kind)
+        nodes = (*nodes, Node(CMP, (len(left_nodes) - 1, len(nodes) - 1, code)))
+        return _emit_mask(shape, nodes, shapes, scalars)
+
+    def __eq__(self, other):
+        return self._compare(other, "eq")
+
+    def __ne__(self, other):
+        return self._compare(other, "ne")
+
+    def __lt__(self, other):
+        return self._compare(other, "lt")
+
+    def __le__(self, other):
+        return self._compare(other, "le")
+
+    def __gt__(self, other):
+        return self._compare(other, "gt")
+
+    def __ge__(self, other):
+        return self._compare(other, "ge")
+
+    def __bool__(self):
+        raise TypeError("device lane coordinates cannot control Python branches")
+
+
+def _fold_constant(coord):
+    """Evaluate one scalar-only coordinate expression at construction time."""
+    require(not coord.scalars and coord.shape == (), "expected a coordinate constant")
+    values = []
+    for node in coord.nodes:
+        op, args = node.op, node.args
+        if op == CONST:
+            values.append(args[0])
+        elif op == ADD:
+            values.append(values[args[0]] + values[args[1]])
+        elif op == SUB:
+            values.append(values[args[0]] - values[args[1]])
+        elif op == MULC:
+            values.append(values[args[0]] * args[1])
+        elif op == DIVC:
+            values.append(values[args[0]] // args[1])
+        elif op == MODC:
+            values.append(values[args[0]] % args[1])
+        elif op == NEG:
+            values.append(-values[args[0]])
+        else:
+            raise AssertionError("not a scalar coordinate expression")
+    return values[-1]
+
+
+def _merge_programs(left, right):
+    left_nodes = left.value.owner.program().nodes
+    right_nodes = right.value.owner.program().nodes
+    left_scalars, right_scalars = left.value.owner.scalars, right.value.owner.scalars
+    scalars = list(left_scalars)
+    index = {value: position for position, value in enumerate(scalars)}
+    right_map = []
+    for value in right_scalars:
+        if value not in index:
+            index[value] = len(scalars)
+            scalars.append(value)
+        right_map.append(index[value])
+    left_map = [index[value] for value in left_scalars]
+    return (
+        rebase(left_nodes, left_map),
+        rebase(right_nodes, right_map),
+        tuple(scalars),
+    )
+
+
+def _mask_binary(left, right, kind):
+    require(isinstance(right, _Mask), "predicate combination requires two predicate values")
+    require(
+        not left.materialized and not right.materialized,
+        "materialized predicate combination needs explicit storage: "
+        "N.mask_and/mask_or(left, right, out=...)",
+    )
+    shape = broadcast_shapes(left.shape, right.shape)
+    require(shape is not None, "combined predicates do not broadcast")
+    require(
+        isinstance(left.value.owner, MaskOp) and isinstance(right.value.owner, MaskOp),
+        "symbolic predicate lost its source program",
+    )
+    left_program, right_program = left.value.owner.program(), right.value.owner.program()
+    left_nodes, right_nodes, scalars = _merge_programs(left, right)
+    right_nodes = shift(right_nodes, len(left_nodes))
+    nodes = (*left_nodes, *right_nodes)
+    shapes = (*left_program.node_shapes, *right_program.node_shapes)
+    nodes, shapes = append_boolean(
+        list(nodes),
+        list(shapes),
+        AND if kind == "and" else OR,
+        [len(left_nodes) - 1, len(nodes) - 1],
+    )
+    return _emit_mask(shape, nodes, shapes, scalars)
+
+
 def _deps(values):
     return [_trace().logical(v.value) for v in values if isinstance(v, _Value)]
 
@@ -643,7 +1023,11 @@ def _allocate(
         len(axes) <= 8 and all(shape[i].scale == 1 for i in axes),
         "at most eight unscaled runtime tensor axes required",
     )
-    dtype = DType(dtype)
+    try:
+        dtype = DType(dtype)
+    except ValueError:
+        # Internal packed predicate storage uses raw u8 bytes, never f32.
+        require(dtype == "u8", "unknown native element type")
     name = name or trace.name(memory.lower())
     op = AllocationOp.create(
         operands=[trace.size(shape[i]) for i in axes],
@@ -830,7 +1214,44 @@ def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
     return _Value(dst, op.value)
 
 
-def _element(kind, values, out, scalar=None, valid=None, scratch=None):
+def _mask_operands(mask, destination_shape, scratch, values):
+    """Resolve one explicit predicate operand into storage and dependence."""
+    if mask is None:
+        return None, None, None, []
+    require(isinstance(mask, _Mask), "mask= requires an N.arange comparison or data predicate")
+    if tuple(mask.shape) != tuple(destination_shape):
+        require(
+            broadcast_shapes(tuple(mask.shape), tuple(destination_shape))
+            == tuple(destination_shape),
+            "masked update needs a predicate broadcastable to the destination",
+        )
+        require(
+            not mask.materialized,
+            "materialized predicate storage must match the destination lane domain",
+        )
+        producer = mask.value.owner
+        require(isinstance(producer, MaskOp), "symbolic predicate lost its program")
+        program = producer.program()
+        mask = _emit_mask(
+            tuple(destination_shape),
+            (*program.nodes, Node(BROADCAST, (len(program.nodes) - 1,))),
+            (*program.node_shapes, tuple(destination_shape)),
+            tuple(producer.scalars),
+        )
+    if not mask.materialized:
+        return mask.value, None, None, []
+    storage = mask.storage
+    require(scratch is not None, "data-predicate updates need explicit same-shape scratch")
+    dependency = _trace().logical(storage.tile.value)
+    return (
+        mask.value,
+        storage.view.emit(),
+        dependency,
+        [(len(values), dependency)],
+    )
+
+
+def _element(kind, values, out, scalar=None, valid=None, scratch=None, mask=None):
     dst, inputs = _view(out).bound(), [_view(value) for value in values]
     require(dst.buffer.op.access.data != "read", "arithmetic cannot write a read-only tensor")
     if not kind.endswith("_rows"):
@@ -838,25 +1259,55 @@ def _element(kind, values, out, scalar=None, valid=None, scratch=None):
             all(v.shape == dst.shape for v in inputs),
             "elementwise operands require equal tile shape",
         )
-    temporary = None if scratch is None else _view(scratch).bound()
-    require(
-        temporary is None or temporary.buffer.op.access.data != "read",
-        "broadcast scratch must be writable",
-    )
     if kind != "cast":
         require(
             dst.buffer.dtype == f32 and all(v.buffer.dtype == f32 for v in inputs),
             "arithmetic currently requires f32; use explicit cast",
         )
-    attrs = {"kind": StringAttr(kind), "dependency_inputs": _dependency_inputs(values)}
+    if mask is not None:
+        require(valid is None, "masked updates cannot combine a valid prefix")
+        require(
+            not kind.endswith("_rows") and kind != "cast",
+            ("masked row broadcast and conversion are not implemented"),
+        )
+    mask_value, mask_storage, mask_dependency, extra = _mask_operands(
+        mask, dst.shape, scratch, values
+    )
+    temporary = None if scratch is None else _view(scratch).bound()
+    if temporary is not None and not kind.endswith("_rows"):
+        require(
+            temporary.buffer.op.access.data != "read" and temporary.shape == dst.shape,
+            "scratch must be a writable same-shape tile",
+        )
+        require(
+            temporary.buffer.dtype == f32 and temporary.buffer.memory == "UB",
+            "scratch must be an f32 UB tile",
+        )
+        if mask is not None and mask.materialized:
+            require(
+                temporary.buffer.op is not dst.buffer.op,
+                "data-predicate scratch must not alias the preserve-update destination",
+            )
+    attrs = {
+        "kind": StringAttr(kind),
+        "dependency_inputs": _ints(
+            (
+                *(value.data for value in _dependency_inputs(values)),
+                *(index for index, _ in extra),
+            )
+        ),
+    }
     if scalar is not None:
         attrs["scalar"] = FloatAttr(round_f32(scalar, allow_infinity=kind == "fill"), ir_f32)
     op = ElementOp.build(
         operands=[
             [v.emit(valid) for v in inputs],
             dst.emit(valid),
-            _deps(values),
+            [*_deps(values), *(dependency for _, dependency in extra)],
             None if temporary is None else temporary.emit(),
+            mask_value,
+            mask_storage,
+            mask_dependency,
         ],
         result_types=[_tile(dst)],
         attributes=attrs,
@@ -871,13 +1322,14 @@ def _rows(kind, lhs, rhs, out, scratch):
     return _element(kind + "_rows", [lhs, rhs.source], out, scratch=scratch)
 
 
-def mul(lhs, rhs, *, out, valid=None, scratch=None):
+def mul(lhs, rhs, *, out, valid=None, scratch=None, mask=None):
     if isinstance(rhs, _RowBroadcast):
-        require(valid is None, "masked row broadcast is not implemented")
+        require(valid is None and mask is None, "masked row broadcast is not implemented")
         return _rows("mul", lhs, rhs, out, scratch)
-    require(scratch is None, "scratch requires a row broadcast operand")
+    if not (mask is not None and mask.materialized):
+        require(scratch is None, "scratch requires a data predicate or a row broadcast")
     if isinstance(rhs, _Scalar):
-        require(valid is None, "masked captured-scalar multiplication is not implemented")
+        require(valid is None and mask is None, "masked captured scalars are not implemented")
         src, dst = _view(lhs), _view(out).bound()
         require(dst.buffer.op.access.data != "read", "multiplication writes a read-only view")
         op = ScaleOp.build(
@@ -889,69 +1341,270 @@ def mul(lhs, rhs, *, out, valid=None, scratch=None):
         _trace().record(op.value)
         return _Value(dst, op.value)
     return (
-        _element("mul_scalar", [lhs], out, rhs, valid)
+        _element("mul_scalar", [lhs], out, rhs, valid, mask=mask)
         if isinstance(rhs, (float, int))
-        else _element("mul", [lhs, rhs], out, valid=valid)
+        else _element("mul", [lhs, rhs], out, valid=valid, mask=mask, scratch=scratch)
     )
 
 
-def add(lhs, rhs, *, out):
+def add(lhs, rhs, *, out, mask=None, scratch=None):
     return (
-        _element("add_scalar", [lhs], out, rhs)
+        _element("add_scalar", [lhs], out, rhs, mask=mask)
         if isinstance(rhs, (float, int))
-        else _element("add", [lhs, rhs], out)
+        else _element("add", [lhs, rhs], out, mask=mask, scratch=scratch)
     )
 
 
-def sub(lhs, rhs, *, out, scratch=None):
+def sub(lhs, rhs, *, out, scratch=None, mask=None):
     if isinstance(rhs, _RowBroadcast):
+        require(mask is None, "masked row broadcast is not implemented")
         return _rows("sub", lhs, rhs, out, scratch)
-    require(scratch is None, "scratch requires a row broadcast operand")
-    return _element("sub", [lhs, rhs], out)
+    if not (mask is not None and mask.materialized):
+        require(scratch is None, "scratch requires a data predicate or a row broadcast")
+    return _element("sub", [lhs, rhs], out, scratch=scratch, mask=mask)
 
 
-def maximum(lhs, rhs, *, out):
-    return _element("maximum", [lhs, rhs], out)
+def maximum(lhs, rhs, *, out, mask=None, scratch=None):
+    return _element("maximum", [lhs, rhs], out, mask=mask, scratch=scratch)
 
 
-def fill_upper(destination, value, *, row_start=0, col_start=0):
-    dst = _view(destination).bound()
-    require(dst.buffer.op.access.data != "read", "upper fill writes a read-only tensor")
-    op = FillUpperOp.build(
+def exp(source, *, out, mask=None, scratch=None):
+    return _element("exp", [source], out, mask=mask, scratch=scratch)
+
+
+def sqrt(source, *, out, mask=None, scratch=None):
+    return _element("sqrt", [source], out, mask=mask, scratch=scratch)
+
+
+def rsqrt(source, *, out, mask=None, scratch=None):
+    return _element("rsqrt", [source], out, mask=mask, scratch=scratch)
+
+
+def div(lhs, rhs, *, out, scratch=None, mask=None):
+    if isinstance(rhs, _RowBroadcast):
+        require(mask is None, "masked row broadcast is not implemented")
+        return _rows("div", lhs, rhs, out, scratch)
+    if not (mask is not None and mask.materialized):
+        require(scratch is None, "scratch requires a data predicate or a row broadcast")
+    return _element("div", [lhs, rhs], out, scratch=scratch, mask=mask)
+
+
+def arange(extent):
+    """One logical lane-coordinate vector; exact integer, never a float table."""
+    return _Coord.arange(extent)
+
+
+def alloc_mask(shape, *, name=None):
+    """Explicit packed predicate storage: 32 bytes per whole 64-lane block."""
+    from math import prod
+
+    shape = tuple(shape)
+    require(
+        shape and all(type(size) is int and 0 < size <= (1 << 22) for size in shape),
+        "alloc_mask needs positive bounded static lane extents",
+    )
+    lanes = prod(shape)
+    require(lanes % 64 == 0, "packed predicates need whole 64-lane blocks")
+    chunks = lanes // 64
+    buffer = _allocate((chunks * 32,), "u8", "UB", name=name or _trace().name("mask"))
+    return _MaskBuffer(buffer, shape)
+
+
+def compare(source, threshold, *, kind="gt", out):
+    from math import prod
+
+    require(kind in CMP_KINDS, "compare requires one of eq/ne/lt/le/gt/ge")
+    require(isinstance(out, _MaskBuffer), "compare requires explicit alloc_mask storage")
+    src = _view(source)
+    require(
+        tuple(out.shape) == tuple(src.shape),
+        "data comparison predicate must match the compared tile",
+    )
+    lanes = prod(src.shape)
+    require(lanes % 64 == 0, "packed data comparison needs whole 64-lane blocks")
+    chunks = lanes // 64
+    scalar = None
+    other = None
+    if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+        scalar = round_f32(threshold)
+    else:
+        other = _view(threshold)
+        require(
+            other.shape == src.shape,
+            "data comparison operands require equal tile shapes",
+        )
+    from ..dialects.types import MaskType
+
+    op = CompareOp.build(
+        operands=[src.emit(), None if other is None else other.emit(), out.view.emit()],
+        result_types=[
+            TileType(_ints((chunks * 32,)), StringAttr("u8")),
+            MaskType(_ints(src.shape)),
+        ],
+        attributes={
+            "kind": StringAttr(kind),
+            **({"scalar": FloatAttr(scalar, ir_f32)} if scalar is not None else {}),
+        },
+    )
+    _trace().add(op)
+    _trace().record(op.value)
+    storage = _MaskStorage(out.view, chunks, _Value(out.view, op.value))
+    return _Mask(tuple(src.shape), op.mask, storage)
+
+
+def materialize(mask, *, out):
+    require(
+        isinstance(mask, _Mask) and not mask.materialized,
+        "only symbolic predicates need materialization",
+    )
+    require(isinstance(out, _MaskBuffer), "materialize requires explicit alloc_mask storage")
+    require(
+        tuple(out.shape) == tuple(mask.shape),
+        "predicate materialization needs matching lane storage",
+    )
+    from ..dialects.types import MaskType
+
+    op = MaterializeMaskOp.build(
+        operands=[mask.value, out.view.emit()],
+        result_types=[
+            TileType(_ints((out.chunks * 32,)), StringAttr("u8")),
+            MaskType(_ints(mask.shape)),
+        ],
+    )
+    _trace().add(op)
+    _trace().record(op.value)
+    storage = _MaskStorage(out.view, out.chunks, _Value(out.view, op.value))
+    return _Mask(mask.shape, op.result, storage)
+
+
+def _require_mask_out(out):
+    require(
+        isinstance(out, _MaskBuffer), "masked boolean combination needs explicit alloc_mask out"
+    )
+
+
+def mask_and(lhs, rhs, *, out):
+    return _mask_combine(lhs, rhs, "and", out)
+
+
+def mask_or(lhs, rhs, *, out):
+    return _mask_combine(lhs, rhs, "or", out)
+
+
+def mask_not(value, *, out):
+    require(isinstance(value, _Mask), "mask_not requires a predicate value")
+    _require_mask_out(out)
+    if not value.materialized:
+        require(
+            tuple(value.shape) == tuple(out.shape),
+            "predicate negation needs matching lane storage",
+        )
+        return materialize(~value, out=out)
+    return _mask_combine(value, None, "not", out)
+
+
+def _mask_combine(lhs, rhs, kind, out):
+    from ..dialects.types import MaskType
+
+    require(isinstance(lhs, _Mask), "mask combination needs predicates")
+    _require_mask_out(out)
+    unary = kind == "not"
+    if unary:
+        require(rhs is None, "predicate negation takes one operand")
+    else:
+        require(isinstance(rhs, _Mask), "mask combination needs two predicates")
+        require(
+            lhs.shape == rhs.shape and lhs.shape == out.shape,
+            "masked boolean combination requires equal predicate shapes",
+        )
+    if not unary and not lhs.materialized and not rhs.materialized:
+        combined = _mask_binary(lhs, rhs, kind)
+        return materialize(combined, out=out)
+    require(
+        lhs.materialized and (unary or rhs.materialized),
+        ("mixed coordinate/data predicate combination needs an explicit N.materialize first"),
+    )
+    require(
+        tuple(lhs.shape) == tuple(out.shape),
+        "masked boolean combination requires equal predicate shapes",
+    )
+    sources = (lhs.storage,) if unary else (lhs.storage, rhs.storage)
+    require(
+        all(storage.view.buffer.op is not out.buffer.op for storage in sources),
+        "masked boolean combination output needs distinct predicate storage",
+    )
+    from ..dialects.source import MaskCombineOp as Combine
+
+    dependencies = [_trace().logical(storage.tile.value) for storage in sources]
+    rhs_mask = None if unary else rhs.value
+    rhs_view = None if unary else rhs.storage.view.emit()
+    op = Combine.build(
         operands=[
+            lhs.value,
+            rhs_mask,
+            lhs.storage.view.emit(),
+            rhs_view,
+            out.view.emit(),
+            dependencies,
+        ],
+        result_types=[
+            TileType(_ints((out.chunks * 32,)), StringAttr("u8")),
+            MaskType(_ints(out.shape)),
+        ],
+        attributes={
+            "kind": StringAttr(kind),
+            "dependency_inputs": _ints(range(len(sources))),
+        },
+    )
+    _trace().add(op)
+    _trace().record(op.value)
+    storage = _MaskStorage(out.view, out.chunks, _Value(out.view, op.value))
+    return _Mask(out.shape, op.result, storage)
+
+
+def where(mask, x, y, *, out):
+    require(
+        isinstance(mask, _Mask) and mask.materialized,
+        ("where requires a materialized data predicate; coordinate predicates use mask= updates"),
+    )
+    xv, yv, dst = _view(x), _view(y), _view(out).bound()
+    require(
+        xv.shape == yv.shape == dst.shape == mask.shape,
+        "where requires equal predicate and branch shapes",
+    )
+    require(
+        all(view.buffer.memory == "UB" and view.buffer.dtype == f32 for view in (xv, yv, dst)),
+        "where currently requires f32 UB branches",
+    )
+    require(dst.buffer.op.access.data != "read", "where writes a read-only tensor")
+    from ..dialects.source import WhereOp as Select
+
+    dependency = _trace().logical(mask.storage.tile.value)
+    op = Select.build(
+        operands=[
+            mask.value,
+            mask.storage.view.emit(),
+            dependency,
+            xv.emit(),
+            yv.emit(),
             dst.emit(),
-            _trace().scalar(row_start),
-            _trace().scalar(col_start),
-            _deps([destination]),
+            [dependency],
         ],
         result_types=[_tile(dst)],
-        attributes={
-            "scalar": FloatAttr(round_f32(value, allow_infinity=True), ir_f32),
-            "dependency_inputs": _dependency_inputs([destination]),
-        },
+        attributes={"dependency_inputs": _ints((0,))},
     )
     _trace().add(op)
     _trace().record(op.value)
     return _Value(dst, op.value)
 
 
-def exp(source, *, out):
-    return _element("exp", [source], out)
+def cast(source, *, out, mask=None, scratch=None):
+    require(scratch is None, "conversion keeps no scratch tile")
+    return _element("cast", [source], out, mask=mask)
 
 
-def sqrt(source, *, out):
-    return _element("sqrt", [source], out)
-
-
-def rsqrt(source, *, out):
-    return _element("rsqrt", [source], out)
-
-
-def div(lhs, rhs, *, out, scratch=None):
-    if isinstance(rhs, _RowBroadcast):
-        return _rows("div", lhs, rhs, out, scratch)
-    require(scratch is None, "scratch requires a row broadcast operand")
-    return _element("div", [lhs, rhs], out)
+def fill(destination, value, *, mask=None, scratch=None):
+    return _element("fill", [], destination, value, mask=mask, scratch=scratch)
 
 
 @dataclass(frozen=True)
@@ -1008,14 +1661,6 @@ def reduce_sum(source, *, axis, out, scratch, order):
 def reduce_max(source, *, axis, out, scratch, order):
     """Reduce f32 rows with the same explicit scratch/tree contract as reduce_sum."""
     return _reduce("max", source, axis=axis, out=out, scratch=scratch, order=order)
-
-
-def cast(source, *, out):
-    return _element("cast", [source], out)
-
-
-def fill(destination, value):
-    return _element("fill", [], destination, value)
 
 
 def matmul(a, b, *, accum, initialize=True):

@@ -57,7 +57,15 @@ def _last_source(minimum, *, overwritten=False):
     pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
     reader = tuple(op for op in source.walk() if isinstance(op, ElementOp))[-1]
     replacement = ElementOp.build(
-        operands=[reader.inputs, reader.destination, [pipeline.values[0]], reader.scratch],
+        operands=[
+            reader.inputs,
+            reader.destination,
+            [pipeline.values[0]],
+            reader.scratch,
+            None,
+            None,
+            None,
+        ],
         attributes={
             "dependency_inputs": ArrayAttr([IntAttr(0)]),
             "kind": reader.kind,

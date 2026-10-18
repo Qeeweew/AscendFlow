@@ -21,7 +21,29 @@ CAPACITY = {
 }
 
 
-ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2}
+ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2, "u8": 1}
+
+_CMP_KINDS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
+_MASKED_UNARY = frozenset({"mask_muls", "mask_adds", "mask_exp", "mask_rsqrt", "mask_sqrt"})
+_MASKED_ELEMENTS = frozenset(
+    {
+        "mask_fill",
+        *_MASKED_UNARY,
+        "mask_add",
+        "mask_mul",
+        "mask_sub",
+        "mask_div",
+        "mask_max",
+    }
+)
+
+
+def _chunks(params, message):
+    require(
+        len(params) == 1 and params[0] > 0 and params[0] <= 65535,
+        f"{message} needs a bounded 64-lane chunk count",
+    )
+    return params[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,24 +305,113 @@ def native_contract(
             "bitwise Vector copy needs equal contiguous f32 UB footprints",
         )
         return "V", ("R", "W")
-    if native == "fill_upper":
-        require(len(params) == 2, "upper fill needs its physical row/column counts")
-        rows, cols = params
+    if native in _MASKED_ELEMENTS:
+        arity = 1 if native == "mask_fill" else 2 if native in _MASKED_UNARY else 3
         require(
-            1 <= rows <= 255
-            and 64 <= cols <= 4096
-            and cols % 64 == 0
-            and len(refs) == 1
+            len(refs) == arity
+            and not params
+            and banks == ("UB",) * arity
+            and dtypes == ("f32",) * arity
+            and layouts == ("linear",) * arity
+            and all(r.contiguous for r in refs)
+            and len(set(lengths)) == 1
+            and lengths[0] > 0
+            and lengths[0] % 256 == 0,
+            "masked Vector work needs equal contiguous f32 UB tiles of whole 64-lane blocks",
+        )
+        # Masked lanes keep the old destination value: a real read/write
+        # update, never a full initialization of the destination footprint.
+        return "V", ("RW",) if arity == 1 else ("R",) * (arity - 1) + ("RW",)
+    if native.startswith("compare_"):
+        chunks = _chunks(params, "packed data comparison")
+        scalar = native.startswith("compare_scalar_")
+        kind = native[len("compare_scalar_") if scalar else len("compare_") :]
+        require(kind in _CMP_KINDS, "packed data comparison needs a supported kind")
+        arity = 2 if scalar else 3
+        require(
+            len(refs) == arity
+            and banks == ("UB",) * arity
+            and layouts == ("linear",) * arity
+            and (dtypes[0] == "f32" if scalar else dtypes[:2] == ("f32", "f32"))
+            and dtypes[-1] == "u8"
+            and all(r.contiguous for r in refs[:-1])
+            and all(r.total_nbytes == chunks * 256 for r in refs[:-1])
+            # The destination is a conservative whole-block preserve update:
+            # vcmpv writes the 64-bit lane word and preserves the other 24
+            # padding bytes, which the separately declared `mask_zero` Vector
+            # task has already defined. `RW` states "old whole-block state is
+            # read and the block stays defined", not a hardware padding read,
+            # and it never creates a fresh full-initialization fact on its own.
+            and refs[-1].contiguous
+            and lengths[-1] == chunks * 32,
+            "packed data comparison needs whole f32 chunks and 32-byte predicate blocks",
+        )
+        return "V", ("R",) * (arity - 1) + ("RW",)
+    if native == "mask_zero":
+        require(
+            len(params) == 1 and params[0] > 0 and params[0] % 16 == 0,
+            "packed predicate zeroing needs a whole uint16 count of 32-byte blocks",
+        )
+        require(
+            len(refs) == 1
             and banks == ("UB",)
-            and dtypes == ("f32",)
+            and dtypes == ("u8",)
             and layouts == ("linear",)
             and refs[0].contiguous
-            and lengths == (rows * cols * 4,),
-            "upper fill requires complete aligned f32 UB rows",
+            and lengths == (params[0] * 2,),
+            "packed predicate zeroing needs its complete aligned byte block",
         )
-        # Masked Dup preserves the old, unselected lanes. This is an update,
-        # never an unconditional initialization of the complete footprint.
-        return "V", ("RW",)
+        # A count-mode Vector Dup defines the whole packed block, including
+        # the padding bytes no packed mask consumer interprets as lanes.
+        return "V", ("W",)
+    if native == "mask_bits":
+        chunks = _chunks(params, "coordinate predicate materialization")
+        require(
+            len(refs) == 1
+            and banks == ("UB",)
+            and dtypes == ("u8",)
+            and layouts == ("linear",)
+            and refs[0].contiguous
+            and lengths == (chunks * 32,),
+            "predicate materialization writes exact 32-byte packed blocks",
+        )
+        # Scalar stores build each packed word; no Vector execute-lane mask is
+        # involved. The bytes are a real UB write for later synchronization.
+        return "S", ("W",)
+    if native in {"mask_and", "mask_or", "mask_not"}:
+        require(
+            len(params) == 1 and params[0] > 0,
+            "packed predicate combination needs its uint16 word count",
+        )
+        arity = 2 if native == "mask_not" else 3
+        require(
+            len(refs) == arity
+            and banks == ("UB",) * arity
+            and dtypes == ("u8",) * arity
+            and layouts == ("linear",) * arity
+            and all(r.contiguous for r in refs)
+            and len(set(lengths)) == 1
+            and lengths[0] == params[0] * 2
+            and lengths[0] % 32 == 0,
+            "packed predicate combination needs equal aligned byte blocks",
+        )
+        return "V", ("R",) * (arity - 1) + ("W",)
+    if native in {"select_masked", "select_masked_update"}:
+        chunks = _chunks(params, "packed predicate selection")
+        update = native == "select_masked_update"
+        arity = 3 if update else 4
+        floats = ("f32",) * (arity - 1)
+        require(
+            len(refs) == arity
+            and banks == ("UB",) * arity
+            and dtypes == ("u8", *floats)
+            and layouts == ("linear",) * arity
+            and refs[0].contiguous
+            and lengths[0] == chunks * 32
+            and all(r.contiguous and r.total_nbytes == chunks * 256 for r in refs[1:]),
+            "predicate selection needs packed blocks and whole f32 chunks",
+        )
+        return "V", ("R", "R", "RW") if update else ("R", "R", "R", "W")
     if native in {"fill", "fill_neg_inf"}:
         require(
             len(refs) == 1

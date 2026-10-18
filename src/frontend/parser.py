@@ -43,6 +43,8 @@ _CALLS = {
     "Cube",
     "Vector",
     "alloc_ub",
+    "alloc_mask",
+    "arange",
     "alloc_l1",
     "alloc_l0a",
     "alloc_l0b",
@@ -55,7 +57,12 @@ _CALLS = {
     "exp",
     "cast",
     "fill",
-    "fill_upper",
+    "compare",
+    "materialize",
+    "mask_and",
+    "mask_or",
+    "mask_not",
+    "where",
     "matmul",
     "sqrt",
     "rsqrt",
@@ -700,18 +707,37 @@ class _Parser:
             )
         if isinstance(node, ast.Subscript):
             value, index = self.expr(node.value), self.expr(node.slice)
-            if not isinstance(value, (builders._Buffer, builders._View, builders._Value, tuple)):
-                self.fail(node, "only tensor views and constexpr tuples support indexing")
+            if not isinstance(
+                value,
+                (builders._Buffer, builders._View, builders._Value, builders._Coord, tuple),
+            ):
+                self.fail(node, "only tensor views, lane coordinates and constexpr tuples index")
             return value[index]
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
             value = self.expr(node.operand)
             return value * (-1 if isinstance(node.op, ast.USub) else 1)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            value = self.expr(node.operand)
+            if isinstance(value, builders._Mask):
+                return ~value
+            self.fail(node, "bitwise inversion requires a coordinate predicate")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.BitAnd, ast.BitOr)):
+            lhs, rhs = self.expr(node.left), self.expr(node.right)
+            if isinstance(lhs, builders._Mask) or isinstance(rhs, builders._Mask):
+                if not isinstance(lhs, builders._Mask) or not isinstance(rhs, builders._Mask):
+                    self.fail(node, "predicate conjunction needs two predicates")
+                return (lhs & rhs) if isinstance(node.op, ast.BitAnd) else (lhs | rhs)
+            if type(lhs) is int and type(rhs) is int:
+                return lhs & rhs if isinstance(node.op, ast.BitAnd) else lhs | rhs
+            self.fail(node, "device bitwise operations require coordinate predicates")
         if isinstance(node, ast.BinOp) and type(node.op) in _BINARY:
             lhs, rhs = self.expr(node.left), self.expr(node.right)
             if isinstance(node.op, ast.Div):
                 if type(lhs) not in {int, float} or type(rhs) not in {int, float}:
                     self.fail(node, "device integer division requires // or N.ceildiv")
                 return lhs / rhs
+            if isinstance(lhs, builders._Coord) or isinstance(rhs, builders._Coord):
+                return _BINARY[type(node.op)](lhs, rhs)
             if type(lhs) not in {int, float} or type(rhs) not in {int, float}:
                 lhs, rhs = builders._index(lhs), builders._index(rhs)
             return _BINARY[type(node.op)](lhs, rhs)
@@ -725,6 +751,8 @@ class _Parser:
                 and type(rhs) is str
                 and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
             ):
+                return compare(lhs, rhs)
+            if isinstance(lhs, builders._Coord) or isinstance(rhs, builders._Coord):
                 return compare(lhs, rhs)
             return self.trace.index_op(arith.CmpiOp, lhs, rhs, comparison=name)
         if isinstance(node, ast.Call):
