@@ -9,7 +9,9 @@ from .build import build_file
 
 def main():
     parser = argparse.ArgumentParser(prog="ascendflow", description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="Python DSL or serialized source IR")
+    parser.add_argument(
+        "--input", type=Path, required=True, help="Python DSL or serialized source IR"
+    )
     parser.add_argument("--entry", help="captured AST prim_func in a Python input file")
     parser.add_argument(
         "--parameters", type=json.loads, default={}, help="JSON AST constexpr specializations"

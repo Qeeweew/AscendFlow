@@ -1,10 +1,20 @@
 # 测试入口与验证边界
 
-使用工作区独立 `.venv`。当前产品只有 `compile` / `Compilation` 这一条 source 链路：实际控制与地址、内存 admission、依赖、通知生成及 credit、事件资源，再生成最终物理 IR 与 ASC。导出的物理快照不能作为已证明的 source 编译输入。
+使用工作区独立 `.venv`，从仓库根目录运行：
+
+```bash
+python -m pip install -e '.[validation,dev]'
+python -m pytest -q
+```
+
+示例的 CANN/设备检查和两项 msprof 采集见[测试指南](../docs/guide/testing.md)；
+实际结果见[示例验证](../docs/reports/examples.md)。以下说明开发回归的职责。
+
+当前产品只有 `compile` / `Compilation` 这一条 source 链路：实际控制与地址、内存 admission、依赖、通知生成及 credit、事件资源，再生成最终物理 IR 与 ASC。导出的物理快照不能作为已证明的 source 编译输入。
 
 旧 planner、scope/query/sequence 求解器专属测试、旧局部同步实现和对应 IR 解释器已删除。测试目录不保留这些实现或兼容入口。删除旧 API 测试不等于当前完整链路获得资格；collection 成功也不表示测试体通过。
 
-旧实验保存在 Git 的 `1231f4f`。Path/搜索树及其内部形状测试已删除，语义反例已迁移到 `sync/test_generation_contracts.py` 等当前测试。规则见[生成合同](../docs/generation-rules.md)，不在测试中保留旧 solver。
+旧实验保存在 Git 的 `1231f4f`。Path/搜索树及其内部形状测试已删除，语义反例已迁移到 `sync/test_generation_contracts.py` 等当前测试。规则见[生成合同](../docs/development/generation-rules.md)，不在测试中保留旧 solver。
 
 ## 当前职责
 
@@ -23,6 +33,10 @@
 旧硬件反例按职责保留在当前表示中：`sync/test_structured_event_semantics.py` 和 `models/structured_events.py` 包含 native end 非 FIFO、RAW/WAR/WAW、删 Wait、错 ID、过早 Set、跨 body 二元事件复用、Scalar controller 阻塞、双 AIV mode2 quorum、未消费容量与跨队列阻塞环。共享 GM 输入的有限字节检查使用同一 structured 模型。几何与 packet 合同直接使用当前静态对象或实际 SSA；native end 与退休的区别由实际事件模型检查。旧求解器的节点数量、缓存、路径搜索与旧 IR 布局断言不再作为产品合同。
 
 这些覆盖说明测试职责，不代表所有旧场景都已在新编译器获得证明。当前 mixed region、祖先 invocation 和完整 source 集成必须分别满足现有同步契约；未证明的关系应明确拒绝。FA、CANN、设备和性能资格不能由目录清理或小合同通过推导。
+
+清单完整性、失败即停和默认 profiling 流程由 `test_example_checks.py`、
+`test_profile_defaults.py` 检查；本地文档链接由 `test_documentation.py` 检查。
+动态 valid prefix 仅是 `fixtures/prefix.py` 的未支持/拒绝用例，不计入 runnable examples。
 
 ## Helper 与模型的独立性
 
@@ -44,9 +58,9 @@ native快照，不能把物理发射顺序当作算法的逻辑次序。模型�
 先执行小规模 Python/IR 检查，再考虑 ASC/CANN 离线编译。运行结果绑定实际源码和产物，不把 collection 当作通过。从本仓库根目录、已激活的 Python 环境检查入口：
 
 ```bash
-python -m pytest --collect-only -q tests
+python -m pytest -q tests
 ```
 
-collection 不执行 fixture 和测试体。完整 generated pipeline 用例检查真实 source 的资源及进展契约；手工 IR 模型和后端筛选结果不能替代完整 source 验证。
+需要仅查看清单时使用 `--collect-only`，它不执行 fixture 和测试体。完整 generated pipeline 用例检查真实 source 的资源及进展契约；手工 IR 模型和后端筛选结果不能替代完整 source 验证。
 
-单个进程/算子构建不超过 300 秒；失败停止后续候选并清理所属子进程。设备 runner 位于 `support/`，其运行须遵守工作区卡健康、进程、显存、利用率和显式物理映射要求。
+单个进程/算子构建不超过 300 秒；失败停止后续候选并清理所属子进程。示例设备 runner 位于 `benchmarks/`，独立设备诊断位于 `support/`；运行须遵守工作区卡健康、进程、显存、利用率和显式物理映射要求。

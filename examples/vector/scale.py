@@ -1,7 +1,6 @@
 """AST frontend: explicit UB slots and one runtime tile-count parameter.
 
-This example uses complete tiles. See prefix.py for aligned element tails and
-two independent runtime lengths; device validation lives in benchmarks/vector.
+This example uses complete tiles; device validation lives in benchmarks/vector.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ import pytest
 from ascendflow import compile
 from ascendflow.diagnostics import CompileError
 from ascendflow.frontend import from_source
-from examples.vector.prefix import scale_prefix
+from tests.fixtures.prefix import scale_prefix
 
 
 def test_incorrect_valid_expression_is_not_treated_as_padding():

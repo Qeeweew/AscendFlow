@@ -15,7 +15,7 @@ L1 使用 384 KiB，L0A/B 各 64 KiB、L0C 128 KiB。B 的两个列片在 GM→L
 主体用 `T.tile_ranges` 绑定每轴的 `(base,count,valid)`，删除手写 M/N/K
 整块和尾块枚举；有效宽度仍为 constexpr。N 尾部的多个 BN 列片现在共用
 同一份 A 和一次宽 B 搬运、同一条 K 流水，逐列片裁剪 FIXPIPE。
-L2 坐标政策在 [schedule.py](../examples/gemm/schedule.py) 的 `@T.inline`
+L2 坐标政策在 [schedule.py](../../examples/gemm/schedule.py) 的 `@T.inline`
 helper 中；其 AST 在正常前端内联，原轴、字节访问、ownership 和同步检查照常执行。
 K 流水只有 load/compute 两个 stage；最后一个 panel 在 compute 末尾执行
 FIXPIPE，不为只执行一次的写回增加 export stage。MAD→FIX 与 accumulator
@@ -37,7 +37,7 @@ FIXPIPE，不为只执行一次的写回增加 export stage。MAD→FIX 与 accu
 [`CalcTile` / `DoL2CacheTiling`](https://gitcode.com/cann/ops-nn/blob/a7539b121effe3c7b32a1e5e38de5b620b2e4ac9/matmul/mat_mul_v3/op_host/op_tiling/matmul_v3_base_tiling.cpp)、
 [`UpdateBlockCnt` / `CalcGMOffset`](https://gitcode.com/cann/ops-nn/blob/a7539b121effe3c7b32a1e5e38de5b620b2e4ac9/matmul/mat_mul_v3/op_kernel/mat_mul_base_block.h)。
 复用其两层分块和映射思路；没有复刻 `UpdateBasicIndex` 的完整错位策略。不依赖参考
-工程或调用其 kernel；计时基线仍是容器安装的 CANN 9.1.0 ACLNN 库。
+工程或调用其 kernel。日常 kernel time 只采集当前生成 kernel；ACLNN 参考用于专项诊断。
 
 ```python
 from examples.gemm.matmul import gemm
@@ -129,10 +129,7 @@ oracle 精确相等，没有因尾块失败而放宽容差。
 一行，检查这些行全部 N 列；另检查完整输出有限性/hash、输入不变、前后
 各 512 B guard。地址可额外偏移 0–15 个 b16 元素。
 
-性能采用同卡三批，每批预热 5 次、计时 30 次的 msprof 设备 task p50。
-`compare_matmul` 重验产物、dtype、输入、设备及原始 CSV，要求最慢生成
-批次 / 最快 ACLNN 批次 ≤ 1.00。ACL stream interval 包括 host 提交间隙，
-另行记录。逻辑 `2*M*N*K` 速率不等于尾块下的 native FLOPs。
-具体已测形状、构建耗时、数值检查及三批性能结果集中在
-[性能与设备验证记录](performance-results.md)。性能资格按记录中的 shape、dtype、
-政策和产物身份限定；任意正尺寸支持与性能门槛分别验收。
+日常性能记录固定为默认 4096×4096×4096 FP16、正态输入，各采集一次默认
+msprof；具体命令与预热/执行次数见[测试指南](../guide/testing.md)，当前 kernel time
+见[性能报告](../reports/performance.md)。原有 ACLNN 三批比较器保留作专项诊断，
+不是日常验收步骤。任意正尺寸的正确性支持与某一配置的性能记录分别限定范围。

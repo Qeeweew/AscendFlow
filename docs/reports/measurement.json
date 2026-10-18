@@ -1,0 +1,538 @@
+{
+  "schema": "ascendflow-validation-v1",
+  "date": "2026-10-18",
+  "head": "64dff2720c71510dbd57276a8a4f6dedae3d0b5b",
+  "python": "3.11.15",
+  "xdsl": "0.73.0",
+  "numpy": "2.4.6",
+  "target": "dav-2201",
+  "cann": "9.1.0",
+  "physical_device": 2,
+  "logical_device": 0,
+  "compiler_changes": "No executable compiler changes; src/cli.py formatted after measurements.",
+  "cli_formatting": {
+    "before_sha256": "85baa545378e47e502320d530cd4c2df4f259631e5b69feae289d01b56c4e84e",
+    "after_sha256": "0f446fc4314b48ccb76fff65c9b66387e581fbf138341d9409dc3b69a3ba8177",
+    "executable_ast_equal": true
+  },
+  "examples": {
+    "status": "passed",
+    "entries": 16,
+    "device_cases": 53,
+    "results_path": "build/docs-validation-20261018/examples/results.json",
+    "results_sha256": "2c27220219f79eb52425b47c37973fab737a8c1f843aae7eab3c1c7f9188fe6e",
+    "cases": [
+      {
+        "name": "scale",
+        "status": "device-passed",
+        "source": "examples/vector/scale.py",
+        "entry": "scale",
+        "build_seconds": 6.630604580044746,
+        "device_cases": 3,
+        "output": "build/docs-validation-20261018/examples/scale",
+        "asc_sha256": "adc9a1effcfc0ebc83478c193639d18e023fe4c42a22ef081930cd2c34b1e390",
+        "shared_sha256": "856485ebc383dff98b1341afa1324b31478a778a0e1e10b2b41dad4006c96da4",
+        "device_records": {
+          "build/docs-validation-20261018/examples/scale/device.json": "a451e938371ccab2630aee7a7be14340f79c14ef0d0dc418fef9fbcc2d149f1e"
+        }
+      },
+      {
+        "name": "grouped-scale",
+        "status": "device-passed",
+        "source": "examples/vector/grouped.py",
+        "entry": "grouped_scale",
+        "build_seconds": 6.8811148554086685,
+        "device_cases": 3,
+        "output": "build/docs-validation-20261018/examples/grouped-scale",
+        "asc_sha256": "45c6a30f8e735f56673ac0f3c81bee70cba1f55937dd49f70841e820fd48f83c",
+        "shared_sha256": "6a6708397776580d04dfc00dfd514d7c8674e805ab3fbbce02693b8ac8b70696",
+        "device_records": {
+          "build/docs-validation-20261018/examples/grouped-scale/device.json": "9cd1abeff1301b5a99eac23bb7b93c7760de313ff2c1308bf6e6ab49491c755b"
+        }
+      },
+      {
+        "name": "rings",
+        "status": "device-passed",
+        "source": "examples/vector/independent_rings.py",
+        "entry": "independent_rings",
+        "build_seconds": 6.627816189080477,
+        "device_cases": 4,
+        "output": "build/docs-validation-20261018/examples/rings",
+        "asc_sha256": "f7447baba6b8b4ff5ec4b03b5cb5d6e7b0915e70847608c286f4ead2418f546d",
+        "shared_sha256": "2d8fb61e510fcc230b7eba04908f52e15db9696f6e0ce2fb5f93952af8c95af4",
+        "device_records": {
+          "build/docs-validation-20261018/examples/rings/device.json": "8e531fc79e8b9c3ca114638349b606c4cfcb86e2ec3443ff112bd70d948931f2"
+        }
+      },
+      {
+        "name": "rms",
+        "status": "device-passed",
+        "source": "examples/normalization/rms_norm.py",
+        "entry": "rms_normalize",
+        "build_seconds": 6.731960993260145,
+        "device_cases": 3,
+        "output": "build/docs-validation-20261018/examples/rms",
+        "asc_sha256": "29338aaabc6186daf63546ffe6868c876f98193842870a8ac2151e47e70d7a17",
+        "shared_sha256": "4b805957340ce3cb64d7b1d84fa78cfcadf2c3ab9a0dbd9f7a1275b5732baf63",
+        "device_records": {
+          "build/docs-validation-20261018/examples/rms/device-generated.json": "06b63c1c644c1fb8ba5990624dcf35602710255ca9cb0ff1c85ad63aa9fd2dbb"
+        }
+      },
+      {
+        "name": "softmax",
+        "status": "device-passed",
+        "source": "examples/normalization/softmax.py",
+        "entry": "softmax",
+        "build_seconds": 6.878278683871031,
+        "device_cases": 3,
+        "output": "build/docs-validation-20261018/examples/softmax",
+        "asc_sha256": "baddd5bbfc5c1f0aaa75edf6d567ee0e64d89b26baef00b6b9f3d12f623d3cd5",
+        "shared_sha256": "309e7e076ea191956f4b061641aea3c5743424ff2eccb9f76ebc4fd9e5d36cf2",
+        "device_records": {
+          "build/docs-validation-20261018/examples/softmax/device-generated.json": "7df575dd7d24a14ee001861eae7ae4c5d97bdff570c3849020d1e1457ac39c8e"
+        }
+      },
+      {
+        "name": "batched-gemm",
+        "status": "device-passed",
+        "source": "examples/gemm/batched.py",
+        "entry": "batched_matmul",
+        "build_seconds": 6.781610477715731,
+        "device_cases": 3,
+        "output": "build/docs-validation-20261018/examples/batched-gemm",
+        "asc_sha256": "73170d97ed1af6f45c1e320ffb4424e35567c11bdbfde36b74857a15634d26f5",
+        "shared_sha256": "2650f7e1b2751db677a81424c71f67538731766a818a803255557de9844f9a1e",
+        "device_records": {
+          "build/docs-validation-20261018/examples/batched-gemm/device-generated.json": "8b53d1dbaa0c7d9c875aaec518f9fa8b08006ec6ab338a50290200b21e4e3b8a"
+        }
+      },
+      {
+        "name": "reduction-gemm",
+        "status": "device-passed",
+        "source": "examples/gemm/reduction.py",
+        "entry": "reduction_gemm",
+        "build_seconds": 7.02930024266243,
+        "device_cases": 3,
+        "output": "build/docs-validation-20261018/examples/reduction-gemm",
+        "asc_sha256": "93e32dde5833da70272389bcd184393536798e87d3bbd78c1bfd3701e360b88c",
+        "shared_sha256": "bc292ebf870deaa048ab2e88bdd04a6bc47c3d00222a49dee172cd6282eb7358",
+        "device_records": {
+          "build/docs-validation-20261018/examples/reduction-gemm/device-generated.json": "7f6bd274de12c6f212c4b2f10d9a5094d49601922be0a5ab2ec8935bfaa4ce67"
+        }
+      },
+      {
+        "name": "hierarchical-gemm",
+        "status": "device-passed",
+        "source": "examples/gemm/hierarchical.py",
+        "entry": "hierarchical_gemm",
+        "build_seconds": 8.283616930246353,
+        "device_cases": 4,
+        "output": "build/docs-validation-20261018/examples/hierarchical-gemm",
+        "asc_sha256": "d298f7ea714bdbd0ec6a02248a0a1a2f60247e6a708de0f256cb20abcccf0fde",
+        "shared_sha256": "c8e0dca7544d8325e361d67a687087e5a31a2ae6871349bda9efbf9c37dcf8f5",
+        "device_records": {
+          "build/docs-validation-20261018/examples/hierarchical-gemm/device-generated.json": "d15f2e1ee5cb8e5d2de5556af932246409cf48ac8a4b47cf44a3f21b1fe907ff"
+        }
+      },
+      {
+        "name": "dense-gemm",
+        "status": "device-passed",
+        "source": "examples/gemm/dense.py",
+        "entry": "dense_gemm",
+        "build_seconds": 7.929812215268612,
+        "device_cases": 1,
+        "output": "build/docs-validation-20261018/examples/dense-gemm",
+        "asc_sha256": "9a7b4bde4bf63af8ad6eda96429973f6cae2f9e80162a731432edf70116ff21c",
+        "shared_sha256": "d33ed320177e94fda9bddf8bfdb7fb7bbe48c12f55b9dcd8a144384fe5c7290f",
+        "device_records": {
+          "build/docs-validation-20261018/examples/dense-gemm/device-generated.json": "e5e84844f41eca853b5dc2b16d8f90a15e3bb37e6f8b6deed0e0ba2348f5bd34"
+        }
+      },
+      {
+        "name": "gemm",
+        "status": "device-passed",
+        "source": "examples/gemm/matmul.py",
+        "entry": "gemm",
+        "build_seconds": 17.45736300572753,
+        "device_cases": 1,
+        "output": "build/docs-validation-20261018/examples/gemm",
+        "asc_sha256": "209175cec0fcb910f114df6c5397b888f81be33fc633ef8233e38e24219a02ae",
+        "shared_sha256": "e6a3e89980408cae1a5470df66de67acf19100c3f687de4895526656521662ea",
+        "device_records": {
+          "build/docs-validation-20261018/examples/gemm/device-generated.json": "ad2cf31473348f1c8b386f663f5b81618df9407e7f78c73efbc2d02572fdd15a"
+        }
+      },
+      {
+        "name": "nested-cv",
+        "status": "device-passed",
+        "source": "examples/cv/nested.py",
+        "entry": "nested_cv",
+        "build_seconds": 7.634896386414766,
+        "device_cases": 4,
+        "output": "build/docs-validation-20261018/examples/nested-cv",
+        "asc_sha256": "b8768b88b2d3af3f48d028e0bc41b7dcf75eb2823de878ea1da77ec4e1603800",
+        "shared_sha256": "8c70048018ce2266b9aaed67f9d48f6c7171ba6f4e6cecdd7467506d7ebd830a",
+        "device_records": {
+          "build/docs-validation-20261018/examples/nested-cv/device.json": "94e462c3f11a1ce208efd1b74232da03ce044599e8db56b7e31209f998e4cf2d"
+        }
+      },
+      {
+        "name": "state",
+        "status": "device-passed",
+        "source": "examples/state/recurrence.py",
+        "entry": "state_sum",
+        "build_seconds": 6.579238522797823,
+        "device_cases": 4,
+        "output": "build/docs-validation-20261018/examples/state",
+        "asc_sha256": "ebd0ee727b0e697d21449b60546b3447d03b7965568ea2b458c0c56bd41970c7",
+        "shared_sha256": "50fb6e39975275cc43d14cabff4a689102096acbfc2ee98d6bf3b01fa58df0b8",
+        "device_records": {
+          "build/docs-validation-20261018/examples/state/device-generated.json": "85194cd26ca0ba42acb655d66b7d481d8f0f20c66074955478783d5e54f5b2ca"
+        }
+      },
+      {
+        "name": "grouped-state",
+        "status": "device-passed",
+        "source": "examples/state/grouped.py",
+        "entry": "grouped_state_sum",
+        "build_seconds": 7.085512064397335,
+        "device_cases": 5,
+        "output": "build/docs-validation-20261018/examples/grouped-state",
+        "asc_sha256": "c60b307bf7d478ba81895e6794e0c251e911a9076637969b9c2d561db85fc03d",
+        "shared_sha256": "8f21a341581e0a7cb42579d1345cb390686935e0b978d78a7113af86e07668ff",
+        "device_records": {
+          "build/docs-validation-20261018/examples/grouped-state/device-generated.json": "a0884fbad77f9ce9b5b891c15eca05c1f81c7742ebb46cf0138d61ecdb2e63d5"
+        }
+      },
+      {
+        "name": "shared-state",
+        "status": "device-passed",
+        "source": "examples/state/shared_inputs.py",
+        "entry": "shared_state_sum",
+        "build_seconds": 6.98573175817728,
+        "device_cases": 5,
+        "output": "build/docs-validation-20261018/examples/shared-state",
+        "asc_sha256": "06e7dfe2f098a727775aef35ac9f60e2636003b7d7710fed9dd0c0bdbe4c6a8a",
+        "shared_sha256": "6cece649f4dbaeaa741f9160d7066fe06b21b10614d7cfe112eb78c220609d10",
+        "device_records": {
+          "build/docs-validation-20261018/examples/shared-state/device-generated.json": "9ac9259b92fd9828a555c5c7dabe55a9d0f652d07fab5303db6a8ac0027f8591"
+        }
+      },
+      {
+        "name": "frame-state",
+        "status": "device-passed",
+        "source": "examples/state/frame_snapshot.py",
+        "entry": "frame_state_sum",
+        "build_seconds": 7.384717628359795,
+        "device_cases": 5,
+        "output": "build/docs-validation-20261018/examples/frame-state",
+        "asc_sha256": "dcb099094aa16f8b4fefae4bee1f8d9174d63cf00c786bf57904e1ba832adc0d",
+        "shared_sha256": "3de90175fd5b614260167136cbf1223e0a928219e8be665f492e3aeba9a058a0",
+        "device_records": {
+          "build/docs-validation-20261018/examples/frame-state/device-generated.json": "95c286e269a37b2fa2dced196ac6be614ce4190894ea7297e81d8f87697cbe45"
+        }
+      },
+      {
+        "name": "flash-attention",
+        "status": "device-passed",
+        "source": "examples/flash_attention/attention.py",
+        "entry": "attention_target",
+        "build_seconds": 30.44172816351056,
+        "device_cases": 2,
+        "output": "build/docs-validation-20261018/examples/flash-attention",
+        "asc_sha256": "3f442bc853196df869270f5034b26a5cc8ead014388d5a539d9a627a04e5ab21",
+        "shared_sha256": "5d56912dc48017c4dbcd3bfb51aa78658b30f93a34019d6e5f8fa1a0cd9cf0d5",
+        "device_records": {
+          "build/docs-validation-20261018/examples/flash-attention/device-generated-standard.json": "c305ad14ea239c8e76295d01af3d90c68503e3b805bfb60fb2a9f5d9a264b55d"
+        }
+      }
+    ]
+  },
+  "performance": {
+    "status": "passed",
+    "method": "one msprof invocation per case, default collection options; generated only",
+    "results_path": "build/docs-validation-20261018/kernel-times/results.json",
+    "results_sha256": "1e0bed03fe946b5b1e0c67220817f671e7b1cc2bdd4d7674ffeb1ac47efdad4a",
+    "cases": [
+      {
+        "name": "flash-attention",
+        "status": "passed",
+        "shape": [
+          1,
+          8,
+          8,
+          4096,
+          4096,
+          128
+        ],
+        "dtype": "f16",
+        "kernel_time_us": 506.512,
+        "warmup": 1,
+        "repeats": 3,
+        "profile_invocations": 1,
+        "msprof_command": [
+          "msprof",
+          "--output=/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/profile",
+          "/workspace/xdsl-910b/AscendFlow/benchmarks/profile.sh",
+          "benchmarks.attention.run",
+          "--output",
+          "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/artifact",
+          "--physical",
+          "2",
+          "--scope",
+          "sampled",
+          "--record",
+          "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/profile/device.json",
+          "--cases",
+          "4096:4096"
+        ],
+        "build_seconds": 29.357626903802156,
+        "asc_sha256": "3f442bc853196df869270f5034b26a5cc8ead014388d5a539d9a627a04e5ab21",
+        "shared_sha256": "5d56912dc48017c4dbcd3bfb51aa78658b30f93a34019d6e5f8fa1a0cd9cf0d5",
+        "cann_commands": [
+          [
+            "/usr/local/Ascend/cann-9.1.0/tools/bisheng_compiler/bin/bisheng",
+            "-O2",
+            "-fPIC",
+            "-std=c++20",
+            "-mllvm",
+            "-cce-aicore-dcpreload-args=false",
+            "--npu-arch=dav-2201",
+            "--cce-aicore-only",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/artifact/attention_target.asc",
+            "-o",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/artifact/attention_target.o"
+          ],
+          [
+            "/usr/local/Ascend/cann-9.1.0/tools/bisheng_compiler/bin/ld.lld",
+            "-m",
+            "aicorelinux",
+            "-Ttext",
+            "0",
+            "--no-mmap-output-file",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/artifact/attention_target.o",
+            "-o",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/artifact/attention_target.aibin"
+          ],
+          [
+            "/usr/local/Ascend/cann-9.1.0/tools/bisheng_compiler/bin/bisheng",
+            "-O2",
+            "-fPIC",
+            "-std=c++20",
+            "-mllvm",
+            "-cce-aicore-dcpreload-args=false",
+            "--npu-arch=dav-2201",
+            "-shared",
+            "-Wl,--no-mmap-output-file",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/artifact/attention_target.asc",
+            "-o",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/flash-attention/artifact/attention_target.so"
+          ]
+        ],
+        "artifact": "build/docs-validation-20261018/kernel-times/flash-attention/artifact",
+        "csv": "build/docs-validation-20261018/kernel-times/flash-attention/profile/PROF_000001_20261018033638952_02214152KECRPLOR/mindstudio_profiler_output/op_summary_20261018033643.csv",
+        "csv_sha256": "16b0772d0f77d186eddd1ca4543297e03407cd212f7beb25b27ab34bef768421",
+        "device_record": "build/docs-validation-20261018/kernel-times/flash-attention/profile/device.json",
+        "device_record_sha256": "bf5a0afda566bd52c70a0ed086b0822ad0deac4d17696c43d5b9f2722719ae70",
+        "oracle_scope": "sampled",
+        "checked_elements": 196608,
+        "max_abs_error": 1.52587890625e-05,
+        "input_sha256": {
+          "q": "6b5e2cfa3353b8604cc4c96252fde4cd12ce31b45e7cc58aca4d2c954777b0f1",
+          "k": "f3f464979dbb0f6a66964f40bd6ceed2e5172a299b2ac8b7a962b274a131b645",
+          "v": "b3d0fe02c843b52b601719fd10f7bbd20768039393eef191e129b754bba459e2",
+          "o": "581d3a1338e7efceb91400f13ae860ccaf9880cf460f6c814008065f0086c68c",
+          "score": "94db62b3301072ed0caf25ddaf98b9e103fed6c05fc5c31366c0706cf8d57157",
+          "p": "332f4ef8728f44a14098d68506f894c1d1dd7288c1e423592209b1e355b39289",
+          "pv": "2137811c30ff06f971ec8e4dc9a63841085556c209c0ffefc9579b7ea6ff33da"
+        },
+        "output_sha256": "1769e403c2cb2f1abf16bc5084f0659dfcd4b9e337f71e28748989707cae8293",
+        "hardware": {
+          "soc": "Ascend910B3",
+          "aic_cores": 20,
+          "aiv_cores": 40,
+          "clocks": {
+            "hbm": {
+              "status": 0,
+              "mhz": 1600
+            },
+            "aic_current": {
+              "status": 0,
+              "mhz": 800
+            },
+            "aic_max": {
+              "status": 0,
+              "mhz": 1800
+            },
+            "aiv_current": {
+              "status": -8255,
+              "mhz": null
+            }
+          }
+        },
+        "policy": {
+          "batch": 1,
+          "heads": 8,
+          "kv_heads": 8,
+          "dim": 128,
+          "groups": 20,
+          "dtype": "f16",
+          "query_tile": 256
+        }
+      },
+      {
+        "name": "gemm-normal",
+        "status": "passed",
+        "shape": [
+          4096,
+          4096,
+          4096
+        ],
+        "dtype": "f16",
+        "kernel_time_us": 484.54,
+        "warmup": 5,
+        "repeats": 30,
+        "profile_invocations": 1,
+        "msprof_command": [
+          "msprof",
+          "--output=/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/profile",
+          "/workspace/xdsl-910b/AscendFlow/benchmarks/profile.sh",
+          "benchmarks.gemm.run_matmul",
+          "--output",
+          "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/artifact",
+          "--physical",
+          "2",
+          "--scope",
+          "sampled",
+          "--record",
+          "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/profile/device.json"
+        ],
+        "build_seconds": 8.986496169120073,
+        "asc_sha256": "64e7a99d5d87ef6b08d0e06e3c45fb8d6b37c14c9375054c79e8fab990d01fab",
+        "shared_sha256": "0b61379e7666f83a5b091644496a944efc85efd526495d44fc8b375246dc2542",
+        "cann_commands": [
+          [
+            "/usr/local/Ascend/cann-9.1.0/tools/bisheng_compiler/bin/bisheng",
+            "-O2",
+            "-fPIC",
+            "-std=c++20",
+            "-mllvm",
+            "-cce-aicore-dcpreload-args=false",
+            "--npu-arch=dav-2201",
+            "--cce-aicore-only",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/artifact/gemm.asc",
+            "-o",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/artifact/gemm.o"
+          ],
+          [
+            "/usr/local/Ascend/cann-9.1.0/tools/bisheng_compiler/bin/ld.lld",
+            "-m",
+            "aicorelinux",
+            "-Ttext",
+            "0",
+            "--no-mmap-output-file",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/artifact/gemm.o",
+            "-o",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/artifact/gemm.aibin"
+          ],
+          [
+            "/usr/local/Ascend/cann-9.1.0/tools/bisheng_compiler/bin/bisheng",
+            "-O2",
+            "-fPIC",
+            "-std=c++20",
+            "-mllvm",
+            "-cce-aicore-dcpreload-args=false",
+            "--npu-arch=dav-2201",
+            "-shared",
+            "-Wl,--no-mmap-output-file",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/artifact/gemm.asc",
+            "-o",
+            "/workspace/xdsl-910b/AscendFlow/build/docs-validation-20261018/kernel-times/gemm-normal/artifact/gemm.so"
+          ]
+        ],
+        "artifact": "build/docs-validation-20261018/kernel-times/gemm-normal/artifact",
+        "csv": "build/docs-validation-20261018/kernel-times/gemm-normal/profile/PROF_000001_20261018033659035_02214586NKLNHEEJ/mindstudio_profiler_output/op_summary_20261018033705.csv",
+        "csv_sha256": "3d7649ccd59f42ba596878bd7fddba4ff2d3f920c197d250a8951a39729bad65",
+        "device_record": "build/docs-validation-20261018/kernel-times/gemm-normal/profile/device.json",
+        "device_record_sha256": "c7002e8b5f412a7395dfba5591018d2ec7d2e577fcc0232464265a71ad32fed4",
+        "oracle_scope": "sampled",
+        "checked_elements": 790528,
+        "max_abs_error": 0.031220584103721194,
+        "input_sha256": [
+          "0e6fa97ff31941e97cff50c6ea13f16e56c2c88742c7c5bdb940752f6139162b",
+          "56eb52c6352b080d6074a0cd11363482598ae8fe765c56954408e21e76bb343e"
+        ],
+        "output_sha256": "0a9e4000bb270e2d8f5efa34ad36913656ee7753aedc54557d2b2ecd6040b507",
+        "hardware": {
+          "soc": "Ascend910B3",
+          "aic_cores": 20,
+          "aiv_cores": 40,
+          "clocks": {
+            "hbm": {
+              "status": 0,
+              "mhz": 1600
+            },
+            "aic_current": {
+              "status": 0,
+              "mhz": 800
+            },
+            "aic_max": {
+              "status": 0,
+              "mhz": 1800
+            },
+            "aiv_current": {
+              "status": -8255,
+              "mhz": null
+            }
+          }
+        },
+        "policy": {
+          "M": 4096,
+          "N": 4096,
+          "K": 4096,
+          "BM": 128,
+          "BN": 128,
+          "BK": 256,
+          "CK": 128,
+          "COL_PARTS": 2,
+          "L2_TILE": 0,
+          "GROUPS": 20,
+          "DTYPE": "f16",
+          "OUTPUT_CACHE": "auto",
+          "L2_BYTES": 201326592
+        }
+      }
+    ]
+  },
+  "quality": {
+    "tests": {
+      "tests": "1816",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "312.278"
+    },
+    "junit_path": "build/docs-validation-20261018/tests.xml",
+    "junit_sha256": "87df28240ce5c550bbf798683a36e6631eedd49a1ad9bafebb755b2af18fdb40",
+    "log_path": "build/docs-validation-20261018/tests.log",
+    "log_sha256": "f7350e9bd63a3852a0d06d94ed3afc778f26aba93133f9e4664e0be9e759c421",
+    "ruff_check": "passed",
+    "ruff_format": "271 files already formatted",
+    "git_diff_check": "passed",
+    "artifact_identity_audit": "18 ASC/shared-library pairs and 2 raw profiler CSV hashes checked"
+  },
+  "documentation_review": {
+    "skill": "pi-subagent",
+    "model": "deepseek/deepseek-flash",
+    "read_only": true,
+    "initial_task_id": "8a24bbb906b8",
+    "initial_status": "timed_out",
+    "followup_task_id": "e597d63a3267",
+    "followup_status": "succeeded",
+    "findings": 5,
+    "disposition": "All five inspected and fixed; final local documentation links passed.",
+    "result_path": "build/docs-validation-20261018/pi-review.md",
+    "result_sha256": "5a181395f6cb5690b911f3b96ed554cec23bfe33f864645997a48f4ca905e212",
+    "resolution_path": "build/docs-validation-20261018/pi-review-resolution.md"
+  }
+}

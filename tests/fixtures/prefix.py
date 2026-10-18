@@ -1,4 +1,4 @@
-"""Runtime element lengths, exact aligned tails, and explicit double buffering.
+"""Unsupported dynamic valid-prefix fixture; frontend and rejection tests only.
 
 Process min(n, m) elements. The rest of Y is untouched; neither allocation is
 padded to the pipeline tile. The launch contract requires min(n, m) % 8 == 0.

@@ -1,6 +1,6 @@
 # Flash Attention 示例合同
 
-源码：[examples/flash_attention/attention.py](../examples/flash_attention/attention.py)，入口 `attention_target`。算法与固定排步属于example，不属于编译器内部。编译和设备验证使用[统一验收口径](validation.md)。
+源码：[examples/flash_attention/attention.py](../../examples/flash_attention/attention.py)，入口 `attention_target`。算法与固定排步属于example，不属于编译器内部。编译和设备验证使用[统一验收口径](../development/validation.md)。
 
 ## 当前默认配置
 
@@ -41,16 +41,13 @@ Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
 
 ## 资格边界
 
-默认数值验收配置包括 Sq:Sk 为256:1024、768:3072、1536:1024、1024:2048等，
-误差阈值为rtol=0.002、atol=0.0002；4K/8K用于稳态性能比较。
-每次结论绑定本次生成的ASC和库、输入与设备，采样与全输出验证分别标明。性能目标为同卡设备时间不慢于ACLNN（时间比≤1.00）；BQ128仍可显式选择，其历史性能不能代替当前默认政策的资格。
+数值容差为 rtol=0.002、atol=0.0002。当前日常检查对 256:1024 和 768:3072
+进行全输出 oracle；性能只采集 Sq=Sk=4096 的默认政策。预热和执行次数、一次默认
+msprof 的步骤见[测试指南](../guide/testing.md)，实际结果分别见
+[示例验证](../reports/examples.md)与[性能报告](../reports/performance.md)。
 
-合并最终 O 写回 stage 后的具体数值、性能与产物身份见
-[性能与设备验证记录](performance-results.md)。其中 default/BQ128、全输出/采样及
-standard/uniform/sharp 分别记录，资格不随 runner 参数自动扩展。
-
-同完成前缀上的重复 PIPE_V 屏障已在 IR 条件变换中合并；规则、历史产物和
-当前验收范围见[同步性能优化状态](deferred-optimizations.md)。
+这些记录只覆盖对应配置和产物；BQ128 及其他政策的历史记录不代替当前默认配置。
+连续 fence 合并的规则见[同步优化边界](../development/sync-optimizations.md)。
 
 runner能接受某些dtype/head/tile参数不代表其全部通过。causal、mask、tail、空序列、varlen、paged/sparse、persistent及continuous多时钟状态不在默认例资格内。后续变体应通过通用控制/访问合同表达，不创建attention专属pass。
 
@@ -63,4 +60,4 @@ python -m ascendflow --input examples/flash_attention/attention.py --entry atten
 python -m benchmarks.attention.run --output build/attention/generated --build
 ```
 
-独立手写AscendC/ACLNN、设备运行和profile见[benchmarks](../benchmarks/README.md)。手写参考通过不等于本DSL通过。每次构建总期限≤300s；设备运行需全卡检查、显式物理映射，失败立即停止。
+独立手写AscendC/ACLNN、设备运行和profile见[benchmarks](../../benchmarks/README.md)。手写参考通过不等于本DSL通过。每次构建总期限≤300s；设备运行需全卡检查、显式物理映射，失败立即停止。

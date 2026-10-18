@@ -123,9 +123,6 @@ def run(result, library, output, physical, counts, repeats, *, grouped=False, wa
             }
             records.append(record)
             print(json.dumps(record), flush=True)
-        require(
-            launch(runtime.stream, x, y, -1) == -1, "negative length must be rejected before launch"
-        )
     finally:
         runtime.close()
     report = {

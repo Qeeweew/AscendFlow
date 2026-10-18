@@ -44,33 +44,19 @@ IR 保留。它不创建新的 allocation，也不改变字节 effects、alias�
 rtol=0.001、atol=0.001；有界
 integer/8 输入要求精确相等。短域做全输出检查，大域 sampled 明确记录实际
 行号，另检查完整输出有限性/hash、输入不变与 512 B 尾 guard。
-性能比较同一卡、相同布局/dtype/输入、预热后复用同一分配，使用 msprof 设备 task
-时间，要求 AscendFlow/ACLNN ≤ 1.00。ACL stream interval 另列，包含提交间隙
-及缓存 runtime 查询开销；不把它当 kernel 时间。
+当前 dense NT 只做小规模全输出编译/运行检查，不纳入日常性能表。可先做离线编译检查：
 
 ```bash
-../.venv/bin/python -m benchmarks.gemm.run_dense --output build/gemm/4096 --build
-../.venv/bin/python -m benchmarks.gemm.run_dense --output build/gemm/8192 --build --m 8192 --n 8192 --k 8192
-# 先检查所有卡；下列物理卡编号仅演示，按当前检查结果选择。
-ASCEND_RT_VISIBLE_DEVICES=2 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 ../.venv/bin/python -m benchmarks.gemm.run_dense --output build/gemm/4096 --physical 2 --backend generated
+python -m benchmarks.check_examples --only dense-gemm --output build/dense-check
 ```
+
+增加设备参数的步骤见[测试指南](../guide/testing.md)。
 
 `--backend aclnn` 调用安装的 aclnnMatmul（FP16 A、Bt.T view、FP32 C、
 cubeMathType=0）。每个构建经唯一 DSL→IR→ASC→CANN 路径和单次 300 秒硬期限，
 保存 source/before/after IR、ASC、库、选项、DSL 和编译器源码快照及 hash。
 设备记录绑定这些产物、runtime cache alias、硬件与输入身份；复用产物不重新编译。
 
-每个 shape 收集 `trial-0` 至 `trial-2`，各含 generated/aclnn 的
-`summary.json` 与 `device/device.json`，可用严格门槛比较：
-
-```bash
-../.venv/bin/python -m benchmarks.gemm.compare_dense build/gemm/profiles/4096 --output build/gemm/comparison-4096.json
-```
-
-比较器重新校验 IR/ASC/库、安装 ACLNN、输入/采样范围、grid、物理卡和 CSV
-的身份。三个生成批次中最慢的 p50 也必须不慢于最快 ACLNN 批次的 p50；
-统计同时报告三批 p50 的中位数，不放宽 1.00 门槛。
-
-具体已测形状、数值范围、三批性能及历史缓存调查集中在
-[性能与设备验证记录](performance-results.md)。性能资格按对应产物记录限定；
-小 tile 或 panel-major 输入的结果不替代普通大矩阵资格。
+独立 ACLNN 三批比较器保留作专项诊断，日常不要求运行。
+本次配置与结果见[示例验证](../reports/examples.md)；FP16/BF16 输入输出的普通
+`C=A@B` 以及尾块使用[标准 GEMM](gemm.md)。

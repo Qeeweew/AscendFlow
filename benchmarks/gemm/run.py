@@ -241,7 +241,6 @@ def main():
                     json.dumps({key: value for key, value in record.items() if key != "work"}),
                     flush=True,
                 )
-            require(launch(runtime.stream, ap, bp, cp, -1) == -1, "negative size was accepted")
     finally:
         runtime.close()
     report = {

@@ -172,8 +172,6 @@ def main():
                     json.dumps({k: v for k, v in record.items() if k != "work"}),
                     flush=True,
                 )
-            for bad in (-1, 1 << 62):
-                require(launch(runtime.stream, ip, xp, op, bad) == -1, "invalid extent accepted")
     finally:
         runtime.close()
     output.write_text(

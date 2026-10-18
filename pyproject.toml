@@ -11,6 +11,7 @@ dependencies = ["xdsl==0.73.0"]
 
 [project.optional-dependencies]
 validation = ["numpy>=2,<3"]
+dev = ["pytest>=8,<10", "ruff>=0.14,<1"]
 
 [project.scripts]
 ascendflow = "ascendflow.cli:main"

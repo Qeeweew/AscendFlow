@@ -1,140 +1,37 @@
-# 编译、正确性与性能工具
+# 示例验证与测量工具
 
-以下命令从本仓库根目录、已激活的独立 Python 环境运行。源码在examples；产物、日志、profile和运行数据写入已忽略的 `build/`，不纳入Git。
+日常只需要两个入口，完整操作见[测试指南](../docs/guide/testing.md)：
 
-工具参数支持不等于对应算子已取得资格。完整测试/性能口径见[validation.md](../docs/validation.md)。
+```bash
+python -m benchmarks.check_examples --list
+python -m benchmarks.check_examples --output build/examples-cann
+# 检查全部卡并显式映射后，增加 --physical 进行数值验证。
+python -m benchmarks.profile_defaults --output build/kernel-times --physical 2
+```
 
-## 目录职责
+`check_examples` 检查所有公开示例；`profile_defaults` 仅采集默认 4K Flash Attention
+和 GEMM normal，各一次默认 msprof。输出目录须是新目录。运行环境、卡选择和
+输入合同见[快速上手](../docs/guide/quickstart.md)，结果见[示例验证](../docs/reports/examples.md)
+和[性能报告](../docs/reports/performance.md)。
 
-| 路径 | 职责 |
+| 工具 | 用途 |
 |---|---|
-| compile.py、regions.py | 冷进程源码→ASC、结构成本输入 |
-| vector/、gemm/、normalization/、state/ | 对应真实DSL示例的验证 |
-| attention/ | DSL FA、固定政策AscendC与ACLNN的构建/验证/profile |
-| references/ascendc/、references/ | 独立手写ASC、CANN/ACLNN适配；不从生成PlanIR反向构造参考 |
-| validation/ | 无设备初始化副作用的数值参考和确定性输入 |
-| profile.sh、profile_summary.py、artifacts.py | msprof包装、汇总及源码/库身份校验 |
-| work.py | 新 source 的未加权结构清单、算法工作量记录及不可得计数的明确状态；不做同步分析或运行期请求推导 |
+| `check_examples.py` | 统一示例清单，CANN 构建、设备数值检查、失败即停 |
+| `profile_defaults.py` | 两个关键用例的一次采集与 kernel time |
+| `vector/`、`normalization/`、`gemm/`、`cv/`、`state/`、`attention/` | 单个示例 runner；参数用 `python -m <模块> --help` 查看 |
+| `profile.sh`、`profile_summary.py`、`artifacts.py` | msprof 应用包装、设备 task 汇总和产物身份检查 |
+| `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 
-每个variant的输入构造、Python、ASC、CANN共用≤300s总期限；超时或失败停止后续候选，清理整个所属进程组。不能拿较短阶段预算代替整个build上限。历史已删除库需重建，不能直接运行旧hash记录。
+## 专项诊断
 
-## 无设备：冷编译与CANN
+以下工具保留给明确的编译或性能调查，输出均写入 Git 忽略的 `build/`：
 
-```bash
-python -m benchmarks.compile --input examples/vector/scale.py --entry scale --parameters '{"B":64}' --mode normal --trials 5 --timeout 300 --output build/compile/scale-cold
-python -m benchmarks.compile --input examples/flash_attention/attention.py --entry attention_target --mode normal --trials 1 --timeout 300 --output build/compile/fa-probe
-python -m ascendflow --input examples/flash_attention/attention.py --entry attention_target --compile --timeout 300 --output build/attention/cann
-```
+- `compile.py`：冷进程 source→ASC 计时；单次 probe 与至少五次资格分开，CANN/RSS 另列。
+- `references/`、`attention/run_policy.py`：独立 AscendC 与安装版 ACLNN 对照。
+- `gemm/compare_*`、`attention/compare.py`：历史三批严格比较流程，要求各自记录 schema。
+- `*/analyze*.py`、`work.py`、`regions.py`：结构清单、算法工作量与条件速率分析。
 
-`--parameters`只传显式constexpr；runtime Sq/Sk不作为特化参数。`normal` 使用当前 source 流水线；`deep` 额外启用 `debug_verify`，目前只调用 xDSL 结构验证，不是独立同步检查；`both` 分别记录这两种运行。`--trials 1`是probe，不是五次资格。source→ASC包含源码构造、当前分析、通知物化、输出和内部快照，import、进程总时长、CANN及RSS单列。禁止跨编译cache美化数据。
-
-每次独立目录记录输入、entry、参数、编译器/源码/ASC身份、版本、选项、阶段计时和完成状态。失败即终止后续trial。默认FA目标p50≤5s、max≤10s；达到资格前不反复跑五次FA。
-
-## 工作量报告
-
-vector、state、gemm、normalization runner 的每个 case 使用 `work` 字段，schema 为 `source-work-v1`：
-
-| 字段 | 含义与边界 |
-|---|---|
-| `structure_inventory` | 最终生成 IR 的 native/notification/control 模板和 allocation 声明数量，以及根节点的 grid、runtime ABI 参数；不按循环次数、分支、actor 或 group 加权，不代表执行次数或峰值存储 |
-| `algorithm_work` | runner 从实际问题形状和固定算法政策计算的数学操作量/逻辑输入输出字节，明确标注 convention；GEMM 按每个标量 FMA 两次运算，不冒充 native Cube FLOPs 或访存请求 |
-| `runtime_requests` | 当前为 `status: unavailable`，因为尚未建立新 source 的运行期 native、transfer、operand-byte 和 notification 计数；不填零或 `None` 代替未知量 |
-
-零长度问题可以有零算法工作量，同时保留非零静态模板；运行期请求计数仍不可得。各参考 variant 共享的是生成 source 的结构清单，不能从它推断 AscendC/ACLNN 内部工作。
-
-三个 analyze 入口消费此 schema，保留计时、源码/库、输入输出、grid 与设备合同检查，报告算法工作量除以实测时间得到的速率。缺失 schema 或必要算法计数会给出明确错误；旧 `requested_work` 记录不会被静默解释为新 source 计数。当前不输出基于缺失 native/GM/UB 请求数的带宽或硬件 roofline。
-
-`ascendflow.performance` 只保留硬件快照、profile 证据绑定和基于显式输入的条件速率模型，不重新验证物理 plan 或遍历旧同步图。调用条件模型时仍须独立说明各输入的来源，算法 FLOPs 不能替代未取得的 native FLOPs。
-
-## 连续矩阵 GEMM 与 ACLNN
-
-标准连续 `C=A@B`、FP16/BF16 输入输出及尾块使用
-`benchmarks.gemm.run_matmul`，合同见 [matmul-target.md](../docs/matmul-target.md)。
-支持完整 FP64 oracle、halfway 舍入、非 32 B 对齐地址与长行步长验证；
-`compare_matmul` 对同 dtype ACLNN 执行严格的三批设备性能验收。
-构建同时保存 GEMM 主体和 L2 policy helper 的源码快照，校验内联 helper 的来源。
-
-`benchmarks.gemm.run_dense` 使用普通连续 FP16 A/Bt 和 FP32 C，默认两个
-128×128 列片共享 A，按 example 的 L2 预算决定输出缓存政策。合同和复现见
-[gemm-target.md](../docs/gemm-target.md)。`--build` 保存完整编译器源码快照和
-DSL/IR/ASC/库身份；单独选择 `--backend generated` 或 `aclnn`，不在复用产物
-时重新编译。标准/精确数据、全输出/采样 oracle、guard 和设备 task 计时的
-范围分别记录。原有 batched/reduction/hierarchical 仍是各自显式 tile/panel
-合同的验证工具，不作为普通大矩阵的性能结果。
-
-## FA三方对照
-
-数学和workspace合同见[attention-target.md](../docs/attention-target.md)。当前工具能接受部分head/dtype/tile政策，但默认例的设备证据不能自动扩展到这些参数。独立AscendC参考是BQ128模板；BQ256等政策与它不具有相同排步，比较必须标注。
-
-```bash
-python -m benchmarks.attention.run --output build/attention/generated --build
-python -m benchmarks.attention.run_policy --output build/attention/reference --batch 1 --heads 8 --kv-heads 8 --groups 20 --dtype f16 --build
-```
-
-第一条构建生成代码，第二条构建独立手写参考，互不替代。ACLNN另有独立库身份。设备比较覆盖generated、ascendc、aclnn，并结合ops-transformer的实现组织分析差距。
-
-## 设备运行与profiling（需要先检查卡状态）
-
-先检查所有卡健康、进程、显存和利用率，选择健康空闲物理卡；每进程显式映射逻辑0。以下物理6只演示参数，不能照抄为固定选卡。错误立即停止，不用/tmp锁、不reset、不换卡规避错误。
-
-```bash
-ASCEND_RT_VISIBLE_DEVICES=6 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1 python -m benchmarks.attention.run --output build/attention/generated --physical 6 --backend generated --cases 4096:4096 8192:8192 --scope sampled --warmup 5 --repeats 30
-```
-
-`--backend aclnn`使用安装版对照；`--backend ascendc --reference-output build/attention/reference`使用手写参考。sampled 的实际 query 行号保存在 `query_rows_per_head`，当前每 64 行取第 0、7、63 行，必须如实标注；不能替代短域全输出检查、输入不变和guard检查。ACL stream interval包含host提交间隙，性能结论应同时使用msprof设备task时间。
-
-profiling统一通过`benchmarks/profile.sh <模块名> <参数...>`调用，`ASCENDFLOW_PYTHON` 指向当前 Python 环境的解释器；物理映射等环境变量同样传给被profile进程。通用汇总入口为：
-
-```bash
-python -m benchmarks.profile_summary build/attention/profiles/trial-0/generated --warmup 5 --repeats 30
-```
-
-原始profile必须与该源码/ASC/库和设备绑定，不能混用旧路径。主例使用4K/8K等稳态规模，固定政策，三后端交替有限批次；不无界调参。
-
-标准 GEMM 的完整采集示例如下；先完成全卡检查并选择健康空闲物理卡，
-这里的物理 2 仅为演示。`--build` 不初始化设备；后续 profile 复用同一产物。
-`gemm_profile_root` 必须是尚未使用的新目录。三个 trial 按 generated→aclnn、
-aclnn→generated、generated→aclnn 顺序采集，任一命令失败即停止。
-
-```bash
-set -euo pipefail
-export ASCENDFLOW_PYTHON="$PWD/../.venv/bin/python"
-export ASCEND_RT_VISIBLE_DEVICES=2 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1
-gemm_output="$PWD/build/gemm/nn-4096-f16"
-gemm_profile_root="$PWD/build/gemm/profiles/nn-4096-f16"
-test ! -e "$gemm_profile_root"
-"$ASCENDFLOW_PYTHON" -m benchmarks.gemm.run_matmul --build --output "$gemm_output" --m 4096 --n 4096 --k 4096 --dtype f16
-for gemm_trial in 0 1 2; do
-    gemm_backends=(generated aclnn)
-    if [ "$gemm_trial" -eq 1 ]; then gemm_backends=(aclnn generated); fi
-    for gemm_backend in "${gemm_backends[@]}"; do
-        gemm_profile="$gemm_profile_root/trial-$gemm_trial/$gemm_backend"
-        msprof --output="$gemm_profile" --aic-metrics=PipeUtilization --python-path="$ASCENDFLOW_PYTHON" \
-            benchmarks/profile.sh benchmarks.gemm.run_matmul --output "$gemm_output" \
-            --backend "$gemm_backend" --physical 2 --scope sampled --data normal \
-            --warmup 5 --repeats 30 --record "$gemm_profile/device/device.json"
-        "$ASCENDFLOW_PYTHON" -m benchmarks.profile_summary "$gemm_profile" --warmup 5 --repeats 30
-    done
-done
-"$ASCENDFLOW_PYTHON" -m benchmarks.gemm.compare_matmul "$gemm_profile_root" --output "$gemm_profile_root/comparison.json"
-```
-
-8192 或 BF16 使用独立的构建/profile 目录，并相应修改构建尺寸或 dtype；
-设备阶段读取构建中保存的合同。dense NT 使用 `run_dense` / `compare_dense`。
-当前已测范围与汇总见[性能与设备验证记录](../docs/performance-results.md)。
-
-FA的`benchmarks.attention.compare`读取每个profile目录下的`summary.json`和
-`device/device.json`。一次profile只运行一个`--cases Sq:Sk`，并用`--record`
-将runner记录写到对应的`device/device.json`；该记录必须完成数值、输入及guard检查。
-每个shape单独收集`trial-0`至`trial-2`，各含`generated`和`aclnn`目录，再运行：
-
-```bash
-python -m benchmarks.attention.compare build/attention/profiles/4096 --output build/attention/profiles/4096/comparison.json
-```
-
-比较器从runner的`cases`读取数值结果，健康和硬件信息来自顶层记录。
-生成库检查其ASC/CANN manifest；安装版ACLNN检查实际`libopapi.so`、
-`libnnopbase.so`及适配器身份，不要求它具有生成代码的manifest。
-默认允许时间比为1.00，即设备时间不能慢于ACLNN；超过目标会保存`failed`结果并以非零状态退出。
-
-先审查最终ASC的搬运、槽位、early release、CV派发与等待，再用可用的pipe/访存/冲突指标解释差距。不同PMU replay组不可相加分解延迟；GM请求包含L2命中，不等于HBM实流量。理论算力/带宽下界写明核心数、频率、dtype、FLOP/字节和假设，不能从设计宣称性能无损。
+`source-work-v1` 的静态模板数不代表运行期执行数，算法 FLOPs 不代表 native FLOPs；
+运行期请求数尚不可得时保持 `unavailable`。profile 与实际 DSL、IR、ASC、库、选项、
+输入和设备绑定，不能将参考路径的通过当成当前 DSL 通过。验证边界见
+[开发验证方法](../docs/development/validation.md)。

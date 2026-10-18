@@ -1,35 +1,48 @@
-# 算子示例
+# 可运行示例
 
-算法、数学主体与固定排步政策放在这里；通用编译器不根据示例名选择实现。运行/计时/profiling放在[benchmarks](../benchmarks/README.md)，硬件反例放tests。
-
-下表列出 AST 源码入口；每次构建和设备结果按[验证口径](../docs/validation.md)记录。
-
-| 示例 | 表达的结构 | 工具入口 |
-|---|---|---|
-| [vector/scale.py](vector/scale.py) | 双缓冲GM→UB→Vector→GM | benchmarks.vector.run |
-| [vector/grouped.py](vector/grouped.py) | runtime BNSD商余、cyclic分组和空owner | 同上，--example grouped |
-| [vector/prefix.py](vector/prefix.py) | 两 runtime 长度及对齐 prefix（native lowering 尚拒绝） | benchmarks.vector.run_prefix |
-| [vector/independent_rings.py](vector/independent_rings.py) | 独立输入/输出ring | benchmarks.vector.run_rings |
-| [normalization/rms_norm.py](normalization/rms_norm.py) | 归约、Scalar最后读取 | benchmarks.normalization.run |
-| [normalization/softmax.py](normalization/softmax.py) | 行统计、广播scratch、Vector流水 | 同上，--operator softmax |
-| [gemm/batched.py](gemm/batched.py) | L1/L0/MAD/FIX多缓冲 | benchmarks.gemm.run |
-| [gemm/reduction.py](gemm/reduction.py) | runtime K归约 | benchmarks.gemm.run_reduction |
-| [gemm/hierarchical.py](gemm/hierarchical.py) | 输出块循环嵌套K流水 | benchmarks.gemm.run_hierarchical |
-| [gemm/dense.py](gemm/dense.py) | 连续 NT 矩阵、配对列片与输出缓存政策 | benchmarks.gemm.run_dense |
-| [gemm/matmul.py](gemm/matmul.py) | 连续 C=A@B、FP16/BF16 输入输出与任意正尺寸尾块 | benchmarks.gemm.run_matmul |
-| [cv/nested.py](cv/nested.py) | 双缓冲 GM handoff、嵌套 Cube 与共享双 AIV body | 通用 CLI，entry=nested_cv |
-| [state/recurrence.py](state/recurrence.py) | 初始化、递推、导出 | benchmarks.state.run |
-| [state/grouped.py](state/grouped.py) | 两runtime轴、跨调用复用 | benchmarks.state.run_grouped |
-| [state/shared_inputs.py](state/shared_inputs.py) | 共享只读输入 | 同上，--shared-inputs |
-| [state/frame_snapshot.py](state/frame_snapshot.py) | snapshot、WAR、最后读取 | 同上，--frame-snapshot |
-| [flash_attention/attention.py](flash_attention/attention.py) | 输出Q块、KV及原生子流水，CV多阶段 | 通用CLI及benchmarks.attention.run |
-
-从本仓库根目录、已激活的 Python 环境运行：
+算法、分块、缓存和排步政策放在 `examples/`；编译器走同一条 DSL→IR→ASC→CANN
+路径。先读[快速上手](../docs/guide/quickstart.md)，所有示例的统一检查命令为：
 
 ```bash
-python -m examples.vector.scale --output build/quickstart/vector
+python -m benchmarks.check_examples --list
+python -m benchmarks.check_examples --output build/examples-cann
+# 完成全卡检查与显式映射后，再加 --physical <物理卡号> 检查设备结果。
 ```
 
-FA只有一个正常数学主体`attention_target`。默认dense f16 B1/Hq8/Hkv8/D128及BQ256/BK1024/CK128/VR8的数学、workspace和验证要求见[FA合同](../docs/attention-target.md)。Sq/Sk是runtime；不把外层Q块当成编译器专属控制类型。
+| 检查名称 | 源码 / DSL 入口 | 主要展示内容 |
+|---|---|---|
+| `scale` | [vector/scale.py](vector/scale.py) · `scale` | GM→UB→Vector→GM 双缓冲 |
+| `grouped-scale` | [vector/grouped.py](vector/grouped.py) · `grouped_scale` | runtime BNSD、循环分组、空 owner |
+| `rings` | [vector/independent_rings.py](vector/independent_rings.py) · `independent_rings` | 输入/输出独立的 5/7 槽环 |
+| `rms` | [normalization/rms_norm.py](normalization/rms_norm.py) · `rms_normalize` | 归约、Scalar 最后读取 |
+| `softmax` | [normalization/softmax.py](normalization/softmax.py) · `softmax` | 行统计、广播 scratch、Vector 流水 |
+| `batched-gemm` | [gemm/batched.py](gemm/batched.py) · `batched_matmul` | 多级 L1/L0/MAD/FIX 环 |
+| `reduction-gemm` | [gemm/reduction.py](gemm/reduction.py) · `reduction_gemm` | runtime K 归约 |
+| `hierarchical-gemm` | [gemm/hierarchical.py](gemm/hierarchical.py) · `hierarchical_gemm` | 输出块循环嵌套 K 流水 |
+| `dense-gemm` | [gemm/dense.py](gemm/dense.py) · `dense_gemm` | 连续 NT、FP16 输入/FP32 输出 |
+| `gemm` | [gemm/matmul.py](gemm/matmul.py) · `gemm` | 连续 NN、FP16/BF16、静态尾块 |
+| `nested-cv` | [cv/nested.py](cv/nested.py) · `nested_cv` | 嵌套混合流水、共享 GM、双 AIV 共用 body |
+| `state` | [state/recurrence.py](state/recurrence.py) · `state_sum` | 初始化、FP32 递推、导出 |
+| `grouped-state` | [state/grouped.py](state/grouped.py) · `grouped_state_sum` | 两个 runtime 轴、跨调用复用 |
+| `shared-state` | [state/shared_inputs.py](state/shared_inputs.py) · `shared_state_sum` | 多调用共享只读输入 |
+| `frame-state` | [state/frame_snapshot.py](state/frame_snapshot.py) · `frame_state_sum` | snapshot、WAR、最后读取 |
+| `flash-attention` | [flash_attention/attention.py](flash_attention/attention.py) · `attention_target` | QK/softmax/PV/update 多级 CV 流水 |
 
-runner参数存在不等于变体已验证。causal、tail、空序列、varlen、paged/sparse、persistent和continuous多时钟状态分别需要明确合同。透明 DSL helper 和静态尾块区间的现有语法见 [dsl-multistage.md](../docs/dsl-multistage.md)；设计中的其他数学块/宏不构成已实现 API，不在 examples 堆预期失败的方案文件或多份候选算子。
+[gemm/schedule.py](gemm/schedule.py) 是 GEMM 的 inline L2 政策 helper，随 GEMM 验证。
+`independent_rings` 用于测试互质环的组合，不是推荐的性能参数。
+
+单个示例可用 CLI 构建，例如：
+
+```bash
+python -m ascendflow --input examples/cv/nested.py --entry nested_cv --shared --timeout 300 --output build/nested-cv
+```
+
+设备运行器可按[工具目录](../benchmarks/README.md)查找。普通 GEMM 的尺寸、dtype、
+对齐与数值条件见[GEMM 合同](../docs/operators/gemm.md)；dense NT 有单独的
+[整块合同](../docs/operators/dense-gemm.md)。FA 的 runtime Sq/Sk、workspace、
+数值边界与限制见[FA 合同](../docs/operators/flash-attention.md)。
+
+当前逐项编译/运行证据见[示例验证](../docs/reports/examples.md)。性能仅测默认
+Flash Attention 与 GEMM normal，见[性能报告](../docs/reports/performance.md)。
+动态 `valid=` prefix 地址等未支持形式保留在拒绝测试中，不作为 runnable example；
+runner 接受某个参数不代表该变体已经设备验证。

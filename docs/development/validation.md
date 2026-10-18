@@ -1,4 +1,4 @@
-# 验证与编译、设备性能验收
+# 编译器验证方法
 
 本页定义 CPU/IR、ASC、CANN 离线编译以及设备数值和性能的验收口径。生成规则使用唯一 normal 链路，各层结果分别记录。
 
@@ -45,7 +45,7 @@
 
 任何单个算子构建≤300秒，覆盖Python构造、分析、ASC、CANN及子进程。超时终止整个所属进程组，保存阶段信息，停止后续候选。测试的外层预算不能用来反复自动重试超过限制的构建。
 
-## 4. 编译复杂度与冷计时
+## 4. 专项编译复杂度与冷计时
 
 先记录阶段工作量：AST/native数量、访问描述/相交、依赖、边界条款、guard/周期分量、最大前沿、比较/更新、lease冲突/候选、输出大小、实际重复遍历。每项明确统计口径；不能只比较最后图节点或cache命中率。
 
@@ -64,19 +64,22 @@ python -m benchmarks.compile --input examples/flash_attention/attention.py --ent
 
 冻结源码、编译器Git加未提交diff身份、constexpr政策、版本、ASC SHA、命令及原始JSON。单次probe和带采样诊断不作为五次p50；当前 normal 使用生成规则的域、phase 和 credit 前提；不再执行旧 progress/path solver。`generated-lifetimes` 仅描述来源，不能作为独立证明。normal与额外结构验证的成本分开。无需清空OS文件cache，不允许跨编译结果缓存。
 
-## 5. ASC与设备性能
+## 5. CANN、设备与日常性能记录
 
-先直接审查最终ASC：实际load/store数量与范围、L1/L0/UB容量与slot、MAD/FIX组织、早release、CV派发、event映射和返回drain。PLE或变量命名变化可不逐字节相同，但须保留实际执行组织；不能多加buffer/barrier换编译速度。
+先审查最终 ASC 的 load/store 范围、L1/L0/UB 容量与槽位、MAD/FIX、早 release、
+CV 派发、事件映射和返回 drain。不能增加全局 barrier 或静默 fallback 换取通过。
+CPU/IR 通过、CANN 编译通过和设备数值通过各自记录。
 
-CPU合同和CANN离线通过后，设备运行前检查所有卡的健康、进程、显存与利用率，选择健康空闲卡；每进程指定物理卡并映射逻辑0。不用/tmp锁，不reset或换卡绕过错误。
+日常验证采用[测试指南](../guide/testing.md)的统一入口：16 个公开示例编译/运行，
+仅 Flash Attention 和 GEMM normal 各采集一次默认 msprof。记录实际 DSL/IR/ASC/库、
+编译选项、输入、设备、预热/执行次数和原始 CSV；kernel time 采用设备 task 时长。
+full 与 sampled 分开，ACL stream interval 不当作 kernel time。
 
-FA设备主例为4K/8K等能反映稳态的大规模；短、零、尾块另作正确性边界。明确full与sampled，不把6行采样称全输出验证。其他算子选择足以饱和设备的规模，固定参数，不无界搜索。
+运行前检查所有卡的健康、进程、显存与利用率，选择空闲健康卡，每进程显式映射物理
+卡到逻辑 0。设备错误立即停止，不 reset、不换卡规避。输入声明由调用方满足，薄
+launcher 不执行 shape/alias/对齐检查；非法输入不得发到设备测试 host 拒绝。
 
-对照必须包含：
-
-- 相同数学合同下的独立手写AscendC；政策不同时注明，而非声称相同排步。
-- 安装版ACLNN，并结合对应ops-transformer源码分析组织差距。
-- msprof设备task时间与可用硬件指标；host stream计时单列，不能只看利用率百分比猜瓶颈。
-- 实际shape/dtype/核心数/运行频率下的FLOP、GM/L2搬运量和条件下界。带宽单位、有效吞吐、cache命中未知时明确标出，不能把请求流量当实测HBM带宽。
-
-同时绑定源码、IR、ASC、二进制、编译选项、运行设备及频率、warmup/repeats和profile原始数据。历史产物删除后，保存报告可作历史线索，不能宣称仍可直接复现或获得当前资格。
+独立 AscendC、ACLNN、PMU 与理论下界只在明确开展专项比较或归因时使用。比较需
+保持数学、dtype/layout、输入和设备一致；参考政策不同时说明差异。PMU replay 组
+不能相加分解时间，GM 请求不等于 HBM 实流量。日常 kernel time 报告不宣称完成
+历史三批门槛、性能无损证明或冷编译资格。历史结果通过 Git 查阅。

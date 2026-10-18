@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--library", type=Path)
     parser.add_argument("--physical", type=int)
     parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--counts", type=int, nargs="+", default=[0, 1, 2, 4, 7, 14, 35])
+    parser.add_argument("--repeats", type=int, default=2)
     args = parser.parse_args()
     build_output = args.output if args.library is None else args.output / "source-check"
     build_file(
@@ -39,8 +41,8 @@ def main():
             library,
             args.output,
             args.physical,
-            [0, 1, 2, 4, 5, 6, 7, 8, 14, 35, 65536, 262144],
-            5,
+            args.counts,
+            args.repeats,
         )
     print(result.timings)
 

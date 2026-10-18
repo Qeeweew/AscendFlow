@@ -1,6 +1,6 @@
 # DSL：运行时循环、物理存储与多级流水
 
-本文说明现有公开语法和语言语义。**语法被识别、通过lowering、设备验证是不同资格。** 当前限制见下表，验证方法见[validation.md](validation.md)。
+本文说明现有公开语法和语言语义。**语法被识别、通过lowering、设备验证是不同资格。** 当前限制见下表，验证方法见[validation.md](../development/validation.md)。
 
 ## 1. 用户负责表达什么
 
@@ -27,7 +27,7 @@ stage数、buffer slot数、event width互不等同。`cube.task/vector.task`已
 
 ## 2. 双缓冲示例
 
-完整当前源码：[scale.py](../examples/vector/scale.py)。核心结构如下：
+完整当前源码：[scale.py](../../examples/vector/scale.py)。核心结构如下：
 
 ```python
 for t in T.Pipelined(tiles, stages=3):
@@ -49,7 +49,7 @@ pipeline在actor-local step j执行 `t=j-s`，仅在合法域内激活。issue_o
 
 ## 3. CV与嵌套语义
 
-FA的真实数学主体在[attention.py](../examples/flash_attention/attention.py)。四个stage是QK、softmax、PV、output update；内部还有Cube分块和Vector行块pipeline。用户政策可令AIC先新QK后旧PV、AIV先新softmax后旧update。
+FA的真实数学主体在[attention.py](../../examples/flash_attention/attention.py)。四个stage是QK、softmax、PV、output update；内部还有Cube分块和Vector行块pipeline。用户政策可令AIC先新QK后旧PV、AIV先新softmax后旧update。
 
 不同stage可以共用物理存储，但各自逻辑代次、slot和状态必须准确。两个AIV对P的贡献和GM reader释放由编译器根据实际访问建立；不能把一个actor完成当成两者都完成。
 
@@ -66,7 +66,7 @@ scratch/effects、原式定义性、ownership 和同步合同不变。内联共�
 extent/width 必须是 constexpr 整数，extent 非负、width 为正；只拆分静态有效宽度，
 没有声明输入天然在界内或绕过 native 对齐要求。
 
-serial、pipeline、嵌套及循环前后操作使用统一控制与region接口，语义见[循环与边界组合](design.md)。示例源码列于[examples](../examples/README.md)；设计示意本身不构成可运行API。
+serial、pipeline、嵌套及循环前后操作使用统一控制与region接口，语义见[循环与边界组合](../development/design.md)。示例源码列于[examples](../../examples/README.md)；设计示意本身不构成可运行API。
 
 ## 4. 当前识别与lowering边界
 
@@ -89,9 +89,9 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 
 source view保留root、原始轴、SSA坐标、宽度和父view约束。先检查每个轴，再转字节地址：扁平地址未越界不能授权`head=H`落入下一batch。subview/recast不创建独立allocation，不同名字不证明不别名。
 
-runtime输入的minimum/multiple支持除数正性和整除推导；非法的原始除法不能因为后续乘0或相减化简而逃过admission。地址化简须说明数学整数、设备i64、溢出、除法和guard支配条件。保留现有host整数溢出检查。
+runtime输入的minimum/multiple支持除数正性和整除推导；非法的原始除法不能因为后续乘0或相减化简而逃过admission。地址化简须说明数学整数、设备i64、溢出、除法和guard支配条件。调用方满足合法 int64 索引求值前提，launcher 不检查运行时溢出。
 
-cyclic任务按 `flat=group+task*GROUPS` 绑定owner；空owner没有任务。动态frame、prefix、mixed及父view组合按当前实现分别限制，不从单个grouped例推断全部支持。未知alias不可用任意barrier掩盖。
+cyclic任务按 `flat=group+task*GROUPS` 绑定owner；空owner没有任务。动态 frame、valid prefix、mixed 及父 view 组合按当前实现分别限制，不从单个grouped例推断全部支持。未知alias不可用任意barrier掩盖。
 
 FA允许FP32 sum改变归约树，但P/O舍入、在线m/l/O更新及其他状态算子的数值边界仍须保持。同步pass不改变算法政策。`[:, None]`的广播意图不能偷偷分配整张tensor，现有Vector recipe的显式scratch读写必须保留。
 
