@@ -49,8 +49,8 @@ Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
 [性能与设备验证记录](performance-results.md)。其中 default/BQ128、全输出/采样及
 standard/uniform/sharp 分别记录，资格不随 runner 参数自动扩展。
 
-当前重复 PIPE_V 屏障的事实、原因及后续验收要求见
-[待处理的性能问题](deferred-optimizations.md)。本轮保留该问题，尚未实现去重。
+同完成前缀上的重复 PIPE_V 屏障已在 IR 条件变换中合并；规则、历史产物和
+当前验收范围见[同步性能优化状态](deferred-optimizations.md)。
 
 runner能接受某些dtype/head/tile参数不代表其全部通过。causal、mask、tail、空序列、varlen、paged/sparse、persistent及continuous多时钟状态不在默认例资格内。后续变体应通过通用控制/访问合同表达，不创建attention专属pass。
 

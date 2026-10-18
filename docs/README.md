@@ -14,7 +14,7 @@
 | [attention-target.md](attention-target.md) | FA example的数学、存储与验证合同 |
 | [validation.md](validation.md) | 分层验证、工作量、冷编译、CANN及后续设备性能口径 |
 | [performance-results.md](performance-results.md) | 当前 GEMM/FA 的已测形状、数值范围、设备性能和证据索引 |
-| [deferred-optimizations.md](deferred-optimizations.md) | 已确认的待处理性能问题及后续验收要求 |
+| [deferred-optimizations.md](deferred-optimizations.md) | 同步性能优化的实现状态、验收范围及后续边界 |
 | [source-notes.md](source-notes.md) | 参考HEAD与硬件语义来源 |
 
 算法在[examples](../examples/README.md)，基准工具在[benchmarks](../benchmarks/README.md)，语义回归在[tests](../tests/README.md)。设计、计划、测试总数和报告标签都不能代替实际资格。

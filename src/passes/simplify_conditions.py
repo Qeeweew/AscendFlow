@@ -3,8 +3,9 @@
 Loop/branch premises describe integer domains, never runtime phase flags. A
 notification packet is rewritten only when its scalar evaluations are total at
 the packet entry. Mutually exclusive alternatives may share an instruction and
-an event expression; overlapping alternatives retain their original multiplicity.
-Native packets and loop identities are not changed or reordered.
+an event expression. Consecutive equal pipe fences share one completion prefix
+and may also merge overlapping alternatives; event contributions keep their
+original multiplicity. Native packets and loops end the notification packet.
 """
 
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from xdsl.ir import Block, Region
 
 from ..dialects.physical import BufferOp, CoreIdOp, RuntimeSizeOp
 from ..dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
+from ..target.ascend910b import SyncKind
 from .simplify_scalars import (
     _UNSIGNED,
     ScalarFacts,
@@ -98,6 +100,7 @@ class ConditionWork:
     input_notifications: int = 0
     output_notifications: int = 0
     shared_blocks: int = 0
+    removed_fences: int = 0
 
 
 class _Domains:
@@ -825,7 +828,15 @@ def _packet(operations, scope, work, ranks, changed):
         if (
             groups
             and _instruction(groups[-1][0][1]) == _instruction(op)
-            and all(domains.intersect(cube, prior) is None for prior, _ in groups[-1])
+            and (
+                # collect admits only pure integer SSA, branches and notifications.
+                # Adjacent equal fences therefore have the same actor/pipe and
+                # no new work or other synchronization between their captures.
+                # F;F = F on every active path, so their existence is the union
+                # of guards. This does not apply to Set/Wait contributions.
+                op.kind.data == SyncKind.FENCE.value
+                or all(domains.intersect(cube, prior) is None for prior, _ in groups[-1])
+            )
         ):
             groups[-1].append((cube, op))
         else:
@@ -921,6 +932,9 @@ def _packet(operations, scope, work, ranks, changed):
     work.packets += 1
     work.input_notifications += len(cases)
     work.output_notifications += len(groups)
+    work.removed_fences += sum(
+        len(group) - 1 for group in groups if group[0][1].kind.data == SyncKind.FENCE.value
+    )
     return result
 
 

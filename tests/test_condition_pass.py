@@ -4,6 +4,7 @@ import itertools
 
 import pytest
 from xdsl.dialects import arith, scf
+from xdsl.dialects.builtin import UnregisteredOp
 
 from ascendflow import language as N
 from ascendflow.analysis.structured_memory import collect_native_memory
@@ -17,7 +18,11 @@ from ascendflow.passes.simplify_conditions import simplify_conditions
 from ascendflow.passes.simplify_scalars import ScalarFacts, simplify_scalars
 from ascendflow.scalar import expression, literal
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
-from tests.models.structured_events import _Interpret
+from tests.models.structured_events import (
+    EventModelError,
+    _Interpret,
+    check_structured_events,
+)
 
 NESTED = """
 def packets(q:N.int64,n:N.int64):
@@ -32,10 +37,10 @@ def packets(q:N.int64,n:N.int64):
 """
 
 
-def trace(module, parameters):
+def trace(module, parameters, actor=Actor.AIV0):
     memory = collect_native_memory(module)
     model = _Interpret(memory, parameters, physical=True, maximum=10000)
-    model.block(module.body.block.first_op.body.block, {}, 0, 0, Actor.AIV0)
+    model.block(module.body.block.first_op.body.block, {}, 0, 0, actor)
     return tuple(
         (
             c.kind,
@@ -101,13 +106,16 @@ def test_nested_first_previous_and_slot_cases_become_one_guarded_instruction():
         assert trace(module, parameters) == trace(parse(original), parameters)
 
 
-def test_overlapping_identical_notifications_keep_both_contributions():
+@pytest.mark.parametrize(
+    "kind", [SyncKind.LOCAL_SET, SyncKind.LOCAL_WAIT, SyncKind.CROSS_SET, SyncKind.CROSS_WAIT]
+)
+def test_overlapping_identical_notifications_keep_both_contributions(kind):
     module, memory, task, _, _, g = packet_program()
     materialize_notifications(
         memory,
         (
-            action(task, 1, (Comparison(g, ">=", literal(1)),)),
-            action(task, 1, (Comparison(g, ">=", literal(2)),)),
+            action(task, 1, (Comparison(g, ">=", literal(1)),), kind=kind),
+            action(task, 1, (Comparison(g, ">=", literal(2)),), kind=kind),
         ),
     )
     original = dump(module)
@@ -116,6 +124,199 @@ def test_overlapping_identical_notifications_keep_both_contributions():
     module.verify()
     assert sum(isinstance(op, NotificationOp) for op in module.walk()) == 2
     assert trace(module, {"q": 2, "n": 3}) == trace(parse(original), {"q": 2, "n": 3})
+
+
+def fence(task, tests=(), *, pipe=Engine.V, origin="", placement=Placement.BEFORE):
+    return SyncAction(
+        task,
+        placement,
+        (Actor.AIV0,),
+        SyncKind.FENCE,
+        pipe,
+        pipe,
+        guard=ActionGuard(tuple(tests)),
+        protocols=(origin,),
+    )
+
+
+def without_repeated_fences(commands):
+    """Compare concrete actor traces modulo adjacent identical fence stutters."""
+    result = []
+    for command in commands:
+        if command[0] == SyncKind.FENCE.value and result and result[-1] == command:
+            continue
+        result.append(command)
+    return tuple(result)
+
+
+@pytest.mark.parametrize("guards", ["unconditional", "cover", "overlap"])
+def test_same_prefix_fences_union_guards_and_keep_all_origins(guards):
+    module, memory, task, q, _, g = packet_program()
+
+    def ge(value, n):
+        return Comparison(value, ">=", literal(n))
+
+    def le(value, n):
+        return Comparison(value, "<=", literal(n))
+
+    cases = {
+        "unconditional": ((), (ge(g, 1),), (ge(q, 1),)),
+        "cover": ((ge(g, 2),), (le(g, 4),)),
+        "overlap": ((ge(g, 1), le(g, 4)), (ge(g, 3), le(g, 6))),
+    }[guards]
+    materialize_notifications(
+        memory, [fence(task, tests, origin=str(i)) for i, tests in enumerate(cases)]
+    )
+    original = dump(module)
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    notifications = [op for op in module.walk() if isinstance(op, NotificationOp)]
+    assert len(notifications) == 1
+    assert set(notifications[0].protocol.data.split(", ")) == {str(i) for i in range(len(cases))}
+    assert work.removed_fences == len(cases) - 1
+    for qcount, n in itertools.product(range(4), repeat=2):
+        parameters = {"q": qcount, "n": n}
+        assert trace(module, parameters) == without_repeated_fences(
+            trace(parse(original), parameters)
+        )
+
+
+@pytest.mark.parametrize("boundary", ["native", "loop", "opaque"])
+def test_fences_do_not_cross_new_work_loops_or_unmodeled_effects(boundary):
+    source = N.from_source("""
+        def work(n:N.int64):
+            with N.Kernel():
+                x=N.alloc_ub((64,))
+                N.fill(x,1.0)
+                for i in N.serial(n):
+                    N.fill(x,2.0)
+                N.fill(x,3.0)
+    """)
+    module = lower_native_structure(source).module
+    memory = collect_native_memory(module)
+    first, _, last = (item.operation for item in memory.templates)
+    if boundary == "native":
+        actions = [fence(first), fence(last)]
+    elif boundary == "loop":
+        loop = next(op for op in module.walk() if isinstance(op, scf.ForOp))
+        actions = [fence(loop, placement=Placement.ENTRY), fence(last)]
+    else:
+        actions = [fence(last), fence(last)]
+    materialize_notifications(memory, actions)
+    if boundary == "opaque":
+        notifications = [op for op in module.walk() if isinstance(op, NotificationOp)]
+        last.parent.insert_op_before(
+            UnregisteredOp.with_name("test.opaque_effect").create(), notifications[-1]
+        )
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    assert sum(isinstance(op, NotificationOp) for op in module.walk()) == 2
+    assert work.removed_fences == 0
+
+
+@pytest.mark.parametrize("middle", ["pipe", "event"])
+def test_fence_merge_keeps_other_pipe_and_event_instruction_boundaries(middle):
+    module, memory, task, _, _, _ = packet_program()
+    between = fence(task, pipe=Engine.MTE2) if middle == "pipe" else action(task, 0, ())
+    materialize_notifications(memory, [fence(task), between, fence(task)])
+    original = dump(module)
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    assert work.removed_fences == 0
+    assert trace(module, {"q": 2, "n": 3}) == trace(parse(original), {"q": 2, "n": 3})
+
+
+def test_fence_coalescing_preserves_finite_byte_dependencies_and_required_fences():
+    source = N.from_source("""
+        def work(n:N.int64):
+            with N.Kernel():
+                x=N.alloc_ub((64,))
+                for i in N.serial(n):
+                    N.fill(x,1.0)
+                    N.mul(x,2.0,out=x)
+                    if i>=1:
+                        N.mul(x,3.0,out=x)
+    """)
+    module = lower_native_structure(source).module
+    original = collect_native_memory(parse(dump(module)))
+    memory = collect_native_memory(module)
+    first, second, third = (item.operation for item in memory.templates)
+    i = next(iter(memory.control.loops.values())).ordinal
+    materialize_notifications(
+        memory,
+        [
+            fence(first),
+            fence(second),
+            fence(second, (Comparison(i, ">=", literal(1)),)),
+            fence(second, (Comparison(i, ">=", literal(2)),)),
+            fence(third),
+        ],
+    )
+    before = collect_native_memory(parse(dump(module)))
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    after = collect_native_memory(module)
+    assert work.removed_fences == 2
+    assert sum(isinstance(op, NotificationOp) for op in module.walk()) == 3
+    for n in range(5):
+        baseline = check_structured_events(before, {"n": n}, logical_reference=original)
+        result = check_structured_events(after, {"n": n}, logical_reference=original)
+        assert (result.bytes_read, result.bytes_written) == (
+            baseline.bytes_read,
+            baseline.bytes_written,
+        )
+        assert len(result.hazards) == len(baseline.hazards)
+    required = next(
+        op for op in module.walk() if isinstance(op, NotificationOp) and op.next_op is second
+    )
+    required.parent.erase_op(required)
+    with pytest.raises(EventModelError, match="unordered physical WAW"):
+        check_structured_events(collect_native_memory(module), {"n": 1}, logical_reference=original)
+
+
+def test_fence_union_preserves_each_aiv_existence_domain_in_the_shared_body():
+    source = N.from_source("""
+        def shared(n:N.int64):
+            with N.Kernel(kind="mixed"):
+                x=N.alloc_ub((64,))
+                with N.Vector():
+                    for i in N.serial(n):
+                        N.fill(x,1.0)
+    """)
+    module = lower_native_structure(source).module
+    memory = collect_native_memory(module)
+    task = memory.templates[0].operation
+    i = next(iter(memory.control.loops.values())).ordinal
+    actions = [
+        SyncAction(
+            task,
+            Placement.BEFORE,
+            (actor,),
+            SyncKind.FENCE,
+            Engine.V,
+            Engine.V,
+            guard=ActionGuard(tests),
+        )
+        for actor, tests in (
+            (Actor.AIV0, ()),
+            (Actor.AIV0, (Comparison(i, ">=", literal(1)),)),
+            (Actor.AIV1, (Comparison(i, ">=", literal(2)),)),
+        )
+    ]
+    materialize_notifications(memory, actions)
+    original = dump(module)
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    assert work.removed_fences == 2
+    for n, actor in itertools.product(range(5), (Actor.AIV0, Actor.AIV1)):
+        assert trace(module, {"n": n}, actor) == without_repeated_fences(
+            trace(parse(original), {"n": n}, actor)
+        )
 
 
 def test_complementary_slot_relations_cover_the_whole_nested_iteration():

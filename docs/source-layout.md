@@ -80,7 +80,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `passes/lower_execution.py` | 将 count/stage 表示降为实际 arith/scf；按 family 保持 issue order，移动原 native，不复制双 AIV body |
 | `analysis/scalar_uses.py` | 终端 lowering 和输出共用的逐 family SSA 使用关系 |
 | `passes/simplify_scalars.py` | 复用源循环联合范围；共享仿射视图、倍数事实、支配 CSE、域内化简和安全外提 |
-| `passes/simplify_conditions.py` | 用实际loop/祖先/分支前提化简条件并集，共享连续条件块，合并互斥通知及event ID；保持重叠贡献和指令次序 |
+| `passes/simplify_conditions.py` | 用实际loop/祖先/分支前提化简条件并集，共享连续条件块，合并互斥事件通知及event ID；同一完成前缀的连续 fence 按幂等规则合并，保留重叠 Set/Wait 贡献 |
 | `backend/structured.py`、`backend/cann.py`、`build.py`、`runtime/process.py` | 打印实际 IR；CANN 离线编译与 300 秒组期限 |
 | `tests/models/structured_events.py` | 独立有限队列/二值 flag/quorum/字节版本检查，可对照 pre-sync 快照 |
 
@@ -152,8 +152,10 @@ if (g == 7) {
 }
 ```
 
-内部选择式不再重复已经成立的 `g==7`。只有互斥分支的同类通知可以共享
-一次指令，重叠分支保留原次数与次序。连续指令共用相同 SSA guard。
+内部选择式不再重复已经成立的 `g==7`。只有互斥分支的同类事件通知可以共享
+一次指令，重叠分支保留原 Set/Wait 次数与次序。同 pipe、同参与者、同完成
+前缀的连续 fence 可合并重叠条件；native、循环、其他通知及未知 effects
+阻止跨边界合并。连续指令共用相同 SSA guard，协议来源全部保留。
 结构边界先判断一次，局部域内的区间、余数、条件规范形和并集查询按不可变
 输入复用；这些表仅属于本次 packet，不跨编译保存事实。
 

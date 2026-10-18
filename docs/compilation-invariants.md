@@ -1,6 +1,6 @@
 # 编译不变量与检查职责
 
-2026-10-17。以下合同由当前唯一 source 链路保持。具体生成规则、前提及
+2026-10-18。以下合同由当前唯一 source 链路保持。具体生成规则、前提及
 归纳理由见 [generation-rules.md](generation-rules.md)，验证方法见
 [validation.md](validation.md)。设备与编译性能须对实际产物分别测量。
 
@@ -125,9 +125,11 @@ unsigned LAST/rem移到其定义域之外。
 仅供控制和通知使用的二次幂unsigned余数可精确改写为全定义的位掩码；地址、
 loop header、buffer extent及yield依赖的原式不改写。新表达式沿已有scope增量
 更新CSE、范围和外提事实，不重跑原式准入、同步选择或整套标量分析。
-连续native/内存/同步块共享相同条件；相同路由和参与者的连续通知只有在
+连续native/内存/同步块共享相同条件；相同路由和参与者的连续事件通知只有在
 分支互斥时才合成一条，并按实际slot生成event ID表达式。重叠分支继续保留
-各次贡献及原次序；不能用二值flag或fence的直觉去掉重复指令。
+各次 Set/Wait 贡献及原次序。连续相同 pipe fence 在没有新 native 或其他通知、
+且标量在公共入口可求值时，可按幂等规则合并其执行域并保留全部来源；
+native、循环及未知 effects 结束该区间，不跨边界推断完成。
 
 后端只消费最终IR。每个pipeline/family打印一个时钟循环和一份stage body，
 相邻同offset stage共用存在guard；N=0时所有stage均不执行，短循环使用同一规则。

@@ -1,6 +1,7 @@
 # GEMM / FA 性能与设备验证记录
 
-2026-10-17，记录通用 b16 GEMM、DSL helper 和末块输出 stage 合并后的验证。
+2026-10-17 的记录覆盖通用 b16 GEMM、DSL helper 和末块输出 stage 合并后的验证；
+2026-10-18 的 PIPE_V 合并验证单独列于本文末尾。
 接口与算法合同分别见 [NN GEMM](matmul-target.md)、[NT GEMM](gemm-target.md)
 和 [FA](attention-target.md)；复现工具见 [benchmarks](../benchmarks/README.md)。
 
@@ -16,7 +17,7 @@ Ascend910B3，物理卡 2 映射逻辑卡 0，CANN 9.1.0，目标 dav-2201，CAN
 比较器重新校验实际 DSL、IR、ASC、编译选项、库、输入、设备及原始 CSV
 身份。ACLNN 使用容器安装库，其身份不能由上游参考源码代替。
 
-## 当前性能
+## 2026-10-17 性能
 
 | 算子 | 尺寸 | 输出类型 | AscendFlow µs | ACLNN µs | 最严格批次比 |
 |---|---|---|---:|---:|---:|
@@ -116,8 +117,51 @@ CSV 路径用于身份校验，复核时保留原目录。构建记录生成时�
 | `final/code-comparison.json`、`final/source.patch` | stage 合并后的代码变化与测量时源码 diff |
 | `final/final-npu-smi.txt`、`final/final-health.json` | 最终全卡健康检查 |
 
-当前默认 FA ASC 的 SHA256 为
+2026-10-17 默认 FA ASC 的 SHA256 为
 `29b38ccc6f2e1a2eb2c8e116d47cacfbb37cdc409b84e8ee3ecdd25dc5aa49ff`，
 位于 `terminal-stages/fa-256/attention_target.asc`。仍有 28 个静态 PIPE_V
-调用点，452–458 行的重叠屏障仍在；问题及后续验收要求见
-[待处理的性能问题](deferred-optimizations.md)，尚未实现 fence 去重。
+调用点，452–458 行的重叠屏障当时仍在。2026-10-18 已在 IR 层合并，规则和
+历史基线见[同步性能优化状态](deferred-optimizations.md)。
+
+## 2026-10-18 PIPE_V 合并验证
+
+当前实现将相同参与者、相同 pipe、相同完成前缀的连续 fence 合并，guard 取
+并集，保留所有 protocol 来源。Set/Wait 贡献次数不按此规则合并。
+默认 FA 的 PIPE_V 静态调用点 28→20，ASC 557→531 行；CANN 二进制的
+`.text` 为 8524→8208 字节。新旧 source IR 和同步前 IR 完全相同，52 个
+native 和 309 个 protocol 来源均保留；本地与跨核通知的静态次数保持。
+
+全量测试 **1812 passed，313.69 s**；包含独立有限 byte/event 模型及必要
+fence 删除反例。Ruff、格式及 diff 检查通过。实际 DSL→IR→ASC→CANN 对象和
+共享库的单次构建 28.001 s，整个进程组共用 300 s 硬期限。本次未重做五次
+冷编译资格，不把该单次构建时间当作编译速度提升。
+
+Ascend910B3 物理卡 2 映射逻辑卡 0，CANN 9.1.0、dav-2201、`-O2`。
+运行前检查全部八张卡的健康、进程、显存与利用率。新产物通过六组全输出检查：
+standard 的 Sq:Sk 为 256:1024、768:3072、1536:1024、1024:2048，另对
+768:3072 检查 uniform 和 sharp。每组预热 2 次、执行 3 次，全部输出、输入
+不变及 guard 通过；最大绝对误差分别不超过 0.000030518、0 和 0.000488281，
+均满足 FA 声明的容差。
+
+同一卡上交替重测合并前的原产物和当前产物，各三个批次，顺序为
+旧/新、新/旧、旧/新；每批预热 5 次、计时 30 次。输入、数学合同、编译选项
+一致，计时复用同一 allocation，不 flush。下表为三批 msprof 设备 task p50
+的中位数，排除 host 提交间隙：
+
+| Sq=Sk | 合并前 µs | 合并后 µs | 新/旧 | 批次范围 |
+|---|---:|---:|---:|---|
+| 4096 | 510.000 | 509.412 | 0.99885 | 重叠，改善未确定 |
+| 8192 | 1762.272 | 1759.494 | 0.99842 | 三批均低于基线范围 |
+
+变化仅约 0.12%/0.16%，本次不据此宣称显著加速。4K/8K 使用 sampled oracle，
+同时检查完整输出有限性、输入不变及 guard；各批新旧产物的完整输出 hash 相同。
+本次对照评估同一 DSL 的 fence 变换前后，未将 2026-10-17 的 ACLNN 时间
+当作本次重测。`performance-comparison.json` 和 `profiles-{4096,8192}/` 保存
+逐批数值、身份校验、原始 CSV 及命令。
+
+本机证据在 `build/pipe-v-coalescing-20261018/`：`fa/` 保存当前 source/IR/ASC/
+CANN 产物，`artifact-comparison.json`、`machine-code-comparison.json` 保存
+与 2026-10-17 原产物的身份和内容比较，`quality.json` 保存测试摘要，
+`device-{standard,uniform,sharp}.json` 保存六组完整数值检查。
+当前 ASC SHA256 为
+`3f442bc853196df869270f5034b26a5cc8ead014388d5a539d9a627a04e5ab21`。

@@ -166,10 +166,19 @@ mode-2 的十六个 base ID 来自安装 CANN 9.1 的 2201 `GetfftsConfig` 四�
 `simplify_conditions`使用实际loop、祖先和分支前提保持`g`与`g-N`关联，合并
 连续指令的共同条件。仅当标量在共同入口完整可求值时才移动计算；通知专用
 二次幂余数可改为全定义的位掩码，地址及loop header依赖的原式保持不变。
-同种类/路由/参与者的连续通知在分支互斥时合并执行域和event ID表达式，
-重叠分支仍按原顺序贡献各次指令。诊断协议来源全部保留，不重新选择同步。
+同种类/路由/参与者的连续事件通知在分支互斥时合并执行域和event ID表达式，
+重叠分支仍按原顺序贡献各次 Set/Wait。诊断协议来源全部保留，不重新选择同步。
 event选择式在公共guard的剩余域内生成，内部不重复判断共同条件。
 有限bank slot的互补选择可化简为无条件指令，不枚举runtime迭代或循环阶段。
+
+同 pipe fence 使用独立的幂等规则：在仅含纯整数 SSA、条件和通知的 packet 中，
+同路由、同 eligible participants 的连续 fence 可将执行域取并集，即使条件重叠。
+两次 capture 之间没有新的 native 或其他通知，因而覆盖同一个完成前缀；
+每条实际执行路径上 `F;F=F`，并集保留原来至少一次 fence 的全部路径。
+SID 条件仍属于执行域，不能把一个 AIV 的完成当作另一个的完成。
+native、循环、地址/配置及未知 effects 都结束 packet，不跨边界借用完成事实。
+合并后的 NotificationOp 保留所有 protocol 来源，`removed_fences` 记录静态合并数；
+事件贡献次数、native 顺序、地址和循环身份保持。该规则不依赖 CANN 自动同步。
 
 后端只打印最终IR，每个pipeline/family只有一个物理时钟循环、一份stage body；
 相邻同offset的stage共享存在guard。ASC中无阶段枚举、阶段参数、stage lambda
