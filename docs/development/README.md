@@ -15,5 +15,7 @@
 | 8 | [内存合同](memory-contracts.md) | 并行前提、读写权限、write_disjoint 与可能别名分别由谁负责？ |
 | 9 | [统一语义域与 SMT 重构方案](smt-refactor-plan.md) | 已确认的设计欠账、Z3 接入边界、删除项与分阶段验收是什么？ |
 
+本次重构的实际提交和验收状态见 [实施进展](smt-refactor-progress.md)。
+
 日常命令和两项性能采集统一在[测试指南](../guide/testing.md)，测试目录职责见
 [tests](../../tests/README.md)。不要恢复历史 solver、旧公开 task API 或第二条编译路径。
