@@ -14,7 +14,7 @@
 | P3 存储与值 | 部分实现 | NativeSpec 公共字段已收敛；保留现有合同，存储和值接口尚未完成收敛 |
 | P4 同步与资源 | 主体已接通 | 层级顺序、一致释放集合与编译内成对兼容关系已实现；新算子的完整资源资格继续集成 |
 | P5 最终链路 | 主体已实现，集成中 | 终端条件查询已统一；逻辑模块与终端模块已隔离，后端只读取 executable plan；全链资格仍需完成 |
-| P6 集成资格 | 集成中 | 分组全量 1937 项通过；公开例子前 19 组及 KDA recurrent/decode 已通过 CANN/设备，prefill 与性能资格尚未完成 |
+| P6 集成资格 | 集成中 | 最新分组全量 1945 项通过；prefill 十个 specialization、B1/S4096/H32 和 S4077 已通过 CANN/设备，主配置 BasicInfo 已采集；其他公开示例的最新全链资格仍需收敛 |
 
 ## 2026-10-19 接手与监督恢复
 
@@ -293,7 +293,7 @@ ASC SHA256 为 `1e0823709660afbabdc8033b8fb6423a1148701dbd953a994aaa9490a10f46d4
 产品的 deadline 保护来迁就测试。尚有公开示例清单缺少 KDA 和 scalar_store 的
 真实集成问题，正在补全；没有将全量宣称通过。
 
-当前 core source 为 87 个模块、27,225 行，比审计基线增加 195 行。局部旧推理
+该阶段 core source 为 87 个模块、27,225 行，比审计基线增加 195 行。局部旧推理
 主体已删除，整个编译器的大幅净简化、P2/P3 剩余收敛及完整 P6 仍未完成。
 
 ## 全量 Python 回归与公开示例补全
@@ -384,3 +384,35 @@ read、bounds、后端 trace、mask、matmul 和 FP32 cube。包含新增三项�
 单次冷进程 source→ASC：19.7382 秒、19.0032 秒。二者 ASC SHA256 相同，均为
 `1e0823709660afbabdc8033b8fb6423a1148701dbd953a994aaa9490a10f46d4`。
 只说明这两次 probe 的结果，不称稳定加速或五次性能资格；仍未达到 p50≤5s。
+
+## 本轮集成结果
+
+代码提交：`6e1b3b0`（metadata 与完整 activation）、`2f6c2e8`（NativeSpec）、
+`8d25b68`（未变 scope 输入复用）。随后三处格式收敛的可执行 AST 与修改前
+一致，逐文件 hash 和 AST 对照见 `native-format-equivalence.json`。
+
+`owned-final-regression-02/summary.json` 汇总八组 JUnit：1945 个不同用例全部
+通过，failure/error/skip 均为零；25 项 watchdog/CLI 自测独立运行，其他组
+保持 300 秒 command 上限。未按重复执行累计用例数。
+
+`owned-prefill-example-device-02` 的 H8/S127 prefill 十个 phase specialization
+全部完成 DSL→ASC→CANN shared，整体构建 101.62 秒；设备 output/state
+RMSE ratio 为 0.001518/0.000799，满足原有 0.005 合同。这是整个 pipeline
+输出与最终状态检查，不称每个中间矩阵已独立数值验收。
+
+当前格式后的代码另在 `owned-prefill-main-01` 完成 B1/S4096/H32、K=V128、
+chunk64 的全部十个 specialization 构建，整体 111.88 秒。物理卡 2→逻辑 0，
+全卡健康/进程/显存/利用率检查通过，无设备错误、reset 或换卡。
+`owned-prefill-main-basic-01/metrics.json` 使用 msprof op BasicInfo、默认 kernel
+重放；十次 phase launch 合计 3736.04 us，Gram 为 1239.62 us。
+本次采集的 output/state RMSE ratio 为 0.001742/0.001164；记录包含输入、
+source IR、ASC、库、编译选项、设备及原始 CSV 身份，不以 stream interval
+代替 kernel time，也不将单次采集称为稳定性能无损或性能提升。
+
+`owned-prefill-main-tail-01` 使用同一份当前库及合法相同 chunk domain 运行
+S4077，output/state RMSE ratio 为 0.001743/0.001206，原容差通过。
+
+本轮统计时的 `src/**/*.py` 为 87 模块、27,182 行；比上一轮代码审计的
+27,238 行减少 56 行，比引入 Z3 前的 27,030 行仍增加 152 行。此次减少的是
+重复 native 表示及转发，不把它称作整个编译器的大幅净简化。跨模块坐标
+接口、存储/值合同收敛以及 FA 冷构建目标仍未完成。

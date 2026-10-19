@@ -436,9 +436,7 @@ def _configurations(memory):
                 )
                 source = template.accesses[0].address.geometry
                 actual_width = (
-                    source.row_stride // 32
-                    if not source.contiguous
-                    else template.spec.params[0]
+                    source.row_stride // 32 if not source.contiguous else template.spec.params[0]
                 )
                 _require(
                     width.data == actual_width,

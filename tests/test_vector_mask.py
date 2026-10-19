@@ -851,9 +851,7 @@ def test_data_compare_where_and_mask_logic_keep_actual_packed_reads():
     select = next(t for t in memory.templates if t.spec.native == "mask_and")
     assert compare.spec.modes == ("R", "RW")
     assert select.spec.modes == ("R", "R", "W")
-    packet = next(
-        t for t in memory.templates if t.spec.native == "select_masked"
-    ).spec.packet
+    packet = next(t for t in memory.templates if t.spec.native == "select_masked").spec.packet
     assert packet is not None and packet.closed_mask
     assert "CMPMASK" in packet.clobbers and packet.internal_fences == ("V",)
     where = next(t.spec for t in memory.templates if t.spec.native == "select_masked")
@@ -1495,9 +1493,7 @@ def test_standalone_compare_cannot_authorize_uninitialized_packed_reads():
     zero.detach()
     partial = collect_native_memory(structure.module)
     partial_template = next(
-        template
-        for template in partial.templates
-        if template.spec.native == "compare_scalar_gt"
+        template for template in partial.templates if template.spec.native == "compare_scalar_gt"
     )
     assert partial_template.spec.modes == ("R", "RW")
     with pytest.raises(CompileError, match="initialized writer coverage"):

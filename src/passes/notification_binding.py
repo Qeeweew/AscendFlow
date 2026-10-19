@@ -195,9 +195,7 @@ def _bind_endpoint(
         endpoint.engine
         if isinstance(endpoint, QueueEndpoint)
         else next(
-            item.spec.engine
-            for item in memory.templates
-            if item.operation is occurrence.operation
+            item.spec.engine for item in memory.templates if item.operation is occurrence.operation
         )
     )
     substitutions, coordinate_guards, tests, families, selector_tests, coordinates = (
