@@ -206,3 +206,31 @@ producer 也使用实际可获得的 selected consumer header，不能留下另�
 主体确已删除，但身份、显式结果和缓存失效合同也增加了代码，尚未实现整个
 编译器的大幅净简化。P3、资源共享收敛、最终 executable plan 边界、五次冷
 编译目标以及新代码的设备数值/性能验收均未完成。
+
+## 层级顺序与一致 ownership 集合
+
+空 child 的失败来自不可达的循环回边：先证明局部步数相等，会在空 activation
+上取得空真值，再按词法位置错误地判为逆序。现在对完整层级词典序关系做
+Bool/Int 查询，不将空域上的中间相等关系当作后续决策。原始 guard 定义性仍
+由原阶段准入；空循环端口、零次透传和实际同步指令没有删除。
+
+局部释放前缀使用统一的 `StructuredNeed.ownership_key`。多个 cell 可以共同
+释放，但必须在全部候选片段（包括 steady 和 selected boundary）中保持同一
+完整 ownership 集合；仅边界合并、内部仍分散的候选保留各自 credit。由此恢复
+八 panel、双槽程序，同时保留八 cell 嵌套重入的已有约束。cell channel 的
+手写等式替换和逐个谓词取反分离查询已删除，改用一次完整的共存查询。
+
+分配器将成对兼容关系与候选 ID 搜索分开：固定成员、域和生命周期的关系只
+建立一次，包括已拒绝的可选共享；成功关系保留真实 consume→Set handback。
+报告增加 `sharing_pairs` 与 `sharing_reuses`，不扩大 bank 容量或删除预留。
+
+`owned-sync-integration-01/build.log` 中同步目录、资源合同与 AST Cube 分组
+共 256 项通过，238.18 秒。该分组已包含默认与 causal FA，且没有排除原失败。
+这次分组在兼容关系缓存接入前启动；缓存接入后的专项结果另行记录。
+回归新增 child count 为 `parent%4` 的多次执行，并在八 panel 用例中检查两次
+调用、循环回绕和删除真实释放 Wait 的反例。DMA 测试仅更新拒绝消息正则，
+仍检查非法 GM→L1 transpose。
+
+缓存接入后 `owned-resource-relations-01/build.log` 的 34 项通过；共享测试直接
+记录真实 `share_events` 调用，要求同一固定成员对不因候选 ID 重复建立关系，
+并继续执行独立 byte/event 重入检查。ruff、format 和 diff 检查通过。

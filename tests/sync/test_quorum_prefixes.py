@@ -37,8 +37,19 @@ def local_prefix(X:N.Tensor((n,8,64),N.f32),
     artifact = compile(program)
     final = collect_native_memory(artifact.plan)
     original = collect_native_memory(parse(artifact.before_ir))
-    for count in (0, 1, 2, 5):
-        check_structured_events(final, {"n": count}, logical_reference=original)
+    for count in (0, 1, 2, 5, 7):
+        check_structured_events(final, {"n": count}, logical_reference=original, invocations=2)
+    release = next(
+        op
+        for op in final.module.walk()
+        if isinstance(op, NotificationOp)
+        and op.kind.data == SyncKind.LOCAL_WAIT.value
+        and op.source.data == Engine.V.value
+        and op.destination.data == Engine.MTE2.value
+    )
+    release.parent.erase_op(release)
+    with pytest.raises(EventModelError):
+        check_structured_events(final, {"n": 7}, logical_reference=original)
 
 
 def test_two_gm_handoffs_use_one_complete_quorum_prefix():

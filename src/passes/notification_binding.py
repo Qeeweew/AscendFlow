@@ -16,6 +16,7 @@ from xdsl.dialects import arith
 from ..analysis.access_frontier import LoopResidueSelection, QueueEndpoint, ResiduePosition
 from ..analysis.hazards import HazardKind
 from ..analysis.integer_facts import IntegerFacts
+from ..analysis.smt import all_of, any_of
 from ..analysis.structured_dependencies import StructuredDependencies
 from ..analysis.structured_dispatch import StructuredDispatch
 from ..analysis.structured_protocols import (
@@ -484,24 +485,37 @@ class _IssueOrder:
         """Return -1/0/1 only for proved order on one actual controller."""
         if before.actor is not after.actor:
             return None
-        premises = self.premises(need)
-        for a, b in zip(self.position(before), self.position(after)):
+        left, right = self.position(before), self.position(after)
+        earlier, later, equal = [], [], True
+        for a, b in zip(left, right):
             if a[0] is not b[0]:
-                return None
-            if a[1] == b[1] or self.arithmetic.prove(Comparison(a[1], "==", b[1]), premises):
-                if a[2] != b[2]:
-                    return -1 if a[2] < b[2] else 1
-                continue
-            if self.arithmetic.prove(Comparison(b[1], ">", a[1]), premises):
-                return -1
-            if self.arithmetic.prove(Comparison(a[1], ">", b[1]), premises):
-                return 1
-            return None
-        if before.operation is not after.operation:
-            return None
-        if before.placement is after.placement:
-            return 0
-        return -1 if before.placement is Placement.BEFORE else 1
+                equal = False
+                break
+            if a[1] != b[1]:
+                earlier.append(all_of(equal, Comparison(a[1], "<", b[1])))
+                later.append(all_of(equal, Comparison(a[1], ">", b[1])))
+                equal = all_of(equal, Comparison(a[1], "==", b[1]))
+            if a[2] != b[2]:
+                (earlier if a[2] < b[2] else later).append(equal)
+                equal = False
+                break
+        else:
+            if len(left) != len(right) or before.operation is not after.operation:
+                equal = False
+            elif before.placement is not after.placement:
+                (earlier if before.placement is Placement.BEFORE else later).append(equal)
+                equal = False
+        # Query each complete lexicographic relation. Proving an intermediate
+        # equality under an empty activation and then choosing a lexical tie
+        # would arbitrarily reverse an otherwise valid inactive loop carry.
+        # These mathematical questions never admit the original guards.
+        for relation, result in ((any_of(*earlier), -1), (equal, 0), (any_of(*later), 1)):
+            if (
+                relation is True
+                or self.arithmetic.queries.implies(relation, self.premises(need)).proved
+            ):
+                return result
+        return None
 
 
 def _point_key(point, *, actor=True):
@@ -911,34 +925,11 @@ def _notification_prefixes(notifications, order):
         if item.mechanism not in {NotificationKind.CROSS_EVENT, NotificationKind.LOCAL_EVENT}:
             selected.append(item)
             continue
-        # A binary release credit follows one physical ownership word through
-        # its inner iterations and selected boundary fragments. Combining
-        # unrelated releases here changes that word's identity: an aggregate
-        # boundary can no longer reuse its existing per-cell credit. Preserve
-        # the same physical keys consumed by construct_cell_channels. RAW
-        # capture coverage and cross-participant quorum keep their own rules.
-        release = (
-            tuple(
-                (
-                    origin.cell.physical_key
-                    if isinstance(origin.cell, StorageCell)
-                    else origin.cell,
-                    origin.kind,
-                    origin.source.participant,
-                    origin.consumer.participant,
-                )
-                for origin in item.origins
-            )
-            if item.mechanism is NotificationKind.LOCAL_EVENT
-            and any(origin.kind is not HazardKind.RAW for origin in item.origins)
-            else ()
-        )
         key = (
             item.mechanism,
             item.source_engine,
             item.destination_engine,
             _domain_key(item),
-            release,
             tuple(
                 phase(p, local=item.mechanism is NotificationKind.LOCAL_EVENT)
                 for p in sorted(item.sources, key=lambda p: p.actor.value)
@@ -949,40 +940,72 @@ def _notification_prefixes(notifications, order):
             ),
         )
         groups.setdefault(key, []).append(item)
+
+    def release_owners(item):
+        return (
+            frozenset(origin.ownership_key for origin in item.origins)
+            if item.mechanism is NotificationKind.LOCAL_EVENT
+            and any(origin.kind is not HazardKind.RAW for origin in item.origins)
+            else frozenset()
+        )
+
+    candidates, cohorts = [], {}
     for items in (part for batch in groups.values() for part in _prefix_versions(batch)):
-        requirements = tuple(need for item in items for need in item.requirements)
-        endpoints = []
-        for source in (True, False):
-            participants = {}
-            for item in items:
-                for point in item.sources if source else item.consumers:
-                    participants.setdefault(point.actor, []).append(point)
-            endpoints.append(
-                tuple(
-                    _ordered_prefix_point(points, requirements, order, source=source)
-                    for points in participants.values()
-                )
-            )
-        valid = not any(point is None for points in endpoints for point in points)
-        if valid and items[0].mechanism is NotificationKind.LOCAL_EVENT:
-            # Keep every load before the first acquired use. Interleaved
-            # source reuse still needs its original separate credits.
-            valid = all(
-                order.compare(endpoints[0][0], endpoints[1][0], need) == -1 for need in requirements
-            )
-        if not valid:
-            selected.extend(items)
-        else:
-            selected.append(
-                replace(
-                    items[0],
-                    sources=endpoints[0],
-                    consumers=endpoints[1],
-                    requirements=requirements,
-                    origins=tuple(origin for item in items for origin in item.origins),
-                )
-            )
+        combined = _merge_prefix(items, order)
+        for members, item in (
+            ((items, combined),) if combined is not None else (((item,), item) for item in items)
+        ):
+            owners = release_owners(item)
+            candidates.append((members, item, owners))
+            for owner in owners:
+                cohorts.setdefault(owner, set()).add(owners)
+    for members, item, owners in candidates:
+        # One release credit must retain the same complete ownership cohort
+        # through steady iterations AND selected child/parent boundaries.
+        # A boundary-only union would lose each inner cell's existing credit.
+        # Conversely, disjoint cells consistently released together can use
+        # one capture after all readers and one acquire before all writers.
+        if all(len(cohorts[owner]) == 1 for owner in owners):
+            selected.append(item)
+            continue
+        separate = {}
+        for member in members:
+            separate.setdefault(release_owners(member), []).append(member)
+        for group in separate.values():
+            combined = _merge_prefix(group, order)
+            selected.extend(group if combined is None else (combined,))
     return tuple(selected)
+
+
+def _merge_prefix(items, order):
+    requirements = tuple(need for item in items for need in item.requirements)
+    endpoints = []
+    for source in (True, False):
+        participants = {}
+        for item in items:
+            for point in item.sources if source else item.consumers:
+                participants.setdefault(point.actor, []).append(point)
+        endpoints.append(
+            tuple(
+                _ordered_prefix_point(points, requirements, order, source=source)
+                for points in participants.values()
+            )
+        )
+    if any(point is None for points in endpoints for point in points):
+        return None
+    if items[0].mechanism is NotificationKind.LOCAL_EVENT and not all(
+        order.compare(endpoints[0][0], endpoints[1][0], need) == -1 for need in requirements
+    ):
+        # Keep every load before the first acquired use. Interleaved source
+        # reuse still needs its original separate credits.
+        return None
+    return replace(
+        items[0],
+        sources=endpoints[0],
+        consumers=endpoints[1],
+        requirements=requirements,
+        origins=tuple(origin for item in items for origin in item.origins),
+    )
 
 
 def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:

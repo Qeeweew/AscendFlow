@@ -143,11 +143,12 @@ def test_prefix_protocol_missing_real_instruction_has_a_counterexample(removed):
         check_structured_events(final, {"n": 6}, logical_reference=original)
 
 
-@pytest.fixture(scope="module")
-def compiled_prefix():
+@pytest.fixture(scope="module", params=(2, 4))
+def compiled_prefix(request):
     from ascendflow.passes.structured_sync import synchronize_structure
 
-    return synchronize_structure(N.from_source(PREFIX_STATE, disjoint_external=True))
+    source = PREFIX_STATE.replace("parent%2", f"parent%{request.param}")
+    return synchronize_structure(N.from_source(source, disjoint_external=True))
 
 
 @pytest.mark.parametrize("n", (0, 1, 2, 3, 6, 9))

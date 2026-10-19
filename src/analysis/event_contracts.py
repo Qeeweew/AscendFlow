@@ -85,6 +85,8 @@ class ResourceWork:
     ring_cases: int = 0
     cell_channels: int = 0
     cell_members: int = 0
+    sharing_pairs: int = 0
+    sharing_reuses: int = 0
     allocated_local_ids: int = 0
     allocated_cross_ids: int = 0
 

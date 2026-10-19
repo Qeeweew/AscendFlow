@@ -10,11 +10,9 @@ credits. Successive writers/readers may be different native operations.
 
 from dataclasses import dataclass, replace
 
-from ..indexing import arguments
-from ..scalar import literal, substitute
+from ..scalar import literal
 from .access_frontier import QueueEndpoint
 from .event_contracts import CaseLease, StructuredEventLease
-from .guard_cover import opposite
 from .structured_protocols import NotificationKind
 from .structured_regions import StorageCell
 
@@ -73,43 +71,9 @@ def _disjoint(domains, left, right):
                         if not domains.active[left, ac] or not domains.active[right, bc]:
                             continue
                         tests = _actual_tests(domains, a, ac) + _actual_tests(domains, b, bc)
-                        if not _separated(domains.arithmetic, tests):
+                        if not domains.arithmetic.queries.satisfies(tests).impossible:
                             return False
     return True
-
-
-def _separated(arithmetic, tests):
-    """Mathematical coexistence, after original guard definedness admission.
-
-    A selected LAST is often x == N-1. Substitute that established equality
-    before comparing it with x < N-1; interval bounds alone intentionally do
-    not bind a variable to a symbolic RHS. This never rewrites emitted guards.
-    """
-    bindings = {}
-    for test in tests:
-        if test.predicate != "==":
-            continue
-        a, b = substitute(test.lhs, bindings), substitute(test.rhs, bindings)
-        if a.kind != "argument":
-            a, b = b, a
-        if a.kind == "argument" and a.args[0] not in arguments(b):
-            change = {a: b}
-            bindings = {v: substitute(value, change) for v, value in bindings.items()} | change
-    reduced = tuple(
-        type(t)(substitute(t.lhs, bindings), t.predicate, substitute(t.rhs, bindings))
-        for t in tests
-    )
-    present = set(reduced)
-    for t in reduced:
-        if t.lhs == t.rhs and t.predicate in {"!=", "<", ">"}:
-            return True
-        if t.lhs.constant is not None and t.rhs.constant is not None and not t.evaluate({}):
-            return True
-        if opposite(t) in present:
-            return True
-    return any(
-        arithmetic.prove(opposite(t), reduced[:i] + reduced[i + 1 :]) for i, t in enumerate(reduced)
-    )
 
 
 def construct_cell_channels(domains):
@@ -126,15 +90,7 @@ def construct_cell_channels(domains):
         # and acquire reuse, and consumed only inside this owned compile.
         # Every physical participant still has its own exact memory edge.
         key = (
-            tuple(
-                (
-                    n.cell.physical_key,
-                    n.kind,
-                    n.source.participant,
-                    n.consumer.participant,
-                )
-                for n in origins
-            ),
+            frozenset(n.ownership_key for n in origins),
             item.source_engine,
             item.destination_engine,
             item.mechanism,

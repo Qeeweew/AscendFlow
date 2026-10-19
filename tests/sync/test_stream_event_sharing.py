@@ -30,9 +30,22 @@ def repeated(X:N.Tensor((n,m,9,64),N.f32),
     )
 
 
-def test_repeated_queue_ports_share_only_after_consumption_and_nested_reentry():
+def test_repeated_queue_ports_share_only_after_consumption_and_nested_reentry(monkeypatch):
+    from ascendflow.analysis import structured_resources
+
+    establish = structured_resources.share_events
+    queried = set()
+
+    def once(domains, rule, left, right):
+        pair = frozenset((left, right))
+        assert pair not in queried, "candidate IDs must reuse unchanged lifetime relations"
+        queried.add(pair)
+        return establish(domains, rule, left, right)
+
+    monkeypatch.setattr(structured_resources, "share_events", once)
     plan = synchronize_structure(conditional_loads(reuse=True))
     assert plan.resources.sharing
+    assert queried
     for outer, inner in ((0, 0), (0, 3), (1, 0), (1, 1), (2, 2), (3, 4)):
         check_compiled_events(plan, {"n": outer, "m": inner}, invocations=2)
 

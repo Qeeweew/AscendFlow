@@ -47,6 +47,24 @@ class _EventBanks:
         self.channels = {member: channel for channel in channels for member in channel.members}
         self.cell_channels = channels
         self.channel_ids = {}
+        self.compatibility = {}
+
+    def _compatible(self, left, right):
+        # Candidate IDs do not change these members, domains or lifetimes.
+        # Cache the complete relation, including a declined optional sharing.
+        # A successful relation retains its real consumption handbacks.
+        pair = frozenset((left, right))
+        if pair in self.compatibility:
+            self.domains.work.sharing_reuses += 1
+            return self.compatibility[pair]
+        if self.domains._exclusive(left, right):
+            result = ()
+        else:
+            witness = share_events(self.domains, self.handbacks, left, right)
+            result = None if witness is None else (witness,)
+        self.compatibility[pair] = result
+        self.domains.work.sharing_pairs += 1
+        return result
 
     def allocate(self, lifetimes, order):
         self._reserve()
@@ -151,12 +169,10 @@ class _EventBanks:
                 if prior is None:
                     break  # Native initializer/final-drain reservations are never borrowed.
                 for member in members:
-                    if self.domains._exclusive(prior, member):
-                        continue
-                    witness = share_events(self.domains, self.handbacks, prior, member)
-                    if witness is None:
+                    relation = self._compatible(prior, member)
+                    if relation is None:
                         break
-                    witnesses.append(witness)
+                    witnesses.extend(relation)
                 else:
                     continue
                 # Sharing introduces a constraint on the *whole* credit,

@@ -212,6 +212,16 @@ class StructuredNeed:
             else Milestone.ADMISSION,
         )
 
+    @property
+    def ownership_key(self):
+        """Physical lifetime role, independent of coverage and edge spelling."""
+        return (
+            self.cell.physical_key if isinstance(self.cell, StorageCell) else self.cell,
+            self.kind,
+            self.source.participant,
+            self.consumer.participant,
+        )
+
 
 @dataclass(slots=True)
 class DependencyWork:

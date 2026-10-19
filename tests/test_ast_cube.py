@@ -34,7 +34,7 @@ def test_transpose_flag_does_not_license_other_dma_routes():
     source = batched_matmul.to_ir()
     copy = next(op for op in source.walk() if isinstance(op, CopyOp))
     copy.attributes["transpose"] = IntAttr(1)
-    with pytest.raises(VerifyException, match="L1→L0B"):
+    with pytest.raises(VerifyException, match="complete L1→L0A/L0B matrix"):
         source.verify()
 
 
