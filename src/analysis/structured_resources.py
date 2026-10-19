@@ -1,8 +1,9 @@
 """Allocate finite banks from generated credits and explicit new sharing.
 
 No domain, memory or progress graph is rebuilt here. A cell credit's members
-already share one lifetime; other finite ID sharing adds a consume-to-Set
-constraint. Materialization receives the final IDs and real instruction sites.
+already share one lifetime; other ID sharing establishes a consume-to-Set
+handback or aligned single-publisher counter FIFO with a whole-credit budget.
+Materialization receives the final IDs and unchanged real instruction sites.
 """
 
 from dataclasses import replace
@@ -12,6 +13,7 @@ from ..dialects.physical import FixConfigOp, Load3DConfigOp
 from ..scalar import expression, literal
 from ..target.ascend910b import Actor, Engine, SyncKind
 from .event_contracts import (
+    CROSS_BACKLOG,
     LOCAL_CAPACITY,
     SUPPORTED_CROSS_IDS,
     EventBankUsage,
@@ -19,7 +21,7 @@ from .event_contracts import (
     StructuredEventAssignment,
     StructuredEventPlan,
 )
-from .event_sharing import share_events
+from .event_sharing import share_counters, share_events
 from .notification_lifetimes import HandbackRule
 from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard, Placement, SyncAction
@@ -60,13 +62,18 @@ class _EventBanks:
         if self.domains._exclusive(left, right):
             result = ()
         else:
-            witness = share_events(self.domains, self.handbacks, left, right)
+            witness = (
+                share_counters(self.domains, left, right)
+                if left.mechanism is NotificationKind.CROSS_EVENT
+                else share_events(self.domains, self.handbacks, left, right)
+            )
             result = None if witness is None else (witness,)
         self.compatibility[pair] = result
         self.domains.work.sharing_pairs += 1
         return result
 
     def allocate(self, lifetimes, order):
+        self.lifetimes = lifetimes
         self._reserve()
         for notification in self.domains.notifications:
             if notification.mechanism is NotificationKind.PIPE_FENCE:
@@ -94,6 +101,20 @@ class _EventBanks:
             )
             + (EventBankUsage(None, tuple(sorted(self.cross_occupied))),),
         )
+
+    def _counter_backlog(self, members):
+        """Count each complete physical credit once, including later members."""
+        credits = {}
+        for member in members:
+            lease = self.lifetimes[member]
+            require(
+                all(case.backlog is not None for case in lease.cases),
+                "counter allocation requires an established backlog for every active case",
+            )
+            backlog = max((case.backlog for case in lease.cases), default=0)
+            credit = self.channels.get(member, member)
+            credits[credit] = max(credits.get(credit, 0), backlog)
+        return sum(credits.values())
 
     def _reserve(self):
         root = self.domains.memory.module.body.block.first_op
@@ -165,6 +186,8 @@ class _EventBanks:
             priors = dict.fromkeys(
                 prior for pool in pools for flag in ids for prior in pool.get(flag, ())
             )
+            if cross and self._counter_backlog((*priors, *members)) > CROSS_BACKLOG:
+                continue
             for prior in priors:
                 if prior is None:
                     break  # Native initializer/final-drain reservations are never borrowed.
@@ -180,6 +203,11 @@ class _EventBanks:
                 # A handback for one finite fragment cannot license its loop.
                 break
             else:
+                if cross:
+                    self.domains.work.maximum_counter_backlog = max(
+                        self.domains.work.maximum_counter_backlog,
+                        self._counter_backlog((*priors, *members)),
+                    )
                 self.sharing.extend(witnesses)
                 for pool in pools:
                     for flag in ids:

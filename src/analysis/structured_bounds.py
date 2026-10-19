@@ -354,6 +354,11 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
         try:
             original = _original_view(address, facts)
             span = _subview(address, original)
+            tensor_bytes = literal(ITEMSIZE[address.geometry.dtype])
+            for extent in address.axes.extents:
+                tensor_bytes = expression("mul", tensor_bytes, extent)
+            capacity = allocations[address.root]
+            full_tensor = equivalent(capacity, tensor_bytes, facts)
             aligned = _multiple_of(address.offset, alignment, facts)
             aligned = aligned and (
                 address.geometry.rows == 1 or address.geometry.row_stride % alignment == 0
@@ -375,6 +380,14 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
             for domain in domains:
                 domain_contracts += 1
                 checker.check_axes(address, domain)
+                if full_tensor or domain_nonnegative(
+                    expression("sub", capacity, tensor_bytes), domain, facts
+                ):
+                    # The checked linearization maps the bounded original
+                    # axes into this tensor; _subview keeps every native byte
+                    # in that view. Compose those facts with real capacity,
+                    # instead of re-proving the flattened nonlinear address.
+                    continue
                 _nonnegative(
                     address.offset,
                     facts,

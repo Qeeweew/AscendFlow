@@ -29,6 +29,15 @@ tile，但 native 字节范围不变，reader family 保留原始 count。捕获
 上界代次代替真实最后读取。计算 LAST 的 Expr 同样解析 selected ancestor；
 canonical occurrence 已有的 j-d 祖先平移不重做。变化的 child 通过共同控制端口组合，不要求该 family 精确闭合。
 
+精确分区按真实地址周期识别物理槽。对于步长可证明为常数 `a` 的
+`(a*i+b)%m`，周期为 `m/gcd(abs(a),m)`；步长为 0 或 m 的倍数时周期为 1。
+不能按余数表达式的语法将同一物理地址复制为多个独立槽。未知映射继续使用
+AliasRegion，原始算术定义性和范围检查不由周期推理代替。
+
+字节 bounds 组合已经验证的原轴范围、真实线性化和 native 子视图；真实 root
+容量可容纳整个原 tensor 时，不重新求解等价的扁平地址边界。容量关系不成立
+或未知时仍验证实际 slice 的字节边界，不能用轴 metadata 代替真实 allocation。
+
 ## 1. 捕获与获取
 
 每个 retained need 绑定实际位置：native 的 Set 在 source 之后、Wait 在 consumer
@@ -42,6 +51,11 @@ Vector 等同 pipe 依赖保留实际 pipe fence。
 只选已经需要且确实更晚发射的 source；复用 acquire 只使用已经存在的更早同
 queue acquire。被选通知保留它自身的原始 ownership edge，不把新增 coverage
 反过来当作捕获者自己的存储归属。
+
+以上规则也适用于已经完整的跨核 quorum：每个 producer 的捕获都覆盖所需
+source，每个 receiver 的已有 acquire 都先于所需 consumer，才能复用。
+相同 Stage、ActorDomain 或共同写入某个 cell 都不授权合并独立完成边界；
+不能为了节省 ID 将多个独立通知改成「最后 capture → 最早 acquire」。
 
 ## 2. physical-step 和局部阶段序
 
@@ -110,11 +124,10 @@ receiver 都消费，release 要两个实际 reader 都贡献。少一个成员�
 consumer 前的 queue Wait。两个 AIV 的原始 lifetime edges 全部保留；配对、阶段序
 和 cell credit 仍检查合并后的实际位置，无法比较顺序或缺少参与者仍拒绝。
 
-已经完整的 quorum 还可在相同 physical stage、相同 ActorDomain body、激活域、
-坐标与边界 family 内合并前缀：逐 actor 选择最后真实 capture 和最早 acquire，
-并保留全部原始 requirements/origins。不能跨不同 C/V body 拼接前缀；后续配对、
-进展、cell lifetime 与事件资源约束仍正常生成。有限执行与缺第二 AIV 贡献的反例
-见 `tests/sync/test_quorum_prefixes.py`。
+quorum 的完成覆盖与物理 ID 共享是不同的变换。前者遵守第 1 节已有位置的
+复用规则；后者不改变 Set/Wait 的位置和次数，遵守第 6 节的事件资源合同。
+独立发布、完整 quorum、缺第二 AIV 贡献及 ID 共享反例见
+`tests/sync/test_quorum_prefixes.py`。
 
 ## 4. 无稳定 cell 的通知
 
@@ -156,6 +169,13 @@ child exit 只结束控制派发，不说明 native 已完成。变化空 child 
 最后一次活跃 child。非空稳定 loop 可使用窄的 native reader/writer。MTE1 最后读 L1 后即可 release，MAD/FIX
 可以继续；MTE2 最后读 GM 后即可 release，Vector 可以继续。
 
+条件访问只有在全部激活和坐标选择输入在循环入口可求值时，才可能保留窄的
+guarded 端点；这包括 child count、FIRST/LAST 选择和不透明 queue 边界，
+不能只检查 if 谓词。还须满足该 cell 每轮都有无条件排序写入，或通过整数域
+证明访问集合至多在一个 ordinal 激活。后者查询两个不同合法 ordinal 能否
+同时激活，不匹配 `i==N-1` 等表达式形状。存在空洞的多次条件写入和晚定义
+metadata 继续使用共同 queue 端口，保留跳过分支时的平衡及真实 S 定义位置。
+
 kernel 返回才执行每个实际异步 engine 的 Set→S Wait drain；配置 ID 和 drain ID
 进入同一 bank 预留台账。最终 drain 不参与普通 buffer 的早释放证明。
 
@@ -166,6 +186,18 @@ kernel 返回才执行每个实际异步 engine 的 Set→S Wait drain；配置 
 约束，必须有实际消费回传或 invocation-uniform 互斥，不能仅比较 controller 源码位置。
 台账从第一次分配就占用完整 credit 的所有成员；对后来才物化的成员也逐一检查
 新共享约束，不能以第一片的有限 handback 授权整个循环 credit。
+
+mode-2 计数器还允许一种独立的 FIFO 共享规则：两个完整通道只有一个实际
+发布者，source pipe、接收者集合、clock、坐标、激活域、边界 family 和 case
+一致，且发布顺序与每个接收者的消费顺序严格一致。证明使用各端已建立的
+实际 issue 关系和同 source pipe 的计数贡献 FIFO；不把普通 native end 当作
+FIFO，也不移动、合并或减少 Set/Wait。每个接收者仍消费各自完整消息。
+
+分配候选 ID 时，对全部已占用与将占用的完整 credit 求积压上界之和；同一个
+物理 credit 只计一次，总和不得超过 15。未知积压不是 0。容量检查覆盖之后
+才物化的 credit 成员，不只检查当前通知。多个 AIV 共同发布尚无独立的
+quorum 轮次证明，因此不采用此 FIFO 规则共享 ID；每个发送者自身有序不足以
+证明快发送者的下一轮贡献不会被消费到另一发送者的上一轮。
 
 本地 bank 是 `(physical actor, source engine, destination engine)`，每 bank 八 ID。
 mode-2 的十六个 base ID 来自安装 CANN 9.1 的 2201 `GetfftsConfig` 四位编码；

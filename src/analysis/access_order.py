@@ -17,13 +17,15 @@ from xdsl.dialects import arith, scf
 from xdsl.ir import Operation
 
 from ..diagnostics import require
-from ..indexing import nonnegative, normalize_or_identity
+from ..indexing import arguments, nonnegative, normalize_or_identity
 from ..scalar import Expr, expression, literal, substitute
+from ..symbols import Symbol, SymbolKind, is_coordinate
 from .access_frontier import AccessEndpoint, LoopResidueSelection, QueueEndpoint, ResiduePosition
 from .guard_cover import opposite
 from .hazards import HazardKind
 from .integer_facts import IntegerFacts
 from .region_coordinates import RegionCoordinates
+from .smt import all_of, any_of
 from .structured_access import PartitionedAccesses, partition_accesses
 from .structured_memory import NativeMemoryFacts
 from .structured_regions import (
@@ -133,6 +135,12 @@ class _Builder:
         self.coordinates = RegionCoordinates(memory, self.accesses.patterns)
         self.facts = memory.control.environment.facts
         self.arithmetic = IntegerFacts(self.facts)
+        self.entry_symbols = {
+            memory.control.group.args[0],
+            memory.control.sid.args[0],
+            *(name for name in self.facts if not is_coordinate(name)),
+        }
+        self.peer_ordinals = {}
         self.iteration_writes = set()
         for cells in self.accesses.effects.values():
             for cell, effects in cells.items():
@@ -171,6 +179,84 @@ class _Builder:
             )
             tests.append(opposite(test) if frame.branch else test)
         return tuple(tests)
+
+    def _entry_available(self, operation, points):
+        """All original activation/selection inputs exist at this loop entry.
+
+        A known branch predicate alone is insufficient: a child LAST or an
+        opaque queue boundary may still depend on metadata loaded in the arm.
+        This is a scope check, independent of the predicate's syntax.
+        """
+        control = self.memory.control
+        available = self.entry_symbols | {
+            loop.ordinal.args[0] for loop in control.frames[operation].loops()
+        }
+        values = []
+        for point in points:
+            values.extend(
+                value for test in self._activation(point) for value in (test.lhs, test.rhs)
+            )
+            for binding in point.bindings:
+                if isinstance(binding.ordinal, Expr):
+                    values.append(binding.ordinal)
+                else:
+                    values.append(control.loops[binding.loop].count)
+                    if isinstance(binding.ordinal.residue, Expr):
+                        values.append(binding.ordinal.residue)
+            if isinstance(point.endpoint, QueueEndpoint):
+                endpoint = point.operation
+                if endpoint in control.loops:
+                    values.append(control.loops[endpoint].count)
+                elif isinstance(endpoint, scf.IfOp):
+                    comparison = endpoint.cond.owner
+                    values.extend(
+                        control.environment.expression(operand) for operand in comparison.operands
+                    )
+        return all(arguments(value) <= available for value in values)
+
+    def _single_activation(self, loop, points):
+        """Prove the union has at most one active iteration, not a LAST idiom.
+
+        A sparse writer with holes needs a forwarding queue protocol. A
+        singleton does not: two distinct active iterations must be impossible.
+        Source arithmetic definedness remains admission's separate obligation.
+        """
+        logical = self.memory.control.loops[loop]
+        if loop not in self.peer_ordinals:
+            self.peer_ordinals[loop] = Expr(
+                "argument", (Symbol("$peer", SymbolKind.ORDINAL, object()),)
+            )
+        peer = self.peer_ordinals[loop]
+        mapping = {logical.ordinal: peer}
+        activations = tuple(dict.fromkeys(self._activation(point) for point in points))
+        first = any_of(*(all_of(*tests) for tests in activations))
+        second = any_of(
+            *(
+                all_of(
+                    *(
+                        Comparison(
+                            substitute(test.lhs, mapping),
+                            test.predicate,
+                            substitute(test.rhs, mapping),
+                        )
+                        for test in tests
+                    )
+                )
+                for tests in activations
+            )
+        )
+        return self.arithmetic.queries.satisfies(
+            (
+                all_of(
+                    Comparison(logical.ordinal, ">=", literal(0)),
+                    Comparison(logical.ordinal, "<", logical.count),
+                    Comparison(peer, ">", logical.ordinal),
+                    Comparison(peer, "<", logical.count),
+                    first,
+                    second,
+                ),
+            )
+        ).impossible
 
     def _emit(self, cell, kind, sources, consumers, scope, *, required=True, guards=(), **clock):
         guards = self.coordinates.guards(
@@ -571,20 +657,35 @@ class _Builder:
             if loops:
                 loop = loops[-1].operation
                 for cell, transfer in union.items():
-                    varying = any(
-                        not self.memory.control.invariant_over(value, loop)
-                        for p in transfer.head_reads
+                    points = (
+                        transfer.head_reads
                         + transfer.tail_reads
                         + transfer.first_writes
                         + transfer.tail_writes
+                    )
+                    varying = any(
+                        not self.memory.control.invariant_over(value, loop)
+                        for p in points
                         for test in self._activation(p)
                         for value in (test.lhs, test.rhs)
                     )
-                    if varying and (
-                        transfer.head_reads
-                        or transfer.tail_reads
-                        or transfer.first_writes
-                        and (cell, loop) not in self.iteration_writes
+                    exact = (
+                        varying
+                        and self._entry_available(operation, points)
+                        and (
+                            (cell, loop) in self.iteration_writes
+                            or self._single_activation(loop, points)
+                        )
+                    )
+                    if (
+                        varying
+                        and not exact
+                        and (
+                            transfer.head_reads
+                            or transfer.tail_reads
+                            or transfer.first_writes
+                            and (cell, loop) not in self.iteration_writes
+                        )
                     ):
                         # A conditional reader can depend on an S value
                         # defined after an earlier producer. The common

@@ -67,9 +67,6 @@ def test_both_organizations_share_actual_algorithm_and_explicit_operations():
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         ]
         assert "exp" in names and "reduce_sum" in names and "reduce_max" in names
-        # Each of QK/PV has a default and a paired constexpr branch. Actual
-        # retained native counts are checked after specialization below.
-        assert names.count("matmul") == 4
         assert not set(names) & {"task", "autosync", "verify_plan", "set_flag", "wait_flag"}
 
 

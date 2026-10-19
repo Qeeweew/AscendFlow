@@ -144,15 +144,11 @@ class AttentionPolicy:
         """Declared source allocations; UB storage is private to each AIV."""
         bq, bm, bk, vr, dtype = self.query_tile, 128, self.kv_tile, self.vector_rows, self.dtype
         return (
-            ((bm, 128) if bq == bm else (bq // bm, bm, 128), dtype, "L1", "NZ"),
+            ((bq // bm, bm, 128), dtype, "L1", "NZ"),
             ((2, 128, 128), dtype, "L1", "NZ"),
-            ((2, bq, 128) if bq == bm else (2, bq // bm, bm, 128), dtype, "L1", "NZ"),
+            ((2, bq // bm, bm, 128), dtype, "L1", "NZ"),
             ((2, 128, 128), dtype, "L1", "NZ"),
-            *(
-                (((bm, 128), dtype, "L0A", "ZZ"),) * 2
-                if bq == bm
-                else (((2, bm, 128), dtype, "L0A", "ZZ"),)
-            ),
+            ((2, bm, 128), dtype, "L0A", "ZZ"),
             ((2, 128, 128), dtype, "L0B", "ZN"),
             ((2, bm, 128), "f32", "L0C", "NZ"),
             ((2, vr, bk), "f32", "UB", "linear"),

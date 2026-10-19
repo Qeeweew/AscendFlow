@@ -7,6 +7,7 @@ import pytest
 from ascendflow import compile
 from ascendflow import language as N
 from ascendflow.diagnostics import CompileError
+from ascendflow.target.ascend910b import Engine
 from examples.gemm.reduction import reduction_gemm
 
 
@@ -42,6 +43,50 @@ def test_nonterminal_export_is_supported_while_late_first_clear_remains_invalid(
         check_structured_events(final, {"panels": panels}, logical_reference=original)
     with pytest.raises(CompileError, match="own pipeline's first logical iteration"):
         compile(replace(reduction_gemm, source=reduction_gemm.source.replace("k == 0", "k == 1")))
+
+
+@pytest.mark.parametrize("reader_engine", [Engine.FIX, Engine.MTE3])
+@pytest.mark.parametrize("predicate", ["i == panels - 1", "i + 1 == panels"])
+def test_singleton_reader_does_not_synchronize_its_idle_engine_each_iteration(
+    reader_engine, predicate
+):
+    from ascendflow.analysis.structured_memory import collect_native_memory
+    from ascendflow.dialects.io import parse
+    from tests.models.structured_events import check_structured_events
+
+    definition = (
+        replace(
+            reduction_gemm,
+            source=reduction_gemm.source.replace("k == panels - 1", predicate.replace("i", "k")),
+        )
+        if reader_engine is Engine.FIX
+        else N.from_source(f"""
+        def last_store(Y: N.Tensor((64,), N.f32, access="write"), panels: N.int64):
+            with N.Kernel():
+                x = N.alloc_ub((64,))
+                for i in N.Pipelined(panels, stages=1):
+                    N.fill(x, 1.0)
+                    if {predicate}:
+                        N.copy(x, Y)
+        """)
+    )
+    result = compile(definition)
+    final = collect_native_memory(result.plan)
+    original = collect_native_memory(parse(result.before_ir))
+    counts = []
+    for panels in (0, 1, 2, 7):
+        checked = check_structured_events(
+            final, {"panels": panels}, logical_reference=original, invocations=2
+        )
+        if panels:
+            counts.append(
+                sum(
+                    command.kind != "native"
+                    and reader_engine in (command.source, command.destination)
+                    for command in checked.commands
+                )
+            )
+    assert len(set(counts)) == 1, "inactive readers must not add per-iteration queue handoffs"
 
 
 def test_terminal_writer_cannot_initialize_a_steady_first_read():

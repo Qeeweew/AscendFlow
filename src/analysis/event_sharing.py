@@ -1,4 +1,4 @@
-"""New allocation constraints: share event lifetimes through real handbacks."""
+"""New allocation constraints: real event handbacks and aligned counter FIFO."""
 
 from dataclasses import dataclass
 
@@ -15,6 +15,107 @@ class EventSharing:
     earlier: object
     later: object
     handbacks: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class CounterSharing:
+    """Two aligned FIFO messages, without merging their publications/waits.
+
+    One publisher's same-pipe contributions retain effect FIFO. Every receiver
+    must consume in the corresponding issue order. The allocator separately
+    bounds the backlog of the complete set of credits placed on this ID.
+    """
+
+    earlier: object
+    later: object
+    ordered_points: tuple
+
+
+def _counter_shape(notification):
+    def points(values):
+        return tuple(
+            (
+                p.actor,
+                p.placement,
+                p.guard,
+                p.coordinates,
+                p.coordinate_guards,
+                p.families,
+                p.selected,
+            )
+            for p in sorted(values, key=lambda p: p.actor.value)
+        )
+
+    return (
+        notification.source_engine,
+        notification.destination_engine,
+        notification.clock,
+        notification.ordinal,
+        notification.period,
+        notification.distance,
+        notification.domains,
+        points(notification.sources),
+        points(notification.consumers),
+    )
+
+
+def share_counters(domains, left, right):
+    """Pack aligned complete mode-2 streams whose FIFO orders agree.
+
+    This sufficient rule keeps identical coordinates, activation and family
+    selection, including the enclosing reentry. It does not identify different
+    loop clocks, use cross-pipe issue as completion, or drop an AIV member.
+    """
+    if any(n.mechanism is not NotificationKind.CROSS_EVENT for n in (left, right)):
+        return None
+    if any(len(n.sources) != 1 for n in (left, right)):
+        # Multiple publishers need a separate quorum-round proof: agreement
+        # of each sender's FIFO alone cannot establish that a fast sender's
+        # later contribution is not consumed in another sender's old round.
+        return None
+    if _counter_shape(left) != _counter_shape(right):
+        return None
+    a, b = domains.cases[left], domains.cases[right]
+
+    def cases(values):
+        return tuple(
+            (c.condition, c.substitutions, c.windows, c.projections, c.empty) for c in values
+        )
+
+    if cases(a) != cases(b):
+        return None
+
+    def ordered(earlier, ec, later, lc):
+        result = []
+        for phase in ("sources", "consumers"):
+            old = sorted(getattr(earlier, phase), key=lambda p: p.actor.value)
+            new = sorted(getattr(later, phase), key=lambda p: p.actor.value)
+            for before, after in zip(old, new, strict=True):
+                # Equal anchors would require an explicit instruction ordering
+                # decision. This rule only consumes an existing strict order.
+                if before.operation is after.operation:
+                    return None
+                for ac, bc in zip(ec, lc, strict=True):
+                    if not domains.active[earlier, ac] and not domains.active[later, bc]:
+                        continue
+                    if domains.active[earlier, ac] != domains.active[later, bc]:
+                        return None
+                    x = domains._instance(before, {}, case=ac)
+                    y = domains._instance(after, {}, case=bc)
+                    conditions = domains._order_conditions(x, y)
+                    assumptions = x.guard.comparisons + y.guard.comparisons
+                    # Only a mathematical issue relation is queried. Original
+                    # endpoint arithmetic was already admitted by EventDomains.
+                    if not domains.arithmetic.queries.covers(conditions, assumptions).proved:
+                        return None
+                result.append((before, after))
+        return tuple(result)
+
+    for earlier, ec, later, lc in ((left, a, right, b), (right, b, left, a)):
+        points = ordered(earlier, ec, later, lc)
+        if points is not None:
+            return CounterSharing(earlier, later, points)
+    return None
 
 
 def _single(domains, notification):

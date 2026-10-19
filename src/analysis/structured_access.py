@@ -127,18 +127,26 @@ def _integer_shift(value, coordinate):
     return None if a is None or b is None else lcm(a, b)
 
 
-def _period(value, coordinate):
+def _period(value, coordinate, facts):
     if not _depends(value, coordinate):
         return 1
     if value.kind in {"constant", "argument"}:
         return None
     a, b = value.args
     if value.kind == "rem" and b.constant is not None:
+        shifted = substitute(a, {coordinate: expression("add", coordinate, literal(1))})
+        delta = exact_constant(expression("sub", shifted, a), facts)
+        if delta is not None:
+            # (a*i+b) mod m repeats after m/gcd(a,m), including period one
+            # when the actual address is independent of the ordinal. A
+            # syntactic period m would duplicate one physical cell across
+            # residues, losing its identity and inventing alias dependencies.
+            return b.constant // gcd(abs(delta), b.constant)
         shift = _integer_shift(a, coordinate)
         return None if shift is None else shift * b.constant
     if value.kind not in {"add", "mul"}:
         return None
-    a, b = _period(a, coordinate), _period(b, coordinate)
+    a, b = _period(a, coordinate, facts), _period(b, coordinate, facts)
     return None if a is None or b is None else lcm(a, b)
 
 
@@ -360,7 +368,10 @@ class _Partitioner:
         # One strided rectangle remains one rectangle regardless of rows or
         # child trip count; original per-occurrence anchors remain unchanged.
         for loop in reversed(template.frame.loops()):
-            if not _depends(offset, loop.ordinal) or _period(offset, loop.ordinal) is not None:
+            if (
+                not _depends(offset, loop.ordinal)
+                or _period(offset, loop.ordinal, self.facts) is not None
+            ):
                 continue
             count = exact_constant(loop.count, self.facts)
             if count is None and access.mode is AccessMode.READ:
@@ -401,7 +412,7 @@ class _Partitioner:
         for loop in template.frame.loops():
             if not _depends(offset, loop.ordinal):
                 continue
-            period = _period(offset, loop.ordinal)
+            period = _period(offset, loop.ordinal, self.facts)
             if period is None:
                 count = exact_constant(loop.count, self.facts)
                 capacity = address.root.owner.nbytes.data

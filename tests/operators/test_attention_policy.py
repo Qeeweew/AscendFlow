@@ -179,7 +179,8 @@ def check_operand_ring(stages, order, producer, reader, count, slots):
 
 
 @pytest.mark.parametrize(
-    "producer,reader,slots", [("operand_k", "qk_native", 2), ("operand_pv", "pv_native", 1)]
+    "producer,reader,slots",
+    [("operand_k", "qk_emit", 2), ("operand_p0", "pv_0", 1), ("operand_p1", "pv_1", 1)],
 )
 def test_target_operand_issue_order_respects_its_ring(target_schedule, producer, reader, slots):
     for count in (0, 1, 2, 8, 17):

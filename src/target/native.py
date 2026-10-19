@@ -198,6 +198,14 @@ def native_contract(
         if refs and refs[0].dtype == "f32":
             require(len(params) == 2, "FP32 Load3D requires matrix dimensions")
             rows, cols = params
+            source = refs[0]
+            source_matches = source.contiguous or (
+                native == "load3d_a"
+                and source.nbytes == rows * 8 * 4
+                and source.rows == cols // 8
+                and source.row_stride % (16 * 8 * 4) == 0
+                and source.nbytes <= source.row_stride <= 256 * 8 * 4
+            )
             require(
                 all(16 <= d <= 256 and d % 16 == 0 for d in params)
                 and len(refs) == 2
@@ -206,9 +214,9 @@ def native_contract(
                 and (refs[0].layout, refs[1].layout)
                 == ("NZ", "ZZ" if native == "load3d_a" else "ZN")
                 and refs[0].total_nbytes == refs[1].total_nbytes == rows * cols * 4
-                and refs[0].contiguous
+                and source_matches
                 and refs[1].contiguous,
-                "FP32 Load3D requires complete compact f32 fractal planes",
+                "FP32 Load3D requires an aligned NZ source and compact f32 destination plane",
             )
             return "MTE1", ("R", "W")
         # Complete b16 matrix, unit filters/strides, zero padding. Layout and

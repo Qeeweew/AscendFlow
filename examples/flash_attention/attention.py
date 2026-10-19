@@ -65,23 +65,14 @@ def attention_target(
         assert BK % CK == 0, "KV tile must contain complete Cube reduction tiles"
         assert CK == D, "shared QK/PV accumulator planes require CK equal to D"
         # Declarations dominate all actor regions that use their storage.
-        if BQ == BM:
-            q1 = N.alloc_l1((BQ, D), DTYPE)
-        else:
-            q1 = N.alloc_l1((BQ // BM, BM, D), DTYPE)
+        parts = BQ // BM
+        q1 = N.alloc_l1((parts, BM, D), DTYPE)
         k1 = N.alloc_l1((2, CK, D), DTYPE)
-        if BQ == BM:
-            p1 = N.alloc_l1((2, BQ, CK), DTYPE)
-        else:
-            p1 = N.alloc_l1((2, BQ // BM, BM, CK), DTYPE)
+        p1 = N.alloc_l1((2, parts, BM, CK), DTYPE)
         v1 = N.alloc_l1((2, CK, D), DTYPE)
-        if BQ == BM:
-            qa = N.alloc_l0a((BM, D), DTYPE)
-            pa = N.alloc_l0a((BM, CK), DTYPE)
-        else:
-            # A paired row tile uses a separate operand slot for each part.
-            # QK/PV share those slots; total L0A remains 64KiB.
-            a0 = N.alloc_l0a((2, BM, D), DTYPE)
+        # One row part: Q/P have separate slots. Two parts: QK/PV share
+        # both slots by phase. Q stays resident throughout each QK child.
+        a0 = N.alloc_l0a((2, BM, D), DTYPE)
         # QK and PV share the physical L0B bank. Two slots let MTE1
         # prepare the next operand while MAD still reads the other slot.
         b0 = N.alloc_l0b((2, D, CK), DTYPE)
@@ -136,20 +127,18 @@ def attention_target(
             batch = global_query // (HQ * query_tiles)
             kv_head = head // (HQ // HKV)
             with N.Cube():
-                if BQ == BM:
-                    N.copy(Q[batch, head, query_row : query_row + BQ, :], q1)
-                    N.copy(q1, qa)
-                else:
-                    for part in N.unroll(BQ // BM):
-                        N.copy(
-                            Q[
-                                batch,
-                                head,
-                                query_row + part * BM : query_row + (part + 1) * BM,
-                                :,
-                            ],
-                            q1[part, :, :],
-                        )
+                for part in N.unroll(parts):
+                    N.copy(
+                        Q[
+                            batch,
+                            head,
+                            query_row + part * BM : query_row + (part + 1) * BM,
+                            :,
+                        ],
+                        q1[part, :, :],
+                    )
+                if parts == 1:
+                    N.copy(q1[0, :, :], a0[0, :, :])
             with N.Vector():
                 N.fill(m, NEG_INF)
                 N.fill(l, 0.0)
@@ -173,56 +162,41 @@ def attention_target(
                 else:
                     s = task % 2
                 with N.Stage(0, name="qk"), N.Cube():
-                    if BQ == BM:
-                        qk_order = ("load_k", "qk_native", "operand_k", "export_score")
-                    else:
-                        # Each native row tile owns one accumulator plane.
-                        # Export the old chunk before overwriting either plane.
-                        qk_order = ("export_score", "load_k", "qk_native", "operand_k")
+                    if parts == 2:
+                        # PV overwrites these slots between QK phases, but
+                        # Q is unchanged across every CK chunk of this child.
+                        for part in N.unroll(parts):
+                            N.copy(q1[part, :, :], a0[part, :, :])
                     for chunk in N.Pipelined(
                         BK // CK,
-                        stages=4,
-                        issue_order={"cube": qk_order},
+                        stages=3,
+                        issue_order={"cube": ("load_k", "qk_emit", "operand_k")},
                     ):
                         j = kv * BK + chunk * CK
                         with N.Stage(0, name="load_k"):
                             N.copy(K[batch, kv_head, j : j + CK, :], k1[chunk % 2, :, :])
                         with N.Stage(1, name="operand_k"):
                             N.copy(k1[chunk % 2, :, :], b0[chunk % 2, :, :], transpose=True)
-                        with N.Stage(2, name="qk_native"):
-                            if BQ == BM:
+                        with N.Stage(2, name="qk_emit"):
+                            for part in N.unroll(parts):
+                                plane = (chunk * parts + part) % 2
                                 N.matmul(
-                                    qa,
+                                    a0[part, :, :],
                                     b0[chunk % 2, :, :],
-                                    accum=c0[chunk % 2, :, :],
+                                    accum=c0[plane, :, :],
                                     initialize=True,
                                 )
-                            else:
-                                for part in N.unroll(BQ // BM):
-                                    N.copy(q1[part, :, :], a0[part, :, :])
-                                    N.matmul(
-                                        a0[part, :, :],
-                                        b0[chunk % 2, :, :],
-                                        accum=c0[part, :, :],
-                                        initialize=True,
-                                    )
-                        with N.Stage(3, name="export_score"):
-                            if BQ == BM:
+                                # Publish each native result at its producer;
+                                # its FIX read retires independently of peers.
                                 N.copy(
-                                    c0[chunk % 2, :, :],
-                                    Score[group, s, :, chunk * CK : (chunk + 1) * CK],
+                                    c0[plane, :, :],
+                                    Score[
+                                        group,
+                                        s,
+                                        part * BM : (part + 1) * BM,
+                                        chunk * CK : (chunk + 1) * CK,
+                                    ],
                                 )
-                            else:
-                                for part in N.unroll(BQ // BM):
-                                    N.copy(
-                                        c0[part, :, :],
-                                        Score[
-                                            group,
-                                            s,
-                                            part * BM : (part + 1) * BM,
-                                            chunk * CK : (chunk + 1) * CK,
-                                        ],
-                                    )
                 with N.Stage(1, name="softmax"), N.Vector() as lane:
                     for row in N.Pipelined(BQ // 2 // VR, stages=3):
                         r = row * VR
@@ -288,52 +262,57 @@ def attention_target(
                         )
                     else:
                         pv_chunks = BK // CK
+                    if parts == 1:
+                        pv_order = ("load_pv", "operand_v", "pv_0", "operand_p0")
+                    else:
+                        pv_order = (
+                            "load_pv",
+                            "operand_v",
+                            "pv_0",
+                            "operand_p0",
+                            "pv_1",
+                            "operand_p1",
+                        )
                     for chunk in N.Pipelined(
                         pv_chunks,
                         stages=3,
-                        issue_order={"cube": ("load_pv", "pv_native", "operand_pv")},
+                        issue_order={"cube": pv_order},
                     ):
                         j = kv * BK + chunk * CK
                         with N.Stage(0, name="load_pv"):
-                            if BQ == BM:
+                            for part in N.unroll(parts):
                                 N.copy(
-                                    P[group, s, :, chunk * CK : (chunk + 1) * CK],
-                                    p1[chunk % 2, :, :],
+                                    P[
+                                        group,
+                                        s,
+                                        part * BM : (part + 1) * BM,
+                                        chunk * CK : (chunk + 1) * CK,
+                                    ],
+                                    p1[chunk % 2, part, :, :],
                                 )
-                            else:
-                                for part in N.unroll(BQ // BM):
-                                    N.copy(
-                                        P[
-                                            group,
-                                            s,
-                                            part * BM : (part + 1) * BM,
-                                            chunk * CK : (chunk + 1) * CK,
-                                        ],
-                                        p1[chunk % 2, part, :, :],
-                                    )
                             N.copy(V[batch, kv_head, j : j + CK, :], v1[chunk % 2, :, :])
-                        with N.Stage(1, name="operand_pv"):
-                            if BQ == BM:
-                                N.copy(p1[chunk % 2, :, :], pa)
+                        with N.Stage(1, name="operand_v"):
                             N.copy(v1[chunk % 2, :, :], b0[chunk % 2, :, :])
-                        with N.Stage(2, name="pv_native"):
-                            if BQ == BM:
+                        with N.Stage(1, name="operand_p0"):
+                            N.copy(p1[chunk % 2, 0, :, :], a0[1 if parts == 1 else 0, :, :])
+                        with N.Stage(2, name="pv_0"):
+                            N.matmul(
+                                a0[1 if parts == 1 else 0, :, :],
+                                b0[chunk % 2, :, :],
+                                accum=c0[0, :, :],
+                                initialize=(chunk == 0),
+                            )
+                        if parts == 2:
+                            with N.Stage(1, name="operand_p1"):
+                                N.copy(p1[chunk % 2, 1, :, :], a0[1, :, :])
+                            with N.Stage(2, name="pv_1"):
                                 N.matmul(
-                                    pa,
+                                    a0[1, :, :],
                                     b0[chunk % 2, :, :],
-                                    accum=c0[0, :, :],
+                                    accum=c0[1, :, :],
                                     initialize=(chunk == 0),
                                 )
-                            else:
-                                for part in N.unroll(BQ // BM):
-                                    N.copy(p1[chunk % 2, part, :, :], a0[part, :, :])
-                                    N.matmul(
-                                        a0[part, :, :],
-                                        b0[chunk % 2, :, :],
-                                        accum=c0[part, :, :],
-                                        initialize=(chunk == 0),
-                                    )
-                    for part in N.unroll(BQ // BM):
+                    for part in N.unroll(parts):
                         N.copy(c0[part, :, :], PV[group, s, part * BM : (part + 1) * BM, :])
                 with N.Stage(2, name="update"), N.Vector() as lane:
                     # All rows rescale independently before adding this PV.

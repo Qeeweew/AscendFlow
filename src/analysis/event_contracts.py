@@ -15,7 +15,7 @@ from .structured_schedule import SyncAction
 if TYPE_CHECKING:
     from .cell_channels import CellChannel
     from .event_domains import EventCase
-    from .event_sharing import EventSharing
+    from .event_sharing import CounterSharing, EventSharing
     from .event_windows import EventWindow
     from .notification_lifetimes import Reuse
     from .queue_order import QueueOrder
@@ -89,6 +89,7 @@ class ResourceWork:
     sharing_reuses: int = 0
     allocated_local_ids: int = 0
     allocated_cross_ids: int = 0
+    maximum_counter_backlog: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,4 +103,4 @@ class StructuredEventPlan:
     work: ResourceWork
     channels: tuple[CellChannel, ...]
     banks: tuple[EventBankUsage, ...]
-    sharing: tuple[EventSharing, ...] = ()
+    sharing: tuple[EventSharing | CounterSharing, ...] = ()

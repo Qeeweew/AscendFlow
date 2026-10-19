@@ -9,9 +9,37 @@ import pytest
 
 from ascendflow import language as N
 from ascendflow.analysis.hazards import HazardKind
+from ascendflow.analysis.structured_regions import StorageCell
 from ascendflow.passes.structured_sync import synchronize_structure
 from tests.fixtures.nested import shared_l0c_qk_pv
 from tests.models.structured_events import check_compiled_events
+
+
+@pytest.mark.parametrize("step,bias,modulus", [(2, 0, 2), (3, 0, 6), (4, 1, 6)])
+def test_equivalent_affine_residues_keep_their_real_storage_identity(step, bias, modulus):
+    plan = synchronize_structure(
+        N.from_source(f"""
+    def residues(Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+        with N.Kernel():
+            x=N.alloc_ub(({modulus},64),N.f32)
+            for i in N.Pipelined(n,stages=2,issue_order={{"vector":("store","fill")}}):
+                with N.Stage(0,name="fill"):
+                    N.fill(x[({step}*i+{bias})%{modulus},:],1.0)
+                with N.Stage(1,name="store"):
+                    N.copy(x[({step}*i+{bias})%{modulus},:],Out[i,:])
+    """)
+    )
+    cells = {
+        cell
+        for effects in plan.dependencies.order.accesses.effects.values()
+        for cell in effects
+        if cell.root.type.bank.data == "UB"
+    }
+    assert cells and all(isinstance(cell, StorageCell) for cell in cells)
+    physical_slots = {(step * i + bias) % modulus for i in range(modulus)}
+    assert {cell.start // 256 for cell in cells} == physical_slots
+    for count in (0, 1, 2, 7):
+        check_compiled_events(plan, {"n": count}, invocations=2)
 
 
 @pytest.fixture(scope="module")

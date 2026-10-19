@@ -17,6 +17,17 @@ def test_geometry_counts_accessed_bytes_without_including_pitched_holes():
     assert replace(partials, rows=1).contiguous
 
 
+def test_fp32_l1_row_slice_retains_its_real_strided_load3d_footprint():
+    source = NativeGeometry("L1", "f32", "NZ", 32 * 8 * 4, rows=16, row_stride=128 * 8 * 4)
+    destination = NativeGeometry("L0A", "f32", "ZZ", 32 * 128 * 4)
+    assert native_contract("load3d_a", (source, destination), (32, 128)) == ("MTE1", ("R", "W"))
+    assert source.total_nbytes == destination.total_nbytes
+    assert not source.contiguous
+    for invalid in (replace(source, rows=15), replace(source, row_stride=source.row_stride + 32)):
+        with pytest.raises(CompileError, match="aligned NZ source"):
+            native_contract("load3d_a", (invalid, destination), (32, 128))
+
+
 @pytest.mark.parametrize(
     "changes",
     [

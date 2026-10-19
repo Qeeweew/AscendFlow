@@ -499,10 +499,10 @@ class EventDomains:
     def _order_conditions(self, before, after):
         """Exact queue order under both endpoints' established activation.
 
-        The first endpoint is a Wait admission, and the second is the native
-        position after a Set. These roles retain their phase even if the two
-        endpoints name the same native operation. Conditions prove ordering,
-        never the existence or definedness of a selected coordinate.
+        Endpoint placements retain their actual issue phases. Consume-to-Set
+        handbacks additionally check the queue/controller gate; counter FIFO
+        packing uses this same order for publications and receiver admissions.
+        Conditions prove ordering, never completion, existence or definedness.
         """
         if before.actor is not after.actor:
             return ()

@@ -14,7 +14,6 @@ from math import gcd, lcm
 from xdsl.dialects import arith
 
 from ..analysis.access_frontier import LoopResidueSelection, QueueEndpoint, ResiduePosition
-from ..analysis.hazards import HazardKind
 from ..analysis.integer_facts import IntegerFacts
 from ..analysis.smt import all_of, any_of
 from ..analysis.structured_dependencies import StructuredDependencies
@@ -36,12 +35,10 @@ from ..analysis.structured_regions import (
     BranchGuard,
     LoopCountGuard,
     LoopOrdinalGuard,
-    StorageCell,
 )
 from ..analysis.structured_schedule import ActionGuard, Comparison, Placement
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import TaskOp
-from ..dialects.structured import ActorDomainOp
 from ..indexing import arguments, equivalent, nonnegative, normalize
 from ..scalar import Expr, expression, literal
 from ..symbols import is_coordinate
@@ -647,32 +644,57 @@ def _implicit(notification, order):
     return None
 
 
+def _actor_points(points):
+    return tuple(sorted(points, key=lambda point: point.actor.value))
+
+
+def _route_key(notification):
+    return (
+        notification.mechanism,
+        notification.source_engine,
+        notification.destination_engine,
+        tuple(point.actor for point in _actor_points(notification.sources)),
+        tuple(point.actor for point in _actor_points(notification.consumers)),
+    )
+
+
+def _capture_order(left, right, requirements, order):
+    """Compare every participant's actual prefix, without moving an endpoint."""
+    return {
+        order.compare(a, b, need)
+        for a, b in zip(_actor_points(left), _actor_points(right), strict=True)
+        for need in requirements
+    }
+
+
 def _group_captures(notifications, order):
-    """One exact acquire may use its latest already-required engine capture."""
+    """One exact acquire needs only its latest already-required capture.
+
+    Select an existing notification. Its original ownership remains the
+    lifetime witness; other memory requirements only add completion coverage.
+    Complete cross-core quorums retain every actual participant.
+    """
     grouped = {}
     for item in notifications:
         key = (
-            _point_key(item.consumers[0]),
-            item.source_engine,
-            item.destination_engine,
-            item.mechanism,
-            item.sources[0].actor,
+            tuple(_point_key(point) for point in _actor_points(item.consumers)),
+            _route_key(item),
             _domain_key(item),
         )
         previous = grouped.get(key)
         if previous is None:
             grouped[key] = item
             continue
-        orders = {
-            order.compare(previous.sources[0], item.sources[0], need)
-            for need in previous.requirements + item.requirements
-        }
-        if None in orders or len(orders) != 1:
+        requirements = previous.requirements + item.requirements
+        relative = _capture_order(previous.sources, item.sources, requirements, order)
+        if relative <= {-1, 0}:
+            selected = item
+        elif relative <= {0, 1}:
+            selected = previous
+        else:
             grouped[key + (len(grouped),)] = item
             continue
-        relative = next(iter(orders))
-        selected = item if relative <= 0 else previous
-        grouped[key] = replace(selected, requirements=previous.requirements + item.requirements)
+        grouped[key] = replace(selected, requirements=requirements)
     return tuple(grouped.values())
 
 
@@ -711,54 +733,48 @@ def _contains_activation(wide, narrow, order):
 
 
 def _reuse_acquisitions(notifications, order):
-    """Reuse an already-selected real acquire on the same queue and domain.
+    """Cover a requirement with an acquire already required at that position.
 
-    Coverage needs two concrete comparisons: the capture is after the needed
-    source issue, and its queue acquire precedes the needed consumer issue.
-    A pipe fence additionally captures every already-issued same-pipe task.
-    There is no native-end FIFO or origin/reachability closure here.
+    The retained capture covers the needed source on every producer queue;
+    its existing acquire precedes the consumer on every receiver queue. This
+    adds no completion ordering. It never replaces independent pairs by the
+    latest capture and earliest acquire. ID sharing is a later, separate rule.
     """
 
     def key(item):
-        task = order.dispatch.site(item.consumers[0])
+        task = order.dispatch.site(_actor_points(item.consumers)[0])
         steps, scope = [(task.stage, task.lexical)], task.scope
         while scope.parent is not None:
             steps.append((scope.parent_stage, scope.parent_lexical * 3 + 1))
             scope = scope.parent
         return task.actor.value, tuple(reversed(steps)), item.source_engine.value
 
-    selected = []
+    selected, candidates = [], {}
     for item in sorted(notifications, key=key):
-        if item.mechanism is NotificationKind.CROSS_EVENT:
-            selected.append(item)
-            continue
-        for i, previous in enumerate(selected):
-            if previous.mechanism is NotificationKind.CROSS_EVENT or (
-                previous.source_engine is not item.source_engine
-                or previous.destination_engine is not item.destination_engine
-                or previous.sources[0].actor is not item.sources[0].actor
-                or not _contains_activation(previous, item, order)
-            ):
+        route = _route_key(item)
+        for index in candidates.get(route, ()):
+            previous = selected[index]
+            if not _contains_activation(previous, item, order):
                 continue
-            acquire = {
-                order.compare(previous.consumers[0], item.consumers[0], need)
-                for need in item.requirements
-            }
+            acquire = _capture_order(previous.consumers, item.consumers, item.requirements, order)
             if not acquire <= {-1, 0}:
                 continue
-            capture_point = (
-                previous.consumers[0]
-                if (previous.mechanism is NotificationKind.PIPE_FENCE)
-                else previous.sources[0]
+            capture = _capture_order(
+                item.sources,
+                previous.consumers
+                if previous.mechanism is NotificationKind.PIPE_FENCE
+                else previous.sources,
+                item.requirements,
+                order,
             )
-            capture = {
-                order.compare(item.sources[0], capture_point, need) for need in item.requirements
-            }
             if not capture <= {-1, 0}:
                 continue
-            selected[i] = replace(previous, requirements=previous.requirements + item.requirements)
+            selected[index] = replace(
+                previous, requirements=previous.requirements + item.requirements
+            )
             break
         else:
+            candidates.setdefault(route, []).append(len(selected))
             selected.append(item)
     return tuple(selected)
 
@@ -858,154 +874,6 @@ def _quorums(notifications, order):
     return tuple(local), tuple(unresolved)
 
 
-def _prefix_versions(items):
-    """Independent cells can share a prefix; successive values cannot.
-
-    A later writer of the same cell can require an earlier reader to retire.
-    Moving that reader's ready capture to the later writer creates a cycle.
-    Release prefixes likewise retain the next writer they authorize. Unknown
-    alias regions provide no independence premise for this optional merge.
-    """
-    groups = []
-    for item in items:
-        versions = {}
-        for origin in item.origins:
-            if not isinstance(origin.cell, StorageCell):
-                versions = None
-                break
-            point = origin.source if origin.kind is HazardKind.RAW else origin.consumer
-            versions.setdefault(origin.cell.physical_key, set()).add(point.operation)
-        for members, owners in groups:
-            if (
-                versions is not None
-                and owners is not None
-                and all(
-                    cell not in owners or owners[cell] == values
-                    for cell, values in versions.items()
-                )
-            ):
-                members.append(item)
-                owners.update(versions)
-                break
-        else:
-            groups.append(([item], versions))
-    return (members for members, _ in groups)
-
-
-def _notification_prefixes(notifications, order):
-    """Share complete local/quorum capture/acquire within one physical phase.
-
-    Every actor retains its own actual source prefix and first controller
-    acquire. Activation, coordinates, boundary families and physical stages
-    must match exactly. Pairing, progress and new cell lifetimes are then
-    constructed normally for the combined original ownership requirements.
-    """
-    selected, groups = [], {}
-
-    def phase(point, *, local=False):
-        task = order.dispatch.site(point)
-        actor_scope = point.operation.parent_op()
-        while actor_scope is not None and not isinstance(actor_scope, ActorDomainOp):
-            actor_scope = actor_scope.parent_op()
-        return (
-            point.actor,
-            point.placement,
-            point.guard,
-            point.coordinates,
-            point.coordinate_guards,
-            point.families,
-            task.scope,
-            task.stage,
-            actor_scope if actor_scope is not None else None if local else point.operation,
-        )
-
-    for item in notifications:
-        if item.mechanism not in {NotificationKind.CROSS_EVENT, NotificationKind.LOCAL_EVENT}:
-            selected.append(item)
-            continue
-        key = (
-            item.mechanism,
-            item.source_engine,
-            item.destination_engine,
-            _domain_key(item),
-            tuple(
-                phase(p, local=item.mechanism is NotificationKind.LOCAL_EVENT)
-                for p in sorted(item.sources, key=lambda p: p.actor.value)
-            ),
-            tuple(
-                phase(p, local=item.mechanism is NotificationKind.LOCAL_EVENT)
-                for p in sorted(item.consumers, key=lambda p: p.actor.value)
-            ),
-        )
-        groups.setdefault(key, []).append(item)
-
-    def release_owners(item):
-        return (
-            frozenset(origin.ownership_key for origin in item.origins)
-            if item.mechanism is NotificationKind.LOCAL_EVENT
-            and any(origin.kind is not HazardKind.RAW for origin in item.origins)
-            else frozenset()
-        )
-
-    candidates, cohorts = [], {}
-    for items in (part for batch in groups.values() for part in _prefix_versions(batch)):
-        combined = _merge_prefix(items, order)
-        for members, item in (
-            ((items, combined),) if combined is not None else (((item,), item) for item in items)
-        ):
-            owners = release_owners(item)
-            candidates.append((members, item, owners))
-            for owner in owners:
-                cohorts.setdefault(owner, set()).add(owners)
-    for members, item, owners in candidates:
-        # One release credit must retain the same complete ownership cohort
-        # through steady iterations AND selected child/parent boundaries.
-        # A boundary-only union would lose each inner cell's existing credit.
-        # Conversely, disjoint cells consistently released together can use
-        # one capture after all readers and one acquire before all writers.
-        if all(len(cohorts[owner]) == 1 for owner in owners):
-            selected.append(item)
-            continue
-        separate = {}
-        for member in members:
-            separate.setdefault(release_owners(member), []).append(member)
-        for group in separate.values():
-            combined = _merge_prefix(group, order)
-            selected.extend(group if combined is None else (combined,))
-    return tuple(selected)
-
-
-def _merge_prefix(items, order):
-    requirements = tuple(need for item in items for need in item.requirements)
-    endpoints = []
-    for source in (True, False):
-        participants = {}
-        for item in items:
-            for point in item.sources if source else item.consumers:
-                participants.setdefault(point.actor, []).append(point)
-        endpoints.append(
-            tuple(
-                _ordered_prefix_point(points, requirements, order, source=source)
-                for points in participants.values()
-            )
-        )
-    if any(point is None for points in endpoints for point in points):
-        return None
-    if items[0].mechanism is NotificationKind.LOCAL_EVENT and not all(
-        order.compare(endpoints[0][0], endpoints[1][0], need) == -1 for need in requirements
-    ):
-        # Keep every load before the first acquired use. Interleaved source
-        # reuse still needs its original separate credits.
-        return None
-    return replace(
-        items[0],
-        sources=endpoints[0],
-        consumers=endpoints[1],
-        requirements=requirements,
-        origins=tuple(origin for item in items for origin in item.origins),
-    )
-
-
 def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     """Consume all finite recursive needs through one capture/acquire contract.
 
@@ -1076,9 +944,9 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     # Physical cells own binary credits. Keep disjoint slot residues here;
     # allocation may unite their instruction spelling after assigning IDs.
     grouped = _group_captures(notifications, order)
-    grouped = _reuse_acquisitions(grouped, order)
     grouped, quorum_issues = _quorums(grouped, order)
-    grouped = _notification_prefixes(grouped, order)
+    grouped = _group_captures(grouped, order)
+    grouped = _reuse_acquisitions(grouped, order)
     unresolved.extend(quorum_issues)
     selected = tuple(replace(item, name=f"notification_{i}") for i, item in enumerate(grouped))
     for item in selected:

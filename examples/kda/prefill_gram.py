@@ -44,8 +44,9 @@ def prefill_gram_cross(
         rows = N.alloc_ub((16, 8), N.f32)
         scores16 = N.alloc_ub((16, 16), N.f32)
         scores32 = N.alloc_ub((16, 32), N.f32)
-        a1_small = N.alloc_l1((2, 2, 32, K), N.f32)
-        a1_large = N.alloc_l1((2, 2, 32, K), N.f32)
+        # One actual DMA defines the complete left slab. Its L1 reuse waits
+        # for all four readers; right operands retain compact transpose planes.
+        a1 = N.alloc_l1((2, 128, K), N.f32)
         b1_small = N.alloc_l1((2, 2, 16, K), N.f32)
         b1_large = N.alloc_l1((2, 32, K), N.f32)
         a0_small = N.alloc_l0a((32, K), N.f32)
@@ -131,32 +132,28 @@ def prefill_gram_cross(
                 for item in N.Pipelined(PACK, stages=2):
                     native_ring = item % 2
                     with N.Stage(0, name="load"):
+                        N.copy(GramLeft[owner, ring, item, :, :], a1[native_ring, :, :])
                         for panel in N.unroll(2):
-                            N.copy(
-                                GramLeft[owner, ring, item, panel * 32 : panel * 32 + 32, :],
-                                a1_small[native_ring, panel, :, :],
-                            )
                             N.copy(
                                 GramRight[owner, ring, item, panel * 16 : panel * 16 + 16, :],
                                 b1_small[native_ring, panel, :, :],
                             )
-                        for part in N.unroll(2):
-                            N.copy(
-                                GramLeft[owner, ring, item, 64 + part * 32 : 96 + part * 32, :],
-                                a1_large[native_ring, part, :, :],
-                            )
                         N.copy(GramRight[owner, ring, item, 32:64, :], b1_large[native_ring, :, :])
                     with N.Stage(1, name="dot"):
                         for panel in N.unroll(2):
-                            aa = N.copy(a1_small[native_ring, panel, :, :], a0_small)
+                            aa = N.copy(a1[native_ring, panel * 32 : panel * 32 + 32, :], a0_small)
                             bb = N.copy(
-                                b1_small[native_ring, panel, :, :], b0_small, transpose=True
+                                b1_small[native_ring, panel, :, :],
+                                b0_small,
+                                transpose=True,
                             )
                             N.matmul(aa, bb, accum=c0_small, initialize=True)
                             N.copy(c0_small, GramSmall[owner, ring, item, panel, :, :])
                         bb = N.copy(b1_large[native_ring, :, :], b0_large, transpose=True)
                         for part in N.unroll(2):
-                            aa = N.copy(a1_large[native_ring, part, :, :], a0_large)
+                            aa = N.copy(
+                                a1[native_ring, 64 + part * 32 : 96 + part * 32, :], a0_large
+                            )
                             N.matmul(aa, bb, accum=c0_large, initialize=True)
                             N.copy(
                                 c0_large,

@@ -28,6 +28,11 @@ SSA/代次。opcode、参数或地址 operand 数量改变必须更新描述，�
 构造标量范围 DAG，保留 owner/iteration 的联合区间；原始除法和源码算术仍独立
 检查。Expr 的 free variables 在节点构造时建立，不依赖 range/guard 环境。
 
+原轴范围、实际线性化和 native 子视图已经检查后，若真实 allocation 能容纳
+整个原 tensor，就组合这些事实推出 native 字节边界，不再独立求解展开后的
+非线性 offset。无法建立完整 tensor 容量关系时，仍检查实际 slice 的字节界；
+轴范围不能授权伪造 offset、过小 allocation 或跨越行间空洞的 native。
+
 地址解码保留原始 axes、真实字节 footprint 和可选 ND 矩形几何；bounds 按实际
 active domain 检查。编译器不反解 GEMM swizzle、排列 mixed-radix digit 或搜索
 tile-grid 的逆坐标。简单矩形分离不能排除冲突时保留 AliasRegion 及必要访问
@@ -55,7 +60,7 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 | ready/release覆盖 | notification binding | 真实 capture/acquire、独立覆盖及原始 ownership edges |
 | 配对与事件消费/复用 | 生成器的域、cell credit 与 handback 规则 | 域只检查一次；物理 lifetime 归纳或明确消费回传，rank 不提供消费证据 |
 | 可进展 | queue_order 的分层生成准入 | 零 step phase DAG、正 step 前进；父层只组合 child may-block 边界 |
-| bank/ID/width/quorum | 分配器消费已建生命周期，建立新增资源约束 | 不默认ID共享只是改名；不每候选重新搜索整套路径 |
+| bank/ID/width/quorum | 分配器消费已建生命周期，建立新增资源约束 | 不默认ID共享只是改名；单发布者counter FIFO需逐接收者同序且完整积压≤15；不每候选重新搜索整套路径 |
 | 输出对应 | 物化与后端 | 不重选同步，不改native/控制/guard语义 |
 
 上表不表示所有已存在的前置分析都应重写。先对源码确认真实职责，只删除被替代的机制。

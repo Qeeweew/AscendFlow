@@ -11,11 +11,12 @@ from benchmarks.attention.contract import AttentionPolicy
 from tests.models.structured_events import check_structured_events
 
 
-@pytest.fixture(scope="module")
-def causal_attention(tmp_path_factory):
+@pytest.fixture(scope="module", params=[(512, 16), (1024, 8)])
+def causal_attention(tmp_path_factory, request):
     directory = tmp_path_factory.mktemp("causal-fa")
     source = Path(__file__).parents[2] / "examples/flash_attention/attention.py"
-    policy = AttentionPolicy(causal=True, kv_tile=512, vector_rows=16)
+    kv_tile, vector_rows = request.param
+    policy = AttentionPolicy(causal=True, kv_tile=kv_tile, vector_rows=vector_rows)
     build_file(
         source, directory, entry="attention_target", parameters=policy.parameters(), timeout_s=300
     )
@@ -23,6 +24,7 @@ def causal_attention(tmp_path_factory):
         collect_native_memory(parse((directory / "after.xdsl").read_text())),
         collect_native_memory(parse((directory / "before.xdsl").read_text())),
         (directory / "attention_target.asc").read_text(),
+        policy,
     )
 
 
@@ -32,7 +34,8 @@ def causal_attention(tmp_path_factory):
 def test_causal_parent_lengths_and_slot_releases_match_actual_source(
     causal_attention, sq, sk, groups
 ):
-    final, original, asc = causal_attention
+    final, original, asc, policy = causal_attention
+    sk = max(sk, policy.minimum_sk)
     checked = check_structured_events(
         final, {"Sq": sq, "Sk": sk}, groups=groups, logical_reference=original, max_commands=100000
     )

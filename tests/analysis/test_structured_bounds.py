@@ -197,6 +197,45 @@ def test_original_axes_do_not_certify_an_undersized_real_allocation():
     assert error.value.kind == ErrorKind.INVALID
 
 
+def test_a_smaller_allocation_can_still_contain_the_actual_native_slice():
+    block = Block()
+    gm, ub = _buffer(block, "GM", 128), _buffer(block, "UB", 128)
+    source = _address(block, gm, extents=(128,), widths=(32,), nbytes=128)
+    destination = _address(block, ub, extents=(32,), widths=(32,), nbytes=128)
+    _task(block, "copy", source, destination)
+    assert admit_memory_bounds(collect_native_memory(_module(block))).checked_accesses == 2
+
+
+def test_rotated_runtime_grid_composes_axes_with_real_capacity(monkeypatch):
+    from ascendflow.analysis import structured_bounds
+
+    source = N.from_source("""
+def rotated(X:N.Tensor((3,n,64),N.f32),Out:N.Tensor((3,n,64),N.f32,access="write"),
+            n:N.int64(minimum=64,multiple_of=64)):
+    with N.Kernel(7) as owner:
+        tile=N.alloc_ub((64,64),N.f32)
+        blocks=n//64
+        tasks=3*blocks
+        for i in N.serial(N.ceildiv(N.max(tasks-owner,0),7)):
+            task=(owner+i*7+tasks//2)%tasks
+            head=task//blocks
+            row=(task%blocks)*64
+            N.copy(X[head,row:row+64,:],tile)
+            N.copy(tile,Out[head,row:row+64,:])
+""")
+    memory = native_memory(source)
+    nonnegative = structured_bounds.domain_nonnegative
+
+    def capacity_query(value, domains, facts):
+        assert not domains, "bounded axes must not be re-proved as one flat nonlinear address"
+        return nonnegative(value, domains, facts)
+
+    monkeypatch.setattr(structured_bounds, "domain_nonnegative", capacity_query)
+    bounds = admit_memory_bounds(memory)
+    assert bounds.checked_accesses == 4
+    assert all(bound.frames for bound in bounds.addresses.values())
+
+
 def test_large_byte_allocation_cannot_hide_an_invalid_original_axis():
     block = Block()
     gm, ub = _buffer(block, "GM", 1024), _buffer(block, "UB", 256)

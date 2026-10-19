@@ -19,7 +19,12 @@ Q/K/V/O与workspace的真实指针区间遵守外部disjoint合同；局部L1/L0
 
 QK产生FP32 score，online softmax保留FP32 m/l；denominator使用未舍入p32，P显式RN后进入PV。O在FP32 rescale/add，最后归一化并RN输出。FP32求和树允许按误差合同调整；其余算法/舍入边界不自动获得修改授权。
 
-默认AIC先新QK后旧PV、AIV先新softmax后旧update。每个K/V分块服务两个BM128行片，减少重复的GM→L1读取。两个片各占一份L0C；QK子流水先导出旧片，再按load/MAD/operand发射，PV子流水为load/MAD/operand并在外部FIX。编译器保持这些政策、早释放、缓冲复用与事件共享。
+默认AIC先新QK后旧PV、AIV先新softmax后旧update。每个K/V分块服务两个BM128行片，减少重复的GM→L1读取。QK子流水有 load_k、operand_k、qk_emit 三个偏移，发射顺序为 load_k、qk_emit、operand_k；qk_emit 内每片 MAD 后紧接自己的 FIX export。两个片的结果独立发布，槽覆盖等待对应的真实最后 reader。
+
+PV 同样有三个偏移。默认物理 step j 依次发射 load_pv(j)、operand_v(j-1)、
+pv_0(j-2)、operand_p0(j-1)、pv_1(j-2)、operand_p1(j-1)。两个 MAD 共用
+当前 V；每片 MAD 发射后即可准备该槽下一片 P，等待本槽读取退休。
+FP32 累加仍按 CK chunk 递增顺序执行，完整 PV 的 FIX export 位于子循环之后。
 
 两个AIV分别处理128行，仍共用一份runtime SID body。其GM分片对应不同的Cube操作；通用通知合并只在相同激活域和坐标下、Cube发射次序可证明时，选择较晚的累计capture或较早的acquire。两个AIV的真实贡献、原始storage lifetime和有限配对检查均保留。
 
@@ -30,7 +35,10 @@ L1为320KiB，L0A/B各64KiB、L0C128KiB，每AIV UB187264B。Score/P/PV的GM环�
 QK/PV共用L0B的两个32KiB槽，按各自chunk代次选择槽；总容量仍为64KiB。
 QK可在MAD读取一槽时装入下一槽，跨QK/PV交接及每槽真实最后reader由同一同步链建立。
 默认配对BM片的L0A也在相同64KiB容量中分为两槽，按part选择；QK/PV共用它们。
-装入第二片无需等第一片MAD读完同一槽；跨阶段覆盖仍等待对应槽的真实最后reader。
+Q 在每次 QK 子循环入口装入一次，整个 CK 遍历期间驻留；PV 随后将两槽用于 P。
+默认 BK/CK=8 时，每次 QK 的 Q L1→L0A 搬运为 64KiB，避免逐 CK 重装的
+512KiB 流量。BQ=BM 时，Q 固定驻留 a0[0]，P 使用 a0[1]，Q 每个 query
+只装一次。跨阶段覆盖仍等待对应槽的真实最后 reader，不增加 L0 容量。
 softmax中独立的alpha Exp与矩阵减法按完成依赖排步；P的独立FP16转换提前到
 denominator归约之前，归约继续读取原始FP32 work，不读取转换后的P。
 这些选择不改变逐行递推、FP32归约树或输出dtype。

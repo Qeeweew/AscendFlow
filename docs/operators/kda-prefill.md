@@ -52,6 +52,13 @@ kernel 内的 ready/release、GM 交接和事件资源由公共同步链建立�
 Cube/Vector 通过 GM workspace 交接；每个 mixed kernel 的两个 AIV 共用 body，
 通过 runtime SID 区分地址和角色，分析保留各自私有 UB 与 quorum 贡献。
 
+gram_cross 每项的四片左操作数在 L1 中保存为一个 `[128,K]` NZ slab，使用
+一次真实 GM→L1 DMA 导入，再由四次行切片 Load3D 读取。slab 下一次覆盖等
+全部旧 reader 退休。右操作数保留紧凑转置平面；每项导入从七次减少为四次，
+L1 容量不变。FP32 Load3D A 的 strided NZ 源保留每个 K/8 平面的实际行距，
+行距按 16×8 个 FP32 对齐且宽度不超过 256；目标仍是完整紧凑 L0A 平面。
+该能力不放宽 FP32 转置 Load2D 的紧凑源合同，也不改变矩阵乘输入精度。
+
 scan 中每个 chunk 保存更新前的 FP16 snapshot，同时用 FP32 历史状态做投影；
 residual 舍入为 FP16 后参与状态增量。carry 在 FP32 中完成衰减与加法，
 每个 sequence/head 必须按 chunk 顺序执行。独立的 output 阶段读取各 chunk 的

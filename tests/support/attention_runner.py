@@ -56,7 +56,7 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
         "chunk",
         "p1",
         "v1",
-        *(("qa", "pa") if policy.query_tile == 128 else ("a0",)),
+        "a0",
         "b0",
         "c0",
         "score_in",
