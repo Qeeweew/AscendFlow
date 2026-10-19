@@ -980,6 +980,10 @@ def block8_reduction_widths(columns: int) -> tuple[int, ...]:
     output rows must remain 32-byte aligned for the next stage and merge;
     padding or a different reduction tree must be selected explicitly.
     """
+    if columns == 8:
+        # The terminal datablock reduction packs its results directly. Its
+        # whole-repeat row extent is checked by ReduceOp below.
+        return (1,)
     widths = []
     while True:
         if columns < 64 or columns > 4096 or columns % 64:
@@ -1014,7 +1018,11 @@ class ReduceOp(IRDLOperation):
         if len(shape) not in {1, 2} or self.axis.data != len(shape) - 1:
             raise VerifyException("reduction currently requires the final axis of a vector/matrix")
         cols = shape[-1]
-        if cols < 64 or cols > 4096 or cols % 64:
+        block8 = self.order.data == "block8_then_packed_merge"
+        narrow = block8 and cols == 8 and len(shape) == 2
+        if narrow and (shape[0] % 8 or not 8 <= shape[0] <= 248):
+            raise VerifyException("eight-column reduction needs 8-aligned rows in [8,248]")
+        if not narrow and (cols < 64 or cols > 4096 or cols % 64):
             raise VerifyException("reduction needs 64-aligned columns in [64,4096]")
         if self.kind.data not in {"sum", "max"} or self.order.data not in {
             "r64_then_native_merge",
@@ -1022,7 +1030,6 @@ class ReduceOp(IRDLOperation):
             "block8_then_packed_merge",
         }:
             raise VerifyException("reduction requires an explicit supported order")
-        block8 = self.order.data == "block8_then_packed_merge"
         packed = block8 or self.order.data == "r64_then_packed_merge"
         result_shape = shape[:-1] if packed else (*shape[:-1], 1)
         if packed and len(shape) != 2:

@@ -516,6 +516,9 @@ def lower_reduce(op: ReduceOp, context: RecipeContext) -> RecipeResult:
     )
     tasks = []
     block8 = op.order.data == "block8_then_packed_merge"
+    if block8 and cols == 8:
+        task = context.emit("_block8", "reduce_" + op.kind.data + "8", source, destination)
+        return RecipeResult((task,), task, 1, (NativeRead(0, task, 0),))
     if block8:
         workspace, byte_offset = temporary, 0
         widths = block8_reduction_widths(cols)
