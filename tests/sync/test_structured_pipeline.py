@@ -30,7 +30,7 @@ def selected(request):
 
 def test_actual_local_pipeline_has_one_owned_structure(selected):
     selected.selection.require_closed()
-    assert selected.selection.dispatch.memory is selected.memory
+    assert selected.selection.dispatch.memory is selected.admission.memory
     assert len(selected.selection.coverage) == len(selected.dependencies.required)
     assert selected.resources.selection is selected.selection
     assert selected.resources.leases
@@ -45,12 +45,16 @@ def test_actual_selected_actions_materialize_as_guarded_ssa_ir(selected):
     from ascendflow.dialects.io import dump, parse
     from ascendflow.dialects.structured import NotificationOp
 
-    memory = selected.memory
-    # The final scalar pass can replace/delete arith SSA. Execution, control
-    # and address operations must keep their identities and relative order.
-    original_operations = tuple(template.operation for template in memory.templates)
+    memory = selected.admission.memory
+    # Logical analysis retains its module; terminal native correspondence is
+    # established once before scalar/control rewriting of the terminal module.
+    original_operations = tuple(native.operation for native in selected.executable.natives)
     module = selected.module
-    assert module is memory.module is selected.structure.module
+    assert memory.module is selected.structure.module and module is not memory.module
+    assert all(
+        old.operation is not new.operation and old.operation.uid == new.operation.uid
+        for old, new in zip(memory.templates, selected.executable.natives, strict=True)
+    )
     module.verify()
     text = dump(module)
     parse(text).verify()
@@ -71,7 +75,7 @@ def test_actual_selected_actions_materialize_as_guarded_ssa_ir(selected):
 
 @pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 7, 12])
 def test_emitted_domains_have_exactly_paired_ids_at_start_and_end(selected, count):
-    logical = next(iter(selected.memory.control.loops.values()))
+    logical = next(iter(selected.admission.memory.control.loops.values()))
     events = {SyncKind.LOCAL_SET: Counter(), SyncKind.LOCAL_WAIT: Counter()}
     for action in selected.resources.actions:
         for generation in range(count):

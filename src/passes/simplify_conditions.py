@@ -338,7 +338,16 @@ class _Domains:
         result = dict(a)
         for q, allowed in b.items():
             result[q] = result.get(q, _FULL).intersect(allowed)
-        return self.normalize(result)
+        return result
+
+    def disjoint(self, a, b):
+        # Mutual exclusion needs one coexistence question, not a normalized
+        # intersection with every surviving predicate proved again.
+        cube = self.intersect(a, b)
+        return (
+            any(not allowed.intervals for allowed in cube.values())
+            or self.queries.satisfies((self._formula(cube),), self._premises({})).impossible
+        )
 
     @staticmethod
     def _contains(a, b):
@@ -678,9 +687,10 @@ def _packet(operations, scope, work, ranks, changed):
                 cube = None
                 break
             cube = domains.intersect(cube, literal)
-            if cube is None:
-                break
-        if cube is not None:
+        # collect already admitted every moved scalar at this packet entry.
+        # Build the complete mathematical guard first, then normalize once;
+        # partial conjunctions are not separate optimization obligations.
+        if cube is not None and (cube := domains.normalize(cube)) is not None:
             normalized.append((cube, op))
     build, groups = _Build(domains), []
     for cube, op in normalized:
@@ -694,7 +704,7 @@ def _packet(operations, scope, work, ranks, changed):
                 # F;F = F on every active path, so their existence is the union
                 # of guards. This does not apply to Set/Wait contributions.
                 op.kind.data == SyncKind.FENCE.value
-                or all(domains.intersect(cube, prior) is None for prior, _ in groups[-1])
+                or all(domains.disjoint(cube, prior) for prior, _ in groups[-1])
             )
         ):
             groups[-1].append((cube, op))

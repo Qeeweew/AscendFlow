@@ -399,75 +399,13 @@ def physical_terms(expr, facts):
 
 
 def nonnegative(expr, facts):
-    """Sufficient algebraic sign proof; no parameter sampling."""
-    from .scalar import infer
+    """Mathematical sign under input facts; original evaluation is separate."""
+    from .analysis.smt import query_service
+    from .analysis.structured_schedule import Comparison
 
-    inferred = infer(expr, facts)
-    if inferred is not None and inferred.minimum >= 0:
-        return True
-    if expr.kind == "max" and any(nonnegative(arg, facts) for arg in expr.args):
-        return True
-    if expr.kind == "min" and all(nonnegative(arg, facts) for arg in expr.args):
-        return True
-
-    def sufficient(terms):
-        lower = 0
-        for term, coefficient in terms.items():
-            if coefficient < 0 and term:
-                return False
-            value = coefficient
-            for atom in term:
-                inferred = infer(atom, facts)
-                if inferred is None:
-                    return False
-                value *= inferred.minimum
-            lower += value
-        return lower >= 0
-
-    terms = polynomial(expr, facts)
-    # Polynomial normalization expands n % d into n-d*floor(n/d).
-    # Recover both bounds 0 <= remainder <= d-1 at integral scale.
-    # This is a mathematical inequality, not permission to evaluate
-    # an original unsigned division outside its checked activation prefix.
-    bounded = terms
-    for term, coefficient in terms.items():
-        if len(term) != 1:
-            continue
-        (atom,) = term
-        if atom.kind != "floordiv":
-            continue
-        numerator, divisor = atom.args
-        width = divisor.constant
-        if width is None or width <= 0 or coefficient % width:
-            continue
-        bounded = _sum(bounded, {term: -coefficient})
-        bounded = _sum(bounded, _scale(polynomial(numerator, facts), coefficient // width))
-        if coefficient > 0:
-            bounded = _sum(bounded, {(): -(coefficient // width) * (width - 1)})
-    if sufficient(bounded):
-        return True
-    if sufficient(terms):
-        return True
-    # min(a,b)<=a,b and max(a,b)>=a,b give direct lower bounds.
-    # Try one linear bound at a time; this is not a recursive case search.
-    for term, coefficient in terms.items():
-        if len(term) != 1:
-            continue
-        (atom,) = term
-        if not (atom.kind == "min" and coefficient < 0 or atom.kind == "max" and coefficient > 0):
-            continue
-        remaining = _sum(terms, {term: -coefficient})
-        pending, seen = list(atom.args), set()
-        while pending:
-            arg = pending.pop()
-            if arg in seen:
-                continue
-            seen.add(arg)
-            if arg.kind == atom.kind:
-                pending.extend(arg.args)
-            elif sufficient(_sum(remaining, _product({(): coefficient}, polynomial(arg, facts)))):
-                return True
-    return False
+    if expr.constant is not None:
+        return expr.constant >= 0
+    return query_service(facts).implies(Comparison(expr, ">=", literal(0))).proved
 
 
 def _joint_affine_interval(expr, domains, facts, *, atomic=False, queries=None):
@@ -606,86 +544,21 @@ def interval(expr, domains, facts, *, queries=None):
 
 
 def domain_nonnegative(expr, domains, facts):
-    """Resolve lexical lower bounds without discarding their correlations.
+    """Keep the complete lexical range relations in one sign query.
 
-    An inner loop's lower bound may be a previously loaded metadata value.
-    Follow that value's earlier range only when its sign is needed; eagerly
-    replacing every bound would lose relations such as end >= begin.
+    Loaded metadata and ancestor/child coordinates keep their actual identities.
+    Do not recursively replace correlated bounds by independent extrema, or
+    borrow a later condition to authorize an original unsigned evaluation.
     """
-    # Eliminate affine coordinates from the innermost lexical range first.
-    # Independent intervals of start and row lose row < length <= T-start.
-    # A substitution is monotone only when this coordinate occurs as one
-    # linear term, with no hidden occurrence inside another polynomial atom.
-    current = expr
-    ordered = tuple(reversed(domains))
+    from .analysis.smt import query_service
+    from .analysis.structured_schedule import Comparison
 
-    def replace_coordinate(terms, coordinate, lower, upper):
-        axis = polynomial(coordinate, facts, retained=True)
-        variables = {term: c for term, c in axis.items() if term}
-        if not variables or any(len(term) != 1 or term[0].kind != "argument" for term in variables):
-            return None
-        ratios = {_ratio(terms.get(term, 0), c) for term, c in variables.items()}
-        if len(ratios) != 1:
-            return None
-        (coefficient,) = ratios
-        if not coefficient or coefficient.denominator != 1:
-            return None
-        remainder = _sum(terms, _scale(axis, -coefficient))
-        if any(arguments(atom) & arguments(coordinate) for term in remainder for atom in term):
-            return None
-        bound = lower if coefficient > 0 else upper
-        return expression(
-            "add", _to_expr(remainder), expression("mul", literal(int(coefficient)), bound)
-        )
-
-    for position, (coordinate, lower, upper) in enumerate(ordered):
-        if nonnegative(current, facts):
-            return True
-        terms = polynomial(current, facts, retained=True)
-        # One min/max inequality may remove a correlated coordinate before
-        # ordinary extrema are taken (T-start-min(BT,T-start), for example).
-        # This is a single linear bound, never a recursive case search.
-        if all(c.denominator == 1 and len(term) <= 1 for term, c in terms.items()):
-            for term, coefficient in terms.items():
-                if len(term) != 1:
-                    continue
-                (atom,) = term
-                if not (
-                    atom.kind == "min" and coefficient < 0 or atom.kind == "max" and coefficient > 0
-                ):
-                    continue
-                remainder = _sum(terms, {term: -coefficient})
-                for bound in atom.args:
-                    candidate = _to_expr(
-                        _sum(
-                            remainder, _scale(polynomial(bound, facts, retained=True), coefficient)
-                        )
-                    )
-                    if nonnegative(interval(candidate, domains, facts)[0], facts):
-                        return True
-        # The induction range immediately precedes its derived zero-based
-        # ordinal range. Prefer the real induction when lower != 0; its
-        # exact upper bound avoids losing the active-loop relation to max(0,count).
-        replacement = None
-        if coordinate.kind == "argument" and position + 1 < len(ordered):
-            candidate = ordered[position + 1]
-            if candidate[0].kind != "argument" and arguments(coordinate) <= arguments(candidate[0]):
-                replacement = replace_coordinate(terms, *candidate)
-        if replacement is None:
-            replacement = replace_coordinate(terms, coordinate, lower, upper)
-        if replacement is not None:
-            current = replacement
-    if nonnegative(current, facts):
-        return True
-    seen = set()
-    for _ in range(len(domains) + 2):
-        if nonnegative(expr, facts):
-            return True
-        if expr in seen:
-            return False
-        seen.add(expr)
-        expr = interval(expr, domains, facts)[0]
-    return False
+    premises = tuple(
+        test
+        for coordinate, lower, upper in domains
+        for test in (Comparison(coordinate, ">=", lower), Comparison(coordinate, "<=", upper))
+    )
+    return query_service(facts).implies(Comparison(expr, ">=", literal(0)), premises).proved
 
 
 def check_axis(origin, width, extent, domains, facts):

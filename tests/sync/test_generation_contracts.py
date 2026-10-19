@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from ascendflow.analysis.queue_order import establish_queue_order
+from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_protocols import NotificationKind
 from ascendflow.analysis.structured_schedule import Placement, SyncAction
 from ascendflow.diagnostics import CompileError
@@ -146,7 +147,9 @@ def parent_credit():
 def test_physical_cell_credit_spans_child_and_parent_invocations(parent_credit, count):
     assert parent_credit.generation.channels
     assert not parent_credit.generation.order.root.ports
-    result = check_structured_events(parent_credit.memory, {"n": count}, invocations=2)
+    result = check_structured_events(
+        collect_native_memory(parent_credit.module), {"n": count}, invocations=2
+    )
     assert len(result.natives) == count * 8
 
 

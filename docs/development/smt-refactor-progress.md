@@ -253,3 +253,45 @@ Bool/Int 查询，不将空域上的中间相等关系当作后续决策。原�
 `owned-terminal-isolation-01/build.log`：修改保留的逻辑 native scalar 和地址，
 禁止再查询逻辑坐标与分析入口，终端 ASC 仍保持相同。未将这两组外推为全量
 或设备资格；真实默认 FA 的冷构建与 CANN 继续验证。
+
+## 原式索引符号查询与本轮资格
+
+提交 `15660ff` 建立层级顺序和一致释放集合；`3d48f12` 接通独立终端边界。
+其默认 FA 的单次冷进程 source→ASC 为 20.7260 秒；完整 CANN shared 构建
+27.0610 秒，通过。ASC SHA256 为
+`32f038551fae0d07ccf4b9fb96c7764afff97f093db6e9deb2e283f7a8f240ae`，
+SO 为 `78fd5a9bed736574e3433b094054cacbd408751b9cfd9fc3b6bc56b77c690dd0`。
+最终通知从此前 127 条降为 117 条。来源分别为 `owned-fa-executable-01` 和
+`owned-fa-executable-cann-01`；不是五次冷进程资格。
+
+`owned-fa-executable-device-01/device.json` 对该库通过物理卡 2 的两组全输出
+数值检查，Sq:Sk 为 256:1024、768:3072，最大绝对误差分别为 3.05176e-5、
+1.52588e-5。运行前检查了全部八卡；它们均健康空闲，进程显式映射物理 2
+到逻辑 0。记录中的 stream interval 不称作 kernel 性能。
+
+终端 packet 改为完整 guard 建成后归一化一次；判断互斥只问一次共存性，
+不为其所有中间条件再次消元。`owned-complete-packet-domains-01` 的 100 项
+通过；该改动单次 FA 仍为 20.7569 秒，没有明显提速。
+
+实际函数级诊断见 `owned-fa-current-profile-01/compile.prof`，仅用于归因。
+索引符号与词法域内的非负性改为统一 SMT 查询，删除约 140 行手写余数界、
+min/max 搜索和相关坐标消元；原始除法准入与实际区间构造保留。原式定义性
+不能借数学非负性免除。`owned-index-signs-01` 的 146 项通过。
+`owned-fa-index-signs-01` 的当前单次冷进程 source→ASC 为 19.4165 秒，bounds
+从前一 probe 的 1.8606 秒降至 0.7851 秒；未达到 p50≤5/max≤10 的目标。
+ASC SHA256 为 `1e0823709660afbabdc8033b8fb6423a1148701dbd953a994aaa9490a10f46d4`，
+本节上述 CANN/设备结果属于前一 ASC，不能代替该新产物的资格。
+
+不将全部索引构造直接换成裸 SMT：独立诊断中，两个动态基数的完整 divmod
+重组在单查询 2 秒下为 unknown。没有扩大时限、将 unknown 当安全或恢复第二
+求解路径；用于实际 index/slot 构造的有界规范化暂时保留，后续仍需收敛。
+
+完整回归按目录分组推进。已执行部分发现的旧 `result.memory` 测试接口已改为
+显式逻辑 facts 或重新收集真实终端 IR，50 项迁移回归通过。watchdog 自测必须
+在不套另一层 command watchdog 的进程运行，其 24 项独立通过；CLI 本地 helper
+导入用例也独立通过。此前外层 watchdog 造成的拒绝不算编译器缺陷，也未修改
+产品的 deadline 保护来迁就测试。尚有公开示例清单缺少 KDA 和 scalar_store 的
+真实集成问题，正在补全；没有将全量宣称通过。
+
+当前 core source 为 87 个模块、27,225 行，比审计基线增加 195 行。局部旧推理
+主体已删除，整个编译器的大幅净简化、P2/P3 剩余收敛及完整 P6 仍未完成。
