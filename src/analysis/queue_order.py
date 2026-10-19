@@ -248,9 +248,11 @@ class _OrderConstruction:
             for ancestor in self.chains[region][:-1]:
                 ordinal = self.control.loops[ancestor].ordinal
                 actual = substitute(coordinates[ancestor], translations)
-                difference = self.domains.arithmetic.normalize(expression("sub", actual, ordinal))
-                if difference.constant is not None:
-                    translations[ordinal] = expression("sub", ordinal, difference)
+                difference = self.domains.arithmetic.exact_constant(
+                    expression("sub", actual, ordinal)
+                )
+                if difference is not None:
+                    translations[ordinal] = expression("sub", ordinal, literal(difference))
                 elif self.control.invariant_over(actual, ancestor):
                     restrictions.append(Comparison(ordinal, "==", actual))
                 else:
@@ -348,9 +350,10 @@ class _OrderConstruction:
         self.work["publication_checks"] += 1
         a, at = self._time(source, region)
         b, bt = self._time(wait, region)
-        delta = self.domains.arithmetic.normalize(expression("sub", b, a))
-        if delta.constant is not None and delta.constant >= 0:
-            return int(delta.constant > 0)
+        delta = expression("sub", b, a)
+        constant = self.domains.arithmetic.exact_constant(delta)
+        if constant is not None and constant >= 0:
+            return int(constant > 0)
         tests = at + bt
         if not self._possible(tests):
             return None
@@ -383,13 +386,13 @@ class _OrderConstruction:
                     self._boundary_time(wait, region),
                     self._boundary_time(source, region),
                 )
-                delta = self.domains.arithmetic.normalize(expression("sub", b, a))
-                if (
-                    delta.constant is not None
-                    and (delta.constant < 0 if lexical else delta.constant <= 0)
-                ) or (bh is not None and al is not None and (bh < al if lexical else bh <= al)):
+                delta = expression("sub", b, a)
+                constant = self.domains.arithmetic.exact_constant(delta)
+                if (constant is not None and (constant < 0 if lexical else constant <= 0)) or (
+                    bh is not None and al is not None and (bh < al if lexical else bh <= al)
+                ):
                     return None
-                if (delta.constant is not None and delta.constant > 0) or (
+                if (constant is not None and constant > 0) or (
                     bl is not None and ah is not None and bl > ah
                 ):
                     return 1

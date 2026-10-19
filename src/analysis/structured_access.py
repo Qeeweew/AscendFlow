@@ -15,9 +15,17 @@ from types import MappingProxyType
 
 from xdsl.ir import Operation
 
-from ..diagnostics import CompileError, require
+from ..diagnostics import require
 from ..dialects.physical import TaskOp
-from ..indexing import arguments, equivalent, interval, nonnegative, normalize, polynomial
+from ..indexing import (
+    arguments,
+    equivalent,
+    exact_constant,
+    interval,
+    nonnegative,
+    normalize_or_identity,
+    polynomial,
+)
 from ..scalar import Expr, expression, infer, literal, substitute
 from ..target.ascend910b import Actor
 from .native import AccessMode
@@ -85,18 +93,6 @@ class _Projection:
     conditions: tuple[Guard, ...] = ()
     contracted: tuple[Operation, ...] = ()
     coordinates: tuple[tuple[Operation, Expr], ...] = ()
-
-
-def _normalize(value, facts):
-    # Declared uniform multiples can give the proof polynomial rational
-    # coefficients (e.g. Sq/128). Keep its original exact quotient DAG when
-    # that polynomial cannot be reconstructed with integer coefficients.
-    try:
-        return normalize(value, facts)
-    except CompileError as error:
-        if error.message != "runtime address retains a fractional coefficient":
-            raise
-        return value
 
 
 def _count_core(value, facts):
@@ -211,7 +207,7 @@ class _Partitioner:
                     anchor = value
                     high = rectangle.widths[axis]
                 else:
-                    displacement = _normalize(expression("sub", value, anchor), self.facts).constant
+                    displacement = exact_constant(expression("sub", value, anchor), self.facts)
                     if displacement is None:
                         valid = False
                         break
@@ -301,7 +297,7 @@ class _Partitioner:
         shifted = substitute(
             numerator, {inner.ordinal: expression("add", inner.ordinal, literal(1))}
         )
-        delta = _normalize(expression("sub", shifted, numerator), self.facts).constant
+        delta = exact_constant(expression("sub", shifted, numerator), self.facts)
         if delta != 1 or len(active) != 2:
             return None
         base = substitute(numerator, {inner.ordinal: literal(0)})
@@ -329,12 +325,12 @@ class _Partitioner:
                         base,
                         {
                             inner.count: literal(count),
-                            _normalize(inner.count, self.facts): literal(count),
+                            normalize_or_identity(inner.count, self.facts): literal(count),
                             _count_core(inner.count, self.facts): literal(count),
                             outer.ordinal: literal(parent_residue),
                         },
                     )
-                    concrete = _normalize(concrete, self.facts)
+                    concrete = normalize_or_identity(concrete, self.facts)
                     if concrete.constant is None:
                         return None
                     visits = [j for j in range(count) if (concrete.constant + j) % period == slot]
@@ -364,7 +360,7 @@ class _Partitioner:
         for loop in reversed(template.frame.loops()):
             if not _depends(offset, loop.ordinal) or _period(offset, loop.ordinal) is not None:
                 continue
-            count = _normalize(loop.count, self.facts).constant
+            count = exact_constant(loop.count, self.facts)
             if count is None and access.mode is AccessMode.READ:
                 # A bounded dense reader prefix has a fixed spatial union,
                 # but retirement still ranges over its actual loop.count.
@@ -377,7 +373,7 @@ class _Partitioner:
             shifted = substitute(
                 offset, {loop.ordinal: expression("add", loop.ordinal, literal(1))}
             )
-            delta = _normalize(expression("sub", shifted, offset), self.facts).constant
+            delta = exact_constant(expression("sub", shifted, offset), self.facts)
             if delta == geometry.nbytes and (
                 geometry.rows == 1 or geometry.nbytes * count <= geometry.row_stride
             ):
@@ -405,7 +401,7 @@ class _Partitioner:
                 continue
             period = _period(offset, loop.ordinal)
             if period is None:
-                count = _normalize(loop.count, self.facts).constant
+                count = exact_constant(loop.count, self.facts)
                 capacity = address.root.owner.nbytes.data
                 # This is the image of a physical address coordinate, bounded
                 # by declared storage, not enumeration of native loop tasks.
@@ -433,14 +429,14 @@ class _Partitioner:
                 loop.ordinal: literal(residue)
                 for (loop, _), residue in zip(choices, residues, strict=True)
             }
-            value = _normalize(substitute(offset, substitution), self.facts)
+            value = normalize_or_identity(substitute(offset, substitution), self.facts)
             constant = polynomial(value, self.facts).get((), 0)
             require(
                 constant.denominator == 1 if hasattr(constant, "denominator") else True,
                 "cell displacement must be integral",
             )
             constant = int(constant)
-            origin = _normalize(expression("sub", value, literal(constant)), self.facts)
+            origin = normalize_or_identity(expression("sub", value, literal(constant)), self.facts)
             key = tuple(sorted(polynomial(origin, self.facts).items(), key=repr))
             origin = self._origin_pool.setdefault(key, origin)
             domains = (
@@ -541,7 +537,7 @@ class _Partitioner:
                 shifted = substitute(
                     origin, {loop.ordinal: expression("add", loop.ordinal, literal(1))}
                 )
-                delta = _normalize(expression("sub", shifted, origin), self.facts)
+                delta = normalize_or_identity(expression("sub", shifted, origin), self.facts)
                 span = max(p.stop + (p.rows - 1) * p.row_stride for p in projections) - min(
                     p.start for p in projections
                 )

@@ -18,7 +18,7 @@ from xdsl.utils.exceptions import VerifyException
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.structured import AddressOp
-from ..indexing import check_axis, equivalent, normalize
+from ..indexing import check_axis, equivalent, exact_constant, normalize
 from ..scalar import Expr, Fact, expression, from_ssa, literal
 from ..target.native import ITEMSIZE, NativeGeometry
 
@@ -52,7 +52,7 @@ def nd_rectangle(offset, geometry, axes, facts):
         or axes.displacement != 0
     ):
         return None
-    extents = tuple(normalize(value, facts).constant for value in axes.extents)
+    extents = tuple(exact_constant(value, facts) for value in axes.extents)
     widths = axes.widths
     if any(
         width <= 0 or size is None or size < width

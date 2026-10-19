@@ -83,7 +83,7 @@ def test_default_and_explicit_empty_bounds_use_one_core_result(monkeypatch):
     assert queries._context(()).tests == ()
 
 
-@pytest.mark.parametrize("query", ("bounds", "prove"))
+@pytest.mark.parametrize("query", ("bounds",))
 def test_recursion_reuses_one_owned_context_without_reentering_public_tuple_api(monkeypatch, query):
     queries = IntegerFacts({})
     premises = (Comparison(X, ">=", literal(1)),)
@@ -131,7 +131,7 @@ def test_recursive_bounds_keys_do_not_hash_any_premise_comparison(monkeypatch, s
     assert hashes == 0
 
 
-@pytest.mark.parametrize("query,method", (("bounds", "infer"), ("prove", "bounded")))
+@pytest.mark.parametrize("query,method", (("bounds", "infer"),))
 def test_failed_core_queries_are_retried_and_never_cached_as_unknown(monkeypatch, query, method):
     queries = IntegerFacts({})
     original = getattr(queries, method)
@@ -214,38 +214,12 @@ def test_derived_constructions_are_reused_across_distinct_ordered_premises(monke
 
     monkeypatch.setattr(integer_facts, "expression", observed)
     assert queries.prove(test, (lower,))
-    constraint = queries._constraint(test)
     difference = queries._difference(X, threshold)
-    assert len(constructions) == 2
+    assert len(constructions) == 1
     for premises in ((lower,), (lower, extra), (extra, lower)):
         assert queries.prove(test, premises)
-        assert queries._constraint(Comparison(X, ">", literal(2))) is constraint
         assert queries._difference(X, literal(2)) is difference
-    assert len(constructions) == 2
-
-
-def test_constraint_keeps_the_raw_factor_and_unsigned_domain_without_reduction(monkeypatch):
-    queries = IntegerFacts({})
-    numerator = expression("sub", X, literal(1))
-    remainder = Expr("rem", (numerator, literal(1)))
-    factor = Expr("add", (remainder, Y))
-    value = expression("mul", numerator, factor)
-    test = Comparison(value, ">", literal(0))
-    expected = expression("sub", value, literal(1))
-
-    def no_reduction(*args):
-        pytest.fail("a raw constraint performed integer reduction")
-
-    monkeypatch.setattr(queries, "bounded", no_reduction)
-    monkeypatch.setattr(queries, "normalize", no_reduction)
-    constraint = queries._constraint(test)
-    assert constraint == expected and value in constraint.args
-    assert any(arg is numerator for arg in value.args)
-    assert any(arg is factor for arg in value.args)
-    assert factor.args[0] is remainder and remainder.args[0] is numerator
-    with pytest.raises(CompileError, match="nonnegative numerator"):
-        constraint.evaluate({"x": 0, "y": 2})
-    assert constraint.evaluate({"x": 3, "y": 2}) == 3
+    assert len(constructions) == 1
 
 
 def test_difference_uses_exactly_one_bounded_raw_subtraction_layer(monkeypatch):
@@ -293,16 +267,13 @@ def test_derived_queries_keep_raw_structural_keys_and_do_not_cross_fact_owners(m
     assert constructions == [safe, unsafe]
     assert large._difference(safe, zero) == literal(0)
     assert constructions == [safe, unsafe, safe]
-    for value in (safe, unsafe):
-        constraint = small._constraint(Comparison(value, ">=", zero))
-        assert constraint is value
     assert small.ordered_definedness((Comparison(unsafe, "==", zero),)) == (
         Comparison(unsafe.args[0], ">=", zero),
         (),
     )
 
 
-@pytest.mark.parametrize("method", ("_constraint", "_difference"))
+@pytest.mark.parametrize("method", ("_difference",))
 def test_derived_construction_failures_are_retried_without_a_cached_answer(monkeypatch, method):
     queries = IntegerFacts({})
     zero = literal(0)

@@ -14,6 +14,7 @@ from math import gcd, lcm
 from xdsl.dialects import arith
 
 from ..analysis.access_frontier import LoopResidueSelection, QueueEndpoint, ResiduePosition
+from ..analysis.hazards import HazardKind
 from ..analysis.integer_facts import IntegerFacts
 from ..analysis.structured_dependencies import StructuredDependencies
 from ..analysis.structured_dispatch import StructuredDispatch
@@ -34,6 +35,7 @@ from ..analysis.structured_regions import (
     BranchGuard,
     LoopCountGuard,
     LoopOrdinalGuard,
+    StorageCell,
 )
 from ..analysis.structured_schedule import ActionGuard, Comparison, Placement
 from ..diagnostics import CompileError, ErrorKind, require
@@ -864,11 +866,34 @@ def _notification_prefixes(notifications, order):
         if item.mechanism not in {NotificationKind.CROSS_EVENT, NotificationKind.LOCAL_EVENT}:
             selected.append(item)
             continue
+        # A binary release credit follows one physical ownership word through
+        # its inner iterations and selected boundary fragments. Combining
+        # unrelated releases here changes that word's identity: an aggregate
+        # boundary can no longer reuse its existing per-cell credit. Preserve
+        # the same physical keys consumed by construct_cell_channels. RAW
+        # capture coverage and cross-participant quorum keep their own rules.
+        release = (
+            tuple(
+                (
+                    origin.cell.physical_key
+                    if isinstance(origin.cell, StorageCell)
+                    else origin.cell,
+                    origin.kind,
+                    origin.source.participant,
+                    origin.consumer.participant,
+                )
+                for origin in item.origins
+            )
+            if item.mechanism is NotificationKind.LOCAL_EVENT
+            and any(origin.kind is not HazardKind.RAW for origin in item.origins)
+            else ()
+        )
         key = (
             item.mechanism,
             item.source_engine,
             item.destination_engine,
             _domain_key(item),
+            release,
             tuple(
                 phase(p, local=item.mechanism is NotificationKind.LOCAL_EVENT)
                 for p in sorted(item.sources, key=lambda p: p.actor.value)

@@ -224,10 +224,7 @@ class EventDomains:
                     self.work.binding_roundtrips += 1
                     ordinal = self.control.loops[loop].ordinal
                     restored = substitute(bound.expression(ordinal), bindings)
-                    if (
-                        self.arithmetic.normalize(expression("sub", restored, ordinal)).constant
-                        != 0
-                    ):
+                    if self.arithmetic.exact_constant(expression("sub", restored, ordinal)) != 0:
                         self.fail(
                             notification,
                             "endpoint coordinates and inverse binding do not round-trip",
@@ -299,7 +296,7 @@ class EventDomains:
         bindings = {self.control.loops[loop].ordinal: value for loop, value in bound.coordinates}
         restored = case.specialize(substitute(bound.expression(event), bindings))
         event = case.specialize(event)
-        if self.arithmetic.normalize(expression("sub", restored, event)).constant != 0:
+        if self.arithmetic.exact_constant(expression("sub", restored, event)) != 0:
             self.fail(
                 assignment.notification,
                 "event ID does not round-trip through the actual endpoint coordinates",

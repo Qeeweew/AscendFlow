@@ -55,3 +55,16 @@ def poll(phase, **counts):
             f"compilation {reason} at {phase}" + (f" ({detail})" if detail else ""),
             kind=ErrorKind.ANALYSIS_LIMIT,
         )
+
+
+def remaining(phase):
+    """Seconds left in the enclosing compilation before its hard deadline.
+
+    ``None`` when no limit is active. Query services use this to bound a single
+    solver call by the same deadline as the operator build; a local time limit
+    must never outlive the process group's overall budget.
+    """
+    budget = _active.get()
+    if budget is None:
+        return None
+    return max(0.0, budget.deadline - perf_counter())

@@ -15,7 +15,7 @@ from math import gcd, lcm
 from xdsl.ir import Operation
 
 from ..diagnostics import CompileError, ErrorKind, require
-from ..indexing import arguments, normalize
+from ..indexing import arguments, normalize_integral, normalize_or_identity
 from ..scalar import INT64_MAX, Expr, Fact, expression, literal, substitute
 from .periodic import evaluate_comparison_at, period_of
 from .structured_protocols import LogicalNotification
@@ -287,15 +287,6 @@ def _guard(tests):
     )
 
 
-def _normal(value, facts):
-    try:
-        return normalize(value, facts)
-    except CompileError as error:
-        if error.message != "runtime address retains a fractional coefficient":
-            raise
-        return value
-
-
 def _difference_mod(a, b, period):
     """Canonical (a-b) mod p for 0<=a<p and 0<=b<=p, with safe sums."""
     if period == 1:
@@ -364,7 +355,9 @@ class _Builder:
         self.actual = tuple(dict.fromkeys(actual))
         self.lower, self.count = (
             literal(0),
-            literal(0) if inactive else _normal(substitute(count, self.parameter_bindings), facts),
+            literal(0)
+            if inactive
+            else normalize_or_identity(substitute(count, self.parameter_bindings), facts),
         )
         self.period, self.residues, self.single = 1, (literal(0),), False
         self.residue_work = 0
@@ -387,7 +380,8 @@ class _Builder:
         )
 
     def constant(self, value):
-        return _normal(value, self.facts)
+        """The exactly integral normalization, or ``None`` for a fraction term."""
+        return normalize_integral(value, self.facts)
 
     def limit(self, condition, message):
         if not condition:
@@ -408,6 +402,8 @@ class _Builder:
 
     def linear(self, value):
         value = self.constant(value)
+        if value is None:
+            return None
         if self.invariant(value):
             return 0, value
         if value == self.ordinal:
@@ -415,13 +411,15 @@ class _Builder:
         if value.kind == "add":
             a, b = (self.linear(child) for child in value.args)
             if a is not None and b is not None:
-                return a[0] + b[0], self.constant(expression("add", a[1], b[1]))
+                constant = self.constant(expression("add", a[1], b[1]))
+                if constant is not None:
+                    return a[0] + b[0], constant
         if value.kind == "mul":
             for scalar, other in (value.args, tuple(reversed(value.args))):
                 if scalar.constant is not None and (part := self.linear(other)) is not None:
-                    return part[0] * scalar.constant, self.constant(
-                        expression("mul", scalar, part[1])
-                    )
+                    constant = self.constant(expression("mul", scalar, part[1]))
+                    if constant is not None:
+                        return part[0] * scalar.constant, constant
         return None
 
     def add_invariant(self, test):

@@ -4,15 +4,20 @@ An answer is reused only for the same expression and complete ordered premise
 sequence. Ordered definedness checks validate unsigned operands before other
 queries consume a guard's relations; no query establishes completion or ownership.
 Tables die with this analysis, never live in process-global memoized methods.
+
+Non-trivial relations between original expressions are decided by
+:class:`~ascendflow.analysis.smt.IntegerQueryService`, which encodes the raw DAG
+under the same complete premises. Bounds stay a cheap interval view of the same
+environment; they never replace the query service nor act as a proof.
 """
 
 from dataclasses import dataclass
 from functools import cache, wraps
 from types import MappingProxyType
 
-from ..diagnostics import CompileError
-from ..indexing import AtomIdentity, normalize
+from ..indexing import AtomIdentity, exact_constant, normalize_integral
 from ..scalar import DIVISION, Expr, expression, infer, literal
+from .smt import IntegerQueryService
 from .structured_schedule import Comparison
 
 _OPPOSITE = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
@@ -32,15 +37,6 @@ def _query(method):
         return answer
 
     return query
-
-
-def normalize_integer(value, facts, *, identity):
-    try:
-        return normalize(value, facts, identity=identity)
-    except CompileError as error:
-        if error.message != "runtime address retains a fractional coefficient":
-            raise
-        return value
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -64,6 +60,14 @@ class IntegerFacts:
         self._atom_identity = AtomIdentity()
         self._premise_owner = object()
         self._contexts: dict[tuple[Comparison, ...], _PremiseContext] = {}
+        self._queries: IntegerQueryService | None = None
+
+    @property
+    def queries(self):
+        """The single mathematical decision procedure for this environment."""
+        if self._queries is None:
+            self._queries = IntegerQueryService(self._facts)
+        return self._queries
 
     @property
     def facts(self):
@@ -83,24 +87,25 @@ class IntegerFacts:
             raise ValueError("integer premise context belongs to another owner")
 
     @_query
-    def _constraint(self, test):
-        """Retain the original factored predicate, without integer reduction."""
-        if test.predicate in {">", ">="}:
-            value = expression("sub", test.lhs, test.rhs)
-            return expression("sub", value, literal(int(test.predicate == ">")))
-        if test.predicate in {"<", "<="}:
-            value = expression("sub", test.rhs, test.lhs)
-            return expression("sub", value, literal(int(test.predicate == "<")))
-        return None
-
-    @_query
     def _difference(self, lhs, rhs):
         """Construct and bound one operand difference in this facts owner."""
         return self.bounded(expression("sub", lhs, rhs))
 
     @_query
     def normalize(self, value):
-        return normalize_integer(value, self.facts, identity=self._atom_identity)
+        """Best-effort ring-normal form; a non-integral form keeps ``value``.
+
+        The normalized spelling is a convenience for callers that compare or
+        rebuild coordinates. It is not a proof and it never invents a quotient:
+        when the declared multiples make a term rational, the original
+        expression is returned and callers query relations explicitly.
+        """
+        return normalize_integral(value, self.facts, identity=self._atom_identity) or value
+
+    @_query
+    def exact_constant(self, value):
+        """The exact integer value of one normalized expression, or ``None``."""
+        return exact_constant(value, self.facts, identity=self._atom_identity)
 
     @_query
     def infer(self, value):
@@ -118,15 +123,11 @@ class IntegerFacts:
         """
 
         def proved(test, prefix):
-            try:
-                return self.prove(test, prefix)
-            except CompileError as error:
-                if error.message != "index divisor must be provably positive and uniform":
-                    raise
-                # Polynomial normalization cannot use a prefix-only dynamic
-                # divisor fact. This query remains unproved, never a reason
-                # to skip a later expression or accept a missing operand fact.
-                return False
+            # One query service decides the premise. A premise that cannot be
+            # proved in its own ordered prefix stays unproved; it is never a
+            # reason to skip a later expression or accept a missing operand
+            # fact.
+            return self.prove(test, prefix)
 
         def check(value, prefix, completed):
             identity = id(value)
@@ -253,7 +254,7 @@ class IntegerFacts:
             if test.rhs.constant is not None and (
                 value.kind == "argument" or self.bounded(test.lhs) == self.bounded(value)
             ):
-                offset = self.normalize(self._difference(test.lhs, value)).constant
+                offset = self.exact_constant(self._difference(test.lhs, value))
                 if offset is None:
                     continue
                 bound = test.rhs.constant - offset
@@ -337,62 +338,8 @@ class IntegerFacts:
 
     @_query
     def _prove(self, test, context: _PremiseContext):
+        """Answered by the shared query service under this exact premise tuple."""
         self._check_context(context)
-        assumptions = context.tests
-        if test in assumptions:
+        if test in context.tests:
             return True
-        difference = self._difference(test.lhs, test.rhs)
-        if difference.constant is not None:
-            return Comparison(difference, test.predicate, literal(0)).evaluate({})
-        constraint = self._constraint(test)
-        if constraint is not None:
-            lower, _ = self._bounds(constraint, context)
-            if lower is not None and lower >= 0:
-                return True
-        difference = self.normalize(difference)
-        if difference.constant is not None:
-            return Comparison(difference, test.predicate, literal(0)).evaluate({})
-        if test.predicate in {"==", "!="}:
-            for prior in assumptions:
-                if (
-                    prior.predicate == test.predicate
-                    and self.normalize(
-                        expression(
-                            "sub",
-                            self._difference(prior.lhs, prior.rhs),
-                            difference,
-                        )
-                    ).constant
-                    == 0
-                ):
-                    return True
-            if test.predicate == "!=":
-                lower, upper = self._bounds(difference, context)
-                return lower is not None and lower > 0 or upper is not None and upper < 0
-            return self._prove(Comparison(test.lhs, ">=", test.rhs), context) and self._prove(
-                Comparison(test.lhs, "<=", test.rhs), context
-            )
-        term = self.bounded(self._constraint(test))
-        for prior in assumptions:
-            if prior.predicate == "==":
-                # An exact relation supplies both nonnegative directions.
-                # Retain its operand difference so affine translations and
-                # reversed comparisons cancel in the ordinary integer ring.
-                constraints = (
-                    self._difference(prior.lhs, prior.rhs),
-                    self._difference(prior.rhs, prior.lhs),
-                )
-            else:
-                constraint = self._constraint(prior)
-                constraints = () if constraint is None else (constraint,)
-            for constraint in constraints:
-                remainder = self._difference(term, constraint)
-                if remainder.constant is not None:
-                    if remainder.constant >= 0:
-                        return True
-                    continue
-                bound, _ = self._bounds(remainder, context)
-                if bound is not None and bound >= 0:
-                    return True
-        lower, _ = self._bounds(term, context)
-        return lower is not None and lower >= 0
+        return self.queries.implies(test, context.tests).proved

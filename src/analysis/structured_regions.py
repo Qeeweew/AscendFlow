@@ -123,6 +123,19 @@ class StorageCell:
     def participant(self):
         return self.private
 
+    @property
+    def physical_key(self):
+        """Storage identity; activation and lifetime admission remain separate."""
+        return (
+            self.root,
+            self.private,
+            self.origin,
+            self.start,
+            self.stop,
+            self.rows,
+            self.row_stride,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class AliasRegion:

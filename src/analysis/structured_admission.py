@@ -22,6 +22,7 @@ from ..indexing import (
     arguments,
     domain_nonnegative,
     equivalent,
+    exact_constant,
     interval,
     nonnegative,
     normalize,
@@ -339,7 +340,7 @@ def _covers(spans, read, frame, facts, work):
             # Its holes are not reads and need no initializer. Only accept
             # an exact, constant translation after common origins cancel;
             # every selected row and column must stay inside the writer.
-            shift = normalize(expression("sub", read.base, candidate.base), facts).constant
+            shift = exact_constant(expression("sub", read.base, candidate.base), facts)
             width = candidate.width.constant
             needed_width = read.width.constant
             if shift is not None and width is not None and needed_width is not None and shift >= 0:
@@ -360,7 +361,7 @@ def _covers(spans, read, frame, facts, work):
         for candidate in spans:
             if candidate.width.constant is None:
                 continue
-            delta = normalize(expression("sub", candidate.base, anchor.base), facts).constant
+            delta = exact_constant(expression("sub", candidate.base, anchor.base), facts)
             if delta is None:
                 continue
             intervals.extend(

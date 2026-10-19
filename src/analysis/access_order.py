@@ -17,13 +17,13 @@ from xdsl.dialects import arith, scf
 from xdsl.ir import Operation
 
 from ..diagnostics import require
-from ..indexing import nonnegative
+from ..indexing import nonnegative, normalize_or_identity
 from ..scalar import Expr, expression, literal, substitute
 from .access_frontier import AccessEndpoint, LoopResidueSelection, QueueEndpoint, ResiduePosition
 from .guard_cover import opposite
 from .hazards import HazardKind
 from .integer_facts import IntegerFacts
-from .region_coordinates import RegionCoordinates, normalize_coordinate
+from .region_coordinates import RegionCoordinates
 from .structured_access import PartitionedAccesses, partition_accesses
 from .structured_memory import NativeMemoryFacts
 from .structured_regions import (
@@ -363,7 +363,7 @@ class _Builder:
                     return True
                 test = condition.read
                 lhs, rhs = (
-                    normalize_coordinate(substitute(v, bindings), self.facts)
+                    normalize_or_identity(substitute(v, bindings), self.facts)
                     for v in (test.lhs, test.rhs)
                 )
                 if (
@@ -496,7 +496,7 @@ class _Builder:
         )
         for edge in word.adjacencies:
             source, consumer = packets[edge.source.key], packets[edge.consumer.key]
-            delta = normalize_coordinate(
+            delta = normalize_or_identity(
                 expression("sub", edge.consumer.ordinal, edge.source.ordinal), self.facts
             ).constant
             require(delta is not None, "packet adjacency lost its generation distance")
@@ -530,7 +530,7 @@ class _Builder:
             cells = self._native(operation)
         elif (
             operation in self.memory.control.loops
-            and normalize_coordinate(
+            and normalize_or_identity(
                 self.memory.control.loops[operation].count, self.facts
             ).constant
             == 0

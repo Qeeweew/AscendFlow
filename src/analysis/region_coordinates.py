@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ..diagnostics import CompileError, require
-from ..indexing import normalize
+from ..diagnostics import require
+from ..indexing import normalize_or_identity
 from ..scalar import Expr, expression, infer, literal, substitute
 from .access_frontier import LoopResidueSelection, ResiduePosition
 from .structured_regions import (
@@ -22,18 +22,6 @@ from .structured_regions import (
     StructuredNeed,
 )
 from .structured_schedule import Comparison
-
-
-def normalize_coordinate(value, facts):
-    # Declared uniform multiples can give the proof polynomial rational
-    # coefficients (e.g. Sq/128). Keep its original exact quotient DAG when
-    # that polynomial cannot be reconstructed with integer coefficients.
-    try:
-        return normalize(value, facts)
-    except CompileError as error:
-        if error.message != "runtime address retains a fractional coefficient":
-            raise
-        return value
 
 
 class RegionCoordinates:
@@ -60,7 +48,7 @@ class RegionCoordinates:
         guards = []
         for guard in (guard for group in groups for guard in group):
             if isinstance(guard, LoopCountGuard):
-                count = normalize_coordinate(guard.count, self.facts)
+                count = normalize_or_identity(guard.count, self.facts)
                 bounds = infer(count, self.facts)
                 threshold = (
                     literal(guard.threshold) if type(guard.threshold) is int else guard.threshold
@@ -126,7 +114,9 @@ class RegionCoordinates:
                             return None
             elif isinstance(guard, LoopOrdinalGuard):
                 test = guard.comparison
-                difference = normalize_coordinate(expression("sub", test.lhs, test.rhs), self.facts)
+                difference = normalize_or_identity(
+                    expression("sub", test.lhs, test.rhs), self.facts
+                )
                 if difference.constant is not None:
                     if not Comparison(difference, test.predicate, literal(0)).evaluate({}):
                         return None
@@ -237,7 +227,7 @@ class RegionCoordinates:
                             literal(candidate.ordinal.constant + 1),
                         )
                     if distance is None:
-                        distance = normalize_coordinate(
+                        distance = normalize_or_identity(
                             expression("sub", candidate.ordinal, source.bindings[-1].ordinal),
                             self.facts,
                         ).constant

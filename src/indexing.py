@@ -12,7 +12,7 @@ from fractions import Fraction
 from itertools import product
 
 from .diagnostics import CompileError, require
-from .scalar import Expr, expression, literal
+from .scalar import DIVISION, Expr, expression, literal
 
 MAX_TERMS = 256
 MAX_WORK = 16384
@@ -66,6 +66,13 @@ def _multiple(atom, facts):
 
 
 def _integral(polynomial, facts):
+    """Whether a term's *value* is integral under declared input multiples.
+
+    This relaxation lets equality queries cancel a quotient against its
+    numerator (``4*(n//4) == n`` for ``n % 4 == 0``). The rational coefficient is
+    a proof-form artifact only: it is never rebuilt into an executable
+    expression, which requires :func:`_exact_integers` instead.
+    """
     for term, coefficient in polynomial.items():
         value = coefficient
         for atom in term:
@@ -76,7 +83,14 @@ def _integral(polynomial, facts):
 
 
 def _to_expr(polynomial):
-    """Reconstruct only integral coefficients; proof fractions stay internal."""
+    """Rebuild one executable expression from an *integral* proof polynomial.
+
+    Rational coefficients are a property of the proof representation, not of
+    the program: the executable DAG keeps the original quotient atoms. A caller
+    that only has a rational form must keep the original expression (or ask the
+    query service for the relation it needs) instead of reconstructing a new
+    product/division DAG here.
+    """
     result = literal(0)
     for term, coefficient in sorted(
         polynomial.items(), key=lambda item: tuple(atom.order_key for atom in item[0])
@@ -191,8 +205,13 @@ class _PolynomialQuery:
         keys=False,
         memo=None,
         work=None,
+        opaque_quotients=False,
     ):
         self.facts, self.periodic = facts, periodic
+        # A relation between quotient *atoms* is weaker and therefore safe; it
+        # is what a caller wants when it must name the original quotient in an
+        # executable expression instead of expanding it over declared multiples.
+        self.opaque_quotients = opaque_quotients
         self.identity = AtomIdentity() if identity is None else identity
         self.retained, self.keys = retained, keys
         self.memo = {} if memo is None else memo
@@ -227,7 +246,7 @@ class _PolynomialQuery:
                 ),
             )
             result = _sum(a, b) if expr.kind == "add" else _product(a, b)
-        elif self.retained:
+        elif self.retained or self.opaque_quotients and expr.kind in DIVISION:
             result = {(self.atom(expr),): 1}
         elif expr.kind in {"floordiv", "rem"}:
             numerator, divisor = expr.args
@@ -302,8 +321,60 @@ def equivalent(a, b, facts):
     return query.visit(a) == query.visit(b)
 
 
+def _exact_integers(polynomial):
+    return all(coefficient.denominator == 1 for coefficient in polynomial.values())
+
+
 def normalize(expr, facts, *, identity=None):
+    """Ring-normalize one expression that stays integral over the integers.
+
+    A declared input multiple can make a rational proof coefficient denote an
+    integer value, but the executable DAG then has no quotient term to name it.
+    Such a case keeps the original expression at its caller instead of a new
+    product/division DAG; see :func:`normalize_integral`.
+    """
     return _to_expr(_PolynomialQuery(facts, identity=identity).visit(expr))
+
+
+def normalize_integral(expr, facts, *, identity=None):
+    """Rebuild a normalized expression, or ``None`` when it is not integral.
+
+    A caller that can proceed with less information (for example a window
+    reduction that only wants its clock-invariant part) must not turn a
+    fractional proof coefficient into an exception, and must never receive a
+    fabricated integer.
+    """
+    polynomial = _PolynomialQuery(facts, identity=identity).visit(expr)
+    if not _exact_integers(polynomial):
+        return None
+    return _to_expr(polynomial)
+
+
+def normalize_or_identity(expr, facts, *, identity=None):
+    """Best-effort ring normalization that keeps the original when it cannot.
+
+    Some captures legitimately have a rational proof coefficient because of a
+    declared input multiple. Such a caller needs a canonical spelling *or* the
+    untouched syntax, never an invented quotient and never a string-matched
+    exception path. Both outcomes stay unproved expressions; every non-trivial
+    relation is asked through the query service.
+    """
+    integral = normalize_integral(expr, facts, identity=identity)
+    return expr if integral is None else integral
+
+
+def exact_constant(expr, facts, *, identity=None):
+    """The exact integer value of a normalized expression, or ``None``.
+
+    Callers that only ask whether two coordinates differ by a constant must not
+    force a full executable reconstruction: a term whose coefficient is only
+    integral under an input multiple is still not a constant.
+    """
+    polynomial = _PolynomialQuery(facts, identity=identity).visit(expr)
+    if any(term for term in polynomial):
+        return None
+    value = polynomial.get((), 0)
+    return int(value) if value.denominator == 1 else None
 
 
 def arguments(expr):
@@ -398,13 +469,16 @@ def nonnegative(expr, facts):
     return False
 
 
-def _joint_affine_interval(expr, domains, facts, *, atomic=False):
+def _joint_affine_interval(expr, domains, facts, *, atomic=False, queries=None):
     """Recover a proved joint coordinate after ordinary polynomial expansion.
 
     A captured address may spell ``tile*core + tile*groups*query`` rather
     than ``tile*(core + groups*query)``. Independent intervals lose the
     owner/query correlation. Use an exact polynomial identity with a positive
-    constant scale and a uniform bias; never infer a new iteration domain.
+    or negative constant scale and an integral uniform bias; never infer a new
+    iteration domain. Every returned bound is additionally proved as an
+    implication of the coordinate's own domain by the shared query service, so
+    the concrete integer DAG is never trusted from algebra alone.
     """
     candidates = [
         (coordinate, lower, upper)
@@ -422,7 +496,7 @@ def _joint_affine_interval(expr, domains, facts, *, atomic=False):
             if any(name.startswith("$") for atom in term for name in arguments(atom))
         }
 
-    query = _PolynomialQuery(facts)
+    query = _PolynomialQuery(facts, opaque_quotients=True)
     top = query.visit(expr)
     left = varying(top)
     if not left:
@@ -438,14 +512,40 @@ def _joint_affine_interval(expr, domains, facts, *, atomic=False):
         (ratio,) = ratios
         if ratio == 0 or ratio.denominator != 1:
             continue
-        bias = _to_expr(_sum(top, _scale(bottom, -ratio)))
+        remainder = _sum(top, _scale(bottom, -ratio))
+        if not _exact_integers(remainder):
+            continue
+        bias = _to_expr(remainder)
         scale = literal(int(ratio))
         selected = (lower, upper) if ratio > 0 else (upper, lower)
-        return tuple(expression("add", expression("mul", scale, bound), bias) for bound in selected)
+        bounds = tuple(
+            expression("add", expression("mul", scale, bound), bias) for bound in selected
+        )
+        if queries is not None and not _bounds_hold(
+            expr, bounds, coordinate, lower, upper, queries
+        ):
+            return None
+        return bounds
     return None
 
 
-def interval(expr, domains, facts):
+def _bounds_hold(expr, bounds, coordinate, lower, upper, queries):
+    """Ask the shared query service whether the joint bounds are implied.
+
+    The coordinate's own lexical domain is the only premise; no new iteration
+    domain and no expression's own legality is assumed.
+    """
+    from .analysis.structured_schedule import Comparison
+
+    premises = (Comparison(coordinate, ">=", lower), Comparison(coordinate, "<=", upper))
+    low, high = bounds
+    return (
+        queries.implies(Comparison(expr, ">=", low), premises).proved
+        and queries.implies(Comparison(expr, "<=", high), premises).proved
+    )
+
+
+def interval(expr, domains, facts, *, queries=None):
     """Inclusive symbolic range on an active loop iteration.
 
     Each domain entry is (expression, lower, upper). It can describe a joint
@@ -462,7 +562,7 @@ def interval(expr, domains, facts):
             )
     if matched is not None:
         return matched
-    correlated = _joint_affine_interval(expr, domains, facts)
+    correlated = _joint_affine_interval(expr, domains, facts, queries=queries)
     if correlated is not None:
         return correlated
     if expr.kind in {"constant", "argument"}:

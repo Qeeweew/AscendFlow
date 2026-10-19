@@ -25,11 +25,6 @@ class CellChannel:
     members: tuple
 
 
-def _cell_key(cell):
-    # Activation is checked on the members, not part of physical identity.
-    return (cell.root, cell.private, cell.origin, cell.start, cell.stop, cell.rows, cell.row_stride)
-
-
 def owns_stable_cell(notification, control, common_clocks):
     """Whether physical lifetime induction replaces an ordinal/ring window.
 
@@ -133,7 +128,7 @@ def construct_cell_channels(domains):
         key = (
             tuple(
                 (
-                    _cell_key(n.cell),
+                    n.cell.physical_key,
                     n.kind,
                     n.source.participant,
                     n.consumer.participant,

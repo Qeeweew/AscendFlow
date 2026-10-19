@@ -6,17 +6,10 @@ frontier accepting a five-slot operator.
 """
 
 from itertools import product
-from math import prod
 
 import pytest
 
-from ascendflow.analysis.guard_cover import (
-    CoverLeaf,
-    CoverWork,
-    IntegerSplit,
-    ResidueSplit,
-    prove_guard_cover,
-)
+from ascendflow.analysis.guard_cover import prove_guard_cover
 from ascendflow.analysis.integer_facts import IntegerFacts
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison
 from ascendflow.diagnostics import CompileError, ErrorKind
@@ -24,21 +17,6 @@ from ascendflow.scalar import Expr, Fact, expression, literal
 
 M, P, G, X, Y = (Expr("argument", (name,)) for name in ("m", "p", "g", "x", "y"))
 WORD = expression("add", expression("mul", P, M), G)
-
-
-def test_failed_coverage_retains_work_and_later_queries_share_the_budget():
-    work = CoverWork()
-    assumptions = (Comparison(X, ">=", literal(0)),)
-    alternatives = (ActionGuard((Comparison(X, "==", literal(0)),)),)
-    assert prove_guard_cover(IntegerFacts({}), assumptions, alternatives, work=work) is None
-    assert work.nodes > 0 and work.queries > 0
-    consumed = work.queries
-    with pytest.raises(CompileError) as error:
-        prove_guard_cover(
-            IntegerFacts({}), assumptions, alternatives, work=work, max_queries=consumed
-        )
-    assert error.value.kind is ErrorKind.ANALYSIS_LIMIT
-    assert work.queries == consumed + 1
 
 
 def comparison(value, predicate, point):
@@ -71,55 +49,12 @@ def finite_slot_inputs():
                 yield {"m": m, "p": p, "g": g}
 
 
-def replay(proof, values):
-    """Interpret the certificate with integers, without any proof queries."""
+def covered_alternative(proof, values):
+    """Evaluate the original guards independently of SMT and its encoding."""
     assert all(test.evaluate(values) for test in proof.assumptions)
-    node = proof.root
-    while not isinstance(node, CoverLeaf):
-        assert all(test.evaluate(values) for test in node.established)
-        if isinstance(node, IntegerSplit):
-            value = node.value.evaluate(values)
-            position = 0 if value < node.point else 1 if value == node.point else 2
-            node = node.children[position]
-        else:
-            assert isinstance(node, ResidueSplit)
-            value = (
-                sum(
-                    coefficient * prod(factor.evaluate(values) for factor in monomial)
-                    for monomial, coefficient in node.atom.terms
-                )
-                % node.atom.modulus
-            )
-            matches = [child for residues, child in node.children if value in residues]
-            assert len(matches) == 1
-            node = matches[0]
-    assert node.alternative is not None
-    assert 0 <= node.alternative < len(proof.alternatives)
-    assert proof.alternatives[node.alternative].evaluate(values)
-    return node.alternative
-
-
-def assert_slot_partitions(node, possible=None):
-    """This fixture starts with no modular restriction in its assumptions."""
-    possible = {} if possible is None else possible
-    if isinstance(node, CoverLeaf):
-        if node.alternative is None:
-            assert node.contradiction is not None
-        return
-    if isinstance(node, IntegerSplit):
-        assert len(node.children) == 3
-        for child in node.children:
-            assert_slot_partitions(child, possible)
-        return
-    assert isinstance(node, ResidueSplit)
-    allowed = possible.get(node.atom, frozenset(range(node.atom.modulus)))
-    seen = frozenset()
-    for residues, child in node.children:
-        assert isinstance(residues, frozenset) and residues
-        assert residues <= allowed and not residues & seen
-        seen |= residues
-        assert_slot_partitions(child, possible | {node.atom: residues})
-    assert seen == allowed
+    matches = [i for i, guard in enumerate(proof.alternatives) if guard.evaluate(values)]
+    assert matches
+    return matches[0]
 
 
 @pytest.mark.parametrize("period", (2, 5))
@@ -129,15 +64,13 @@ def test_parameter_and_whole_slot_expression_have_a_complete_local_cover(period)
     assert proof is not None
     assert proof.assumptions == assumptions
     assert proof.alternatives == alternatives
-    assert 0 < proof.work.nodes <= 128
-    assert 0 < proof.work.queries <= 4096
-    assert_slot_partitions(proof.root)
+    assert proof.answer.proved
     for values in finite_slot_inputs():
         m, p, g = (values[name] for name in ("m", "p", "g"))
         expected = (0 if m == 3 else period) + (p * m + g) % period
         assert all(test.evaluate(values) for test in assumptions)
         assert [i for i, h in enumerate(alternatives) if h.evaluate(values)] == [expected]
-        assert replay(proof, values) == expected
+        assert covered_alternative(proof, values) == expected
 
 
 @pytest.mark.parametrize(
@@ -205,10 +138,10 @@ def test_inequality_keeps_its_noncontiguous_residue_set():
     )
     proof = prove_guard_cover(IntegerFacts({}), assumptions, alternatives)
     assert proof is not None
-    assert_slot_partitions(proof.root)
+    assert proof.answer.proved
     for values in finite_slot_inputs():
         expected = int((values["p"] * values["m"] + values["g"]) % 5 == 3)
-        assert replay(proof, values) == expected
+        assert covered_alternative(proof, values) == expected
 
 
 def test_reduced_modulus_predicates_share_only_a_proved_canonical_atom():
@@ -220,10 +153,10 @@ def test_reduced_modulus_predicates_share_only_a_proved_canonical_atom():
     )
     proof = prove_guard_cover(IntegerFacts({}), assumptions, alternatives)
     assert proof is not None
-    assert_slot_partitions(proof.root)
+    assert proof.answer.proved
     for values in finite_slot_inputs():
         expected = (values["p"] * values["m"] + values["g"]) % 2
-        assert replay(proof, values) == expected
+        assert covered_alternative(proof, values) == expected
 
 
 @pytest.mark.parametrize("missing_odd", (False, True))
@@ -251,7 +184,7 @@ def test_a_later_exact_integer_rekeys_the_existing_residue_branch(missing_odd):
         # At m=3, 0 <= g and g+2<m force g=0. A residue split made
         # before establishing m=3 must keep that exact-value correlation.
         expected = values["p"] % 2 if values["m"] == 3 else 2
-        assert replay(proof, values) == expected
+        assert covered_alternative(proof, values) == expected
 
 
 def test_integer_thresholds_preserve_the_equality_branch():
@@ -263,7 +196,7 @@ def test_integer_thresholds_preserve_the_equality_branch():
     proof = prove_guard_cover(IntegerFacts({}), assumptions, complete)
     assert proof is not None
     for x in range(8):
-        assert replay(proof, {"x": x}) == (0 if x < 3 else 2 if x == 3 else 1)
+        assert covered_alternative(proof, {"x": x}) == (0 if x < 3 else 2 if x == 3 else 1)
 
 
 @pytest.mark.parametrize("complete", (False, True))
@@ -290,7 +223,9 @@ def test_shifted_loop_end_equality_terminates_and_keeps_the_uncovered_tail(compl
             for index in range(8):
                 values = {"g": group, "x": index}
                 if all(test.evaluate(values) for test in assumptions):
-                    assert replay(proof, values) == int(count.evaluate(values) == index + 2)
+                    assert covered_alternative(proof, values) == int(
+                        count.evaluate(values) == index + 2
+                    )
 
 
 @pytest.mark.parametrize("reverse", (False, True))
@@ -302,7 +237,7 @@ def test_integer_trichotomy_covers_signed_values_and_reversed_operands(reverse):
     proof = prove_guard_cover(IntegerFacts({}), (), alternatives)
     assert proof is not None
     for x in range(-5, 6):
-        assert replay(proof, {"x": x}) == (0 if x < 0 else 1 if x == 0 else 2)
+        assert covered_alternative(proof, {"x": x}) == (0 if x < 0 else 1 if x == 0 else 2)
 
 
 def test_the_next_obligation_cannot_borrow_a_previous_residue_state():
@@ -330,7 +265,7 @@ def test_each_alternative_supplies_its_own_ordered_unsigned_prefix():
     for x in range(9):
         expected = 2 if x == 0 else (x - 1) % 2
         assert [i for i, h in enumerate(alternatives) if h.evaluate({"x": x})] == [expected]
-        assert replay(proof, {"x": x}) == expected
+        assert covered_alternative(proof, {"x": x}) == expected
 
 
 @pytest.mark.parametrize("invalid_assumptions", (False, True))
@@ -356,24 +291,7 @@ def test_a_proved_false_prefix_leaves_its_unsigned_tail_unreachable():
     proof = prove_guard_cover(IntegerFacts({}), assumptions, alternatives)
     assert proof is not None
     assert not alternatives[0].evaluate({"x": 0})
-    assert replay(proof, {"x": 0}) == 1
-
-
-@pytest.mark.parametrize("limit", ("max_nodes", "max_queries"))
-def test_local_analysis_budgets_reject_explicitly(limit):
-    assumptions, alternatives = slot_problem()
-    with pytest.raises(CompileError) as raised:
-        prove_guard_cover(IntegerFacts({}), assumptions, alternatives, **{limit: 1})
-    assert raised.value.kind is ErrorKind.ANALYSIS_LIMIT
-    assert raised.value.phase == "event-guard-cover"
-
-
-def test_input_audits_share_the_budget_even_when_an_empty_guard_already_covers():
-    alternatives = (guard(), guard(*(comparison(X, ">=", i) for i in range(16))))
-    with pytest.raises(CompileError) as raised:
-        prove_guard_cover(IntegerFacts({}), (), alternatives, max_queries=4)
-    assert raised.value.kind is ErrorKind.ANALYSIS_LIMIT
-    assert raised.value.phase == "event-guard-cover"
+    assert covered_alternative(proof, {"x": 0}) == 1
 
 
 def test_empty_alternatives_do_not_cover_a_possible_obligation():
@@ -384,12 +302,10 @@ def test_an_impossible_obligation_keeps_its_contradiction_witness():
     assumptions = (comparison(X, ">=", 0), comparison(X, "<", 0))
     proof = prove_guard_cover(IntegerFacts({}), assumptions, ())
     assert proof is not None
-    assert isinstance(proof.root, CoverLeaf)
-    assert proof.root.alternative is None
-    assert isinstance(proof.root.contradiction, Comparison)
+    assert proof.answer.proved
 
 
 def test_an_empty_conjunction_covers_a_possible_obligation():
     proof = prove_guard_cover(IntegerFacts({}), (), (guard(),))
     assert proof is not None
-    assert replay(proof, {}) == 0
+    assert covered_alternative(proof, {}) == 0

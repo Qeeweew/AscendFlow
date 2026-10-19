@@ -66,6 +66,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `frontend/`、`dialects/source.py`、`language.py` | TileLang 风格 AST、typed source、逻辑 Tile 和显式 buffer |
 | `passes/lower_pipeline.py`、`lower_native.py`、`native_recipes.py`、`native_addresses.py` | 参数化控制及 native recipe；尚未建立异步完成 |
 | `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/footprint/effects、目标 native 合同 |
+| `analysis/smt.py`、`integer_facts.py`、`guard_cover.py` | 原式数学关系与条件覆盖共用 Z3 查询；定义性和机器范围独立，输入环境与完整前提限定缓存 |
 | `analysis/structured_bounds.py`、`structured_admission.py`、`structured_host.py` | bounds、外部别名、实际存储实例、初始化、借用 Tile 及整数范围前提；group/peer 独立性属于源程序合同 |
 | `analysis/structured_access.py`、`structured_regions.py` | 可选精确 cell 与可能别名的 AliasRegion；保留实际 native 访问，不将 may-write 当完整定义 |
 | `analysis/access_order.py`、`storage_packets.py`、`storage_word.py`、`structured_dependencies.py` | 可能冲突的 RAW/WAR/WAW、条件访问的并集、共同队列端口、局部完整 packet 的实际复用 |
@@ -89,6 +90,11 @@ build_file                               # 同一链路 + CANN，单次进程组
 `structured_event_sharing` 已被删除，测试不保留旧 solver。历史源码通过 Git
 追溯，不另建 legacy 或转发别名。纯整数查询仍负责真实前提，不能以删除所有
 `prove` 调用代替重构。
+
+局部 WAR/WAW 通知前缀保留 `StorageCell.physical_key` 对应的 ownership 集合，
+使循环内及 FIRST/LAST 边界继续属于同一 credit。RAW 的覆盖合并与跨参与者
+quorum 保持各自合同。手写 guard coverage 搜索及其专用 `modular.py` 已删除；
+最终 SSA 两个优化 pass 尚待接入统一查询，不能视作本次收敛已全部完成。
 
 算法和政策在 `examples/`；测量及独立 AscendC/ACLNN 在 `benchmarks/`。
 

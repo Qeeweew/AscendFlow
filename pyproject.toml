@@ -7,7 +7,7 @@ name = "ascendflow"
 version = "0.1.0"
 description = "AscendFlow: an Ascend 910B pipeline compiler with automatic synchronization, built on xDSL"
 requires-python = ">=3.11"
-dependencies = ["xdsl==0.73.0"]
+dependencies = ["xdsl==0.73.0", "z3-solver==4.15.4.0"]
 
 [project.optional-dependencies]
 validation = ["numpy>=2,<3"]

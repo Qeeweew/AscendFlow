@@ -12,6 +12,7 @@ from xdsl.dialects.builtin import IndexType
 from ..diagnostics import ErrorKind, require
 from ..indexing import _joint_affine_interval, arguments, nonnegative
 from ..scalar import Expr, expression, literal, positive
+from .smt import IntegerQueryService
 
 
 def _require(condition, message, operation, *, kind=ErrorKind.UNSUPPORTED, witness=()):
@@ -38,6 +39,7 @@ class _HostRanges:
 
     def __init__(self, domains, facts):
         self.domains, self.facts, self.ranges = domains, facts, {}
+        self.queries = IntegerQueryService(facts)
         for coordinate, lower, upper in domains:
             self.ranges.setdefault(coordinate, (lower, upper))
 
@@ -51,7 +53,9 @@ class _HostRanges:
             return value, value
         if value.kind in {"constant", "argument"}:
             return value, value  # Unknown scalar carries remain unbounded.
-        joint = _joint_affine_interval(value, self.domains, self.facts, atomic=True)
+        joint = _joint_affine_interval(
+            value, self.domains, self.facts, atomic=True, queries=self.queries
+        )
         if joint is not None:
             return joint
         a, b = value.args

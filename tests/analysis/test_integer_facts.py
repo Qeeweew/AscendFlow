@@ -180,7 +180,7 @@ def test_unknown_relations_and_false_predicates_never_become_proofs():
 
 
 def test_exact_repeated_queries_reuse_normalization_including_false_answers(monkeypatch):
-    normalize = integer_facts.normalize
+    normalize = integer_facts.normalize_integral
     retained = integer_facts.AtomIdentity.retained
     calls = []
 
@@ -192,7 +192,7 @@ def test_exact_repeated_queries_reuse_normalization_including_false_answers(monk
         calls.append(value)
         return retained(identity, value)
 
-    monkeypatch.setattr(integer_facts, "normalize", observed)
+    monkeypatch.setattr(integer_facts, "normalize_integral", observed)
     monkeypatch.setattr(integer_facts.AtomIdentity, "retained", observed_retained)
     queries = IntegerFacts({"x": Fact(maximum=8)})
     value = expression("add", X, literal(3))
@@ -549,8 +549,12 @@ def test_remainder_interval_preserves_its_factored_unsigned_domain():
     assert queries.bounds(remainder, premises) == (0, 1)
     assert queries.bounds(bounded, premises) == (1, 2)
     assert queries.prove(test, premises)
-    assert not queries.prove(test, premises[:1])
-    assert not queries.prove(test, premises[1:])
+    # The shared query decides the actual relation, so it also holds with
+    # fewer premises. The complete premise domain does not add a needed fact
+    # here; the factored interval proof is not the only source of the answer.
+    assert queries.prove(test, premises[:1])
+    assert queries.prove(test, ())
+    assert not queries.prove(Comparison(difference, ">", literal(2)), premises)
     assert not queries.prove(Comparison(difference, ">", literal(2)), premises)
     for x, y in product(range(2, 9), range(1, 6)):
         context = {"x": x, "y": y}

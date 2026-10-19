@@ -18,7 +18,7 @@ from xdsl.ir import SSAValue
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import BufferOp, MixedOp
-from ..indexing import domain_nonnegative, equivalent, normalize, polynomial
+from ..indexing import domain_nonnegative, equivalent, exact_constant, polynomial
 from ..scalar import Expr, Fact, expression, infer, literal
 from ..target.ascend910b import Actor, Engine
 from ..target.native import CAPACITY, ITEMSIZE, nz_columns
@@ -73,7 +73,7 @@ def _multiple_of(value: Expr, alignment: int, facts: Mapping[str, Fact]) -> bool
 def _nonnegative(value, facts, operation, message, *, witness=(), domains=()):
     if domain_nonnegative(value, domains, facts):
         return
-    constant = normalize(value, facts).constant
+    constant = exact_constant(value, facts)
     _require(
         False,
         message,
@@ -195,7 +195,7 @@ def _original_view(address: AddressFacts, facts):
         stride = expression("mul", stride, extent)
     expected = expression("add", base, literal(axes.displacement))
     if not equivalent(address.offset, expected, facts):
-        difference = normalize(expression("sub", address.offset, expected), facts).constant
+        difference = exact_constant(expression("sub", address.offset, expected), facts)
         _require(
             False,
             "address offset does not match original-axis linearization and displacement",
@@ -221,7 +221,7 @@ def _original_view(address: AddressFacts, facts):
     rows, pitch = 1, 0
     if len(selected) == 2:
         rows = axes.widths[selected[0]]
-        pitch = normalize(strides[selected[0]], facts).constant
+        pitch = exact_constant(strides[selected[0]], facts)
         _require(
             pitch is not None and pitch >= width,
             "original view row pitch needs a static non-overlapping byte stride",
@@ -231,7 +231,7 @@ def _original_view(address: AddressFacts, facts):
         assert pitch is not None
     if geometry.layout != "linear":
         rank = len(axes.origins)
-        extents = tuple(normalize(extent, facts).constant for extent in axes.extents[-2:])
+        extents = tuple(exact_constant(extent, facts) for extent in axes.extents[-2:])
         column_slice = geometry.bank == "L1" and geometry.layout == "NZ"
         _require(
             rank >= 2
