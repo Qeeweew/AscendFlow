@@ -12,7 +12,7 @@ from statistics import mean
 
 from ascendflow.diagnostics import require
 from ascendflow.runtime.process import bounded_process
-from benchmarks.kda.prefill import GRAM_PHASES, KERNELS
+from benchmarks.kda.prefill import KERNELS
 from benchmarks.kda.run import digest
 
 
@@ -91,18 +91,9 @@ def summarize(directory, metrics="BasicInfo"):
     if set(record["results"]) == {"ascendflow"}:
         rows = [row for row in rows if row["name"].startswith("prefill_")]
         config = record["configuration"]
-        slabs = (
-            len(config["lengths"]) * config["chunks_per_sequence"] * config["heads"]
-            + config.get("gram_slab_tasks", 1)
-            - 1
-        ) // config.get("gram_slab_tasks", 1)
         require(
             sorted(row["name"] for row in rows)
-            == sorted(
-                KERNELS.get(p, "prefill_" + p)
-                for p in config["phases"]
-                for _ in range(slabs if p in GRAM_PHASES else 1)
-            ),
+            == sorted(KERNELS.get(p, "prefill_" + p) for p in config["phases"]),
             "prefill phase launch multiplicities differ",
         )
     else:

@@ -20,30 +20,19 @@ from ascendflow.runtime.process import bounded_process
 from benchmarks.kda.reference import load_reference
 from benchmarks.kda.run import digest, error_metrics
 
-GRAM_SLAB = 512
-GRAM_PHASES = ("gram_prepare", "gram_dot16", "gram_dot32", "gram_dot48", "gram_store")
+GRAM_PACK = 16
 PHASES = (
     "prepare_full",
     "prepare",
     "gram",
-    *GRAM_PHASES,
+    "gram_cross",
     "solve_merge16",
     "solve_merge32",
     "transform",
     "wu",
     "scan",
 )
-KERNELS = {
-    p: "prefill_"
-    + (
-        "solve_merge"
-        if p.startswith("solve_merge")
-        else "gram_dot"
-        if p.startswith("gram_dot")
-        else p
-    )
-    for p in PHASES
-}
+KERNELS = {p: "prefill_" + ("solve_merge" if p.startswith("solve_merge") else p) for p in PHASES}
 RUNTIME_PHASES = {"prepare_full", "prepare", "scan"}
 ORDERS = {
     "prepare": (
@@ -61,8 +50,19 @@ ORDERS = {
         "Lengths",
     ),
     "gram": ("Qp", "Kp", "Gp", "Bp", "Aqk", "Diagonal", "Ai32", "Lengths"),
-    "gram_prepare": ("Qp", "Kp", "Gp", "GramLeft", "GramRight"),
-    "gram_store": ("GramScore", "Bp", "Negative", "Aqk", "Lengths"),
+    "gram_cross": (
+        "Qp",
+        "Kp",
+        "Gp",
+        "Bp",
+        "Negative",
+        "Aqk",
+        "Lengths",
+        "GramLeft",
+        "GramRight",
+        "GramSmall",
+        "GramLarge",
+    ),
     "solve_merge16": ("Negative", "Diagonal", "Merge16", "Ai32", "Inverse"),
     "solve_merge32": ("Negative", "Ai32", "Merge32", "Off32", "Inverse"),
     "transform": ("Qp", "Kp", "Vp", "Gp", "Bp", "Right", "KG", "QG", "Lengths"),
@@ -90,16 +90,13 @@ ORDERS = {
     ),
 }
 ORDERS["prepare_full"] = ORDERS["prepare"]
-for _phase in GRAM_PHASES[1:4]:
-    ORDERS[_phase] = ("GramLeft", "GramRight", "GramScore")
 MERGE_ABI = ("Negative", "Blocks", "Merge", "Off", "Inverse")
 
 
-def gram_slab_tasks(chunks, heads):
-    # Complete chunk batches avoid partially populated Cube workspaces.
-    # The 512-task budget bounds the three FP32 planes to 54 MiB.
-    require(0 < heads <= GRAM_SLAB, "Gram slab needs at most 512 heads")
-    return heads * gcd(chunks, GRAM_SLAB // heads)
+def gram_pack_tasks(chunks, heads):
+    pack = gcd(chunks * heads, GRAM_PACK)
+    require(pack > 0, "cross Gram requires nonempty task cohorts")
+    return pack
 
 
 def oracle(host, lengths):
@@ -132,7 +129,7 @@ def build(args):
         "scan currently requires the same nonzero chunk count per sequence",
     )
     parameters = {"CHUNKS": nc * len(args.lengths), "H": args.heads, "DTYPE": args.dtype}
-    slab_tasks = gram_slab_tasks(parameters["CHUNKS"], args.heads)
+    pack_tasks = gram_pack_tasks(parameters["CHUNKS"], args.heads)
     for phase in args.phases:
         print(f"build prefill_{phase}", flush=True)
         options = parameters | (
@@ -142,17 +139,15 @@ def build(args):
         )
         if phase.startswith("solve_merge"):
             options["WIDTH"] = int(phase[-2:])
-        if phase in GRAM_PHASES:
-            options["SLAB"] = slab_tasks
-        if phase.startswith("gram_dot"):
-            options["PANEL"] = int(phase.removeprefix("gram_dot")) // 16
+        if phase == "gram_cross":
+            options["PACK"] = pack_tasks
         build_file(
             Path(__file__).resolve().parents[2]
             / (
                 "examples/kda/prefill_prepare.py"
                 if phase == "prepare_full"
                 else "examples/kda/prefill_gram.py"
-                if phase in GRAM_PHASES
+                if phase == "gram_cross"
                 else "examples/kda/prefill_solve.py"
                 if phase.startswith("solve")
                 else "examples/kda/prefill.py"
@@ -177,7 +172,7 @@ def build(args):
                 "chunks_per_sequence": nc,
                 "parameters": parameters,
                 "phases": PHASES,
-                "gram_slab_tasks": slab_tasks,
+                "gram_pack_tasks": pack_tasks,
                 "artifacts": identity,
             },
             indent=2,
@@ -188,7 +183,7 @@ def build(args):
 
 def validate_artifacts(directory, heads, dtype, chunks, sequences):
     identity = {}
-    slab_tasks = gram_slab_tasks(chunks, heads)
+    pack_tasks = gram_pack_tasks(chunks, heads)
     for phase in PHASES:
         path = directory / phase
         source = parse((path / "source.xdsl").read_text())
@@ -199,27 +194,25 @@ def validate_artifacts(directory, heads, dtype, chunks, sequences):
         }
         expected_abi = MERGE_ABI if phase.startswith("solve_merge") else ORDERS[phase]
         require(tuple(buffers) == expected_abi, f"{phase} library ABI differs")
-        if not phase.startswith("gram_dot"):
-            primary = (
-                buffers["Qp"]
-                if "Qp" in buffers
-                else buffers["Negative"]
-                if phase == "gram_store"
-                else buffers["Inverse"]
-                if phase.startswith("solve_merge") or phase == "wu"
-                else buffers["WU"]
-            )
-            require(
-                primary.shape.data[0].data == chunks
-                and primary.shape.data[1].data == heads
-                and primary.dtype.data == ("f32" if phase == "gram_store" else dtype),
-                f"{phase} specialization differs",
-            )
-        if phase in GRAM_PHASES:
+        primary = (
+            buffers["Qp"]
+            if "Qp" in buffers
+            else buffers["Inverse"]
+            if phase.startswith("solve_merge") or phase == "wu"
+            else buffers["WU"]
+        )
+        require(
+            primary.shape.data[0].data == chunks
+            and primary.shape.data[1].data == heads
+            and primary.dtype.data == dtype,
+            f"{phase} specialization differs",
+        )
+        if phase == "gram_cross":
             shapes = {
-                "GramLeft": (slab_tasks, 3, 32, 128),
-                "GramRight": (slab_tasks, 96, 128),
-                "GramScore": (slab_tasks, 32, 96),
+                "GramLeft": (20, 2, pack_tasks, 128, 128),
+                "GramRight": (20, 2, pack_tasks, 64, 128),
+                "GramSmall": (20, 2, pack_tasks, 2, 32, 16),
+                "GramLarge": (20, 2, pack_tasks, 64, 32),
             }
             require(
                 all(
@@ -228,16 +221,17 @@ def validate_artifacts(directory, heads, dtype, chunks, sequences):
                     for name, shape in shapes.items()
                     if name in buffers
                 ),
-                "Gram L2 workspace differs from the runner",
+                "Gram ring workspace differs from the runner",
             )
-            if phase.startswith("gram_dot"):
-                width = int(phase.removeprefix("gram_dot"))
-                operands = [
-                    tuple(d.data for d in op.ref.type.shape.data)
-                    for op in source.walk()
-                    if isinstance(op, AllocationOp) and op.ref.type.memory.data == "L0B"
-                ]
-                require(operands == [(128, width)], "Gram panel specialization differs")
+            operands = [
+                tuple(d.data for d in op.ref.type.shape.data)
+                for op in source.walk()
+                if isinstance(op, AllocationOp) and op.ref.type.memory.data == "L0B"
+            ]
+            require(
+                operands == [(128, width) for width in (16, 32)],
+                "Gram panel specialization differs",
+            )
         if phase == "scan":
             require(
                 buffers["Initial"].shape.data[0].data == sequences, "scan sequence count differs"
@@ -303,8 +297,8 @@ def worker(args):
     lengths = config["lengths"]
     tokens, batch, heads, dimension = sum(lengths), len(lengths), config["heads"], 128
     chunks, bt = batch * config["chunks_per_sequence"], 64
-    slab_tasks = gram_slab_tasks(chunks, heads)
-    require(config["gram_slab_tasks"] == slab_tasks, "Gram slab policy differs")
+    pack_tasks = gram_pack_tasks(chunks, heads)
+    require(config["gram_pack_tasks"] == pack_tasks, "Gram cohort policy differs")
     dtype = {"f16": torch.float16, "bf16": torch.bfloat16}[config["dtype"]]
     generator = torch.Generator().manual_seed(42)
     host = {
@@ -353,9 +347,10 @@ def worker(args):
         workspace(name, (chunks, heads, 2, bt, dimension), dtype)
     workspace("Snapshot", (chunks, heads, dimension, dimension), dtype)
     workspace("Delta", (chunks, heads, dimension, dimension), torch.float32)
-    workspace("GramLeft", (slab_tasks, 3, 32, dimension), torch.float32)
-    workspace("GramRight", (slab_tasks, 96, dimension), torch.float32)
-    workspace("GramScore", (slab_tasks, 32, 96), torch.float32)
+    workspace("GramLeft", (20, 2, pack_tasks, 128, dimension), torch.float32)
+    workspace("GramRight", (20, 2, pack_tasks, 64, dimension), torch.float32)
+    workspace("GramSmall", (20, 2, pack_tasks, 2, 32, 16), torch.float32)
+    workspace("GramLarge", (20, 2, pack_tasks, 64, 32), torch.float32)
     for name in ("History", "Final"):
         workspace(name, (batch, heads, dimension, dimension), torch.float32)
     workspace("Output", (tokens, heads, dimension), dtype)
@@ -374,9 +369,7 @@ def worker(args):
         libraries.append(library)
         launch = getattr(library, "launch_" + kernel)
         launch.argtypes = [ct.c_void_p] * (len(ORDERS[phase]) + 1) + (
-            [ct.c_int64]
-            if phase in RUNTIME_PHASES or phase in {"gram_prepare", "gram_store"}
-            else []
+            [ct.c_int64] if phase in RUNTIME_PHASES else []
         )
         launch.restype = ct.c_int
         launchers[phase] = launch
@@ -387,14 +380,8 @@ def worker(args):
             "commands": manifest["commands"],
         }
 
-    def launch_phase(phase, slab=0):
-        runtime = (
-            [tokens]
-            if phase in RUNTIME_PHASES
-            else [slab]
-            if phase in {"gram_prepare", "gram_store"}
-            else []
-        )
+    def launch_phase(phase):
+        runtime = [tokens] if phase in RUNTIME_PHASES else []
         require(
             launchers[phase](
                 stream.npu_stream, *(device[n].data_ptr() for n in ORDERS[phase]), *runtime
@@ -408,12 +395,7 @@ def worker(args):
 
     def generated():
         for phase in PHASES:
-            if phase == GRAM_PHASES[0]:
-                for slab in range(chunks * heads // slab_tasks):
-                    for gram_phase in GRAM_PHASES:
-                        launch_phase(gram_phase, slab)
-            elif phase not in GRAM_PHASES:
-                launch_phase(phase)
+            launch_phase(phase)
         return device["Output"], device["Final"]
 
     functions, reference = {"ascendflow": generated}, None

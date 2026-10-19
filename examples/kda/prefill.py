@@ -125,6 +125,7 @@ def prefill_gram(
         weighted = N.alloc_ub((16, K), N.f32)
         gates = N.alloc_ub((16, K), N.f32)
         decay = N.alloc_ub((16, K), N.f32)
+        steps = N.alloc_ub((16, K), N.f32)
         product = N.alloc_ub((16, K), N.f32)
         zeros = N.alloc_ub((BT, BT), N.f32)
         rows = N.alloc_ub((16, 8), N.f32)
@@ -173,6 +174,11 @@ def prefill_gram(
                 N.copy(Qp[chunk, head, block : block + 16, :], keys16)
                 N.cast(keys16, out=queries)
                 N.copy(Gp[chunk, head, block : block + 16, :], gates)
+                N.fill(steps[0, :], 1.0)
+                N.mul(gates[:15, :], -1.0, out=steps[1:16, :])
+                N.add(steps[1:16, :], gates[1:16, :], out=steps[1:16, :])
+                N.exp(steps[1:16, :], out=steps[1:16, :])
+                N.copy(keys, decay)
                 N.fill(diagonal, 0.0)
                 N.fill(attention, 0.0)
                 # Four causal prefixes avoid evaluating most upper-triangle
@@ -180,13 +186,14 @@ def prefill_gram(
                 for quarter in N.unroll(4):
                     extent = (quarter + 1) * 4
                     for local in N.serial(quarter * 4, N.min(extent, N.max(0, valid - block))):
-                        gate_row = gates[local, :]
                         key_row = weighted[local, :]
                         query_row = queries[local, :]
-                        N.mul(gates[:extent, :], -1.0, out=decay[:extent, :])
-                        N.add(decay[:extent, :], gate_row[None, :], out=decay[:extent, :])
-                        N.exp(decay[:extent, :], out=decay[:extent, :])
-                        N.mul(decay[:extent, :], keys[:extent, :], out=decay[:extent, :])
+                        step_row = steps[local, :]
+                        # Carry k_j * exp(G_i-G_j) forward one row. Each
+                        # diagonal resets to k_i; upper entries are discarded
+                        # by the final masks after both score reductions.
+                        N.mul(decay[:extent, :], step_row[None, :], out=decay[:extent, :])
+                        N.copy(keys[local, :], decay[local, :])
                         N.mul(decay[:extent, :], key_row[None, :], out=product[:extent, :])
                         N.reduce_sum(
                             product[:extent, :],
