@@ -226,7 +226,7 @@ def test_compound_slot_short_and_long_children_preserve_actual_byte_values(width
     assert plan.dependencies.work.cells <= 2 * width**2
     child = next(
         loop
-        for loop, logical in plan.memory.control.loops.items()
+        for loop, logical in plan.admission.memory.control.loops.items()
         if logical.count.kind == "argument" and logical.count.args[0].name == "k"
     )
     long_cells = [

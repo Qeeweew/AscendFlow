@@ -22,9 +22,8 @@ from ..dialects.structured import (
 )
 
 
-def lower_execution(memory, facts):
-    uses = ScalarUses(memory, metadata=True)
-    module = memory.module
+def lower_execution(module, natives, facts):
+    uses = ScalarUses(module, natives, metadata=True)
     root = module.body.block.first_op
 
     def remap(value, bindings):

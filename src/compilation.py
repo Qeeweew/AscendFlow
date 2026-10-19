@@ -109,7 +109,7 @@ class Compilation:
                     "environments": plan.integer_queries,
                 },
             },
-            "native_templates": len(plan.memory.templates),
+            "native_templates": len(plan.executable.natives),
             "required_dependencies": len(plan.dependencies.required),
             "selected_protocols": len(plan.selection.notifications),
             "sync_instructions": len(plan.resources.actions),

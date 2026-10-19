@@ -13,7 +13,7 @@
 | P2 域与代次 | 部分实现 | 已接通 SSA 身份、显式 symbol 种类和 metadata/carry 捕获代次；跨模块坐标接口尚待收敛 |
 | P3 存储与值 | 待实施 | 保留现有合同，尚未完成计划中的收敛 |
 | P4 同步与资源 | 部分修复 | 已保留释放 credit 的物理身份，恢复默认 FA 分配；共享兼容关系收敛仍待实施 |
-| P5 最终链路 | 部分实现，集成中 | 终端条件查询已接通统一服务，旧闭包与余数证明已删除；executable plan 边界仍待实施 |
+| P5 最终链路 | 主体已实现，集成中 | 终端条件查询已统一；逻辑模块与终端模块已隔离，后端只读取 executable plan；全链资格仍需完成 |
 | P6 集成资格 | 未取得 | 当前默认 FA 已通过 ASC/CANN；analysis 636 项通过，整组仍有失败且无本次设备资格 |
 
 ## 2026-10-19 接手与监督恢复
@@ -234,3 +234,22 @@ Bool/Int 查询，不将空域上的中间相等关系当作后续决策。原�
 缓存接入后 `owned-resource-relations-01/build.log` 的 34 项通过；共享测试直接
 记录真实 `share_events` 调用，要求同一固定成员对不因候选 ID 重复建立关系，
 并继续执行独立 byte/event 重入检查。ruff、format 和 diff 检查通过。
+
+## 显式终端边界
+
+同步后逻辑模块保留原 count/stage 和 admission/dependency/resource 记录。
+终端转换使用独立模块，一次显式映射 native 身份、实际 SSA 与已准入的范围。
+`ExecutablePlan` 只携带最终模块、native 的 operand geometry/packet、参与者及
+只读最终 SSA 范围，检查 native 一一对应及逻辑控制已消除。它不是外部输入
+的 verified 标记；公共 compile 仍只接受 source，debug 输出仍含禁止执行声明。
+
+后端删除 `NativeMemoryFacts`、`ControlFacts`、`MemoryTemplate` 与原始地址
+表达式的输入依赖；native 格式化始终从终端 operand 取得地址与 scalar。
+`ScalarUses` 只接收实际模块和 native 参与者，lowering/输出不再借用旧 memory。
+独立 byte/event 模型改为重新读取实际最终 IR，不借用旧逻辑 frames 作终端事实。
+
+`owned-terminal-boundary-02/build.log` 中 backend、execution lowering、实际同步
+语义、空 child、八 panel 与依赖分组 170 项通过，52.92 秒。新增的隔离回归另见
+`owned-terminal-isolation-01/build.log`：修改保留的逻辑 native scalar 和地址，
+禁止再查询逻辑坐标与分析入口，终端 ASC 仍保持相同。未将这两组外推为全量
+或设备资格；真实默认 FA 的冷构建与 CANN 继续验证。

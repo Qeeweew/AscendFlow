@@ -51,6 +51,7 @@ compile / Compilation
     allocate_structured_events           # 消费生命周期，建立 bank/ID/共享新约束
     materialize_notifications
     ScalarFacts                         # 复用原始控制和合法索引范围
+    executable projection               # 独立终端模块；映射 native、geometry 与 SSA 范围
     lower_execution                     # 单时钟与存在域→arith/scf
     simplify_scalars → simplify_conditions
   backend.structured → ASC
@@ -75,10 +76,11 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期 |
 | `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |
 | `analysis/queue_order.py` | 每层零 step DAG 及正 step 前进；child 仅导出 open ports 和 may-block cuts |
-| `analysis/cell_channels.py` | 相同物理 cell 和 role 的非重复 credit；原始值/存储 lifetime 归纳 |
+| `analysis/cell_channels.py` | 相同完整物理 ownership 集合和 role 的非重复 credit；原始值/存储 lifetime 归纳 |
 | `analysis/notification_lifetimes.py` | 有限使用或明确 queue handback，连接实际首末端口，无任意路径搜索 |
-| `analysis/event_sharing.py`、`structured_resources.py`、`event_contracts.py` | 有限 bank、配置/drain 台账、生成 credit 的 ID 分配与新增共享约束 |
+| `analysis/event_sharing.py`、`structured_resources.py`、`event_contracts.py` | 有限 bank、配置/drain 台账；固定成员的兼容关系只建立一次，候选 ID 分配复用关系及真实 handback |
 | `passes/materialize_structure.py` | 插入确定动作、共享同位置短路 guard 前缀；不改变 native 或 issue order |
+| `passes/executable.py` | 终端模块、native 对应、静态 geometry/packet 与最终 SSA 范围；不携带逻辑控制、地址证明或同步求解入口 |
 | `passes/lower_execution.py` | 将 count/stage 表示降为实际 arith/scf；按 family 保持 issue order，移动原 native，不复制双 AIV body |
 | `analysis/scalar_uses.py` | 终端 lowering 和输出共用的逐 family SSA 使用关系 |
 | `passes/simplify_scalars.py` | 复用源循环联合范围；共享仿射视图、倍数事实、支配 CSE、域内化简和安全外提 |
@@ -184,6 +186,14 @@ canonicalization，不反复运行整个标量/条件 pass。
 可能溢出的计算。未知优化事实保留原式，不跳过 admission 或同步检查。
 
 ## ASC 输出
+
+`StructuredSynchronization` 保留的 structure/admission/dependencies/resources 是逻辑
+诊断，指向没有被终端重写的同步后逻辑模块；`module` 指向独立的
+`executable.module`。投影时显式建立 native 与 SSA 对应，复用已准入的几何和
+范围，不重跑内存分析。`ExecutablePlan` 仅检查终端 native 对应及逻辑控制已消除，
+保存只读的最终 SSA 范围。它本身不是外部输入的同步资格；公共 compile 仍只接受 source。
+ASC emitter 只接收该终端数据，不再读取 `NativeMemoryFacts`、`ControlFacts`、
+`MemoryTemplate` 或原始地址表达式。
 
 后端打印最终 `scf.for/scf.if` 和实际地址 SSA，不构造循环次数、stage 偏移
 或阶段状态机。表达式内联按运算代价和使用次数选择；共享的复杂谓词保留

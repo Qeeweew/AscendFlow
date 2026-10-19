@@ -14,7 +14,6 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr, IntegerType
 
 from ..analysis.scalar_uses import ScalarUses
-from ..analysis.structured_memory import NativeMemoryFacts
 from ..analysis.structured_schedule import SyncKind
 from ..diagnostics import ErrorKind, require
 from ..dialects.physical import (
@@ -33,6 +32,7 @@ from ..dialects.structured import (
     AddressOp,
     NotificationOp,
 )
+from ..passes.executable import ExecutablePlan, NativeExecution
 from ..target.ascend910b import Actor
 from .native import QUALIFIER, load3d_init
 from .structured_native import format_native
@@ -82,31 +82,25 @@ class _Context:
 
 
 class _Emitter:
-    def __init__(self, memory, work, facts=None):
-        require(
-            isinstance(memory, NativeMemoryFacts), "structured emission needs owned memory facts"
-        )
-        require(
-            memory.control.module is memory.module, "emission control belongs to another module"
-        )
-        self.memory, self.control, self.work = memory, memory.control, work
-        self.facts = facts
+    def __init__(self, plan, work):
+        require(isinstance(plan, ExecutablePlan), "structured emission needs terminal SSA")
+        self.plan, self.work = plan, work
         self.expression_cost = {}
-        self.root = memory.module.body.block.first_op
+        self.root = plan.module.body.block.first_op
         require(isinstance(self.root, (KernelOp, MixedOp)), "unsupported structured kernel root")
         self.mixed = isinstance(self.root, MixedOp)
-        self.templates = {item.operation: item for item in memory.templates}
+        self.templates = {item.operation: item for item in plan.natives}
         self.task_names = {operation: f"task_{i}" for i, operation in enumerate(self.templates)}
-        self.buffers = tuple(op for op in memory.module.walk() if isinstance(op, BufferOp))
+        self.buffers = tuple(op for op in plan.module.walk() if isinstance(op, BufferOp))
         self.roots = {op.ref: f"npu_buffer_{i}" for i, op in enumerate(self.buffers)}
         self.externals = tuple(op for op in self.buffers if op.external.data)
-        self.parameters = tuple(op for op in memory.module.walk() if isinstance(op, RuntimeSizeOp))
-        uses = ScalarUses(memory)
+        self.parameters = tuple(op for op in plan.module.walk() if isinstance(op, RuntimeSizeOp))
+        uses = ScalarUses(plan.module, plan.natives)
         self.relevant = uses.operations
         self.scalar_uses = uses.values
         self.scalar_reads = uses.reads
         self.serial = 0
-        self.work.native_templates = len(memory.templates)
+        self.work.native_templates = len(plan.natives)
 
     def fresh(self, prefix):
         result = f"npu_{prefix}_{self.serial}"
@@ -145,7 +139,7 @@ class _Emitter:
             code = f"({a} {predicates[predicate]} {b})"
         elif type(operation) in _BINARY:
             if isinstance(operation, (arith.DivUIOp, arith.RemUIOp)):
-                ranges = {} if self.facts is None else self.facts.ranges
+                ranges = self.plan.scalar_ranges
                 if (
                     ranges.get(operation.lhs, (-1, 0))[0] < 0
                     or ranges.get(operation.rhs, (0, 0))[0] <= 0
@@ -234,7 +228,7 @@ class _Emitter:
         template = self.templates[operation]
         if context.family not in self.relevant[operation]:
             return []
-        packet = template.contract.packet
+        packet = template.packet
         require(
             packet is not None and packet.closed_mask, "ASC needs an audited closed native packet"
         )
@@ -467,7 +461,7 @@ class _Emitter:
             lines.append('#error "Unsynchronized structured intermediate: debug output only"')
         from .vector_mask import helper_lines, needs_helpers
 
-        if needs_helpers(self.memory.templates):
+        if needs_helpers(self.plan.natives):
             lines.extend([""] + helper_lines())
         lines.extend(
             [
@@ -501,13 +495,13 @@ class _Emitter:
                 lines.append(
                     f"{indent}{QUALIFIER[bank]} uint8_t* {self.roots[allocation.ref]} = ({QUALIFIER[bank]} uint8_t*){offset};"
                 )
-            for template in self.memory.templates:
+            for template in self.plan.natives:
                 if (
-                    template.contract.native in {"scalar_load", "index_load"}
+                    template.operation.native.data in {"scalar_load", "index_load"}
                     and family in self.relevant[template.operation]
                 ):
                     lines.append(
-                        f"{indent}{'int64_t' if template.contract.native == 'index_load' else 'float'} npu_value_{self.task_names[template.operation]} = 0;"
+                        f"{indent}{'int64_t' if template.operation.native.data == 'index_load' else 'float'} npu_value_{self.task_names[template.operation]} = 0;"
                     )
             context = _Context({}, family)
             body = self.block(self.root.body.block, context)
@@ -531,10 +525,11 @@ def emit_structure_debug(memory, *, work=None):
     from ..passes.simplify_scalars import ScalarFacts, simplify_scalars
 
     facts = ScalarFacts()
-    lower_execution(memory, facts)
+    natives = tuple(NativeExecution.from_template(t, t.operation) for t in memory.templates)
+    lower_execution(memory.module, natives, facts)
     simplify_scalars(memory.module, facts=facts)
     work = EmissionWork() if work is None else work
-    return _Emitter(memory, work, facts).render()
+    return _Emitter(ExecutablePlan(memory.module, natives, facts.ranges), work).render()
 
 
 def _emit_owned(plan, *, host_launcher=True, work=None):
@@ -543,16 +538,8 @@ def _emit_owned(plan, *, host_launcher=True, work=None):
     require(
         isinstance(plan, StructuredSynchronization), "executable ASC needs owned synchronization"
     )
-    require(
-        plan.structure.module is plan.module is plan.memory.module
-        and plan.admission.structure is plan.structure
-        and plan.dependencies.memory is plan.memory
-        and plan.selection.dependencies is plan.dependencies
-        and plan.resources.selection is plan.selection,
-        "synchronization and memory belong to different owned structures",
-    )
     work = EmissionWork() if work is None else work
-    return _Emitter(plan.memory, work, plan.scalar_facts).render(
+    return _Emitter(plan.executable, work).render(
         executable=True,
         host_launcher=host_launcher,
     )

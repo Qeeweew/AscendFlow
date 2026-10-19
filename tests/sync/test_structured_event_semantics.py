@@ -395,9 +395,12 @@ def test_generated_final_ir_preserves_finite_access_versions_and_event_consumpti
 ):
     plan, reference = generated
     result = check_structured_events(
-        plan.memory, {"tiles": count}, logical_reference=reference, invocations=2
+        collect_native_memory(plan.module),
+        {"tiles": count},
+        logical_reference=reference,
+        invocations=2,
     )
-    assert len(result.natives) == 2 * count * len(plan.memory.templates)
+    assert len(result.natives) == 2 * count * len(plan.executable.natives)
     assert result.consumptions
     if count:
         assert result.bytes_read and result.bytes_written and result.hazards
@@ -440,7 +443,10 @@ def test_adjacent_child_and_parent_credits_preserve_the_pre_sync_native_referenc
     # contract; sequential launches are externally ordered by the runtime.
     invocations = 1 if isinstance(plan.module.body.block.first_op, MixedOp) else 2
     result = check_structured_events(
-        plan.memory, {"n": count}, logical_reference=reference, invocations=invocations
+        collect_native_memory(plan.module),
+        {"n": count},
+        logical_reference=reference,
+        invocations=invocations,
     )
     assert bool(result.natives) == bool(count)
     assert all(len(bank.ids) <= 8 for bank in plan.resources.banks if bank.bank is not None)
@@ -475,7 +481,7 @@ def test_generated_actual_waits_and_retirement_captures_are_necessary(mutation):
             and op.source.data == Engine.MTE2.value
             and op.destination.data == Engine.V.value
         )
-        source = plan.memory.templates[0].operation
+        source = plan.executable.natives[0].operation
         # Preserve the ID's defining SCF/SSA scope and move that complete
         # guarded instruction before the producer's real execution point.
         outer = send

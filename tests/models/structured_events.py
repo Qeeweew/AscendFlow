@@ -702,7 +702,7 @@ def check_compiled_events(compilation, parameters=None, **options):
 
     original = collect_native_memory(parse(compilation.before_ir))
     return check_structured_events(
-        compilation.memory, parameters, logical_reference=original, **options
+        collect_native_memory(compilation.module), parameters, logical_reference=original, **options
     )
 
 

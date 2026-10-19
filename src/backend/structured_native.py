@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import IntegerAttr
 
-from ..analysis.structured_addresses import AddressFacts
 from ..diagnostics import require
 from ..dialects.structured import AddressOp
 from ..mask import Program
@@ -26,13 +25,9 @@ class PrintStorage:
 
 @dataclass(frozen=True, slots=True)
 class PrintOperand:
-    address: AddressFacts
+    geometry: NativeGeometry
     operation: AddressOp
     storage: PrintStorage
-
-    @property
-    def geometry(self) -> NativeGeometry:
-        return self.address.geometry
 
     @property
     def dtype(self):
@@ -89,16 +84,16 @@ def format_native(template, *, render, roots, task_names, generation):
         return f"({QUALIFIER[ref.geometry.bank]} {CTYPE[ref.dtype]}*)({roots[operation.source]} + ({offset}))"
 
     operands = []
-    for access in template.accesses:
+    for access in template.operands:
         # The admitted geometry survives controlled scalar rewrites. Executable
         # pointer identity and offset always come from the final native operand.
         operation = template.operation.refs[access.operand_index].owner
         require(isinstance(operation, AddressOp), "final native operand needs an SSA address")
         operands.append(
             PrintOperand(
-                access.address,
+                access.geometry,
                 operation,
-                PrintStorage(access.address.geometry.bank, roots[operation.source]),
+                PrintStorage(access.geometry.bank, roots[operation.source]),
             )
         )
     operation = template.operation

@@ -133,6 +133,10 @@ release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继�
 逻辑pipeline只保存次数、实际stage偏移和发射政策，每个stage只有一个ordinal。
 同步确定后，终端lowering将时钟和存在条件变成真实arith/scf，并保持两个AIV共享body。
 原始依赖与生命周期仍属于逻辑域；后端只消费保留的native几何及最终SSA，不读取旧控制节点。
+同步后逻辑模块和终端模块分别拥有 IR；一次显式投影映射 native 身份和已准入
+的 SSA 范围。逻辑分析记录不随终端重写变成失真的最终事实。后端只消费
+`ExecutablePlan` 中的实际 SSA、静态 geometry/packet 和只读范围，不持有源
+地址或逻辑 frame。终端 native 对应检查不是重新运行同步证明。
 标量定义移动到更大执行域时，原域的范围事实失效；目标域重新建立完整求值范围后才能外提。
 
 最终 `simplify_scalars` 在原式、整数范围和通知定义性准入之后执行。整数 CSE 只复用

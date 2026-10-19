@@ -177,8 +177,11 @@ mode-2 的十六个 base ID 来自安装 CANN 9.1 的 2201 `GetfftsConfig` 四�
 交集，因此物化后的指令采用所在 family 的参与者，不让后端再加第二层 SID 判断。
 
 物化只插入已确定的 native 前后、loop/if ENTRY/EXIT 通知及有序短路 guard，保持 native、地址和循环
-身份。终端 `lower_execution` 随后将 count/stage 表示降低为实际 arith/scf，
-按每个 actor 的既定 issue order 映射控制与地址，移动原 native，保持双 AIV 共用代码。
+身份。随后一次显式投影建立独立终端模块、native 与 SSA 范围映射，保留已准入
+的静态 geometry/packet；逻辑事实仍指向原逻辑模块。终端 `lower_execution`
+将投影后的 count/stage 表示降低为实际 arith/scf，按每个 actor 的既定 issue
+order 映射控制与地址，移动终端 native，保持双 AIV 共用代码。后端只接收
+最终 `ExecutablePlan`，不读取原逻辑内存、控制或地址证明表达式。
 整数化简复用支配定义、源循环联合范围和实际 runtime/actor/loop/branch，
 折叠 min/max、仿射冗余及比较，并外提目标域内求值合法的不变量；
 除法定义性及全部 signed 中间量在目标域未知时不外提。

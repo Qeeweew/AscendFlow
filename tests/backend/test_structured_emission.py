@@ -27,6 +27,7 @@ from ascendflow.backend.structured import EmissionWork, _emit_owned, emit_struct
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import dump
 from ascendflow.dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
+from ascendflow.passes.executable import ExecutablePlan, NativeExecution
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.materialize_structure import materialize_notifications
 from ascendflow.passes.simplify_scalars import simplify_scalars
@@ -84,11 +85,14 @@ def forbid_analysis(monkeypatch):
 def test_owned_emission_only_consumes_final_ir_and_preserves_it(source, monkeypatch):
     plan = synchronize_structure(source)
     before = dump(plan.module)
+    logical = dump(plan.structure.module)
+    assert plan.module is not plan.structure.module
     forbid_analysis(monkeypatch)
     work = EmissionWork()
     asc = _emit_owned(plan, work=work)
     assert dump(plan.module) == before
-    assert work.native_templates == work.native_prints == len(plan.memory.templates)
+    assert dump(plan.structure.module) == logical
+    assert work.native_templates == work.native_prints == len(plan.executable.natives)
     assert all(count == 1 for count in work.task_prints.values())
     assert work.actions_printed == sum(isinstance(op, NotificationOp) for op in plan.module.walk())
     assert work.output_bytes == len(asc.encode())
@@ -96,6 +100,29 @@ def test_owned_emission_only_consumes_final_ir_and_preserves_it(source, monkeypa
     assert "asc_sync_notify(" in asc and "asc_sync_wait(" in asc
     assert "PIPE_ALL" not in asc  # Final drains are already explicit root EXIT actions.
     assert "npu_size_$" not in asc
+
+
+def test_terminal_emission_does_not_borrow_logical_control_addresses_or_native_fields(monkeypatch):
+    from xdsl.dialects.builtin import FloatAttr, IndexType, f32
+
+    plan = synchronize_structure(scale)
+    expected = _emit_owned(plan)
+    logical = plan.admission.memory
+    assert any(isinstance(op, PipelineLoopOp) for op in logical.module.walk())
+    assert not any(isinstance(op, PipelineLoopOp) for op in plan.module.walk())
+    old = next(t.operation for t in logical.templates if t.contract.native == "muls")
+    old.scalar = FloatAttr(99.0, f32)
+    address = next(op for op in logical.module.walk() if isinstance(op, AddressOp))
+    offset = arith.ConstantOp.from_int_and_width(65536, IndexType())
+    address.parent.insert_op_before(offset, address)
+    address.operands = (address.source, offset.result, *address.origins, *address.extents)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("terminal emission queried a logical coordinate")
+
+    monkeypatch.setattr(logical.control.environment, "expression", forbidden)
+    forbid_analysis(monkeypatch)
+    assert _emit_owned(plan) == expected
 
 
 def test_fa_structure_debug_prints_each_template_once_and_is_not_executable(monkeypatch):
@@ -303,19 +330,13 @@ def test_actions_surround_complete_packet_and_loop_invocation_with_ordered_guard
         assert actual == expected
 
 
-def test_foreign_plan_module_and_unbound_address_symbols_are_rejected():
+def test_foreign_memory_inconsistent_native_mapping_and_unbound_address_symbols_are_rejected():
     _, facts = memory(scale)
     with pytest.raises(CompileError, match="owned synchronization"):
         _emit_owned(facts)
     plan = synchronize_structure(scale)
-    forged = object.__new__(type(plan))
-    from dataclasses import fields
-
-    for name in (field.name for field in fields(plan)):
-        object.__setattr__(forged, name, getattr(plan, name))
-    object.__setattr__(forged, "structure", lower_native_structure(scale))
-    with pytest.raises(CompileError, match="different owned structures"):
-        _emit_owned(forged)
+    with pytest.raises(CompileError, match="native instruction correspondence"):
+        replace(plan.executable, module=plan.module.clone())
     invalid = SyncAction(
         facts.templates[0].operation,
         Placement.ENTRY,
@@ -728,7 +749,9 @@ def test_compact_native_and_sync_traces_match_the_actual_ir(case, tmp_path):
     )
     for n, k in [(0, 0), (1, 1), (2, 1), (3, 2), (4, 3), (8, 5)]:
         parameters = {"tiles": n} if case == "scale" else {"n": n, "k": k}
-        interpreter = _Interpret(plan.memory, parameters, physical=True, maximum=10000)
+        interpreter = _Interpret(
+            collect_native_memory(plan.module), parameters, physical=True, maximum=10000
+        )
         interpreter.block(plan.module.body.block.first_op.body.block, {}, 0, 0, Actor.AIV0)
         expected = [
             (
@@ -825,7 +848,14 @@ def test_guarded_event_and_first_last_arithmetic_stay_inside_short_circuit(tmp_p
     facts.module.verify()
     if simplified:
         simplify_scalars(facts.module)
-    emitter = _Emitter(facts, EmissionWork())
+    emitter = _Emitter(
+        ExecutablePlan(
+            facts.module,
+            tuple(NativeExecution.from_template(t, t.operation) for t in facts.templates),
+            {},
+        ),
+        EmissionWork(),
+    )
     code = "\n".join(emitter.block(root.body.block, _Context({}, "vector")))
     assert "emit_actions" not in dir(emitter)
     division = next(
@@ -1055,7 +1085,7 @@ def test_real_reduction_first_chunk_clear_uses_actual_stage_ordinal_ssa(tmp_path
     template.operation.native = StringAttr("mad_cycle")
     template.operation.params = ArrayAttr(IntAttr(v) for v in (16, 16, 16, 2))
     code = format_native(
-        template,
+        NativeExecution.from_template(template, template.operation),
         render=lambda value: "actual_offset",
         roots={address.root: "root" for address in facts.addresses.values()},
         task_names={template.operation: "mad"},

@@ -35,7 +35,7 @@ def test_nested_short_empty_and_sparse_offsets_preserve_the_actor_instruction_tr
     original = dump(memory.module)
     native_ids = {id(template.operation) for template in memory.templates}
     facts = ScalarFacts.from_control(memory.control)
-    lower_execution(memory, facts)
+    lower_execution(memory.module, memory.templates, facts)
     simplify_scalars(memory.module, facts=facts)
     memory.module.verify()
     assert not any(isinstance(op, PipelineLoopOp) for op in memory.module.walk())
@@ -62,7 +62,7 @@ def test_unbounded_count_clock_has_defined_arithmetic_at_int64_edges():
         ).module
     )
     facts = ScalarFacts.from_control(memory.control)
-    lower_execution(memory, facts)
+    lower_execution(memory.module, memory.templates, facts)
     simplify_scalars(memory.module, facts=facts)
     memory.module.verify()
     root = memory.module.body.block.first_op

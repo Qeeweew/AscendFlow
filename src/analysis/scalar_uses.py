@@ -10,21 +10,21 @@ from ..target.ascend910b import Actor
 
 
 class ScalarUses:
-    def __init__(self, memory, *, metadata=False):
+    def __init__(self, module, natives, *, metadata=False):
         self.operations = defaultdict(set)
         self.values = set()
         self.reads = defaultdict(int)
-        root = memory.module.body.block.first_op
+        root = module.body.block.first_op
 
         def mark(op, family):
             while op is not None:
                 self.operations[op].add(family)
                 op = op.parent_op()
 
-        for template in memory.templates:
+        for template in natives:
             for actor in template.participants:
                 mark(template.operation, "cube" if actor is Actor.AIC else "vector")
-        for op in memory.module.walk():
+        for op in module.walk():
             if isinstance(op, (FixConfigOp, Load3DConfigOp)):
                 mark(op, "cube")
             elif isinstance(op, NotificationOp):
@@ -72,7 +72,7 @@ class ScalarUses:
             for operand in operands:
                 scalar(operand, family)
 
-        for op in memory.module.walk():
+        for op in module.walk():
             for family in tuple(self.operations[op]):
                 if isinstance(op, TaskOp):
                     operands = op.refs
