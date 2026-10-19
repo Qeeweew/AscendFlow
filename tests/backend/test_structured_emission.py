@@ -38,9 +38,9 @@ from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.gemm.reduction import reduction_gemm
 from examples.vector.scale import scale
-from tests.control.test_recursive_native import NESTED, dispatch
-from tests.control.test_shared_aiv import SHARED
+from tests.fixtures.control import NESTED, SHARED
 from tests.fixtures.nested import nested_cv
+from tests.models.native_control import dispatch
 
 CARRY = """
 def carry(n:N.int64):

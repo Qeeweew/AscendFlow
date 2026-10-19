@@ -9,7 +9,7 @@ SID 条件、原式定义性和全部 protocol 来源仍保留。
 需要另外建立完成覆盖。Set/Wait 仅合并互斥分支；重叠的本地二值事件和跨核贡献
 保留次数，不能套用 fence 的幂等规则。后端不修改 ASC 字符串来删除同步。
 
-回归在[条件 pass 测试](../../tests/test_condition_pass.py)及独立有限字节/event 模型中，
+回归在[条件 pass 测试](../../tests/passes/test_condition_pass.py)及独立有限字节/event 模型中，
 包括重叠条件、SID 域、未知 effects 边界和必要 fence 删除反例。
 完整保持合同见[编译不变量](compilation-invariants.md)。
 

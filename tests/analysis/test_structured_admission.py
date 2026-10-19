@@ -19,7 +19,7 @@ from ascendflow.target.ascend910b import Actor
 from examples.flash_attention.attention import attention_target
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
-from tests.control.test_shared_aiv import SHARED
+from tests.fixtures.control import SHARED
 from tests.models.structured_events import EventModelError, check_structured_events
 
 

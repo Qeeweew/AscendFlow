@@ -41,7 +41,7 @@ from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.notification_binding import _bind_endpoint, _IssueOrder
 from ascendflow.scalar import expression, literal
 from ascendflow.target.ascend910b import Actor, Engine
-from tests.analysis.test_conditional_accesses import _retarget, _structure
+from tests.fixtures.conditional_mad import _retarget, _structure
 
 
 @pytest.fixture(scope="module")

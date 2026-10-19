@@ -13,7 +13,7 @@ from ascendflow.target.native import NativeGeometry, native_contract
 from examples.gemm.schedule import l2_tile
 from tests.models.structured_events import check_structured_events
 
-EXAMPLE = Path(__file__).parents[1] / "examples/gemm/matmul.py"
+EXAMPLE = Path(__file__).parents[2] / "examples/gemm/matmul.py"
 
 
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])

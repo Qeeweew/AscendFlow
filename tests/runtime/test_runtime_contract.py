@@ -4,10 +4,6 @@ The CPU library below contains the actual emitted launcher. Its device launch
 line alone is replaced by a counter; this tests ABI forwarding, not NPU work.
 """
 
-import ctypes
-import re
-import shutil
-import subprocess
 from dataclasses import replace
 
 import pytest
@@ -23,6 +19,7 @@ from ascendflow.frontend import FrontendError
 from examples.state.grouped import grouped_state_sum
 from examples.vector.scale import scale
 from tests.fixtures.source_programs import cv_source
+from tests.support.host_launcher import contracts, host_launcher
 
 
 def contract_source(*, minimum=1, multiple=4):
@@ -44,14 +41,6 @@ def contract_source(*, minimum=1, multiple=4):
         """,
         disjoint_external=True,
     ).specialize(MINIMUM=minimum, MULTIPLE=multiple)
-
-
-def contracts(module, kind):
-    return {
-        op.sym_name.data: (op.minimum.data, op.multiple.data)
-        for op in module.walk()
-        if isinstance(op, kind)
-    }
 
 
 @pytest.fixture(scope="module")
@@ -151,51 +140,6 @@ def test_forged_contract_is_rejected_by_ir_verification(local, kind, field, valu
     size.attributes[field] = IntAttr(value)
     with pytest.raises(VerifyException, match="runtime (minimum|multiple)"):
         module.verify()
-
-
-def host_launcher(artifact, directory):
-    """Compile the actual wrapper, replacing only the device launch line."""
-    marker = f'extern "C" int launch_{artifact.name}('
-    launcher = artifact.asc[artifact.asc.index(marker) :]
-    launcher, changed = re.subn(
-        r"(?m)^  [A-Za-z_]\w*<<<[^\n]+>>>\([^\n]+\);$",
-        "  ++npu_dispatches;",
-        launcher,
-    )
-    assert changed == 1
-    assert not re.search(r"\b(if|for|while)\b|npu_host_|overflow", launcher)
-    source = directory / "launcher.cpp"
-    source.write_text(
-        "#include <cstdint>\n#include <cstddef>\n"
-        "static int npu_dispatches = 0;\n"
-        + launcher
-        + '\nextern "C" int dispatches() { return npu_dispatches; }\n'
-    )
-    compiler = shutil.which("c++")
-    assert compiler is not None, "the CPU launcher-contract test requires a C++ compiler"
-    binary = directory / "launcher.so"
-    subprocess.run(
-        [compiler, "-std=c++17", "-shared", "-fPIC", "-O2", str(source), "-o", str(binary)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    library = ctypes.CDLL(str(binary))
-    launch = getattr(library, "launch_" + artifact.name)
-    parameters = contracts(parse(artifact.plan_ir), RuntimeSizeOp)
-    root_count = launch_source_root_count(artifact)
-    launch.argtypes = [ctypes.c_void_p] * (root_count + 1) + [ctypes.c_int64] * len(parameters)
-    launch.restype = ctypes.c_int
-    library.dispatches.restype = ctypes.c_int
-    # The stub never dereferences these disjoint, aligned addresses.
-    pointers = [ctypes.c_void_p((i + 1) << 32) for i in range(root_count)]
-    return library, lambda *values: launch(None, *pointers, *values)
-
-
-def launch_source_root_count(artifact):
-    signature = artifact.asc.split(f'extern "C" int launch_{artifact.name}(', 1)[1].split(")", 1)[0]
-    return signature.count("void* arg_")
 
 
 @pytest.mark.parametrize(

@@ -25,7 +25,7 @@ from ascendflow.dialects.source import (
 )
 from ascendflow.target.native import ITEMSIZE
 from tests.fixtures.scoped_queries import GROUPS, scoped_query_recurrence
-from tests.test_index_frontend import evaluate as evaluate_index
+from tests.models.source_index import evaluate as evaluate_index
 
 
 def view(ref):

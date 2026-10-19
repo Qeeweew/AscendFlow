@@ -7,12 +7,16 @@
 
 ```bash
 python -m pip install -e '.[validation,dev]'
-python -m pytest -q
+python -m benchmarks.check_tests --jobs 32 --output build/tests-parallel
 python -m ruff check src examples benchmarks tests
 python -m ruff format --check src examples benchmarks tests
 ```
 
 测试职责见[tests](../../tests/README.md)。这些检查不初始化 NPU，也不替代 CANN/设备检查。
+局部改动按 `tests/frontend`、`analysis`、`passes`、`sync`、`backend`、`operators`、
+`integration`、`runtime`、`tooling` 及 `control/loops` 的职责选择目录。
+默认/causal FA 的完整构建与有限 byte/event 集成检查位于 `tests/integration`；
+全量 `pytest` 默认包含它们，不通过默认过滤隐藏慢用例。
 
 ## 所有示例编译与运行
 
@@ -48,7 +52,7 @@ KDA recurrent 使用长度 0/1/3/0，decode 使用四个单 token 序列，prefi
 输出目录必须不存在，以免旧记录混入新结果。定位后可用 `--only nested-cv` 等名称
 在新目录重跑相关项；该记录只代表选中的项。
 
-未支持的动态 `valid=` prefix 地址仅保留在[拒绝测试](../../tests/test_prefix.py)，
+未支持的动态 `valid=` prefix 地址仅保留在[拒绝测试](../../tests/frontend/test_prefix.py)，
 不作为可运行示例。`schedule.py` 是被 GEMM 使用的 inline helper，随 GEMM 检查。
 
 ## FA / GEMM 多 shape：ACLNN 对照与 TFLOPS

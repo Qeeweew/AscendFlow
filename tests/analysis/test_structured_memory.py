@@ -14,7 +14,7 @@ from ascendflow.target import native
 from ascendflow.target.ascend910b import Actor
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
-from tests.control.test_shared_aiv import SHARED
+from tests.fixtures.control import SHARED
 
 
 @pytest.mark.parametrize(

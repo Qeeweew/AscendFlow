@@ -30,7 +30,7 @@ from ascendflow.target.ascend910b import Actor
 from ascendflow.target.native import CAPACITY, ITEMSIZE
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
-from tests.control.test_shared_aiv import SHARED
+from tests.fixtures.control import SHARED
 
 
 def _index(block, value):

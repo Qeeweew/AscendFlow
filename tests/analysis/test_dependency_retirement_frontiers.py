@@ -6,7 +6,7 @@ from ascendflow.analysis.structured_dependencies import build_structured_depende
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.target.ascend910b import Actor, Engine, Milestone
-from tests.analysis.test_structured_dependencies import materialized_edges
+from tests.models.dependency_edges import materialized_edges
 
 
 def dependencies(source):

@@ -99,7 +99,7 @@ def test_periodic_native_reset_does_not_require_activation_history_closure():
     # compile path. Definedness/first-reset counterexamples stay in the native
     # admission suite; this checks order generation accepts their real modes.
     from ascendflow.analysis.structured_dependencies import build_structured_dependencies
-    from tests.analysis.test_conditional_accesses import _admit, _retarget, _structure
+    from tests.fixtures.conditional_mad import _admit, _retarget, _structure
 
     for period in (1, 2, 3):
         structure = _structure()

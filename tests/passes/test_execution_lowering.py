@@ -14,7 +14,7 @@ from ascendflow.passes.lower_execution import lower_execution
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.simplify_scalars import ScalarFacts, simplify_scalars
 from tests.models.structured_events import _Interpret, check_structured_events
-from tests.test_condition_pass import trace
+from tests.models.terminal_trace import trace
 
 NESTED = """
 def clocks(n:N.int64,m:N.int64):

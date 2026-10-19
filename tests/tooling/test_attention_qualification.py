@@ -5,7 +5,7 @@ import pytest
 from ascendflow.diagnostics import CompileError
 from benchmarks.attention import run
 from benchmarks.attention.compare import compare, qualification
-from tests.test_attention_runner import mock_cann, mock_execution, publish
+from tests.support.attention_runner import mock_cann, mock_execution, publish
 
 
 def test_clear_slowdown_fails_and_overlap_is_not_called_success():

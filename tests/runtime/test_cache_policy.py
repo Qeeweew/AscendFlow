@@ -17,7 +17,7 @@ from examples.gemm.dense import dense_gemm
 
 def test_cache_alias_binding_changes_launcher_and_preserves_kernel_and_storage(tmp_path):
     artifacts = {}
-    source = Path(__file__).parents[1] / "examples/gemm/dense.py"
+    source = Path(__file__).parents[2] / "examples/gemm/dense.py"
     for cache in ("normal", "bypass"):
         directory = tmp_path / cache
         build_file(

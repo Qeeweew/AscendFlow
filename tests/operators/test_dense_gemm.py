@@ -17,7 +17,7 @@ from ascendflow.scalar import expression, literal
 from examples.gemm.dense import dense_gemm
 from tests.models.structured_events import EventModelError, check_structured_events
 
-EXAMPLE = Path(__file__).parents[1] / "examples/gemm/dense.py"
+EXAMPLE = Path(__file__).parents[2] / "examples/gemm/dense.py"
 
 
 @pytest.mark.parametrize("bk,k", [(16, 16), (16, 32), (16, 48), (32, 32), (64, 128)])

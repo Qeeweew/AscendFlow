@@ -22,7 +22,7 @@ def test_fp32_mad_cannot_use_b16_byte_footprints():
 @pytest.mark.parametrize("transpose", [False, True])
 def test_fp32_operands_keep_32byte_nz_columns_and_ieee_mode(tmp_path, transpose):
     build_file(
-        Path(__file__).parents[1] / "examples/gemm/batched.py",
+        Path(__file__).parents[2] / "examples/gemm/batched.py",
         tmp_path,
         entry="batched_matmul",
         parameters={

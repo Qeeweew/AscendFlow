@@ -16,7 +16,7 @@ from ascendflow.analysis.structured_regions import AccessOccurrence, LoopOrdinal
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.scalar import Expr
 from ascendflow.target.ascend910b import Actor
-from tests.analysis.test_structured_dependencies import materialized_edges, trace_edges
+from tests.models.dependency_edges import materialized_edges, trace_edges
 from tests.models.structured_domains import actual_dispatch
 
 

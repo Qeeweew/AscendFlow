@@ -6,7 +6,7 @@ from urllib.parse import unquote
 
 
 def test_local_documentation_links_resolve():
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     pages = [
         root / name
         for name in ("README.md", "examples/README.md", "benchmarks/README.md", "tests/README.md")

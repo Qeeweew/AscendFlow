@@ -9,7 +9,7 @@ from ascendflow import language as T
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.physical import RuntimeSizeOp
 from examples.vector.grouped import grouped_scale
-from tests.test_runtime_contract import host_launcher
+from tests.support.host_launcher import host_launcher
 
 
 @pytest.fixture(scope="module")

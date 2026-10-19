@@ -42,7 +42,7 @@ int main(int argc,char** argv) {
             "-std=c++20",
             "-O0",
             "-I",
-            str(Path(__file__).parent / "support"),
+            str(Path(__file__).parents[1] / "support"),
             str(path / "reference.cpp"),
             "-o",
             str(path / "reference"),

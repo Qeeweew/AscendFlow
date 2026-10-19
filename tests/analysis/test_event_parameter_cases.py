@@ -8,6 +8,7 @@ from ascendflow.analysis.event_contracts import ResourceWork
 from ascendflow.analysis.event_domains import EventDomains
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison
 from ascendflow.scalar import Expr, expression, literal
+from tests.fixtures.event_slots import nested_slot_source
 from tests.support.structured import selected
 
 
@@ -113,21 +114,6 @@ def test_empty_intersection_does_not_hide_mismatched_endpoints(base):
     )
     with pytest.raises(CompileError, match="activation domains are not proved equivalent"):
         EventDomains(selection, ResourceWork())
-
-
-def nested_slot_source(slots):
-    return f"""
-    def slots(X:N.Tensor((n,m,64),N.f32),n:N.int64,m:N.int64):
-        with N.Kernel():
-            x,y=N.alloc_ub(({slots},64)),N.alloc_ub(({slots},64))
-            for p in N.serial(n):
-                for g in N.Pipelined(m,stages=2):
-                    slot=(p*m+g)%{slots}
-                    with N.Stage(0):
-                        N.copy(X[p,g,:],x[slot,:])
-                    with N.Stage(1):
-                        N.mul(x[slot,:],2.0,out=y[slot,:])
-    """
 
 
 def test_real_nested_slot_selection_preserves_actual_endpoint_domains():

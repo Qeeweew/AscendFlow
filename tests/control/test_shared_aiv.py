@@ -12,36 +12,8 @@ from ascendflow.dialects.physical import BufferOp, MixedOp, TaskOp
 from ascendflow.dialects.source import DomainOp
 from ascendflow.dialects.structured import ActorDomainOp, PipelineLoopOp
 from ascendflow.passes.lower_native import lower_native_structure
-from tests.control.test_recursive_native import dispatch
-
-SHARED = """
-def shared(A:N.Tensor((GROUPS,n,32,16),N.f16),
-           B:N.Tensor((GROUPS,n,16,16),N.f16),
-           Scratch:N.Tensor((GROUPS,2,32,16),N.f32,access="write"),
-           Y:N.Tensor((GROUPS,n,32,16),N.f32,access="write"),
-           n:N.int64,GROUPS:N.constexpr=3):
-    with N.Kernel(GROUPS,kind="mixed") as group:
-        a1=N.alloc_l1((32,16),N.f16)
-        b1=N.alloc_l1((16,16),N.f16)
-        a0=N.alloc_l0a((32,16),N.f16)
-        b0=N.alloc_l0b((16,16),N.f16)
-        c0=N.alloc_l0c((32,16),N.f32)
-        x=N.alloc_ub((16,16),N.f32,name="x")
-        y=N.alloc_ub((16,16),N.f32,name="y")
-        for t in N.Pipelined(n,stages=2,
-                 issue_order={"cube":("produce",),"vector":("consume",)}):
-            with N.Stage(0,name="produce"),N.Cube():
-                av=N.copy(A[group,t,:,:],a1)
-                bv=N.copy(B[group,t,:,:],b1)
-                aa=N.copy(av,a0)
-                bb=N.copy(bv,b0)
-                acc=N.matmul(aa,bb,accum=c0,initialize=True)
-                N.copy(acc,Scratch[group,t%2,:,:])
-            with N.Stage(1,name="consume"),N.Vector() as sid:
-                tile=N.copy(Scratch[group,t%2,sid*16:(sid+1)*16,:],x)
-                value=N.mul(tile,2.0,out=y)
-                N.copy(value,Y[group,t,sid*16:(sid+1)*16,:])
-"""
+from tests.fixtures.control import SHARED
+from tests.models.native_control import dispatch
 
 
 def test_mixed_ir_has_one_vector_body_one_sid_and_shared_gm_root():

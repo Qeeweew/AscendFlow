@@ -20,7 +20,7 @@ from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
-from tests.analysis.test_event_parameter_cases import nested_slot_source
+from tests.fixtures.event_slots import nested_slot_source
 from tests.fixtures.nested import nested_copy, nested_cv, shared_l0c_qk_pv
 from tests.models.structured_events import (
     EventModelError,

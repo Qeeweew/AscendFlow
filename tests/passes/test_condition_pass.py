@@ -10,7 +10,6 @@ from ascendflow import language as N
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement, SyncAction
 from ascendflow.dialects.io import dump, parse
-from ascendflow.dialects.physical import TaskOp
 from ascendflow.dialects.structured import NotificationOp
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.materialize_structure import materialize_notifications
@@ -20,9 +19,9 @@ from ascendflow.scalar import expression, literal
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from tests.models.structured_events import (
     EventModelError,
-    _Interpret,
     check_structured_events,
 )
+from tests.models.terminal_trace import trace
 
 NESTED = """
 def packets(q:N.int64,n:N.int64):
@@ -35,23 +34,6 @@ def packets(q:N.int64,n:N.int64):
                         with N.Stage(0,name="work"):
                             N.fill(x,1.0)
 """
-
-
-def trace(module, parameters, actor=Actor.AIV0):
-    memory = collect_native_memory(module)
-    model = _Interpret(memory, parameters, physical=True, maximum=10000)
-    model.block(module.body.block.first_op.body.block, {}, 0, 0, actor)
-    return tuple(
-        (
-            c.kind,
-            c.source,
-            c.destination,
-            c.event,
-            c.occurrence.operation.uid.data if isinstance(c.occurrence.operation, TaskOp) else None,
-            tuple(g for _, g in c.occurrence.coordinates),
-        )
-        for c in model.commands
-    )
 
 
 def packet_program():
