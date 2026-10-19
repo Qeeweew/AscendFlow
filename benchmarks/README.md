@@ -16,8 +16,7 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 `--causal` 单独采集这四个等长 causal FA shape，使用 example 中三组显式分块；
 `--require-no-slower` 在任一 shape 慢于 ACLNN 时返回失败，数值通过不代表性能通过。
 输出目录须是新目录。运行环境、卡选择和
-输入合同见[快速上手](../docs/guide/quickstart.md)，结果见[示例验证](../docs/reports/examples.md)
-和[性能报告](../docs/reports/performance.md)。
+输入合同见[快速上手](../docs/guide/quickstart.md)，每次运行的结果和产物保存在指定输出目录。
 
 | 工具 | 用途 |
 |---|---|

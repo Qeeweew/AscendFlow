@@ -29,6 +29,10 @@ python -m benchmarks.check_examples --output build/examples-cann
 | `shared-state` | [state/shared_inputs.py](state/shared_inputs.py) · `shared_state_sum` | 多调用共享只读输入 |
 | `frame-state` | [state/frame_snapshot.py](state/frame_snapshot.py) · `frame_state_sum` | snapshot、WAR、最后读取 |
 | `flash-attention` | [flash_attention/attention.py](flash_attention/attention.py) · `attention_target` | QK/softmax/PV/update 多级 CV 流水 |
+| `scalar-store` | [vector/scalar_store.py](vector/scalar_store.py) · `scalar_store` | Scalar capture/store 与精确 FP32 检查 |
+| `kda-recurrent` | [kda/recurrent.py](kda/recurrent.py) · `recurrent_kda` | token 顺序递推、FP32 carry 与独立快照 |
+| `kda-decode` | [kda/decode.py](kda/decode.py) · `decode_kda` | 单 token 解码、三阶段 head 流水 |
+| `kda-prefill` | [KDA prefill](../docs/operators/kda-prefill.md) · 九个入口、十个特化 | chunk 预处理、Gram/块逆、递推及输出 |
 
 [gemm/schedule.py](gemm/schedule.py) 是 GEMM 的 inline L2 政策 helper，随 GEMM 验证。
 `independent_rings` 用于测试互质环的组合，不是推荐的性能参数。
@@ -44,11 +48,11 @@ python -m ascendflow --input examples/cv/nested.py --entry nested_cv --shared --
 [整块合同](../docs/operators/dense-gemm.md)。FA 的 runtime Sq/Sk、workspace、
 数值边界与限制见[FA 合同](../docs/operators/flash-attention.md)。
 
-KDA 使用专用多阶段构建与对照 runner，尚未纳入上表的统一示例检查：
-[decode](../docs/operators/kda.md) 提供 batch 1–64 的 Triton 性能矩阵；
+统一清单包含 KDA 的小规模数值检查；大规模构建和 Triton 对照使用专用 runner：
+[decode](../docs/operators/kda.md) 提供 batch 1–64 的 Triton 对照方法；
 [prefill](../docs/operators/kda-prefill.md) 包括 IEEE FP32 Cube、块逆及混合流水。
 
-当前逐项编译/运行证据见[示例验证](../docs/reports/examples.md)。性能仅测默认
-Flash Attention 与 GEMM normal 的多 shape ACLNN 对照及 TFLOPS，见[性能报告](../docs/reports/performance.md)。
+逐项编译/运行证据保存在 `check_examples` 的输出目录。默认 Flash Attention 与
+GEMM normal 的多 shape ACLNN 对照及 TFLOPS 采集见[测试指南](../docs/guide/testing.md)。
 动态 `valid=` prefix 地址等未支持形式保留在拒绝测试中，不作为 runnable example；
 runner 接受某个参数不代表该变体已经设备验证。

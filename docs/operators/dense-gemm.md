@@ -57,5 +57,5 @@ cubeMathType=0）。每个构建经唯一 DSL→IR→ASC→CANN 路径和单次 
 设备记录绑定这些产物、runtime cache alias、硬件与输入身份；复用产物不重新编译。
 
 独立 ACLNN 三批比较器保留作专项诊断，日常不要求运行。
-本次配置与结果见[示例验证](../reports/examples.md)；FP16/BF16 输入输出的普通
+检查清单和结果格式见[测试指南](../guide/testing.md)；FP16/BF16 输入输出的普通
 `C=A@B` 以及尾块使用[标准 GEMM](gemm.md)。

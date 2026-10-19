@@ -40,7 +40,7 @@ python -m benchmarks.check_examples --output build/examples-device --physical 2
 检查整个 pipeline 的输出和最终状态，不把这一结果称为每个中间矩阵的独立数值验证。
 检查输入与 guard，包含各自适用的空、单次、多次和跨槽复用情况。GEMM 使用
 129×257×259 尾块；dense NT 使用 256×512×256；FA 使用 256:1024、768:3072。
-其他参数见[清单实现](../../benchmarks/check_examples.py)，结果见[示例验证](../reports/examples.md)。
+其他参数见[清单实现](../../benchmarks/check_examples.py)，每次结果保存在指定输出目录。
 KDA recurrent 使用长度 0/1/3/0，decode 使用四个单 token 序列，prefill 使用
 八头、127 token 尾块；它们是数值 smoke，不代替 B1/S4096/H32 的性能资格。
 构建清单会核对每个声明入口确实发布了编译记录，KDA 的设备记录保存在各组的
@@ -98,7 +98,9 @@ msprof 的“一次采集”和 kernel 执行次数分开：沿用运行器默�
 不作为 kernel time。采样 oracle、完整输出有限性、输入不变和 guard 分别检查，
 采样不称全输出验证。
 
-[性能报告](../reports/performance.md)列出 shape、两个实现的时间、加速比和算法
-TFLOPS，并说明 FLOPs 公式。加速比为 `ACLNN 时间 / AscendFlow 时间`，大于 1 表示
-本次 AscendFlow 更快。每个后端只有一次采集，不据此宣称通过历史三批严格门槛。
+输出的 `tables.md` 列出 shape、两个实现的时间、加速比和算法 TFLOPS。
+GEMM 有效 FLOPs 为 `2*M*N*K`；dense FA 为 `4*B*Hq*Sq*Sk*D`，causal FA 为
+`4*B*Hq*D*sum_i min(i+1,Sk)`，均不计 softmax 与搬运。`TFLOPS=FLOPs/(time_us*10^6)`，
+不是 native 指令吞吐或硬件利用率。加速比为 `ACLNN 时间 / AscendFlow 时间`，大于 1
+表示本次 AscendFlow 更快。每个后端只有一次采集，不据此宣称通过历史三批严格门槛。
 AscendC、PMU 和 roofline 工具保留作专项诊断。

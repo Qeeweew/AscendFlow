@@ -82,14 +82,14 @@ masked fill仍是需要初始化目标的读写更新，不是隐藏mask workspa
 使用一个输出 UB 槽，为 VR16 留出容量，复用等待实际 MTE3 最后读取。
 
 编译器新增的是通用三角更新、clamped 整数范围、原始轴网格坐标及有界 reader family
-支持；没有 attention 专属 pass。设备和性能资格见[causal 验收](../reports/causal-attention.md)。
+支持；没有 attention 专属 pass。设备与性能验收方法见[测试指南](../guide/testing.md)。
 
 ## 资格边界
 
 数值容差为 rtol=0.002、atol=0.0002。当前日常检查对 256:1024 和 768:3072
 进行全输出 oracle；causal 与非 causal 的性能验收都只覆盖 1K/2K/4K/8K 等长正方形，保持默认政策，
-每个 shape 的生成代码与 ACLNN 各采集一次默认 msprof。预热和执行次数见[测试指南](../guide/testing.md)，实际结果分别见
-[示例验证](../reports/examples.md)与[性能报告](../reports/performance.md)。FA 的 TFLOPS 只计 QK/PV 两次矩阵乘法的算法 FLOPs。
+每个 shape 的生成代码与 ACLNN 各采集一次默认 msprof。预热、执行次数及结果格式见
+[测试指南](../guide/testing.md)。FA 的 TFLOPS 只计 QK/PV 两次矩阵乘法的算法 FLOPs。
 
 这些记录只覆盖对应配置和产物；BQ128 及其他政策的历史记录不代替当前默认配置。
 连续 fence 合并的规则见[同步优化边界](../development/sync-optimizations.md)。

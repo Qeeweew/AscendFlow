@@ -131,6 +131,6 @@ oracle 精确相等，没有因尾块失败而放宽容差。
 日常性能使用 1K/2K/4K/8K 方阵及两组矩形，FP16、正态输入；每个 shape 的
 生成代码与安装版 ACLNN 各采集一次默认 msprof。保留 example 的默认 `OUTPUT_CACHE="auto"`，
 实际 C 缓存政策随记录保存；`normal` 指正态数据。具体命令和预热/执行次数见
-[测试指南](../guide/testing.md)，时间、加速比与 `2*M*N*K` 算法 TFLOPS 见
-[性能报告](../reports/performance.md)。三批比较器保留作专项诊断，日常不要求运行。
+[测试指南](../guide/testing.md)，时间、加速比与 `2*M*N*K` 算法 TFLOPS 记录在
+每次输出的 `tables.md`。三批比较器保留作专项诊断，日常不要求运行。
 任意正尺寸的正确性支持与各配置的性能记录分别限定范围。

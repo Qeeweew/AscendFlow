@@ -13,6 +13,5 @@ SID 条件、原式定义性和全部 protocol 来源仍保留。
 包括重叠条件、SID 域、未知 effects 边界和必要 fence 删除反例。
 完整保持合同见[编译不变量](compilation-invariants.md)。
 
-该规则已由 `64dff27` 实现。旧的调用点数量、逐批性能和优化过程通过 Git 查阅；
-当前设备数值与两项 kernel time 只在[示例验证](../reports/examples.md)和
-[性能报告](../reports/performance.md)维护。
+该规则的验证方法见[编译器验证](validation.md)，设备数值与 kernel time 的采集
+见[测试指南](../guide/testing.md)。各次结果随其产物保存，不作为规则本身的证明。

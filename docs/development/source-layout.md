@@ -22,7 +22,7 @@ AscendFlow/
   examples/              # 算法及政策
   tests/                 # 语义与集成回归
   benchmarks/            # 编译及后续设备测量
-  docs/                  # 当前设计与资格
+  docs/                  # 已落实的设计、合同与使用指南
 ```
 
 `src/` 直接放置代码，没有额外的 `src/ascendflow/`。项目配置将逻辑包
@@ -96,8 +96,8 @@ build_file                               # 同一链路 + CANN，单次进程组
 
 局部 WAR/WAW 通知前缀保留 `StorageCell.physical_key` 对应的 ownership 集合，
 使循环内及 FIRST/LAST 边界继续属于同一 credit。RAW 的覆盖合并与跨参与者
-quorum 保持各自合同。手写 guard coverage 搜索及其专用 `modular.py` 已删除；
-最终 SSA 两个优化 pass 尚待接入统一查询，不能视作本次收敛已全部完成。
+quorum 保持各自合同。原式数学查询与最终 SSA 条件查询共用 SMT 服务，
+但各自的求值定义域和机器范围检查仍独立保留。
 
 算法和政策在 `examples/`；测量及独立 AscendC/ACLNN 在 `benchmarks/`。
 
