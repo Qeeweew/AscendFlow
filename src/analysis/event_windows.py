@@ -17,6 +17,7 @@ from xdsl.ir import Operation
 from ..diagnostics import CompileError, ErrorKind, require
 from ..indexing import arguments, normalize_integral, normalize_or_identity
 from ..scalar import INT64_MAX, Expr, Fact, expression, literal, substitute
+from ..symbols import Symbol, SymbolKind, is_coordinate
 from .periodic import evaluate_comparison_at, period_of
 from .structured_protocols import LogicalNotification
 from .structured_schedule import ActionGuard, Comparison
@@ -340,7 +341,12 @@ class _Builder:
                 and invariant(source)
                 and invariant(replacement)
                 and all(
-                    name in facts and (not name.startswith("$") or name == "$group")
+                    name in facts
+                    and (
+                        not is_coordinate(name)
+                        or isinstance(name, Symbol)
+                        and name.kind is SymbolKind.GROUP
+                    )
                     for name in arguments(source) | arguments(replacement)
                 ),
                 "event parameter bindings must contain only uniform input expressions",

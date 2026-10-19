@@ -39,6 +39,8 @@ group watchdog enforces the build's hard time limit.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from operator import eq, ge, gt, le, lt, ne
 from time import perf_counter
@@ -49,8 +51,10 @@ from z3 import (
     BitVec,
     BitVecVal,
     BoolVal,
+    Function,
     If,
     Int,
+    IntSort,
     IntVal,
     Not,
     Or,
@@ -64,6 +68,7 @@ from z3 import (
 from ..budget import poll, remaining
 from ..diagnostics import require
 from ..scalar import DIVISION, INT64_MAX, Expr, Fact
+from ..symbols import Symbol, SymbolKind
 from .structured_schedule import Comparison
 
 INT64_MIN = -INT64_MAX - 1
@@ -74,13 +79,53 @@ NONE = "none"
 WITNESS = "witness"
 _LOCAL_TIMEOUT_MS = 2000
 _PREDICATES = {"==": eq, "!=": ne, "<": lt, "<=": le, ">": gt, ">=": ge}
+_active_services = ContextVar("ascendflow_integer_queries", default=None)
+
+
+@contextmanager
+def query_scope():
+    """Own query reuse within one complete compilation, never between builds."""
+    if _active_services.get() is not None:
+        yield
+        return
+    services = {}
+    token = _active_services.set(services)
+    try:
+        yield
+    finally:
+        _active_services.reset(token)
+        services.clear()
+
+
+def query_service(facts):
+    """Reuse precisely the same immutable input environment in this build."""
+    services = _active_services.get()
+    if services is None:
+        return IntegerQueryService(facts)
+    key = frozenset(facts.items())
+    if key not in services:
+        services[key] = IntegerQueryService(facts)
+    return services[key]
+
+
+def query_statistics():
+    services = _active_services.get()
+    return tuple(
+        {
+            "input_symbols": len(service._facts),
+            "expressions": len(service._expressions),
+            "contexts": len(service._contexts),
+            **service.statistics.report(),
+        }
+        for service in (() if services is None else services.values())
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class Instance:
     """One concrete assignment returned by the solver."""
 
-    values: tuple[tuple[str, int], ...]
+    values: tuple[tuple[str | Symbol, int], ...]
 
     def text(self):
         return ", ".join(f"{name}={value}" for name, value in self.values)
@@ -208,7 +253,10 @@ class IntegerQueryService:
             require(isinstance(fact, Fact), f"integer query facts must be Fact values: {name}")
         self._timeout = timeout_ms
         self._values = {}
+        self._symbols = {}
+        self._functions = {}
         self._expressions = {}
+        self._comparisons = {}
         self._defined = {}
         self._contexts = {}
         self._answers = {}
@@ -233,10 +281,28 @@ class IntegerQueryService:
         if value.kind == "constant":
             result = IntVal(value.constant)
         elif value.kind == "argument":
-            result = self._values.get(value.args[0])
+            symbol = value.args[0]
+            result = self._values.get(symbol)
             if result is None:
-                result = Int(value.args[0])
-                self._values[value.args[0]] = result
+                if (
+                    isinstance(symbol, Symbol)
+                    and symbol.kind in {SymbolKind.METADATA, SymbolKind.CARRY}
+                    and symbol.captures
+                ):
+                    key = symbol.kind, symbol._identity
+                    function = self._functions.get(key)
+                    if function is None:
+                        function = Function(
+                            f"capture_{len(self._functions)}",
+                            *(IntSort() for _ in range(len(symbol.captures) + 1)),
+                        )
+                        self._functions[key] = function
+                    result = function(*(self._integer(capture) for capture in symbol.captures))
+                else:
+                    name = f"scalar_{len(self._values)}"
+                    result = Int(name)
+                    self._symbols[name] = symbol
+                self._values[symbol] = result
         else:
             a, b = (self._integer(arg) for arg in value.args)
             if value.kind == "add":
@@ -274,7 +340,11 @@ class IntegerQueryService:
         return result
 
     def _comparison(self, test: Comparison):
-        return _cmp(self._integer(test.lhs), test.predicate, self._integer(test.rhs))
+        result = self._comparisons.get(test)
+        if result is None:
+            result = _cmp(self._integer(test.lhs), test.predicate, self._integer(test.rhs))
+            self._comparisons[test] = result
+        return result
 
     def _context(self, assumptions):
         """Input facts plus one complete ordered premise tuple, as relations.
@@ -292,7 +362,7 @@ class IntegerQueryService:
         cached = self._contexts.get(assumptions)
         if cached is not None:
             return cached
-        encoded = tuple(self._comparison(test) for test in assumptions)
+        encoded = (And(*(self._comparison(test) for test in assumptions)),)
         self._contexts[assumptions] = encoded
         return encoded
 
@@ -352,9 +422,16 @@ class IntegerQueryService:
                 values.append((declaration.name(), value.as_signed_long()))
             else:
                 try:
-                    values.append((declaration.name(), value.as_long()))
+                    values.append(
+                        (self._symbols.get(declaration.name(), declaration.name()), value.as_long())
+                    )
                 except AttributeError:
                     continue
+        values.extend(
+            (symbol, model.eval(value, model_completion=True).as_long())
+            for symbol, value in self._values.items()
+            if value.num_args() > 0
+        )
         return Instance(tuple(values))
 
     # -- mathematical queries --------------------------------------------

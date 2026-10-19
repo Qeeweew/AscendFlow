@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from xdsl.dialects.builtin import ModuleOp
 
+from ..analysis.smt import query_scope, query_statistics
 from ..analysis.structured_admission import StructuredAdmission, admit_structured_memory
 from ..analysis.structured_bounds import admit_memory_bounds
 from ..analysis.structured_dependencies import StructuredDependencies, build_structured_dependencies
@@ -53,6 +54,7 @@ class StructuredSynchronization:
     condition_work: ConditionWork
     scalar_facts: ScalarFacts
     timings: tuple[tuple[str, float], ...]
+    integer_queries: tuple[dict, ...]
 
     def __init__(self, *args, **kwargs):
         raise TypeError("use synchronize_structure to establish the executable contracts")
@@ -114,11 +116,13 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
         ("condition_work", conditions),
         ("scalar_facts", scalar_facts),
         ("timings", timings),
+        ("integer_queries", query_statistics()),
     ):
         object.__setattr__(result, name, value)
     return result
 
 
+@query_scope()
 def synchronize_structure(source) -> StructuredSynchronization:
     """Run the current analysis stages, then materialize the selected program.
 

@@ -10,10 +10,17 @@ from ascendflow import indexing
 from ascendflow.diagnostics import CompileError
 from ascendflow.indexing import check_axis, equivalent, physical_terms, polynomial
 from ascendflow.scalar import Expr, Fact, expression, literal
+from ascendflow.symbols import Symbol, SymbolKind
+
+_COORDINATES = {
+    "$g": Symbol("$g", SymbolKind.ORDINAL),
+    "$core": Symbol("$core", SymbolKind.GROUP),
+    "$call": Symbol("$call", SymbolKind.ORDINAL),
+}
 
 
 def argument(name):
-    return Expr("argument", (name,))
+    return Expr("argument", (_COORDINATES.get(name, name),))
 
 
 def split(task, heads, tiles):

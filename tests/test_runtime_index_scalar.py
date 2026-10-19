@@ -26,6 +26,7 @@ from ascendflow.scalar import (
     positive,
     uniform,
 )
+from ascendflow.symbols import Symbol, SymbolKind
 
 
 def argument(name):
@@ -52,12 +53,13 @@ def ceil_quotient(a, b):
 def test_size_contract_uses_its_first_feasible_value(kind):
     sizes = [size(kind, "n", minimum=1, multiple=64), size(kind, "empty", multiple=64)]
     facts = facts_from_sizes([arith.ConstantOp.from_int_and_width(0, IndexType()), *sizes])
-    assert facts["n"].minimum == 64
-    assert facts["empty"].minimum == 0
-    assert facts["n"].maximum <= INT64_MAX
-    assert facts["n"].maximum % 64 == 0
-    assert positive(expression("floordiv", argument("n"), literal(64)), facts)
-    assert not positive(argument("empty"), facts)
+    n, empty = (from_ssa(op.value) for op in sizes)
+    assert facts[n.args[0]].minimum == 64
+    assert facts[empty.args[0]].minimum == 0
+    assert facts[n.args[0]].maximum <= INT64_MAX
+    assert facts[n.args[0]].maximum % 64 == 0
+    assert positive(expression("floordiv", n, literal(64)), facts)
+    assert not positive(empty, facts)
 
 
 def test_fact_bounds_and_duplicate_contracts_must_have_feasible_values():
@@ -171,8 +173,9 @@ def test_unsigned_ssa_extraction_checks_dynamic_divisors_even_with_cached_ir(ope
     value = operation(a.value, b.value).result
     facts, memo = facts_from_sizes([a, b]), {}
     result = from_ssa(value, facts=facts, memo=memo)
-    assert result == expression(kind, argument("a"), argument("b"))
-    for environment in (None, {"a": Fact(), "b": Fact()}):
+    left, right = (from_ssa(op.value) for op in (a, b))
+    assert result == expression(kind, left, right)
+    for environment in (None, {left.args[0]: Fact(), right.args[0]: Fact()}):
         with pytest.raises(CompileError, match="uniform and provably positive"):
             from_ssa(value, facts=environment, memo=memo)
     constant = arith.ConstantOp.from_int_and_width(8, IndexType())
@@ -184,13 +187,14 @@ def test_coordinate_numerator_uses_a_separate_range_environment():
     divisor = size(SizeOp, "d", minimum=1)
     quotient = arith.DivUIOp(block.args[0], divisor.value).result
     facts = facts_from_sizes([divisor])
-    value = from_ssa(quotient, coordinates={block.args[0]: "$g"}, facts=facts)
-    assert value.c() == "(g / npu_size_d)"
+    coordinate = Symbol("$g", SymbolKind.ORDINAL, block.args[0])
+    value = from_ssa(quotient, coordinates={block.args[0]: coordinate}, facts=facts)
+    assert value.evaluate({"$g": 63, "d": 8}) == 7
     assert not uniform(value, facts)
-    assert infer(value, {**facts, "$g": Fact(0, maximum=63)}).maximum == 63
+    assert infer(value, {**facts, coordinate: Fact(0, maximum=63)}).maximum == 63
     bad = arith.DivUIOp(divisor.value, block.args[0]).result
     with pytest.raises(CompileError, match="uniform and provably positive"):
-        from_ssa(bad, coordinates={block.args[0]: "$g"}, facts=facts)
+        from_ssa(bad, coordinates={block.args[0]: coordinate}, facts=facts)
 
 
 def test_unknown_kinds_fail_before_any_ceildiv_emission():

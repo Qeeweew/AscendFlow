@@ -9,13 +9,14 @@ prefix; unsupported domains fail explicitly.
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import gcd
 
 from xdsl.dialects import arith
 
 from .diagnostics import CompileError, require
 from .dialects.physical import RuntimeSizeOp
+from .symbols import Symbol, SymbolKind, symbol_name, symbol_order
 
 INT64_MAX = (1 << 63) - 1
 DIVISION = {"floordiv", "rem", "ceildiv"}
@@ -49,7 +50,7 @@ class _ExprType(type):
         if kind == "constant":
             valid = len(args) == 1 and type(args[0]) is int
         elif kind == "argument":
-            valid = len(args) == 1 and type(args[0]) is str
+            valid = len(args) == 1 and type(args[0]) in {str, Symbol}
         else:
             valid = (
                 kind in BINARY
@@ -97,7 +98,7 @@ def facts_from_sizes(operations):
     """Collect Size/RuntimeSize contracts from an explicitly chosen IR scope."""
     from .dialects.source import SizeOp
 
-    facts = {}
+    facts, contracts = {}, {}
     for op in operations:
         if not isinstance(op, (SizeOp, RuntimeSizeOp)):
             continue
@@ -107,6 +108,12 @@ def facts_from_sizes(operations):
             "invalid uniform scalar contract",
         )
         fact = Fact(minimum, multiple, INT64_MAX)
+        require(
+            name not in contracts or contracts[name] == fact,
+            f"uniform scalar contract disagrees: {name}",
+        )
+        contracts[name] = fact
+        name = Symbol(name, SymbolKind.PARAMETER, op.value)
         require(
             name not in facts or facts[name] == fact, f"uniform scalar contract disagrees: {name}"
         )
@@ -132,7 +139,7 @@ class Expr(metaclass=_ExprType):
     depth: int = field(init=False, compare=False, repr=False)
     order_key: tuple = field(init=False, compare=False, repr=False)
     _hash: int = field(init=False, compare=False, repr=False)
-    variables: frozenset[str] = field(init=False, compare=False, repr=False)
+    variables: frozenset[str | Symbol] = field(init=False, compare=False, repr=False)
 
     def __post_init__(self):
         require(
@@ -146,8 +153,14 @@ class Expr(metaclass=_ExprType):
             require(len(self.args) == 1 and type(self.args[0]) is int, "invalid scalar constant")
         elif self.kind == "argument":
             require(
-                len(self.args) == 1 and isinstance(self.args[0], str), "invalid scalar argument"
+                len(self.args) == 1 and isinstance(self.args[0], (str, Symbol)),
+                "invalid scalar argument",
             )
+            if isinstance(self.args[0], Symbol):
+                require(
+                    all(isinstance(value, Expr) for value in self.args[0].captures),
+                    "scalar captures need original integer coordinates",
+                )
         else:
             require(
                 len(self.args) == 2 and all(isinstance(arg, Expr) for arg in self.args),
@@ -173,13 +186,21 @@ class Expr(metaclass=_ExprType):
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "depth", depth)
         object.__setattr__(self, "_hash", hash((self.kind, self.args)))
-        key = tuple(arg.order_key for arg in children) if children else self.args
+        key = (
+            (symbol_order(self.args[0]),)
+            if self.kind == "argument"
+            else tuple(arg.order_key for arg in children)
+            if children
+            else self.args
+        )
         object.__setattr__(self, "order_key", (self.kind, key))
         names = (
             frozenset((self.args[0],))
             if self.kind == "argument"
             else frozenset().union(*(arg.variables for arg in children))
         )
+        if self.kind == "argument" and isinstance(self.args[0], Symbol):
+            names |= frozenset().union(*(value.variables for value in self.args[0].captures))
         object.__setattr__(self, "variables", names)
 
     def __hash__(self):
@@ -193,7 +214,8 @@ class Expr(metaclass=_ExprType):
         if self.kind == "constant":
             return self.args[0]
         if self.kind == "argument":
-            return values[self.args[0]]
+            symbol = self.args[0]
+            return values[symbol] if symbol in values else values[symbol_name(symbol)]
         a, b = (arg.evaluate(values) for arg in self.args)
         if self.kind in DIVISION:
             require(
@@ -217,7 +239,7 @@ class Expr(metaclass=_ExprType):
         if self.kind == "constant":
             return str(self.args[0])
         if self.kind == "argument":
-            return self.args[0]
+            return symbol_name(self.args[0])
         return f"{self.kind}({', '.join(arg.text() for arg in self.args)})"
 
     def c(self, names=None):
@@ -273,6 +295,14 @@ def substitute(value: Expr, bindings: Mapping[Expr, Expr]) -> Expr:
             return memo[identity]
         if current in bindings:
             result = bindings[current]
+        elif current.kind == "argument" and isinstance(current.args[0], Symbol):
+            symbol = current.args[0]
+            captures = tuple(visit(capture) for capture in symbol.captures)
+            result = (
+                current
+                if captures == symbol.captures
+                else Expr("argument", (replace(symbol, captures=captures),))
+            )
         elif current.kind in {"constant", "argument"}:
             result = current
         else:
@@ -367,7 +397,9 @@ def from_ssa(value, *, coordinates=None, memo=None, facts=None):
         if coordinates and value in coordinates:
             result = Expr("argument", (coordinates[value],))
         elif isinstance(value.owner, (SizeOp, RuntimeSizeOp)):
-            result = Expr("argument", (value.owner.sym_name.data,))
+            result = Expr(
+                "argument", (Symbol(value.owner.sym_name.data, SymbolKind.PARAMETER, value),)
+            )
         elif isinstance(value.owner, arith.ConstantOp):
             result = literal(value.owner.value.value.data)
         else:

@@ -104,6 +104,10 @@ class Compilation:
                     "output_bytes": emission.output_bytes,
                 },
                 "condition_simplification": asdict(plan.condition_work),
+                "integer_queries": {
+                    "scope": "SMT backend calls after each consumer's local query cache",
+                    "environments": plan.integer_queries,
+                },
             },
             "native_templates": len(plan.memory.templates),
             "required_dependencies": len(plan.dependencies.required),

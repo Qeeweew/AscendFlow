@@ -17,7 +17,7 @@ from types import MappingProxyType
 
 from ..indexing import AtomIdentity, exact_constant, normalize_integral
 from ..scalar import DIVISION, Expr, expression, infer, literal
-from .smt import IntegerQueryService
+from .smt import IntegerQueryService, query_service
 from .structured_schedule import Comparison
 
 _OPPOSITE = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
@@ -66,7 +66,7 @@ class IntegerFacts:
     def queries(self):
         """The single mathematical decision procedure for this environment."""
         if self._queries is None:
-            self._queries = IntegerQueryService(self._facts)
+            self._queries = query_service(self._facts)
         return self._queries
 
     @property

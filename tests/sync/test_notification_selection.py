@@ -120,7 +120,8 @@ def test_actual_captures_and_acquires_cover_sources_and_earliest_consumers(actua
 def test_selected_set_and_wait_existence_is_exact_for_empty_short_and_reentry(actual_selection):
     result = actual_selection
     actors = {actor for _, actor in result.dispatch.tasks}
-    maximum_group = result.dependencies.memory.control.environment.facts["$group"].maximum
+    control = result.dependencies.memory.control
+    maximum_group = control.environment.facts[control.group.args[0]].maximum
     assert maximum_group is not None
     for count, requested_group in [(0, 0), (1, 0), (2, 0), (3, 0), (2, 19)]:
         group = min(requested_group, maximum_group)
@@ -153,7 +154,7 @@ def test_selected_set_and_wait_existence_is_exact_for_empty_short_and_reentry(ac
                     if key[0] is point.operation and point.guard.evaluate(context):
                         identity = tuple(
                             (e.args[0], point.expression(e).evaluate(context))
-                            for e in sorted(free, key=lambda e: e.args[0])
+                            for e in sorted(free, key=lambda e: e.order_key)
                         )
                         counter[identity] += 1
                 counters.append(counter)

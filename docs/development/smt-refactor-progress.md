@@ -10,11 +10,11 @@
 |---|---|---|
 | P0 基线与反例 | 部分记录 | 已保留接手补丁、旧调用日志和 FA 失败；完整反例矩阵仍需核对 |
 | P1 整数查询 | 主体已实现，FA ASC 已恢复 | 已接通正式 Z3 依赖、原式数学查询与覆盖；公共例子的完整资格仍待集成 |
-| P2 域与代次 | 待实施 | 尚未接通统一的 typed symbol、occurrence 与坐标映射 |
+| P2 域与代次 | 部分实现 | 已接通 SSA 身份、显式 symbol 种类和 metadata/carry 捕获代次；跨模块坐标接口尚待收敛 |
 | P3 存储与值 | 待实施 | 保留现有合同，尚未完成计划中的收敛 |
 | P4 同步与资源 | 部分修复 | 已保留释放 credit 的物理身份，恢复默认 FA 分配；共享兼容关系收敛仍待实施 |
 | P5 最终链路 | 待实施 | 尚未完成终端边界和旧推理实现删除 |
-| P6 集成资格 | 未取得 | 默认 FA 已有 ASC；尚无本次完整 CANN、设备数值或性能资格 |
+| P6 集成资格 | 未取得 | 第一段实现的默认 FA 已通过 ASC/CANN；当前 typed symbol 版本已有 ASC，尚无本次设备资格 |
 
 ## 2026-10-19 接手与监督恢复
 
@@ -99,3 +99,32 @@ ID 容量或改变 native issue order。
 这只是第一段替换；尚不能称大幅简化，终端两个 pass 等重复推理仍待删除。
 上述日志均属于工作区外层 `runs/`；ASC/IR、输入、编译器树身份和阶段计时
 随实际构建保存。CANN 与设备状态未被这些 Python/ASC 结果代替。
+
+## SSA 身份、捕获代次与编译内查询复用
+
+第一段实现提交为 `2080d9d`。其默认 FA 的 Python→ASC→CANN 完整构建在
+`runs/smt-refactor/owned-fa-cann-01/build-result.json` 中通过，31.4193 秒；
+库 SHA256 为 `c49e976572e7a9ea5be4285478b729f970032ebe789a64a3e40676c592ed255d`。
+使用 CANN 9.1.0、dav-2201，尚未设备执行。
+
+本段将参数、group、SID、loop ordinal、metadata 与 carry 改为显式种类。
+编译器符号绑定真实 SSA/control 定义；打印名字不参与定义身份，不再用 `$`
+前缀判断 uniform 或执行坐标。metadata/carry 捕获实际 group、SID 与祖先 loop
+ordinal；同时替换只应用一次，求解端以捕获坐标为自变量建立实际读取函数。
+不同代次不能借用同一值，相同代次的等价坐标仍指向同一次读取。
+
+完整输入事实快照相同的整数查询服务只在一次编译内共享，退出时释放。
+原始表达式驻留仍只共享语法，不保存范围或正确性事实。报告新增 backend
+查询统计；它计数的是消费者本地缓存之后的查询，不能当作全部 prove 调用数。
+
+验证与实际限度：
+
+- `runs/smt-refactor/owned-symbol-owned-queries-02/build.log`：89 项通过，含
+  symbol/捕获反例、原式语义、实际通知 trace、ownership 重入、execution
+  lowering 和 structured admission（含真实默认 FA）。ruff 和 diff 检查通过。
+- `runs/smt-refactor/owned-fa-symbols-01/benchmark.json`：默认 FA 单次冷进程
+  source→ASC 25.9319 秒，通过；ASC SHA256 与第一段实现相同。本段尚未重跑 CANN。
+- 此次真实编译共用一个四符号输入环境，backend 调用 4,148 次、distinct 3,876，
+  unknown 为零。条件简化 6.6621 秒、标量简化 2.7015 秒，仍有显著重复分析。
+- 该结果不是五次冷进程验收，尚未达到 p50≤5 秒目标；P2 坐标接口、P3、P4
+  资源分配职责及 P5 终端旧推理器的收敛继续实施，不将本段称作完整重构。

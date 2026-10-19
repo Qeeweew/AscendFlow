@@ -10,6 +10,7 @@ from ascendflow.dialects.physical import TaskOp
 from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.scalar import Expr, Fact, expression, literal
+from ascendflow.symbols import Symbol, SymbolKind
 from ascendflow.target.ascend910b import Actor
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
@@ -130,8 +131,10 @@ def test_scalar_carry_retains_unknown_range_instead_of_an_assumed_nonnegative_va
 
 @pytest.mark.parametrize("division", ["ceildiv", "floordiv"])
 def test_divided_loop_bound_keeps_joint_ancestor_bias_and_exact_active_range(division):
-    n, owner, induction = (Expr("argument", (name,)) for name in ("n", "$owner", "$iv"))
-    facts = {"n": Fact(), "$owner": Fact(maximum=6)}
+    n = Expr("argument", ("n",))
+    owner = Expr("argument", (Symbol("$owner", SymbolKind.GROUP),))
+    induction = Expr("argument", (Symbol("$iv", SymbolKind.ORDINAL),))
+    facts = {"n": Fact(), owner.args[0]: Fact(maximum=6)}
     for divisor in (2, 3, 7):
         upper = expression(
             division, expression("max", literal(0), expression("sub", n, owner)), literal(divisor)
@@ -153,8 +156,10 @@ def test_divided_loop_bound_keeps_joint_ancestor_bias_and_exact_active_range(div
 def test_divided_lower_bound_preserves_only_the_matching_joint_coordinate(
     lower_bias, lower_divisor
 ):
-    end, owner, induction = (Expr("argument", (name,)) for name in ("end", "$owner", "$iv"))
-    facts = {"begin": Fact(), "end": Fact(), "$owner": Fact(maximum=6)}
+    end = Expr("argument", ("end",))
+    owner = Expr("argument", (Symbol("$owner", SymbolKind.GROUP),))
+    induction = Expr("argument", (Symbol("$iv", SymbolKind.ORDINAL),))
+    facts = {"begin": Fact(), "end": Fact(), owner.args[0]: Fact(maximum=6)}
     for start in range(12):
         lower = expression(
             "ceildiv",

@@ -28,6 +28,7 @@ from ..diagnostics import CompileError
 from ..dialects.physical import CoreIdOp, RuntimeSizeOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ..scalar import Expr, Fact, literal
+from ..symbols import is_coordinate, symbol_name
 
 
 @dataclass
@@ -50,7 +51,7 @@ class ScalarFacts:
                 fact.multiple,
                 min(
                     (1 << 63) - 1 if fact.maximum is None else fact.maximum,
-                    result.limits.get(name, (1 << 63) - 1),
+                    result.limits.get(symbol_name(name), (1 << 63) - 1),
                 ),
             )
             for name, fact in control.environment.facts.items()
@@ -128,7 +129,7 @@ class ScalarFacts:
                     continue
                 try:
                     expr = control.environment.expression(value)
-                    if not any(name.startswith("$") for name in expr.variables):
+                    if not any(is_coordinate(name) for name in expr.variables):
                         uniform_range = bounds(expr)
                         if uniform_range is not None:
                             low, high = uniform_range
@@ -794,7 +795,7 @@ def _runtime_limits(expressions):
             if value.constant is not None:
                 result = value.constant, None
             elif value.kind == "argument":
-                result = 1, value.args[0]
+                result = 1, symbol_name(value.args[0])
             elif value.kind == "mul":
                 left, right = (product(child) for child in value.args)
                 if left is not None and right is not None and (left[1] is None or right[1] is None):

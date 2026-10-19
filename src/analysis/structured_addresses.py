@@ -20,6 +20,7 @@ from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.structured import AddressOp
 from ..indexing import check_axis, equivalent, exact_constant, normalize
 from ..scalar import Expr, Fact, expression, from_ssa, literal
+from ..symbols import Symbol
 from ..target.native import ITEMSIZE, NativeGeometry
 
 
@@ -100,7 +101,7 @@ class ScalarEnvironment:
     domain supplied to a proof, never to this uniform-input environment.
     """
 
-    def __init__(self, bindings: Mapping[SSAValue, Expr], facts: Mapping[str, Fact]):
+    def __init__(self, bindings: Mapping[SSAValue, Expr], facts: Mapping[str | Symbol, Fact]):
         require(
             all(
                 isinstance(value, SSAValue) and isinstance(expr, Expr)
@@ -109,14 +110,17 @@ class ScalarEnvironment:
             "structured scalar bindings need actual SSA values and expressions",
         )
         require(
-            all(isinstance(name, str) and isinstance(fact, Fact) for name, fact in facts.items()),
+            all(
+                isinstance(name, (str, Symbol)) and isinstance(fact, Fact)
+                for name, fact in facts.items()
+            ),
             "structured uniform scalar facts need names and Fact values",
         )
         self._memo = dict(bindings)
-        self._facts: Mapping[str, Fact] = MappingProxyType(dict(facts))
+        self._facts: Mapping[str | Symbol, Fact] = MappingProxyType(dict(facts))
 
     @property
-    def facts(self) -> Mapping[str, Fact]:
+    def facts(self) -> Mapping[str | Symbol, Fact]:
         return self._facts
 
     def expression(self, value: SSAValue) -> Expr:

@@ -43,6 +43,7 @@ from ..dialects.physical import TaskOp
 from ..dialects.structured import ActorDomainOp
 from ..indexing import arguments, equivalent, nonnegative, normalize
 from ..scalar import Expr, expression, literal
+from ..symbols import is_coordinate
 from ..target.ascend910b import Actor, Engine
 
 
@@ -210,7 +211,7 @@ def _bind_endpoint(
     selections = []
     family_map = {domain.loop: domain for domain in occurrence.families}
     available = {control.group.args[0], control.sid.args[0]}
-    available.update(name for name in environment.facts if not name.startswith("$"))
+    available.update(name for name in environment.facts if not is_coordinate(name))
     for frame in occurrence.frame.ancestors():
         operation = frame.operation
         if isinstance(operation, TaskOp) and operation.native.data == "index_load":

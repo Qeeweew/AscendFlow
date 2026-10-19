@@ -13,6 +13,7 @@ from itertools import product
 
 from .diagnostics import CompileError, require
 from .scalar import DIVISION, Expr, expression, literal
+from .symbols import Symbol, SymbolKind, is_coordinate
 
 MAX_TERMS = 256
 MAX_WORK = 16384
@@ -261,7 +262,7 @@ class _PolynomialQuery:
                 and expr.kind == "rem"
                 and divisor.constant is not None
                 and coordinate.kind == "argument"
-                and coordinate.args[0].startswith("$")
+                and is_coordinate(coordinate.args[0])
             ):
                 result = {(self.atom(expr),): 1}
             elif expr.kind == "rem":
@@ -387,7 +388,7 @@ def physical_terms(expr, facts):
     """Separate a uniform coefficient from one physical clock per term."""
     grouped = {}
     for term, coefficient in polynomial(expr, facts, periodic=True).items():
-        coordinates = [atom for atom in term if any(n.startswith("$") for n in arguments(atom))]
+        coordinates = [atom for atom in term if any(is_coordinate(n) for n in arguments(atom))]
         require(len(coordinates) <= 1, "address combines unsupported task clocks")
         coordinate = coordinates[0] if coordinates else None
         uniform = list(term)
@@ -484,7 +485,7 @@ def _joint_affine_interval(expr, domains, facts, *, atomic=False, queries=None):
         (coordinate, lower, upper)
         for coordinate, lower, upper in domains
         if coordinate.kind in ({"argument", "add", "mul"} if atomic else {"add", "mul"})
-        and any(name.startswith("$") for name in arguments(coordinate))
+        and any(is_coordinate(name) for name in arguments(coordinate))
     ]
     if not candidates or expr.kind not in {"add", "mul"}:
         return None
@@ -493,7 +494,7 @@ def _joint_affine_interval(expr, domains, facts, *, atomic=False, queries=None):
         return {
             term: coefficient
             for term, coefficient in poly.items()
-            if any(name.startswith("$") for atom in term for name in arguments(atom))
+            if any(is_coordinate(name) for atom in term for name in arguments(atom))
         }
 
     query = _PolynomialQuery(facts, opaque_quotients=True)
@@ -747,15 +748,26 @@ def validate_source_arithmetic(program):
 
     facts = facts_from_sizes(program.body.block.ops)
     owner = program.body.block.args[0]
-    core = Expr("argument", ("$core",))
-    facts["$core"] = Fact(maximum=program.groups.data - 1)
+    core = Expr("argument", (Symbol("$core", SymbolKind.GROUP, program),))
+    facts[core.args[0]] = Fact(maximum=program.groups.data - 1)
     number = 0
 
     def walk(block, coordinates, domains):
         nonlocal number
         for op in block.ops:
             if isinstance(op, IndexReadOp):
-                name = f"$metadata{number}"
+                name = Symbol(
+                    f"$metadata{number}",
+                    SymbolKind.METADATA,
+                    op.value,
+                    tuple(
+                        Expr("argument", (symbol,))
+                        for symbol in coordinates.values()
+                        if isinstance(symbol, Symbol)
+                        and symbol.kind
+                        in {SymbolKind.GROUP, SymbolKind.PARTICIPANT, SymbolKind.ORDINAL}
+                    ),
+                )
                 number += 1
                 lower, upper = (
                     from_ssa(v, coordinates=coordinates, facts=facts)
@@ -802,7 +814,11 @@ def validate_source_arithmetic(program):
                 )
             local, ranges = coordinates, domains
             if isinstance(op, (PipelineOp, DomainOp, scf.ForOp)):
-                name = f"$index{number}"
+                name = Symbol(
+                    f"$index{number}",
+                    SymbolKind.PARTICIPANT if isinstance(op, DomainOp) else SymbolKind.ORDINAL,
+                    op,
+                )
                 number += 1
                 value = op.body.block.args[0]
                 if isinstance(op, DomainOp):
@@ -838,5 +854,7 @@ def validate_source_arithmetic(program):
                     walk(child, local, ranges)
 
     walk(
-        program.body.block, {owner: "$core"}, [(core, literal(0), literal(program.groups.data - 1))]
+        program.body.block,
+        {owner: core.args[0]},
+        [(core, literal(0), literal(program.groups.data - 1))],
     )

@@ -12,7 +12,8 @@ from xdsl.dialects.builtin import IndexType
 from ..diagnostics import ErrorKind, require
 from ..indexing import _joint_affine_interval, arguments, nonnegative
 from ..scalar import Expr, expression, literal, positive
-from .smt import IntegerQueryService
+from ..symbols import is_coordinate
+from .smt import query_service
 
 
 def _require(condition, message, operation, *, kind=ErrorKind.UNSUPPORTED, witness=()):
@@ -39,7 +40,7 @@ class _HostRanges:
 
     def __init__(self, domains, facts):
         self.domains, self.facts, self.ranges = domains, facts, {}
-        self.queries = IntegerQueryService(facts)
+        self.queries = query_service(facts)
         for coordinate, lower, upper in domains:
             self.ranges.setdefault(coordinate, (lower, upper))
 
@@ -49,7 +50,7 @@ class _HostRanges:
         return self.ranges[value]
 
     def _construct(self, value):
-        if not any(name.startswith("$") for name in arguments(value)):
+        if not any(is_coordinate(name) for name in arguments(value)):
             return value, value
         if value.kind in {"constant", "argument"}:
             return value, value  # Unknown scalar carries remain unbounded.
@@ -107,7 +108,7 @@ def build_host_expressions(memory, bounds):
             scopes[domains] = _HostRanges(domains, facts)
         ranges = scopes[domains]
         for _ in range(len(domains) + 2):
-            if not any(name.startswith("$") for name in arguments(lower) | arguments(upper)):
+            if not any(is_coordinate(name) for name in arguments(lower) | arguments(upper)):
                 result[lower] = result[upper] = None
                 return
             next_lower = ranges.visit(lower)[0]

@@ -23,7 +23,8 @@ from ..diagnostics import ErrorKind, require
 from ..dialects.physical import CoreIdOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ..indexing import arguments, domain_nonnegative, equivalent, interval, nonnegative
-from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
+from ..scalar import INT64_MAX, Expr, Fact, expression, from_ssa, literal, positive
+from ..symbols import Symbol, SymbolKind, is_coordinate
 from ..target.ascend910b import Actor
 from .structured_addresses import ScalarEnvironment
 
@@ -36,7 +37,7 @@ def _uniform_parts(value, memo):
         return memo[value]
     zero = literal(0)
     if value.kind in {"constant", "argument"}:
-        varying = value.kind == "argument" and value.args[0].startswith("$")
+        varying = value.kind == "argument" and is_coordinate(value.args[0])
         result = (zero, value) if varying else (value, zero)
     else:
         (au, av), (bu, bv) = (_uniform_parts(child, memo) for child in value.args)
@@ -176,6 +177,13 @@ class ControlFacts:
                 for coordinate, _, _ in frame.parent.domains()
                 if coordinate.kind == "argument"
             )
+        if frame is not None:
+            for ancestor in frame.ancestors():
+                operation = ancestor.operation
+                if isinstance(operation, TaskOp) and operation.native.data == "index_load":
+                    symbol = self.environment.expression(operation.value).args[0]
+                    if all(arguments(value) <= names for value in symbol.captures):
+                        names.add(symbol)
         return arguments(value) <= names
 
 
@@ -195,8 +203,12 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
     require(1 <= groups <= 1024, "invalid physical group count")
     mixed = isinstance(root, MixedOp)
     require(mixed or root.core.data in {"aic", "aiv"}, "unsupported physical actor family")
-    group, sid = Expr("argument", ("$group",)), Expr("argument", ("$sid",))
-    facts = {"$group": Fact(maximum=groups - 1), "$sid": Fact(maximum=1 if mixed else 0)}
+    group = Expr("argument", (Symbol("$group", SymbolKind.GROUP, root),))
+    sid = Expr("argument", (Symbol("$sid", SymbolKind.PARTICIPANT, root),))
+    facts = {
+        group.args[0]: Fact(maximum=groups - 1),
+        sid.args[0]: Fact(maximum=1 if mixed else 0),
+    }
     bindings, loops, frames = {}, {}, {}
     runtime_names = set()
     visited = unknown = 0
@@ -204,10 +216,13 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
     def scalar(value):
         return from_ssa(value, memo=bindings, facts=facts)
 
-    def unknown_scalar(value):
+    def unknown_scalar(value, frame, kind=SymbolKind.CARRY):
         nonlocal unknown
         if isinstance(value.type, IndexType):
-            bindings[value] = Expr("argument", (f"$scalar{unknown}",))
+            captures = (group, sid, *(loop.ordinal for loop in frame.loops()))
+            bindings[value] = Expr(
+                "argument", (Symbol(f"$scalar{unknown}", kind, value, captures),)
+            )
             unknown += 1
 
     def visit(operation, frame):
@@ -217,8 +232,9 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
             name = operation.sym_name.data
             require(name not in runtime_names, "duplicate runtime parameter identity")
             runtime_names.add(name)
-            facts[name] = Fact(operation.minimum.data, operation.multiple.data)
-            bindings[operation.value] = Expr("argument", (name,))
+            symbol = Symbol(name, SymbolKind.PARAMETER, operation.value)
+            facts[symbol] = Fact(operation.minimum.data, operation.multiple.data, INT64_MAX)
+            bindings[operation.value] = Expr("argument", (symbol,))
         elif isinstance(operation, CoreIdOp):
             bindings[operation.value] = group
         elif isinstance(operation, TaskOp) and operation.native.data == "index_load":
@@ -231,7 +247,7 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                 and isinstance(operation.value.type, IndexType),
                 "index metadata load lost its explicit bounds",
             )
-            unknown_scalar(operation.value)
+            unknown_scalar(operation.value, frame, SymbolKind.METADATA)
             coordinate = bindings[operation.value]
             lower, upper = scalar(operation.refs[1]), scalar(operation.refs[2])
             frame = ControlFrame(
@@ -268,7 +284,9 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                 phase="structured control",
                 location=str(operation.location),
             )
-            ordinal = Expr("argument", (f"$loop{len(loops)}",))
+            ordinal = Expr(
+                "argument", (Symbol(f"$loop{len(loops)}", SymbolKind.ORDINAL, operation),)
+            )
             difference = expression("sub", upper, lower)
             # This count is a derived mathematical coordinate, not a rewrite
             # of the original loop header. Preserve that header/SSA for its
@@ -297,15 +315,17 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
             )
             if isinstance(operation, scf.ForOp):
                 bindings[operation.body.block.args[0]] = induction
-                for value in (*operation.body.block.args[1:], *operation.results):
-                    unknown_scalar(value)
+                for value in operation.body.block.args[1:]:
+                    unknown_scalar(value, frame)
+                for value in operation.results:
+                    unknown_scalar(value, frame.parent)
         elif isinstance(operation, PipelineStageOp):
             loop = loops[operation.parent_op()]
             bindings[operation.body.block.args[0]] = loop.ordinal
             frame = ControlFrame(frame, operation, frame.participants)
         elif isinstance(operation, scf.IfOp):
             for value in operation.results:
-                unknown_scalar(value)
+                unknown_scalar(value, frame)
         frames[operation] = frame
         for branch, region in enumerate(operation.regions):
             child_frame = (

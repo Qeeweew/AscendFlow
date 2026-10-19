@@ -137,6 +137,9 @@ MAD 首轮/周期 clear 所需的 ordinal 是显式 index operand，
 ## 标量与条件的共同事实
 
 可执行标量使用 xDSL SSA，`scalar.Expr` 是原始整数分析的视图。
+`symbols.Symbol` 绑定实际 SSA/control 身份与明确种类，名字只用于诊断；
+metadata/carry 捕获 group、SID 与祖先 loop ordinal，并随同时坐标替换特化。
+`analysis.smt` 在一次编译内按完整不可变输入快照共享查询服务，不跨构建保存。
 原式定义性先检查；数学化简不能掩盖非法 unsigned 求值或原始溢出。
 `ScalarFacts` 复用已建立的控制域、联合 owner/iteration 范围和合法索引前提。
 整数与谓词 pass 共用以真实 SSA 为原子的仿射视图，并保留非线性、除法和余数节点。

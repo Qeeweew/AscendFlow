@@ -15,6 +15,7 @@ from ascendflow.analysis.structured_schedule import Comparison
 from ascendflow.diagnostics import CompileError, ErrorKind
 from ascendflow.indexing import arguments
 from ascendflow.scalar import INT64_MAX, Expr, Fact, expression, literal
+from ascendflow.symbols import Symbol, SymbolKind
 from ascendflow.target.ascend910b import Engine
 
 G = Expr("argument", ("g",))
@@ -210,19 +211,19 @@ def test_false_specialized_prefix_does_not_construct_nonexistent_unsigned_select
 
 
 def test_group_invocation_parameter_binding_specializes_the_same_concrete_fiber():
-    group = Expr("argument", ("$group",))
+    group = Expr("argument", (Symbol("$group", SymbolKind.GROUP),))
     residue = expression("rem", group, literal(3))
     window = _window(
         (Comparison(expression("rem", G, literal(3)), "==", residue),),
-        facts={"$group": Fact(maximum=19)},
+        facts={group.args[0]: Fact(maximum=19)},
         bindings={group: literal(2)},
         domains=lambda loop: (LoopDomain(loop, N, 3, residue),),
     )
     assert window.residues == (literal(2),)
     _oracle(window, 8, lambda g: g % 3 == 2, context={"$group": 0})
-    sid = Expr("argument", ("$sid",))
+    sid = Expr("argument", (Symbol("$sid", SymbolKind.PARTICIPANT),))
     with pytest.raises(CompileError, match="uniform input"):
-        _window(facts={"$sid": Fact(maximum=1)}, bindings={sid: literal(0)})
+        _window(facts={sid.args[0]: Fact(maximum=1)}, bindings={sid: literal(0)})
 
 
 def test_negative_static_affine_coefficient_has_exact_residues():
