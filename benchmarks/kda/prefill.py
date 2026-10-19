@@ -31,9 +31,10 @@ PHASES = (
     "transform",
     "wu",
     "scan",
+    "output",
 )
 KERNELS = {p: "prefill_" + ("solve_merge" if p.startswith("solve_merge") else p) for p in PHASES}
-RUNTIME_PHASES = {"prepare_full", "prepare", "scan"}
+RUNTIME_PHASES = {"prepare_full", "prepare", "output"}
 ORDERS = {
     "prepare": (
         "Q",
@@ -65,26 +66,29 @@ ORDERS = {
     ),
     "solve_merge16": ("Negative", "Diagonal", "Merge16", "Ai32", "Inverse"),
     "solve_merge32": ("Negative", "Ai32", "Merge32", "Off32", "Inverse"),
-    "transform": ("Qp", "Kp", "Vp", "Gp", "Bp", "Right", "KG", "QG", "Lengths"),
-    "wu": ("Inverse", "Right", "WU"),
+    "transform": ("Qp", "Kp", "Vp", "Gp", "Bp", "Right", "KG", "QG", "Aqk", "A16", "Lengths"),
+    "wu": ("Inverse", "Right", "U", "W16Ring", "W32"),
     "scan": (
-        "WU",
+        "U",
         "KG",
-        "QG",
         "Gp",
-        "Aqk",
         "Initial",
         "Final",
-        "Output",
         "History",
         "Snapshot",
         "W32",
         "Projection",
         "Residual",
-        "A16",
         "Delta",
-        "Inter",
-        "Intra",
+        "Lengths",
+    ),
+    "output": (
+        "QG",
+        "A16",
+        "Snapshot",
+        "Residual",
+        "Output",
+        "OutputProducts",
         "Starts",
         "Lengths",
     ),
@@ -134,7 +138,7 @@ def build(args):
         print(f"build prefill_{phase}", flush=True)
         options = parameters | (
             {"SEQUENCES": len(args.lengths), "NC": nc}
-            if phase in {"prepare_full", "prepare", "scan"}
+            if phase in {"prepare_full", "prepare", "scan", "output"}
             else {}
         )
         if phase.startswith("solve_merge"):
@@ -144,7 +148,9 @@ def build(args):
         build_file(
             Path(__file__).resolve().parents[2]
             / (
-                "examples/kda/prefill_prepare.py"
+                "examples/kda/prefill_output.py"
+                if phase == "output"
+                else "examples/kda/prefill_prepare.py"
                 if phase == "prepare_full"
                 else "examples/kda/prefill_gram.py"
                 if phase == "gram_cross"
@@ -199,7 +205,9 @@ def validate_artifacts(directory, heads, dtype, chunks, sequences):
             if "Qp" in buffers
             else buffers["Inverse"]
             if phase.startswith("solve_merge") or phase == "wu"
-            else buffers["WU"]
+            else buffers["QG"]
+            if phase == "output"
+            else buffers["U"]
         )
         require(
             primary.shape.data[0].data == chunks
@@ -240,6 +248,28 @@ def validate_artifacts(directory, heads, dtype, chunks, sequences):
             require(
                 operands == [(128, width) for width in (16, 32)],
                 "Gram panel specialization differs",
+            )
+        if phase == "wu":
+            require(
+                all(
+                    tuple(d.data for d in buffers[name].shape.data) == shape
+                    and buffers[name].dtype.data == storage
+                    for name, shape, storage in (
+                        ("U", (chunks, heads, 64, 128), dtype),
+                        ("W32", (chunks, heads, 64, 128), "f32"),
+                        ("W16Ring", (20, 2, 64, 128), dtype),
+                    )
+                ),
+                "W/U output or conversion workspace differs from the runner",
+            )
+        if phase == "output":
+            require(
+                tuple(d.data for d in buffers["A16"].shape.data) == (chunks, heads, 64, 64)
+                and buffers["A16"].dtype.data == dtype
+                and tuple(d.data for d in buffers["OutputProducts"].shape.data)
+                == (20, 2, 2, 64, 128)
+                and buffers["OutputProducts"].dtype.data == "f32",
+                "output ring workspace differs from the runner",
             )
         if phase == "scan":
             require(
@@ -352,7 +382,7 @@ def worker(args):
 
     for name in ("Qp", "Kp", "Vp", "KG", "QG", "Residual"):
         workspace(name, (chunks, heads, bt, dimension), dtype)
-    for name in ("Gp", "W32", "Projection", "Inter", "Intra"):
+    for name in ("Gp", "W32", "Projection"):
         workspace(name, (chunks, heads, bt, dimension), torch.float32)
     workspace("Aqk", (chunks, heads, bt, bt), torch.float32)
     for name in ("Ai32", "Negative", "Diagonal"):
@@ -361,10 +391,12 @@ def worker(args):
     for width in (16, 32):
         workspace(f"Merge{width}", (20, 2, width, width), torch.float32)
     workspace("Off32", (20, 2, 32, 32), torch.float32)
-    for name in ("Inverse", "A16"):
-        workspace(name, (chunks, heads, bt, bt), dtype)
-    for name in ("Right", "WU"):
-        workspace(name, (chunks, heads, 2, bt, dimension), dtype)
+    workspace("Inverse", (chunks, heads, bt, bt), dtype)
+    workspace("A16", (chunks, heads, bt, bt), dtype)
+    workspace("OutputProducts", (20, 2, 2, bt, dimension), torch.float32)
+    workspace("Right", (chunks, heads, 2, bt, dimension), dtype)
+    workspace("U", (chunks, heads, bt, dimension), dtype)
+    workspace("W16Ring", (20, 2, bt, dimension), dtype)
     workspace("Snapshot", (chunks, heads, dimension, dimension), dtype)
     workspace("Delta", (chunks, heads, dimension, dimension), torch.float32)
     workspace("GramLeft", (20, 2, pack_tasks, 128, dimension), torch.float32)

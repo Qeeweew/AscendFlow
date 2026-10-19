@@ -259,6 +259,8 @@ def prefill_transform(
     Right: N.Tensor((CHUNKS, H, 2, BT, K), DTYPE, access="write", write_disjoint=True),
     KG: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
     QG: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
+    Aqk: N.Tensor((CHUNKS, H, BT, BT), N.f32),
+    A16: N.Tensor((CHUNKS, H, BT, BT), DTYPE, access="write", write_disjoint=True),
     Lengths: N.Tensor((CHUNKS,), N.i64),
     CHUNKS: N.constexpr = 2,
     H: N.constexpr = 32,
@@ -277,6 +279,8 @@ def prefill_transform(
         last = N.alloc_ub((K,), N.f32)
         beta = N.alloc_ub((BT,), N.f32)
         rows = N.alloc_ub((BT, 8), N.f32)
+        af32 = N.alloc_ub((BT, BT), N.f32)
+        af16 = N.alloc_ub((BT, BT), DTYPE)
         for task in N.serial(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
@@ -313,13 +317,18 @@ def prefill_transform(
             N.mul(work, factor, out=work)
             N.cast(work, out=packed)
             N.copy(packed, QG[chunk, head, :, :])
+            N.copy(Aqk[chunk, head, :, :], af32)
+            N.cast(af32, out=af16)
+            N.copy(af16, A16[chunk, head, :, :])
 
 
 @N.prim_func(disjoint_external=True)
 def prefill_wu(
     Inverse: N.Tensor((CHUNKS, H, BT, BT), DTYPE),
     Right: N.Tensor((CHUNKS, H, 2, BT, K), DTYPE),
-    WU: N.Tensor((CHUNKS, H, 2, BT, K), DTYPE, access="write", write_disjoint=True),
+    U: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
+    W16Ring: N.Tensor((GROUPS, 2, BT, K), DTYPE, access="write"),
+    W32: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write", write_disjoint=True),
     CHUNKS: N.constexpr = 2,
     H: N.constexpr = 32,
     K: N.constexpr = 128,
@@ -327,50 +336,56 @@ def prefill_wu(
     GROUPS: N.constexpr = 20,
     DTYPE: N.constexpr = N.f16,
 ):
-    with N.Kernel(GROUPS, kind="cube") as owner:
+    with N.Kernel(GROUPS, kind="mixed") as owner:
         a1 = N.alloc_l1((2, BT, BT), DTYPE)
         b1 = N.alloc_l1((2, 2, BT, K), DTYPE)
         a0 = N.alloc_l0a((BT, BT), DTYPE)
         b0 = N.alloc_l0b((BT, K), DTYPE)
         c0 = N.alloc_l0c((BT, K), N.f32)
-        for task in N.Pipelined(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS), stages=2):
+        w16 = N.alloc_ub((2, BT // 2, K), DTYPE)
+        w32 = N.alloc_ub((2, BT // 2, K), N.f32)
+        for task in N.Pipelined(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS), stages=3):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
             ring = task % 2
-            with N.Stage(0, name="load"):
+            with N.Stage(0, name="load"), N.Cube():
                 N.copy(Inverse[chunk, head, :, :], a1[ring, :, :])
                 for part in N.unroll(2):
                     N.copy(Right[chunk, head, part, :, :], b1[ring, part, :, :])
-            with N.Stage(1, name="compute"):
+            with N.Stage(1, name="compute"), N.Cube():
                 aa = N.copy(a1[ring, :, :], a0)
-                for part in N.unroll(2):
-                    bb = N.copy(b1[ring, part, :, :], b0)
-                    N.matmul(aa, bb, accum=c0, initialize=True)
-                    N.copy(c0, WU[chunk, head, part, :, :])
+                ww = N.copy(b1[ring, 0, :, :], b0)
+                N.matmul(aa, ww, accum=c0, initialize=True)
+                N.copy(c0, W16Ring[owner, ring, :, :])
+                uu = N.copy(b1[ring, 1, :, :], b0)
+                N.matmul(aa, uu, accum=c0, initialize=True)
+                N.copy(c0, U[chunk, head, :, :])
+            with N.Stage(2, name="cast"), N.Vector() as lane:
+                # Preserve the low-precision W rounding before its FP32 projection.
+                N.copy(
+                    W16Ring[owner, ring, lane * (BT // 2) : (lane + 1) * (BT // 2), :],
+                    w16[ring, :, :],
+                )
+                N.cast(w16[ring, :, :], out=w32[ring, :, :])
+                N.copy(
+                    w32[ring, :, :], W32[chunk, head, lane * (BT // 2) : (lane + 1) * (BT // 2), :]
+                )
 
 
 @N.prim_func(disjoint_external=True)
 def prefill_scan(
-    WU: N.Tensor((CHUNKS, H, 2, BT, K), DTYPE),
+    U: N.Tensor((CHUNKS, H, BT, K), DTYPE),
     KG: N.Tensor((CHUNKS, H, BT, K), DTYPE),
-    QG: N.Tensor((CHUNKS, H, BT, K), DTYPE),
     Gp: N.Tensor((CHUNKS, H, BT, K), N.f32),
-    Aqk: N.Tensor((CHUNKS, H, BT, BT), N.f32),
     Initial: N.Tensor((SEQUENCES, H, K, K), N.f32),
     Final: N.Tensor((SEQUENCES, H, K, K), N.f32, access="write", write_disjoint=True),
-    Output: N.Tensor((TOKENS, H, K), DTYPE, access="write", write_disjoint=True),
     History: N.Tensor((SEQUENCES, H, K, K), N.f32, access="write"),
-    Snapshot: N.Tensor((CHUNKS, H, K, K), DTYPE, access="write"),
-    W32: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write"),
+    Snapshot: N.Tensor((CHUNKS, H, K, K), DTYPE, access="write", write_disjoint=True),
+    W32: N.Tensor((CHUNKS, H, BT, K), N.f32),
     Projection: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write"),
     Residual: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write"),
-    A16: N.Tensor((CHUNKS, H, BT, BT), DTYPE, access="write"),
     Delta: N.Tensor((CHUNKS, H, K, K), N.f32, access="write"),
-    Inter: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write"),
-    Intra: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write"),
-    Starts: N.Tensor((CHUNKS,), N.i64),
     Lengths: N.Tensor((CHUNKS,), N.i64),
-    TOKENS: N.int64(minimum=1),
     SEQUENCES: N.constexpr = 1,
     NC: N.constexpr = 2,
     CHUNKS: N.constexpr = 2,
@@ -383,31 +398,23 @@ def prefill_scan(
     DTYPE: N.constexpr = N.f16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
-        assert K == 128 and BT == 64 and CK == 64 and BV == 64, "initial scan tile policy"
+        assert K == 128 and BT == 64 and CK == 64 and BV == 64, "scan tile policy"
         assert CHUNKS == SEQUENCES * NC, "each sequence has NC nonempty chunks"
         carry = N.alloc_ub((BV, K), N.f32)
         state16 = N.alloc_ub((BV, K), DTYPE)
-        w16 = N.alloc_ub((BT // 2, K), DTYPE)
-        w32 = N.alloc_ub((BT // 2, K), N.f32)
-        u16 = N.alloc_ub((BT, BV), DTYPE)
+        u16 = N.alloc_ub((2, BT, BV), DTYPE)
         scratch = N.alloc_ub((BT, BV), N.f32)
         other = N.alloc_ub((BT, BV), N.f32)
         r16 = N.alloc_ub((BT, BV), DTYPE)
-        af32 = N.alloc_ub((BT // 2, BT), N.f32)
-        af16 = N.alloc_ub((BT // 2, BT), DTYPE)
         update = N.alloc_ub((BV, K), N.f32)
-        last_gate = N.alloc_ub((K,), N.f32)
-        a32_1 = N.alloc_l1((BT, CK), N.f32)
+        last_gate = N.alloc_ub((2, K), N.f32)
+        a32_1 = N.alloc_l1((2, K // CK, BT, CK), N.f32)
         b32_1 = N.alloc_l1((K, CK), N.f32)
         a32_0 = N.alloc_l0a((BT, CK), N.f32)
         b32_0 = N.alloc_l0b((CK, K), N.f32)
         res1 = N.alloc_l1((BT, K), DTYPE)
-        kg1 = N.alloc_l1((BT, K), DTYPE)
-        q1 = N.alloc_l1((BT, CK), DTYPE)
-        h1 = N.alloc_l1((K, CK), DTYPE)
-        aq1 = N.alloc_l1((BT, BT), DTYPE)
+        kg1 = N.alloc_l1((2, BT, K), DTYPE)
         update_a0 = N.alloc_l0a((K, BT), DTYPE)
-        out_a0 = N.alloc_l0a((BT, CK), DTYPE)
         right0 = N.alloc_l0b((BT, K), DTYPE)
         score0 = N.alloc_l0c((BT, K), N.f32)
         state0 = N.alloc_l0c((K, K), N.f32)
@@ -416,86 +423,50 @@ def prefill_scan(
             seq, head = flat // H, flat % H
             with N.Vector() as initial_lane:
                 N.copy(Initial[seq, head, initial_lane * BV : (initial_lane + 1) * BV, :], carry)
-            for local in N.serial(NC):
+            for local in N.Pipelined(NC, stages=2):
                 chunk = seq * NC + local
-                for clock in N.Pipelined(1, stages=5):
-                    with N.Stage(0, name="publish"), N.Vector() as lane:
+                ring = local % 2
+                with N.Stage(0, name="prefetch"):
+                    with N.Vector() as lane:
+                        valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
+                        N.copy(Gp[chunk, head, valid - 1, :], last_gate[ring, :])
+                        N.exp(last_gate[ring, :], out=last_gate[ring, :])
+                        N.copy(U[chunk, head, :, lane * BV : (lane + 1) * BV], u16[ring, :, :])
+                    with N.Cube():
+                        for part in N.unroll(K // CK):
+                            N.copy(
+                                W32[chunk, head, :, part * CK : (part + 1) * CK],
+                                a32_1[ring, part, :, :],
+                            )
+                        N.copy(KG[chunk, head, :, :], kg1[ring, :, :])
+                with N.Stage(1, name="recur"):
+                    with N.Vector() as lane:
                         N.copy(carry, History[seq, head, lane * BV : (lane + 1) * BV, :])
                         N.cast(carry, out=state16)
                         N.copy(state16, Snapshot[chunk, head, lane * BV : (lane + 1) * BV, :])
-                        N.copy(
-                            WU[chunk, head, 0, lane * (BT // 2) : (lane + 1) * (BT // 2), :], w16
-                        )
-                        N.cast(w16, out=w32)
-                        N.copy(w32, W32[chunk, head, lane * (BT // 2) : (lane + 1) * (BT // 2), :])
-                    with N.Stage(1, name="projection"), N.Cube():
+                    with N.Cube():
                         for part in N.unroll(K // CK):
-                            aa = N.copy(W32[chunk, head, :, part * CK : (part + 1) * CK], a32_1)
                             bb = N.copy(History[seq, head, :, part * CK : (part + 1) * CK], b32_1)
-                            aa = N.copy(aa, a32_0)
+                            aa = N.copy(a32_1[ring, part, :, :], a32_0)
                             bb = N.copy(bb, b32_0, transpose=True)
                             N.matmul(aa, bb, accum=score0, initialize=part == 0)
                         N.copy(score0, Projection[chunk, head, :, :])
-                    with N.Stage(2, name="residual"), N.Vector() as lane:
-                        N.copy(WU[chunk, head, 1, :, lane * BV : (lane + 1) * BV], u16)
-                        N.cast(u16, out=other)
+                    with N.Vector() as lane:
+                        N.cast(u16[ring, :, :], out=other)
                         N.copy(Projection[chunk, head, :, lane * BV : (lane + 1) * BV], scratch)
                         N.sub(other, scratch, out=scratch)
                         N.cast(scratch, out=r16)
                         N.copy(r16, Residual[chunk, head, :, lane * BV : (lane + 1) * BV])
-                        N.copy(Aqk[chunk, head, lane * (BT // 2) : (lane + 1) * (BT // 2), :], af32)
-                        N.cast(af32, out=af16)
-                        N.copy(af16, A16[chunk, head, lane * (BT // 2) : (lane + 1) * (BT // 2), :])
-                    with N.Stage(3, name="products"), N.Cube():
+                    with N.Cube():
                         rr = N.copy(Residual[chunk, head, :, :], res1)
-                        kk = N.copy(KG[chunk, head, :, :], kg1)
                         aa = N.copy(rr, update_a0, transpose=True)
-                        bb = N.copy(kk, right0)
+                        bb = N.copy(kg1[ring, :, :], right0)
                         N.matmul(aa, bb, accum=state0, initialize=True)
                         N.copy(state0, Delta[chunk, head, :, :])
-                        for part in N.unroll(K // CK):
-                            qq = N.copy(QG[chunk, head, :, part * CK : (part + 1) * CK], q1)
-                            hh = N.copy(Snapshot[chunk, head, :, part * CK : (part + 1) * CK], h1)
-                            aa = N.copy(qq, out_a0)
-                            bb = N.copy(hh, right0, transpose=True)
-                            N.matmul(aa, bb, accum=score0, initialize=part == 0)
-                        N.copy(score0, Inter[chunk, head, :, :])
-                        aq = N.copy(A16[chunk, head, :, :], aq1)
-                        aa = N.copy(aq, out_a0)
-                        bb = N.copy(res1, right0)
-                        N.matmul(aa, bb, accum=score0, initialize=True)
-                        N.copy(score0, Intra[chunk, head, :, :])
-                    with N.Stage(4, name="commit"), N.Vector() as lane:
-                        start = N.load_index(
-                            Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - 1
-                        )
-                        valid = N.load_index(
-                            Lengths[chunk : chunk + 1], minimum=1, maximum=N.min(BT, TOKENS - start)
-                        )
-                        N.copy(Gp[chunk, head, valid - 1, :], last_gate)
-                        N.exp(last_gate, out=last_gate)
-                        N.mul(carry, last_gate[None, :], out=carry)
+                    with N.Vector() as lane:
+                        decay = last_gate[ring, :]
+                        N.mul(carry, decay[None, :], out=carry)
                         N.copy(Delta[chunk, head, lane * BV : (lane + 1) * BV, :], update)
                         N.add(carry, update, out=carry)
-                        N.copy(Inter[chunk, head, :, lane * BV : (lane + 1) * BV], scratch)
-                        N.copy(Intra[chunk, head, :, lane * BV : (lane + 1) * BV], other)
-                        N.add(scratch, other, out=scratch)
-                        N.cast(scratch, out=r16)
-                        if local < NC - 1:
-                            full_start = N.load_index(
-                                Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT
-                            )
-                            N.copy(
-                                r16,
-                                Output[
-                                    full_start : full_start + BT, head, lane * BV : (lane + 1) * BV
-                                ],
-                            )
-                        else:
-                            for row in N.serial(valid):
-                                N.copy(
-                                    r16[row, :],
-                                    Output[start + row, head, lane * BV : (lane + 1) * BV],
-                                )
             with N.Vector() as final_lane:
                 N.copy(carry, Final[seq, head, final_lane * BV : (final_lane + 1) * BV, :])
