@@ -20,6 +20,7 @@ class SymbolKind(str, Enum):
     ORDINAL = "ordinal"
     METADATA = "metadata"
     CARRY = "carry"
+    SSA = "ssa"
 
 
 def _binding_order(origin):

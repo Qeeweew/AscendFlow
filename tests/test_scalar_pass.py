@@ -621,3 +621,30 @@ def test_scoped_range_query_visits_a_shared_dag_once_and_observes_later_guards(m
     sibling.relation(unrelated, 5, zero.result)
     assert sibling.interval(result) == (0, 3 << depth)
     assert visits <= 4 * depth
+
+
+def test_range_reuse_observes_parent_changes_and_broadened_source_facts():
+    from ascendflow.passes import simplify_scalars as integers
+
+    block = Block(arg_types=[IndexType(), IndexType()])
+    value, unrelated = block.args
+    zero, two = (_constant(block, n) for n in (0, 2))
+    doubled = arith.AddiOp(value, value)
+    block.add_op(doubled)
+    _function(block, doubled.result).verify()
+    facts = integers.ScalarFacts(ranges={doubled.result: (0, 4)})
+    parent = integers._Scope(ranges={value: (0, 3), unrelated: (0, 1)}, facts=facts)
+    child = parent.child()
+    child.relation(unrelated, 5, zero.result)
+    assert child.interval(doubled.result) == (0, 4)
+    # Moving the definition out of its old guard broadens the source fact.
+    facts.bind_range(doubled.result, (0, 20))
+    assert child.interval(doubled.result) == (0, 6)
+    parent.bind_range(value, (0, 5))
+    assert child.interval(doubled.result) == (0, 10)
+    sibling = parent.child()
+    sibling.relation(unrelated, 5, zero.result)
+    assert sibling.interval(doubled.result) == (0, 10)
+    child.relation(value, 5, two.result)
+    assert child.interval(doubled.result) == (4, 10)
+    assert sibling.interval(doubled.result) == (0, 10)

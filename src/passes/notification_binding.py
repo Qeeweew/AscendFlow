@@ -247,6 +247,13 @@ def _bind_endpoint(
                 phase="notification-selection",
             )
             family = _restricted_family(family_map[binding.loop], need, memory)
+            family = replace(
+                family,
+                count=substitute(family.count, selected_outer),
+                residue=substitute(family.residue, selected_outer)
+                if isinstance(family.residue, Expr)
+                else family.residue,
+            )
             first, last = _selected(
                 family.count, family.period, family.residue, max(family.distance, family.first)
             )
@@ -320,12 +327,15 @@ def _bind_endpoint(
         for domain in need.domains:
             ordinal = control.loops[domain.loop].ordinal
             selected_consumer = consumer_coordinates.get(domain.loop)
-            if (
-                selected_consumer is not None
-                and ordinal in substitutions
-                and ordinal.args[0] not in arguments(selected_consumer)
+            if selected_consumer is not None and ordinal.args[0] not in arguments(
+                selected_consumer
             ):
-                substitutions[ordinal] = substitute(selected_consumer, actual_substitutions)
+                selected_consumer = substitute(selected_consumer, actual_substitutions)
+                if arguments(selected_consumer) <= available:
+                    # An invariant producer can be outside this selected
+                    # ancestor entirely. Its activation still uses the actual
+                    # selected consumer header, not an unbound child count.
+                    substitutions[ordinal] = selected_consumer
 
     for domain in need.domains:
         logical = control.loops[domain.loop]
@@ -836,6 +846,40 @@ def _quorums(notifications, order):
     return tuple(local), tuple(unresolved)
 
 
+def _prefix_versions(items):
+    """Independent cells can share a prefix; successive values cannot.
+
+    A later writer of the same cell can require an earlier reader to retire.
+    Moving that reader's ready capture to the later writer creates a cycle.
+    Release prefixes likewise retain the next writer they authorize. Unknown
+    alias regions provide no independence premise for this optional merge.
+    """
+    groups = []
+    for item in items:
+        versions = {}
+        for origin in item.origins:
+            if not isinstance(origin.cell, StorageCell):
+                versions = None
+                break
+            point = origin.source if origin.kind is HazardKind.RAW else origin.consumer
+            versions.setdefault(origin.cell.physical_key, set()).add(point.operation)
+        for members, owners in groups:
+            if (
+                versions is not None
+                and owners is not None
+                and all(
+                    cell not in owners or owners[cell] == values
+                    for cell, values in versions.items()
+                )
+            ):
+                members.append(item)
+                owners.update(versions)
+                break
+        else:
+            groups.append(([item], versions))
+    return (members for members, _ in groups)
+
+
 def _notification_prefixes(notifications, order):
     """Share complete local/quorum capture/acquire within one physical phase.
 
@@ -905,7 +949,7 @@ def _notification_prefixes(notifications, order):
             ),
         )
         groups.setdefault(key, []).append(item)
-    for items in groups.values():
+    for items in (part for batch in groups.values() for part in _prefix_versions(batch)):
         requirements = tuple(need for item in items for need in item.requirements)
         endpoints = []
         for source in (True, False):

@@ -23,7 +23,7 @@ from ..diagnostics import ErrorKind, require
 from ..dialects.physical import CoreIdOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ..indexing import arguments, domain_nonnegative, equivalent, interval, nonnegative
-from ..scalar import INT64_MAX, Expr, Fact, expression, from_ssa, literal, positive
+from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
 from ..symbols import Symbol, SymbolKind, is_coordinate
 from ..target.ascend910b import Actor
 from .structured_addresses import ScalarEnvironment
@@ -233,7 +233,7 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
             require(name not in runtime_names, "duplicate runtime parameter identity")
             runtime_names.add(name)
             symbol = Symbol(name, SymbolKind.PARAMETER, operation.value)
-            facts[symbol] = Fact(operation.minimum.data, operation.multiple.data, INT64_MAX)
+            facts[symbol] = Fact(operation.minimum.data, operation.multiple.data)
             bindings[operation.value] = Expr("argument", (symbol,))
         elif isinstance(operation, CoreIdOp):
             bindings[operation.value] = group

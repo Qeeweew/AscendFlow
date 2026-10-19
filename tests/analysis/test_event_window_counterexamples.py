@@ -77,7 +77,8 @@ def _evaluate(value, context, *, checked):
     if value.kind == "constant":
         result = value.constant
     elif value.kind == "argument":
-        result = context[value.args[0]]
+        symbol = value.args[0]
+        result = context[symbol] if symbol in context else context[str(symbol)]
     else:
         a, b = (_evaluate(child, context, checked=checked) for child in value.args)
         if value.kind == "add":
@@ -247,7 +248,8 @@ def selected_last_identity():
     control = build_control_facts(lower_native_structure(source).module)
     (loop,) = control.loops.values()
     queries = IntegerFacts(control.environment.facts)
-    tiles = expression("floordiv", Expr("argument", ("extent",)), literal(8))
+    extent = next(name for name in control.environment.facts if name.name == "extent")
+    tiles = expression("floordiv", Expr("argument", (extent,)), literal(8))
     previous = expression("sub", loop.ordinal, literal(1))
     restored = expression("sub", expression("add", previous, literal(1)), literal(1))
     end = expression("sub", loop.count, literal(1))

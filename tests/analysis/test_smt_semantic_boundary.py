@@ -3,7 +3,7 @@
 import pytest
 
 from ascendflow.analysis.integer_facts import IntegerFacts
-from ascendflow.analysis.smt import IntegerQueryService
+from ascendflow.analysis.smt import IntegerQueryService, all_of, any_of
 from ascendflow.analysis.structured_schedule import Comparison
 from ascendflow.diagnostics import CompileError
 from ascendflow.scalar import INT64_MAX, Expr, Fact, expression, literal
@@ -84,6 +84,25 @@ def test_a_query_cannot_borrow_a_different_premise_or_input_environment():
     inputs["x"] = Fact(minimum=1, maximum=4)
     assert queries.implies(positive).refuted
     assert IntegerQueryService(inputs).implies(positive).proved
+
+
+def test_correlated_boolean_union_retains_its_complete_context():
+    y = Expr("argument", ("y",))
+    queries = IntegerQueryService({"x": Fact(maximum=1), "y": Fact(maximum=1)})
+    equal = Comparison(X, "==", y)
+    opposite = Comparison(expression("add", X, y), "==", literal(1))
+    complete = any_of(equal, opposite)
+    assert all(x == other or x + other == 1 for x in range(2) for other in range(2))
+    assert queries.implies(complete).proved
+    assert queries.satisfies((all_of(equal, opposite),)).impossible
+    selected = any_of(
+        all_of(equal, Comparison(X, "==", ZERO)),
+        all_of(opposite, Comparison(y, "==", ZERO)),
+    )
+    assert queries.implies(selected).refuted
+    assert queries.implies(selected, (Comparison(y, "==", ZERO),)).proved
+    with pytest.raises(CompileError, match="original comparisons"):
+        queries.defined((complete,))
 
 
 @pytest.mark.parametrize("width,overlaps", ((4, False), (5, True)))

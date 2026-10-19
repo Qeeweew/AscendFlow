@@ -10,6 +10,7 @@ notification and control operations keep their identities.
 from dataclasses import dataclass, field
 from fractions import Fraction
 from math import gcd
+from types import MappingProxyType
 from typing import Self
 
 from xdsl.dialects import arith, scf
@@ -37,6 +38,23 @@ class ScalarFacts:
 
     limits: dict = field(default_factory=dict)
     ranges: dict = field(default_factory=dict)
+    _range_data: dict = field(init=False, repr=False, compare=False)
+    _observed: set = field(default_factory=set, init=False, repr=False, compare=False)
+    revision: int = field(default=0, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        self._range_data = dict(self.ranges)
+        self.ranges = MappingProxyType(self._range_data)
+
+    def bound(self, value):
+        self._observed.add(value)
+        return self.ranges.get(value)
+
+    def bind_range(self, value, bounds):
+        if self.ranges.get(value) != bounds:
+            self._range_data[value] = bounds
+            if value in self._observed:
+                self.revision += 1
 
     @classmethod
     def from_control(cls, control=None, index_extrema=()):
@@ -134,7 +152,7 @@ class ScalarFacts:
                         if uniform_range is not None:
                             low, high = uniform_range
                             if -(1 << 63) <= low <= high < (1 << 63):
-                                result.ranges[value] = uniform_range
+                                result.bind_range(value, uniform_range)
                             continue
                     key = expr, frame.domains()
                     if key not in symbolic:
@@ -156,7 +174,7 @@ class ScalarFacts:
                     if left is not None and right is not None:
                         low, high = max(-(1 << 63), left[0]), min((1 << 63) - 1, right[1])
                         if low <= high:
-                            result.ranges[value] = low, high
+                            result.bind_range(value, (low, high))
                 except CompileError:
                     # An opaque carry or a guarded non-affine scalar has no
                     # exported optimization fact. Admission already checked it.
@@ -232,6 +250,35 @@ class _Scope:
     affines: dict = field(default_factory=dict)
     canonical: dict = field(default_factory=dict)
     multiples: dict = field(default_factory=dict)
+    _range_data: dict = field(init=False, repr=False)
+    _intervals: dict = field(default_factory=dict, init=False, repr=False)
+    _revision: int = field(default=0, init=False, repr=False)
+    _parent_revision: int = field(default=-1, init=False, repr=False)
+    _facts_revision: tuple = field(default=(), init=False, repr=False)
+
+    def __post_init__(self):
+        self._range_data = dict(self.ranges)
+        self.ranges = MappingProxyType(self._range_data)
+
+    def _invalidate(self):
+        self._intervals.clear()
+        self.affines.clear()
+        self._revision += 1
+
+    def refresh(self):
+        if self.parent is not None:
+            self.parent.refresh()
+        parent_revision = -1 if self.parent is None else self.parent._revision
+        facts_revision = () if self.facts is None else (id(self.facts), self.facts.revision)
+        if (parent_revision, facts_revision) != (self._parent_revision, self._facts_revision):
+            self._invalidate()
+            self._parent_revision, self._facts_revision = parent_revision, facts_revision
+
+    def bind_range(self, value, bounds):
+        if self.ranges.get(value) != bounds:
+            self._range_data[value] = bounds
+            if value in self._intervals:
+                self._invalidate()
 
     def child(self):
         return _Scope(placements=self.placements, parent=self, facts=self.facts)
@@ -254,19 +301,16 @@ class _Scope:
             return self.conditions[value]
         return self.parent.condition(value) if self.parent else None
 
-    def interval(self, value, memo=None):
-        # Share a DAG query across operands and ancestor scopes. The memo ends
-        # with this query, so later guards or SSA edits cannot reuse stale bounds.
-        memo = {} if memo is None else memo
-        key = id(self), value
-        if (cached := memo.get(key)) is not None:
+    def interval(self, value):
+        self.refresh()
+        if (cached := self._intervals.get(value)) is not None:
             return cached
         constant = _constant(value)
         if constant is not None:
             return constant, constant
         result = self.ranges.get(value)
         if result is None:
-            result = self.parent.interval(value, memo) if self.parent else _limits(value)
+            result = self.parent.interval(value) if self.parent else _limits(value)
             # A dominating expression can become tighter under a child guard
             # without being recomputed there (for example t-s under t>=s).
             if (
@@ -275,13 +319,13 @@ class _Scope:
                 and isinstance(value.owner, Operation)
                 and _scalar_arithmetic(value.owner)
             ):
-                refined = _bounded_interval(value.owner, self, memo)
+                refined = _bounded_interval(value.owner, self)
                 if refined is not None:
                     result = max(result[0], refined[0]), min(result[1], refined[1])
-        if self.facts is not None and value in self.facts.ranges:
-            low, high = self.facts.ranges[value]
+        if self.facts is not None and (bound := self.facts.bound(value)) is not None:
+            low, high = bound
             result = max(result[0], low), min(result[1], high)
-        memo[key] = result
+        self._intervals[value] = result
         return result
 
     def affine_definition(self, key):
@@ -298,6 +342,8 @@ class _Scope:
         return self.parent.multiple(value) if self.parent else 1
 
     def relation(self, lhs, predicate, rhs, truth=True):
+        if not self.relations:
+            self._invalidate()
         if predicate >= 6:
             # An unsigned comparison cannot establish a signed range.
             self.relations[lhs, predicate, rhs] = truth
@@ -318,7 +364,7 @@ class _Scope:
             elif signs <= {0, 1}:
                 low = max(low, other_low + int(0 not in signs))
             if low <= high:
-                self.ranges[a] = low, high
+                self.bind_range(a, (low, high))
 
     def assume(self, condition, truth):
         self.conditions[condition] = truth
@@ -368,17 +414,16 @@ class _Scope:
         return None
 
 
-def _bounded_interval(op, scope, memo=None):
+def _bounded_interval(op, scope):
     """Transfer only bounds whose complete signed result range cannot wrap."""
-    memo = {} if memo is None else memo
     if isinstance(op, arith.SelectOp):
-        left, right = (scope.interval(v, memo) for v in op.operands[1:])
+        left, right = (scope.interval(v) for v in op.operands[1:])
         return min(left[0], right[0]), max(left[1], right[1])
     if isinstance(op, (arith.AndIOp, arith.OrIOp)) and (modulo := _modulo(op.result)) is None:
         return _limits(op.result)
     if len(op.operands) != 2:
         return None
-    (al, ah), (bl, bh) = (scope.interval(value, memo) for value in op.operands)
+    (al, ah), (bl, bh) = (scope.interval(value) for value in op.operands)
     if isinstance(op, arith.AddiOp):
         result = al + bl, ah + bh
     elif isinstance(op, arith.SubiOp):
@@ -417,6 +462,7 @@ def _interval(op, scope):
 
 def _affine(value, scope):
     """One exact, scope-safe linear view shared by integers and predicates."""
+    scope.refresh()
     if value in scope.affines:
         return scope.affines[value]
     owner, constant = value.owner, _constant(value)
@@ -502,11 +548,11 @@ def _place_invariant(op, scope, key):
                 # A source-domain bound is invalidated when its definition
                 # moves. Export the bound of the actual new evaluation domain.
                 if scope.facts is not None:
-                    scope.facts.ranges[result] = destination_range
+                    scope.facts.bind_range(result, destination_range)
                 if destination.facts is not None:
-                    destination.facts.ranges[result] = destination_range
-                destination.ranges[result] = destination_range
-                scope.ranges[result] = local_range
+                    destination.facts.bind_range(result, destination_range)
+                destination.bind_range(result, destination_range)
+                scope.bind_range(result, local_range)
         return True
     return False
 
@@ -613,7 +659,7 @@ def _replace(op, value, scope=None):
         low, high = scope.interval(value)
         low, high = max(low, old_low), min(high, old_high)
         if low <= high:
-            scope.ranges[value] = low, high
+            scope.bind_range(value, (low, high))
     op.results[0].replace_all_uses_with(value)
     op.parent.erase_op(op)
 
@@ -624,7 +670,7 @@ def _seed(block, scope):
         scope.canonical[frozenset(((value, 1),)), 0, value.type] = value
     owner = block.parent_op()
     if isinstance(owner, ActorDomainOp):
-        scope.ranges[block.args[0]] = (0, 1 if owner.kind.data == "vector" else 0)
+        scope.bind_range(block.args[0], (0, 1 if owner.kind.data == "vector" else 0))
     elif isinstance(owner, scf.ForOp) and (_constant(owner.step) or 0) > 0:
         induction = block.args[0]
         scope.relation(induction, 5, owner.lb)
@@ -633,7 +679,7 @@ def _seed(block, scope):
         loop = owner.parent_op()
         ordinal = block.args[0]
         scope.relation(ordinal, 2, loop.count)
-        scope.ranges[ordinal] = (0, scope.interval(ordinal)[1])
+        scope.bind_range(ordinal, (0, scope.interval(ordinal)[1]))
 
 
 def _materialize_constant(op, scope, value, typ):
@@ -658,17 +704,19 @@ def _simplify_block(block, scope, runtime_limits):
             low, high = _limits(op.value)
             low = max(low, op.minimum.data)
             high = min(high, runtime_limits.get(op.sym_name.data, high))
-            scope.ranges[op.value] = ((low + multiple - 1) // multiple * multiple, high)
+            scope.bind_range(op.value, ((low + multiple - 1) // multiple * multiple, high))
             scope.multiples[op.value] = multiple
         elif isinstance(op, CoreIdOp):
             root = op.parent_op()
-            scope.ranges[op.value] = (0, (root.blocks.data if root.blocks is not None else 1) - 1)
+            scope.bind_range(
+                op.value, (0, (root.blocks.data if root.blocks is not None else 1) - 1)
+            )
         elif _scalar_arithmetic(op):
             normalized = _linear_operation(op, scope)
             if normalized is not op:
                 op.parent.insert_op_before(normalized, op)
                 if scope.facts is not None and op.results[0] in scope.facts.ranges:
-                    scope.facts.ranges[normalized.result] = scope.facts.ranges[op.results[0]]
+                    scope.facts.bind_range(normalized.result, scope.facts.ranges[op.results[0]])
                 _replace(op, normalized.result, scope)
                 op = normalized
             if isinstance(op, arith.RemUIOp) and (period := _constant(op.rhs)) and period > 0:
@@ -688,7 +736,7 @@ def _simplify_block(block, scope, runtime_limits):
                         complement = arith.SubiOp(bound, remainder)
                         op.parent.insert_op_before(complement, op)
                         _replace(op, complement.result, scope)
-                        scope.ranges[complement.result] = (0, period - 1)
+                        scope.bind_range(complement.result, (0, period - 1))
                         scope.defined.add(complement.result)
                         scope.available[_key(complement)] = complement.result
                         _place_invariant(complement, scope, _key(complement))
@@ -763,9 +811,9 @@ def _simplify_block(block, scope, runtime_limits):
             if form is not None:
                 scope.canonical[form] = op.results[0]
             if not isinstance(op, arith.ConstantOp):
-                scope.ranges[op.results[0]] = _interval(op, scope)
+                scope.bind_range(op.results[0], _interval(op, scope))
                 if scope.facts is not None:
-                    scope.facts.ranges[op.results[0]] = scope.ranges[op.results[0]]
+                    scope.facts.bind_range(op.results[0], scope.ranges[op.results[0]])
         elif isinstance(op, scf.IfOp) and _constant(op.cond) is None:
             known = scope.condition(op.cond)
             if known is None and isinstance(op.cond.owner, arith.CmpiOp):
@@ -857,7 +905,7 @@ def _cse_block(block, scope, changed):
                 continue
             scope.available[key] = op.results[0]
             if not isinstance(op, arith.ConstantOp):
-                scope.ranges[op.results[0]] = _interval(op, scope)
+                scope.bind_range(op.results[0], _interval(op, scope))
         elif isinstance(op, scf.IfOp) and (known := scope.truth(op.cond)) is not None:
             if _constant(op.cond) is None:
                 op.operands = (_materialize_constant(op, scope, int(known), op.cond.type),)

@@ -13,8 +13,8 @@
 | P2 域与代次 | 部分实现 | 已接通 SSA 身份、显式 symbol 种类和 metadata/carry 捕获代次；跨模块坐标接口尚待收敛 |
 | P3 存储与值 | 待实施 | 保留现有合同，尚未完成计划中的收敛 |
 | P4 同步与资源 | 部分修复 | 已保留释放 credit 的物理身份，恢复默认 FA 分配；共享兼容关系收敛仍待实施 |
-| P5 最终链路 | 待实施 | 尚未完成终端边界和旧推理实现删除 |
-| P6 集成资格 | 未取得 | 第一段实现的默认 FA 已通过 ASC/CANN；当前 typed symbol 版本已有 ASC，尚无本次设备资格 |
+| P5 最终链路 | 部分实现，集成中 | 终端条件查询已接通统一服务，旧闭包与余数证明已删除；executable plan 边界仍待实施 |
+| P6 集成资格 | 未取得 | 当前默认 FA 已通过 ASC/CANN；analysis 636 项通过，整组仍有失败且无本次设备资格 |
 
 ## 2026-10-19 接手与监督恢复
 
@@ -128,3 +128,81 @@ ordinal；同时替换只应用一次，求解端以捕获坐标为自变量建�
   unknown 为零。条件简化 6.6621 秒、标量简化 2.7015 秒，仍有显著重复分析。
 - 该结果不是五次冷进程验收，尚未达到 p50≤5 秒目标；P2 坐标接口、P3、P4
   资源分配职责及 P5 终端旧推理器的收敛继续实施，不将本段称作完整重构。
+
+## 终端条件查询收敛（集成中）
+
+终端 guard 保留紧凑区间/合取/并集语法及实际 SSA 原子；可达性、蕴含与覆盖
+改为同一整数服务的布尔组合查询。删除手写差分闭包、整数 gcd 可行性、成对
+余数枚举、递归 residue 搜索和覆盖减法。只按已证明不回绕的算术展开 affine；
+非二次幂 unsigned remainder 仍要求实际入口的非负前提。移位或合并后的标量
+是否能在公共入口求值，继续由原有合法性和 materializer 检查，数学证明不替代它。
+
+初版仍逐一搜索旧算法的候选，默认 FA 虽通过却退化到 44.4670 秒。随后将
+候选合并改为语法对齐、对实际覆盖一次查询，复用固定约束的编码；反例保留
+固定的 solver model，仅在需要诊断时解码。没有保留旧 solver 作为 fallback。
+
+标量区间与 affine 视图复用到前提变化为止；范围表经只读视图暴露，更新通过
+显式接口。已查询的范围、父域或源域范围改变时失效，兄弟域保持隔离；给新
+SSA 增加尚未查询过的事实不清空已有结果。定义被外提后，原 guard 范围必须
+改为目标域范围。新增回归覆盖父域变化和源事实放宽，不能复用旧的窄范围。
+
+当前证据（尚非完整 P5/P6）：
+
+- `owned-terminal-smt-lazy-model-01/build.log`：69 项通过，含独立最终执行
+  trace、重叠通知次数、两个 AIV、unsigned 短路、原式整数和失效反例。
+- `owned-fa-terminal-lazy-model-01/benchmark.json`：单次冷进程 source→ASC
+  24.0488 秒，通过；峰值 RSS 137,820 KiB。标量简化 1.6591 秒，条件简化
+  7.2444 秒。仍未达到五次冷进程 p50≤5 秒目标。
+- 生成 ASC SHA256 为 `2f20a86da3ebab1ddd22470aa8a0c69c26a8ded10d3470532f333cb49d113fd8`。
+  FA 最终通知 127 条，前一版本 133 条；尚待本段 CANN 与设备验证。
+- 完整回归正在集成，已观察到失败；未将局部通过记为全量资格。
+
+## 域接口与前缀安全的集成修正
+
+同一物理 cell 的不同 writer 不能因同处一段 queue prefix 就合并 ready：
+后一个 writer 可能等待前一个 reader 退休。前缀合并现保留真实 value writer
+身份；release 对应其下一 writer。未知 alias 不提供可选合并的独立性前提。
+原有独立 byte/event 检查恢复了 interleaved scratch 的合法流水。
+
+runtime 参数的 int64 上界改为由实际 SSA 类型提供给查询服务，不再填入
+逻辑 `Fact.maximum`。机器表示界不是 dense reader 的空间收缩上界；混用曾将
+动态整条读取收缩到巨大的静态区域，丢失 nested copy 的值区分。原有动态
+容量拒绝和 nested copy 的独立重入验证均保留。
+
+选定祖先后，同步 family 的 count/residue 同时特化；处于祖先之外的 invariant
+producer 也使用实际可获得的 selected consumer header，不能留下另一次
+调用的裸 ordinal。`owned-selection-integrated-01/build.log` 的 79 项通过。
+
+域配对、互斥和可达性改为完整合取/存在性查询，删除逐个 predicate 取反的
+循环。服务可复用已经取得的 SMT model，但必须重新检验该 model 满足完整
+查询上下文；它仅给出存在见证或反例，不能证明全称性质，也不补全未知值。
+报告区分实际 solver check、model reuse 和完全相同查询的 cache hit。
+
+当前验收边界：
+
+- `owned-analysis-integrated-01/build.log`：analysis 目录全部 636 项通过。
+- `owned-query-reuse-01/build.log`：182 项数学/原式/布尔/符号/条件与标量回归
+  通过。与其他分组有重叠，不将各组执行次数相加当作 unique test 数。
+- `owned-fa-current-cann-01/build-result.json`：当前默认 FA 完整 DSL→ASC→
+  CANN shared library 通过，27.2882 秒。构建时另有 CPU 回归在运行，因此
+  该数字不是冷编译性能比较。ASC SHA256 为上节的 `2f20a86...`，SO SHA256 为
+  `4bd5349ba9b34a76b144872c03464720ab52dcbf6a3c1f3070dddb9d511c2452`。
+- `owned-fa-checkpoint-01/benchmark.json`：当前默认 FA 单次冷进程 source→ASC
+  22.3002 秒，通过，ASC SHA256 与本段 CANN 构建相同；仍未达到五次冷进程
+  p50≤5 秒目标，也不将本次单次结果当作 p50。
+- `owned-causal-diagnostic-03/worker-result.json`：真实 causal FA 的诊断构建
+  source→ASC 52.5652 秒通过，两套输入环境均无 unknown；不是干净计时。
+  随后完整回归的因果 FA fixture 也构建通过（61.6561 秒），并继续执行了
+  实际最终 IR 的有限 byte/event 检查。
+- 两次整组 pytest 都达到整组 watchdog 的 300 秒上限，已清理进程；没有
+  获得整组通过结果。第二次执行至 1,138/1,930 项时停止，失败节点完整保存在
+  `owned-integration-02/failure-nodes.json`，没有将未执行项或错误计为通过。
+- 尚有两个真实同步问题待处理：八 panel 的 local prefix 在 V→MTE2 bank
+  分配不足；可能为空的 child prefix 尚未建立 same-engine source→fence
+  的层级 issue order。另有一项 DMA 拒绝测试的旧诊断正则需要更新。分组
+  复现见 `owned-integration-failures-03/build.log`；仍保留原测试和必要检查。
+
+当前源码 86 个 Python 模块、27,268 行，比审计基线增加 238 行。旧条件证明
+主体确已删除，但身份、显式结果和缓存失效合同也增加了代码，尚未实现整个
+编译器的大幅净简化。P3、资源共享收敛、最终 executable plan 边界、五次冷
+编译目标以及新代码的设备数值/性能验收均未完成。

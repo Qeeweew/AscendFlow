@@ -39,12 +39,16 @@ group watchdog enforces the build's hard time limit.
 
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 from operator import eq, ge, gt, le, lt, ne
 from time import perf_counter
 
+from xdsl.dialects.builtin import IndexType
+from xdsl.ir import SSAValue
 from z3 import (
     Z3_OP_UNINTERPRETED,
     And,
@@ -61,6 +65,7 @@ from z3 import (
     Solver,
     URem,
     is_bv_value,
+    is_true,
     sat,
     unsat,
 )
@@ -80,6 +85,36 @@ WITNESS = "witness"
 _LOCAL_TIMEOUT_MS = 2000
 _PREDICATES = {"==": eq, "!=": ne, "<": lt, "<=": le, ">": gt, ">=": ge}
 _active_services = ContextVar("ascendflow_integer_queries", default=None)
+
+
+@dataclass(frozen=True, slots=True)
+class Boolean:
+    """A mathematical conjunction/union, never an executable guard rewrite."""
+
+    kind: str
+    operands: tuple
+
+    def __post_init__(self):
+        require(self.kind in {"and", "or"}, "unknown boolean query operation")
+        require(
+            isinstance(self.operands, tuple)
+            and all(isinstance(value, (Comparison, Boolean, bool)) for value in self.operands),
+            "boolean queries need immutable mathematical predicates",
+        )
+
+
+def all_of(*conditions):
+    if any(condition is False for condition in conditions):
+        return False
+    values = tuple(dict.fromkeys(condition for condition in conditions if condition is not True))
+    return True if not values else values[0] if len(values) == 1 else Boolean("and", values)
+
+
+def any_of(*conditions):
+    if any(condition is True for condition in conditions):
+        return True
+    values = tuple(dict.fromkeys(condition for condition in conditions if condition is not False))
+    return False if not values else values[0] if len(values) == 1 else Boolean("or", values)
 
 
 @contextmanager
@@ -121,11 +156,37 @@ def query_statistics():
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Instance:
-    """One concrete assignment returned by the solver."""
+    """A fixed solver model; decode assignments only when diagnostics need them."""
 
-    values: tuple[tuple[str | Symbol, int], ...]
+    _model: object = field(repr=False)
+    _symbols: dict = field(repr=False)
+    _captures: tuple = field(repr=False)
+
+    @cached_property
+    def values(self):
+        values = []
+        for declaration in sorted(self._model.decls(), key=lambda item: item.name()):
+            if declaration.kind() != Z3_OP_UNINTERPRETED:
+                continue
+            value = self._model[declaration]
+            if value is None:
+                continue
+            if is_bv_value(value):
+                values.append((declaration.name(), value.as_signed_long()))
+            else:
+                try:
+                    values.append(
+                        (self._symbols.get(declaration.name(), declaration.name()), value.as_long())
+                    )
+                except AttributeError:
+                    continue
+        values.extend(
+            (symbol, self._model.eval(value, model_completion=True).as_long())
+            for symbol, value in self._captures
+        )
+        return tuple(values)
 
     def text(self):
         return ", ".join(f"{name}={value}" for name, value in self.values)
@@ -210,6 +271,8 @@ class Statistics:
     unknown: int = 0
     seconds: float = 0.0
     maximum: float = 0.0
+    solver_checks: int = 0
+    model_reuses: int = 0
 
     def record(self, kind, elapsed, *, cached):
         self.calls += 1
@@ -233,6 +296,8 @@ class Statistics:
             "unknown": self.unknown,
             "seconds": round(self.seconds, 6),
             "maximum_seconds": round(self.maximum, 6),
+            "solver_checks": self.solver_checks,
+            "model_reuses": self.model_reuses,
         }
 
 
@@ -255,11 +320,13 @@ class IntegerQueryService:
         self._values = {}
         self._symbols = {}
         self._functions = {}
+        self._captures = {}
         self._expressions = {}
         self._comparisons = {}
         self._defined = {}
         self._contexts = {}
         self._answers = {}
+        self._witnesses = deque(maxlen=4)
         self.statistics = Statistics()
         self._solver = Solver()
         self._solver.set(random_seed=0)
@@ -268,6 +335,15 @@ class IntegerQueryService:
         for name, fact in self._facts.items():
             integer = self._integer(Expr("argument", (name,)))
             self._solver.add(integer >= fact.minimum)
+            if (
+                isinstance(name, Symbol)
+                and name.kind is SymbolKind.PARAMETER
+                and isinstance(name.origin, SSAValue)
+                and isinstance(name.origin.type, IndexType)
+            ):
+                # This is a runtime input's machine representation, not a
+                # static spatial bound for contracting a whole address family.
+                self._solver.add(integer <= INT64_MAX)
             if fact.maximum is not None:
                 self._solver.add(integer <= fact.maximum)
             if fact.multiple != 1:
@@ -298,6 +374,7 @@ class IntegerQueryService:
                         )
                         self._functions[key] = function
                     result = function(*(self._integer(capture) for capture in symbol.captures))
+                    self._captures[symbol] = result
                 else:
                     name = f"scalar_{len(self._values)}"
                     result = Int(name)
@@ -339,10 +416,16 @@ class IntegerQueryService:
         self._defined[value] = result
         return result
 
-    def _comparison(self, test: Comparison):
+    def _comparison(self, test: Comparison | Boolean | bool):
         result = self._comparisons.get(test)
         if result is None:
-            result = _cmp(self._integer(test.lhs), test.predicate, self._integer(test.rhs))
+            if type(test) is bool:
+                result = BoolVal(test)
+            elif isinstance(test, Boolean):
+                operation = And if test.kind == "and" else Or
+                result = operation(*(self._comparison(value) for value in test.operands))
+            else:
+                result = _cmp(self._integer(test.lhs), test.predicate, self._integer(test.rhs))
             self._comparisons[test] = result
         return result
 
@@ -356,8 +439,8 @@ class IntegerQueryService:
         """
         require(
             isinstance(assumptions, tuple)
-            and all(isinstance(item, Comparison) for item in assumptions),
-            "integer query premises must be an immutable comparison tuple",
+            and all(isinstance(item, (Comparison, Boolean, bool)) for item in assumptions),
+            "integer query premises must be an immutable predicate tuple",
         )
         cached = self._contexts.get(assumptions)
         if cached is not None:
@@ -385,19 +468,37 @@ class IntegerQueryService:
         solver = self._solver
         solver.set(timeout=self._local_timeout(), random_seed=0)
         started = perf_counter()
+        question = And(*self._context(assumptions), goal())
+        # An already obtained SMT model can witness another question only if
+        # that exact model satisfies its COMPLETE context and counterexample
+        # formula. This never proves a universal claim, never samples inputs,
+        # and never uses model completion to invent a missing value.
+        for model in self._witnesses:
+            if is_true(model.eval(question, model_completion=False)):
+                elapsed = perf_counter() - started
+                outcome = COUNTEREXAMPLE if universal else WITNESS
+                answer = (Answer if universal else Exists)(
+                    outcome, kind, elapsed, self._model_instance(model)
+                )
+                self.statistics.model_reuses += 1
+                self.statistics.record(outcome, elapsed, cached=False)
+                self._answers[cache_key] = answer
+                return answer
         solver.push()
         try:
-            solver.add(*self._context(assumptions))
-            solver.add(goal())
+            solver.add(question)
+            self.statistics.solver_checks += 1
             outcome = solver.check()
             elapsed = perf_counter() - started
             if outcome == unsat:
                 result = (PROVED if universal else NONE, elapsed, None, "")
             elif outcome == sat:
+                model = solver.model()
+                self._witnesses.appendleft(model)
                 result = (
                     COUNTEREXAMPLE if universal else WITNESS,
                     elapsed,
-                    self._instance(solver),
+                    self._model_instance(model),
                     "",
                 )
             else:
@@ -410,32 +511,13 @@ class IntegerQueryService:
         return answer
 
     def _instance(self, solver):
-        model = solver.model()
-        values = []
-        for declaration in sorted(model.decls(), key=lambda item: item.name()):
-            if declaration.kind() != Z3_OP_UNINTERPRETED:
-                continue
-            value = model[declaration]
-            if value is None:
-                continue
-            if is_bv_value(value):
-                values.append((declaration.name(), value.as_signed_long()))
-            else:
-                try:
-                    values.append(
-                        (self._symbols.get(declaration.name(), declaration.name()), value.as_long())
-                    )
-                except AttributeError:
-                    continue
-        values.extend(
-            (symbol, model.eval(value, model_completion=True).as_long())
-            for symbol, value in self._values.items()
-            if value.num_args() > 0
-        )
-        return Instance(tuple(values))
+        return self._model_instance(solver.model())
+
+    def _model_instance(self, model):
+        return Instance(model, self._symbols, tuple(self._captures.items()))
 
     # -- mathematical queries --------------------------------------------
-    def implies(self, test: Comparison, assumptions: tuple[Comparison, ...] = ()) -> Answer:
+    def implies(self, test: Comparison | Boolean | bool, assumptions: tuple = ()) -> Answer:
         """Prove ``assumptions -> test`` between values.
 
         Only a mathematical relation: the caller keeps the ordered definedness
@@ -521,6 +603,10 @@ class IntegerQueryService:
         """
         tests = tuple(tests)
         premises = tuple(dict.fromkeys(assumptions))
+        require(
+            all(isinstance(test, Comparison) for test in (*tests, *premises)),
+            "ordered definedness needs original comparisons in evaluation order",
+        )
 
         def guarded():
             return And(
@@ -567,6 +653,7 @@ class IntegerQueryService:
         solver.set(timeout=self._local_timeout(), random_seed=0)
         solver.add(URem(bits, BitVecVal(1 << power, width)) != (bits & mask))
         started = perf_counter()
+        self.statistics.solver_checks += 1
         outcome = solver.check()
         elapsed = perf_counter() - started
         if outcome == unsat:

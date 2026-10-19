@@ -227,7 +227,7 @@ def test_compound_slot_short_and_long_children_preserve_actual_byte_values(width
     child = next(
         loop
         for loop, logical in plan.memory.control.loops.items()
-        if logical.count == Expr("argument", ("k",))
+        if logical.count.kind == "argument" and logical.count.args[0].name == "k"
     )
     long_cells = [
         transfer

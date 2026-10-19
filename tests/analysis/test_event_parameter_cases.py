@@ -27,7 +27,10 @@ def base():
 
 def parameter_domain(base, period):
     logical = next(iter(base.dependencies.memory.control.loops.values()))
-    m = Expr("argument", ("m",))
+    symbol = next(
+        name for name in base.dependencies.memory.control.environment.facts if name.name == "m"
+    )
+    m = Expr("argument", (symbol,))
     predicate = Comparison(
         m, ">", expression("rem", expression("mul", logical.ordinal, m), literal(period))
     )

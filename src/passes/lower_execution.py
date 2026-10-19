@@ -87,7 +87,7 @@ def lower_execution(memory, facts):
                     target.add_op(clone)
                     for old, new in zip(op.results, clone.results, strict=True):
                         if old in facts.ranges:
-                            facts.ranges[new] = facts.ranges[old]
+                            facts.bind_range(new, facts.ranges[old])
             else:
                 require(False, f"unmodeled terminal execution operation {op.name}")
 

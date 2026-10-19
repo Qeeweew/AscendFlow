@@ -23,6 +23,7 @@ from .access_frontier import QueueEndpoint
 from .event_contracts import ResourceWork
 from .event_windows import EventWindow, WindowExistence
 from .integer_facts import IntegerFacts
+from .smt import all_of
 from .structured_control import ControlFacts
 from .structured_dispatch import StructuredDispatch
 from .structured_memory import NativeMemoryFacts
@@ -267,11 +268,12 @@ class EventDomains:
 
     def _paired(self, notification):
         def implies(tests, premises):
-            for test in tests:
-                self.work.pairing_implications += 1
-                if not self.arithmetic.prove(test, premises):
-                    return False
-            return True
+            self.work.pairing_implications += len(tests)
+            remaining = tuple(test for test in tests if test not in premises)
+            return (
+                not remaining
+                or self.arithmetic.queries.implies(all_of(*remaining), premises).proved
+            )
 
         for case in self.cases[notification]:
             points = notification.sources + notification.consumers
@@ -314,15 +316,7 @@ class EventDomains:
                 and self.control.invariant_over(test.rhs, self.memory.module.body.block.first_op)
             )
 
-        a, b = uniform(left), uniform(right)
-        opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
-        return any(
-            self.arithmetic.prove(Comparison(test.lhs, opposite[test.predicate], test.rhs), b)
-            for test in a
-        ) or any(
-            self.arithmetic.prove(Comparison(test.lhs, opposite[test.predicate], test.rhs), a)
-            for test in b
-        )
+        return self.arithmetic.queries.satisfies(uniform(left) + uniform(right)).impossible
 
     def fail(self, notification, message, *, phase="structured-event-resources", witness=()):
         raise CompileError(
@@ -670,12 +664,7 @@ class EventDomains:
                 break
 
     def _possible(self, bounds):
+        # _validate admitted each original endpoint's ordered evaluation before
+        # pairing asks this purely mathematical coexistence question.
         tests = tuple(test for bound in bounds for test in bound.guard.comparisons)
-        opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
-        return not any(
-            self.arithmetic.prove(
-                Comparison(test.lhs, opposite[test.predicate], test.rhs),
-                tests[:index] + tests[index + 1 :],
-            )
-            for index, test in enumerate(tests)
-        )
+        return not self.arithmetic.queries.satisfies(tests).impossible

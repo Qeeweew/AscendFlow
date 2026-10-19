@@ -224,6 +224,7 @@ def test_real_branch_premise_is_not_reused_after_its_removal():
     """)
     memory = selection.dependencies.memory
     loop = next(iter(memory.control.loops.values()))
+    n = next(name for name in memory.control.environment.facts if name.name == "n")
     need = next(
         need
         for need in selection.dependencies.required
@@ -231,7 +232,7 @@ def test_real_branch_premise_is_not_reused_after_its_removal():
         and need.consumer.operation is memory.templates[1].operation
     )
     assert any(
-        g.comparison == Comparison(Expr("argument", ("n",)), ">=", literal(3)) for g in need.guards
+        g.comparison == Comparison(Expr("argument", (n,)), ">=", literal(3)) for g in need.guards
     )
     before = point(selection, loop, 0, literal(1), Placement.AFTER)
     after = point(selection, loop, 1, expression("sub", loop.count, literal(1)), Placement.BEFORE)
@@ -244,4 +245,4 @@ def test_real_branch_premise_is_not_reused_after_its_removal():
     assert order.compare(before, after, need) == -1
     assert order.compare(after, before, need) == 1
     assert order.compare(before, after, replace(need, guards=())) is None
-    assert Comparison(Expr("argument", ("n",)), ">=", literal(3)) in order.premises(need)
+    assert Comparison(Expr("argument", (n,)), ">=", literal(3)) in order.premises(need)

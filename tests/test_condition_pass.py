@@ -461,7 +461,7 @@ def test_untaken_prefix_and_total_bitmask_extension_preserve_unsigned_evaluation
     module = lower_native_structure(source).module
     memory = collect_native_memory(module)
     task = memory.templates[0].operation
-    n = next(v for v in memory.control.environment.facts if v == "n")
+    n = next(v for v in memory.control.environment.facts if v.name == "n")
     from ascendflow.scalar import Expr
 
     number = Expr("argument", (n,))

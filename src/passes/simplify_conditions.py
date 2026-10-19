@@ -10,15 +10,18 @@ original multiplicity. Native packets and loops end the notification packet.
 
 from dataclasses import dataclass
 from functools import reduce
-from itertools import product
 from math import gcd, inf
 
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType, StringAttr, i1
 from xdsl.ir import Block, Region
 
+from ..analysis.smt import all_of, any_of, query_service
+from ..analysis.structured_schedule import Comparison
 from ..dialects.physical import BufferOp, CoreIdOp, RuntimeSizeOp
 from ..dialects.structured import AddressOp, NotificationOp, PipelineLoopOp
+from ..scalar import Expr, literal
+from ..symbols import Symbol, SymbolKind
 from ..target.ascend910b import SyncKind
 from .simplify_scalars import (
     _UNSIGNED,
@@ -104,12 +107,12 @@ class ConditionWork:
 
 
 class _Domains:
-    """Local interval unions with the actual loop difference constraints.
+    """Compact guard syntax with one shared mathematical query service.
 
-    A cube is a conjunction of ranges of affine SSA quantities. Difference
-    closure retains g<N without separating g and N. Other affine quantities
-    use conservative intervals. No integer values or phase products are
-    enumerated; residue reasoning is bounded by a real event bank's width.
+    Quantities expand only arithmetic already known not to wrap in the packet
+    entry scope. Atoms retain actual SSA identity and their admitted entry
+    bounds. Modulo links preserve correlations without enumerating phase or
+    residue products. This view never authorizes a new runtime evaluation.
     """
 
     def __init__(self, scope, ranks):
@@ -121,20 +124,17 @@ class _Domains:
         self.modulos = {}
         self.normalized = {}
         self.unions = {}
-        self.closures = {}
-        self.residue_pairs = {}
-        self.resolving = set()
         self.base = {}
-        visible = set()
+        self.queries = query_service({})
+        self.atoms, self.constraints, self.predicates, self.cubes = {}, {}, {}, {}
+        self.fixed_constraints = None
         current = scope
         while current is not None:
-            visible.update(current.defined)
             for (a, predicate, b), truth in current.relations.items():
                 if predicate < 6:
                     q, allowed = self.comparison(a, predicate, b, truth)
                     self.base[q] = self.base.get(q, _FULL).intersect(allowed)
             current = current.parent
-        self.remainders = sorted((v for v in visible if self.modulo(v) is not None), key=self.rank)
 
     def interval(self, value):
         if value not in self.intervals:
@@ -206,240 +206,128 @@ class _Domains:
         self.tests[q, allowed] = value, truth
         return {q: allowed}
 
-    def _closure(self, cube):
-        key = frozenset(cube.items())
-        if key not in self.closures:
-            self.closures[key] = self._close(cube)
-        return self.closures[key]
-
-    def _close(self, cube):
-        constraints = dict(self.base)
-        for q, allowed in cube.items():
-            constraints[q] = constraints.get(q, _FULL).intersect(allowed)
-        variables = dict.fromkeys(v for q in constraints for v, _ in q)
-        values = [None, *variables]
-        index = {v: i for i, v in enumerate(values)}
-        matrix = [[0 if a == b else inf for b in values] for a in values]
-        for v in variables:
-            low, high = self.interval(v)
-            matrix[index[v]][0], matrix[0][index[v]] = high, -low
-        aliases = {}
-        for v in variables:
-            modulo = self.modulo(v)
-            if modulo is None:
-                continue
+    def _atom(self, value):
+        if value in self.atoms:
+            return self.atoms[value]
+        symbol = Symbol(f"ssa{self.rank(value)}", SymbolKind.SSA, value)
+        result = Expr("argument", (symbol,))
+        self.atoms[value] = result
+        low, high = self.interval(value)
+        constraints = [
+            Comparison(result, ">=", literal(low)),
+            Comparison(result, "<=", literal(high)),
+        ]
+        self.constraints[value] = constraints
+        self.fixed_constraints = None
+        modulo = self.modulo(value)
+        if modulo is not None:
             period, numerator = modulo
-            if period & (period - 1) and self.interval(numerator)[0] < 0:
-                continue
-            terms, bias = self.affine(numerator)
-            signature = (
-                period,
-                frozenset((a, c % period) for a, c in terms.items() if c % period),
-                bias % period,
-            )
-            if signature in aliases:
-                a, b = index[v], index[aliases[signature]]
-                matrix[a][b] = matrix[b][a] = 0
-            else:
-                aliases[signature] = v
-        for q, allowed in constraints.items():
-            if not allowed.intervals:
-                return None, constraints
-            low, high = allowed.intervals[0][0], allowed.intervals[-1][1]
-            if not q:
-                if not allowed.contains(_Ranges(((0, 0),))):
-                    return None, constraints
-                continue
-            if len(q) == 1 and q[0][1] == 1:
-                a, b = index[q[0][0]], 0
-            elif len(q) == 2 and {c for _, c in q} == {-1, 1}:
-                a = index[next(v for v, c in q if c == 1)]
-                b = index[next(v for v, c in q if c == -1)]
-            else:
-                continue
-            matrix[a][b], matrix[b][a] = min(matrix[a][b], high), min(matrix[b][a], -low)
-        for k in range(len(values)):
-            for i in range(len(values)):
-                if matrix[i][k] == inf:
-                    continue
-                for j in range(len(values)):
-                    matrix[i][j] = min(matrix[i][j], matrix[i][k] + matrix[k][j])
-        if any(matrix[i][i] < 0 for i in range(len(values))):
-            return None, constraints
-        # Exact difference equalities can turn a general affine equality
-        # into an impossible integer residue, e.g. x-y=0 and x+y=1.
-        for q, allowed in constraints.items():
-            reduced, bias = {}, 0
-            for v, coefficient in q:
-                a = index[v]
-                root = next(
-                    b
-                    for b in range(len(values))
-                    if matrix[a][b] < inf and matrix[a][b] == -matrix[b][a]
+            # Low-bit masks and unsigned power-of-two remainders equal
+            # mathematical modulo for every bit pattern. Other divisors need
+            # the nonnegative dividend premise from this actual entry scope.
+            if period & (period - 1) == 0 or self.interval(numerator)[0] >= 0:
+                terms, bias = self.affine(numerator)
+                dividend = self._quantity(tuple(terms.items()), bias)
+                constraints.append(
+                    Comparison(result, "==", Expr("rem", (dividend, literal(period))))
                 )
-                bias += coefficient * matrix[a][root]
-                if root:
-                    reduced[root] = reduced.get(root, 0) + coefficient
-            divisor = reduce(gcd, (abs(c) for c in reduced.values() if c), 0)
-            if not divisor:
-                possible = allowed.contains(_Ranges(((bias, bias),)))
-            else:
-                possible = any(
-                    low == -inf
-                    or high == inf
-                    or -(-(low - bias) // divisor) <= (high - bias) // divisor
+        return result
+
+    def _quantity(self, q, bias=0):
+        result = literal(bias)
+        for value, coefficient in q:
+            term = self._atom(value)
+            if coefficient != 1:
+                term = Expr("mul", (literal(coefficient), term))
+            result = term if result.constant == 0 else Expr("add", (result, term))
+        return result
+
+    def _predicate(self, q, allowed):
+        key = q, allowed
+        if key not in self.predicates:
+            value = self._quantity(q)
+            self.predicates[key] = any_of(
+                *(
+                    Comparison(value, "==", literal(low))
+                    if low == high
+                    else all_of(
+                        True if low == -inf else Comparison(value, ">=", literal(low)),
+                        True if high == inf else Comparison(value, "<=", literal(high)),
+                    )
                     for low, high in allowed.intervals
                 )
-            if not possible:
-                return None, constraints
-        # Preserve the finite, correlated choices of two event-slot residues.
-        # Taking only the hull of x-y != 0 loses the fact that two bits must
-        # then satisfy x+y == 1. Enumerate bank residues, never loop iterations
-        # or combinations of pipeline phases. Other variables are deliberately
-        # projected out, so rejecting an empty pair projection is conservative.
-        pairs = dict.fromkeys(
-            tuple(v for v, _ in q)
-            for q in constraints
-            if len(q) == 2
-            and all((m := self.modulo(v)) is not None and 1 < m[0] <= 16 for v, _ in q)
+            )
+        return self.predicates[key]
+
+    def _formula(self, cube):
+        key = frozenset(cube.items())
+        if key not in self.cubes:
+            self.cubes[key] = all_of(*(self._predicate(q, r) for q, r in cube.items()))
+        return self.cubes[key]
+
+    def _premises(self, cube):
+        # Encode first: a newly encountered atom may contribute its own bounds
+        # and a modulo link. Every query key then contains the complete snapshot.
+        base, current = self._formula(self.base), self._formula(cube)
+        if self.fixed_constraints is None:
+            self.fixed_constraints = all_of(
+                *(test for constraints in self.constraints.values() for test in constraints)
+            )
+        return self.fixed_constraints, base, current
+
+    def _bounds(self, q, cube):
+        low = high = 0
+        for value, coefficient in q:
+            a, b = (coefficient * bound for bound in self.interval(value))
+            low, high = low + min(a, b), high + max(a, b)
+        return (
+            _Ranges(((low, high),)).intersect(self.base.get(q, _FULL)).intersect(cube.get(q, _FULL))
         )
-        for pair in pairs:
-            projected = tuple(
-                (q, allowed) for q, allowed in constraints.items() if all(v in pair for v, _ in q)
-            )
-            a, b = (index[v] for v in pair)
-            bounds = tuple(
-                (max(0, int(-matrix[0][i])), min(self.modulo(v)[0] - 1, int(matrix[i][0])))
-                for v, i in zip(pair, (a, b), strict=True)
-            )
-            differences = -matrix[b][a], matrix[a][b]
-            key = pair, projected, bounds, differences
-            if key not in self.residue_pairs:
-                self.residue_pairs[key] = any(
-                    differences[0] <= left - right <= differences[1]
-                    and all(
-                        allowed.contains(
-                            _Ranges(((total := sum(c * values[v] for v, c in q), total),))
-                        )
-                        for q, allowed in projected
-                    )
-                    for left, right in product(*(range(low, high + 1) for low, high in bounds))
-                    for values in ({pair[0]: left, pair[1]: right},)
-                )
-            if not self.residue_pairs[key]:
-                return None, constraints
-        return (index, matrix), constraints
 
     def bounds(self, q, cube):
         key = q, frozenset(cube.items())
-        if key in self.bounds_cache:
-            return self.bounds_cache[key]
-        closure, constraints = self._closure(cube)
-        if closure is None:
-            result = _EMPTY
-        else:
-            index, matrix = closure
-            if len(q) == 2 and {c for _, c in q} == {-1, 1} and all(v in index for v, _ in q):
-                a = index[next(v for v, c in q if c == 1)]
-                b = index[next(v for v, c in q if c == -1)]
-                low, high = -matrix[b][a], matrix[a][b]
-            else:
-                low = high = 0
-                for v, c in q:
-                    vl, vh = (
-                        (-matrix[0][index[v]], matrix[index[v]][0])
-                        if v in index
-                        else self.interval(v)
-                    )
-                    if self.modulo(v) is not None and (residues := self.residues(v, cube, closure)):
-                        vl, vh = max(vl, min(residues)), min(vh, max(residues))
-                    a, b = c * vl, c * vh
-                    low, high = low + min(a, b), high + max(a, b)
-            result = _Ranges(((low, high),)).intersect(constraints.get(q, _FULL))
-        self.bounds_cache[key] = result
-        return result
-
-    def residues(self, value, cube, closure):
-        period, numerator = self.modulo(value)
-        if period is None or not 1 < period <= 16:
-            return None
-        key = value, frozenset(cube.items())
-        if key in self.resolving:
-            return set(range(period))
-        self.resolving.add(key)
-        try:
-            terms, bias = self.affine(numerator)
-            terms = dict(terms)
-            # Powers of two also respect unsigned fixed-width bit patterns.
-            # Other moduli need the original nonnegative numerator domain.
-            if period & (period - 1) and self.interval(numerator)[0] < 0:
-                return set(range(period))
-            replaced = {}
-            for atom, coefficient in terms.items():
-                replacement = atom
-                for remainder in self.remainders:
-                    inner_period, inner_numerator = self.modulo(remainder)
-                    if remainder is value or inner_period != period:
-                        continue
-                    if period & (period - 1) and self.interval(inner_numerator)[0] < 0:
-                        continue
-                    basis, offset = self.affine(inner_numerator)
-                    if basis == {atom: 1} and offset == 0:
-                        replacement = remainder
-                        break
-                replaced[replacement] = replaced.get(replacement, 0) + coefficient
-            terms = replaced
-            index, matrix = closure
-            reduced = {}
-            for atom, coefficient in terms.items():
-                root, offset = atom, 0
-                if atom in index:
-                    a = index[atom]
-                    equivalents = [
-                        v
-                        for v, b in index.items()
-                        if v is not value and matrix[a][b] < inf and matrix[a][b] == -matrix[b][a]
-                    ]
-                    if equivalents:
-                        root = min(equivalents, key=lambda v: -1 if v is None else self.rank(v))
-                        offset = matrix[a][index[root]]
-                bias += coefficient * offset
-                if root is not None:
-                    reduced[root] = (reduced.get(root, 0) + coefficient) % period
-            reduced = {v: c for v, c in reduced.items() if c}
-            if not reduced:
-                return {int(bias) % period}
-            if value in reduced:
-                return set(range(period))
-            q = tuple(sorted(reduced.items(), key=lambda t: self.rank(t[0])))
-            bounds = self.bounds(q, cube)
-            result = set()
-            for low, high in bounds.intervals:
-                if high - low >= period or low == -inf or high == inf:
-                    return set(range(period))
-                result.update(n % period for n in range(int(low + bias), int(high + bias) + 1))
-            return result
-        finally:
-            self.resolving.remove(key)
+        if key not in self.bounds_cache:
+            result = self._bounds(q, cube)
+            # Only event-selector output needs individual finite ID values.
+            # This projects at most 16 values, not pairs of residues or loops.
+            if sum(high - low + 1 for low, high in result.intervals) <= 16:
+                value = self._quantity(q)
+                premises = self._premises(cube)
+                result = _EMPTY
+                for low, high in self._bounds(q, cube).intervals:
+                    for point in range(low, high + 1):
+                        possible = self.queries.satisfies(
+                            (Comparison(value, "==", literal(point)),), premises
+                        )
+                        if not possible.impossible:
+                            result = result.union(_Ranges(((point, point),)))
+            self.bounds_cache[key] = result
+        return self.bounds_cache[key]
 
     def normalize(self, cube):
+        if not cube:
+            return {}
         key = frozenset(cube.items())
         if key in self.normalized:
             result = self.normalized[key]
             return None if result is None else dict(result)
-        if self._closure(cube)[0] is None:
+        formula = self._formula(cube)
+        if self.queries.satisfies((formula,), self._premises({})).impossible:
             self.normalized[key] = None
             return None
         result = dict(cube)
         for q, allowed in tuple(result.items()):
             other = result.copy()
             del other[q]
-            valid = self.bounds(q, other)
+            valid = self._bounds(q, other)
             narrowed = allowed.intersect(valid)
             if not narrowed.intervals:
                 self.normalized[key] = None
                 return None
-            if allowed.contains(valid):
+            if (
+                allowed.contains(valid)
+                or self.queries.implies(self._predicate(q, allowed), self._premises(other)).proved
+            ):
                 del result[q]
             else:
                 result[q] = narrowed
@@ -452,39 +340,15 @@ class _Domains:
             result[q] = result.get(q, _FULL).intersect(allowed)
         return self.normalize(result)
 
-    def covers(self, a, b):
-        return all(allowed.contains(self.bounds(q, b)) for q, allowed in a.items())
+    @staticmethod
+    def _contains(a, b):
+        """Syntactic absorption only; absence is no mathematical refutation."""
+        return all(allowed.contains(b.get(q, _FULL)) for q, allowed in a.items())
 
     def covered(self, candidate, alternatives):
-        """Subtract ordered cubes; empty remainder is exact local coverage.
-
-        Splits use only existing predicate endpoints, never loop iterations.
-        If a fragmented union is too large for this local optimization, retain
-        its original predicates. No correctness check or protocol is bypassed.
-        """
-        pending = [candidate]
-        for alternative in alternatives:
-            remaining = []
-            for cube in pending:
-                if self.covers(alternative, cube):
-                    continue
-                if self.intersect(cube, alternative) is None:
-                    remaining.append(cube)
-                    continue
-                inside = cube
-                for q, allowed in alternative.items():
-                    outside = self.intersect(inside, {q: allowed.complement()})
-                    if outside is not None:
-                        remaining.append(outside)
-                    inside = self.intersect(inside, {q: allowed})
-                    if inside is None:
-                        break
-                if len(remaining) > 128:
-                    return False
-            pending = remaining
-            if not pending:
-                return True
-        return not pending
+        """One exact union query; unknown retains the original guards."""
+        formula = any_of(*(self._formula(cube) for cube in alternatives))
+        return self.queries.implies(formula, self._premises(candidate)).proved
 
     def union(self, cubes):
         key = tuple(frozenset(cube.items()) for cube in cubes)
@@ -493,33 +357,28 @@ class _Domains:
         result = []
         for cube in cubes:
             cube = self.normalize(cube)
-            if cube is not None and not any(self.covers(prior, cube) for prior in result):
-                result = [prior for prior in result if not self.covers(cube, prior)] + [cube]
-        # Each replacement strictly broadens an existing cube, or removes one.
-        # The finite input endpoints bound this reduction; no case tree grows.
+            if cube is not None and not any(self._contains(prior, cube) for prior in result):
+                result = [prior for prior in result if not self._contains(cube, prior)] + [cube]
+        # Aligned rectangles merge by syntax. Do not ask the solver about
+        # every pair and every guessed dimension: the complete union below
+        # decides correlated coverage once for each actual simplification.
         changed = True
         while changed:
             changed = False
             for i, a in enumerate(result):
                 for j, b in enumerate(result[:i]):
-                    for q in dict.fromkeys((*a, *b)):
-                        candidate = {}
-                        for variable in dict.fromkeys((*a, *b)):
-                            left, right = a.get(variable, _FULL), b.get(variable, _FULL)
-                            candidate[variable] = (
-                                left.union(right) if variable == q else left.intersect(right)
-                            )
-                        candidate = self.normalize(candidate)
-                        if candidate is None:
-                            continue
-                        indices = [k for k, c in enumerate(result) if self.covers(candidate, c)]
-                        if not indices or any(self.covers(c, candidate) for c in result):
-                            continue
-                        result = [c for k, c in enumerate(result) if k not in indices] + [candidate]
-                        changed = True
-                        break
-                    if changed:
-                        break
+                    differences = [q for q in a.keys() | b.keys() if a.get(q) != b.get(q)]
+                    if len(differences) != 1:
+                        continue
+                    q = differences[0]
+                    candidate = dict(a)
+                    candidate[q] = a.get(q, _FULL).union(b.get(q, _FULL))
+                    candidate = self.normalize(candidate)
+                    result = [c for k, c in enumerate(result) if k not in (i, j)]
+                    if candidate is not None:
+                        result.append(candidate)
+                    changed = True
+                    break
                 if changed:
                     break
         changed = True
@@ -534,7 +393,7 @@ class _Domains:
                         result = [
                             c
                             for j, c in enumerate(result)
-                            if j == i or not self.covers(candidate, c)
+                            if j == i or not self._contains(candidate, c)
                         ]
                         changed = True
                         break
@@ -586,7 +445,7 @@ class _Build:
         self.available[key] = op.results[0]
         self.scope.defined.update(op.results)
         if not isinstance(op, arith.ConstantOp):
-            self.scope.ranges[op.results[0]] = _interval(op, self.scope)
+            self.scope.bind_range(op.results[0], _interval(op, self.scope))
         return op.results[0]
 
     def constant(self, value, typ=None):
@@ -783,9 +642,9 @@ def _packet(operations, scope, work, ranks, changed):
             movable.append(op)
             local.defined.update(op.results)
             if not isinstance(op, arith.ConstantOp):
-                local.ranges[op.results[0]] = interval or _limits(op.results[0])
+                local.bind_range(op.results[0], interval or _limits(op.results[0]))
                 if local.facts is not None:
-                    local.facts.ranges[op.results[0]] = local.ranges[op.results[0]]
+                    local.facts.bind_range(op.results[0], local.ranges[op.results[0]])
         elif isinstance(op, scf.IfOp) and not op.results:
             constant = _constant(op.cond)
             for truth, region in ((True, op.true_region), (False, op.false_region)):
@@ -920,7 +779,7 @@ def _packet(operations, scope, work, ranks, changed):
     for op in movable:
         op.parent.detach_op(op)
         if scope.facts is not None and op.results[0] in local.facts.ranges:
-            scope.facts.ranges[op.results[0]] = local.facts.ranges[op.results[0]]
+            scope.facts.bind_range(op.results[0], local.facts.ranges[op.results[0]])
     prefix = list(movable)
     for scalar in tuple(builder.ops):
         if _scalar_arithmetic(scalar):
@@ -1038,18 +897,23 @@ def simplify_conditions(module, *, index_extrema=(), facts=None):
                         if _scalar_arithmetic(new):
                             scope.defined.update(new.results)
                             if not isinstance(new, arith.ConstantOp):
-                                scope.ranges[new.results[0]] = _interval(new, scope)
+                                scope.bind_range(new.results[0], _interval(new, scope))
                     i = stop
                     continue
             if isinstance(op, RuntimeSizeOp):
                 multiple = op.multiple.data
-                scope.ranges[op.value] = (
-                    (op.minimum.data + multiple - 1) // multiple * multiple,
-                    limits.get(op.sym_name.data, _limits(op.value)[1]),
+                scope.bind_range(
+                    op.value,
+                    (
+                        (op.minimum.data + multiple - 1) // multiple * multiple,
+                        limits.get(op.sym_name.data, _limits(op.value)[1]),
+                    ),
                 )
             elif isinstance(op, CoreIdOp):
                 root = module.body.block.first_op
-                scope.ranges[op.value] = (0, (1 if root.blocks is None else root.blocks.data) - 1)
+                scope.bind_range(
+                    op.value, (0, (1 if root.blocks is None else root.blocks.data) - 1)
+                )
             elif _scalar_arithmetic(op):
                 if op in affected:
                     folded = _fold(op, scope)
@@ -1065,7 +929,7 @@ def simplify_conditions(module, *, index_extrema=(), facts=None):
                         i += 1
                         continue
                 if not isinstance(op, arith.ConstantOp):
-                    scope.ranges[op.results[0]] = _interval(op, scope)
+                    scope.bind_range(op.results[0], _interval(op, scope))
                 scope.available[_key(op)] = op.results[0]
             for branch, region in enumerate(op.regions):
                 for child in region.blocks:
