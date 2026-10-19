@@ -148,11 +148,13 @@ class _Partitioner:
     def __init__(self, memory, admission):
         self.memory, self.admission = memory, admission
         self.facts = memory.control.environment.facts
+        # Only the loaded value is an indirect index. Its capture dependencies
+        # describe which invocation read it; they do not turn every ordinary
+        # group/ordinal address in that invocation into data-dependent access.
         self.indirect_values = frozenset(
-            name
+            memory.control.environment.expression(template.operation.value).args[0]
             for template in memory.templates
             if template.operation.native.data == "index_load" and template.frame.loops()
-            for name in arguments(memory.control.environment.expression(template.operation.value))
         )
         self.work = DependencyWork(native_templates=len(memory.templates))
         self.effects, self.patterns, self._origin_pool = {}, {}, {}

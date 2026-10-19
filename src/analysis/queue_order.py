@@ -154,14 +154,7 @@ class _OrderConstruction:
         return f"{channel} {point.actor.value}/{route} {point.phase} at {point.operation.location}"
 
     def _possible(self, tests):
-        opposite = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
-        return not any(
-            self.domains.arithmetic.prove(
-                Comparison(test.lhs, opposite[test.predicate], test.rhs),
-                tests[:index] + tests[index + 1 :],
-            )
-            for index, test in enumerate(tests)
-        )
+        return not self.domains.arithmetic.queries.satisfies(tests).impossible
 
     def _inside(self, point, region):
         frame = (

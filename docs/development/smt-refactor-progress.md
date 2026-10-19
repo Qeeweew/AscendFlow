@@ -327,3 +327,23 @@ output RMSE ratio 分别为 0.001171、0.001196，state 分别为 8.059e-5、1.4
 均满足原有 0.005 合同。仍在物理卡 2，无设备错误、reset 或换卡。
 prefill 的 source 在构建前拒绝了 smoke 的 H=2（要求八头对齐），属于清单配置
 错误；已改用 H=8，不修改原算子的 dtype、数学、assert 或计时政策。
+
+## metadata 值与捕获坐标的存储分类
+
+H=8 的真实 prefill 集成已完成 prepare_full、prepare、gram、gram_cross、
+solve_merge16/32、transform、wu 八个 specialization 的 CANN shared 构建；
+scan 随后在零 step 阻塞环检查中拒绝，未进入 prefill 设备执行。记录位于
+`owned-prefill-example-device-01`，不能称完整 prefill 通过。
+
+根因是间接地址分类把 index load 的自由变量全部当成数据索引，其中包含
+metadata 的 group/SID/祖先 ordinal 捕获坐标。普通 `local%2` 地址因此也丢掉
+双缓冲分区，错误地建立距离 1 的复用顺序。现在只把实际 load 值的 symbol
+归为间接索引；真正使用该值选择地址时仍保留 AliasRegion 和必要冲突顺序。
+queue activation 的可满足性改为询问完整条件合取，不再逐项尝试其反条件。
+
+`owned-captured-storage-order-01` 的 49 项回归通过（27.11 秒），包括 metadata
+捕获、真实间接地址重复 slot、条件 queue、代次、alias 与实际 Gram。新增两项
+独立模型检查覆盖 0/1/2/3/7 次、两次调用及连续重复 metadata 值。
+`owned-prefill-scan-source-02` 的真实 H=8/NC=2/CHUNKS=2/SEQUENCES=1 scan
+source→ASC 与结构验证通过，3.6063 秒。该修复尚未重新取得 scan 的 CANN
+和完整 prefill 设备资格。
