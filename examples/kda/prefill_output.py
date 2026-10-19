@@ -14,7 +14,7 @@ def prefill_output(
     Snapshot: N.Tensor((CHUNKS, H, K, K), DTYPE),
     Residual: N.Tensor((CHUNKS, H, BT, K), DTYPE),
     Output: N.Tensor((TOKENS, H, K), DTYPE, access="write", write_disjoint=True),
-    OutputProducts: N.Tensor((GROUPS, 2, 2, BT, K), N.f32, access="write"),
+    OutputProducts: N.Tensor((GROUPS, 2, BT, 2 * K), N.f32, access="write"),
     Starts: N.Tensor((CHUNKS,), N.i64),
     Lengths: N.Tensor((CHUNKS,), N.i64),
     TOKENS: N.int64(minimum=1),
@@ -38,10 +38,12 @@ def prefill_output(
         a1 = N.alloc_l1((2, BT, BT), DTYPE)
         a0 = N.alloc_l0a((2, BT, CK), DTYPE)
         b0 = N.alloc_l0b((2, CK, K), DTYPE)
-        products0 = N.alloc_l0c((2, 2, BT, K), N.f32)
-        inter = N.alloc_ub((2, BT, BV), N.f32)
-        intra = N.alloc_ub((2, BT, BV), N.f32)
-        output = N.alloc_ub((2, BT, BV), DTYPE)
+        # Adjacent NZ column intervals let one FIX publish both products.
+        # Each AIV imports a contiguous half of the rows, then adds in FP32.
+        products0 = N.alloc_l0c((2, BT, 2 * K), N.f32)
+        products = N.alloc_ub((2, BT // 2, 2 * K), N.f32)
+        total = N.alloc_ub((2, BT // 2, K), N.f32)
+        output = N.alloc_ub((2, BT // 2, K), DTYPE)
         for task in N.Pipelined(
             N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS),
             stages=3,
@@ -60,25 +62,23 @@ def prefill_output(
                     bb = N.copy(
                         h1[ring, :, part * CK : (part + 1) * CK], b0[part, :, :], transpose=True
                     )
-                    N.matmul(aa, bb, accum=products0[ring, 0, :, :], initialize=part == 0)
-                N.copy(products0[ring, 0, :, :], OutputProducts[owner, ring, 0, :, :])
+                    N.matmul(aa, bb, accum=products0[ring, :, :K], initialize=part == 0)
                 aa = N.copy(a1[ring, :, :], a0[0, :, :])
                 bb = N.copy(r1[ring, :, :], b0[0, :, :])
-                N.matmul(aa, bb, accum=products0[ring, 1, :, :], initialize=True)
-                N.copy(products0[ring, 1, :, :], OutputProducts[owner, ring, 1, :, :])
+                N.matmul(aa, bb, accum=products0[ring, :, K:], initialize=True)
+                N.copy(products0[ring, :, :], OutputProducts[owner, ring, :, :])
             with N.Stage(2, name="store"), N.Vector() as lane:
-                column = lane * BV
-                N.copy(OutputProducts[owner, ring, 0, :, column : column + BV], inter[ring, :, :])
-                N.copy(OutputProducts[owner, ring, 1, :, column : column + BV], intra[ring, :, :])
-                N.add(inter[ring, :, :], intra[ring, :, :], out=inter[ring, :, :])
-                N.cast(inter[ring, :, :], out=output[ring, :, :])
+                row = lane * (BT // 2)
+                N.copy(OutputProducts[owner, ring, row : row + BT // 2, :], products[ring, :, :])
+                N.add(products[ring, :, :K], products[ring, :, K:], out=total[ring, :, :])
+                N.cast(total[ring, :, :], out=output[ring, :, :])
                 if chunk % NC < NC - 1:
                     full_start = N.load_index(
                         Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT
                     )
                     N.copy(
                         output[ring, :, :],
-                        Output[full_start : full_start + BT, head, column : column + BV],
+                        Output[full_start + row : full_start + row + BT // 2, head, :],
                     )
                 else:
                     tail_start = N.load_index(
@@ -89,8 +89,8 @@ def prefill_output(
                         minimum=1,
                         maximum=N.min(BT, TOKENS - tail_start),
                     )
-                    for token in N.serial(valid):
+                    for token in N.serial(N.min(BT // 2, N.max(0, valid - row))):
                         N.copy(
                             output[ring, token, :],
-                            Output[tail_start + token, head, column : column + BV],
+                            Output[tail_start + row + token, head, :],
                         )

@@ -335,6 +335,20 @@ def native_contract(
         # Different-width overlap cannot be repaired by an event or by native
         # in-place conversion assumptions. Origins are rechecked at extraction.
         return "V", ("R", "W")
+    if native == "add_strided":
+        require(
+            len(refs) == 3
+            and banks == ("UB",) * 3
+            and dtypes == ("f32",) * 3
+            and layouts == ("linear",) * 3
+            and not params
+            and 1 <= refs[0].rows <= 255
+            and refs[0].nbytes % 256 == 0
+            and all(r.rows == refs[0].rows and r.nbytes == refs[0].nbytes for r in refs)
+            and all(r.row_stride % 32 == 0 and 1 <= r.row_stride // 32 <= 255 for r in refs),
+            "strided add needs equal full-lane f32 UB rows and bounded repeat strides",
+        )
+        return "V", ("R", "R", "W")
     if native in {
         "muls",
         "adds",

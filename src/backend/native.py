@@ -122,6 +122,15 @@ def native_line(task, *, pointer_renderer, generation):
         )
     if task.spec.native in {"add", "mul", "sub", "div", "max"}:
         return f"asc_{task.spec.native}({p[2]}, {p[0]}, {p[1]}, uint32_t({length(refs[0], 4)}));"
+    if task.spec.native == "add_strided":
+        operands = [ptr(i, extra="npu_chunk * 256") for i in range(3)]
+        strides = [ref.row_stride // 32 for ref in refs]
+        return (
+            "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
+            f"for (int npu_chunk = 0; npu_chunk < {refs[0].nbytes // 256}; ++npu_chunk) {{ "
+            f"asc_add({operands[2]}, {operands[0]}, {operands[1]}, uint8_t({refs[0].rows}), "
+            f"1, 1, 1, {strides[2]}, {strides[0]}, {strides[1]}); }}"
+        )
     if task.spec.native in {"exp", "rsqrt", "sqrt"}:
         return f"asc_{task.spec.native}({p[1]}, {p[0]}, uint32_t({length(refs[0], 4)}));"
     if task.spec.native in {"scalar_load", "index_load"}:

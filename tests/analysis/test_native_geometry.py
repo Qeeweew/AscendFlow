@@ -28,6 +28,28 @@ def test_fp32_l1_row_slice_retains_its_real_strided_load3d_footprint():
             native_contract("load3d_a", (invalid, destination), (32, 128))
 
 
+def test_strided_add_retains_row_holes_and_rejects_unrepresentable_repeats():
+    from ascendflow.target.packets import MaskStep, audited_packet
+
+    source = NativeGeometry("UB", "f32", "linear", 512, rows=32, row_stride=1024)
+    destination = replace(source, row_stride=512)
+    assert native_contract("add_strided", (source, source, destination), ()) == (
+        "V",
+        ("R", "R", "W"),
+    )
+    packet = audited_packet("add_strided")
+    assert packet.closed_mask and MaskStep.SET_FULL in packet.mask_steps
+    assert source.total_nbytes == destination.total_nbytes == 16384
+    for invalid in (
+        replace(source, rows=31),
+        replace(source, nbytes=384),
+        replace(source, row_stride=1028),
+        replace(source, row_stride=8192),
+    ):
+        with pytest.raises(CompileError, match="strided add"):
+            native_contract("add_strided", (invalid, source, destination), ())
+
+
 @pytest.mark.parametrize(
     "changes",
     [

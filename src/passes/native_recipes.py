@@ -319,6 +319,9 @@ def lower_element(op: ElementOp, context: RecipeContext) -> RecipeResult:
         return lower_masked_element(op, context, native)
     require(op.scratch is None, "scratch requires a data predicate or row broadcast")
     refs = [context.view(value) for value in (*op.inputs, op.destination)]
+    if native == "add" and any(ref.owner.rows.data > 1 for ref in refs):
+        native = "add_strided"
+        refs = [context.view(value, matrix=True) for value in (*op.inputs, op.destination)]
     task = context.emit(
         "_" + op.kind.data,
         native,

@@ -176,16 +176,19 @@ def lower_address(
     contiguous = len(dimensions) == 1 or selected[0] == dimensions[1] * itemsize
     if typ.layout.data != "linear":
         column_slice = typ.memory.data == "L1" and typ.layout.data == "NZ"
+        # Full M retains the NZ column-block pitch: an aligned L0C column
+        # interval is itself compact and needs no strided MAD addressing.
+        accumulator_columns = typ.memory.data == "L0C" and typ.layout.data == "NZ"
         _require(
             len(shape) >= 2
             and len(dimensions) == 2
             and axes == (len(shape) - 2, len(shape) - 1)
             and (column_slice or dimensions[0] == shape[-2])
-            and (column_slice or dimensions[1] == shape[-1])
+            and (column_slice or accumulator_columns or dimensions[1] == shape[-1])
             and all(size > 0 and size % 16 == 0 for size in dimensions)
             and (column_slice or _constant(view.origins[-2]) == 0)
-            and (column_slice or _constant(view.origins[-1]) == 0),
-            "fractal view needs a complete matrix plane or an aligned L1 NZ rectangle",
+            and (column_slice or accumulator_columns or _constant(view.origins[-1]) == 0),
+            "fractal view needs a complete matrix plane, aligned L1 NZ rectangle or full-row L0C columns",
             unsupported=True,
         )
     if typ.layout.data == "NZ" and dimensions[0] != shape[-2]:

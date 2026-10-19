@@ -233,19 +233,24 @@ def _original_view(address: AddressFacts, facts):
         rank = len(axes.origins)
         extents = tuple(exact_constant(extent, facts) for extent in axes.extents[-2:])
         column_slice = geometry.bank == "L1" and geometry.layout == "NZ"
+        accumulator_columns = geometry.bank == "L0C" and geometry.layout == "NZ"
         _require(
             rank >= 2
             and selected == (rank - 2, rank - 1)
             and (column_slice or equivalent(axes.origins[-2], literal(0), facts))
-            and (column_slice or equivalent(axes.origins[-1], literal(0), facts))
+            and (
+                column_slice
+                or accumulator_columns
+                or equivalent(axes.origins[-1], literal(0), facts)
+            )
             and all(extent is not None and extent > 0 and extent % 16 == 0 for extent in extents)
             and (column_slice or axes.widths[-2] == extents[0])
             and axes.widths[-2] % 16 == 0
             and _multiple_of(axes.origins[-2], 16, facts)
             and axes.widths[-1] % 16 == 0
             and _multiple_of(axes.origins[-1], 16, facts)
-            and (column_slice or axes.widths[-1] == extents[1]),
-            "fractal address needs its complete matrix plane or an aligned L1 NZ rectangle",
+            and (column_slice or accumulator_columns or axes.widths[-1] == extents[1]),
+            "fractal address needs a complete matrix plane, aligned L1 NZ rectangle or full-row L0C columns",
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )

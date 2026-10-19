@@ -161,6 +161,7 @@ _COUNT = frozenset(
 )
 _FULL = frozenset(
     {
+        "add_strided",
         "mul_columns",
         "mul_outer",
         "add_columns",

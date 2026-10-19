@@ -262,9 +262,10 @@ def test_complete_fractal_plane_uses_only_its_leading_slot_coordinate(layout, ba
     ]
 
 
-def test_l1_nz_column_slice_retains_axes_and_uses_fractal_byte_coordinates():
+@pytest.mark.parametrize("bank,dtype", [("L1", "f16"), ("L0C", "f32")])
+def test_nz_column_slice_retains_axes_and_uses_fractal_byte_coordinates(bank, dtype):
     source = Block(arg_types=[IndexType()])
-    allocation = _allocation((2, 32, 128), dtype="f16", bank="L1", layout="NZ")
+    allocation = _allocation((2, 32, 128), dtype=dtype, bank=bank, layout="NZ")
     view = _view(
         source,
         allocation,
@@ -276,11 +277,12 @@ def test_l1_nz_column_slice_retains_axes_and_uses_fractal_byte_coordinates():
     address, _, _ = _lower(
         view, matrix=True, bindings=[(source.args[0], output.args[0])], output=output
     )
-    assert (address.nbytes.data, address.rows.data) == (32 * 32 * 2, 1)
+    itemsize = ITEMSIZE[dtype]
+    assert (address.nbytes.data, address.rows.data) == (32 * 32 * itemsize, 1)
     assert tuple(width.data for width in address.widths) == (1, 32, 32)
     assert [_evaluate(address.offset, {output.args[0]: slot}) for slot in (0, 1)] == [
-        48 * 32 * 2,
-        32 * 128 * 2 + 48 * 32 * 2,
+        48 * 32 * itemsize,
+        32 * 128 * itemsize + 48 * 32 * itemsize,
     ]
 
 

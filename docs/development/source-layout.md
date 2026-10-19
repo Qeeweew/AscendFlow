@@ -108,6 +108,11 @@ native、bounds、ownership、同步和资源分配链，不是第二编译路�
 标准连续 b16 `C=A@B` 与尾块的合同见 [标准 GEMM](../operators/gemm.md)。
 类型转换、补零及 strided NZ 几何经过相同 native/effects、bounds、ownership
 和同步链；封闭 packet 的内部顺序不提供外部异步完成保证。
+L0C NZ 允许保留全部 M 行的、按 16 列对齐的列切片；它仍是紧凑物理平面，
+可由独立 MAD 定义并由一次完整 FIX 读取。部分 M 行不能套用此合同。
+二维 FP32 `N.add` 支持按 32 B 对齐的 UB 行距，每行包含完整的 64-lane 分组，
+至多 255 行、repeat stride 为 1..255 个 32 B 块。lowering 选择完整 normal-mask
+repeat packet，访问和初始化检查保留真实行间空洞，结果可写入紧凑的 UB 行。
 UB 的跨步矩形 `N.copy` 使用有完整 mask 设置的 Vector bitwise copy：每行
 32–256 字节、至多 255 行，行距与起点按 32 字节对齐，repeat stride 不超过
 255 个 32 字节块。它保留真实行与间隙，源/目标必须证明不重叠；未知别名不准入。

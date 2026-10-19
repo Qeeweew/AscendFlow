@@ -270,8 +270,7 @@ def validate_artifacts(directory, heads, dtype, chunks, sequences):
             require(
                 tuple(d.data for d in buffers["A16"].shape.data) == (chunks, heads, 64, 64)
                 and buffers["A16"].dtype.data == dtype
-                and tuple(d.data for d in buffers["OutputProducts"].shape.data)
-                == (20, 2, 2, 64, 128)
+                and tuple(d.data for d in buffers["OutputProducts"].shape.data) == (20, 2, 64, 256)
                 and buffers["OutputProducts"].dtype.data == "f32",
                 "output ring workspace differs from the runner",
             )
@@ -397,7 +396,7 @@ def worker(args):
     workspace("Off32", (20, 2, 32, 32), torch.float32)
     workspace("Inverse", (chunks, heads, bt, bt), dtype)
     workspace("A16", (chunks, heads, bt, bt), dtype)
-    workspace("OutputProducts", (20, 2, 2, bt, dimension), torch.float32)
+    workspace("OutputProducts", (20, 2, bt, 2 * dimension), torch.float32)
     workspace("Right", (chunks, heads, 2, bt, dimension), dtype)
     workspace("U", (chunks, heads, bt, dimension), dtype)
     workspace("W16Ring", (20, 2, bt, dimension), dtype)

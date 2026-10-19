@@ -64,6 +64,14 @@ residual 舍入为 FP16 后参与状态增量。carry 在 FP32 中完成衰减�
 每个 sequence/head 必须按 chunk 顺序执行。独立的 output 阶段读取各 chunk 的
 snapshot、residual 等数据，按 chunk 分配负载，不重新计算递推状态。
 
+output 的两项 FP32 乘积在 L0C 中占据同一 `[BT,2*K]` 平面的两个列区间，
+分别保留原有初始化和累加顺序。一次 FIX 将两项结果发布到
+`OutputProducts[GROUPS,2,BT,2*K]`，两个 AIV 各连续导入 BT/2 行，再用
+strided FP32 `N.add` 写入紧凑求和区并 RN 输出。每个 task 只需一轮完整 CV
+交接；尾块按实际有效行裁剪，允许其中一个 AIV 不写输出，但两个 AIV 都完成
+workspace 读取和 credit 归还。L0C 仍为 128 KiB，GM workspace 字节数不变，
+每个 AIV 的 UB 为 112 KiB。
+
 ## 验证边界
 
 运行器用独立 CPU FP32 递推检查整个 pipeline 的 output/state，relative RMSE
