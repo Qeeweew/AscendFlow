@@ -184,7 +184,25 @@ class ControlFacts:
                     symbol = self.environment.expression(operation.value).args[0]
                     if all(arguments(value) <= names for value in symbol.captures):
                         names.add(symbol)
-        return arguments(value) <= names
+        metadata = {
+            name._identity
+            for name in names
+            if isinstance(name, Symbol)
+            and name.kind is SymbolKind.METADATA
+            and name.origin is not None
+        }
+        # Actor/ancestor selection specializes the capture coordinates, not
+        # the load's definition. Expr.variables already includes every capture
+        # dependency recursively: all must still be fixed in this invocation.
+        # A load defined inside the queried loop has no visible origin here,
+        # even if someone substitutes a constant for its captured ordinal.
+        return all(
+            name in names
+            or isinstance(name, Symbol)
+            and name.kind is SymbolKind.METADATA
+            and name._identity in metadata
+            for name in arguments(value)
+        )
 
 
 def build_control_facts(module: ModuleOp) -> ControlFacts:

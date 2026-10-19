@@ -83,3 +83,44 @@ def test_complete_fact_snapshots_reuse_queries_only_inside_one_compilation():
         assert fresh is not changed
         assert fresh.statistics.calls == 0
         assert fresh.implies(positive).refuted
+
+
+def test_metadata_invariance_retains_definition_and_every_specialized_capture():
+    from ascendflow import language as N
+    from ascendflow.analysis.structured_control import build_control_facts
+    from ascendflow.dialects.physical import TaskOp
+    from ascendflow.passes.lower_native import lower_native_structure
+
+    source = N.from_source("""
+    def captured(Offsets:N.Tensor((4,),N.i64)):
+        with N.Kernel():
+            first=N.load_index(Offsets[0:1],minimum=0,maximum=4)
+            last=N.load_index(Offsets[1:2],minimum=first,maximum=4)
+            for outer in N.serial(2):
+                middle=N.load_index(Offsets[2:3],minimum=0,maximum=4)
+                for inner in N.serial(first,last):
+                    current=N.load_index(Offsets[3:4],minimum=0,maximum=4)
+    """)
+    control = build_control_facts(lower_native_structure(source).module)
+    outer, inner = control.loops.values()
+    first, _last, middle, current = (
+        control.environment.expression(op.value)
+        for op in control.frames
+        if isinstance(op, TaskOp) and op.native.data == "index_load"
+    )
+    selected = substitute(inner.count, {control.sid: literal(0)})
+    assert selected != inner.count
+    assert control.invariant_over(selected, inner.operation)
+    assert control.invariant_over(substitute(first, {control.sid: literal(0)}), outer.operation)
+    assert control.invariant_over(middle, inner.operation)
+    assert not control.invariant_over(middle, outer.operation)
+    assert not control.invariant_over(
+        substitute(middle, {outer.ordinal: literal(0)}), outer.operation
+    )
+    assert not control.invariant_over(
+        substitute(current, {inner.ordinal: literal(0)}), inner.operation
+    )
+    variant = replace(first.args[0], captures=(control.group, inner.ordinal))
+    assert not control.invariant_over(Expr("argument", (variant,)), inner.operation)
+    carry = replace(first.args[0], kind=SymbolKind.CARRY)
+    assert not control.invariant_over(Expr("argument", (carry,)), inner.operation)

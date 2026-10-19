@@ -295,3 +295,28 @@ ASC SHA256 为 `1e0823709660afbabdc8033b8fb6423a1148701dbd953a994aaa9490a10f46d4
 
 当前 core source 为 87 个模块、27,225 行，比审计基线增加 195 行。局部旧推理
 主体已删除，整个编译器的大幅净简化、P2/P3 剩余收敛及完整 P6 仍未完成。
+
+## 全量 Python 回归与公开示例补全
+
+`owned-final-regression-01/summary.json` 汇总八组 JUnit：1937 个不同 test case
+全部通过，failure/error/skip 均为零，没有把重复执行计作 unique case。watchdog
+与 CLI 的 25 项按它们自身进程组合同独立运行，其余分组仍受 300 秒 command
+watchdog 限制。该全量对应 core 提交 `30ae678`、清单提交 `85713a8`，不外推到
+之后的源码修改。后续命令占位串修正 `e50a844` 的清单/文档三项另外通过。
+
+公开清单原来遗漏 KDA 及 scalar_store：现在按 22 组覆盖实际 AST 声明的 30 个
+kernel 入口，prefill 组构建十个 specialization 并核对实际发布记录。离线构建
+不再需要一个虚假的 physical ID；设备阶段仍强制物理卡映射和全卡检查。
+`owned-all-examples-device-01` 的前 19 组均完成 CANN/设备检查，包括当前新
+ASC 的默认 FA 和 scalar capture/store。首次 KDA 因 JSON 被误作格式占位串而
+未启动构建；`e50a844` 已修正，未把这个工具错误算作设备/编译器错误。
+
+随后真实 KDA recurrent 构建在 metadata 循环 count 的 invariance 上拒绝，见
+`owned-kda-examples-device-01`。实际根因是 SID 特化将 capture 从 `(group,sid)`
+改为 `(group,0)`，原先仅按完整 symbol 集合判断，丢失了同一个可见 load 定义。
+现在保留 definition identity，并要求全部捕获依赖在该 invocation 中不变；
+Expr 的自由变量已递归包含 capture 依赖。循环内定义的 load 即使捕获 ordinal
+被替成常数也不能变成外部可见值，CARRY 不能冒充 metadata。
+新增反例覆盖这些界限；实际 recurrent 的四 token、0/1/3/0 序列域已恢复
+source→ASC 和结构检查（2.7589 秒），CANN 与设备继续验证。KDA 的本次真实
+集成尚未取得全部资格，不用先前完整 Python 通过掩盖这一缺口。

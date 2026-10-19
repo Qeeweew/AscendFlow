@@ -305,3 +305,14 @@ def test_shared_uniform_dag_is_emitted_once():
     names, lines = bindings([quotient, quotient, expression("rem", argument("a"), denominator)])
     assert len(lines) == 3
     assert len(names[quotient]) < 30
+
+
+def test_recurrent_kda_keeps_a_metadata_loop_extent_after_actor_specialization():
+    from ascendflow import compile
+    from examples.kda.recurrent import recurrent_kda
+
+    result = compile(
+        recurrent_kda.specialize(TOKENS=4, SEQUENCES=4, SLOTS=5, INDEX_WIDTH=4, H=8, HV=8)
+    )
+    result.plan.verify()
+    assert 'extern "C" int launch_recurrent_kda(' in result.asc
