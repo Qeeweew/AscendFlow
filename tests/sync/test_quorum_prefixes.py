@@ -12,6 +12,35 @@ from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from tests.models.structured_events import EventModelError, check_structured_events
 
 
+def test_eight_local_loads_keep_one_ordered_prefix_and_exact_ring_lifetimes():
+    program = N.from_source(
+        """
+def local_prefix(X:N.Tensor((n,8,64),N.f32),
+                 Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+    with N.Kernel(1,kind="vector"):
+        inputs=N.alloc_ub((8,2,64),N.f32)
+        total=N.alloc_ub((2,64),N.f32)
+        with N.Vector():
+            for i in N.Pipelined(n,stages=3):
+                with N.Stage(0,name="load"):
+                    for panel in N.unroll(8):
+                        N.copy(X[i,panel,:],inputs[panel,i%2,:])
+                with N.Stage(1,name="sum"):
+                    N.copy(inputs[0,i%2,:],total[i%2,:])
+                    for panel in N.unroll(1,8):
+                        N.add(total[i%2,:],inputs[panel,i%2,:],out=total[i%2,:])
+                with N.Stage(2,name="store"):
+                    N.copy(total[i%2,:],Out[i,:])
+""",
+        disjoint_external=True,
+    )
+    artifact = compile(program)
+    final = collect_native_memory(artifact.plan)
+    original = collect_native_memory(parse(artifact.before_ir))
+    for count in (0, 1, 2, 5):
+        check_structured_events(final, {"n": count}, logical_reference=original)
+
+
 def test_two_gm_handoffs_use_one_complete_quorum_prefix():
     program = N.from_source(
         """

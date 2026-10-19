@@ -19,7 +19,7 @@ from .event_contracts import (
     StructuredEventAssignment,
     StructuredEventPlan,
 )
-from .event_sharing import share_finite_events
+from .event_sharing import share_events
 from .notification_lifetimes import HandbackRule
 from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard, Placement, SyncAction
@@ -153,7 +153,7 @@ class _EventBanks:
                 for member in members:
                     if self.domains._exclusive(prior, member):
                         continue
-                    witness = share_finite_events(self.domains, self.handbacks, prior, member)
+                    witness = share_events(self.domains, self.handbacks, prior, member)
                     if witness is None:
                         break
                     witnesses.append(witness)

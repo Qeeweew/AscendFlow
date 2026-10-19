@@ -266,6 +266,33 @@ def test_integer_thresholds_preserve_the_equality_branch():
         assert replay(proof, {"x": x}) == (0 if x < 3 else 2 if x == 3 else 1)
 
 
+@pytest.mark.parametrize("complete", (False, True))
+def test_shifted_loop_end_equality_terminates_and_keeps_the_uncovered_tail(complete):
+    count = expression(
+        "ceildiv", expression("max", expression("sub", literal(128), G), literal(0)), literal(20)
+    )
+    next_end = expression("add", X, literal(2))
+    assumptions = (
+        comparison(G, ">=", 0),
+        comparison(G, "<", 20),
+        comparison(X, ">=", 0),
+        comparison(count, ">", expression("add", X, literal(1))),
+    )
+    alternatives = (guard(comparison(count, ">", next_end)),)
+    if complete:
+        alternatives += (guard(comparison(count, "==", next_end)),)
+    proof = prove_guard_cover(IntegerFacts({}), assumptions, alternatives)
+    if not complete:
+        assert proof is None
+    else:
+        assert proof is not None
+        for group in range(20):
+            for index in range(8):
+                values = {"g": group, "x": index}
+                if all(test.evaluate(values) for test in assumptions):
+                    assert replay(proof, values) == int(count.evaluate(values) == index + 2)
+
+
 @pytest.mark.parametrize("reverse", (False, True))
 def test_integer_trichotomy_covers_signed_values_and_reversed_operands(reverse):
     alternatives = tuple(

@@ -198,6 +198,11 @@ def _summarize(span, loop, facts, bindings):
         return _collapse(_Span(base, width, span.rows, span.pitch))
     if span.rows == 1 and iterations.constant is not None:
         return _Span(base, span.width, iterations.constant, stride)
+    if span.rows > 1 and stride == span.rows * span.pitch and iterations.constant is not None:
+        # Successive complete row groups keep precisely the original holes.
+        # This is one strided rectangle, not the contiguous bounding box of
+        # the writes. No runtime loop instances or completion facts expand.
+        return _Span(base, span.width, span.rows * iterations.constant, span.pitch)
     return None
 
 

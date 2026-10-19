@@ -386,6 +386,13 @@ class _Partitioner:
                 geometry = replace(
                     geometry, nbytes=geometry.total_nbytes * count, rows=1, row_stride=0
                 )
+            elif geometry.contiguous and delta is not None and delta > geometry.total_nbytes:
+                # A dense loop can visit a strided rectangle with holes.
+                # Keep the holes instead of allocating one cell/event per
+                # physical image of its finite iteration coordinate.
+                geometry = replace(
+                    geometry, nbytes=geometry.total_nbytes, rows=count, row_stride=delta
+                )
             elif geometry.rows > 1 and delta == geometry.rows * geometry.row_stride:
                 geometry = replace(geometry, rows=geometry.rows * count)
             else:

@@ -750,8 +750,8 @@ def _unique_points(points):
     return tuple(result.values())
 
 
-def _quorum_cube_point(points, requirements, order, *, source):
-    """Capture the latest Cube prefix, or acquire before its first reader.
+def _ordered_prefix_point(points, requirements, order, *, source):
+    """Capture the latest actor prefix, or acquire before its first reader.
 
     The caller groups only identical activation/coordinate domains. Every
     moved endpoint must have a proved controller order under every original
@@ -806,7 +806,7 @@ def _quorums(notifications, order):
             cube_source = a == {Actor.AIC}
             cube = sources if cube_source else consumers
             vector = consumers if cube_source else sources
-            selected = _quorum_cube_point(cube, requirements, order, source=cube_source)
+            selected = _ordered_prefix_point(cube, requirements, order, source=cube_source)
             complete = selected is not None and len(vector) == 2
             if complete:
                 if cube_source:
@@ -833,8 +833,8 @@ def _quorums(notifications, order):
     return tuple(local), tuple(unresolved)
 
 
-def _quorum_prefixes(notifications, order):
-    """Share a complete quorum's capture/acquire within one physical phase.
+def _notification_prefixes(notifications, order):
+    """Share complete local/quorum capture/acquire within one physical phase.
 
     Every actor retains its own actual source prefix and first controller
     acquire. Activation, coordinates, boundary families and physical stages
@@ -843,7 +843,7 @@ def _quorum_prefixes(notifications, order):
     """
     selected, groups = [], {}
 
-    def phase(point):
+    def phase(point, *, local=False):
         task = order.dispatch.site(point)
         actor_scope = point.operation.parent_op()
         while actor_scope is not None and not isinstance(actor_scope, ActorDomainOp):
@@ -857,19 +857,26 @@ def _quorum_prefixes(notifications, order):
             point.families,
             task.scope,
             task.stage,
-            actor_scope if actor_scope is not None else point.operation,
+            actor_scope if actor_scope is not None else None if local else point.operation,
         )
 
     for item in notifications:
-        if item.mechanism is not NotificationKind.CROSS_EVENT:
+        if item.mechanism not in {NotificationKind.CROSS_EVENT, NotificationKind.LOCAL_EVENT}:
             selected.append(item)
             continue
         key = (
+            item.mechanism,
             item.source_engine,
             item.destination_engine,
             _domain_key(item),
-            tuple(phase(p) for p in sorted(item.sources, key=lambda p: p.actor.value)),
-            tuple(phase(p) for p in sorted(item.consumers, key=lambda p: p.actor.value)),
+            tuple(
+                phase(p, local=item.mechanism is NotificationKind.LOCAL_EVENT)
+                for p in sorted(item.sources, key=lambda p: p.actor.value)
+            ),
+            tuple(
+                phase(p, local=item.mechanism is NotificationKind.LOCAL_EVENT)
+                for p in sorted(item.consumers, key=lambda p: p.actor.value)
+            ),
         )
         groups.setdefault(key, []).append(item)
     for items in groups.values():
@@ -882,11 +889,18 @@ def _quorum_prefixes(notifications, order):
                     participants.setdefault(point.actor, []).append(point)
             endpoints.append(
                 tuple(
-                    _quorum_cube_point(points, requirements, order, source=source)
+                    _ordered_prefix_point(points, requirements, order, source=source)
                     for points in participants.values()
                 )
             )
-        if any(point is None for points in endpoints for point in points):
+        valid = not any(point is None for points in endpoints for point in points)
+        if valid and items[0].mechanism is NotificationKind.LOCAL_EVENT:
+            # Keep every load before the first acquired use. Interleaved
+            # source reuse still needs its original separate credits.
+            valid = all(
+                order.compare(endpoints[0][0], endpoints[1][0], need) == -1 for need in requirements
+            )
+        if not valid:
             selected.extend(items)
         else:
             selected.append(
@@ -973,7 +987,7 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     grouped = _group_captures(notifications, order)
     grouped = _reuse_acquisitions(grouped, order)
     grouped, quorum_issues = _quorums(grouped, order)
-    grouped = _quorum_prefixes(grouped, order)
+    grouped = _notification_prefixes(grouped, order)
     unresolved.extend(quorum_issues)
     selected = tuple(replace(item, name=f"notification_{i}") for i, item in enumerate(grouped))
     for item in selected:

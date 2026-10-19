@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from ascendflow.analysis.structured_admission import _covers, _Span
+from ascendflow.analysis.structured_admission import _covers, _Span, _summarize
 from ascendflow.diagnostics import CompileError
-from ascendflow.scalar import literal
+from ascendflow.scalar import Expr, expression, literal
 from ascendflow.target.native import NativeGeometry, native_contract
 from ascendflow.target.packets import MaskStep, audited_packet
 
@@ -22,6 +22,42 @@ def test_strided_initializer_coverage_matches_actual_bytes():
                 reader = _Span(literal(origin), literal(width), rows, 32)
                 accessed = {origin + r * 32 + col for r in range(rows) for col in range(width)}
                 assert _covers([writer], reader, frame, {}, Counter()) == (accessed <= initialized)
+
+
+@pytest.mark.parametrize("count", [1, 2, 16])
+def test_repeated_rectangles_preserve_row_holes_and_exact_byte_coverage(count):
+    ordinal = Expr("argument", ("tile",))
+    loop = SimpleNamespace(ordinal=ordinal, count=literal(count))
+    source = _Span(
+        expression("add", literal(256), expression("mul", ordinal, literal(96))), literal(16), 3, 32
+    )
+    summary = _summarize(source, loop, {}, {})
+    written = {
+        256 + tile * 96 + row * 32 + col
+        for tile in range(count)
+        for row in range(3)
+        for col in range(16)
+    }
+    represented = {
+        summary.base.constant + row * summary.pitch + col
+        for row in range(summary.rows)
+        for col in range(summary.width.constant)
+    }
+    assert represented == written
+    frame = SimpleNamespace(domains=lambda: ())
+    for row in range(count * 3):
+        for column, width in ((0, 16), (8, 8), (8, 16), (16, 8)):
+            reader = _Span(literal(256 + row * 32 + column), literal(width))
+            accessed = set(range(256 + row * 32 + column, 256 + row * 32 + column + width))
+            assert _covers([summary], reader, frame, {}, Counter()) == (accessed <= written)
+
+
+@pytest.mark.parametrize("stride", [64, 128])
+def test_repeated_rectangles_with_different_group_pitch_still_reject(stride):
+    ordinal = Expr("argument", ("tile",))
+    loop = SimpleNamespace(ordinal=ordinal, count=literal(4))
+    source = _Span(expression("mul", ordinal, literal(stride)), literal(16), 3, 32)
+    assert _summarize(source, loop, {}, {}) is None
 
 
 @pytest.mark.parametrize("columns", [8, 16, 24, 32, 48, 64, 128])

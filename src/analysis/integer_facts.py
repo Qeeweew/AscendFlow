@@ -374,8 +374,18 @@ class IntegerFacts:
             )
         term = self.bounded(self._constraint(test))
         for prior in assumptions:
-            constraint = self._constraint(prior)
-            if constraint is not None:
+            if prior.predicate == "==":
+                # An exact relation supplies both nonnegative directions.
+                # Retain its operand difference so affine translations and
+                # reversed comparisons cancel in the ordinary integer ring.
+                constraints = (
+                    self._difference(prior.lhs, prior.rhs),
+                    self._difference(prior.rhs, prior.lhs),
+                )
+            else:
+                constraint = self._constraint(prior)
+                constraints = () if constraint is None else (constraint,)
+            for constraint in constraints:
                 remainder = self._difference(term, constraint)
                 if remainder.constant is not None:
                     if remainder.constant >= 0:
