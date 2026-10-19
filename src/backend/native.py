@@ -86,6 +86,19 @@ def native_line(task, *, pointer_renderer, generation):
             # CATLASS AtlasA2 zN->zZ uses classic Load2D with ifTranspose=false.
             return f"asc_copy_l12l0a({p[1]}, {p[0]}, 0, 1, 1, 0);"
         return f"asc_copy_l12l0b({p[1]}, {p[0]}, 0, 1, 1, 0);"
+    if task.native == "vector_copy_rows":
+        columns = refs[0].nbytes // 4
+        bits = [
+            value.replace(CTYPE[ref.dtype] + "*", "uint32_t*")
+            for value, ref in zip(p, refs, strict=True)
+        ]
+        strides = [ref.row_stride // 32 if ref.rows > 1 else 1 for ref in refs]
+        return (
+            "asc_set_mask_norm(); "
+            f"asc_set_vector_mask(0, UINT64_C({(1 << columns) - 1})); "
+            f"asc_copy({bits[1]}, {bits[0]}, uint8_t({refs[0].rows}), "
+            f"1, 1, {strides[1]}, {strides[0]});"
+        )
     if task.native == "copy_rows":
         function = "asc_copy_gm2ub" if refs[0].storage.bank == "GM" else "asc_copy_ub2gm"
         gaps = [(r.row_stride - r.nbytes) // 32 if r.rows > 1 else 0 for r in refs]

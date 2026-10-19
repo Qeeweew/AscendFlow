@@ -45,3 +45,23 @@ def test_row_broadcast_rejects_unaligned_or_unmodeled_repeats(columns):
     scalars = NativeGeometry("UB", "f32", "linear", 16 * 32)
     with pytest.raises(CompileError, match="row broadcast arithmetic"):
         native_contract("mul_row_broadcast", (matrix, scalars, matrix), (16, columns))
+
+
+@pytest.mark.parametrize("width", [32, 64, 128, 256])
+def test_vector_row_copy_uses_exact_pitched_footprints(width):
+    source = NativeGeometry("UB", "f32", "linear", width, rows=16, row_stride=width + 32)
+    destination = NativeGeometry("UB", "f32", "linear", width, rows=16, row_stride=width + 64)
+    assert native_contract(
+        "vector_copy_rows", (source, destination), (), disjoint=lambda: True
+    ) == ("V", ("R", "W"))
+    with pytest.raises(CompileError, match="provably disjoint"):
+        native_contract("vector_copy_rows", (source, destination), (), disjoint=lambda: False)
+
+
+@pytest.mark.parametrize(
+    "width,rows,pitch", [(16, 16, 64), (288, 16, 320), (64, 256, 64), (64, 16, 8192)]
+)
+def test_vector_row_copy_rejects_unrepresentable_native_geometry(width, rows, pitch):
+    ref = NativeGeometry("UB", "f32", "linear", width, rows=rows, row_stride=pitch)
+    with pytest.raises(CompileError, match="Vector row copy"):
+        native_contract("vector_copy_rows", (ref, ref), (), disjoint=lambda: True)

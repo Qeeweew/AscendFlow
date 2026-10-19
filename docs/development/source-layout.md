@@ -99,6 +99,10 @@ native、bounds、ownership、同步和资源分配链，不是第二编译路�
 标准连续 b16 `C=A@B` 与尾块的合同见 [标准 GEMM](../operators/gemm.md)。
 类型转换、补零及 strided NZ 几何经过相同 native/effects、bounds、ownership
 和同步链；封闭 packet 的内部顺序不提供外部异步完成保证。
+UB 的跨步矩形 `N.copy` 使用有完整 mask 设置的 Vector bitwise copy：每行
+32–256 字节、至多 255 行，行距与起点按 32 字节对齐，repeat stride 不超过
+255 个 32 字节块。它保留真实行与间隙，源/目标必须证明不重叠；未知别名不准入。
+这与连续 UB copy 使用同一 source/native/同步链，没有标量逐元素搬运。
 复现命令将运行产物和诊断写入已忽略的 `build/`，文档不依赖仓库外的实验目录。
 
 ## Pipeline 的最小表示

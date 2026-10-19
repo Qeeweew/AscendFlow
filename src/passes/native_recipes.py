@@ -231,7 +231,14 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
                 context.view(op.source, matrix=True),
                 context.view(op.destination, matrix=True),
             )
-        task = context.emit("_copy", "copy_rows" if padded else "copy", source, destination)
+        native = (
+            "vector_copy_rows"
+            if padded and banks == ("UB", "UB")
+            else "copy_rows"
+            if padded
+            else "copy"
+        )
+        task = context.emit("_copy", native, source, destination)
     return RecipeResult((task,), task, 1, (NativeRead(0, task, 0),))
 
 

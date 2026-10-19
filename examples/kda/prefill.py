@@ -118,6 +118,7 @@ def prefill_gram(
     SCALE: N.constexpr = 0.08838834764831845,
 ):
     with N.Kernel(GROUPS, kind="vector") as owner:
+        assert K == 128 and BT == 64, "four diagonal blocks share 64-wide Vector rows"
         keys16 = N.alloc_ub((16, K), DTYPE)
         keys = N.alloc_ub((16, K), N.f32)
         queries = N.alloc_ub((16, K), N.f32)
@@ -130,12 +131,31 @@ def prefill_gram(
         partial = N.alloc_ub((16 * (K // 8),), N.f32)
         scores = N.alloc_ub((64,), N.f32)
         betas = N.alloc_ub((BT,), N.f32)
-        inverse = N.alloc_ub((16, 16), N.f32)
-        coefficients = N.alloc_ub((16,), N.f32)
-        weighted_inverse = N.alloc_ub((16, 16), N.f32)
-        inverse_tree = N.alloc_ub((8, 16), N.f32)
-        inverse_rows = N.alloc_ub((16, 8), N.f32)
+        diagonal = N.alloc_ub((16, 16), N.f32)
+        attention = N.alloc_ub((16, 16), N.f32)
+        inverse = N.alloc_ub((16, BT), N.f32)
+        coefficients = N.alloc_ub((BT,), N.f32)
+        expanded = N.alloc_ub((BT, 64), N.f32)
+        coefficient_matrix = N.alloc_ub((16, BT), N.f32)
+        weighted_inverse = N.alloc_ub((16, BT), N.f32)
+        inverse_tree = N.alloc_ub((8, BT), N.f32)
+        inverse_rows = N.alloc_ub((BT, 8), N.f32)
+        identity = N.alloc_ub((16, 16), N.f32)
+        identities = N.alloc_ub((16, BT), N.f32)
+        upper_storage = N.alloc_mask((16, 16))
+        strict_upper_storage = N.alloc_mask((16, 16))
+        mask_zero = N.alloc_ub((16, 16), N.f32)
         N.fill(scores, 0.0)
+        # Coordinate masks are invariant across every chunk/head. Build their
+        # packed words once, then consume them with Vector select in the loop.
+        upper = N.materialize(N.arange(16)[:, None] <= N.arange(16)[None, :], out=upper_storage)
+        strict_upper = N.materialize(
+            N.arange(16)[:, None] < N.arange(16)[None, :], out=strict_upper_storage
+        )
+        N.fill(identity, 0.0)
+        N.fill(identity, 1.0, mask=N.arange(16)[:, None] == N.arange(16)[None, :])
+        for plane in N.unroll(BT // 16):
+            N.copy(identity, identities[:, plane * 16 : plane * 16 + 16])
         for task in N.serial(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
@@ -153,13 +173,13 @@ def prefill_gram(
                 N.copy(Qp[chunk, head, block : block + 16, :], keys16)
                 N.cast(keys16, out=queries)
                 N.copy(Gp[chunk, head, block : block + 16, :], gates)
-                N.fill(inverse, 0.0)
+                N.fill(diagonal, 0.0)
+                N.fill(attention, 0.0)
                 # Four causal prefixes avoid evaluating most upper-triangle
                 # exp/products, retaining the same FP32 per-score sum tree.
                 for quarter in N.unroll(4):
                     extent = (quarter + 1) * 4
                     for local in N.serial(quarter * 4, N.min(extent, N.max(0, valid - block))):
-                        row = block + local
                         gate_row = gates[local, :]
                         key_row = weighted[local, :]
                         query_row = queries[local, :]
@@ -175,12 +195,7 @@ def prefill_gram(
                             scratch=partial[: extent * (K // 8)],
                             order="block8_then_packed_merge",
                         )
-                        N.fill(
-                            scores,
-                            0.0,
-                            mask=(N.arange(64) + block >= row) | (N.arange(64) + block >= valid),
-                        )
-                        N.copy(scores[:16], inverse[local, :])
+                        N.copy(scores[:16], diagonal[local, :])
                         N.mul(decay[:extent, :], query_row[None, :], out=product[:extent, :])
                         N.reduce_sum(
                             product[:extent, :],
@@ -190,28 +205,40 @@ def prefill_gram(
                             order="block8_then_packed_merge",
                         )
                         N.mul(scores[:16], SCALE, out=scores[:16])
-                        N.fill(
-                            scores,
-                            0.0,
-                            mask=(N.arange(64) + block > row) | (N.arange(64) + block >= valid),
-                        )
-                        N.copy(scores[:16], Aqk[chunk, head, row, block : block + 16])
-                # Keep the diagonal solve in UB while its Gram block is
-                # resident. All terms and the reduction tree stay FP32.
-                N.mul(inverse, -1.0, out=inverse)
-                for inverse_row in N.serial(2, 16):
-                    N.copy(inverse[inverse_row, :], coefficients)
-                    N.mul(
-                        inverse, coefficients[:, None], out=weighted_inverse, scratch=inverse_rows
+                        N.copy(scores[:16], attention[local, :])
+                N.fill(diagonal, 0.0, mask=upper, scratch=mask_zero)
+                N.fill(attention, 0.0, mask=strict_upper, scratch=mask_zero)
+                N.copy(attention, Aqk[chunk, head, block : block + 16, block : block + 16])
+                N.copy(diagonal, inverse[:, block : block + 16])
+            # Four independent 16x16 blocks share one row recurrence. The
+            # 64-wide row layout keeps the multiply and every sum-tree level
+            # on complete Vector repeats, preserving each block's FP32 tree.
+            N.mul(inverse, -1.0, out=inverse)
+            for inverse_row in N.serial(2, 16):
+                N.copy(inverse[inverse_row, :], coefficients)
+                N.broadcast(coefficients[:, None], out=expanded, scratch=inverse_rows)
+                for plane in N.unroll(BT // 16):
+                    N.copy(
+                        expanded[plane * 16 : plane * 16 + 16, :16],
+                        coefficient_matrix[:, plane * 16 : plane * 16 + 16],
                     )
-                    N.add(weighted_inverse[:8, :], weighted_inverse[8:16, :], out=inverse_tree)
-                    N.add(inverse_tree[:4, :], inverse_tree[4:8, :], out=inverse_tree[:4, :])
-                    N.add(inverse_tree[:2, :], inverse_tree[2:4, :], out=inverse_tree[:2, :])
-                    N.add(inverse_tree[0, :], inverse_tree[1, :], out=inverse_tree[0, :])
-                    N.add(coefficients, inverse_tree[0, :], out=inverse[inverse_row, :])
-                N.fill(inverse, 1.0, mask=N.arange(16)[:, None] == N.arange(16)[None, :])
-                N.copy(inverse, Ai32[chunk, head, block : block + 16, block : block + 16])
-                N.copy(inverse, Diagonal[chunk, head, block : block + 16, block : block + 16])
+                N.mul(inverse, coefficient_matrix, out=weighted_inverse)
+                N.add(weighted_inverse[:8, :], weighted_inverse[8:16, :], out=inverse_tree)
+                N.add(inverse_tree[:4, :], inverse_tree[4:8, :], out=inverse_tree[:4, :])
+                N.add(inverse_tree[:2, :], inverse_tree[2:4, :], out=inverse_tree[:2, :])
+                N.add(inverse_tree[0, :], inverse_tree[1, :], out=inverse_tree[0, :])
+                N.add(coefficients, inverse_tree[0, :], out=inverse[inverse_row, :])
+            N.add(inverse, identities, out=inverse)
+            for plane in N.unroll(BT // 16):
+                block = plane * 16
+                N.copy(
+                    inverse[:, block : block + 16],
+                    Ai32[chunk, head, block : block + 16, block : block + 16],
+                )
+                N.copy(
+                    inverse[:, block : block + 16],
+                    Diagonal[chunk, head, block : block + 16, block : block + 16],
+                )
 
 
 @N.prim_func(disjoint_external=True)

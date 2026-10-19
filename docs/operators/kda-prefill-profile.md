@@ -1,7 +1,8 @@
 # KDA prefill：batch=1、S=4096 的 kernel 重放记录
 
-2026-10-19。实现和合同见 [KDA prefill](kda-prefill.md)。本轮基线为
-`1845d4c`，以下“当前”指随本文提交的 DSL、索引边界和 benchmark 修改。
+2026-10-19。实现和合同见 [KDA prefill](kda-prefill.md)。本页冻结 `a625f83`
+的 L2 分批版本结果，基线为 `1845d4c`；以下“当前”均指 `a625f83`。
+后续四块 Vector 合批与不变 mask 复用见 [Vector 合批报告](kda-prefill-vector-batch.md)。
 
 ## 测量条件
 

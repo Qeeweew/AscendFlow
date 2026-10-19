@@ -244,6 +244,31 @@ def native_contract(
                 "overlapping or changing aliases are unsupported",
             )
         return routes[banks], ("R", "W")
+    if native == "vector_copy_rows":
+        require(
+            len(refs) == 2
+            and banks == ("UB", "UB")
+            and dtypes[0] == dtypes[1]
+            and layouts == ("linear", "linear")
+            and refs[0].rows == refs[1].rows
+            and refs[0].nbytes == refs[1].nbytes
+            and 1 <= refs[0].rows <= 255
+            and refs[0].nbytes % 32 == 0
+            and 32 <= refs[0].nbytes <= 256
+            and all(r.row_stride % 32 == 0 for r in refs)
+            and all(r.rows == 1 or 1 <= r.row_stride // 32 <= 255 for r in refs)
+            and not params,
+            "Vector row copy needs equal aligned UB rows, at most 64 words and bounded repeat strides",
+        )
+        require(
+            callable(disjoint),
+            "UB-to-UB copy requires provably disjoint source and destination ranges",
+        )
+        require(
+            disjoint() is True,
+            "UB-to-UB copy requires provably disjoint source and destination ranges; overlapping or changing aliases are unsupported",
+        )
+        return "V", ("R", "W")
     if native == "copy_rows":
         require(
             len(refs) == 2

@@ -173,7 +173,9 @@ _FULL = frozenset(
         "reduce_tile_max64",
     }
 )
-_COLUMNS = frozenset({"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast"})
+_COLUMNS = frozenset(
+    {"mul_row_broadcast", "sub_row_broadcast", "div_row_broadcast", "vector_copy_rows"}
+)
 _MASKED = frozenset(
     {
         "mask_fill",
