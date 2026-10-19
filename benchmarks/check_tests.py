@@ -1,8 +1,8 @@
-"""Run a fresh complete CPU test suite in parallel file workers.
+"""Run the CPU test suite in parallel file workers.
 
 Each ordinary file owns a 300-second process-group deadline. Watchdog tests
 and the CLI helper exercise that contract themselves and run without another
-build-group wrapper. No previous result or compilation artifact is reused.
+build-group wrapper.
 """
 
 import argparse
@@ -87,7 +87,6 @@ def summarize(output, results, jobs, started):
         "unique_cases": len(cases),
         "failures_errors": errors,
         "skipped": skipped,
-        "reused_results": False,
         "results": results,
     }
 

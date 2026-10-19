@@ -6,7 +6,7 @@
 python -m benchmarks.check_tests --jobs 32 --output build/tests-parallel
 ```
 
-每次使用新输出目录，全量按文件并行，不复用历史结果。每个普通文件保留
+全量按文件并行执行。每个普通文件保留
 300 秒进程组期限；watchdog 与 CLI helper 自测独立运行。JSON 汇总记录
 并发数、总墙钟时间、各文件结果和全部 JUnit 用例。直接 `python -m pytest -q`
 仍是完整串行入口。
