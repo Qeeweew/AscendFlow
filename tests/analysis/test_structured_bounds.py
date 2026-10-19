@@ -31,6 +31,7 @@ from ascendflow.target.native import CAPACITY, ITEMSIZE
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
 from tests.fixtures.control import SHARED
+from tests.support.structured import native_memory
 
 
 def _index(block, value):
@@ -132,10 +133,6 @@ def _module(block, *, core="aiv"):
     return module
 
 
-def _memory(source):
-    return collect_native_memory(lower_native_structure(source).module)
-
-
 @pytest.mark.parametrize(
     "source,count",
     [
@@ -147,7 +144,7 @@ def _memory(source):
 def test_real_scale_cube_and_shared_aiv_reuse_actual_memory_facts_without_native_or_decode(
     source, count, monkeypatch
 ):
-    memory = _memory(source)
+    memory = native_memory(source)
 
     def forbidden(*args, **kwargs):
         pytest.fail("bounds admission reran native rules or address decoding")
@@ -169,7 +166,7 @@ def test_real_scale_cube_and_shared_aiv_reuse_actual_memory_facts_without_native
 
 
 def test_runtime_capacity_uses_actual_count_and_scale_not_prototype_nbytes():
-    memory = _memory(scale)
+    memory = native_memory(scale)
     bounds = admit_memory_bounds(memory)
     root = next(value for value in bounds.allocations if value.owner.sym_name.data == "X")
     assert root.owner.nbytes.data == 256
@@ -475,7 +472,7 @@ def test_unused_local_capacity_is_not_excused_by_an_empty_loop():
                 for i in N.Pipelined(0,stages=1):
                     N.fill(x,0.0)
     """)
-    memory = _memory(source)
+    memory = native_memory(source)
     with pytest.raises(CompileError, match="UB capacity exceeded") as error:
         admit_memory_bounds(memory)
     assert error.value.kind == ErrorKind.RESOURCE

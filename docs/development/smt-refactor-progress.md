@@ -416,3 +416,25 @@ S4077，output/state RMSE ratio 为 0.001743/0.001206，原容差通过。
 27,238 行减少 56 行，比引入 Z3 前的 27,030 行仍增加 152 行。此次减少的是
 重复 native 表示及转发，不把它称作整个编译器的大幅净简化。跨模块坐标
 接口、存储/值合同收敛以及 FA 冷构建目标仍未完成。
+
+## 测试职责重构与并行执行
+
+测试重构前为 111 个测试模块，52 个位于 tests 根目录；915 个测试函数展开为
+1945 个用例，16 处从另一个测试文件导入共享输入/helper。`44cc5aa` 将根目录
+测试及两个完整 FA 集成文件归入职责目录，把共享 source、有限模型和 CPU mock
+分到 fixtures/models/support，清除上述跨测试导入。没有删除边界矩阵或增加
+默认跳过；逐项 collection 对照记录在外层 `runs/test-refactor/`。
+
+本次全量按文件使用 32 个进程重新执行，1945 项全部通过、无 error/failure/skip，
+墙钟时间 77.078 秒，见 `parallel-full-32-01/summary.json`。这是本次运行事实，
+不是要求以后每次都重新执行或禁止复用结果的政策；误写的长期规定已由
+`e137074` 删除。`benchmarks.check_tests` 支持 `--jobs` 和按目录/文件 `--paths`，
+保留单文件 300 秒进程组期限及 watchdog/CLI 自测的隔离边界。
+
+后续将 1520 行 mask 测试分为 source predicate、packet、生命周期、codegen 和
+算子 oracle，将 1115 行后端测试分为物化交接、控制、通知和 launcher。
+相应测试文件最长 398 行；数学预期、DSL 输入和 C++ shim 各保留一份共享实现。
+原 51 个测试函数的断言与参数矩阵保持，`split-contracts-01` 的 82 项并行通过，
+15.858 秒。相同 SSA index 构造和 native memory setup 收敛到 support/structured，
+全部直接/间接消费者共 12 个测试文件；`shared-setup-01` 的 237 项通过，21.967 秒。
+上述两组覆盖不同用例，没有将重复执行累计为新增覆盖。编译器 src 未改变。

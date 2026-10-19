@@ -15,12 +15,7 @@ from ascendflow.dialects.structured import AddressOp
 from ascendflow.dialects.types import ref_type
 from ascendflow.scalar import Expr, Fact, expression, literal
 from ascendflow.target.native import NativeGeometry
-
-
-def _index(block, value):
-    operation = arith.ConstantOp.from_int_and_width(value, IndexType())
-    block.add_op(operation)
-    return operation.result
+from tests.support.structured import index_constant
 
 
 def _binary(block, operation, left, right):
@@ -90,7 +85,7 @@ def test_multiple_ancestor_clocks_and_uniform_radix_remain_one_actual_address(mo
     facts = {"n": Fact(minimum=1), "m": Fact(minimum=1)}
     decoder = _decoder(bindings, facts)
     root = _buffer(block, bank="GM")
-    zero, width, rowbytes = (_index(block, value) for value in (0, 64, 256))
+    zero, width, rowbytes = (index_constant(block, value) for value in (0, 64, 256))
     linear = _binary(block, arith.AddiOp, _binary(block, arith.MuliOp, outer, m), inner)
     offset = _binary(block, arith.MuliOp, linear, rowbytes)
     address = _address(
@@ -137,7 +132,7 @@ def test_shared_ssa_memo_and_injected_logical_identities_are_reused(monkeypatch)
     logical = Expr("argument", ("$logical",))
     sid = Expr("argument", ("$sid",))
     env = ScalarEnvironment({stage0: logical, stage1: logical, domain0: sid, domain1: sid}, {})
-    one = _index(block, 1)
+    one = index_constant(block, 1)
     shared = _binary(block, arith.AddiOp, stage0, one)
     calls = []
     original = scalar.expression
@@ -179,7 +174,7 @@ def test_scalar_environment_copies_bindings_and_exposes_readonly_uniform_facts()
 def test_decode_preserves_rows_and_subview_metadata_without_proving_bounds():
     block = Block()
     root = _buffer(block, dtype="f16", layout="NZ")
-    zero, extent, offset = (_index(block, value) for value in (0, 16, 20000))
+    zero, extent, offset = (index_constant(block, value) for value in (0, 16, 20000))
     operation = _address(
         block,
         root.ref,
@@ -205,7 +200,7 @@ def test_decode_preserves_rows_and_subview_metadata_without_proving_bounds():
 def test_absent_axis_metadata_decodes_but_cannot_supply_axis_admission():
     block = Block()
     root = _buffer(block)
-    operation = _address(block, root.ref, _index(block, 0))
+    operation = _address(block, root.ref, index_constant(block, 0))
     decoder = _decoder()
     address = decoder.decode(operation.ref)
     assert address.axes is None
@@ -217,7 +212,7 @@ def test_absent_axis_metadata_decodes_but_cannot_supply_axis_admission():
 def test_axis_check_uses_retained_projected_away_axes_and_reports_witness():
     block = Block()
     root = _buffer(block)
-    zero, three, four, width = (_index(block, value) for value in (0, 3, 4, 64))
+    zero, three, four, width = (index_constant(block, value) for value in (0, 3, 4, 64))
     operation = _address(
         block,
         root.ref,
@@ -243,7 +238,7 @@ def test_axis_failure_classification_keeps_explicit_constant_violations_invalid(
 ):
     block = Block()
     root = _buffer(block)
-    zero, start, size = (_index(block, value) for value in (0, origin, extent))
+    zero, start, size = (index_constant(block, value) for value in (0, origin, extent))
     operation = _address(
         block,
         root.ref,
@@ -271,7 +266,7 @@ def test_axis_failure_classification_does_not_call_an_unknown_origin_a_counterex
     block = Block(arg_types=[IndexType()])
     origin = block.args[0]
     root = _buffer(block)
-    zero, extent = (_index(block, value) for value in (0, 8))
+    zero, extent = (index_constant(block, value) for value in (0, 8))
     operation = _address(
         block,
         root.ref,
@@ -300,7 +295,7 @@ def test_axis_failure_classification_marks_a_missing_cyclic_joint_range_unsuppor
         {"$group": Fact(maximum=19), "Sq": Fact(minimum=128, multiple=128)},
     )
     root = _buffer(block)
-    zero, one, eight, groups, tile = (_index(block, value) for value in (0, 1, 8, 20, 128))
+    zero, one, eight, groups, tile = (index_constant(block, value) for value in (0, 1, 8, 20, 128))
     tiles = _binary(block, arith.DivUIOp, size, tile)
     divisor = _binary(block, arith.MuliOp, eight, tiles)
     cyclic = _binary(block, arith.AddiOp, group, _binary(block, arith.MuliOp, groups, ordinal))
@@ -340,7 +335,7 @@ def test_axis_failure_classification_preserves_an_explicit_analysis_limit(monkey
 
     block = Block()
     root = _buffer(block)
-    zero, extent = (_index(block, value) for value in (0, 8))
+    zero, extent = (index_constant(block, value) for value in (0, 8))
     operation = _address(
         block,
         root.ref,
@@ -370,7 +365,7 @@ def test_unsigned_dividend_is_checked_before_axis_recombination():
     symbol = Expr("argument", ("$g",))
     decoder = _decoder({g: symbol})
     root = _buffer(block)
-    zero, three, five, extent = (_index(block, value) for value in (0, 3, 5, 8))
+    zero, three, five, extent = (index_constant(block, value) for value in (0, 3, 5, 8))
     dividend = _binary(block, arith.SubiOp, g, five)
     quotient = _binary(block, arith.DivUIOp, dividend, three)
     remainder = _binary(block, arith.RemUIOp, dividend, three)
@@ -402,7 +397,7 @@ def test_unsigned_dividend_is_checked_before_axis_recombination():
 def test_scalar_divisors_need_a_positive_uniform_contract(binding, facts):
     block = Block(arg_types=[IndexType()])
     divisor = block.args[0]
-    quotient = _binary(block, arith.DivUIOp, _index(block, 64), divisor)
+    quotient = _binary(block, arith.DivUIOp, index_constant(block, 64), divisor)
     env = ScalarEnvironment({divisor: binding}, facts)
     with pytest.raises(CompileError, match="uniform and provably positive"):
         env.expression(quotient)
@@ -415,7 +410,7 @@ def test_native_operand_must_be_an_actual_address_and_original_buffer_root():
     with pytest.raises(CompileError, match="actual AddressOp result") as error:
         decoder.decode(root.ref)
     assert error.value.kind == ErrorKind.UNSUPPORTED
-    zero = _index(block, 0)
+    zero = index_constant(block, 0)
     first = _address(block, root.ref, zero)
     nested = _address(block, first.ref, zero)
     with pytest.raises(CompileError, match="original BufferOp allocation root") as error:
@@ -426,7 +421,7 @@ def test_native_operand_must_be_an_actual_address_and_original_buffer_root():
 def test_incomplete_axis_metadata_is_rejected_even_without_prior_ir_verification():
     block = Block()
     root = _buffer(block)
-    zero = _index(block, 0)
+    zero = index_constant(block, 0)
     operation = _address(block, root.ref, zero, origins=(zero,))
     with pytest.raises(CompileError, match="metadata must be complete"):
         _decoder().decode(operation.ref)
@@ -437,7 +432,7 @@ def test_ub_disjointness_uses_actual_roots_even_when_names_match(bank, expected)
     block = Block()
     roots = (_buffer(block, bank=bank), _buffer(block, bank=bank))
     assert roots[0].sym_name == roots[1].sym_name
-    zero = _index(block, 0)
+    zero = index_constant(block, 0)
     decoder = _decoder()
     left, right = (decoder.decode(_address(block, root.ref, zero).ref) for root in roots)
     assert decoder.disjoint(left, right) is expected
@@ -453,14 +448,14 @@ def test_same_root_copy_alias_proof_keeps_all_clocks_and_uniform_terms(distance,
     }
     decoder = _decoder(bindings, {"n": Fact(minimum=1)})
     root = _buffer(block)
-    width = _index(block, 256)
+    width = index_constant(block, 256)
     base = _binary(
         block,
         arith.MuliOp,
         _binary(block, arith.AddiOp, _binary(block, arith.MuliOp, outer, radix), inner),
         width,
     )
-    offset = _binary(block, arith.AddiOp, base, _index(block, distance))
+    offset = _binary(block, arith.AddiOp, base, index_constant(block, distance))
     left = decoder.decode(_address(block, root.ref, base).ref)
     right = decoder.decode(_address(block, root.ref, offset).ref)
     assert decoder.disjoint(left, right) is expected
@@ -472,7 +467,7 @@ def test_distinct_offset_ssa_and_unknown_changing_aliases_do_not_prove_disjointn
     clock = Expr("argument", ("$g",))
     decoder = _decoder({g: clock, h: Expr("argument", ("$h",))})
     root = _buffer(block)
-    zero = _index(block, 0)
+    zero = index_constant(block, 0)
     same = _binary(block, arith.AddiOp, g, zero)
     left = decoder.decode(_address(block, root.ref, g).ref)
     equal = decoder.decode(_address(block, root.ref, same).ref)
@@ -495,10 +490,15 @@ def test_same_root_alias_proof_requires_contiguity_and_the_larger_span(
     block = Block()
     root = _buffer(block)
     decoder = _decoder()
-    left = decoder.decode(_address(block, root.ref, _index(block, 0), nbytes=128).ref)
+    left = decoder.decode(_address(block, root.ref, index_constant(block, 0), nbytes=128).ref)
     right = decoder.decode(
         _address(
-            block, root.ref, _index(block, distance), nbytes=32, rows=rows, row_stride=row_stride
+            block,
+            root.ref,
+            index_constant(block, distance),
+            nbytes=32,
+            rows=rows,
+            row_stride=row_stride,
         ).ref
     )
     assert decoder.disjoint(left, right) is expected

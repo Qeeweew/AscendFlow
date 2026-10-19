@@ -16,7 +16,6 @@ from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.dialects.io import parse
 from ascendflow.dialects.physical import MixedOp
 from ascendflow.dialects.structured import ActorDomainOp, NotificationOp
-from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from examples.gemm.batched import batched_matmul
 from examples.vector.scale import scale
@@ -27,6 +26,7 @@ from tests.models.structured_events import (
     check_compiled_events,
     check_structured_events,
 )
+from tests.support.structured import native_memory
 
 
 def test_shared_l0c_packet_reuse_keeps_actual_read_versions_through_loop_boundaries():
@@ -39,10 +39,6 @@ def test_shared_l0c_packet_reuse_keeps_actual_read_versions_through_loop_boundar
     for count in range(4):
         execution = check_compiled_events(result, {"n": count})
         assert len(execution.natives) == 73 * count
-
-
-def memory(source):
-    return collect_native_memory(lower_native_structure(source).module)
 
 
 def notify(anchor, kind, source, destination, *, actors=(Actor.AIV0,), event=0):
@@ -67,7 +63,7 @@ def notify(anchor, kind, source, destination, *, actors=(Actor.AIV0,), event=0):
 
 
 def empty(*, mixed=False):
-    return memory(
+    return native_memory(
         N.from_source(
             """
         def events():
@@ -88,7 +84,7 @@ def empty(*, mixed=False):
 
 
 def test_source_native_ends_are_not_fifo_and_set_effect_does_not_gate_future_admission():
-    facts = memory(
+    facts = native_memory(
         N.from_source("""
         def independent():
             with N.Kernel():
@@ -131,7 +127,7 @@ def hazards():
         + statements[hazard]
         + "\n"
     )
-    facts = memory(source)
+    facts = native_memory(source)
     if hazard == "WAR":
         notify(facts.templates[1].operation, SyncKind.FENCE, Engine.V, Engine.V)
     with pytest.raises(EventModelError, match=hazard):
@@ -143,7 +139,7 @@ def hazards():
 
 
 def ready_pipeline():
-    facts = memory(
+    facts = native_memory(
         N.from_source("""
         def ready(X:N.Tensor((8,),N.f32),O:N.Tensor((8,),N.f32,access="write")):
             with N.Kernel():
@@ -251,7 +247,7 @@ def test_binary_event_consumption_must_precede_reuse_across_actual_body_invocati
 
 @pytest.mark.parametrize("count", [0, 1, 2, 3, 7])
 def test_finite_zero_single_and_short_actual_pipeline_instances(count):
-    facts = memory(
+    facts = native_memory(
         N.from_source("""
         def short(n:N.int64):
             with N.Kernel():
@@ -271,7 +267,7 @@ def test_finite_zero_single_and_short_actual_pipeline_instances(count):
 
 
 def quorum():
-    facts = memory(
+    facts = native_memory(
         N.from_source("""
         def quorum(X:N.Tensor((16,16),N.f16),Shared:N.Tensor((16,16),N.f16,access="write")):
             with N.Kernel(kind="mixed"):

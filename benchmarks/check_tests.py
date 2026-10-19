@@ -95,33 +95,48 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--jobs", type=int, default=32)
+    parser.add_argument("--paths", nargs="+", type=Path, default=[Path("tests")])
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     output = args.output.resolve()
-    output.mkdir(parents=True, exist_ok=False)
     os.chdir(ROOT)
     os.environ.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1")
-    paths = sorted(Path("tests").rglob("test_*.py"))
+    paths = set()
+    for selected in args.paths:
+        if selected.is_dir():
+            paths.update(selected.rglob("test_*.py"))
+        elif selected.is_file() and selected.name.startswith("test_"):
+            paths.add(selected)
+        else:
+            parser.error(f"test path does not exist: {selected}")
+    if not paths:
+        parser.error("no test files selected")
+    try:
+        paths = sorted({path.resolve().relative_to(ROOT) for path in paths})
+    except ValueError:
+        parser.error("test paths must belong to this repository")
+    output.mkdir(parents=True, exist_ok=False)
     (output / "files.json").write_text(json.dumps([str(p) for p in paths], indent=2) + "\n")
     started = monotonic()
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         results = list(pool.map(lambda p: run_file(p, output), paths))
-    directory = output / "standalone-helper"
-    command = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-q",
-        "--tb=short",
-        "--junitxml=" + str(directory / "results.xml"),
-        CLI_HELPER,
-    ]
-    try:
-        run_isolated(command, directory)
-        results.append({"file": CLI_HELPER, "status": "passed"})
-    except (RuntimeError, subprocess.TimeoutExpired) as error:
-        results.append({"file": CLI_HELPER, "status": "failed", "error": str(error)})
+    if Path(CLI_HELPER.split("::", 1)[0]) in paths:
+        directory = output / "standalone-helper"
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            "--junitxml=" + str(directory / "results.xml"),
+            CLI_HELPER,
+        ]
+        try:
+            run_isolated(command, directory)
+            results.append({"file": CLI_HELPER, "status": "passed"})
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            results.append({"file": CLI_HELPER, "status": "failed", "error": str(error)})
     summary = summarize(output, results, args.jobs, started)
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({k: v for k, v in summary.items() if k != "results"}), flush=True)

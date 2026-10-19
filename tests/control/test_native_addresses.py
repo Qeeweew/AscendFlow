@@ -15,6 +15,7 @@ from ascendflow.dialects.source import AllocationOp, PipelineOp, SizeOp, ViewOp
 from ascendflow.dialects.types import TensorType, ref_type
 from ascendflow.passes.native_addresses import lower_address, subview
 from ascendflow.target.native import ITEMSIZE
+from tests.support.structured import index_constant
 
 
 def _ints(values):
@@ -37,15 +38,9 @@ def _allocation(shape, *, dimensions=(), bank="UB", dtype="f32", layout="linear"
     )
 
 
-def _index(block, value):
-    operation = arith.ConstantOp.from_int_and_width(value, IndexType())
-    block.add_op(operation)
-    return operation.result
-
-
 def _view(block, allocation, widths, axes, origins=None, *, valid=None):
     if origins is None:
-        origins = tuple(_index(block, 0) for _ in widths)
+        origins = tuple(index_constant(block, 0) for _ in widths)
     typ = allocation.ref.type
     operation = ViewOp.build(
         operands=[allocation.ref, origins, valid],
@@ -219,7 +214,9 @@ def test_whole_source_expression_and_per_call_lexical_bindings_are_preserved():
 def test_two_static_views_share_one_root_without_sharing_their_offsets():
     source, output = Block(), Block()
     allocation = _allocation((16,))
-    views = [_view(source, allocation, (8,), (0,), (_index(source, start),)) for start in (0, 8)]
+    views = [
+        _view(source, allocation, (8,), (0,), (index_constant(source, start),)) for start in (0, 8)
+    ]
     root = _buffer(output, allocation)
     addresses = [_lower(view, output=output, buffer=root)[0] for view in views]
     assert all(address.source is root.ref for address in addresses)
@@ -251,7 +248,7 @@ def test_complete_fractal_plane_uses_only_its_leading_slot_coordinate(layout, ba
         allocation,
         (1, 16, 16),
         (1, 2),
-        (source.args[0], _index(source, 0), _index(source, 0)),
+        (source.args[0], index_constant(source, 0), index_constant(source, 0)),
     )
     output = Block(arg_types=[IndexType()])
     address, _, _ = _lower(
@@ -273,7 +270,7 @@ def test_l1_nz_column_slice_retains_axes_and_uses_fractal_byte_coordinates():
         allocation,
         (1, 32, 32),
         (1, 2),
-        (source.args[0], _index(source, 0), _index(source, 48)),
+        (source.args[0], index_constant(source, 0), index_constant(source, 48)),
     )
     output = Block(arg_types=[IndexType()])
     address, _, _ = _lower(
@@ -295,7 +292,7 @@ def test_l1_nz_row_and_column_slice_keeps_physical_fractal_gaps():
         allocation,
         (1, 128, 32),
         (1, 2),
-        (source.args[0], _index(source, 128), _index(source, 16)),
+        (source.args[0], index_constant(source, 128), index_constant(source, 16)),
     )
     output = Block(arg_types=[IndexType()])
     address, _, _ = _lower(
@@ -312,7 +309,7 @@ def test_nested_subviews_keep_the_original_root_and_axis_metadata():
         _allocation((2, 4, 16)),
         (1, 4, 16),
         (1, 2),
-        (source.args[0], _index(source, 0), _index(source, 0)),
+        (source.args[0], index_constant(source, 0), index_constant(source, 0)),
     )
     output = Block(arg_types=[IndexType()])
     address, _, root = _lower(view, bindings=[(source.args[0], output.args[0])], output=output)
@@ -385,7 +382,7 @@ def test_unrepresented_address_geometry_fails_explicitly(case, diagnostic):
 @pytest.mark.parametrize("origin,width", [(-1, 8), (12, 8), (0, 17)])
 def test_obvious_constant_axis_errors_are_rejected(origin, width):
     source = Block()
-    view = _view(source, _allocation((16,)), (width,), (0,), (_index(source, origin),))
+    view = _view(source, _allocation((16,)), (width,), (0,), (index_constant(source, origin),))
     with pytest.raises(CompileError, match="static view"):
         _lower(view)
 
@@ -426,7 +423,7 @@ def test_subview_rejects_an_address_chain_in_place_of_the_actual_buffer_root():
 def test_dynamic_axis_metadata_is_retained_without_claiming_bounds_admission():
     source = Block(arg_types=[IndexType()] * 2)
     allocation = _allocation((-1, 64), dimensions=[source.args[0]], bank="GM")
-    view = _view(source, allocation, (1, 64), (1,), (source.args[1], _index(source, 0)))
+    view = _view(source, allocation, (1, 64), (1,), (source.args[1], index_constant(source, 0)))
     output = Block(arg_types=[IndexType()] * 2)
     address, _, _ = _lower(view, bindings=zip(source.args, output.args, strict=True), output=output)
     assert address.extents[0] is output.args[0] and address.origins[0] is output.args[1]

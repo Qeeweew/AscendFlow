@@ -11,6 +11,12 @@ python -m benchmarks.check_tests --jobs 32 --output build/tests-parallel
 并发数、总墙钟时间、各文件结果和全部 JUnit 用例。直接 `python -m pytest -q`
 仍是完整串行入口。
 
+并行入口也可以只选择相关目录或文件：
+
+```bash
+python -m benchmarks.check_tests --jobs 32 --paths tests/backend tests/analysis/test_mask_packets.py --output build/tests-mask
+```
+
 默认 collection 包含全部测试，没有隐式跳过算子或较慢的有限执行检查。
 2026-10-19 的目录整理保留了全部 915 个测试函数、1945 个参数化用例；
 该数量是整理前后覆盖对应的记录，不是后续新增或删除测试的配额。

@@ -48,3 +48,18 @@ def shared(A:N.Tensor((GROUPS,n,32,16),N.f16),
                 value=N.mul(tile,2.0,out=y)
                 N.copy(value,Y[group,t,sid*16:(sid+1)*16,:])
 """
+
+
+CARRY = """
+def carry(n:N.int64):
+    with N.Kernel():
+        x=N.alloc_ub((64,),name="x")
+        total=7
+        for i in N.serial(1,n,2):
+            if i<3:
+                total=total+i
+            else:
+                total=total+2
+        for j in N.Pipelined(total,stages=1):
+            N.fill(x,1.0)
+"""

@@ -6,6 +6,9 @@ These helpers run neither complete memory admission nor executable compilation
 and are not independent correctness oracles. Importing creates no fixture.
 """
 
+from xdsl.dialects import arith
+from xdsl.dialects.builtin import IndexType
+
 from ascendflow import language as N
 from ascendflow.analysis.event_contracts import ResourceWork
 from ascendflow.analysis.event_domains import EventDomains
@@ -15,9 +18,18 @@ from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.notification_binding import bind_notifications
 
 
+def index_constant(block, value):
+    operation = arith.ConstantOp.from_int_and_width(value, IndexType())
+    block.add_op(operation)
+    return operation.result
+
+
+def native_memory(source):
+    return collect_native_memory(lower_native_structure(source).module)
+
+
 def selected(source):
-    structure = lower_native_structure(N.from_source(source) if isinstance(source, str) else source)
-    memory = collect_native_memory(structure.module)
+    memory = native_memory(N.from_source(source) if isinstance(source, str) else source)
     dependencies = build_structured_dependencies(memory)
     result = bind_notifications(dependencies, dependencies.dispatch)
     result.require_closed()
