@@ -249,7 +249,7 @@ def examples():
                 "--artifacts",
                 "{output}",
                 "--heads",
-                "2",
+            "8",
                 "--lengths",
                 "127",
             ),

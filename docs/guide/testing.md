@@ -38,7 +38,7 @@ python -m benchmarks.check_examples --output build/examples-device --physical 2
 129×257×259 尾块；dense NT 使用 256×512×256；FA 使用 256:1024、768:3072。
 其他参数见[清单实现](../../benchmarks/check_examples.py)，结果见[示例验证](../reports/examples.md)。
 KDA recurrent 使用长度 0/1/3/0，decode 使用四个单 token 序列，prefill 使用
-两头、127 token 尾块；它们是数值 smoke，不代替 B1/S4096/H32 的性能资格。
+八头、127 token 尾块；它们是数值 smoke，不代替 B1/S4096/H32 的性能资格。
 构建清单会核对每个声明入口确实发布了编译记录，KDA 的设备记录保存在各组的
 `validation/results.json`；标量 capture/store 另有精确 FP32、输入与边界检查。
 
