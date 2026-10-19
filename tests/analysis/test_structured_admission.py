@@ -146,6 +146,25 @@ def test_first_logical_iteration_initialization_is_an_inductive_value_fact():
     assert admission.work["read_proofs"] == 1
 
 
+@pytest.mark.parametrize("initialize_second", [False, True])
+def test_maybe_empty_sibling_loops_keep_their_own_initializing_writers(initialize_second):
+    second = "                    N.fill(x,3.0)\n" if initialize_second else ""
+    text = _vector(
+        "                for i in N.serial(n):\n"
+        "                    N.fill(x,1.0)\n"
+        "                    N.mul(x[0:64],2.0,out=y)\n"
+        "                for j in N.serial(m):\n"
+        + second
+        + "                    N.mul(x[0:64],4.0,out=y)",
+        "n:N.int64, m:N.int64",
+    )
+    if initialize_second:
+        assert _admit(text).work["read_proofs"] == 2
+    else:
+        with pytest.raises(CompileError, match="initialized writer coverage"):
+            _admit(text)
+
+
 @pytest.mark.parametrize("minimum,accepted", [(0, False), (1, True)])
 def test_closed_runtime_loop_needs_a_proven_first_writer_before_an_outside_read(minimum, accepted):
     text = _vector(

@@ -619,13 +619,14 @@ def admit_structured_memory(
                 if access.mode.writes:
                     key = instances[template.operation, access.operand_index, actor]
                     # Numerical definedness is monotone. Repeating the exact
-                    # write in the same control block adds no initialized
-                    # bytes. Keep its first defining witness, independently
-                    # of the logical-value analysis's precise later versions.
+                    # write in the same activation frame adds no initialized
+                    # bytes. Sibling loops/branches may be empty independently;
+                    # their common parent is not an initialization witness.
+                    # Logical-value analysis keeps the precise later versions.
                     signature = (
                         key,
                         actor,
-                        template.frame.parent,
+                        template.frame,
                         access.address.offset,
                         access.address.geometry,
                     )
