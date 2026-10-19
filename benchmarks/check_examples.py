@@ -331,7 +331,7 @@ def main():
             command = [
                 sys.executable,
                 "-m",
-                *(part.format(output=output) for part in case.build),
+                *(part.replace("{output}", str(output)) for part in case.build),
                 "--output",
                 str(output),
             ]
@@ -352,7 +352,7 @@ def main():
                 command = [
                     sys.executable,
                     "-m",
-                    *(part.format(output=output) for part in case.run),
+                    *(part.replace("{output}", str(output)) for part in case.run),
                     "--output",
                     str(output / case.device_subdir),
                     "--physical",

@@ -82,6 +82,12 @@ native 是 lifetime word 的不同 occurrence。两个 ready consumer 的共同
 definition 会使 Set 域重合；多个最后 reader 的共同下一 writer 会使 Wait
 域重合，因此它们不会被合并掉。比较使用各端真实坐标，参数 case 仍由域构造负责。
 
+多个精确 cell 可组成共同释放的 ownership 集合：capture 必须在全部旧 reader
+发射之后，acquire 必须在所有下一 writer 之前，且每个被合并的 cell/role 在
+steady 和 selected boundary 的候选片段中保持同一完整集合。只在边界合成的
+集合不取得内部各 cell 的既有 credit。该集合沿用完整物理 lifetime 的归纳，
+不是按 phase rank 给不同存储复用 ID；原始 edges、参与者和路由均保留。
+
 每个 cell credit 使用一个本地二值 ID；完整的跨 AIC/AIV credit 使用一个 mode-2
 ID，并保留双方实际参与者的原始 edges。复用理由是对物理 lifetime word 的归纳：
 
