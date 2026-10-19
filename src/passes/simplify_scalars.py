@@ -253,12 +253,15 @@ class _Scope:
     _range_data: dict = field(init=False, repr=False)
     _intervals: dict = field(default_factory=dict, init=False, repr=False)
     _revision: int = field(default=0, init=False, repr=False)
-    _parent_revision: int = field(default=-1, init=False, repr=False)
-    _facts_revision: tuple = field(default=(), init=False, repr=False)
+    _clock: list[int] = field(default_factory=lambda: [0], init=False, repr=False)
+    _observed: tuple = field(default=(), init=False, repr=False)
+    _inputs: tuple = field(default=(), init=False, repr=False)
 
     def __post_init__(self):
         self._range_data = dict(self.ranges)
         self.ranges = MappingProxyType(self._range_data)
+        if self.parent is not None:
+            self._clock = self.parent._clock
 
     def _invalidate(self):
         self._intervals.clear()
@@ -266,19 +269,30 @@ class _Scope:
         self._revision += 1
 
     def refresh(self):
+        # The clock only reports a possible input change. It never invalidates
+        # sibling scopes: the actual parent/facts revisions below decide that.
+        # Unchanged queries avoid recursively polling the same ancestor chain.
+        facts_revision = () if self.facts is None else (id(self.facts), self.facts.revision)
+        observed = self._clock[0], facts_revision
+        if observed == self._observed:
+            return
         if self.parent is not None:
             self.parent.refresh()
-        parent_revision = -1 if self.parent is None else self.parent._revision
-        facts_revision = () if self.facts is None else (id(self.facts), self.facts.revision)
-        if (parent_revision, facts_revision) != (self._parent_revision, self._facts_revision):
+        inputs = -1 if self.parent is None else self.parent._revision, facts_revision
+        if inputs != self._inputs:
             self._invalidate()
-            self._parent_revision, self._facts_revision = parent_revision, facts_revision
+            self._inputs = inputs
+        self._observed = observed
+
+    def _changed(self):
+        self._invalidate()
+        self._clock[0] += 1
 
     def bind_range(self, value, bounds):
         if self.ranges.get(value) != bounds:
             self._range_data[value] = bounds
             if value in self._intervals:
-                self._invalidate()
+                self._changed()
 
     def child(self):
         return _Scope(placements=self.placements, parent=self, facts=self.facts)
@@ -343,7 +357,7 @@ class _Scope:
 
     def relation(self, lhs, predicate, rhs, truth=True):
         if not self.relations:
-            self._invalidate()
+            self._changed()
         if predicate >= 6:
             # An unsigned comparison cannot establish a signed range.
             self.relations[lhs, predicate, rhs] = truth

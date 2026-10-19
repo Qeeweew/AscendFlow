@@ -153,6 +153,9 @@ metadata/carry 捕获 group、SID 与祖先 loop ordinal，并随同时坐标替
 保留紧凑 guard 的语法构造，删除旧差分闭包、余数组合搜索和覆盖减法。
 区间查询按 SSA DAG 与完整前提复用；显式范围更新、父域变化或源范围放宽
 使相关 scope 的区间/affine 视图失效。新增未被查询的 SSA 定义不清空既有结果。
+同一 scope 树共享输入变更时钟；没有变更时，查询不再逐层检查祖先。
+时钟变化只触发真实 parent/source revision 检查，不直接清空无关兄弟域的缓存；
+源范围放宽和已观察父范围变化仍会使依赖结果失效，不授权复用旧前提。
 
 默认 FA 是联合范围的一个例子：`T=HQ*query_tiles`，默认 `B=1`，
 活跃迭代满足 `query < ceildiv(max(T-group,0),GROUPS)`，因此

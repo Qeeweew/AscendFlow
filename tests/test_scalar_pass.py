@@ -648,3 +648,32 @@ def test_range_reuse_observes_parent_changes_and_broadened_source_facts():
     child.relation(value, 5, two.result)
     assert child.interval(doubled.result) == (4, 10)
     assert sibling.interval(doubled.result) == (0, 10)
+
+
+def test_deep_scope_reuse_does_not_rewalk_unchanged_ancestor_inputs(monkeypatch):
+    from ascendflow.passes import simplify_scalars as integers
+
+    value = Block(arg_types=[IndexType()]).args[0]
+    parent = integers._Scope(ranges={value: (0, 3)})
+    child = parent
+    depth = 64
+    for _ in range(depth):
+        child = child.child()
+    assert child.interval(value) == (0, 3)
+    visits = 0
+    refresh = integers._Scope.refresh
+
+    def observed(scope):
+        nonlocal visits
+        visits += 1
+        return refresh(scope)
+
+    monkeypatch.setattr(integers._Scope, "refresh", observed)
+    queries = 128
+    for _ in range(queries):
+        assert child.interval(value) == (0, 3)
+    assert visits <= queries + depth
+    # A possible-change stamp is not evidence that an old result is valid.
+    # Broaden the real ancestor input after all descendants cached its range.
+    parent.bind_range(value, (0, 7))
+    assert child.interval(value) == (0, 7)

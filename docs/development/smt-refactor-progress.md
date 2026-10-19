@@ -367,3 +367,20 @@ ConditionalRead 不进入该记录，避免重新混入逻辑/终端坐标。
 合计这组 242 个不同用例通过，覆盖真实 native 几何、packet 反例、conditional
 read、bounds、后端 trace、mask、matmul 和 FP32 cube。包含新增三项静态 native
 对应被破坏的拒绝检查。不是当前完整 Python 或新 CANN/设备资格。
+
+## 未变作用域输入的检查复用
+
+`_Scope.refresh` 原来每次区间/仿射查询都递归检查全部祖先，即使 parent/source
+范围没有变化。此前 FA profile 中 96,004 次入口引出 938,006 次 refresh 调用。
+现在一个 scope 树共享变更时钟；只有实际已观察输入变化才推进时钟。没有
+变化时直接复用；有变化时仍比较真实 parent/source revision 决定失效，不以
+全局 stamp 清空无关兄弟域，也不把 stamp 当作正确性证明。
+
+`owned-scope-input-reuse-01` 的 237 项通过（16.99 秒），包括新增长 64 层作用域
+的复用复杂度检查，以及既有父范围更新、源范围放宽、兄弟隔离、短路定义性、
+溢出与真实循环/控制正反例。
+
+`owned-fa-native-spec-01` 与 `owned-fa-scope-input-reuse-01` 分别为变更前后
+单次冷进程 source→ASC：19.7382 秒、19.0032 秒。二者 ASC SHA256 相同，均为
+`1e0823709660afbabdc8033b8fb6423a1148701dbd953a994aaa9490a10f46d4`。
+只说明这两次 probe 的结果，不称稳定加速或五次性能资格；仍未达到 p50≤5s。
