@@ -106,9 +106,10 @@ def prefill_gram(
     Kp: N.Tensor((CHUNKS, H, BT, K), DTYPE),
     Gp: N.Tensor((CHUNKS, H, BT, K), N.f32),
     Bp: N.Tensor((CHUNKS, H, BT), N.f32),
-    Aqk: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
-    Diagonal: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
-    Ai32: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
+    # Full-plane clears overlap the later diagonal-block updates.
+    Aqk: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write"),
+    Diagonal: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write"),
+    Ai32: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write"),
     Lengths: N.Tensor((CHUNKS,), N.i64),
     CHUNKS: N.constexpr = 2,
     H: N.constexpr = 32,
@@ -120,21 +121,24 @@ def prefill_gram(
 ):
     with N.Kernel(GROUPS, kind="vector") as owner:
         assert K == 128 and BT == 64, "four diagonal blocks share 64-wide Vector rows"
-        keys16 = N.alloc_ub((16, K), DTYPE)
+        keys16 = N.alloc_ub((2, 16, K), DTYPE)
+        queries16 = N.alloc_ub((2, 16, K), DTYPE)
         keys = N.alloc_ub((16, K), N.f32)
         queries = N.alloc_ub((16, K), N.f32)
         weighted = N.alloc_ub((16, K), N.f32)
-        gates = N.alloc_ub((16, K), N.f32)
+        gates = N.alloc_ub((2, 16, K), N.f32)
         decay = N.alloc_ub((16, K), N.f32)
         steps = N.alloc_ub((16, K), N.f32)
-        product = N.alloc_ub((16, K), N.f32)
+        # K and Q products occupy independent panels so both can be issued
+        # before one batched reduction with the unchanged per-score sum tree.
+        product = N.alloc_ub((32, K), N.f32)
         zeros = N.alloc_ub((BT, BT), N.f32)
         rows = N.alloc_ub((16, 8), N.f32)
-        partial = N.alloc_ub((16 * (K // 8),), N.f32)
+        partial = N.alloc_ub((32 * (K // 8),), N.f32)
         scores = N.alloc_ub((64,), N.f32)
         betas = N.alloc_ub((BT,), N.f32)
         diagonal = N.alloc_ub((16, 16), N.f32)
-        attention = N.alloc_ub((16, 16), N.f32)
+        attention = N.alloc_ub((2, 16, 16), N.f32)
         inverse = N.alloc_ub((16, BT), N.f32)
         coefficients = N.alloc_ub((BT,), N.f32)
         expanded = N.alloc_ub((BT, 64), N.f32)
@@ -158,66 +162,80 @@ def prefill_gram(
         N.fill(identity, 1.0, mask=N.arange(16)[:, None] == N.arange(16)[None, :])
         for plane in N.unroll(BT // 16):
             N.copy(identity, identities[:, plane * 16 : plane * 16 + 16])
+        N.fill(zeros, 0.0)
+        # Packed Q scores start on a full 32-byte block. Padding rows are
+        # defined here and their scores are removed by the causal masks.
+        N.fill(product, 0.0)
         for task in N.serial(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
             valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
             N.copy(Bp[chunk, head, :], betas)
-            N.fill(zeros, 0.0)
             N.copy(zeros, Aqk[chunk, head, :, :])
             N.copy(zeros, Diagonal[chunk, head, :, :])
             N.copy(zeros, Ai32[chunk, head, :, :])
-            for block_index in N.serial(BT // 16):
+            for block_index in N.Pipelined(
+                BT // 16, stages=3, issue_order={"vector": ("prefetch", "store", "gram")}
+            ):
                 block = block_index * 16
-                N.copy(Kp[chunk, head, block : block + 16, :], keys16)
-                N.cast(keys16, out=keys)
-                N.mul(keys, betas[block : block + 16, None], out=weighted, scratch=rows)
-                N.copy(Qp[chunk, head, block : block + 16, :], keys16)
-                N.cast(keys16, out=queries)
-                N.copy(Gp[chunk, head, block : block + 16, :], gates)
-                N.fill(steps[0, :], 1.0)
-                N.mul(gates[:15, :], -1.0, out=steps[1:16, :])
-                N.add(steps[1:16, :], gates[1:16, :], out=steps[1:16, :])
-                N.exp(steps[1:16, :], out=steps[1:16, :])
-                N.copy(keys, decay)
-                N.fill(diagonal, 0.0)
-                N.fill(attention, 0.0)
-                # Four causal prefixes avoid evaluating most upper-triangle
-                # exp/products, retaining the same FP32 per-score sum tree.
-                for quarter in N.unroll(4):
-                    extent = (quarter + 1) * 4
-                    for local in N.serial(quarter * 4, N.min(extent, N.max(0, valid - block))):
-                        key_row = weighted[local, :]
-                        query_row = queries[local, :]
-                        step_row = steps[local, :]
-                        # Carry k_j * exp(G_i-G_j) forward one row. Each
-                        # diagonal resets to k_i; upper entries are discarded
-                        # by the final masks after both score reductions.
-                        N.mul(decay[:extent, :], step_row[None, :], out=decay[:extent, :])
-                        N.copy(keys[local, :], decay[local, :])
-                        N.mul(decay[:extent, :], key_row[None, :], out=product[:extent, :])
-                        N.reduce_sum(
-                            product[:extent, :],
-                            axis=1,
-                            out=scores[:extent],
-                            scratch=partial[: extent * (K // 8)],
-                            order="block8_then_packed_merge",
-                        )
-                        N.copy(scores[:16], diagonal[local, :])
-                        N.mul(decay[:extent, :], query_row[None, :], out=product[:extent, :])
-                        N.reduce_sum(
-                            product[:extent, :],
-                            axis=1,
-                            out=scores[:extent],
-                            scratch=partial[: extent * (K // 8)],
-                            order="block8_then_packed_merge",
-                        )
-                        N.mul(scores[:16], SCALE, out=scores[:16])
-                        N.copy(scores[:16], attention[local, :])
-                N.fill(diagonal, 0.0, mask=upper, scratch=mask_zero)
-                N.fill(attention, 0.0, mask=strict_upper, scratch=mask_zero)
-                N.copy(attention, Aqk[chunk, head, block : block + 16, block : block + 16])
-                N.copy(diagonal, inverse[:, block : block + 16])
+                ring = block_index % 2
+                with N.Stage(0, name="prefetch"):
+                    N.copy(Kp[chunk, head, block : block + 16, :], keys16[ring, :, :])
+                    N.copy(Qp[chunk, head, block : block + 16, :], queries16[ring, :, :])
+                    N.copy(Gp[chunk, head, block : block + 16, :], gates[ring, :, :])
+                with N.Stage(1, name="gram"):
+                    N.cast(keys16[ring, :, :], out=keys)
+                    N.mul(keys, betas[block : block + 16, None], out=weighted, scratch=rows)
+                    N.cast(queries16[ring, :, :], out=queries)
+                    N.fill(steps[0, :], 1.0)
+                    N.mul(gates[ring, :15, :], -1.0, out=steps[1:16, :])
+                    N.add(steps[1:16, :], gates[ring, 1:16, :], out=steps[1:16, :])
+                    N.exp(steps[1:16, :], out=steps[1:16, :])
+                    N.copy(keys, decay)
+                    N.fill(diagonal, 0.0)
+                    N.fill(attention[ring, :, :], 0.0)
+                    # Four causal prefixes avoid evaluating most upper-triangle
+                    # exp/products, retaining the same FP32 per-score sum tree.
+                    for quarter in N.unroll(4):
+                        extent = (quarter + 1) * 4
+                        panel = N.ceildiv(extent, 8) * 8
+                        for local in N.serial(quarter * 4, N.min(extent, N.max(0, valid - block))):
+                            key_row = weighted[local, :]
+                            query_row = queries[local, :]
+                            step_row = steps[local, :]
+                            # Carry k_j * exp(G_i-G_j) forward one row. Each
+                            # diagonal resets to k_i; upper entries are discarded
+                            # by the final masks after both score reductions.
+                            N.mul(decay[:extent, :], step_row[None, :], out=decay[:extent, :])
+                            N.copy(keys[local, :], decay[local, :])
+                            N.mul(decay[:extent, :], key_row[None, :], out=product[:extent, :])
+                            N.mul(
+                                decay[:extent, :],
+                                query_row[None, :],
+                                out=product[panel : panel + extent, :],
+                            )
+                            N.reduce_sum(
+                                product[: 2 * panel, :],
+                                axis=1,
+                                out=scores[: 2 * panel],
+                                scratch=partial[: 2 * panel * (K // 8)],
+                                order="block8_then_packed_merge",
+                            )
+                            N.copy(scores[:16], diagonal[local, :])
+                            N.mul(
+                                scores[panel : panel + 16],
+                                SCALE,
+                                out=scores[panel : panel + 16],
+                            )
+                            N.copy(scores[panel : panel + 16], attention[ring, local, :])
+                    N.fill(diagonal, 0.0, mask=upper, scratch=mask_zero)
+                    N.fill(attention[ring, :, :], 0.0, mask=strict_upper, scratch=mask_zero)
+                    N.copy(diagonal, inverse[:, block : block + 16])
+                with N.Stage(2, name="store"):
+                    N.copy(
+                        attention[ring, :, :],
+                        Aqk[chunk, head, block : block + 16, block : block + 16],
+                    )
             # Four independent 16x16 blocks share one row recurrence. The
             # 64-wide row layout keeps the multiply and every sum-tree level
             # on complete Vector repeats, preserving each block's FP32 tree.
