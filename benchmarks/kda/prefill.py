@@ -89,7 +89,7 @@ ORDERS = {
         "Lengths",
     ),
 }
-ORDERS["prepare_full"] = ORDERS["prepare"]
+ORDERS["prepare_full"] = ORDERS["prepare"] + ("Lower", "BetaSelectors")
 MERGE_ABI = ("Negative", "Blocks", "Merge", "Off", "Inverse")
 
 
@@ -207,6 +207,15 @@ def validate_artifacts(directory, heads, dtype, chunks, sequences):
             and primary.dtype.data == dtype,
             f"{phase} specialization differs",
         )
+        if phase == "prepare_full":
+            require(
+                all(
+                    tuple(d.data for d in buffers[name].shape.data) == shape
+                    and buffers[name].dtype.data == "f32"
+                    for name, shape in {"Lower": (64, 64), "BetaSelectors": (8, 32, 8)}.items()
+                ),
+                "preprocessing constant geometry differs from the runner",
+            )
         if phase == "gram_cross":
             shapes = {
                 "GramLeft": (20, 2, pack_tasks, 128, 128),
@@ -326,6 +335,17 @@ def worker(args):
     expected, final_expected = oracle(host, lengths)
     torch.npu.set_device(0)
     device = {n: t.npu() for n, t in host.items()}
+    constants = {
+        "Lower": torch.tril(torch.ones(bt, bt, dtype=torch.float32)),
+        "BetaSelectors": torch.eye(8, dtype=torch.float32)[:, None, :]
+        .expand(8, bt // 2, 8)
+        .contiguous(),
+    }
+    constant_sha = {
+        name: hashlib.sha256(t.view(torch.uint8).numpy().tobytes()).hexdigest()
+        for name, t in constants.items()
+    }
+    device.update({name: t.npu() for name, t in constants.items()})
 
     def workspace(name, shape, storage_dtype):
         device[name] = torch.empty(shape, dtype=storage_dtype, device="npu")
@@ -461,6 +481,7 @@ def worker(args):
                 "health": health,
                 "hardware": hardware,
                 "input_sha256": input_sha,
+                "constant_sha256": constant_sha,
                 "generated": artifacts,
                 "reference": reference,
                 "results": results,

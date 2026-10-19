@@ -21,7 +21,8 @@ def prefill_prepare(
     Qp: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
     Kp: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
     Vp: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
-    Gp: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write", write_disjoint=True),
+    # Full-plane clearing precedes overlapping stores of the valid prefix rows.
+    Gp: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write"),
     Bp: N.Tensor((CHUNKS, H, BT), N.f32, access="write", write_disjoint=True),
     Starts: N.Tensor((CHUNKS,), N.i64),
     Lengths: N.Tensor((CHUNKS,), N.i64),
