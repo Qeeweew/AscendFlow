@@ -1,6 +1,7 @@
 # KDA prefill
 
 实现为 [prefill.py](../../examples/kda/prefill.py)、
+[prefill_prepare.py](../../examples/kda/prefill_prepare.py)、
 [prefill_gram.py](../../examples/kda/prefill_gram.py) 和
 [prefill_solve.py](../../examples/kda/prefill_solve.py)。全部 kernel 使用普通 DSL、
 xDSL 自动同步和 ASC/CANN；算法与流水政策均在 examples，编译器没有 KDA 特判。
@@ -12,7 +13,8 @@ H=HV、BT=64，启用 Q/K L2 归一化，Gate 为非正的 log 衰减值。
 state 布局为 `[sequence, head, V, K]`。
 每条序列的 chunk 数相同且非零；最后一个 chunk 可以不足 64 tokens，长度可以不同。
 `TOKENS: N.int64(minimum=1)` 是运行时值，Starts/Lengths 为不可变 GM i64 元数据。
-调用方保证每个 chunk 在对应序列内且 `1 <= valid <= min(64, TOKENS-start)`。
+调用方保证每个 chunk 在对应序列内且 `1 <= valid <= min(64, TOKENS-start)`，
+各序列只有最后一个 chunk 可以不满 64 tokens。
 当前 runner 拒绝零长度和不同 chunk 数的序列，尚未交付 grouped heads、speculative
 state indexing 或 BF16 的设备资格。
 
@@ -27,16 +29,23 @@ FP32 carry 与 FP16 snapshot 是不同的存储和值，snapshot 不反馈到递
 
 | 阶段 | 计算及流水 |
 |---|---|
-| prepare | 双槽三阶段 token 导入、FP32 gate 前缀、store；整块归一化；打包 Q/K/V/G/Beta |
-| gram | 四个 16×16 对角块；整块数据驻留 UB，逐行复用，两个 FP32 reduce 得到 KKT/QKT |
-| gram_inter | 六个严格下三角块对；连续三阶段双槽 V prepare→C FP32 dot→V store；两 AIV 按 K64 分工 |
-| solve | 四个独立 16×16 FP32 严格下三角逆，最后加 identity |
+| prepare_full / prepare | 非末块使用整块跨步 DMA；各序列末块保留三阶段 token 流水与 runtime 尾块；整块归一化，FP32 gate 顺序前缀累加 |
+| gram | 四个 16×16 对角块驻留 UB；4/8/12/16 行因果前缀减少无效 exp/product，保持每个分数的 FP32 归约；在 UB 内完成对角逆，省去独立 solve 和 A workspace |
+| gram_prepare | 纯 Vector，按三组严格下三角行面板打包 FP32 左右输入 |
+| gram_dot16 / gram_dot32 / gram_dot48 | 纯 Cube，M=32、K=128、N=16/32/48；两阶段双缓冲 L1 导入与 IEEE FP32 dot |
+| gram_store | 纯 Vector，应用 beta、有效行与负号，写入块逆和输出乘法输入 |
 | solve_merge16 / solve_merge32 | 同一 DSL kernel 的两次 constexpr 特化；两层 FP32 Cube 块合并，三阶段双槽流水 |
 | transform | 整块 Vector 运算，显式保留 beta*K*expG、beta*V、KG、QG 的 FP16 舍入边界 |
 | wu | FP16 Ai @ RHS，双槽导入/计算流水，生成 W/U |
 | scan | 每个 chunk 内五阶段 CV 依赖；FP32 历史投影、FP16 residual/snapshot、Cube 更新与输出、FP32 carry；有状态的 chunk 顺序执行 |
 
 块逆使用 `[[D0,0],[-D1*A10*D0,D1]]` 合并 16→32→64，乘法输入保持 FP32。
+跨块 Gram 改为同一 stream 上每批依次执行 Vector→三种 Cube→Vector，
+每批最多 512 个 chunk/head 任务，复用 54 MiB workspace。
+加上该批主要输入和输出，估算活跃数据约 102 MiB；192 MiB L2 是分批预算，
+实际命中率由 kernel 重放下的 L2Cache 计数报告，不以容量估算代替采集。
+batch=1、S=4096、H=32 时共 4 批，13 种特化、28 次 kernel launch。
+该阶段通过 stream 顺序交接，没有逐矩阵 mixed C/V 通知。
 输入块、临时乘积与输出块分开存储，避免原地覆盖破坏流水的值和最后读取关系。
 块合并临时乘积、32×32 C→V 交接使用每组两槽 workspace；旧 MTE2 reader 退休后
 即可回收 GM 槽，不等待后续 Vector cast/store，从实际槽位生命周期约束通知复用。
@@ -46,8 +55,33 @@ FP32 carry 与 FP16 snapshot 是不同的存储和值，snapshot 不反馈到递
 为此补齐的通用能力包括 FP32 Cube 及对应 NZ 字节几何、b16 转置 L1→L0A、
 单元素 `store_scalar`、窄行广播、相关元数据边界、精确跨步矩形初始化覆盖，以及
 同一 actor body 内完整双 AIV quorum 的前缀合并。没有关闭必要的同步检查。
+本轮另补齐常数除数下多项式形式余数的上下界，支持分批 workspace 的地址证明；
+原始 unsigned 表达式定义性与同步准入继续检查。
 
-## 设备结果
+## batch=1、S=4096 的当前结果
+
+物理卡 2，1800 MHz；精度、输入、原始参考与官方 wheel 身份逐项核对。
+`msprof op --aic-metrics=BasicInfo` 保持默认 **kernel 重放**，warm-up=0。
+一次调用的全部 kernel Task Duration 之和：
+
+| 实现 | 时间 μs | 原始 Triton / 当前实现 |
+|---|---:|---:|
+| AscendFlow 原版 `1845d4c` | 7578.520 | — |
+| 当前 AscendFlow | 5373.460 | 1.929× |
+| 原始 Triton-Ascend | 10367.480 | 1.000× |
+
+当前实现比 AscendFlow 原版减少 29.10% 时间。输出/状态 relative RMSE
+为 0.00174171 / 0.00116390，均满足独立 CPU FP32 递推的 `<0.005` 门槛。
+同库将 runtime 长度改为 4033，末块长度为 1，再次通过，误差为
+0.00173612 / 0.00109892。
+13 个特化完整构建 126.016 s；当前 DSL 捕获与编译产物的 source IR 逐字节一致。
+分阶段时间、Cube/MTE2、原始 L2 hit/miss 与复现命令见
+[4096-token 性能报告](kda-prefill-profile.md)。
+
+## 历史设备结果（1845d4c）
+
+以下为改写分批 Gram 之前的九阶段实现，不代表当前算法的小规模设备资格。
+对应冻结产物可核验；当前 runner 使用新的 phase ABI，不能直接启动旧库。
 
 设备为 Ascend910B3，物理 2→逻辑 0，1800 MHz，CANN 9.1.0，
 [官方 Triton-Ascend 3.6.0](https://github.com/triton-lang/triton-ascend/releases/tag/v3.6.0)。
@@ -98,7 +132,7 @@ source ../.venv/bin/activate
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 python -m benchmarks.kda.prefill --build-only --physical 2 \
-  --artifacts build/kda/prefill --output build/kda/prefill-device --lengths 128
+  --artifacts build/kda/prefill --output build/kda/prefill-device --lengths 4096
 python -m benchmarks.kda.profile_prefill --physical 2 \
   --artifacts build/kda/prefill --output build/kda/prefill-ours
 python -m benchmarks.kda.profile_prefill --physical 2 --backend triton \

@@ -141,6 +141,28 @@ def test_a_multiple_is_a_required_contract_and_cannot_be_invented_by_algebra():
     assert length - 4 + 4 > allocation
 
 
+@pytest.mark.parametrize("width,scale", [(3, 1), (4, 512), (64, 32)])
+def test_expanded_scaled_remainder_retains_its_one_sided_sign(width, scale):
+    value = argument("slab")
+    quotient = expression("floordiv", value, literal(width))
+    expanded = expression(
+        "sub",
+        expression("mul", literal(scale), value),
+        expression("mul", literal(scale * width), quotient),
+    )
+    facts = {"slab": Fact(minimum=0)}
+    assert indexing.nonnegative(expanded, facts)
+    assert not indexing.nonnegative(expression("mul", literal(-1), expanded), facts)
+    assert not indexing.nonnegative(expression("sub", expanded, literal(1)), facts)
+    upper = expression("sub", literal(scale * (width - 1)), expanded)
+    assert indexing.nonnegative(upper, facts)
+    assert not indexing.nonnegative(expression("sub", upper, literal(1)), facts)
+    for n in (*range(4 * width), (2**63 - 1) // scale):
+        result = expanded.evaluate({"slab": n})
+        assert result == scale * (n % width)
+        assert result >= 0
+
+
 @pytest.mark.parametrize("kind", ["floordiv", "rem"])
 def test_unproven_positive_divisor_cannot_authorize_split_identity_or_axis(kind):
     task, divisor = argument("$g"), argument("divisor")

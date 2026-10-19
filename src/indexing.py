@@ -353,6 +353,27 @@ def nonnegative(expr, facts):
         return lower >= 0
 
     terms = polynomial(expr, facts)
+    # Polynomial normalization expands n % d into n-d*floor(n/d).
+    # Recover both bounds 0 <= remainder <= d-1 at integral scale.
+    # This is a mathematical inequality, not permission to evaluate
+    # an original unsigned division outside its checked activation prefix.
+    bounded = terms
+    for term, coefficient in terms.items():
+        if len(term) != 1:
+            continue
+        (atom,) = term
+        if atom.kind != "floordiv":
+            continue
+        numerator, divisor = atom.args
+        width = divisor.constant
+        if width is None or width <= 0 or coefficient % width:
+            continue
+        bounded = _sum(bounded, {term: -coefficient})
+        bounded = _sum(bounded, _scale(polynomial(numerator, facts), coefficient // width))
+        if coefficient > 0:
+            bounded = _sum(bounded, {(): -(coefficient // width) * (width - 1)})
+    if sufficient(bounded):
+        return True
     if sufficient(terms):
         return True
     # min(a,b)<=a,b and max(a,b)>=a,b give direct lower bounds.

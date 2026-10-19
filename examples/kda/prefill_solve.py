@@ -1,53 +1,10 @@
-"""Block triangular inverse: Vector diagonal solve, then IEEE FP32 Cube merges."""
+"""Merge the Vector diagonal inverses with pipelined IEEE FP32 Cube products."""
 
 from __future__ import annotations
 
 from ascendflow import language as N
 
 # ruff: noqa: F821
-
-
-@N.prim_func(disjoint_external=True)
-def prefill_solve(
-    A: N.Tensor((CHUNKS, H, BT, BT), N.f32),
-    Negative: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
-    Diagonal: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
-    Ai32: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
-    CHUNKS: N.constexpr = 2,
-    H: N.constexpr = 32,
-    BT: N.constexpr = 64,
-    GROUPS: N.constexpr = 40,
-    DTYPE: N.constexpr = N.f16,
-):
-    with N.Kernel(GROUPS, kind="vector") as owner:
-        assert BT == 64, "four 16-row diagonal blocks"
-        negative = N.alloc_ub((BT, BT), N.f32)
-        inverse = N.alloc_ub((16, 16), N.f32)
-        a = N.alloc_ub((16,), N.f32)
-        work = N.alloc_ub((16,), N.f32)
-        zeros = N.alloc_ub((BT, BT), N.f32)
-        N.fill(zeros, 0.0)
-        for task in N.serial(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
-            flat = owner + task * GROUPS
-            chunk, head = flat // H, flat % H
-            N.copy(A[chunk, head, :, :], negative)
-            N.mul(negative, -1.0, out=negative)
-            N.copy(negative, Negative[chunk, head, :, :])
-            N.copy(zeros, Ai32[chunk, head, :, :])
-            N.copy(zeros, Diagonal[chunk, head, :, :])
-            for block in N.serial(BT // 16):
-                begin = block * 16
-                N.fill(inverse, 0.0)
-                for row in N.serial(16):
-                    N.copy(negative[begin + row, begin : begin + 16], a)
-                    N.copy(a, inverse[row, :])
-                    for previous in N.serial(row):
-                        coefficient = N.load_scalar(a[previous : previous + 1])
-                        N.mul(inverse[previous, :], coefficient, out=work)
-                        N.add(inverse[row, :], work, out=inverse[row, :])
-                N.fill(inverse, 1.0, mask=N.arange(16)[:, None] == N.arange(16)[None, :])
-                N.copy(inverse, Ai32[chunk, head, begin : begin + 16, begin : begin + 16])
-                N.copy(inverse, Diagonal[chunk, head, begin : begin + 16, begin : begin + 16])
 
 
 @N.prim_func(disjoint_external=True)

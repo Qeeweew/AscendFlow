@@ -50,6 +50,7 @@ def read_profile(directory, backend):
         "measured_clocks_mhz": sorted(clocks),
         "metrics": str(metrics_path.resolve()),
         "metrics_sha256": digest(metrics_path),
+        "replay_mode": metrics.get("replay_mode", "kernel"),
     }
 
 
@@ -76,6 +77,10 @@ def compare(ascendflow, triton, official_release):
         "device platform differs",
     )
     verify_provenance(theirs_record["reference"], official_release)
+    require(
+        ours["replay_mode"] == theirs["replay_mode"],
+        "profiling replay modes differ",
+    )
     require(
         ours["measured_clocks_mhz"] == theirs["measured_clocks_mhz"]
         and min(ours["measured_clocks_mhz"]) > 0,

@@ -26,6 +26,8 @@ def prefill_prepare(
     Starts: N.Tensor((CHUNKS,), N.i64),
     Lengths: N.Tensor((CHUNKS,), N.i64),
     TOKENS: N.int64(minimum=1),
+    SEQUENCES: N.constexpr = 1,
+    NC: N.constexpr = 2,
     CHUNKS: N.constexpr = 2,
     H: N.constexpr = 32,
     K: N.constexpr = 128,
@@ -34,6 +36,7 @@ def prefill_prepare(
     DTYPE: N.constexpr = N.f16,
 ):
     with N.Kernel(GROUPS, kind="vector") as owner:
+        assert CHUNKS == SEQUENCES * NC and NC > 0, "equal nonempty chunk domains"
         q16 = N.alloc_ub((BT, K), DTYPE)
         k16 = N.alloc_ub((BT, K), DTYPE)
         v16 = N.alloc_ub((BT, K), DTYPE)
@@ -47,9 +50,9 @@ def prefill_prepare(
         partial = N.alloc_ub((BT * (K // 8),), N.f32)
         stat = N.alloc_ub((BT,), N.f32)
         rows = N.alloc_ub((BT, 8), N.f32)
-        for task in N.serial(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
+        for task in N.serial(N.ceildiv(N.max(0, SEQUENCES * H - owner), GROUPS)):
             flat = owner + task * GROUPS
-            chunk, head = flat // H, flat % H
+            chunk, head = (flat // H) * NC + NC - 1, flat % H
             start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - 1)
             valid = N.load_index(
                 Lengths[chunk : chunk + 1], minimum=1, maximum=N.min(BT, TOKENS - start)
@@ -102,8 +105,9 @@ def prefill_gram(
     Kp: N.Tensor((CHUNKS, H, BT, K), DTYPE),
     Gp: N.Tensor((CHUNKS, H, BT, K), N.f32),
     Bp: N.Tensor((CHUNKS, H, BT), N.f32),
-    A: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
     Aqk: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
+    Diagonal: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
+    Ai32: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
     Lengths: N.Tensor((CHUNKS,), N.i64),
     CHUNKS: N.constexpr = 2,
     H: N.constexpr = 32,
@@ -126,6 +130,11 @@ def prefill_gram(
         partial = N.alloc_ub((16 * (K // 8),), N.f32)
         scores = N.alloc_ub((64,), N.f32)
         betas = N.alloc_ub((BT,), N.f32)
+        inverse = N.alloc_ub((16, 16), N.f32)
+        coefficients = N.alloc_ub((16,), N.f32)
+        weighted_inverse = N.alloc_ub((16, 16), N.f32)
+        inverse_tree = N.alloc_ub((8, 16), N.f32)
+        inverse_rows = N.alloc_ub((16, 8), N.f32)
         N.fill(scores, 0.0)
         for task in N.serial(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
             flat = owner + task * GROUPS
@@ -133,8 +142,9 @@ def prefill_gram(
             valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
             N.copy(Bp[chunk, head, :], betas)
             N.fill(zeros, 0.0)
-            N.copy(zeros, A[chunk, head, :, :])
             N.copy(zeros, Aqk[chunk, head, :, :])
+            N.copy(zeros, Diagonal[chunk, head, :, :])
+            N.copy(zeros, Ai32[chunk, head, :, :])
             for block_index in N.serial(BT // 16):
                 block = block_index * 16
                 N.copy(Kp[chunk, head, block : block + 16, :], keys16)
@@ -143,44 +153,65 @@ def prefill_gram(
                 N.copy(Qp[chunk, head, block : block + 16, :], keys16)
                 N.cast(keys16, out=queries)
                 N.copy(Gp[chunk, head, block : block + 16, :], gates)
-                for local in N.serial(N.min(16, N.max(0, valid - block))):
-                    row = block + local
-                    gate_row = gates[local, :]
-                    key_row = weighted[local, :]
-                    query_row = queries[local, :]
-                    N.mul(gates, -1.0, out=decay)
-                    N.add(decay, gate_row[None, :], out=decay)
-                    N.exp(decay, out=decay)
-                    N.mul(decay, keys, out=decay)
-                    N.mul(decay, key_row[None, :], out=product)
-                    N.reduce_sum(
-                        product,
-                        axis=1,
-                        out=scores[:16],
-                        scratch=partial,
-                        order="block8_then_packed_merge",
+                N.fill(inverse, 0.0)
+                # Four causal prefixes avoid evaluating most upper-triangle
+                # exp/products, retaining the same FP32 per-score sum tree.
+                for quarter in N.unroll(4):
+                    extent = (quarter + 1) * 4
+                    for local in N.serial(quarter * 4, N.min(extent, N.max(0, valid - block))):
+                        row = block + local
+                        gate_row = gates[local, :]
+                        key_row = weighted[local, :]
+                        query_row = queries[local, :]
+                        N.mul(gates[:extent, :], -1.0, out=decay[:extent, :])
+                        N.add(decay[:extent, :], gate_row[None, :], out=decay[:extent, :])
+                        N.exp(decay[:extent, :], out=decay[:extent, :])
+                        N.mul(decay[:extent, :], keys[:extent, :], out=decay[:extent, :])
+                        N.mul(decay[:extent, :], key_row[None, :], out=product[:extent, :])
+                        N.reduce_sum(
+                            product[:extent, :],
+                            axis=1,
+                            out=scores[:extent],
+                            scratch=partial[: extent * (K // 8)],
+                            order="block8_then_packed_merge",
+                        )
+                        N.fill(
+                            scores,
+                            0.0,
+                            mask=(N.arange(64) + block >= row) | (N.arange(64) + block >= valid),
+                        )
+                        N.copy(scores[:16], inverse[local, :])
+                        N.mul(decay[:extent, :], query_row[None, :], out=product[:extent, :])
+                        N.reduce_sum(
+                            product[:extent, :],
+                            axis=1,
+                            out=scores[:extent],
+                            scratch=partial[: extent * (K // 8)],
+                            order="block8_then_packed_merge",
+                        )
+                        N.mul(scores[:16], SCALE, out=scores[:16])
+                        N.fill(
+                            scores,
+                            0.0,
+                            mask=(N.arange(64) + block > row) | (N.arange(64) + block >= valid),
+                        )
+                        N.copy(scores[:16], Aqk[chunk, head, row, block : block + 16])
+                # Keep the diagonal solve in UB while its Gram block is
+                # resident. All terms and the reduction tree stay FP32.
+                N.mul(inverse, -1.0, out=inverse)
+                for inverse_row in N.serial(2, 16):
+                    N.copy(inverse[inverse_row, :], coefficients)
+                    N.mul(
+                        inverse, coefficients[:, None], out=weighted_inverse, scratch=inverse_rows
                     )
-                    N.fill(
-                        scores,
-                        0.0,
-                        mask=(N.arange(64) + block >= row) | (N.arange(64) + block >= valid),
-                    )
-                    N.copy(scores[:16], A[chunk, head, row, block : block + 16])
-                    N.mul(decay, query_row[None, :], out=product)
-                    N.reduce_sum(
-                        product,
-                        axis=1,
-                        out=scores[:16],
-                        scratch=partial,
-                        order="block8_then_packed_merge",
-                    )
-                    N.mul(scores[:16], SCALE, out=scores[:16])
-                    N.fill(
-                        scores,
-                        0.0,
-                        mask=(N.arange(64) + block > row) | (N.arange(64) + block >= valid),
-                    )
-                    N.copy(scores[:16], Aqk[chunk, head, row, block : block + 16])
+                    N.add(weighted_inverse[:8, :], weighted_inverse[8:16, :], out=inverse_tree)
+                    N.add(inverse_tree[:4, :], inverse_tree[4:8, :], out=inverse_tree[:4, :])
+                    N.add(inverse_tree[:2, :], inverse_tree[2:4, :], out=inverse_tree[:2, :])
+                    N.add(inverse_tree[0, :], inverse_tree[1, :], out=inverse_tree[0, :])
+                    N.add(coefficients, inverse_tree[0, :], out=inverse[inverse_row, :])
+                N.fill(inverse, 1.0, mask=N.arange(16)[:, None] == N.arange(16)[None, :])
+                N.copy(inverse, Ai32[chunk, head, block : block + 16, block : block + 16])
+                N.copy(inverse, Diagonal[chunk, head, block : block + 16, block : block + 16])
 
 
 @N.prim_func(disjoint_external=True)
@@ -415,9 +446,21 @@ def prefill_scan(
                         N.copy(Intra[chunk, head, :, lane * BV : (lane + 1) * BV], other)
                         N.add(scratch, other, out=scratch)
                         N.cast(scratch, out=r16)
-                        for row in N.serial(valid):
-                            N.copy(
-                                r16[row, :], Output[start + row, head, lane * BV : (lane + 1) * BV]
+                        if local < NC - 1:
+                            full_start = N.load_index(
+                                Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT
                             )
+                            N.copy(
+                                r16,
+                                Output[
+                                    full_start : full_start + BT, head, lane * BV : (lane + 1) * BV
+                                ],
+                            )
+                        else:
+                            for row in N.serial(valid):
+                                N.copy(
+                                    r16[row, :],
+                                    Output[start + row, head, lane * BV : (lane + 1) * BV],
+                                )
             with N.Vector() as final_lane:
                 N.copy(carry, Final[seq, head, final_lane * BV : (final_lane + 1) * BV, :])
