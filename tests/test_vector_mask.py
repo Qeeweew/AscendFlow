@@ -28,6 +28,7 @@ from ascendflow.dialects.physical import TaskOp
 from ascendflow.dialects.source import MaskOp, SizeOp
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.target.ascend910b import Engine
+from ascendflow.target.native import NativeGeometry, NativeSpec
 from ascendflow.target.packets import MaskStep
 from tests.models.structured_events import check_structured_events
 
@@ -155,7 +156,7 @@ def mask_values(result, environment):
 
 def _task(memory, native):
     return next(
-        template.operation for template in memory.templates if template.contract.native == native
+        template.operation for template in memory.templates if template.spec.native == native
     )
 
 
@@ -424,7 +425,7 @@ def test_unit_lane_coefficients_emit_the_interval_recipe():
         task = next(
             template
             for template in collect_native_memory(result.plan).templates
-            if template.contract.native == "mask_fill"
+            if template.spec.native == "mask_fill"
         )
         attributes = task.operation.attributes
         assert attributes["mask_word"].data == WORD_AFFINE
@@ -437,7 +438,7 @@ def test_unit_lane_coefficients_emit_the_interval_recipe():
     row_task = next(
         template
         for template in collect_native_memory(rows.plan).templates
-        if template.contract.native == "mask_fill"
+        if template.spec.native == "mask_fill"
     )
     assert row_task.operation.attributes["mask_iteration"].data == ITERATION_ROWS
     assert "for (int64_t npu_row = 0" in rows.asc
@@ -477,7 +478,7 @@ def _mask_spec(expression, shape=(16, 256)):
     task = next(
         template
         for template in collect_native_memory(result.plan).templates
-        if template.contract.native == "mask_fill"
+        if template.spec.native == "mask_fill"
     )
     attributes = task.operation.attributes
     return (
@@ -542,7 +543,13 @@ def _run_emitter_cases(cases, tmp_path):
     for spec, environment in cases:
         op, program, names, word, repeat, iteration = spec
         task = SimpleNamespace(
-            native="mask_fill",
+            spec=NativeSpec(
+                "mask_fill",
+                Engine.V,
+                ("RW",),
+                (program.lanes // 64,),
+                (NativeGeometry("UB", "f32", "linear", program.lanes * 4),),
+            ),
             scalar=-7.0,
             operands=tuple(f"(int64_t)({environment[name]})" for name in names),
             mask=program,
@@ -780,9 +787,9 @@ def test_memory_collection_rejects_a_tampered_iteration_recipe():
 def test_partial_update_preserves_initialized_lanes_and_rejects_uninitialized():
     result = compile(_masked_fill("(cols + q) > rows"), timeout_s=120)
     memory = collect_native_memory(result.plan)
-    (masked,) = [t for t in memory.templates if t.contract.native == "mask_fill"]
-    assert masked.contract.modes == ("RW",)
-    packet = masked.contract.packet
+    (masked,) = [t for t in memory.templates if t.spec.native == "mask_fill"]
+    assert masked.spec.modes == ("RW",)
+    packet = masked.spec.packet
     assert packet is not None and packet.closed_mask and packet.each_mask_call
     assert packet.clobbers == {"VECTOR_MASK", "VECTOR_MASK_MODE"}
     asc = result.asc
@@ -835,25 +842,25 @@ def _data_predicate_program():
 def test_data_compare_where_and_mask_logic_keep_actual_packed_reads():
     result = compile(_data_predicate_program(), timeout_s=180)
     memory = collect_native_memory(result.plan)
-    natives = [template.contract.native for template in memory.templates]
+    natives = [template.spec.native for template in memory.templates]
     assert "compare_scalar_gt" in natives
     assert "compare_lt" in natives
     assert "mask_and" in natives
     assert "select_masked" in natives
-    compare = next(t for t in memory.templates if t.contract.native == "compare_scalar_gt")
-    select = next(t for t in memory.templates if t.contract.native == "mask_and")
-    assert compare.contract.modes == ("R", "RW")
-    assert select.contract.modes == ("R", "R", "W")
+    compare = next(t for t in memory.templates if t.spec.native == "compare_scalar_gt")
+    select = next(t for t in memory.templates if t.spec.native == "mask_and")
+    assert compare.spec.modes == ("R", "RW")
+    assert select.spec.modes == ("R", "R", "W")
     packet = next(
-        t for t in memory.templates if t.contract.native == "select_masked"
-    ).contract.packet
+        t for t in memory.templates if t.spec.native == "select_masked"
+    ).spec.packet
     assert packet is not None and packet.closed_mask
     assert "CMPMASK" in packet.clobbers and packet.internal_fences == ("V",)
-    where = next(t.contract for t in memory.templates if t.contract.native == "select_masked")
+    where = next(t.spec for t in memory.templates if t.spec.native == "select_masked")
     assert where.modes == ("R", "R", "R", "W")
     # Packed predicate storage is byte-addressed, never retyped as f32.
     for template in memory.templates:
-        if template.contract.native in {"compare_scalar_gt", "compare_lt"}:
+        if template.spec.native in {"compare_scalar_gt", "compare_lt"}:
             assert template.accesses[-1].address.geometry.dtype == "u8"
     original = collect_native_memory(parse(result.before_ir))
     execution = check_structured_events(memory, logical_reference=original)
@@ -878,7 +885,7 @@ def test_source_overwrite_does_not_change_an_earlier_compare():
     ordered = _ordered(execution)
     first = _task(memory, "compare_scalar_gt")
     overwrite = next(
-        template.operation for template in memory.templates if template.contract.native == "muls"
+        template.operation for template in memory.templates if template.spec.native == "muls"
     )
     assert ordered(first, overwrite)
     assert ordered(first, _task(memory, "mask_and"))
@@ -917,12 +924,12 @@ def test_predicate_storage_reuse_requires_the_old_mask_to_be_dead():
     compares = [
         template.operation
         for template in memory.templates
-        if template.contract.native.startswith("compare_scalar_")
+        if template.spec.native.startswith("compare_scalar_")
     ]
     selects = [
         template.operation
         for template in memory.templates
-        if template.contract.native == "select_masked_update"
+        if template.spec.native == "select_masked_update"
     ]
     assert len(compares) == 2 and len(selects) == 2
     assert ordered(compares[0], selects[0])
@@ -955,11 +962,11 @@ def test_materialized_coordinate_predicate_combines_coherently():
     )
     result = compile(program, timeout_s=180)
     memory = collect_native_memory(result.plan)
-    natives = [template.contract.native for template in memory.templates]
+    natives = [template.spec.native for template in memory.templates]
     assert "mask_bits" in natives and "mask_and" in natives
-    bits = next(t for t in memory.templates if t.contract.native == "mask_bits")
-    assert bits.contract.engine.value == "S" and bits.contract.modes == ("W",)
-    assert bits.contract.packet is not None and bits.contract.packet.closed_mask
+    bits = next(t for t in memory.templates if t.spec.native == "mask_bits")
+    assert bits.spec.engine.value == "S" and bits.spec.modes == ("W",)
+    assert bits.spec.packet is not None and bits.spec.packet.closed_mask
     for template in memory.templates:
         for access in template.accesses:
             if access.address.geometry.dtype == "u8":
@@ -990,14 +997,14 @@ def test_mask_alternates_with_count_packets_without_incoming_state():
     )
     result = compile(program, timeout_s=120)
     memory = collect_native_memory(result.plan)
-    masked = [t for t in memory.templates if t.contract.native == "mask_fill"]
-    exp = [t for t in memory.templates if t.contract.native == "exp"]
+    masked = [t for t in memory.templates if t.spec.native == "mask_fill"]
+    exp = [t for t in memory.templates if t.spec.native == "exp"]
     assert len(masked) == 2 and len(exp) == 1
     for template in masked:
-        assert template.contract.packet is not None
-        assert template.contract.packet.mask_steps[0].value == "set-mode-normal"
-        assert template.contract.packet.each_mask_call
-    assert exp[0].contract.packet.each_count_call
+        assert template.spec.packet is not None
+        assert template.spec.packet.mask_steps[0].value == "set-mode-normal"
+        assert template.spec.packet.each_mask_call
+    assert exp[0].spec.packet.each_count_call
     # Each packet configures its own state; no packet consumes an incoming mask.
     assert "PIPE_ALL" not in result.asc
 
@@ -1108,11 +1115,11 @@ def test_packed_compare_and_not_are_declared_vector_packets():
     zero_template, compare_template = templates[zero], templates[compare]
     negative_template = templates[negative]
     # Padding is defined by a real count-mode Vector Dup, not a hidden store.
-    assert zero_template.contract.engine is Engine.V
-    assert zero_template.contract.modes == ("W",)
-    assert zero_template.contract.packet.closed_mask
-    assert zero_template.contract.packet.each_count_call
-    assert zero_template.contract.packet.mask_steps == (
+    assert zero_template.spec.engine is Engine.V
+    assert zero_template.spec.modes == ("W",)
+    assert zero_template.spec.packet.closed_mask
+    assert zero_template.spec.packet.each_count_call
+    assert zero_template.spec.packet.mask_steps == (
         MaskStep.SET_COUNTER,
         MaskStep.SET_COUNT,
         MaskStep.VECTOR_READ,
@@ -1121,15 +1128,15 @@ def test_packed_compare_and_not_are_declared_vector_packets():
     (out,) = zero_template.accesses
     assert out.address.geometry.total_nbytes == 16 * 32
     # Packed compare is still the audited mask-free Vector packet.
-    assert compare_template.contract.engine is Engine.V
-    assert compare_template.contract.modes == ("R", "RW")
-    assert compare_template.contract.packet.mask_steps == ()
-    assert compare_template.contract.packet.internal_fences == ()
+    assert compare_template.spec.engine is Engine.V
+    assert compare_template.spec.modes == ("R", "RW")
+    assert compare_template.spec.packet.mask_steps == ()
+    assert compare_template.spec.packet.internal_fences == ()
     # Packed NOT is a real count-mode Vector native, matching its packet.
-    assert negative_template.contract.engine is Engine.V
-    assert negative_template.contract.modes == ("R", "W")
-    assert negative_template.contract.packet.each_count_call
-    assert negative_template.contract.packet.mask_steps == zero_template.contract.packet.mask_steps
+    assert negative_template.spec.engine is Engine.V
+    assert negative_template.spec.modes == ("R", "W")
+    assert negative_template.spec.packet.each_count_call
+    assert negative_template.spec.packet.mask_steps == zero_template.spec.packet.mask_steps
     for template in (compare_template, negative_template):
         (last,) = template.accesses[-1:]
         assert last.address.geometry.total_nbytes == 16 * 32
@@ -1379,7 +1386,7 @@ def test_selected_word_recipe_and_repeat_policy_are_recorded_before_sync():
     lane = compile(_masked_fill("((cols // 8) % 2) == 0"), timeout_s=120)
     for result, word in ((affine, "affine64"), (lane, "lane64")):
         memory = collect_native_memory(result.plan)
-        tasks = [t for t in memory.templates if t.contract.native == "mask_fill"]
+        tasks = [t for t in memory.templates if t.spec.native == "mask_fill"]
         assert len(tasks) == 1
         attributes = tasks[0].operation.attributes
         assert attributes["mask_word"].data == word
@@ -1447,10 +1454,10 @@ def test_compare_padding_comes_from_a_declared_vector_task_and_pipe_fence():
     assert zero < fence < compare
     assert "*(__ubuf__ uint64_t*)" not in asc
     memory = collect_native_memory(result.plan)
-    zero_template = next(t for t in memory.templates if t.contract.native == "mask_zero")
-    template = next(t for t in memory.templates if t.contract.native == "compare_scalar_gt")
-    assert zero_template.contract.engine is Engine.V
-    assert zero_template.contract.modes == ("W",)
+    zero_template = next(t for t in memory.templates if t.spec.native == "mask_zero")
+    template = next(t for t in memory.templates if t.spec.native == "compare_scalar_gt")
+    assert zero_template.spec.engine is Engine.V
+    assert zero_template.spec.modes == ("W",)
     assert zero_template.accesses[0].address.geometry.total_nbytes == 16 * 32
     # The padded logical Tile is declared as a complete write by the recipe.
     assert template.accesses[-1].mode.writes
@@ -1490,9 +1497,9 @@ def test_standalone_compare_cannot_authorize_uninitialized_packed_reads():
     partial_template = next(
         template
         for template in partial.templates
-        if template.contract.native == "compare_scalar_gt"
+        if template.spec.native == "compare_scalar_gt"
     )
-    assert partial_template.contract.modes == ("R", "RW")
+    assert partial_template.spec.modes == ("R", "RW")
     with pytest.raises(CompileError, match="initialized writer coverage"):
         admit_structured_memory(structure, partial, admit_memory_bounds(partial))
 

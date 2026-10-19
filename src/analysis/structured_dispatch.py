@@ -51,15 +51,15 @@ class StructuredTask:
 
     @property
     def engine(self):
-        return self.template.contract.engine
+        return self.template.spec.engine
 
     @property
     def implicit_completion(self):
-        return self.template.contract.implicit_completion
+        return self.template.spec.implicit_completion
 
     @property
     def native(self):
-        return self.template.contract.native
+        return self.template.spec.native
 
 
 @dataclass(frozen=True, slots=True)

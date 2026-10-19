@@ -335,8 +335,8 @@ def local_child_route(*, vector_publication):
             name,
             (endpoint(selection, source, Actor.AIV0, Placement.AFTER, guard),),
             (endpoint(selection, consumer, Actor.AIV0, Placement.BEFORE, guard),),
-            memory.templates[source].contract.engine,
-            memory.templates[consumer].contract.engine,
+            memory.templates[source].spec.engine,
+            memory.templates[consumer].spec.engine,
             NotificationKind.LOCAL_EVENT,
             (),
             None,
@@ -421,8 +421,8 @@ def translated_child_route(count):
             name,
             (source_bound or endpoint(selection, source, Actor.AIV0, Placement.AFTER),),
             (endpoint(selection, destination, Actor.AIV0, Placement.BEFORE, destination_guard),),
-            memory.templates[source].contract.engine,
-            memory.templates[destination].contract.engine,
+            memory.templates[source].spec.engine,
+            memory.templates[destination].spec.engine,
             NotificationKind.LOCAL_EVENT,
             (),
             None,
@@ -514,7 +514,7 @@ def translated_commands(selection, parent, child, count):
     commands = []
     for key, _ in trace:
         operation, actor, coordinates = key
-        contract = templates[operation].contract
+        contract = templates[operation].spec
         commands.extend(before.get(key, ()))
         commands.append(
             Command(
@@ -559,8 +559,8 @@ def nested_channel_cycle():
             name,
             (port(source, True),),
             (port(destination, False),),
-            memory.templates[source].contract.engine,
-            memory.templates[destination].contract.engine,
+            memory.templates[source].spec.engine,
+            memory.templates[destination].spec.engine,
             NotificationKind.LOCAL_EVENT,
             (),
             None,

@@ -13,52 +13,13 @@ from xdsl.dialects.builtin import IntegerAttr
 from ..diagnostics import require
 from ..dialects.structured import AddressOp
 from ..mask import Program
-from ..target.native import NativeGeometry
+from ..target.native import NativeSpec
 from .native import CTYPE, QUALIFIER, native_line
 
 
 @dataclass(frozen=True, slots=True)
-class PrintStorage:
-    bank: str
-    name: str
-
-
-@dataclass(frozen=True, slots=True)
-class PrintOperand:
-    geometry: NativeGeometry
-    operation: AddressOp
-    storage: PrintStorage
-
-    @property
-    def dtype(self):
-        return self.geometry.dtype
-
-    @property
-    def nbytes(self):
-        return self.geometry.nbytes
-
-    @property
-    def total_nbytes(self):
-        return self.geometry.total_nbytes
-
-    @property
-    def rows(self):
-        return self.geometry.rows
-
-    @property
-    def row_stride(self):
-        return self.geometry.row_stride
-
-    @property
-    def contiguous(self):
-        return self.geometry.contiguous
-
-
-@dataclass(frozen=True, slots=True)
 class PrintTask:
-    native: str
-    refs: tuple[PrintOperand, ...]
-    params: tuple[int, ...]
+    spec: NativeSpec
     scalar: float
     uid: str
     scalar_source: str | None
@@ -70,8 +31,11 @@ class PrintTask:
 
 
 def format_native(template, *, render, roots, task_names, generation):
-    def pointer(ref, *, extra=""):
-        operation = ref.operation
+    def pointer(index, *, extra=""):
+        geometry = template.spec.operands[index]
+        # Geometry is shared; pointer identity and offset are final SSA values.
+        operation = template.operation.refs[index].owner
+        require(isinstance(operation, AddressOp), "final native operand needs an SSA address")
         offset = render(operation.offset)
         if extra:
             owner = operation.offset.owner
@@ -81,28 +45,13 @@ def format_native(template, *, render, roots, task_names, generation):
                 and owner.value.value.data == 0
             )
             offset = extra if zero else f"({offset} + {extra})"
-        return f"({QUALIFIER[ref.geometry.bank]} {CTYPE[ref.dtype]}*)({roots[operation.source]} + ({offset}))"
+        return f"({QUALIFIER[geometry.bank]} {CTYPE[geometry.dtype]}*)({roots[operation.source]} + ({offset}))"
 
-    operands = []
-    for access in template.operands:
-        # The admitted geometry survives controlled scalar rewrites. Executable
-        # pointer identity and offset always come from the final native operand.
-        operation = template.operation.refs[access.operand_index].owner
-        require(isinstance(operation, AddressOp), "final native operand needs an SSA address")
-        operands.append(
-            PrintOperand(
-                access.geometry,
-                operation,
-                PrintStorage(access.geometry.bank, roots[operation.source]),
-            )
-        )
     operation = template.operation
-    count = operation.attributes.get("address_count")
-    count = len(operation.refs) if count is None else count.data
-    atoms = tuple(operation.refs[count:])
+    atoms = tuple(operation.refs[len(template.spec.operands) :])
     scalar_source = (
         atoms[0].owner
-        if operation.native.data in {"scale_value", "sub_value", "scalar_store"}
+        if template.spec.native in {"scale_value", "sub_value", "scalar_store"}
         else None
     )
     program = None
@@ -111,9 +60,7 @@ def format_native(template, *, render, roots, task_names, generation):
             {name: operation.attributes[name] for name in ("shape", "node_shapes", "nodes")}
         )
     task = PrintTask(
-        operation.native.data,
-        tuple(operands),
-        tuple(value.data for value in operation.params),
+        template.spec,
         operation.scalar.value.data,
         task_names[template.operation],
         None if scalar_source is None else task_names[scalar_source],

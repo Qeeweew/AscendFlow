@@ -52,7 +52,7 @@ def complete_each_native(memory):
                     template.operation,
                     Placement.AFTER,
                     kind,
-                    template.contract.engine,
+                    template.spec.engine,
                     Engine.S,
                     (Actor.AIV0,),
                 )

@@ -654,7 +654,7 @@ def masked_element_lines(task, pointers):
     """
     program = task.mask
     require(program is not None, "masked native lost its lane-predicate program")
-    from_scalar = task.native in {"mask_fill", "mask_muls", "mask_adds"}
+    from_scalar = task.spec.native in {"mask_fill", "mask_muls", "mask_adds"}
     scalar = _scalar_value(task.scalar) if from_scalar else ""
     chunks = program.lanes // 64
     require(
@@ -676,26 +676,29 @@ def masked_element_lines(task, pointers):
         lines.extend(bounds)
         lines.append(f"if ({all_true}) {{")
         lines.extend(
-            "  " + line for line in _flush_lines(task.native, pointers, scalar, "0", str(chunks), 2)
+            "  " + line
+            for line in _flush_lines(task.spec.native, pointers, scalar, "0", str(chunks), 2)
         )
         lines.append(f"}} else if (!({all_false})) {{")
         if task.mask_iteration == ITERATION_ROWS:
-            lines.extend(_row_lines(task.native, program, pointers, scalar, 2))
+            lines.extend(_row_lines(task.spec.native, program, pointers, scalar, 2))
         else:
             lines.extend(
-                _chunk_lines(task.native, program, pointers, scalar, chunks, WORD_AFFINE, 2)
+                _chunk_lines(task.spec.native, program, pointers, scalar, chunks, WORD_AFFINE, 2)
             )
         lines.append("}")
     else:
         require(task.mask_word == WORD_LANE, "masked element lost its selected word recipe")
-        lines.extend(_chunk_lines(task.native, program, pointers, scalar, chunks, WORD_LANE, 0))
+        lines.extend(
+            _chunk_lines(task.spec.native, program, pointers, scalar, chunks, WORD_LANE, 0)
+        )
     lines.append("}")
     return lines
 
 
 def mask_zero_lines(task, pointers):
     """Define one packed predicate block with a real count-mode Vector Dup."""
-    words = task.params[0]
+    words = task.spec.params[0]
     require(
         words > 0 and words % 16 == 0,
         "packed predicate zeroing lost its whole-block uint16 count",
@@ -714,9 +717,9 @@ def mask_zero_lines(task, pointers):
 
 
 def compare_lines(task, pointers):
-    chunks = task.params[0]
-    scalar = task.native.startswith("compare_scalar_")
-    kind = task.native.removeprefix("compare_scalar_").removeprefix("compare_")
+    chunks = task.spec.params[0]
+    scalar = task.spec.native.startswith("compare_scalar_")
+    kind = task.spec.native.removeprefix("compare_scalar_").removeprefix("compare_")
     out = _byte_pointer(pointers[-1], "npu_chunk * 32", "uint8_t")
     if scalar:
         source = _byte_pointer(pointers[0], "npu_chunk * 256")
@@ -756,8 +759,8 @@ def mask_bits_lines(task, pointers):
 
 
 def combine_lines(task, pointers):
-    words = task.params[0]
-    kind = task.native.removeprefix("mask_")
+    words = task.spec.params[0]
+    kind = task.spec.native.removeprefix("mask_")
     typed = [f"(__ubuf__ uint16_t*)({pointer})" for pointer in pointers]
     if kind == "not":
         # A real count-mode Vector NOT over the declared packed block.
@@ -767,8 +770,8 @@ def combine_lines(task, pointers):
 
 
 def select_lines(task, pointers):
-    chunks = task.params[0]
-    update = task.native == "select_masked_update"
+    chunks = task.spec.params[0]
+    update = task.spec.native == "select_masked_update"
     lines = [
         "{",
         "  asc_set_mask_norm();",

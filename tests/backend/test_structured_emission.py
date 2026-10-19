@@ -110,7 +110,7 @@ def test_terminal_emission_does_not_borrow_logical_control_addresses_or_native_f
     logical = plan.admission.memory
     assert any(isinstance(op, PipelineLoopOp) for op in logical.module.walk())
     assert not any(isinstance(op, PipelineLoopOp) for op in plan.module.walk())
-    old = next(t.operation for t in logical.templates if t.contract.native == "muls")
+    old = next(t.operation for t in logical.templates if t.spec.native == "muls")
     old.scalar = FloatAttr(99.0, f32)
     address = next(op for op in logical.module.walk() if isinstance(op, AddressOp))
     offset = arith.ConstantOp.from_int_and_width(65536, IndexType())
@@ -123,6 +123,22 @@ def test_terminal_emission_does_not_borrow_logical_control_addresses_or_native_f
     monkeypatch.setattr(logical.control.environment, "expression", forbidden)
     forbid_analysis(monkeypatch)
     assert _emit_owned(plan) == expected
+
+
+@pytest.mark.parametrize("field", ["native", "params", "address_count"])
+def test_terminal_binding_rejects_changes_to_admitted_instruction_geometry(field):
+    from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
+
+    _, facts = memory(scale)
+    template = facts.templates[0]
+    operation = template.operation.clone()
+    operation.attributes[field] = {
+        "native": StringAttr("exp"),
+        "params": ArrayAttr([IntAttr(64)]),
+        "address_count": IntAttr(1),
+    }[field]
+    with pytest.raises(CompileError, match="admitted instruction specification"):
+        NativeExecution.from_template(template, operation)
 
 
 def test_fa_structure_debug_prints_each_template_once_and_is_not_executable(monkeypatch):
@@ -200,7 +216,7 @@ def test_static_empty_and_nonempty_pipelines_use_one_dispatch_rule(count, prints
 
 def test_shared_aiv_abi_family_order_and_singleton_actions():
     _, facts = memory(N.from_source(SHARED, disjoint_external=True))
-    vector = next(template for template in facts.templates if template.contract.native == "muls")
+    vector = next(template for template in facts.templates if template.spec.native == "muls")
     action = SyncAction(
         vector.operation,
         Placement.BEFORE,
@@ -393,9 +409,9 @@ def test_final_address_ssa_and_notification_operations_are_the_executable_input(
     notification.parent.insert_op_before(event, notification)
     notification.operands = (event.result,)
     notification.kind = StringAttr(SyncKind.LOCAL_SET.value)
-    compute = next(t for t in facts.templates if t.contract.native == "muls")
+    compute = next(t for t in facts.templates if t.spec.native == "muls")
     compute.operation.scalar = FloatAttr(3.0, f32)
-    assert compute.contract.scalar == 2.0  # Retained analysis is deliberately unchanged.
+    # The scalar literal is executable IR, not a second value in analysis facts.
     facts.module.verify()
 
     def forbidden(*args, **kwargs):
@@ -520,7 +536,7 @@ def compile_cpp(tmp_path, source, *, sanitize=False):
 @pytest.mark.parametrize("simplified", [False, True])
 def test_single_aiv_guard_precedes_an_id_undefined_on_the_other_lane(tmp_path, simplified):
     _, facts = memory(N.from_source(SHARED, disjoint_external=True))
-    vector = next(template for template in facts.templates if template.contract.native == "muls")
+    vector = next(template for template in facts.templates if template.spec.native == "muls")
     materialize_notifications(
         facts,
         (
@@ -614,8 +630,8 @@ def test_actual_generated_control_and_gm_addresses_match_independent_ir_dispatch
                 placement,
                 template.participants,
                 SyncKind.FENCE,
-                template.contract.engine,
-                template.contract.engine,
+                template.spec.engine,
+                template.spec.engine,
             )
             for template in facts.templates
             for placement in (Placement.BEFORE, Placement.AFTER)
@@ -1079,11 +1095,16 @@ def test_real_reduction_first_chunk_clear_uses_actual_stage_ordinal_ssa(tmp_path
 
     from ascendflow.backend.structured_native import format_native
 
-    template = next(item for item in facts.templates if item.contract.native == "mad_first")
+    template = next(item for item in facts.templates if item.spec.native == "mad_first")
     from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
     template.operation.native = StringAttr("mad_cycle")
     template.operation.params = ArrayAttr(IntAttr(v) for v in (16, 16, 16, 2))
+    # A different primitive needs its own static contract, even in a formatter
+    # microtest; the original mad_first contract cannot authorize mad_cycle.
+    template = replace(
+        template, spec=replace(template.spec, native="mad_cycle", params=(16, 16, 16, 2))
+    )
     code = format_native(
         NativeExecution.from_template(template, template.operation),
         render=lambda value: "actual_offset",

@@ -228,14 +228,14 @@ class _Emitter:
         template = self.templates[operation]
         if context.family not in self.relevant[operation]:
             return []
-        packet = template.packet
+        packet = template.spec.packet
         require(
             packet is not None and packet.closed_mask, "ASC needs an audited closed native packet"
         )
         local = context.child()
         generation = (
             self.scalar(operation.refs[-1], local)
-            if operation.native.data in {"mad_first", "mad_cycle"}
+            if template.spec.native in {"mad_first", "mad_cycle"}
             else "0"
         )
         code = format_native(
@@ -497,11 +497,11 @@ class _Emitter:
                 )
             for template in self.plan.natives:
                 if (
-                    template.operation.native.data in {"scalar_load", "index_load"}
+                    template.spec.native in {"scalar_load", "index_load"}
                     and family in self.relevant[template.operation]
                 ):
                     lines.append(
-                        f"{indent}{'int64_t' if template.operation.native.data == 'index_load' else 'float'} npu_value_{self.task_names[template.operation]} = 0;"
+                        f"{indent}{'int64_t' if template.spec.native == 'index_load' else 'float'} npu_value_{self.task_names[template.operation]} = 0;"
                     )
             context = _Context({}, family)
             body = self.block(self.root.body.block, context)

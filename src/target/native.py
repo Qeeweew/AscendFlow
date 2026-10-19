@@ -7,10 +7,11 @@ programs, enumerate finite instances, or plan synchronization.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
 
 from ..diagnostics import CompileError, require
+from .ascend910b import Engine
+from .packets import NativePacket, audited_packet
 
 CAPACITY = {
     "UB": 192 * 1024,
@@ -88,19 +89,6 @@ class NativeGeometry:
         return self.nbytes * self.rows
 
 
-class NativeInstruction(Protocol):
-    """Instruction fields consumed by the target's completion rule."""
-
-    native: str
-    params: tuple[int, ...]
-
-    @property
-    def pipe(self) -> str: ...
-
-
-IMPLICIT_COMPLETION = {"S"}
-
-
 # Current supported MAD clear-cycle policy, independent of finite expansion.
 # This is an implementation range, not a hardware resource or instruction limit.
 MAX_MAD_CYCLE = 4096
@@ -140,18 +128,53 @@ def native_read_resets(native: str, params: tuple[int, ...]) -> tuple[NativeRead
     return ()
 
 
-def implicit_completion(task: NativeInstruction) -> bool:
-    if task.native == "scalar_store":
+def _implicit_completion(native, engine, params):
+    if native == "scalar_store":
         # Ordered Scalar issue does not publish the UB write to Vector.
         return False
-    if task.pipe in IMPLICIT_COMPLETION:
+    if engine is Engine.S:
         return True
-    if task.pipe != "M":
+    if engine is not Engine.M:
         return False
-    m, n = (16, 16) if task.native == "mad16" else task.params[:2]
+    m, n = (16, 16) if native == "mad16" else params[:2]
     # AtlasA2 CATLASS TileMmad fences short instructions: <10 output
     # fractals cannot supply the prior blanket M completion guarantee.
     return (m // 16) * (n // 16) >= 10
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSpec:
+    """Static instruction facts shared by logical analysis and final emission.
+
+    Operand order is the native's leading reference-operand order. Addresses,
+    scalar SSA values/literals and loop-bound read predicates remain in their
+    actual IR or analysis; this record contains no execution coordinates.
+    """
+
+    native: str
+    engine: Engine
+    modes: tuple[str, ...]
+    params: tuple[int, ...]
+    operands: tuple[NativeGeometry, ...]
+    packet: NativePacket | None = field(init=False)
+    read_resets: tuple[NativeReadReset, ...] = field(init=False)
+    implicit_completion: bool = field(init=False)
+
+    def __post_init__(self):
+        require(len(self.operands) == len(self.modes), "native operand/effect counts differ")
+        object.__setattr__(self, "packet", audited_packet(self.native))
+        resets = native_read_resets(self.native, self.params)
+        require(
+            all(
+                reset.operand < len(self.modes) and self.modes[reset.operand] == "RW"
+                for reset in resets
+            ),
+            "conditional native reset needs a complete read/write operand",
+        )
+        object.__setattr__(self, "read_resets", resets)
+        object.__setattr__(
+            self, "implicit_completion", _implicit_completion(self.native, self.engine, self.params)
+        )
 
 
 def native_contract(

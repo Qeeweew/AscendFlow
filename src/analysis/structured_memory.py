@@ -34,7 +34,7 @@ from ..target import native
 from ..target.ascend910b import Actor, Engine, supports_engine
 from ..target.packets import audited_packet
 from ..target.scalars import round_f32
-from .native import AccessMode, ConditionalRead, NativeContract
+from .native import AccessMode, ConditionalRead
 from .structured_addresses import AddressFacts, StructuredAddresses
 from .structured_control import ControlFacts, ControlFrame, build_control_facts
 from .structured_schedule import Comparison
@@ -53,7 +53,7 @@ class MemoryAccess:
 class MemoryTemplate:
     operation: TaskOp
     frame: ControlFrame
-    contract: NativeContract
+    spec: native.NativeSpec
     accesses: tuple[MemoryAccess, ...]
     scalar_source: TaskOp | None
 
@@ -269,9 +269,10 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
         refs = tuple(decoder.decode(value) for value in operands)
         addresses.update(zip(operands, refs, strict=True))
         params = tuple(value.data for value in operation.params)
+        geometries = tuple(ref.geometry for ref in refs)
         pipe, modes = native.native_contract(
             operation.native.data,
-            tuple(ref.geometry for ref in refs),
+            geometries,
             params,
             disjoint=lambda refs=refs: len(refs) == 2 and decoder.disjoint(*refs),
         )
@@ -291,7 +292,7 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 "local storage bank belongs to another actor participant",
             )
         require(operation.scalar.type == f32, "native Vector scalar literals must be f32")
-        scalar = round_f32(
+        round_f32(
             operation.scalar.value.data,
             allow_infinity=operation.native.data in {"fill", "mask_fill"},
         )
@@ -316,16 +317,16 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 scalar_values[operation.value] = operation
         _check_mask_program(operation, refs, params)
         _check_mask_layout(operation)
-        contract = NativeContract(operation.native.data, engine, modes, params, scalar)
+        spec = native.NativeSpec(operation.native.data, engine, modes, params, geometries)
         require(
-            contract.packet is not None
-            and contract.packet is audited_packet(contract.native)
-            and contract.packet.closed_mask,
+            spec.packet is not None
+            and spec.packet is audited_packet(spec.native)
+            and spec.packet.closed_mask,
             "native requires an audited closed instruction packet",
             phase="structured-memory",
             location=str(operation.location),
         )
-        conditions = _conditional_reads(operation, contract, control)
+        conditions = _conditional_reads(operation, spec, control)
         accesses = tuple(
             MemoryAccess(operand, index, ref, AccessMode(mode), conditions.get(index))
             for index, (operand, ref, mode) in enumerate(zip(operands, refs, modes, strict=True))
@@ -348,7 +349,7 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 phase="structured-memory",
                 location=str(operation.location),
             )
-        templates.append(MemoryTemplate(operation, frame, contract, accesses, scalar_source))
+        templates.append(MemoryTemplate(operation, frame, spec, accesses, scalar_source))
     return NativeMemoryFacts(
         module, control, tuple(templates), MappingProxyType(addresses), len(templates)
     )

@@ -408,7 +408,7 @@ def _configurations(memory):
         for template in memory.templates:
             float_mad = (
                 kind is Load3DConfigOp
-                and template.contract.native in {"mad", "mad_first", "mad_cycle"}
+                and template.spec.native in {"mad", "mad_first", "mad_cycle"}
                 and template.accesses[0].address.geometry.dtype == "f32"
             )
             if float_mad:
@@ -419,7 +419,7 @@ def _configurations(memory):
                     "FP32 MAD requires a preceding IEEE mode configuration",
                     template.operation,
                 )
-            if template.contract.native not in (
+            if template.spec.native not in (
                 {"fix", "fix16"} if kind is FixConfigOp else {"load3d_a", "load3d_b_nn"}
             ):
                 continue
@@ -431,14 +431,14 @@ def _configurations(memory):
             if kind is Load3DConfigOp:
                 width = (
                     matching[0].a_width
-                    if template.contract.native == "load3d_a"
+                    if template.spec.native == "load3d_a"
                     else matching[0].b_width
                 )
                 source = template.accesses[0].address.geometry
                 actual_width = (
                     source.row_stride // 32
                     if not source.contiguous
-                    else template.contract.params[0]
+                    else template.spec.params[0]
                 )
                 _require(
                     width.data == actual_width,

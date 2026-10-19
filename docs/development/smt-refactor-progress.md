@@ -11,7 +11,7 @@
 | P0 基线与反例 | 部分记录 | 已保留接手补丁、旧调用日志和 FA 失败；完整反例矩阵仍需核对 |
 | P1 整数查询 | 主体已实现，FA ASC 已恢复 | 已接通正式 Z3 依赖、原式数学查询与覆盖；公共例子的完整资格仍待集成 |
 | P2 域与代次 | 部分实现 | 已接通 SSA 身份、显式 symbol 种类和 metadata/carry 捕获代次；跨模块坐标接口尚待收敛 |
-| P3 存储与值 | 待实施 | 保留现有合同，尚未完成计划中的收敛 |
+| P3 存储与值 | 部分实现 | NativeSpec 公共字段已收敛；保留现有合同，存储和值接口尚未完成收敛 |
 | P4 同步与资源 | 主体已接通 | 层级顺序、一致释放集合与编译内成对兼容关系已实现；新算子的完整资源资格继续集成 |
 | P5 最终链路 | 主体已实现，集成中 | 终端条件查询已统一；逻辑模块与终端模块已隔离，后端只读取 executable plan；全链资格仍需完成 |
 | P6 集成资格 | 集成中 | 分组全量 1937 项通过；公开例子前 19 组及 KDA recurrent/decode 已通过 CANN/设备，prefill 与性能资格尚未完成 |
@@ -347,3 +347,23 @@ queue activation 的可满足性改为询问完整条件合取，不再逐项尝
 `owned-prefill-scan-source-02` 的真实 H=8/NC=2/CHUNKS=2/SEQUENCES=1 scan
 source→ASC 与结构验证通过，3.6063 秒。该修复尚未重新取得 scan 的 CANN
 和完整 prefill 设备资格。
+
+## 一份原生指令公共描述
+
+`target/native.py::NativeSpec` 统一 opcode、engine/effects、参数、按 operand
+顺序排列的静态 geometry、packet、read reset 与 implicit completion。
+逻辑 MemoryTemplate 与 NativeExecution 共享同一份不可变描述；完成规则不再
+在每个消费者访问属性时重新计算。地址、scalar SSA/literal 和绑定真实循环的
+ConditionalRead 不进入该记录，避免重新混入逻辑/终端坐标。
+
+删除旧 `NativeContract`、终端 `NativeOperand` 以及后端 PrintStorage、PrintOperand
+两层复制/转发对象。后端按 operand index 读取最终 SSA 地址，直接使用共享几何
+和参数，不再重新解码同一套静态字段。终端交接检查 opcode/参数/地址 operand
+数量一致，packet 仍保留可信注册表 identity 与 closed-mask 准入；没有兼容别名。
+
+`owned-native-spec-01` 中 240 项通过，另两项旧私有 fixture 因手工改变 opcode
+未更新描述、或仍使用旧 formatter 字段而失败。只迁移这两个 fixture 后，
+`owned-native-spec-fixtures-01` 两项通过（10.46 秒）；期间产品源码未改变。
+合计这组 242 个不同用例通过，覆盖真实 native 几何、packet 反例、conditional
+read、bounds、后端 trace、mask、matmul 和 FP32 cube。包含新增三项静态 native
+对应被破坏的拒绝检查。不是当前完整 Python 或新 CANN/设备资格。

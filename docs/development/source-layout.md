@@ -66,7 +66,8 @@ build_file                               # 同一链路 + CANN，单次进程组
 |---|---|
 | `frontend/`、`dialects/source.py`、`language.py` | TileLang 风格 AST、typed source、逻辑 Tile 和显式 buffer |
 | `passes/lower_pipeline.py`、`lower_native.py`、`native_recipes.py`、`native_addresses.py` | 参数化控制及 native recipe；尚未建立异步完成 |
-| `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/footprint/effects、目标 native 合同 |
+| `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/effects、绑定真实循环的条件读取；消费共享目标描述 |
+| `target/native.py` 的 `NativeSpec` | 一份不可变的 native opcode、参数、operand geometry/effects、packet、read reset 与完成规则；逻辑分析和终端共享，不含地址/代次 |
 | `analysis/smt.py`、`integer_facts.py`、`guard_cover.py` | 原式数学关系与条件覆盖共用 Z3 查询；定义性和机器范围独立，输入环境与完整前提限定缓存 |
 | `analysis/structured_bounds.py`、`structured_admission.py`、`structured_host.py` | bounds、外部别名、实际存储实例、初始化、借用 Tile 及整数范围前提；group/peer 独立性属于源程序合同 |
 | `analysis/structured_access.py`、`structured_regions.py` | 可选精确 cell 与可能别名的 AliasRegion；保留实际 native 访问，不将 may-write 当完整定义 |
@@ -80,7 +81,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/notification_lifetimes.py` | 有限使用或明确 queue handback，连接实际首末端口，无任意路径搜索 |
 | `analysis/event_sharing.py`、`structured_resources.py`、`event_contracts.py` | 有限 bank、配置/drain 台账；固定成员的兼容关系只建立一次，候选 ID 分配复用关系及真实 handback |
 | `passes/materialize_structure.py` | 插入确定动作、共享同位置短路 guard 前缀；不改变 native 或 issue order |
-| `passes/executable.py` | 终端模块、native 对应、静态 geometry/packet 与最终 SSA 范围；不携带逻辑控制、地址证明或同步求解入口 |
+| `passes/executable.py` | 终端模块、native 对应、共享 NativeSpec 与最终 SSA 范围；不携带逻辑控制、地址证明或同步求解入口 |
 | `passes/lower_execution.py` | 将 count/stage 表示降为实际 arith/scf；按 family 保持 issue order，移动原 native，不复制双 AIV body |
 | `analysis/scalar_uses.py` | 终端 lowering 和输出共用的逐 family SSA 使用关系 |
 | `passes/simplify_scalars.py` | 复用源循环联合范围；共享仿射视图、倍数事实、支配 CSE、域内化简和安全外提 |
@@ -194,6 +195,9 @@ canonicalization，不反复运行整个标量/条件 pass。
 `executable.module`。投影时显式建立 native 与 SSA 对应，复用已准入的几何和
 范围，不重跑内存分析。`ExecutablePlan` 仅检查终端 native 对应及逻辑控制已消除，
 保存只读的最终 SSA 范围。它本身不是外部输入的同步资格；公共 compile 仍只接受 source。
+每个 `NativeExecution` 共享原分析建立的不可变 `NativeSpec`，交接时检查 opcode、
+静态参数及地址 operand 数量一致。后端直接消费其中的几何和 packet；地址、
+scalar SSA 与 scalar literal 仍取实际最终 IR，不在分析里保留另一份 literal。
 ASC emitter 只接收该终端数据，不再读取 `NativeMemoryFacts`、`ControlFacts`、
 `MemoryTemplate` 或原始地址表达式。
 

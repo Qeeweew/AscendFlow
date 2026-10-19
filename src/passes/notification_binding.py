@@ -195,7 +195,7 @@ def _bind_endpoint(
         endpoint.engine
         if isinstance(endpoint, QueueEndpoint)
         else next(
-            item.contract.engine
+            item.spec.engine
             for item in memory.templates
             if item.operation is occurrence.operation
         )

@@ -145,7 +145,7 @@ class _Interpret:
         _check(actor is not None, "native has no actual actor domain")
         template = self.templates[operation]
         _check(
-            template.contract.native == operation.native.data,
+            template.spec.native == operation.native.data,
             "actual native changed its admitted contract",
         )
         occurrence = Occurrence(invocation, group, actor, operation, coordinates)
@@ -167,7 +167,7 @@ class _Interpret:
                 and access is template.accesses[-1]
             ):
                 ordinal = values[operation.refs[-1]]
-                period = 1 if operation.native.data == "mad_first" else template.contract.params[3]
+                period = 1 if operation.native.data == "mad_first" else template.spec.params[3]
                 if ordinal == 0 or operation.native.data == "mad_cycle" and ordinal % period == 0:
                     mode = "W"
             private = root.ref.type.bank.data != "GM"
@@ -192,10 +192,10 @@ class _Interpret:
             Command(
                 occurrence,
                 "native",
-                template.contract.engine,
-                template.contract.engine,
+                template.spec.engine,
+                template.spec.engine,
                 spans=tuple(spans),
-                implicit=template.contract.implicit_completion,
+                implicit=template.spec.implicit_completion,
             )
         )
         _check(len(self.commands) <= self.maximum, "finite model command budget exceeded")

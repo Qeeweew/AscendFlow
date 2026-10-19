@@ -316,7 +316,7 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
         if template.frame.statically_empty:
             continue
         for access in template.accesses:
-            bank, engine = access.address.geometry.bank, template.contract.engine
+            bank, engine = access.address.geometry.bank, template.spec.engine
             alignment = (
                 512
                 if bank != "GM" and engine in {Engine.M, Engine.MTE1, Engine.FIX}

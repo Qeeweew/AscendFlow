@@ -202,9 +202,9 @@ def test_native_conditional_read_guard_uses_the_consumers_actual_ordinal(period,
     if period is not None:
         _retarget(structure, period)
     memory = collect_native_memory(structure.module)
-    consumer = next(template for template in memory.templates if template.contract.read_resets)
+    consumer = next(template for template in memory.templates if template.spec.read_resets)
     writer = (
-        next(template for template in memory.templates if template.contract.native == "mad")
+        next(template for template in memory.templates if template.spec.native == "mad")
         if distance == 0
         else consumer
     )

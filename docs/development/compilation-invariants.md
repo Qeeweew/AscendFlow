@@ -16,6 +16,12 @@
 
 每项义务记录输入、建立者、产出、消费者、保持条件及失效条件。不要把所有名为`prove`的函数一概删除；也不要用cache命中率证明职责设计已合理。不建设可伪造的verified标记或庞大通用proof框架。
 
+目标原生指令的静态描述由 `NativeSpec` 统一保存，逻辑 memory template 和
+终端 native 共享同一份不可变值；实际地址和循环 read condition 各自绑定真实
+SSA/代次。opcode、参数或地址 operand 数量改变必须更新描述，不能沿用旧
+几何输出另一条指令。packet 仍对可信注册表核验 identity 与 closed mask；
+描述共享不取代原生硬件检查、ownership 或同步资格。
+
 当前 bounds 按完全相同的 root、原始 axes、offset DAG 和 native geometry
 建立 view 合同；每个不同 active domain 仍有自己的义务。所有真实 AddressOp
 各自保留映射，不以相同扁平字节范围代替原轴检查。host 以不变 lexical domain

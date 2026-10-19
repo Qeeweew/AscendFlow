@@ -188,7 +188,7 @@ def test_strided_load3d_uses_parent_height_and_shared_operand_retirement(tmp_pat
     final = collect_native_memory(parse((tmp_path / "after.xdsl").read_text()))
     trace = check_structured_events(final, logical_reference=original, groups=(0, 1))
     assert trace.bytes_read and trace.consumptions
-    assert any(t.contract.native == "load3d_b_nn" for t in final.templates)
+    assert any(t.spec.native == "load3d_b_nn" for t in final.templates)
     from ascendflow.dialects.physical import Load3DConfigOp
 
     (config,) = [op for op in final.module.walk() if isinstance(op, Load3DConfigOp)]

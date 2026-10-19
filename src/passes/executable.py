@@ -16,32 +16,28 @@ from ..diagnostics import require
 from ..dialects.physical import TaskOp
 from ..dialects.structured import PipelineLoopOp, PipelineStageOp
 from ..target.ascend910b import Actor
-from ..target.native import NativeGeometry
-from ..target.packets import NativePacket
-
-
-@dataclass(frozen=True, slots=True)
-class NativeOperand:
-    operand_index: int
-    geometry: NativeGeometry
+from ..target.native import NativeSpec
 
 
 @dataclass(frozen=True, slots=True)
 class NativeExecution:
     operation: TaskOp
     participants: tuple[Actor, ...]
-    operands: tuple[NativeOperand, ...]
-    packet: NativePacket
+    spec: NativeSpec
+
+    def __post_init__(self):
+        count = self.operation.attributes.get("address_count")
+        require(
+            self.operation.native.data == self.spec.native
+            and tuple(value.data for value in self.operation.params) == self.spec.params
+            and (len(self.operation.refs) if count is None else count.data)
+            == len(self.spec.operands),
+            "terminal native differs from its admitted instruction specification",
+        )
 
     @classmethod
     def from_template(cls, template, operation):
-        require(template.contract.packet is not None, "native execution needs an audited packet")
-        return cls(
-            operation,
-            template.participants,
-            tuple(NativeOperand(a.operand_index, a.address.geometry) for a in template.accesses),
-            template.contract.packet,
-        )
+        return cls(operation, template.participants, template.spec)
 
 
 @dataclass(frozen=True, slots=True)

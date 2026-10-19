@@ -33,7 +33,7 @@ def test_l1_reuse_retires_at_actual_load2d_reader():
     """)
     templates = result.memory.templates
     root = templates[0].accesses[1].address.root
-    reader = next(t.operation for t in templates if t.contract.native == "load2d_a")
+    reader = next(t.operation for t in templates if t.spec.native == "load2d_a")
     overwrite = templates[-1].operation
     release = [n for n in result.needs if n.kind is HazardKind.WAR and n.cell.root is root]
     assert len(release) == 1
@@ -41,7 +41,7 @@ def test_l1_reuse_retires_at_actual_load2d_reader():
     assert release[0].consumer.operation is overwrite
     assert release[0].source_cut.milestone is Milestone.NATIVE_END
     assert release[0].consumer_cut.milestone is Milestone.ADMISSION
-    assert {Engine.M, Engine.FIX} <= {t.contract.engine for t in templates}
+    assert {Engine.M, Engine.FIX} <= {t.spec.engine for t in templates}
 
 
 def test_shared_gm_reuse_retires_both_aiv_readers_of_one_template():
@@ -66,7 +66,7 @@ def test_shared_gm_reuse_retires_both_aiv_readers_of_one_template():
                     N.matmul(aa,bb,accum=c,initialize=False)
                     N.copy(c,Scratch)
     """)
-    first, overwrite = (t for t in result.memory.templates if t.contract.native == "fix")
+    first, overwrite = (t for t in result.memory.templates if t.spec.native == "fix")
     root = first.accesses[1].address.root
     release = [
         n
@@ -79,7 +79,7 @@ def test_shared_gm_reuse_retires_both_aiv_readers_of_one_template():
     assert {n.source.participant for n in release} == {Actor.AIV0, Actor.AIV1}
     assert release[0].source.operation is release[1].source.operation
     reader = next(t for t in result.memory.templates if t.operation is release[0].source.operation)
-    assert reader.contract.engine is Engine.MTE2
+    assert reader.spec.engine is Engine.MTE2
     assert all(n.source_cut.milestone is Milestone.NATIVE_END for n in release)
     assert all(n.consumer_cut.milestone is Milestone.ADMISSION for n in release)
 

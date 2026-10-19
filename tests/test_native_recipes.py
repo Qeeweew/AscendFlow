@@ -216,7 +216,7 @@ def test_scale_value_segment_keeps_scalar_load_as_an_atom_not_an_address():
     assert count == 2 and len(scale.refs) == 3
     assert tuple(scale.refs[count:]) == (load.value,)
     memory = collect_native_memory(structure.module)
-    scale_fact = next(item for item in memory.templates if item.contract.native == "scale_value")
+    scale_fact = next(item for item in memory.templates if item.spec.native == "scale_value")
     assert scale_fact.scalar_source is load
     asc = compile(source).asc
     assert "asc_mul_scalar" in asc

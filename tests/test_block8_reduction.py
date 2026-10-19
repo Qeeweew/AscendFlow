@@ -51,7 +51,7 @@ def test_block8_workspace_must_be_one_dimensional():
 def test_eight_column_reduction_packs_whole_row_repeats_without_a_merge(kind):
     result = compile(definition(kind=kind, rows=32, columns=8, workspace=32))
     memory = collect_native_memory(result.plan)
-    natives = [t.contract.native for t in memory.templates]
+    natives = [t.spec.native for t in memory.templates]
     assert natives.count("reduce_" + kind + "8") == 1
     assert not any(native.startswith("merge_") for native in natives)
     original = collect_native_memory(parse(result.before_ir))

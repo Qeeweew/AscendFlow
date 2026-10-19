@@ -93,7 +93,7 @@ def test_physical_order_is_projected_without_reordering_the_memory_templates():
     memory = collect_native_memory(structure.module)
     dispatch = bind_structured_dispatch(memory)
     body = next(body for body in dispatch.bodies.values() if body)
-    assert memory.templates[0].contract.native == "nd2nz"
+    assert memory.templates[0].spec.native == "nd2nz"
     assert body[0].native == "fix"  # The expert export-first issue policy.
     assert body[0].template is memory.templates[-1]
     assert len(body) == len(memory.templates) == 6

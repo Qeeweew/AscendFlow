@@ -11,7 +11,7 @@ import pytest
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 
 from ascendflow import language as N
-from ascendflow.analysis.native import AccessMode, ConditionalRead, NativeContract
+from ascendflow.analysis.native import AccessMode, ConditionalRead
 from ascendflow.analysis.structured_admission import admit_structured_memory
 from ascendflow.analysis.structured_bounds import admit_memory_bounds
 from ascendflow.analysis.structured_memory import collect_native_memory
@@ -21,7 +21,7 @@ from ascendflow.dialects.physical import TaskOp
 from ascendflow.dialects.structured import PipelineLoopOp, PipelineStageOp
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.target.ascend910b import Engine
-from ascendflow.target.native import NativeReadReset, native_read_resets
+from ascendflow.target.native import NativeGeometry, NativeReadReset, NativeSpec, native_read_resets
 
 
 def _structure(body=None, *, ring=False):
@@ -75,7 +75,7 @@ def _admit(structure):
 
 
 def _accumulator(memory):
-    template = next(item for item in memory.templates if item.contract.read_resets)
+    template = next(item for item in memory.templates if item.spec.read_resets)
     return template, template.accesses[2]
 
 
@@ -107,7 +107,7 @@ def test_conditional_old_value_read_uses_the_real_stage_ordinal_and_keeps_raw_rw
     assert isinstance(condition.loop, PipelineLoopOp)
     assert condition.ordinal is memory.control.loops[condition.loop].ordinal
     assert accumulator.mode is AccessMode.READ_WRITE
-    assert template.contract.modes == ("R", "R", "RW")
+    assert template.spec.modes == ("R", "R", "RW")
     assert all(access.read_condition is None for access in template.accesses[:2])
     assert condition.read.lhs is condition.kill.lhs
     assert condition.read.rhs == condition.kill.rhs
@@ -229,7 +229,7 @@ def test_reset_rule_requires_an_actual_pipeline_stage_not_just_a_serial_clock():
 def test_static_rmw_has_no_reset_certificate_and_still_needs_defined_input():
     structure = _structure("N.matmul(aa,bb,accum=c0,initialize=False)")
     memory = collect_native_memory(structure.module)
-    template = next(item for item in memory.templates if item.contract.native == "mad")
+    template = next(item for item in memory.templates if item.spec.native == "mad")
     assert template.accesses[2].read_condition is None
     with pytest.raises(CompileError, match="initialized writer coverage"):
         _admit(structure)
@@ -237,4 +237,17 @@ def test_static_rmw_has_no_reset_certificate_and_still_needs_defined_input():
 
 def test_conditional_rule_cannot_be_attached_to_a_non_rw_operand():
     with pytest.raises(CompileError, match="complete read/write operand"):
-        NativeContract("mad_first", Engine.M, ("R", "R", "W"), (16, 16, 16), 0.0)
+        NativeSpec(
+            "mad_first",
+            Engine.M,
+            ("R", "R", "W"),
+            (16, 16, 16),
+            tuple(
+                NativeGeometry(bank, dtype, layout, width)
+                for bank, dtype, layout, width in (
+                    ("L0A", "f16", "ZZ", 512),
+                    ("L0B", "f16", "ZN", 512),
+                    ("L0C", "f32", "NZ", 1024),
+                )
+            ),
+        )
