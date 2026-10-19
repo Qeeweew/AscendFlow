@@ -17,10 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 @dataclass(frozen=True)
 class Example:
     name: str
-    source: str
-    entry: str
+    entries: tuple[tuple[str, str], ...]
     build: tuple[str, ...]
     run: tuple[str, ...]
+    device_subdir: str = ""
+    result_glob: str = "**/device*.json"
 
 
 def examples():
@@ -80,8 +81,7 @@ def examples():
         result.append(
             Example(
                 name,
-                source,
-                entry,
+                ((source, entry),),
                 ("ascendflow", "--input", source, "--entry", entry, "--shared"),
                 (f"benchmarks.vector.{module}", "--library", f"{{output}}/{entry}.so", *options),
             )
@@ -91,8 +91,7 @@ def examples():
         result.append(
             Example(
                 name,
-                f"examples/{source}.py",
-                entry,
+                ((f"examples/{source}.py", entry),),
                 (f"benchmarks.{module}", "--build", *options),
                 (f"benchmarks.{module}", *options, *checks),
             )
@@ -180,6 +179,96 @@ def examples():
         (),
         ("--cases", "256:1024", "768:3072", "--repeats", "1"),
     )
+    source, entry = "examples/vector/scalar_store.py", "scalar_store"
+    result.append(
+        Example(
+            "scalar-store",
+            ((source, entry),),
+            ("ascendflow", "--input", source, "--entry", entry, "--shared"),
+            ("benchmarks.vector.run_scalar_store", "--artifact", "{output}"),
+            "validation",
+        )
+    )
+    for filename, entry, parameters, lengths in (
+        (
+            "recurrent",
+            "recurrent_kda",
+            {"TOKENS": 4, "SEQUENCES": 4, "SLOTS": 5, "INDEX_WIDTH": 4, "H": 8, "HV": 8},
+            ("0", "1", "3", "0"),
+        ),
+        (
+            "decode",
+            "decode_kda",
+            {"SEQUENCES": 4, "SLOTS": 5, "H": 8, "HV": 8, "HEAD_GROUPS": 2},
+            ("1", "1", "1", "1"),
+        ),
+    ):
+        source = f"examples/kda/{filename}.py"
+        result.append(
+            Example(
+                f"kda-{filename}",
+                ((source, entry),),
+                (
+                    "ascendflow",
+                    "--input",
+                    source,
+                    "--entry",
+                    entry,
+                    "--parameters",
+                    json.dumps(parameters),
+                    "--shared",
+                ),
+                (
+                    "benchmarks.kda.run",
+                    "--worker",
+                    "--artifact",
+                    "{output}",
+                    "--backend",
+                    "ascendflow",
+                    "--lengths",
+                    *lengths,
+                    "--warmup",
+                    "0",
+                    "--repeats",
+                    "1",
+                ),
+                "validation",
+                "validation/results.json",
+            )
+        )
+    from benchmarks.kda.prefill import KERNELS, PHASES, SOURCES
+
+    result.append(
+        Example(
+            "kda-prefill",
+            tuple(dict.fromkeys((SOURCES[phase], KERNELS[phase]) for phase in PHASES)),
+            (
+                "benchmarks.kda.prefill",
+                "--build-only",
+                "--build-worker",
+                "--artifacts",
+                "{output}",
+                "--heads",
+                "2",
+                "--lengths",
+                "127",
+            ),
+            (
+                "benchmarks.kda.prefill",
+                "--worker",
+                "--artifacts",
+                "{output}",
+                "--backend",
+                "ascendflow",
+                "--warmup",
+                "0",
+                "--repeats",
+                "1",
+            ),
+            "validation",
+            "validation/results.json",
+        )
+    )
     return tuple(result)
 
 
@@ -205,7 +294,7 @@ def main():
     args = parser.parse_args()
     if args.list:
         for case in examples():
-            print(f"{case.name:20} {case.source}::{case.entry}")
+            print(f"{case.name:20} " + ", ".join(f"{p}::{e}" for p, e in case.entries))
         return 0
     if args.output is None:
         parser.error("--output is required")
@@ -234,17 +323,30 @@ def main():
             output = directory / case.name
             row = {
                 "name": case.name,
-                "source": case.source,
-                "entry": case.entry,
+                "entries": [{"source": source, "entry": entry} for source, entry in case.entries],
                 "status": "building",
                 "output": str(output),
             }
             report["cases"].append(row)
-            command = [sys.executable, "-m", *case.build, "--output", str(output)]
+            command = [
+                sys.executable,
+                "-m",
+                *(part.format(output=output) for part in case.build),
+                "--output",
+                str(output),
+            ]
             row["build_command"] = command
             save()
             # Imports, construction, IR, ASC and CANN share this hard deadline.
             row["build"] = bounded_process(command, output / "build-step", timeout_s=300)
+            publications = {
+                json.loads(path.read_text())["kernel"]: str(path)
+                for path in output.rglob("verification.json")
+            }
+            missing = {entry for _, entry in case.entries} - publications.keys()
+            if missing:
+                raise RuntimeError(f"missing compiled example entries: {sorted(missing)}")
+            row["publications"] = publications
             row["status"] = "compiled"
             if args.physical is not None:
                 command = [
@@ -252,13 +354,13 @@ def main():
                     "-m",
                     *(part.format(output=output) for part in case.run),
                     "--output",
-                    str(output),
+                    str(output / case.device_subdir),
                     "--physical",
                     str(args.physical),
                 ]
                 row["run_command"] = command
                 run_device(command, output / "run-step")
-                records = sorted(output.rglob("device*.json"))
+                records = sorted(output.glob(case.result_glob))
                 if not records:
                     raise RuntimeError(f"missing device evidence: {output}")
                 row["device_records"] = {

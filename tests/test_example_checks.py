@@ -20,7 +20,7 @@ def test_smoke_inventory_covers_every_public_example_entry():
                 declared.add((str(path.relative_to(check_examples.ROOT)), node.name))
     cases = check_examples.examples()
     assert len({case.name for case in cases}) == len(cases)
-    assert {(case.source, case.entry) for case in cases} == declared
+    assert {entry for case in cases for entry in case.entries} == declared
 
 
 def test_failed_build_stops_suite_and_preserves_failure_record(monkeypatch, tmp_path):

@@ -34,6 +34,21 @@ PHASES = (
     "output",
 )
 KERNELS = {p: "prefill_" + ("solve_merge" if p.startswith("solve_merge") else p) for p in PHASES}
+SOURCES = {
+    phase: "examples/kda/"
+    + (
+        "prefill_output.py"
+        if phase == "output"
+        else "prefill_prepare.py"
+        if phase == "prepare_full"
+        else "prefill_gram.py"
+        if phase == "gram_cross"
+        else "prefill_solve.py"
+        if phase.startswith("solve")
+        else "prefill.py"
+    )
+    for phase in PHASES
+}
 RUNTIME_PHASES = {"prepare_full", "prepare", "output"}
 ORDERS = {
     "prepare": (
@@ -146,18 +161,7 @@ def build(args):
         if phase == "gram_cross":
             options["PACK"] = pack_tasks
         build_file(
-            Path(__file__).resolve().parents[2]
-            / (
-                "examples/kda/prefill_output.py"
-                if phase == "output"
-                else "examples/kda/prefill_prepare.py"
-                if phase == "prepare_full"
-                else "examples/kda/prefill_gram.py"
-                if phase == "gram_cross"
-                else "examples/kda/prefill_solve.py"
-                if phase.startswith("solve")
-                else "examples/kda/prefill.py"
-            ),
+            Path(__file__).resolve().parents[2] / SOURCES[phase],
             args.artifacts / phase,
             entry=KERNELS[phase],
             parameters=options,
@@ -531,7 +535,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--physical", required=True, type=int)
+    parser.add_argument("--physical", type=int)
     parser.add_argument("--lengths", nargs="+", type=int, default=[128])
     parser.add_argument(
         "--run-lengths",
@@ -557,6 +561,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=1)
     args = parser.parse_args()
+    require(args.build_only or args.physical is not None, "--physical is required for device runs")
     if args.build or args.build_only:
         if args.build_worker:
             build(args)
@@ -573,8 +578,6 @@ def main():
                     str(args.artifacts),
                     "--output",
                     str(args.output),
-                    "--physical",
-                    str(args.physical),
                     "--heads",
                     str(args.heads),
                     "--dtype",

@@ -31,10 +31,16 @@ export ASCEND_RT_VISIBLE_DEVICES=2 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1
 python -m benchmarks.check_examples --output build/examples-device --physical 2
 ```
 
-这会对清单中的 **16 个公开示例**逐个构建 CANN 共享库、运行小规模全输出 oracle，
+清单包含 **30 个公开 kernel 入口，按 22 组检查**。每组构建 CANN 共享库，再运行
+小规模全输出 oracle；KDA prefill 一组包含十个 phase specialization（九个入口），
+检查整个 pipeline 的输出和最终状态，不把这一结果称为每个中间矩阵的独立数值验证。
 检查输入与 guard，包含各自适用的空、单次、多次和跨槽复用情况。GEMM 使用
 129×257×259 尾块；dense NT 使用 256×512×256；FA 使用 256:1024、768:3072。
 其他参数见[清单实现](../../benchmarks/check_examples.py)，结果见[示例验证](../reports/examples.md)。
+KDA recurrent 使用长度 0/1/3/0，decode 使用四个单 token 序列，prefill 使用
+两头、127 token 尾块；它们是数值 smoke，不代替 B1/S4096/H32 的性能资格。
+构建清单会核对每个声明入口确实发布了编译记录，KDA 的设备记录保存在各组的
+`validation/results.json`；标量 capture/store 另有精确 FP32、输入与边界检查。
 
 每次构建覆盖 Python→IR→ASC→CANN 的总硬期限为 300 秒。失败或超时立即停止，
 清理该构建进程组，保存日志和失败记录。设备检查也有独立的 300 秒上限。

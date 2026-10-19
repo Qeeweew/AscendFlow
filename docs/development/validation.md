@@ -72,7 +72,7 @@ CV 派发、事件映射和返回 drain。不能增加全局 barrier 或静默 f
 CPU/IR 通过、CANN 编译通过和设备数值通过各自记录。
 
 日常验证采用[测试指南](../guide/testing.md)的统一入口：16 个公开示例编译/运行，
-仅 Flash Attention 和 GEMM normal 的固定 shape 矩阵，AscendFlow 与 ACLNN 每组各采集一次默认 msprof。记录实际 DSL/IR/ASC/库、
+仅 Flash Attention 和 GEMM normal 的固定 shape 矩阵，AscendFlow 与 ACLNN 每组各采集一次默认 msprof。公开示例清单现按 22 组覆盖 30 个 kernel 入口，包含 KDA 和 scalar capture/store；清单完整性不是实际编译或数值资格。记录实际 DSL/IR/ASC/库、
 编译选项、输入、设备、预热/执行次数和原始 CSV；kernel time 采用设备 task 时长。
 full 与 sampled 分开，ACL stream interval 不当作 kernel time。
 
