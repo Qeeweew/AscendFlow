@@ -22,7 +22,7 @@ from xdsl.ir import Operation, SSAValue
 
 from ..diagnostics import ErrorKind, require
 from ..dialects.physical import TaskOp
-from ..dialects.source import DomainOp, PipelineOp, StageOp, YieldOp
+from ..dialects.source import DomainOp, IterationOp, StageOp, YieldOp
 from ..dialects.structured import PipelineLoopOp
 from ..dialects.types import TileType
 
@@ -107,7 +107,7 @@ def bind_values(
             owner = current.owner
             _supported(current not in active, "cyclic logical Tile yield provenance", owner)
             active.add(current)
-            if isinstance(owner, (StageOp, DomainOp, PipelineOp)):
+            if isinstance(owner, (StageOp, DomainOp, IterationOp)):
                 terminator = owner.body.block.last_op
                 _supported(
                     isinstance(terminator, YieldOp) and current.index < len(terminator.values),
@@ -128,7 +128,7 @@ def bind_values(
                 values[current] = TileDefinition(recipe.definition, recipe.definition_ref)
         result = values[current]
         for alias, owner in reversed(path):
-            if isinstance(owner, PipelineOp):
+            if isinstance(owner, IterationOp):
                 loop = loops.get(owner)
                 _supported(
                     isinstance(loop, PipelineLoopOp),
@@ -162,7 +162,7 @@ def bind_values(
     # The frontend also exports unused results. Empty loops can retain such
     # unresolved LastTile nodes without inventing a defined numerical value.
     for operation in source.walk():
-        if isinstance(operation, (StageOp, DomainOp, PipelineOp)):
+        if isinstance(operation, (StageOp, DomainOp, IterationOp)):
             for value in operation.results:
                 resolve(value)
     return values, tuple(uses)

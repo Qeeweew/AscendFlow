@@ -10,7 +10,7 @@ from ascendflow.analysis.structured_bounds import admit_memory_bounds
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.diagnostics import CompileError, ErrorKind
 from ascendflow.dialects.physical import FixConfigOp
-from ascendflow.dialects.source import ElementOp, PipelineOp
+from ascendflow.dialects.source import ElementOp, IterationOp
 from ascendflow.indexing import arguments
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.symbols import is_coordinate
@@ -47,15 +47,14 @@ def _last_source(minimum, *, overwritten=False):
     tail = "                    N.fill(x[0:64],2.0)\n" if overwritten else ""
     source = N.from_source(
         _vector(
-            "                for i in N.Pipelined(n,stages=1):\n"
-            "                    N.fill(x[0:64],1.0)\n"
+            "                for i in N.Pipelined(n):\n                    N.fill(x[0:64],1.0)\n"
             + tail
             + "                N.mul(x[0:64],2.0,out=y)",
             f"n:N.int64(minimum={minimum})",
         ),
         disjoint_external=True,
     ).to_ir()
-    pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
+    pipeline = next(op for op in source.walk() if isinstance(op, IterationOp))
     reader = tuple(op for op in source.walk() if isinstance(op, ElementOp))[-1]
     replacement = ElementOp.build(
         operands=[
@@ -126,7 +125,7 @@ def test_real_dsl_admission_keeps_owned_facts_and_reuses_native_address_control(
     [
         "                N.mul(x[0:64],2.0,out=y)",
         "                if n == 1:\n                    N.fill(x,0.0)\n                N.mul(x[0:64],2.0,out=y)",
-        "                for i in N.Pipelined(n,stages=1):\n                    N.mul(x[0:64],2.0,out=y)\n                    if i == 0:\n                        N.fill(x,0.0)",
+        "                for i in N.Pipelined(n):\n                    N.mul(x[0:64],2.0,out=y)\n                    if i == 0:\n                        N.fill(x,0.0)",
     ],
 )
 def test_undefined_local_reads_and_non_dominating_conditional_writers_are_rejected(body):
@@ -137,7 +136,7 @@ def test_undefined_local_reads_and_non_dominating_conditional_writers_are_reject
 def test_first_logical_iteration_initialization_is_an_inductive_value_fact():
     admission = _admit(
         _vector(
-            """                for i in N.Pipelined(n,stages=1):
+            """                for i in N.Pipelined(n):
                     if i == 0:
                         N.fill(x,1.0)
                     N.mul(x[0:64],2.0,out=y)""",
@@ -169,7 +168,7 @@ def test_maybe_empty_sibling_loops_keep_their_own_initializing_writers(initializ
 @pytest.mark.parametrize("minimum,accepted", [(0, False), (1, True)])
 def test_closed_runtime_loop_needs_a_proven_first_writer_before_an_outside_read(minimum, accepted):
     text = _vector(
-        """                for i in N.Pipelined(n,stages=1):
+        """                for i in N.Pipelined(n):
                     N.fill(x,1.0)
                 N.mul(x[0:64],2.0,out=y)""",
         f"n:N.int64(minimum={minimum})",
@@ -192,11 +191,11 @@ def test_closed_runtime_loop_needs_a_proven_first_writer_before_an_outside_read(
                     N.fill(x[0:64],2.0)
                 N.mul(old,2.0,out=y)""",
         """                old=N.fill(x[0:64],1.0)
-                for i in N.Pipelined(2,stages=1):
+                for i in N.Pipelined(2):
                     N.mul(old,2.0,out=y)
                     N.fill(x[0:64],2.0)""",
         """                old=N.fill(x[0:64],1.0)
-                for i in N.Pipelined(3,stages=1):
+                for i in N.Pipelined(3):
                     if i%2 == 0:
                         N.mul(old,2.0,out=y)
                     else:

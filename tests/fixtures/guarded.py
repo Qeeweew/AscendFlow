@@ -19,14 +19,14 @@ def native_guarded_recurrence(
         x = N.alloc_ub((2, 8, 64), N.f32, name="x")
         out = N.alloc_ub((2, 8, 64), N.f16, name="out")
         broadcast = N.alloc_ub((8, 8), N.f32, name="broadcast")
-        for t in N.Pipelined(n, stages=2):
+        for t in N.Pipelined(n):
             with N.Stage(0, name="initialize"):
                 if t == 0:
                     N.fill(state[0, :, :], 0.0)
                     N.fill(state[1, :, :], 0.0)
                     N.fill(factor, 0.5)
             with N.Stage(1, name="update"):
-                for row in N.Pipelined(2, stages=3):
+                for row in N.Pipelined(2):
                     with N.Stage(0, name="load"):
                         N.copy(X[t, row, :, :], x[row % 2, :, :])
                     with N.Stage(1, name="compute"):

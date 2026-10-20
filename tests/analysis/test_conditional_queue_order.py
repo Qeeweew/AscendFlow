@@ -116,13 +116,13 @@ def flat():
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
             with N.Vector():
                 N.copy(X[:],x[:])
-                for i in N.Pipelined(n,stages=2,issue_order={"vector":("second","first")}):
+                for i in N.Pipelined(n,issue_order=("second","first")):
                     with N.Stage(0,name="first"):
                         N.fill(x,1.0)
                     with N.Stage(1,name="second"):
                         N.mul(x,2.0,out=y)
                 N.copy(X[:],y[:])
-    """)
+""")
 
 
 @pytest.mark.parametrize("actor", (Actor.AIV0, Actor.AIV1))
@@ -183,10 +183,10 @@ def test_nested_sibling_and_direct_parent_order_matches_retained_ir(actor, count
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
             with N.Vector():
                 N.copy(X[:],x[:])
-                for p in N.Pipelined(n,stages=2,issue_order={"vector":("later","early")}):
+                for p in N.Pipelined(n,issue_order=("later","early")):
                     with N.Stage(0,name="early"):
                         N.fill(x,1.0)
-                        for i in N.Pipelined(2,stages=2,issue_order={"vector":("read","write")}):
+                        for i in N.Pipelined(2,issue_order=("read","write")):
                             with N.Stage(0,name="write"):
                                 N.fill(x,2.0)
                             with N.Stage(1,name="read"):
@@ -195,9 +195,9 @@ def test_nested_sibling_and_direct_parent_order_matches_retained_ir(actor, count
                         for j in N.serial(2):
                             N.mul(x,3.0,out=y)
                         N.fill(y,4.0)
-                        for k in N.Pipelined(2,stages=1):
+                        for k in N.Pipelined(2):
                             N.fill(x,5.0)
-    """)
+""")
     assert_actual_order(domains, {"n": count, "$group": 0}, actor)
 
 
@@ -209,7 +209,7 @@ def test_nested_conditions_grow_with_depth_without_expanding_iterations():
         "        x,y=N.alloc_ub((64,)),N.alloc_ub((64,))",
     ]
     for index in range(depth):
-        lines.append("    " * (index + 2) + f"for i{index} in N.Pipelined(2,stages=1):")
+        lines.append("    " * (index + 2) + f"for i{index} in N.Pipelined(2):")
     lines.extend(
         "    " * (depth + 2) + operation for operation in ("N.fill(x,1.0)", "N.mul(x,2.0,out=y)")
     )

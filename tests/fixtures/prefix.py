@@ -21,12 +21,12 @@ def scale_prefix(
         x = N.alloc_ub((2, B), N.f32, name="inputs")
         y = N.alloc_ub((2, B), N.f32, name="outputs")
         length = N.min(n, m)
-        for t in N.Pipelined(N.ceildiv(length, B), stages=3):
+        for t in N.Pipelined(N.ceildiv(length, B)):
             valid = N.min(B, length - t * B)
             slot = t % 2
             with N.Stage(0, name="load"):
                 N.copy(X[t * B : (t + 1) * B], x[slot, :], valid=valid)
-            with N.Stage(1, name="compute"), N.Vector():
+            with N.Vector(), N.Stage(1, name="compute"):
                 N.mul(x[slot, :], 2.0, out=y[slot, :], valid=valid)
             with N.Stage(2, name="store"):
                 N.copy(y[slot, :], Y[t * B : (t + 1) * B], valid=valid)

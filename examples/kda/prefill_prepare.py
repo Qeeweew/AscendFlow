@@ -7,6 +7,105 @@ from ascendflow import language as N
 # ruff: noqa: F821
 
 
+@N.inline
+def prepare_gate_load(Starts, chunk, TOKENS, BT, Gate, gates1, head, ring):
+    start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT)
+    N.copy(Gate[start : start + BT, head, :], gates1[ring, :, :])
+
+
+@N.inline
+def prepare_input_load(inputs, buffers, geometry, coordinates):
+    Starts, Q, Key, Value, Beta = inputs
+    q16, k16, v16, beta8 = buffers
+    (BT,) = geometry
+    chunk, TOKENS, lane, head, ring = coordinates
+    start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT)
+    row = lane * (BT // 2)
+    N.copy(Q[start + row : start + row + BT // 2, head, :], q16[ring, :, :])
+    N.copy(Key[start + row : start + row + BT // 2, head, :], k16[ring, :, :])
+    N.copy(Value[start + row : start + row + BT // 2, head, :], v16[ring, :, :])
+    beta_head = (head // 8) * 8
+    N.copy(
+        Beta[start + row : start + row + BT // 2, beta_head : beta_head + 8],
+        beta8[ring, :, :],
+    )
+
+
+@N.inline
+def prepare_gate_prefix(gates0, gates1, ring, lower0, prefixes0, Gp, chunk, head):
+    gg = N.copy(gates1[ring, :, :], gates0)
+    N.matmul(lower0, gg, accum=prefixes0, initialize=True)
+    N.copy(prefixes0, Gp[chunk, head, :, :])
+
+
+@N.inline
+def prepare_normalize(buffers, coordinates):
+    (
+        q16,
+        values,
+        work,
+        stat,
+        partial,
+        rows,
+        k16,
+        selectors,
+        beta_mask,
+        beta8,
+        beta_zero,
+        beta_partial,
+        betas,
+    ) = buffers
+    ring, head = coordinates
+    N.cast(q16[ring, :, :], out=values)
+    N.mul(values, values, out=work)
+    N.reduce_sum(
+        work,
+        axis=1,
+        out=stat,
+        scratch=partial,
+        order="block8_then_packed_merge",
+    )
+    N.add(stat, 1e-6, out=stat)
+    N.rsqrt(stat, out=stat)
+    N.mul(values, stat[:, None], out=values, scratch=rows)
+    N.cast(values, out=q16[ring, :, :])
+    N.cast(k16[ring, :, :], out=values)
+    N.mul(values, values, out=work)
+    N.reduce_sum(
+        work,
+        axis=1,
+        out=stat,
+        scratch=partial,
+        order="block8_then_packed_merge",
+    )
+    N.add(stat, 1e-6, out=stat)
+    N.rsqrt(stat, out=stat)
+    N.mul(values, stat[:, None], out=values, scratch=rows)
+    N.cast(values, out=k16[ring, :, :])
+    ignored = N.compare(selectors[head % 8, :, :], 0.0, kind="eq", out=beta_mask)
+    N.fill(beta8[ring, :, :], 0.0, mask=ignored, scratch=beta_zero)
+    N.reduce_sum(
+        beta8[ring, :, :],
+        axis=1,
+        out=betas[ring, :],
+        scratch=beta_partial,
+        order="block8_then_packed_merge",
+    )
+
+
+@N.inline
+def prepare_store(inputs, buffers, geometry, coordinates):
+    Qp, Kp, Vp, Bp = inputs
+    q16, k16, v16, betas = buffers
+    (BT,) = geometry
+    lane, ring, chunk, head = coordinates
+    row = lane * (BT // 2)
+    N.copy(q16[ring, :, :], Qp[chunk, head, row : row + BT // 2, :])
+    N.copy(k16[ring, :, :], Kp[chunk, head, row : row + BT // 2, :])
+    N.copy(v16[ring, :, :], Vp[chunk, head, row : row + BT // 2, :])
+    N.copy(betas[ring, :], Bp[chunk, head, row : row + BT // 2])
+
+
 @N.prim_func(disjoint_external=True)
 def prefill_prepare_full(
     Q: N.Tensor((TOKENS, H, K), DTYPE),
@@ -62,80 +161,45 @@ def prefill_prepare_full(
             with N.Vector():
                 for selector in N.unroll(8):
                     N.copy(BetaSelectors[selector, :, :], selectors[selector, :, :])
-            for task in N.Pipelined(
+            for task in N.Dataflow(
                 N.ceildiv(N.max(0, SEQUENCES * (NC - 1) * H - owner), GROUPS),
-                stages=3,
-                issue_order={"vector": ("store", "load", "compute")},
+                issue_order={"vector": ("store", "input_load", "normalize")},
             ):
                 flat = owner + task * GROUPS
                 full, head = flat // H, flat % H
                 chunk = (full // (NC - 1)) * NC + full % (NC - 1)
                 ring = task % 2
-                with N.Stage(0, name="load"):
-                    with N.Cube():
-                        start = N.load_index(
-                            Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT
-                        )
-                        N.copy(Gate[start : start + BT, head, :], gates1[ring, :, :])
-                    with N.Vector() as lane:
-                        start = N.load_index(
-                            Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT
-                        )
-                        row = lane * (BT // 2)
-                        N.copy(Q[start + row : start + row + BT // 2, head, :], q16[ring, :, :])
-                        N.copy(Key[start + row : start + row + BT // 2, head, :], k16[ring, :, :])
-                        N.copy(Value[start + row : start + row + BT // 2, head, :], v16[ring, :, :])
-                        beta_head = (head // 8) * 8
-                        N.copy(
-                            Beta[start + row : start + row + BT // 2, beta_head : beta_head + 8],
-                            beta8[ring, :, :],
-                        )
-                with N.Stage(1, name="compute"):
-                    with N.Cube():
-                        gg = N.copy(gates1[ring, :, :], gates0)
-                        N.matmul(lower0, gg, accum=prefixes0, initialize=True)
-                        N.copy(prefixes0, Gp[chunk, head, :, :])
-                    with N.Vector():
-                        N.cast(q16[ring, :, :], out=values)
-                        N.mul(values, values, out=work)
-                        N.reduce_sum(
+                with N.Cube(), N.Stage(0, name="gate_load"):
+                    prepare_gate_load(Starts, chunk, TOKENS, BT, Gate, gates1, head, ring)
+                with N.Vector() as lane, N.Stage(0, name="input_load"):
+                    prepare_input_load(
+                        (Starts, Q, Key, Value, Beta),
+                        (q16, k16, v16, beta8),
+                        (BT,),
+                        (chunk, TOKENS, lane, head, ring),
+                    )
+                with N.Cube(), N.Stage(1, name="gate_prefix"):
+                    prepare_gate_prefix(gates0, gates1, ring, lower0, prefixes0, Gp, chunk, head)
+                with N.Vector(), N.Stage(1, name="normalize"):
+                    prepare_normalize(
+                        (
+                            q16,
+                            values,
                             work,
-                            axis=1,
-                            out=stat,
-                            scratch=partial,
-                            order="block8_then_packed_merge",
-                        )
-                        N.add(stat, 1e-6, out=stat)
-                        N.rsqrt(stat, out=stat)
-                        N.mul(values, stat[:, None], out=values, scratch=rows)
-                        N.cast(values, out=q16[ring, :, :])
-                        N.cast(k16[ring, :, :], out=values)
-                        N.mul(values, values, out=work)
-                        N.reduce_sum(
-                            work,
-                            axis=1,
-                            out=stat,
-                            scratch=partial,
-                            order="block8_then_packed_merge",
-                        )
-                        N.add(stat, 1e-6, out=stat)
-                        N.rsqrt(stat, out=stat)
-                        N.mul(values, stat[:, None], out=values, scratch=rows)
-                        N.cast(values, out=k16[ring, :, :])
-                        ignored = N.compare(
-                            selectors[head % 8, :, :], 0.0, kind="eq", out=beta_mask
-                        )
-                        N.fill(beta8[ring, :, :], 0.0, mask=ignored, scratch=beta_zero)
-                        N.reduce_sum(
-                            beta8[ring, :, :],
-                            axis=1,
-                            out=betas[ring, :],
-                            scratch=beta_partial,
-                            order="block8_then_packed_merge",
-                        )
-                with N.Stage(2, name="store"), N.Vector() as lane:
-                    row = lane * (BT // 2)
-                    N.copy(q16[ring, :, :], Qp[chunk, head, row : row + BT // 2, :])
-                    N.copy(k16[ring, :, :], Kp[chunk, head, row : row + BT // 2, :])
-                    N.copy(v16[ring, :, :], Vp[chunk, head, row : row + BT // 2, :])
-                    N.copy(betas[ring, :], Bp[chunk, head, row : row + BT // 2])
+                            stat,
+                            partial,
+                            rows,
+                            k16,
+                            selectors,
+                            beta_mask,
+                            beta8,
+                            beta_zero,
+                            beta_partial,
+                            betas,
+                        ),
+                        (ring, head),
+                    )
+                with N.Vector() as lane, N.Stage(2, name="store"):
+                    prepare_store(
+                        (Qp, Kp, Vp, Bp), (q16, k16, v16, betas), (BT,), (lane, ring, chunk, head)
+                    )

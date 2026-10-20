@@ -23,8 +23,11 @@ def test_mixed_ir_has_one_vector_body_one_sid_and_shared_gm_root():
     assert [domain.kind.data for domain in domains] == ["cube", "vector"]
     assert sum(isinstance(op, TaskOp) for op in domains[1].walk()) == 3
     assert plan.work["native_templates"] == 9  # vector tasks are not doubled
-    assert len(plan.loops) == 1 and len(plan.domains) == 2
-    assert all(isinstance(op, DomainOp) for op in plan.domains)
+    assert len(plan.loops) == 1
+    assert [op.kind.data for op in plan.source.walk() if isinstance(op, DomainOp)] == [
+        "cube",
+        "vector",
+    ]
     shared = next(
         op.ref
         for op in plan.module.walk()

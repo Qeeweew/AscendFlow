@@ -99,7 +99,12 @@ class Vector(Cube):
 
 
 class Pipelined:
-    def __init__(self, count, *, stages, order="source", issue_order=None):
+    def __init__(self, count, *, issue_order=None):
+        _ast_only()
+
+
+class Dataflow:
+    def __init__(self, count, *, issue_order=None):
         _ast_only()
 
 

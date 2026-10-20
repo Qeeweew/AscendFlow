@@ -26,6 +26,213 @@ def causal_policy(sq, sk):
     return {"kv_tile": 1024, "vector_rows": 8}
 
 
+@N.inline
+def qk_tiles(inputs, buffers, task, geometry):
+    K, Score = inputs
+    q1, k1, a0, b0, c0 = buffers
+    batch, kv_head, group, s, kv = task
+    parts, BM, BK, CK = geometry
+    if parts == 2:
+        # PV overwrites these slots between QK phases, but
+        # Q is unchanged across every CK chunk of this child.
+        for part in N.unroll(parts):
+            N.copy(q1[part, :, :], a0[part, :, :])
+    for chunk in N.Pipelined(
+        BK // CK,
+        issue_order=("load_k", "qk_emit", "operand_k"),
+    ):
+        j = kv * BK + chunk * CK
+        with N.Stage(0, name="load_k"):
+            N.copy(K[batch, kv_head, j : j + CK, :], k1[chunk % 2, :, :])
+        with N.Stage(1, name="operand_k"):
+            N.copy(k1[chunk % 2, :, :], b0[chunk % 2, :, :], transpose=True)
+        with N.Stage(2, name="qk_emit"):
+            for part in N.unroll(parts):
+                plane = (chunk * parts + part) % 2
+                N.matmul(
+                    a0[part, :, :],
+                    b0[chunk % 2, :, :],
+                    accum=c0[plane, :, :],
+                    initialize=True,
+                )
+                # Publish each native result at its producer;
+                # its FIX read retires independently of peers.
+                N.copy(
+                    c0[plane, :, :],
+                    Score[
+                        group,
+                        s,
+                        part * BM : (part + 1) * BM,
+                        chunk * CK : (chunk + 1) * CK,
+                    ],
+                )
+
+
+@N.inline
+def online_softmax_rows(inputs, buffers, state, scratch, task, geometry):
+    Score, P = inputs
+    score_in, score_work, p_out = buffers
+    m, l, alpha = state
+    partial, next_m, row_sum, soft_broadcast = scratch
+    group, s, kv, query_row, lane = task
+    BQ, BM, BK, VR, SCALE, CAUSAL = geometry
+    for row in N.Pipelined(BQ // 2 // VR):
+        r = row * VR
+        g = lane * (BQ // 2) + r
+        with N.Stage(0, name="import_score"):
+            N.copy(Score[group, s, g : g + VR, :], score_in[row % 2, :, :])
+        with N.Stage(1, name="online_softmax"):
+            if BQ == BM:
+                work = score_work
+            else:
+                # Reuse the input slot through its last Vector read;
+                # the other slot remains available to MTE2.
+                work = score_in[row % 2, :, :]
+            N.mul(score_in[row % 2, :, :], SCALE, out=work)
+            if CAUSAL:
+                # Ordinary logical lane coordinates, not a
+                # triangular primitive: lane (r, c) is masked
+                # when its global key column is after the
+                # query row. Work is already fully initialized.
+                rows = N.arange(VR)[:, None]
+                cols = N.arange(BK)[None, :]
+                N.fill(
+                    work,
+                    NEG_INF,
+                    mask=(kv * BK + cols) > (query_row + g + rows),
+                )
+            N.reduce_max(
+                work,
+                axis=1,
+                out=next_m,
+                scratch=partial,
+                order="block8_then_packed_merge",
+            )
+            N.maximum(m[r : r + VR], next_m, out=next_m)
+            N.sub(m[r : r + VR], next_m, out=alpha[s, r : r + VR])
+            N.sub(work, next_m[:, None], out=work, scratch=soft_broadcast)
+            N.exp(alpha[s, r : r + VR], out=alpha[s, r : r + VR])
+            N.exp(work, out=work)
+            # P has separate storage. Publish its conversion
+            # before the denominator reduction so work's final
+            # reader is the first reduction, not this cast.
+            # The denominator still consumes unrounded f32 P.
+            N.cast(work, out=p_out[row % 2, :, :])
+            N.reduce_sum(
+                work,
+                axis=1,
+                out=row_sum,
+                scratch=partial,
+                order="block8_then_packed_merge",
+            )
+            N.mul(l[r : r + VR], alpha[s, r : r + VR], out=l[r : r + VR])
+            N.add(l[r : r + VR], row_sum, out=l[r : r + VR])
+            N.copy(next_m, m[r : r + VR])
+        with N.Stage(2, name="export_p"):
+            N.copy(p_out[row % 2, :, :], P[group, s, g : g + VR, :])
+
+
+@N.inline
+def pv_tiles(inputs, buffers, task, geometry):
+    V, P, PV = inputs
+    v1, p1, a0, b0, c0 = buffers
+    batch, kv_head, group, s, kv, query_row = task
+    parts, BQ, BM, BK, CK, CAUSAL = geometry
+    if CAUSAL:
+        # P is explicitly zero outside the causal prefix.
+        # Keep both operand slots populated, including the
+        # all-masked padding tile at startup.
+        pv_chunks = N.min(BK // CK, N.max(2, N.ceildiv(N.max(0, query_row + BQ - kv * BK), CK)))
+    else:
+        pv_chunks = BK // CK
+    if parts == 1:
+        pv_order = ("load_pv", "operand_v", "pv_0", "operand_p0")
+    else:
+        pv_order = (
+            "load_pv",
+            "operand_v",
+            "pv_0",
+            "operand_p0",
+            "pv_1",
+            "operand_p1",
+        )
+    for chunk in N.Pipelined(
+        pv_chunks,
+        issue_order=pv_order,
+    ):
+        j = kv * BK + chunk * CK
+        with N.Stage(0, name="load_pv"):
+            for part in N.unroll(parts):
+                N.copy(
+                    P[
+                        group,
+                        s,
+                        part * BM : (part + 1) * BM,
+                        chunk * CK : (chunk + 1) * CK,
+                    ],
+                    p1[chunk % 2, part, :, :],
+                )
+            N.copy(V[batch, kv_head, j : j + CK, :], v1[chunk % 2, :, :])
+        with N.Stage(1, name="operand_v"):
+            N.copy(v1[chunk % 2, :, :], b0[chunk % 2, :, :])
+        with N.Stage(1, name="operand_p0"):
+            N.copy(p1[chunk % 2, 0, :, :], a0[1 if parts == 1 else 0, :, :])
+        with N.Stage(2, name="pv_0"):
+            N.matmul(
+                a0[1 if parts == 1 else 0, :, :],
+                b0[chunk % 2, :, :],
+                accum=c0[0, :, :],
+                initialize=(chunk == 0),
+            )
+        if parts == 2:
+            with N.Stage(1, name="operand_p1"):
+                N.copy(p1[chunk % 2, 1, :, :], a0[1, :, :])
+            with N.Stage(2, name="pv_1"):
+                N.matmul(
+                    a0[1, :, :],
+                    b0[chunk % 2, :, :],
+                    accum=c0[1, :, :],
+                    initialize=(chunk == 0),
+                )
+    for part in N.unroll(parts):
+        N.copy(c0[part, :, :], PV[group, s, part * BM : (part + 1) * BM, :])
+
+
+@N.inline
+def update_output_rows(inputs, buffers, state, scratch, task, geometry):
+    PV, O = inputs
+    pv_in, o_out = buffers
+    o, l, alpha = state
+    out_broadcast, ones, inverse = scratch
+    batch, head, group, s, kv, query_row, lane, active_kv_tiles = task
+    BQ, VR, CAUSAL = geometry
+    N.mul(o, alpha[s, :, None], out=o, scratch=out_broadcast)
+    for row in N.Pipelined(BQ // 2 // VR):
+        r = row * VR
+        g = lane * (BQ // 2) + r
+        with N.Stage(0, name="import_pv"):
+            N.copy(PV[group, s, g : g + VR, :], pv_in[row % 2, :, :])
+        with N.Stage(1, name="accumulate_o"):
+            N.add(o[r : r + VR, :], pv_in[row % 2, :, :], out=o[r : r + VR, :])
+            if kv == active_kv_tiles - 1:
+                N.div(ones, l[r : r + VR], out=inverse)
+                N.mul(
+                    o[r : r + VR, :],
+                    inverse[:, None],
+                    out=pv_in[row % 2, :, :],
+                    scratch=out_broadcast[:VR, :],
+                )
+                if CAUSAL:
+                    output_slot = 0
+                else:
+                    output_slot = row % 2
+                N.cast(pv_in[row % 2, :, :], out=o_out[output_slot, :, :])
+                N.copy(
+                    o_out[output_slot, :, :],
+                    O[batch, head, query_row + g : query_row + g + VR, :],
+                )
+
+
 @N.prim_func(disjoint_external=True)
 def attention_target(
     Q: N.Tensor((B, HQ, Sq, D), DTYPE),
@@ -151,9 +358,8 @@ def attention_target(
             else:
                 active_kv_tiles = kv_tiles
                 kv_order = {"cube": ("qk", "pv"), "vector": ("softmax", "update")}
-            for kv in N.Pipelined(
+            for kv in N.Dataflow(
                 active_kv_tiles,
-                stages=3,
                 issue_order=kv_order,
             ):
                 task = query * kv_tiles + kv
@@ -161,185 +367,38 @@ def attention_target(
                     s = kv % 2
                 else:
                     s = task % 2
-                with N.Stage(0, name="qk"), N.Cube():
-                    if parts == 2:
-                        # PV overwrites these slots between QK phases, but
-                        # Q is unchanged across every CK chunk of this child.
-                        for part in N.unroll(parts):
-                            N.copy(q1[part, :, :], a0[part, :, :])
-                    for chunk in N.Pipelined(
-                        BK // CK,
-                        stages=3,
-                        issue_order={"cube": ("load_k", "qk_emit", "operand_k")},
-                    ):
-                        j = kv * BK + chunk * CK
-                        with N.Stage(0, name="load_k"):
-                            N.copy(K[batch, kv_head, j : j + CK, :], k1[chunk % 2, :, :])
-                        with N.Stage(1, name="operand_k"):
-                            N.copy(k1[chunk % 2, :, :], b0[chunk % 2, :, :], transpose=True)
-                        with N.Stage(2, name="qk_emit"):
-                            for part in N.unroll(parts):
-                                plane = (chunk * parts + part) % 2
-                                N.matmul(
-                                    a0[part, :, :],
-                                    b0[chunk % 2, :, :],
-                                    accum=c0[plane, :, :],
-                                    initialize=True,
-                                )
-                                # Publish each native result at its producer;
-                                # its FIX read retires independently of peers.
-                                N.copy(
-                                    c0[plane, :, :],
-                                    Score[
-                                        group,
-                                        s,
-                                        part * BM : (part + 1) * BM,
-                                        chunk * CK : (chunk + 1) * CK,
-                                    ],
-                                )
-                with N.Stage(1, name="softmax"), N.Vector() as lane:
-                    for row in N.Pipelined(BQ // 2 // VR, stages=3):
-                        r = row * VR
-                        g = lane * (BQ // 2) + r
-                        with N.Stage(0, name="import_score"):
-                            N.copy(Score[group, s, g : g + VR, :], score_in[row % 2, :, :])
-                        with N.Stage(1, name="online_softmax"):
-                            if BQ == BM:
-                                work = score_work
-                            else:
-                                # Reuse the input slot through its last Vector read;
-                                # the other slot remains available to MTE2.
-                                work = score_in[row % 2, :, :]
-                            N.mul(score_in[row % 2, :, :], SCALE, out=work)
-                            if CAUSAL:
-                                # Ordinary logical lane coordinates, not a
-                                # triangular primitive: lane (r, c) is masked
-                                # when its global key column is after the
-                                # query row. Work is already fully initialized.
-                                rows = N.arange(VR)[:, None]
-                                cols = N.arange(BK)[None, :]
-                                N.fill(
-                                    work,
-                                    NEG_INF,
-                                    mask=(kv * BK + cols) > (query_row + g + rows),
-                                )
-                            N.reduce_max(
-                                work,
-                                axis=1,
-                                out=next_m,
-                                scratch=partial,
-                                order="block8_then_packed_merge",
-                            )
-                            N.maximum(m[r : r + VR], next_m, out=next_m)
-                            N.sub(m[r : r + VR], next_m, out=alpha[s, r : r + VR])
-                            N.sub(work, next_m[:, None], out=work, scratch=soft_broadcast)
-                            N.exp(alpha[s, r : r + VR], out=alpha[s, r : r + VR])
-                            N.exp(work, out=work)
-                            # P has separate storage. Publish its conversion
-                            # before the denominator reduction so work's final
-                            # reader is the first reduction, not this cast.
-                            # The denominator still consumes unrounded f32 P.
-                            N.cast(work, out=p_out[row % 2, :, :])
-                            N.reduce_sum(
-                                work,
-                                axis=1,
-                                out=row_sum,
-                                scratch=partial,
-                                order="block8_then_packed_merge",
-                            )
-                            N.mul(l[r : r + VR], alpha[s, r : r + VR], out=l[r : r + VR])
-                            N.add(l[r : r + VR], row_sum, out=l[r : r + VR])
-                            N.copy(next_m, m[r : r + VR])
-                        with N.Stage(2, name="export_p"):
-                            N.copy(p_out[row % 2, :, :], P[group, s, g : g + VR, :])
-                with N.Stage(1, name="pv"), N.Cube():
-                    if CAUSAL:
-                        # P is explicitly zero outside the causal prefix.
-                        # Keep both operand slots populated, including the
-                        # all-masked padding tile at startup.
-                        pv_chunks = N.min(
-                            BK // CK, N.max(2, N.ceildiv(N.max(0, query_row + BQ - kv * BK), CK))
-                        )
-                    else:
-                        pv_chunks = BK // CK
-                    if parts == 1:
-                        pv_order = ("load_pv", "operand_v", "pv_0", "operand_p0")
-                    else:
-                        pv_order = (
-                            "load_pv",
-                            "operand_v",
-                            "pv_0",
-                            "operand_p0",
-                            "pv_1",
-                            "operand_p1",
-                        )
-                    for chunk in N.Pipelined(
-                        pv_chunks,
-                        stages=3,
-                        issue_order={"cube": pv_order},
-                    ):
-                        j = kv * BK + chunk * CK
-                        with N.Stage(0, name="load_pv"):
-                            for part in N.unroll(parts):
-                                N.copy(
-                                    P[
-                                        group,
-                                        s,
-                                        part * BM : (part + 1) * BM,
-                                        chunk * CK : (chunk + 1) * CK,
-                                    ],
-                                    p1[chunk % 2, part, :, :],
-                                )
-                            N.copy(V[batch, kv_head, j : j + CK, :], v1[chunk % 2, :, :])
-                        with N.Stage(1, name="operand_v"):
-                            N.copy(v1[chunk % 2, :, :], b0[chunk % 2, :, :])
-                        with N.Stage(1, name="operand_p0"):
-                            N.copy(p1[chunk % 2, 0, :, :], a0[1 if parts == 1 else 0, :, :])
-                        with N.Stage(2, name="pv_0"):
-                            N.matmul(
-                                a0[1 if parts == 1 else 0, :, :],
-                                b0[chunk % 2, :, :],
-                                accum=c0[0, :, :],
-                                initialize=(chunk == 0),
-                            )
-                        if parts == 2:
-                            with N.Stage(1, name="operand_p1"):
-                                N.copy(p1[chunk % 2, 1, :, :], a0[1, :, :])
-                            with N.Stage(2, name="pv_1"):
-                                N.matmul(
-                                    a0[1, :, :],
-                                    b0[chunk % 2, :, :],
-                                    accum=c0[1, :, :],
-                                    initialize=(chunk == 0),
-                                )
-                    for part in N.unroll(parts):
-                        N.copy(c0[part, :, :], PV[group, s, part * BM : (part + 1) * BM, :])
-                with N.Stage(2, name="update"), N.Vector() as lane:
+                with N.Cube(), N.Stage(0, name="qk"):
+                    qk_tiles(
+                        (K, Score),
+                        (q1, k1, a0, b0, c0),
+                        (batch, kv_head, group, s, kv),
+                        (parts, BM, BK, CK),
+                    )
+                with N.Vector() as lane, N.Stage(0, name="softmax"):
+                    online_softmax_rows(
+                        (Score, P),
+                        (score_in, score_work if BQ == BM else None, p_out),
+                        (m, l, alpha),
+                        (partial, next_m, row_sum, soft_broadcast),
+                        (group, s, kv, query_row, lane),
+                        (BQ, BM, BK, VR, SCALE, CAUSAL),
+                    )
+                with N.Cube(), N.Stage(1, name="pv"):
+                    pv_tiles(
+                        (V, P, PV),
+                        (v1, p1, a0, b0, c0),
+                        (batch, kv_head, group, s, kv, query_row),
+                        (parts, BQ, BM, BK, CK, CAUSAL),
+                    )
+                with N.Vector() as lane, N.Stage(1, name="update"):
                     # All rows rescale independently before adding this PV.
                     # Broadcast once for the complete state; retain separate
                     # FP32 multiply/add and the later normalization boundary.
-                    N.mul(o, alpha[s, :, None], out=o, scratch=out_broadcast)
-                    for row in N.Pipelined(BQ // 2 // VR, stages=2):
-                        r = row * VR
-                        g = lane * (BQ // 2) + r
-                        with N.Stage(0, name="import_pv"):
-                            N.copy(PV[group, s, g : g + VR, :], pv_in[row % 2, :, :])
-                        with N.Stage(1, name="accumulate_o"):
-                            N.add(o[r : r + VR, :], pv_in[row % 2, :, :], out=o[r : r + VR, :])
-                            if kv == active_kv_tiles - 1:
-                                N.div(ones, l[r : r + VR], out=inverse)
-                                N.mul(
-                                    o[r : r + VR, :],
-                                    inverse[:, None],
-                                    out=pv_in[row % 2, :, :],
-                                    scratch=out_broadcast[:VR, :],
-                                )
-                                if CAUSAL:
-                                    output_slot = 0
-                                else:
-                                    output_slot = row % 2
-                                N.cast(pv_in[row % 2, :, :], out=o_out[output_slot, :, :])
-                                N.copy(
-                                    o_out[output_slot, :, :],
-                                    O[batch, head, query_row + g : query_row + g + VR, :],
-                                )
+                    update_output_rows(
+                        (PV, O),
+                        (pv_in, o_out),
+                        (o, l, alpha),
+                        (out_broadcast, ones, inverse),
+                        (batch, head, group, s, kv, query_row, lane, active_kv_tiles),
+                        (BQ, VR, CAUSAL),
+                    )

@@ -9,6 +9,25 @@ from __future__ import annotations
 from ascendflow import language as N
 
 
+@N.inline
+def rms_compute(x, slot, y, partial, statistics, D, EPS, constant):
+    N.mul(x[slot, :], x[slot, :], out=y[slot, :])
+    N.reduce_sum(
+        y[slot, :],
+        axis=0,
+        scratch=partial,
+        out=statistics[:1],
+        order="r64_then_native_merge",
+    )
+    N.mul(statistics[:1], 1.0 / D, out=statistics[:1])
+    N.add(statistics[:1], EPS, out=statistics[:1])
+    N.sqrt(statistics[:1], out=statistics[:1])
+    N.fill(constant[:1], 1.0)
+    N.div(constant[:1], statistics[:1], out=statistics[:1])
+    inverse = N.load_scalar(statistics[:1])
+    N.mul(x[slot, :], inverse, out=y[slot, :])
+
+
 @N.prim_func(disjoint_external=True)
 def rms_normalize(
     X: N.Tensor((GROUPS, rows, D), N.f32),  # noqa: F821 - DSL signature scope
@@ -24,27 +43,11 @@ def rms_normalize(
         partial = N.alloc_ub((D // 64,), N.f32, name="partial")
         statistics = N.alloc_ub((8,), N.f32, name="statistics")
         constant = N.alloc_ub((8,), N.f32, name="constant")
-        for row in N.Pipelined(
-            rows, stages=3, issue_order={"vector": ("store", "load", "compute")}
-        ):
+        for row in N.Pipelined(rows, issue_order=("store", "load", "compute")):
             slot = row % 2
             with N.Stage(0, name="load"):
                 N.copy(X[group, row, :], x[slot, :])
-            with N.Stage(1, name="compute"), N.Vector():
-                N.mul(x[slot, :], x[slot, :], out=y[slot, :])
-                N.reduce_sum(
-                    y[slot, :],
-                    axis=0,
-                    scratch=partial,
-                    out=statistics[:1],
-                    order="r64_then_native_merge",
-                )
-                N.mul(statistics[:1], 1.0 / D, out=statistics[:1])
-                N.add(statistics[:1], EPS, out=statistics[:1])
-                N.sqrt(statistics[:1], out=statistics[:1])
-                N.fill(constant[:1], 1.0)
-                N.div(constant[:1], statistics[:1], out=statistics[:1])
-                inverse = N.load_scalar(statistics[:1])
-                N.mul(x[slot, :], inverse, out=y[slot, :])
+            with N.Vector(), N.Stage(1, name="compute"):
+                rms_compute(x, slot, y, partial, statistics, D, EPS, constant)
             with N.Stage(2, name="store"):
                 N.copy(y[slot, :], Y[group, row, :])

@@ -22,9 +22,9 @@ def vector_event_borrow(
         z = N.alloc_ub((2, 16), N.f32, name="z")
         state = N.alloc_ub((4, 16), N.f32, name="state")
         out = N.alloc_ub((2, 16), N.f16, name="out")
-        for t in N.Pipelined(n, stages=3, issue_order={"vector": ("produce", "update")}):
+        for t in N.Pipelined(n, issue_order=("produce", "update")):
             with N.Stage(1, name="produce"):
-                for j in N.Pipelined(4, stages=3):
+                for j in N.Pipelined(4):
                     with N.Stage(0, name="load"):
                         N.copy(X[t, j, :], x[j % 2, :])
                     with N.Stage(1, name="compute"):
@@ -35,7 +35,7 @@ def vector_event_borrow(
             with N.Stage(2, name="update"):
                 if t == 0:
                     N.fill(state, 0.0)
-                for j in N.Pipelined(4, stages=3):
+                for j in N.Pipelined(4):
                     with N.Stage(0, name="load"):
                         N.copy(Z[t, j, :], z[j % 2, :])
                     with N.Stage(1, name="compute"):

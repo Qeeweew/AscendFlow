@@ -21,7 +21,7 @@ def aliases(X:N.Tensor((2,64),N.f32),Y:N.Tensor((n,64),N.f32,access="write"),
         x=N.alloc_ub((4,64))
         y=N.alloc_ub((64,))
         N.fill(x,1.0)
-        for i in N.Pipelined(n,stages=1):
+        for i in N.Pipelined(n):
             N.copy(X[i%2,:],x[(a+i)%4,:])
             N.mul(x[(b+i)%4,:],2.0,out=y)
             N.copy(x[(b+i)%4,:],Y[i,:])
@@ -87,10 +87,10 @@ def test_shifted_ring_reads_preserve_the_previous_iteration_value():
         with N.Kernel():
             x=N.alloc_ub((2,64))
             N.fill(x,1.0)
-            for i in N.Pipelined(n,stages=1):
+            for i in N.Pipelined(n):
                 N.copy(X[i,:],x[i%2,:])
                 N.copy(x[(i+1)%2,:],Y[i,:])
-    """)
+""")
     for n in (0, 1, 2, 3, 7):
         check_structured_events(final, {"n": n}, logical_reference=original)
 
@@ -112,7 +112,7 @@ def test_uncertain_shared_gm_retains_both_aiv_readers_and_actual_quorum():
             b0=N.alloc_l0b((16,16),N.f16)
             c0=N.alloc_l0c((16,16),N.f32)
             x=N.alloc_ub((8,16),N.f32)
-            for i in N.Pipelined(n,stages=1):
+            for i in N.Dataflow(n):
                 slot=(a+i)%2
                 with N.Cube():
                     N.copy(A,a1)
@@ -124,7 +124,7 @@ def test_uncertain_shared_gm_retains_both_aiv_readers_and_actual_quorum():
                 with N.Vector() as sid:
                     N.copy(Work[slot,sid*8:sid*8+8,:],x)
                     N.copy(x,Y[i,sid*8:sid*8+8,:])
-    """)
+""")
     for n, a in product((0, 1, 2, 5), (0, 1, 7)):
         check_structured_events(final, {"n": n, "a": a}, logical_reference=original)
     release = next(

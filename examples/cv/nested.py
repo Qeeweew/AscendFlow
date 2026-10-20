@@ -24,9 +24,9 @@ def nested_cv(
         b = N.alloc_l0b((2, 16, 16))
         c = N.alloc_l0c((2, 16, 16))
         v = N.alloc_ub((2, 4, 32))
-        for t in N.Pipelined(n, stages=2):
-            with N.Stage(0, name="cube"), N.Cube():
-                for j in N.Pipelined(2, stages=4):
+        for t in N.Dataflow(n):
+            with N.Cube(), N.Stage(0, name="cube"):
+                for j in N.Pipelined(2):
                     with N.Stage(0, name="load"):
                         x = N.copy(X[group, t, j, :, :], x1[j % 2, :, :])
                     with N.Stage(1, name="operands"):
@@ -36,8 +36,8 @@ def nested_cv(
                         z = N.matmul(aa, bb, accum=c[j % 2, :, :], initialize=True)
                     with N.Stage(3, name="fix"):
                         N.copy(z, Score[group, t % 2, :, j * 16 : (j + 1) * 16])
-            with N.Stage(1, name="vector"), N.Vector() as lane:
-                for r in N.Pipelined(2, stages=3):
+            with N.Vector() as lane, N.Stage(1, name="vector"):
+                for r in N.Pipelined(2):
                     row = lane * 8 + r * 4
                     with N.Stage(0, name="load"):
                         z = N.copy(Score[group, t % 2, row : row + 4, :], v[r % 2, :, :])

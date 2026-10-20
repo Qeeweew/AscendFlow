@@ -26,14 +26,14 @@ def test_reader_prefix_releases_after_actual_last_member_before_overwrite():
             x=N.alloc_ub((2,64))
             N.fill(init,1.0)
             N.copy(init,Work)
-            for j in N.Pipelined(N.min(4,n),stages=2):
+            for j in N.Pipelined(N.min(4,n)):
                 with N.Stage(0):
                     N.copy(Work[j,:],x[j%2,:])
                 with N.Stage(1):
                     N.copy(x[j%2,:],Out[j,:])
             N.fill(init,2.0)
             N.copy(init,Work)
-    """,
+""",
         ({"n": n} for n in (2, 3, 4, 9)),
     )
     reads = [
@@ -53,14 +53,14 @@ def test_child_last_uses_the_selected_parent_header_not_an_unbound_parent():
         with N.Kernel():
             x=N.alloc_ub((2,64))
             for parent in N.serial(n):
-                for child in N.Pipelined(N.min(4,N.max(2,parent+2)),stages=2):
+                for child in N.Pipelined(N.min(4,N.max(2,parent+2))):
                     with N.Stage(0):
                         N.copy(X[child,:],x[child%2,:])
                     with N.Stage(1):
                         N.mul(x[child%2,:],2.0,out=x[child%2,:])
             N.fill(x,7.0)
             N.copy(x,Y)
-    """,
+""",
         ({"n": n} for n in (1, 2, 3, 5)),
     )
 
@@ -76,7 +76,7 @@ def test_entry_publication_resolves_computed_last_after_a_selected_parent():
             N.fill(one,1.0)
             for parent in N.serial(n):
                 count=N.min(4,N.max(2,N.ceildiv((parent+1)*2,3)))
-                for child in N.Pipelined(count,stages=2):
+                for child in N.Pipelined(count):
                     with N.Stage(0):
                         N.copy(X[child,:],x)
                     with N.Stage(1):
@@ -84,6 +84,6 @@ def test_entry_publication_resolves_computed_last_after_a_selected_parent():
                         if child==count-1:
                             N.mul(x,one,out=x)
                             N.copy(x,Y[parent,:])
-    """,
+""",
         ({"n": n} for n in (1, 2, 3, 5)),
     )

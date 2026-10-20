@@ -12,7 +12,7 @@ def ub_copy(X: N.Tensor((n, 8), N.f32), O: N.Tensor((n, 8), N.f32, access="write
     with N.Kernel():
         source = N.alloc_ub((2, 8), N.f32)
         destination = N.alloc_ub((2, 8), N.f32)
-        for tile in N.Pipelined(n, stages=3):
+        for tile in N.Pipelined(n):
             with N.Stage(0, name="load"):
                 N.copy(X[tile, :], source[tile % 2, :])
             with N.Stage(1, name="copy"):

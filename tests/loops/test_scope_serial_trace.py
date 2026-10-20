@@ -14,8 +14,8 @@ from ascendflow.dialects.source import (
     CopyOp,
     DomainOp,
     ElementOp,
+    IterationOp,
     MatmulOp,
-    PipelineOp,
     PredicateOp,
     ProgramOp,
     SizeOp,
@@ -64,9 +64,9 @@ def scalar(value, bindings):
 class QuerySource:
     program: ProgramOp
     serial: scf.ForOp
-    kv: PipelineOp
-    cube: PipelineOp
-    vector: PipelineOp
+    kv: IterationOp
+    cube: IterationOp
+    vector: IterationOp
     domains: dict[str, DomainOp]
     allocations: dict[str, AllocationOp]
     sizes: dict[str, SizeOp]
@@ -137,13 +137,13 @@ def source():
     serial = next(op for op in program.walk() if isinstance(op, scf.ForOp))
     domains = {op.kind.data: op for op in program.walk() if isinstance(op, DomainOp)}
     children = {
-        kind: next(op for op in domain.walk() if isinstance(op, PipelineOp))
+        kind: next(op for op in domain.walk() if isinstance(op, IterationOp))
         for kind, domain in domains.items()
     }
     return QuerySource(
         program,
         serial,
-        next(op for op in serial.body.block.ops if isinstance(op, PipelineOp)),
+        next(op for op in serial.body.block.ops if isinstance(op, IterationOp)),
         children["cube"],
         children["vector"],
         domains,
@@ -182,7 +182,22 @@ def test_runtime_contract_and_reused_storage_are_in_the_actual_source(source):
     assert not any(isinstance(op, AllocationOp) for op in source.serial.walk())
     assert source.kv.limit is source.sizes["kv_tiles"].value
     assert source.cube.count.data == source.vector.count.data == 2
-    assert (source.kv.stages.data, source.cube.stages.data, source.vector.stages.data) == (2, 4, 3)
+    for loop, offsets in (
+        (source.kv, (0, 1)),
+        (source.cube, (0, 1, 2, 3)),
+        (source.vector, (0, 1, 2)),
+    ):
+        # Child clocks do not contribute to the parent's local schedule.
+        stages = [
+            op
+            for op in loop.walk()
+            if isinstance(op, StageOp)
+            and op.parent_op() is loop
+            or isinstance(op, StageOp)
+            and isinstance(op.parent_op(), DomainOp)
+            and op.parent_op().parent_op() is loop
+        ]
+        assert tuple(op.offset.data for op in stages) == offsets
 
 
 @pytest.mark.parametrize("total", range(8))
@@ -312,7 +327,7 @@ class SequentialSource:
                 for index in range(*(scalar(v, self.bindings) for v in (op.lb, op.ub, op.step))):
                     self.bindings[op.body.block.args[0]] = index
                     self.block(op.body.block, actor)
-            elif isinstance(op, PipelineOp):
+            elif isinstance(op, IterationOp):
                 count = op.count.data if op.count is not None else scalar(op.limit, self.bindings)
                 for index in range(count):
                     self.bindings[op.body.block.args[0]] = index

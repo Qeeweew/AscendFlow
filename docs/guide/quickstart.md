@@ -81,10 +81,10 @@ kernel time 用[msprof 流程](testing.md)获得。
 from ascendflow import language as T
 
 # x/y 是两槽 UB buffer；X/Y 是 GM tensor，t 是运行时代次。
-for t in T.Pipelined(tiles, stages=3):
+for t in T.Pipelined(tiles):
     with T.Stage(0, name="load"):
         T.copy(X[t, :], x[t % 2, :])
-    with T.Stage(1, name="compute"), T.Vector():
+    with T.Vector(), T.Stage(1, name="compute"):
         T.mul(x[t % 2, :], 2.0, out=y[t % 2, :])
     with T.Stage(2, name="store"):
         T.copy(y[t % 2, :], Y[t, :])

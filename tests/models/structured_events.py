@@ -322,20 +322,26 @@ class _Interpret:
             elif isinstance(operation, PipelineLoopOp):
                 count = max(0, values[operation.count])
                 _check(count <= self.maximum, "finite pipeline iteration budget exceeded")
+                family = "cube" if actor is Actor.AIC else "vector"
                 stages = [
                     stage
                     for stage in operation.body.block.ops
                     if isinstance(stage, PipelineStageOp)
+                    and (actor is None or stage.family is None or stage.family.data == family)
                 ]
-                if self.physical and operation.issue_order is not None:
-                    family = "cube" if actor is Actor.AIC else "vector"
-                    if family in operation.issue_order.data:
-                        ranks = {
-                            label.data: rank
-                            for rank, label in enumerate(operation.issue_order.data[family])
-                        }
-                        stages.sort(key=lambda stage: ranks.get(stage.label.data, len(ranks)))
-                horizon = operation.horizon if self.physical else 0
+                if (
+                    self.physical
+                    and operation.issue_order is not None
+                    and family in operation.issue_order.data
+                ):
+                    ranks = {
+                        label.data: rank
+                        for rank, label in enumerate(operation.issue_order.data[family])
+                    }
+                    stages.sort(key=lambda stage: ranks.get(stage.label.data, len(ranks)))
+                horizon = (
+                    max((stage.offset.data for stage in stages), default=0) if self.physical else 0
+                )
                 for clock in range(count + horizon):
                     for stage in stages:
                         ordinal = clock - stage.offset.data if self.physical else clock

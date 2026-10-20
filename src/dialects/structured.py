@@ -100,8 +100,12 @@ class PipelineLoopOp(IRDLOperation):
         if any(not isinstance(operation, PipelineStageOp) for operation in tuple(block.ops)[:-1]):
             raise VerifyException("pipeline loop body contains only pipeline stages and npu.end")
         if self.issue_order is not None:
-            labels = Counter(operation.label.data for operation in tuple(block.ops)[:-1])
             for family, order in self.issue_order.data.items():
+                labels = Counter(
+                    operation.label.data
+                    for operation in tuple(block.ops)[:-1]
+                    if operation.family is None or operation.family.data == family
+                )
                 if (
                     family not in {"cube", "vector"}
                     or not isinstance(order, ArrayAttr)
@@ -116,13 +120,6 @@ class PipelineLoopOp(IRDLOperation):
                         "pipeline issue_order must name existing unambiguous stages"
                     )
 
-    @property
-    def horizon(self):
-        return max(
-            (op.offset.data for op in self.body.block.ops if isinstance(op, PipelineStageOp)),
-            default=0,
-        )
-
 
 @irdl_op_definition
 class PipelineStageOp(IRDLOperation):
@@ -131,6 +128,7 @@ class PipelineStageOp(IRDLOperation):
     name = "npu.pipeline_stage"
     offset = attr_def(IntAttr)
     label = attr_def(StringAttr)
+    family = opt_attr_def(StringAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
 
@@ -142,6 +140,8 @@ class PipelineStageOp(IRDLOperation):
             raise VerifyException("pipeline stage must belong directly to a pipeline loop")
         if not 0 <= self.offset.data <= 32:
             raise VerifyException("pipeline stage offset must be in [0,32]")
+        if self.family is not None and self.family.data not in {"cube", "vector"}:
+            raise VerifyException("pipeline stage family must be cube or vector")
         block = self.body.block
         if len(block.args) != 1 or not isinstance(block.args[0].type, IndexType):
             raise VerifyException("pipeline stage needs one index ordinal block argument")

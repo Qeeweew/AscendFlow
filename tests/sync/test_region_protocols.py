@@ -26,7 +26,7 @@ def prefix_state(X:N.Tensor((2,64),N.f32),
         N.copy(X[0,:],state)
         for parent in N.serial(n):
             N.copy(state,Before[parent,:])
-            for child in N.Pipelined(parent%2,stages=1):
+            for child in N.Pipelined(parent%2):
                 N.copy(X[1,:],state)
             N.copy(state,After[parent,:])
 """
@@ -170,7 +170,7 @@ def test_conditional_write_with_multiple_holes_keeps_all_old_state_readers():
     from ascendflow.passes.structured_sync import synchronize_structure
     from tests.models.structured_events import check_compiled_events
 
-    source = PREFIX_STATE.replace("for child in N.Pipelined(parent%2,stages=1):", "if parent%3==1:")
+    source = PREFIX_STATE.replace("for child in N.Pipelined(parent%2):", "if parent%3==1:")
     result = synchronize_structure(N.from_source(source, disjoint_external=True))
     for n in (0, 1, 2, 3, 6, 10):
         check_compiled_events(result, {"n": n}, invocations=2)
@@ -232,7 +232,7 @@ def test_two_aiv_use_one_body_with_different_child_activity_and_full_quorum():
             b0=N.alloc_l0b((16,16),N.f16)
             c=N.alloc_l0c((16,16),N.f32)
             x=N.alloc_ub((8,16),N.f32)
-            for i in N.Pipelined(n,stages=1):
+            for i in N.Dataflow(n):
                 with N.Cube():
                     N.copy(A,a1)
                     N.copy(B,b1)
@@ -242,12 +242,12 @@ def test_two_aiv_use_one_body_with_different_child_activity_and_full_quorum():
                     N.copy(c,Work)
                 with N.Vector() as sid:
                     N.copy(Work[sid*8:sid*8+8,:],x)
-                    for child in N.Pipelined((i+sid)%2,stages=1):
+                    for child in N.Pipelined((i+sid)%2):
                         N.mul(x,2.0,out=x)
                     N.copy(x,Out[round,i,sid*8:sid*8+8,:])
-    """
+"""
     lines = source.splitlines()
-    start = next(i for i, line in enumerate(lines) if "for i in N.Pipelined" in line)
+    start = next(i for i, line in enumerate(lines) if "for i in N.Dataflow" in line)
     source = "\n".join(
         lines[:start]
         + ["            for round in N.serial(3):"]

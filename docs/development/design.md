@@ -6,7 +6,7 @@
 
 ## 1. 编程模型与当前缺口
 
-使用TileLang风格AST DSL表达计算、物理空间、views、buffer、`serial/Pipelined/Stage`与`Cube/Vector`执行域。两个AIV共享一份body，由runtime sid区分。`cube.task/vector.task`不恢复，内部physical Task IR按lowering需要保留。
+使用TileLang风格AST DSL表达计算、物理空间、views、buffer、`serial/Dataflow/Pipelined/Stage`与`Cube/Vector`执行域。两个AIV共享一份body，由runtime sid区分。`cube.task/vector.task`不恢复，内部physical Task IR按lowering需要保留。
 
 循环长度为runtime值，普通常量界循环也不自动展开；只有显式unroll授权展开。算法、FA变体与分块政策留在examples，不进入编译器。
 
@@ -30,7 +30,8 @@ group/Vector peer 的并行独立性属于[源内存合同](memory-contracts.md)
 
 ## 3. 循环与边界
 
-对N次逻辑迭代，stage偏移s在物理step j对应`g=j-s`，存在条件为`0<=g<N`。归一后的最大偏移为S：
+对 N 次逻辑迭代，actor a 的 stage 偏移 s 在本地 step j[a] 对应 `g=j[a]-s`，
+存在条件为 `0<=g<N`。下文 S 是该 actor 的实际最大偏移：
 
 - N=0：没有 body native 及其内部通知；共同调用端口仍可生成平衡的 Set/Wait，传递真实队列前缀与旧状态。
 - 0<N<S：使用带存在条件的短片段，避免重复的fill/drain。

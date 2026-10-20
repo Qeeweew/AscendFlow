@@ -20,7 +20,7 @@ from xdsl.dialects.builtin import FileLineColLoc, IndexType, IntAttr, ModuleOp, 
 from xdsl.ir import Block, OpResult, Region, SSAValue, SSAValues
 
 from ..diagnostics import CompileError, require
-from ..dialects.source import PipelineOp, YieldOp
+from ..dialects.source import YieldOp
 from . import builders, contracts, syntax
 
 
@@ -75,6 +75,7 @@ _CALLS = {
     "reduce_max",
 }
 _SYNTAX = {
+    "Dataflow",
     "serial",
     "unroll",
     "tile_ranges",
@@ -457,12 +458,13 @@ class _Parser:
         call = node.iter
         symbol = self.expr(call.func)
         if not isinstance(symbol, _Symbol) or symbol.name not in {
+            "Dataflow",
             "Pipelined",
             "serial",
             "unroll",
             "tile_ranges",
         }:
-            self.fail(call, "use T.serial, T.Pipelined, T.unroll, or T.tile_ranges")
+            self.fail(call, "use Dataflow, Pipelined, serial, unroll, or tile_ranges")
         if symbol.name != "tile_ranges" and not isinstance(node.target, ast.Name):
             self.fail(node.target, "device for requires one index")
         args, kwargs = self.arguments(call)
@@ -510,34 +512,17 @@ class _Parser:
                 else:
                     self.env.pop(name, None)
             return
-        if symbol.name == "Pipelined":
-            if (
-                len(args) != 1
-                or set(kwargs) - {"stages", "order", "issue_order"}
-                or "stages" not in kwargs
-            ):
-                self.fail(call, "Pipelined requires one bound and explicit stages")
-            limit = args[0]
-            if type(limit) is int or isinstance(limit, contracts._Dimension):
-                operation = builders.Pipelined(limit, **kwargs).op
-            else:
-                operation = PipelineOp.create(
-                    operands=[self.scalar(limit)],
-                    attributes={
-                        "uid": StringAttr(self.trace.name("pipeline")),
-                        "stages": IntAttr(kwargs["stages"]),
-                        "order": StringAttr(kwargs.get("order", "source")),
-                        **builders._issue_order(kwargs.get("issue_order")),
-                    },
-                    regions=[Region(Block(arg_types=[IndexType()]))],
-                )
+        if symbol.name in {"Pipelined", "Dataflow"}:
+            if len(args) != 1 or set(kwargs) - {"issue_order"}:
+                self.fail(call, f"{symbol.name} requires one count and optional issue_order")
+            operation = getattr(builders, symbol.name)(args[0], **kwargs).op
             self.trace.enter(operation)
-            self.trace.pipelines.append(operation)
+            self.trace.iterations.append(operation)
             self.env[node.target.id] = builders._coordinate(operation.body.block.args[0])
             try:
                 self.body(node.body)
             finally:
-                self.trace.pipelines.pop()
+                self.trace.iterations.pop()
                 self.trace.leave(operation)
         else:
             if kwargs or not 1 <= len(args) <= 3:

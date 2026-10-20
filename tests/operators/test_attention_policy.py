@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from ascendflow.dialects.source import PipelineOp, StageOp
+from ascendflow.dialects.source import IterationOp, StageOp
 from benchmarks.references.attention import reference_source
 from benchmarks.validation.attention import inputs_and_oracle
 from tests.fixtures.attention_target import attention_target
@@ -143,7 +143,7 @@ def target_schedule():
 
 def child_schedule(module, name, *, default=False):
     for node in module.walk():
-        if not isinstance(node, PipelineOp):
+        if not isinstance(node, IterationOp):
             continue
         stages = {
             stage.label.data: stage.offset.data

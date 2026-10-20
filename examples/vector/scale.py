@@ -22,11 +22,11 @@ def scale(
     with N.Kernel(1, kind="vector"):
         x = N.alloc_ub((2, B), N.f32, name="inputs")
         y = N.alloc_ub((2, B), N.f32, name="outputs")
-        for t in N.Pipelined(tiles, stages=3):
+        for t in N.Pipelined(tiles):
             slot = t % 2
             with N.Stage(0, name="load"):
                 N.copy(X[t, :], x[slot, :])
-            with N.Stage(1, name="compute"), N.Vector():
+            with N.Vector(), N.Stage(1, name="compute"):
                 N.mul(x[slot, :], 2.0, out=y[slot, :])
             with N.Stage(2, name="store"):
                 N.copy(y[slot, :], Y[t, :])

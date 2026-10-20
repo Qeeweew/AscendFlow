@@ -26,7 +26,7 @@ def reduction(A:N.Tensor((n,16,16),N.f16),B:N.Tensor((n,16,16),N.f16),n:N.int64)
         a0=N.alloc_l0a((16,16),N.f16)
         b0=N.alloc_l0b((16,16),N.f16)
         c0=N.alloc_l0c({shape},N.f32)
-        for k in N.Pipelined(n,stages=3):
+        for k in N.Pipelined(n):
             with N.Stage(0):
                 av=N.copy(A[k,:,:],a1)
                 bv=N.copy(B[k,:,:],b1)

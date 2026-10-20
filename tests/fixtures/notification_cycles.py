@@ -74,7 +74,7 @@ def notification(name, source, consumer, source_engine, destination_engine):
 
 def sibling_ports(*, at_most_one=False):
     selection = selected(
-        "\n    def siblings(X:N.Tensor((64,),N.f32),n:N.int64):\n        with N.Kernel():\n            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))\n            for j in N.Pipelined(n,stages=1):\n                N.fill(x,1.0)\n                N.fill(y,1.0)\n            for k in N.Pipelined(1,stages=1):\n                N.copy(X[:],x)\n    "
+        "\n    def siblings(X:N.Tensor((64,),N.f32),n:N.int64):\n        with N.Kernel():\n            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))\n            for j in N.Pipelined(n):\n                N.fill(x,1.0)\n                N.fill(y,1.0)\n            for k in N.Pipelined(1):\n                N.copy(X[:],x)\n"
     )
     memory = selection.dependencies.memory
     left, right = tuple(memory.control.loops.values())
@@ -107,7 +107,7 @@ def sibling_ports(*, at_most_one=False):
 def child_to_parent(*, scalar):
     body = "N.load_scalar(x[:1])" if scalar else "N.copy(X[:],x)"
     selection = selected(
-        f"\n    def parent(X:N.Tensor((64,),N.f32),n:N.int64):\n        with N.Kernel():\n            x=N.alloc_ub((64,))\n            for j in N.Pipelined(n,stages=1):\n                {body}\n            N.fill(x,1.0)\n    "
+        f"\n    def parent(X:N.Tensor((64,),N.f32),n:N.int64):\n        with N.Kernel():\n            x=N.alloc_ub((64,))\n            for j in N.Pipelined(n):\n                {body}\n            N.fill(x,1.0)\n"
     )
     memory = selection.dependencies.memory
     loop = next(iter(memory.control.loops.values()))
@@ -137,7 +137,7 @@ def child_to_parent(*, scalar):
 
 def alternating_queues():
     selection = selected(
-        "\n    def residue(X:N.Tensor((n,64),N.f32),n:N.int64):\n        with N.Kernel():\n            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))\n            for j in N.Pipelined(n,stages=1):\n                N.fill(x,1.0)\n                N.copy(X[j,:],y)\n    "
+        "\n    def residue(X:N.Tensor((n,64),N.f32),n:N.int64):\n        with N.Kernel():\n            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))\n            for j in N.Pipelined(n):\n                N.fill(x,1.0)\n                N.copy(X[j,:],y)\n"
     )
     memory = selection.dependencies.memory
     loop = next(iter(memory.control.loops.values()))
@@ -195,10 +195,63 @@ def alternating_queues():
 
 
 def collective_children(*, reverse_vector):
-    order = '("second","first")' if reverse_vector else '("first","second")'
-    selection = selected(
-        f'\n    def collective(X:N.Tensor((16,16),N.f16),n:N.int64):\n        with N.Kernel(1,kind="mixed"):\n            a,b=N.alloc_l1((16,16)),N.alloc_l1((16,16))\n            v,w=N.alloc_ub((16,16),N.f16),N.alloc_ub((16,16),N.f16)\n            for q in N.Pipelined(1,stages=1,issue_order={{"cube":("first","second"),"vector":{order}}}):\n                with N.Stage(0,name="first"):\n                    for i in N.Pipelined(n,stages=1):\n                        with N.Cube():\n                            N.copy(X[:,:],a)\n                        with N.Vector():\n                            N.copy(X[:,:],v)\n                with N.Stage(0,name="second"):\n                    for j in N.Pipelined(n,stages=1):\n                        with N.Cube():\n                            N.copy(X[:,:],b)\n                        with N.Vector():\n                            N.copy(X[:,:],w)\n    '
+    # This is an explicit physical-input counterexample: each child has a
+    # closed C/V transfer, while the parent issues the children in different
+    # controller orders. The public DSL exposes only actor-local Stage scopes.
+    from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IndexType, IntAttr, StringAttr
+    from xdsl.ir import Block, Region
+
+    from ascendflow import language as N
+    from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+    from ascendflow.analysis.structured_memory import collect_native_memory
+    from ascendflow.dialects.physical import EndOp
+    from ascendflow.dialects.structured import PipelineLoopOp, PipelineStageOp
+    from ascendflow.passes.lower_native import lower_native_structure
+    from ascendflow.passes.notification_binding import bind_notifications
+
+    structure = lower_native_structure(
+        N.from_source("""
+    def collective(X:N.Tensor((16,16),N.f16),n:N.int64):
+        with N.Kernel(1,kind="mixed"):
+            a,b=N.alloc_l1((16,16)),N.alloc_l1((16,16))
+            v,w=N.alloc_ub((16,16),N.f16),N.alloc_ub((16,16),N.f16)
+            for q in N.Dataflow(1):
+                for i in N.Dataflow(n):
+                    with N.Cube():
+                        N.copy(X[:,:],a)
+                    with N.Vector():
+                        N.copy(X[:,:],v)
+                for j in N.Dataflow(n):
+                    with N.Cube():
+                        N.copy(X[:,:],b)
+                    with N.Vector():
+                        N.copy(X[:,:],w)
+    """)
     )
+    outer = next(op for op in structure.module.walk() if isinstance(op, PipelineLoopOp))
+    first_stage = next(op for op in outer.body.block.ops if isinstance(op, PipelineStageOp))
+    children = [op for op in first_stage.body.block.ops if isinstance(op, PipelineLoopOp)]
+    first_stage.label = StringAttr("first")
+    first_stage.body.block.detach_op(children[1])
+    second_stage = PipelineStageOp.build(
+        attributes={"offset": IntAttr(0), "label": StringAttr("second")},
+        regions=[Region(Block([children[1], EndOp()], arg_types=[IndexType()]))],
+    )
+    outer.body.block.insert_op_after(second_stage, first_stage)
+    outer.issue_order = DictionaryAttr(
+        {
+            "cube": ArrayAttr(StringAttr(x) for x in ("first", "second")),
+            "vector": ArrayAttr(
+                StringAttr(x)
+                for x in (("second", "first") if reverse_vector else ("first", "second"))
+            ),
+        }
+    )
+    structure.module.verify()
+    memory = collect_native_memory(structure.module)
+    dependencies = build_structured_dependencies(memory)
+    selection = bind_notifications(dependencies, dependencies.dispatch)
+    selection.require_closed()
     memory = selection.dependencies.memory
     outer, first, second = tuple(memory.control.loops.values())
     a, v, b, w = memory.templates
@@ -249,7 +302,7 @@ def collective_children(*, reverse_vector):
 
 def prologue_stream_epilogue(*, cyclic=False):
     selection = selected(
-        '\n    def boundary(X:N.Tensor((n,64),N.f32),Y:N.Tensor((64,),N.f32,access="write"),n:N.int64):\n        with N.Kernel():\n            p,a,b=N.alloc_ub((64,)),N.alloc_ub((64,)),N.alloc_ub((64,))\n            N.fill(p,1.0)\n            for i in N.Pipelined(n,stages=1):\n                N.copy(X[i,:],a)\n                N.mul(a,2.0,out=b)\n            N.copy(p,Y[:])\n            N.fill(p,2.0)\n    '
+        '\n    def boundary(X:N.Tensor((n,64),N.f32),Y:N.Tensor((64,),N.f32,access="write"),n:N.int64):\n        with N.Kernel():\n            p,a,b=N.alloc_ub((64,)),N.alloc_ub((64,)),N.alloc_ub((64,))\n            N.fill(p,1.0)\n            for i in N.Pipelined(n):\n                N.copy(X[i,:],a)\n                N.mul(a,2.0,out=b)\n            N.copy(p,Y[:])\n            N.fill(p,2.0)\n'
     )
     memory = selection.dependencies.memory
     loop = next(iter(memory.control.loops.values()))
@@ -325,7 +378,7 @@ def isolate(selection, notifications):
 def local_child_route(*, vector_publication):
     publication = "N.fill(x,2.0)" if vector_publication else "N.copy(y,O[:])"
     selection = selected(
-        f'\n    def anchors(X:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write"),n:N.int64):\n        with N.Kernel():\n            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))\n            N.fill(y,0.0)\n            N.copy(X[:],x)\n            for i in N.Pipelined(n,stages=1):\n                N.copy(X[:],y)\n                N.fill(x,1.0)\n            {publication}\n    '
+        f'\n    def anchors(X:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write"),n:N.int64):\n        with N.Kernel():\n            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))\n            N.fill(y,0.0)\n            N.copy(X[:],x)\n            for i in N.Pipelined(n):\n                N.copy(X[:],y)\n                N.fill(x,1.0)\n            {publication}\n'
     )
     memory = selection.dependencies.memory
     loop = next(iter(memory.control.loops.values()))
@@ -363,7 +416,7 @@ def positions_at_one(selection):
 
 def mode2_participants(*, reverse):
     selection = selected(
-        '\n    def participants(X:N.Tensor((16,16),N.f16),n:N.int64):\n        with N.Kernel(kind="mixed"):\n            a=N.alloc_l1((16,16))\n            v=N.alloc_ub((64,))\n            for i in N.Pipelined(n,stages=1):\n                with N.Cube():\n                    N.copy(X[:,:],a)\n                with N.Vector() as sid:\n                    N.fill(v,1.0)\n    '
+        '\n    def participants(X:N.Tensor((16,16),N.f16),n:N.int64):\n        with N.Kernel(kind="mixed"):\n            a=N.alloc_l1((16,16))\n            v=N.alloc_ub((64,))\n            for i in N.Dataflow(n):\n                with N.Cube():\n                    N.copy(X[:,:],a)\n                with N.Vector() as sid:\n                    N.fill(v,1.0)\n'
     )
     cube = endpoint(selection, 0, Actor.AIC, Placement.BEFORE if reverse else Placement.AFTER)
     vector = tuple(
@@ -388,7 +441,7 @@ def mode2_participants(*, reverse):
 
 def translated_child_route(count):
     selection = selected(
-        f'\n    def translated(X:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write")):\n        with N.Kernel():\n            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))\n            N.copy(X[:],x)\n            for p in N.Pipelined({count},stages=1):\n                for j in N.Pipelined(1,stages=1):\n                    N.copy(X[:],x)\n                    N.fill(y,1.0)\n                N.copy(y,O[:])\n            N.copy(y,O[:])\n    '
+        f'\n    def translated(X:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write")):\n        with N.Kernel():\n            x,y=N.alloc_ub((64,)),N.alloc_ub((64,))\n            N.copy(X[:],x)\n            for p in N.Pipelined({count}):\n                for j in N.Pipelined(1):\n                    N.copy(X[:],x)\n                    N.fill(y,1.0)\n                N.copy(y,O[:])\n            N.copy(y,O[:])\n'
     )
     memory = selection.dependencies.memory
     parent, child = memory.control.loops.values()
@@ -531,7 +584,7 @@ def translated_commands(selection, parent, child, count):
 
 def nested_channel_cycle():
     selection = selected(
-        '\n    def anchors(X:N.Tensor((16,16),N.f16),O:N.Tensor((16,16),N.f32,access="write"),n:N.int64):\n        with N.Kernel(kind="cube"):\n            x=N.alloc_l1((16,16))\n            a=N.alloc_l0a((16,16))\n            b=N.alloc_l0b((16,16))\n            c=N.alloc_l0c((16,16))\n            N.copy(X[:,:],x)\n            for i in N.Pipelined(n,stages=1):\n                N.copy(X[:,:],x)\n                N.copy(x,a)\n                N.copy(x,b,transpose=True)\n                for j in N.Pipelined(n,stages=1):\n                    N.copy(x,a)\n                    N.matmul(a,b,accum=c,initialize=True)\n                N.matmul(a,b,accum=c,initialize=True)\n                N.copy(c,O[:,:])\n            N.copy(c,O[:,:])\n    '
+        '\n    def anchors(X:N.Tensor((16,16),N.f16),O:N.Tensor((16,16),N.f32,access="write"),n:N.int64):\n        with N.Kernel(kind="cube"):\n            x=N.alloc_l1((16,16))\n            a=N.alloc_l0a((16,16))\n            b=N.alloc_l0b((16,16))\n            c=N.alloc_l0c((16,16))\n            N.copy(X[:,:],x)\n            for i in N.Pipelined(n):\n                N.copy(X[:,:],x)\n                N.copy(x,a)\n                N.copy(x,b,transpose=True)\n                for j in N.Pipelined(n):\n                    N.copy(x,a)\n                    N.matmul(a,b,accum=c,initialize=True)\n                N.matmul(a,b,accum=c,initialize=True)\n                N.copy(c,O[:,:])\n            N.copy(c,O[:,:])\n'
     )
     memory = selection.dependencies.memory
 
@@ -585,7 +638,7 @@ def nested_channel_cycle():
 
 def finite_ports(*, at_most_one=False):
     selection = selected(
-        "\n    def anchors(X:N.Tensor((n,64),N.f32),n:N.int64):\n        with N.Kernel():\n            a,b=N.alloc_ub((2,64)),N.alloc_ub((2,64))\n            for j in N.Pipelined(n,stages=1):\n                N.fill(a[j%2,:],1.0)\n                N.fill(b[j%2,:],1.0)\n                N.copy(X[j,:],a[j%2,:])\n    "
+        "\n    def anchors(X:N.Tensor((n,64),N.f32),n:N.int64):\n        with N.Kernel():\n            a,b=N.alloc_ub((2,64)),N.alloc_ub((2,64))\n            for j in N.Pipelined(n):\n                N.fill(a[j%2,:],1.0)\n                N.fill(b[j%2,:],1.0)\n                N.copy(X[j,:],a[j%2,:])\n"
     )
     memory = selection.dependencies.memory
     logical = next(iter(memory.control.loops.values()))
@@ -666,4 +719,4 @@ def actual_port_cycle(selection, count):
     ) <= position(first.sources[0])
 
 
-PARENT_REUSE = "\ndef parent_reuse(X:N.Tensor((n,2,64),N.f32),n:N.int64):\n    with N.Kernel():\n        x=N.alloc_ub((2,64))\n        for p in N.Pipelined(n,stages=1):\n            for j in N.Pipelined(2,stages=2):\n                with N.Stage(0):\n                    v=N.copy(X[p,j,:],x[j,:])\n                with N.Stage(1):\n                    N.mul(v,2.0,out=x[j,:])\n"
+PARENT_REUSE = "\ndef parent_reuse(X:N.Tensor((n,2,64),N.f32),n:N.int64):\n    with N.Kernel():\n        x=N.alloc_ub((2,64))\n        for p in N.Pipelined(n):\n            for j in N.Pipelined(2):\n                with N.Stage(0):\n                    v=N.copy(X[p,j,:],x[j,:])\n                with N.Stage(1):\n                    N.mul(v,2.0,out=x[j,:])\n"

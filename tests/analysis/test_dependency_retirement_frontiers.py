@@ -89,15 +89,15 @@ def test_reverse_issue_order_preserves_each_read_source_value():
         def logical():
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
-                for g in N.Pipelined(4,stages=3,
-                    issue_order={"vector":("overwrite","read","initialize")}):
+                for g in N.Pipelined(4,
+                    issue_order=("overwrite","read","initialize")):
                     with N.Stage(0,name="initialize"):
                         N.fill(x,0.0)
                     with N.Stage(1,name="read"):
                         N.mul(x,2.0,out=y)
                     with N.Stage(2,name="overwrite"):
                         N.fill(x,1.0)
-    """)
+""")
     initialize, read, _ = (t.operation for t in result.memory.templates)
     loop = next(iter(result.memory.control.loops.values())).operation
     raw = {

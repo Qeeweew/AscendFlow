@@ -341,10 +341,10 @@ def test_notification_ssa_binds_actual_nested_serial_and_pipeline_coordinates(tm
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for i in N.serial(1,n,2):
-                    for j in N.Pipelined(k,stages=2):
+                    for j in N.Pipelined(k):
                         with N.Stage(1,name="work"):
                             N.fill(x,1.0)
-    """)
+""")
     _, facts = memory(source)
     serial, pipeline = facts.control.loops.values()
     event = expression(

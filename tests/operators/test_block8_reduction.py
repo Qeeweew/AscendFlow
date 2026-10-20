@@ -19,7 +19,7 @@ def definition(kind="sum", rows=8, columns=1024, workspace=1152):
                 x = N.alloc_ub(({rows}, {columns}), N.f32)
                 workspace = N.alloc_ub((2, {workspace}), N.f32)
                 statistic = N.alloc_ub(({rows},), N.f32)
-                for i in N.Pipelined(n, stages=1):
+                for i in N.Pipelined(n):
                     values = N.fill(x, 1.0)
                     reduced = N.reduce_{kind}(values, axis=1, out=statistic,
                         scratch=workspace[i % 2, :], order="block8_then_packed_merge")

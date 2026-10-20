@@ -1,8 +1,8 @@
 """A sufficient, compositional order rule for generated notifications.
 
-Each loop uses its actual physical step (logical ordinal plus stage) as the
-major order.  Matching publications may advance that step or stay in it;
-they may not move backwards.  A finite DAG orders the zero-step queue gates.
+Each actor keeps its own issue clock. Constant clock-origin potentials align
+those clocks for a progress proof only; no runtime ordering is inferred from
+comparing two actors' bare stage offsets. A finite DAG orders zero-distance gates.
 Ordinary local waits gate their destination queue, whereas Scalar and cross
 waits gate their actor's controller.  Controller issue order alone is never
 an order between native completions.
@@ -58,6 +58,7 @@ class QueueRegion:
     transfers: tuple[tuple[QueuePoint, QueuePoint], ...]
     children: tuple[QueueRegion, ...]
     positive_relations: int
+    origins: tuple[tuple[Actor, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,8 @@ class QueueOrderWork:
     summary_visits: int
     boundary_points: int
     boundary_transfers: int
+    origin_constraints: int
+    origin_relaxations: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,18 +349,69 @@ class _OrderConstruction:
         delta = expression("sub", b, a)
         constant = self.domains.arithmetic.exact_constant(delta)
         if constant is not None and constant >= 0:
-            return int(constant > 0)
+            return constant
         tests = at + bt
         if not self._possible(tests):
             return None
-        if not self.domains.arithmetic.prove(Comparison(delta, ">=", literal(0)), tests):
+        if constant is not None:
+            return constant
+        if self.domains.arithmetic.prove(Comparison(delta, ">=", literal(0)), tests):
+            return int(self.domains.arithmetic.prove(Comparison(delta, ">", literal(0)), tests))
+        lower, _ = self.domains.arithmetic.bounds(delta, tests)
+        if lower is None or not self.domains.arithmetic.prove(
+            Comparison(delta, ">=", literal(lower)), tests
+        ):
             self._fail(
                 region,
-                "notification publication moves backwards in the actual physical-step order; "
-                "this generation rule does not support that schedule",
+                "notification has no established finite actor-local epoch difference",
                 (source, wait),
             )
-        return 1 if self.domains.arithmetic.prove(Comparison(delta, ">", literal(0)), tests) else 0
+        return lower
+
+    def _origins(self, region, relations):
+        """Solve a finite difference system without choosing an execution schedule.
+
+        Every edge, including opaque child transfers, uses the same potential
+        convention. Omitting a child's cross-actor potential would make cycle
+        weights fail to telescope and could hide an actual blocking cycle.
+        """
+        actors = tuple(dict.fromkeys(p.actor for a, b, _ in relations for p in (a, b)))
+        origins = dict.fromkeys(actors, 0)
+        predecessor = {}
+        last = None
+        self.work["origin_constraints"] += len(relations)
+        for _ in actors:
+            changed = False
+            for source, destination, distance in relations:
+                required = origins[source.actor] - distance
+                if origins[destination.actor] < required:
+                    origins[destination.actor] = required
+                    predecessor[destination.actor] = source, destination
+                    last = destination.actor
+                    self.work["origin_relaxations"] += 1
+                    changed = True
+            if not changed:
+                return origins
+        if actors:
+            # The last relaxation on the |actors|-th round lies downstream
+            # of an incompatible cycle. Report its real endpoint relations,
+            # rather than every unrelated notification in the region.
+            actor = last
+            for _ in actors:
+                actor = predecessor[actor][0].actor
+            cycle, visited = [], set()
+            while actor not in visited:
+                visited.add(actor)
+                source, destination = predecessor[actor]
+                cycle.extend((source, destination))
+                actor = source.actor
+            self._fail(
+                region,
+                "generated queue/controller transfers contain an incompatible clock-origin "
+                "cycle; no actor-local epoch order was established",
+                tuple(dict.fromkeys(cycle)),
+            )
+        return origins
 
     def _gate(self, region, wait, source):
         wp, sp = self._position(wait, region), self._position(source, region)
@@ -442,6 +496,7 @@ class _OrderConstruction:
         original = tuple(points)
         points, index = self._coalesce(points, region)
         edges = set()
+        relations = []
 
         def edge(source, destination, step):
             if step is not None:
@@ -457,10 +512,12 @@ class _OrderConstruction:
             for source in publications:
                 for wait in waits:
                     if source.case is wait.case:
-                        edge(source, wait, self._publication(region, source, wait))
+                        distance = self._publication(region, source, wait)
+                        if distance is not None:
+                            relations.append((source, wait, distance))
         for child in children:
             for source, destination in child.transfers:
-                edge(source, destination, 0)
+                relations.append((source, destination, 0))
         for wait in tuple(points):
             if wait.phase not in {"wait", "output"}:
                 continue
@@ -471,7 +528,15 @@ class _OrderConstruction:
                     points=len(points),
                 )
                 if source.phase in {"set", "input"} and self._route(wait, source):
-                    edge(wait, source, self._gate(region, wait, source))
+                    distance = self._gate(region, wait, source)
+                    if distance is not None:
+                        relations.append((wait, source, distance))
+
+        origins = self._origins(region, relations)
+        for source, destination, distance in relations:
+            shifted = distance + origins[destination.actor] - origins[source.actor]
+            assert shifted >= 0, "clock-origin solution violated an established lower bound"
+            edge(source, destination, int(shifted > 0))
 
         # New cuts summarize only closed publications/gates and child cuts.
         # Open endpoints keep their actual identity and ancestor coordinates.
@@ -538,7 +603,15 @@ class _OrderConstruction:
             )
         positive = sum(step > 0 for _, _, step in edges)
         result = QueueRegion(
-            region, tuple(points), rank, ports, cuts, tuple(transfers), children, positive
+            region,
+            tuple(points),
+            rank,
+            ports,
+            cuts,
+            tuple(transfers),
+            children,
+            positive,
+            tuple(origins.items()),
         )
         self.regions.append(result)
         self.work["regions"] += 1

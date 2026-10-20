@@ -6,7 +6,7 @@ from xdsl.dialects import arith, scf
 from ascendflow import compile
 from ascendflow import language as N
 from ascendflow.dialects.io import dump, parse
-from ascendflow.dialects.source import AllocationOp, CopyOp, ElementOp, PipelineOp, SizeOp
+from ascendflow.dialects.source import AllocationOp, CopyOp, ElementOp, IterationOp, SizeOp
 from ascendflow.frontend import FrontendError, PrimFunction
 from examples.vector.scale import scale
 
@@ -41,7 +41,7 @@ def test_captured_namespace_never_executes_rebound_host_operations(monkeypatch):
     def captured(n: "syntax.int64(minimum=4, multiple_of=2)"):
         with syntax.Kernel():
             x = syntax.alloc_ub((64,))
-            for i in syntax.Pipelined(n, stages=1):
+            for i in syntax.Pipelined(n):
                 syntax.fill(x, 1.0)
 
     for name in ("Kernel", "alloc_ub", "fill"):
@@ -61,7 +61,7 @@ def test_scalar_parameters_are_resolved_before_tensor_annotations_and_slots_are_
     allocations = [op for op in source.walk() if isinstance(op, AllocationOp)]
     assert all(op.versions.data == 1 for op in allocations)
     assert [tuple(v.data for v in op.ref.type.shape) for op in allocations[-2:]] == [(2, 64)] * 2
-    assert next(op for op in source.walk() if isinstance(op, PipelineOp)).limit is sizes[0].value
+    assert next(op for op in source.walk() if isinstance(op, IterationOp)).limit is sizes[0].value
 
 
 def test_runtime_parameter_cannot_be_silently_specialized():
@@ -82,13 +82,13 @@ def test_ast_constant_loop_keeps_one_body_even_for_millions_of_iterations():
             def retained(B: N.constexpr = 64):
                 with N.Kernel():
                     x = N.alloc_ub((2, B))
-                    for i in N.Pipelined(COUNT, stages=1):
+                    for i in N.Pipelined(COUNT):
                         N.fill(x[i % 2, :], 0.0)
-        """,
+""",
             constants={"COUNT": count},
         ).to_ir()
         sizes.append(len(list(source.walk())))
-        assert next(op for op in source.walk() if isinstance(op, PipelineOp)).count.data == count
+        assert next(op for op in source.walk() if isinstance(op, IterationOp)).count.data == count
     assert len(set(sizes)) == 1
 
 
@@ -97,12 +97,12 @@ def test_device_if_is_a_real_scf_region_and_both_sides_are_present():
         def branch(n: N.int64):
             with N.Kernel():
                 x = N.alloc_ub((2, 64))
-                for i in N.Pipelined(n, stages=1):
+                for i in N.Pipelined(n):
                     if i < 2:
                         N.fill(x[i % 2, :], 1.0)
                     else:
                         N.fill(x[i % 2, :], 2.0)
-    """)
+""")
     source = parse(dump(definition.to_ir()))
     assert len([op for op in source.walk() if isinstance(op, scf.IfOp)]) == 1
     assert len([op for op in source.walk() if isinstance(op, arith.CmpiOp)]) == 1
@@ -113,10 +113,10 @@ def test_dynamic_serial_and_ceildiv_are_retained_in_source_ir():
         def nested(n: N.int64, m: N.int64):
             with N.Kernel():
                 x = N.alloc_ub((2, 64))
-                for i in N.Pipelined(n, stages=1):
+                for i in N.Pipelined(n):
                     for j in N.serial(N.ceildiv(m, 64)):
                         N.fill(x[j % 2, :], 1.0)
-    """)
+""")
     source = parse(dump(definition.to_ir()))
     assert len([op for op in source.walk() if isinstance(op, scf.ForOp)]) == 1
     assert len([op for op in source.walk() if isinstance(op, arith.CeilDivUIOp)]) == 1
@@ -148,12 +148,12 @@ def test_unroll_is_explicit_and_does_not_add_a_device_loop():
         def explicit():
             with N.Kernel():
                 x = N.alloc_ub((64,))
-                for i in N.Pipelined(4, stages=1):
+                for i in N.Pipelined(4):
                     for j in N.unroll(3):
                         N.fill(x, 1.0)
-    """).to_ir()
+""").to_ir()
     assert len([op for op in source.walk() if op.name == "npu_source.element"]) == 3
-    assert len([op for op in source.walk() if isinstance(op, PipelineOp)]) == 1
+    assert len([op for op in source.walk() if isinstance(op, IterationOp)]) == 1
 
 
 def test_branch_rebinding_cannot_silently_select_the_host_value():
@@ -161,10 +161,10 @@ def test_branch_rebinding_cannot_silently_select_the_host_value():
         def invalid(n: N.int64):
             with N.Kernel():
                 value = 0
-                for i in N.Pipelined(n, stages=1):
+                for i in N.Pipelined(n):
                     if i == 0:
                         value = 1
-    """)
+""")
     with pytest.raises(FrontendError, match="loop-carried binding value"):
         definition.to_ir()
 

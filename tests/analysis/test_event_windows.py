@@ -20,10 +20,10 @@ def control():
     source = N.from_source("""
     def clocks(n:N.int64,m:N.int64):
         with N.Kernel():
-            for p in N.Pipelined(n,stages=1):
-                for g in N.Pipelined(m,stages=1):
+            for p in N.Pipelined(n):
+                for g in N.Pipelined(m):
                     pass
-    """)
+""")
     return build_control_facts(lower_native_structure(source).module)
 
 
@@ -322,9 +322,9 @@ def test_unknown_scalar_carry_cannot_be_a_window_parameter():
             count=0
             for i in N.serial(n):
                 count=count-1
-            for g in N.Pipelined(n,stages=1):
+            for g in N.Pipelined(n):
                 pass
-    """)
+""")
     control = build_control_facts(lower_native_structure(source).module)
     serial, pipeline = control.loops.values()
     carry = control.environment.expression(serial.operation.results[0])

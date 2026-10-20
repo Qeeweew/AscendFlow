@@ -14,7 +14,7 @@ from ascendflow.dialects.io import dump, parse
 from ascendflow.dialects.physical import (
     TaskOp,
 )
-from ascendflow.dialects.source import CopyOp, PipelineOp
+from ascendflow.dialects.source import CopyOp, IterationOp
 from ascendflow.dialects.structured import PipelineLoopOp, PipelineStageOp
 from ascendflow.passes.lower_native import lower_native_structure
 from examples.gemm.batched import batched_matmul
@@ -83,9 +83,9 @@ def test_serial_carry_and_if_results_keep_zero_iteration_initial_value(n):
                         total=total+i
                     else:
                         total=total+2
-                for j in N.Pipelined(total,stages=1):
+                for j in N.Pipelined(total):
                     pass
-    """)
+""")
     plan = lower_native_structure(source)
     values, _ = dispatch(plan, n=n)
     serial = next(op for op in plan.module.walk() if isinstance(op, scf.ForOp))
@@ -131,11 +131,11 @@ def test_empty_pipeline_exports_last_selection_without_inventing_completion():
         def empty():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for t in N.Pipelined(0,stages=1):
+                for t in N.Pipelined(0):
                     value=N.fill(x,1.0)
-    """)
+""")
     plan = lower_native_structure(source)
-    pipeline = next(op for op in plan.source.walk() if isinstance(op, PipelineOp))
+    pipeline = next(op for op in plan.source.walk() if isinstance(op, IterationOp))
     assert pipeline.values
     assert all(isinstance(plan.values[value], LastTile) for value in pipeline.values)
     assert not plan.uses
@@ -148,11 +148,11 @@ def test_stale_tile_remains_an_explicit_unresolved_writer_requirement():
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 y=N.alloc_ub((64,))
-                for t in N.Pipelined(n,stages=1):
+                for t in N.Pipelined(n):
                     old=N.copy(X[t,:],x)
                     N.mul(old,2.0,out=x)
                     N.add(old,1.0,out=y)
-    """)
+""")
     plan = lower_native_structure(source)
     copy = next(recipe for op, recipe in plan.recipes.items() if isinstance(op, CopyOp))
     assert len(plan.uses) == 2
@@ -166,12 +166,12 @@ def test_cross_stage_scalar_capture_is_not_silently_cloned_or_treated_as_complet
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 y=N.alloc_ub((64,))
-                for t in N.Pipelined(n,stages=2):
+                for t in N.Pipelined(n):
                     with N.Stage(0,name="read"):
                         factor=N.load_scalar(x[0:1])
                     with N.Stage(1,name="use"):
                         N.mul(x,factor,out=y)
-    """)
+""")
     source.to_ir().verify()
     with pytest.raises(CompileError, match="asynchronous values cannot be cloned") as error:
         lower_native_structure(source)

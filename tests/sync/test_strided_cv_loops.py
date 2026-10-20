@@ -23,13 +23,13 @@ def cohort(X:N.Tensor((n,{pack},16,16),N.f16),B:N.Tensor((16,16),N.f16),
         c0=N.alloc_l0c((16,16),N.f32)
         with N.Cube():
             N.copy(B,b1)
-        for parent in N.Pipelined(n,stages=3,issue_order={{"vector":("store","prepare")}}):
-            with N.Stage(0,name="prepare"),N.Vector() as lane:
+        for parent in N.Dataflow(n,issue_order={{"vector":("store","prepare")}}):
+            with N.Vector() as lane, N.Stage(0,name="prepare"):
                 for item in N.serial({pack}):
                     N.copy(X[parent,item,lane*8:lane*8+8,:],x)
                     N.copy(x,Work[parent%2,item,lane*8:lane*8+8,:])
-            with N.Stage(1,name="compute"),N.Cube():
-                for item in N.Pipelined({pack},stages=2):
+            with N.Cube(), N.Stage(1,name="compute"):
+                for item in N.Pipelined({pack}):
                     with N.Stage(0):
                         N.copy(Work[parent%2,item,:,:],a1[item%2,:,:])
                     with N.Stage(1):
@@ -37,7 +37,7 @@ def cohort(X:N.Tensor((n,{pack},16,16),N.f16),B:N.Tensor((16,16),N.f16),
                         bb=N.copy(b1,b0)
                         N.matmul(aa,bb,accum=c0,initialize=True)
                         N.copy(c0,Score[parent%2,item,:,:])
-            with N.Stage(2,name="store"),N.Vector() as lane:
+            with N.Vector() as lane, N.Stage(2,name="store"):
                 for item in N.serial({pack}):
                     N.copy(Score[parent%2,item,lane*8:lane*8+8,:],y)
                     N.copy(y,Out[parent,item,lane*8:lane*8+8,:])

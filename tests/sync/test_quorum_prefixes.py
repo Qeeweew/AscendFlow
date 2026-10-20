@@ -42,16 +42,16 @@ def messages(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
             N.copy(a1,a0)
             N.copy(b1,b0)
             N.matmul(a0,b0,accum=c0,initialize=True)
-        for i in N.Pipelined({count},stages=2):
-            with N.Stage(0),N.Cube():
+        for i in N.Dataflow({count}):
+            with N.Cube(), N.Stage(0):
                 for panel in N.unroll({messages}):
                     N.copy(c0,Work[{index},panel,:,:])
-            with N.Stage(1),N.Vector() as lane:
+            with N.Vector() as lane, N.Stage(1):
                 for panel in N.unroll({messages}):
                     column={messages}-1-panel if {reverse} else panel
                     N.copy(Work[{index},column,lane*8:lane*8+8,:],x)
                     N.copy(x,Out[i,column,lane*8:lane*8+8,:])
-    """,
+""",
         disjoint_external=True,
     )
     from ascendflow.passes.structured_sync import synchronize_structure
@@ -103,12 +103,12 @@ def messages(A:N.Tensor((n,2,32,16),N.f16),B:N.Tensor((16,16),N.f16),
         with N.Cube():
             N.copy(B,b1)
             N.copy(b1,b0)
-        for i in N.Pipelined(n,stages=2):
-            with N.Stage(0),N.Vector() as lane:
+        for i in N.Dataflow(n):
+            with N.Vector() as lane, N.Stage(0):
                 for panel in N.unroll(2):
                     N.copy(A[i,panel,lane*16:lane*16+16,:],x)
                     N.copy(x,Work[i%2,panel,lane*16:lane*16+16,:])
-            with N.Stage(1),N.Cube():
+            with N.Cube(), N.Stage(1):
                 for panel in N.unroll(2):
                     N.copy(Work[i%2,panel,:,:],a1[panel,:,:])
                     N.copy(a1[panel,:,:],a0)
@@ -208,7 +208,7 @@ def local_prefix(X:N.Tensor((n,8,64),N.f32),
         inputs=N.alloc_ub((2,8,64),N.f32)
         total=N.alloc_ub((2,64),N.f32)
         with N.Vector():
-            for i in N.Pipelined(n,stages=3):
+            for i in N.Pipelined(n):
                 with N.Stage(0,name="load"):
                     N.copy(X[i,:,:],inputs[i%2,:,:])
                 with N.Stage(1,name="sum"):
@@ -252,8 +252,8 @@ def paired(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
         c0=N.alloc_l0c((16,16),N.f32)
         x=N.alloc_ub((8,16),N.f32)
         y=N.alloc_ub((8,16),N.f32)
-        for i in N.Pipelined(n,stages=2):
-            with N.Stage(0,name="cube"),N.Cube():
+        for i in N.Dataflow(n):
+            with N.Cube(), N.Stage(0,name="cube"):
                 N.copy(A,a1)
                 N.copy(B,b1)
                 N.copy(a1,a0)
@@ -261,7 +261,7 @@ def paired(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
                 N.matmul(a0,b0,accum=c0,initialize=True)
                 N.copy(c0,Work[i%2,0,:,:])
                 N.copy(c0,Work[i%2,1,:,:])
-            with N.Stage(1,name="vector"),N.Vector() as lane:
+            with N.Vector() as lane, N.Stage(1,name="vector"):
                 N.copy(Work[i%2,0,lane*8:lane*8+8,:],x)
                 N.copy(Work[i%2,1,lane*8:lane*8+8,:],y)
                 N.add(x,y,out=x)

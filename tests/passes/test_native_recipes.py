@@ -99,9 +99,9 @@ def test_broadcast_result_identifies_statistic_reader_and_destination_operand():
                 statistic=N.alloc_ub((8,))
                 scratch=N.alloc_ub((8,8))
                 out=N.alloc_ub((8,64))
-                for i in N.Pipelined(1,stages=1):
+                for i in N.Pipelined(1):
                     N.sub(x,statistic[:,None],out=out,scratch=scratch)
-    """).to_ir()
+""").to_ir()
     op = next(op for op in source.walk() if isinstance(op, ElementOp))
     target = Insertion()
     value = target.bind(op.inputs[0], 256, rows=8, row_stride=256)
@@ -128,10 +128,10 @@ def test_block8_result_keeps_disjoint_workspace_planes_and_original_input_reader
                 x=N.alloc_ub((8,1024))
                 workspace=N.alloc_ub((1152,))
                 out=N.alloc_ub((8,))
-                for i in N.Pipelined(1,stages=1):
+                for i in N.Pipelined(1):
                     N.reduce_sum(x,axis=1,out=out,scratch=workspace,
                         order="block8_then_packed_merge")
-    """).to_ir()
+""").to_ir()
     op = next(op for op in source.walk() if isinstance(op, ReduceOp))
     target = Insertion()
     value = target.bind(op.source, 4096, rows=8, row_stride=4096)
@@ -172,10 +172,10 @@ def test_scalar_result_is_the_actual_ssa_operand_of_its_consumer():
                 statistic=N.alloc_ub((1,))
                 x=N.alloc_ub((64,))
                 out=N.alloc_ub((64,))
-                for i in N.Pipelined(1,stages=1):
+                for i in N.Pipelined(1):
                     factor=N.load_scalar(statistic)
                     N.mul(x,factor,out=out)
-    """).to_ir()
+""").to_ir()
     read = next(op for op in source.walk() if isinstance(op, ScalarReadOp))
     scale = next(op for op in source.walk() if isinstance(op, ScaleOp))
     target = Insertion()
@@ -202,12 +202,12 @@ def test_scale_value_segment_keeps_scalar_load_as_an_atom_not_an_address():
                 statistic=N.alloc_ub((8,))
                 x=N.alloc_ub((64,))
                 out=N.alloc_ub((64,))
-                for i in N.Pipelined(n,stages=1):
+                for i in N.Pipelined(n):
                     N.fill(statistic,1.0)
                     N.fill(x,2.0)
                     factor=N.load_scalar(statistic[:1])
                     N.mul(x,factor,out=out)
-    """)
+""")
     structure = lower_native_structure(source)
     tasks = tuple(op for op in structure.module.walk() if isinstance(op, TaskOp))
     load = next(op for op in tasks if op.native.data == "scalar_load")

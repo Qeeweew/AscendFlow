@@ -14,6 +14,55 @@ from ascendflow import language as T
 # ruff: noqa: F821
 
 
+@T.inline
+def import_panel(inputs, buffers, geometry, coordinates):
+    A, Bt = inputs
+    a1, b1 = buffers
+    A_SLOTS, BM, BK, COL_PARTS, B_SLOTS, BN = geometry
+    row, k, panel, column = coordinates
+    T.copy(A[row : row + BM, k : k + BK], a1[panel % A_SLOTS, :, :])
+    for part in T.unroll(COL_PARTS):
+        T.copy(
+            Bt[column + part * BN : column + (part + 1) * BN, k : k + BK],
+            b1[panel % B_SLOTS, part, :, :],
+        )
+
+
+@T.inline
+def accumulate_panel(inputs, buffers, geometry, coordinates):
+    (C,) = inputs
+    a1, a0, b1, b0, c0 = buffers
+    chunks, COL_PARTS, A_SLOTS, CK, B_SLOTS, C_SLOTS, ktiles, BM, BN = geometry
+    panel, tile, row, column = coordinates
+    for chunk in T.unroll(chunks):
+        aa = T.copy(
+            a1[panel % A_SLOTS, :, chunk * CK : (chunk + 1) * CK],
+            a0[chunk % 2, :, :],
+        )
+        for part in T.unroll(COL_PARTS):
+            # Both output parts borrow the same A operand.
+            bb = T.copy(
+                b1[panel % B_SLOTS, part, :, chunk * CK : (chunk + 1) * CK],
+                b0[(chunk * COL_PARTS + part) % 2, :, :],
+                transpose=True,
+            )
+            if chunk == 0:
+                T.matmul(
+                    aa,
+                    bb,
+                    accum=c0[tile % C_SLOTS, part, :, :],
+                    initialize=(panel == 0),
+                )
+            else:
+                T.matmul(aa, bb, accum=c0[tile % C_SLOTS, part, :, :], initialize=False)
+    if panel == ktiles - 1:
+        for part in T.unroll(COL_PARTS):
+            T.copy(
+                c0[tile % C_SLOTS, part, :, :],
+                C[row : row + BM, column + part * BN : column + (part + 1) * BN],
+            )
+
+
 @T.prim_func(disjoint_external=True)
 def dense_gemm(
     A: T.Tensor((M, K), T.f16),
@@ -66,42 +115,19 @@ def dense_gemm(
             index = group + tile * GROUPS
             row = (index // ntiles) * BM
             column = (index % ntiles) * BN * COL_PARTS
-            for panel in T.Pipelined(ktiles, stages=PREFETCH + 1):
+            for panel in T.Pipelined(ktiles):
                 k = panel * BK
                 with T.Stage(0, name="load"):
-                    T.copy(A[row : row + BM, k : k + BK], a1[panel % A_SLOTS, :, :])
-                    for part in T.unroll(COL_PARTS):
-                        T.copy(
-                            Bt[column + part * BN : column + (part + 1) * BN, k : k + BK],
-                            b1[panel % B_SLOTS, part, :, :],
-                        )
+                    import_panel(
+                        (A, Bt),
+                        (a1, b1),
+                        (A_SLOTS, BM, BK, COL_PARTS, B_SLOTS, BN),
+                        (row, k, panel, column),
+                    )
                 with T.Stage(PREFETCH, name="compute"):
-                    for chunk in T.unroll(chunks):
-                        aa = T.copy(
-                            a1[panel % A_SLOTS, :, chunk * CK : (chunk + 1) * CK],
-                            a0[chunk % 2, :, :],
-                        )
-                        for part in T.unroll(COL_PARTS):
-                            # Both output parts borrow the same A operand.
-                            bb = T.copy(
-                                b1[panel % B_SLOTS, part, :, chunk * CK : (chunk + 1) * CK],
-                                b0[(chunk * COL_PARTS + part) % 2, :, :],
-                                transpose=True,
-                            )
-                            if chunk == 0:
-                                T.matmul(
-                                    aa,
-                                    bb,
-                                    accum=c0[tile % C_SLOTS, part, :, :],
-                                    initialize=(panel == 0),
-                                )
-                            else:
-                                T.matmul(
-                                    aa, bb, accum=c0[tile % C_SLOTS, part, :, :], initialize=False
-                                )
-                    if panel == ktiles - 1:
-                        for part in T.unroll(COL_PARTS):
-                            T.copy(
-                                c0[tile % C_SLOTS, part, :, :],
-                                C[row : row + BM, column + part * BN : column + (part + 1) * BN],
-                            )
+                    accumulate_panel(
+                        (C,),
+                        (a1, a0, b1, b0, c0),
+                        (chunks, COL_PARTS, A_SLOTS, CK, B_SLOTS, C_SLOTS, ktiles, BM, BN),
+                        (panel, tile, row, column),
+                    )

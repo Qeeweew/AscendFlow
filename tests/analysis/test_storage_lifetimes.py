@@ -22,7 +22,7 @@ def scratch(order=("b_fill", "b_read", "a_fill", "a_read")):
         def scratch(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.int64):
             with N.Kernel():
                 s = N.alloc_ub((64,))
-                for g in N.Pipelined(n, stages=1, issue_order={{"vector":{order!r}}}):
+                for g in N.Pipelined(n, issue_order={order!r}):
                     with N.Stage(0,name="a_fill"):
                         N.fill(s,1.0)
                     with N.Stage(0,name="a_read"):
@@ -59,14 +59,14 @@ def test_shifted_private_packets_keep_values_through_fill_and_drain():
         def shifted(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.int64):
             with N.Kernel():
                 s=N.alloc_ub((64,))
-                for g in N.Pipelined(n,stages=2,issue_order={"vector":("a","b")}):
+                for g in N.Pipelined(n,issue_order=("a","b")):
                     with N.Stage(0,name="a"):
                         N.fill(s,1.0)
                         N.copy(s,O[g,0,:])
                     with N.Stage(1,name="b"):
                         N.fill(s,3.0)
                         N.copy(s,O[g,1,:])
-    """,
+""",
             disjoint_external=True,
         )
     )
@@ -92,8 +92,8 @@ def test_same_vector_overwrite_before_the_old_value_read_is_rejected():
         def clobber(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.int64):
             with N.Kernel():
                 s,x,y=N.alloc_ub((64,)),N.alloc_ub((64,)),N.alloc_ub((64,))
-                for g in N.Pipelined(n,stages=1,
-                    issue_order={"vector":("a_fill","b_fill","a_read","b_read")}):
+                for g in N.Pipelined(n,
+                    issue_order=("a_fill","b_fill","a_read","b_read")):
                     with N.Stage(0,name="a_fill"):
                         N.fill(s,1.0)
                     with N.Stage(0,name="a_read"):
@@ -104,7 +104,7 @@ def test_same_vector_overwrite_before_the_old_value_read_is_rejected():
                     with N.Stage(0,name="b_read"):
                         N.mul(s,4.0,out=y)
                         N.copy(y,O[g,1,:])
-    """,
+""",
         disjoint_external=True,
     )
     with pytest.raises(CompileError, match="same-engine source"):

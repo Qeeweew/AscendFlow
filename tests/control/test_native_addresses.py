@@ -11,7 +11,7 @@ from ascendflow import indexing
 from ascendflow import language as N
 from ascendflow.diagnostics import CompileError, ErrorKind
 from ascendflow.dialects.physical import BufferOp
-from ascendflow.dialects.source import AllocationOp, PipelineOp, SizeOp, ViewOp
+from ascendflow.dialects.source import AllocationOp, IterationOp, SizeOp, ViewOp
 from ascendflow.dialects.types import TensorType, ref_type
 from ascendflow.passes.native_addresses import lower_address, subview
 from ascendflow.target.native import ITEMSIZE
@@ -144,11 +144,11 @@ def test_multiple_ancestor_coordinates_and_runtime_extent_stay_in_one_ssa_addres
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for outer in N.serial(n):
-                    for inner in N.Pipelined(m,stages=1):
+                    for inner in N.Pipelined(m):
                         N.copy(X[outer,inner,:],x)
-    """).to_ir()
+""").to_ir()
     serial = next(op for op in source.walk() if isinstance(op, scf.ForOp))
-    pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
+    pipeline = next(op for op in source.walk() if isinstance(op, IterationOp))
     sizes = {op.sym_name.data: op.value for op in source.walk() if isinstance(op, SizeOp)}
     view = next(
         op for op in source.walk() if isinstance(op, ViewOp) and op.source.type.memory.data == "GM"
@@ -181,12 +181,12 @@ def test_whole_source_expression_and_per_call_lexical_bindings_are_preserved():
             with N.Kernel():
                 x=N.alloc_ub((2,64))
                 for outer in N.serial(n):
-                    for inner in N.Pipelined(m,stages=1):
+                    for inner in N.Pipelined(m):
                         slot=((outer*m+inner+3)//m)%2
                         N.fill(x[slot,:],0.0)
-    """).to_ir()
+""").to_ir()
     serial = next(op for op in source.walk() if isinstance(op, scf.ForOp))
-    pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
+    pipeline = next(op for op in source.walk() if isinstance(op, IterationOp))
     m = next(op.value for op in source.walk() if isinstance(op, SizeOp) and op.sym_name.data == "m")
     view = next(op for op in source.walk() if isinstance(op, ViewOp))
     output = Block(arg_types=[IndexType()] * 4)

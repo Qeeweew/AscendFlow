@@ -13,10 +13,10 @@ def test_incorrect_valid_expression_is_not_treated_as_padding():
         def invalid(X: N.Tensor((n,), N.f32), n: N.int64):
             with N.Kernel():
                 x = N.alloc_ub((2, 64))
-                for t in N.Pipelined(N.ceildiv(n, 64), stages=1):
+                for t in N.Pipelined(N.ceildiv(n, 64)):
                     valid = N.min(64, n - t * 64 - 1)
                     N.copy(X[t * 64:(t + 1) * 64], x[t % 2, :], valid=valid)
-    """)
+""")
     with pytest.raises(CompileError, match="valid prefix native addresses are not supported"):
         compile(definition)
 

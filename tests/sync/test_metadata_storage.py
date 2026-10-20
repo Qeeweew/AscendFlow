@@ -31,7 +31,7 @@ def test_unrelated_metadata_read_preserves_an_ordinary_two_buffer_pipeline(metad
             a=N.alloc_ub((2,64))
             b=N.alloc_ub((64,))
             result=N.alloc_ub((64,))
-            for i in N.Pipelined(n,stages=2):
+            for i in N.Pipelined(n):
                 with N.Stage(0):
                     unused=N.load_index(Meta[i:i+1],minimum=0,maximum=1)
                     N.copy(X[i,:],a[i%2,:])
@@ -39,7 +39,7 @@ def test_unrelated_metadata_read_preserves_an_ordinary_two_buffer_pipeline(metad
                     N.copy(Y[i,:],b)
                     N.add(a[i%2,:],b,out=result)
                     N.copy(result,Out[i,:])
-    """,
+""",
         disjoint_external=True,
     )
     plan = synchronize_structure(source)
@@ -54,11 +54,11 @@ def test_a_loaded_index_still_retains_real_aliases_and_repeated_slot_values(meta
                 Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
         with N.Kernel():
             a=N.alloc_ub((2,64))
-            for i in N.Pipelined(n,stages=1):
+            for i in N.Pipelined(n):
                 slot=N.load_index(Meta[i:i+1],minimum=0,maximum=1)
                 N.copy(X[i,:],a[slot,:])
                 N.copy(a[slot,:],Out[i,:])
-    """,
+""",
         disjoint_external=True,
     )
     plan = synchronize_structure(source)

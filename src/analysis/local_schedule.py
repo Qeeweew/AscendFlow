@@ -57,6 +57,10 @@ def bind_local_schedules(memory):
             )
             if not stages:
                 continue
+            require(
+                all(stage.family is None or stage.family.data == family for stage in stages),
+                "stage family disagrees with its actual native participants",
+            )
             policy = None if loop.issue_order is None else loop.issue_order.data.get(family)
             if policy is not None:
                 by_name = {stage.label.data: stage for stage in stages}

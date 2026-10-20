@@ -64,11 +64,11 @@ def test_singleton_reader_does_not_synchronize_its_idle_engine_each_iteration(
         def last_store(Y: N.Tensor((64,), N.f32, access="write"), panels: N.int64):
             with N.Kernel():
                 x = N.alloc_ub((64,))
-                for i in N.Pipelined(panels, stages=1):
+                for i in N.Pipelined(panels):
                     N.fill(x, 1.0)
                     if {predicate}:
                         N.copy(x, Y)
-        """)
+""")
     )
     result = compile(definition)
     final = collect_native_memory(result.plan)
@@ -95,12 +95,12 @@ def test_terminal_writer_cannot_initialize_a_steady_first_read():
             with N.Kernel():
                 x = N.alloc_ub((64,))
                 y = N.alloc_ub((64,))
-                for t in N.Pipelined(n, stages=2):
+                for t in N.Pipelined(n):
                     with N.Stage(0):
                         N.mul(x, 2.0, out=y)
                     with N.Stage(1):
                         if t == n - 1:
                             N.fill(x, 0.0)
-    """)
+""")
     with pytest.raises(CompileError, match="without a proved initialized writer coverage"):
         compile(definition)

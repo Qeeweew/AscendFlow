@@ -52,7 +52,7 @@ compile / Compilation
     materialize_notifications
     ScalarFacts                         # 复用原始控制和合法索引范围
     executable projection               # 独立终端模块；映射 native、geometry 与 SSA 范围
-    lower_execution                     # 单时钟与存在域→arith/scf
+    lower_execution                     # actor 本地时钟与存在域→arith/scf
     simplify_scalars → simplify_conditions
   backend.structured → ASC
 build_file                               # 同一链路 + CANN，单次进程组硬期限
@@ -76,7 +76,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `passes/notification_binding.py`、`analysis/structured_protocols.py` | 复用已经必要的 capture/acquire、建立完整 quorum；保留自身 origin，不将新增 coverage 当作 ownership，不按 Stage 合并独立完成边界 |
 | `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期 |
 | `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |
-| `analysis/queue_order.py` | 每层零 step DAG 及正 step 前进；child 仅导出 open ports 和 may-block cuts |
+| `analysis/queue_order.py` | 每层 actor clock-origin 差约束、零距离 DAG 与正距离前进；child 仅导出 open ports 和 may-block cuts |
 | `analysis/cell_channels.py` | 相同完整物理 ownership 集合和 role 的非重复 credit；原始值/存储 lifetime 归纳 |
 | `analysis/notification_lifetimes.py` | 有限使用或明确 queue handback，连接实际首末端口，无任意路径搜索 |
 | `analysis/event_sharing.py`、`structured_resources.py`、`event_contracts.py` | 有限 bank、配置/drain 台账；固定成员的兼容关系只建立一次，候选 ID 分配复用真实 handback 或单发布者 FIFO，并检查完整 counter 积压 |
@@ -119,13 +119,16 @@ UB 的跨步矩形 `N.copy` 使用有完整 mask 设置的 Vector bitwise copy�
 这与连续 UB copy 使用同一 source/native/同步链，没有标量逐元素搬运。
 复现命令将运行产物和诊断写入已忽略的 `build/`，文档不依赖仓库外的实验目录。
 
-## Pipeline 的最小表示
+## 逻辑迭代与本地排步的最小表示
 
-同步分析使用 `PipelineLoopOp(count, issue_order)` 和
+source 的 `Dataflow` 和单 actor `Pipelined` 统一形成 `IterationOp`，
+它只保存逻辑次数、坐标及政策；Stage 在展开 inline 后绑定实际 actor 和最近迭代域。
+不保存全 actor horizon，不重复保存父 stage。同步分析使用
+`PipelineLoopOp(count, issue_order)` 和
 `PipelineStageOp(offset)`；stage 只有一个 index 块参数 `g`。
 `g=j-offset` 且 `0<=g<count` 是完整存在域。源程序的普通 serial 循环
 仍保留自己的 lower/upper/step；pipeline 不重复保存这些字段，也没有 phase 表。
-最大偏移由实际 stage 推导，声明的 stage 数只用于前端校验。
+各 family 最大偏移由其实际 stage 推导，没有声明的 stage 数或共同 horizon。
 
 派发时建立的 `LocalSchedule` 只引用该逻辑循环内实际参与的 actor stage，
 保存本地发射顺序并推导本地 horizon；它不建立完成或事件消费证据。

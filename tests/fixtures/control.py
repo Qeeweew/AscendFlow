@@ -8,10 +8,10 @@ def nested(X: N.Tensor((n,k,PARTS,64),N.f32), n: N.int64, k: N.int64,
         N.fill(x[0,:],0.0)
         for i in N.serial(1,n,2):
             N.fill(x[0,:],1.0)
-            for j in N.Pipelined(k,stages=3):
+            for j in N.Pipelined(k):
                 with N.Stage(2,name="children"):
                     N.fill(x[0,:],2.0)
-                    for t in N.Pipelined(PARTS,stages=2):
+                    for t in N.Pipelined(PARTS):
                         with N.Stage(1,name="load"):
                             N.copy(X[i,j,t,:],x[t%2,:])
                     N.fill(x[0,:],3.0)
@@ -34,16 +34,16 @@ def shared(A:N.Tensor((GROUPS,n,32,16),N.f16),
         c0=N.alloc_l0c((32,16),N.f32)
         x=N.alloc_ub((16,16),N.f32,name="x")
         y=N.alloc_ub((16,16),N.f32,name="y")
-        for t in N.Pipelined(n,stages=2,
+        for t in N.Dataflow(n,
                  issue_order={"cube":("produce",),"vector":("consume",)}):
-            with N.Stage(0,name="produce"),N.Cube():
+            with N.Cube(), N.Stage(0,name="produce"):
                 av=N.copy(A[group,t,:,:],a1)
                 bv=N.copy(B[group,t,:,:],b1)
                 aa=N.copy(av,a0)
                 bb=N.copy(bv,b0)
                 acc=N.matmul(aa,bb,accum=c0,initialize=True)
                 N.copy(acc,Scratch[group,t%2,:,:])
-            with N.Stage(1,name="consume"),N.Vector() as sid:
+            with N.Vector() as sid, N.Stage(1,name="consume"):
                 tile=N.copy(Scratch[group,t%2,sid*16:(sid+1)*16,:],x)
                 value=N.mul(tile,2.0,out=y)
                 N.copy(value,Y[group,t,sid*16:(sid+1)*16,:])
@@ -60,6 +60,6 @@ def carry(n:N.int64):
                 total=total+i
             else:
                 total=total+2
-        for j in N.Pipelined(total,stages=1):
+        for j in N.Pipelined(total):
             N.fill(x,1.0)
 """

@@ -18,7 +18,7 @@ def inventory(count):
 def work(tiles:N.int64):
     with N.Kernel(3,kind="vector"):
         x=N.alloc_ub((64,),name="x")
-        for i in N.Pipelined({count},stages=1):
+        for i in N.Pipelined({count}):
             if tiles>1:
                 N.fill(x,1.0)
             else:

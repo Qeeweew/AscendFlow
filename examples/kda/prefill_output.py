@@ -7,6 +7,78 @@ from ascendflow import language as N
 # ruff: noqa: F821
 
 
+@N.inline
+def output_load(inputs, buffers, task):
+    QG, Snapshot, Residual, A16 = inputs
+    q1, h1, r1, a1 = buffers
+    chunk, head, ring = task
+    N.copy(QG[chunk, head, :, :], q1[ring, :, :])
+    N.copy(Snapshot[chunk, head, :, :], h1[ring, :, :])
+    N.copy(Residual[chunk, head, :, :], r1[ring, :, :])
+    N.copy(A16[chunk, head, :, :], a1[ring, :, :])
+
+
+@N.inline
+def output_products(operands, buffers, destination, geometry, task):
+    q1, h1, r1, a1 = operands
+    a0, b0, products0 = buffers
+    OutputProducts, owner = destination
+    K, CK = geometry
+    (ring,) = task
+    for part in N.unroll(K // CK):
+        aa = N.copy(q1[ring, :, part * CK : (part + 1) * CK], a0[part, :, :])
+        bb = N.copy(h1[ring, :, part * CK : (part + 1) * CK], b0[part, :, :], transpose=True)
+        N.matmul(aa, bb, accum=products0[ring, :, :K], initialize=part == 0)
+    aa = N.copy(a1[ring, :, :], a0[0, :, :])
+    bb = N.copy(r1[ring, :, :], b0[0, :, :])
+    N.matmul(aa, bb, accum=products0[ring, :, K:], initialize=True)
+    N.copy(products0[ring, :, :], OutputProducts[owner, ring, :, :])
+
+
+@N.inline
+def output_import(buffers, task, geometry):
+    OutputProducts, products = buffers
+    owner, ring, lane = task
+    (BT,) = geometry
+    row = lane * (BT // 2)
+    N.copy(OutputProducts[owner, ring, row : row + BT // 2, :], products[ring, :, :])
+
+
+@N.inline
+def output_merge(buffers, task, geometry):
+    products, total, output = buffers
+    (ring,) = task
+    (K,) = geometry
+    N.add(products[ring, :, :K], products[ring, :, K:], out=total[ring, :, :])
+    N.cast(total[ring, :, :], out=output[ring, :, :])
+
+
+@N.inline
+def output_store(buffers, task, geometry):
+    output, Output, Starts, Lengths = buffers
+    chunk, head, ring, lane = task
+    BT, NC, TOKENS = geometry
+    row = lane * (BT // 2)
+    if chunk % NC < NC - 1:
+        full_start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT)
+        N.copy(
+            output[ring, :, :],
+            Output[full_start + row : full_start + row + BT // 2, head, :],
+        )
+    else:
+        tail_start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - 1)
+        valid = N.load_index(
+            Lengths[chunk : chunk + 1],
+            minimum=1,
+            maximum=N.min(BT, TOKENS - tail_start),
+        )
+        for token in N.serial(N.min(BT // 2, N.max(0, valid - row))):
+            N.copy(
+                output[ring, token, :],
+                Output[tail_start + row + token, head, :],
+            )
+
+
 @N.prim_func(disjoint_external=True)
 def prefill_output(
     QG: N.Tensor((CHUNKS, H, BT, K), DTYPE),
@@ -44,53 +116,23 @@ def prefill_output(
         products = N.alloc_ub((2, BT // 2, 2 * K), N.f32)
         total = N.alloc_ub((2, BT // 2, K), N.f32)
         output = N.alloc_ub((2, BT // 2, K), DTYPE)
-        for task in N.Pipelined(
+        for task in N.Dataflow(
             N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS),
-            stages=3,
         ):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
             ring = task % 2
-            with N.Stage(0, name="load"), N.Cube():
-                N.copy(QG[chunk, head, :, :], q1[ring, :, :])
-                N.copy(Snapshot[chunk, head, :, :], h1[ring, :, :])
-                N.copy(Residual[chunk, head, :, :], r1[ring, :, :])
-                N.copy(A16[chunk, head, :, :], a1[ring, :, :])
-            with N.Stage(1, name="compute"), N.Cube():
-                for part in N.unroll(K // CK):
-                    aa = N.copy(q1[ring, :, part * CK : (part + 1) * CK], a0[part, :, :])
-                    bb = N.copy(
-                        h1[ring, :, part * CK : (part + 1) * CK], b0[part, :, :], transpose=True
-                    )
-                    N.matmul(aa, bb, accum=products0[ring, :, :K], initialize=part == 0)
-                aa = N.copy(a1[ring, :, :], a0[0, :, :])
-                bb = N.copy(r1[ring, :, :], b0[0, :, :])
-                N.matmul(aa, bb, accum=products0[ring, :, K:], initialize=True)
-                N.copy(products0[ring, :, :], OutputProducts[owner, ring, :, :])
-            with N.Stage(2, name="store"), N.Vector() as lane:
-                row = lane * (BT // 2)
-                N.copy(OutputProducts[owner, ring, row : row + BT // 2, :], products[ring, :, :])
-                N.add(products[ring, :, :K], products[ring, :, K:], out=total[ring, :, :])
-                N.cast(total[ring, :, :], out=output[ring, :, :])
-                if chunk % NC < NC - 1:
-                    full_start = N.load_index(
-                        Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT
-                    )
-                    N.copy(
-                        output[ring, :, :],
-                        Output[full_start + row : full_start + row + BT // 2, head, :],
-                    )
-                else:
-                    tail_start = N.load_index(
-                        Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - 1
-                    )
-                    valid = N.load_index(
-                        Lengths[chunk : chunk + 1],
-                        minimum=1,
-                        maximum=N.min(BT, TOKENS - tail_start),
-                    )
-                    for token in N.serial(N.min(BT // 2, N.max(0, valid - row))):
-                        N.copy(
-                            output[ring, token, :],
-                            Output[tail_start + row + token, head, :],
-                        )
+            with N.Cube(), N.Stage(0, name="load"):
+                output_load((QG, Snapshot, Residual, A16), (q1, h1, r1, a1), (chunk, head, ring))
+            with N.Cube(), N.Stage(1, name="products"):
+                output_products(
+                    (q1, h1, r1, a1), (a0, b0, products0), (OutputProducts, owner), (K, CK), (ring,)
+                )
+            with N.Vector() as lane, N.Stage(0, name="import"):
+                output_import((OutputProducts, products), (owner, ring, lane), (BT,))
+            with N.Vector(), N.Stage(1, name="merge"):
+                output_merge((products, total, output), (ring,), (K,))
+            with N.Vector() as lane, N.Stage(2, name="store"):
+                output_store(
+                    (output, Output, Starts, Lengths), (chunk, head, ring, lane), (BT, NC, TOKENS)
+                )

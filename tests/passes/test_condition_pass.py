@@ -28,9 +28,9 @@ def packets(q:N.int64,n:N.int64):
     with N.Kernel():
         x=N.alloc_ub((64,))
         for query in N.serial(q):
-            for kv in N.Pipelined(n,stages=3):
+            for kv in N.Pipelined(n):
                 with N.Stage(0,name="outer"):
-                    for chunk in N.Pipelined(8,stages=4):
+                    for chunk in N.Pipelined(8):
                         with N.Stage(0,name="work"):
                             N.fill(x,1.0)
 """

@@ -42,11 +42,11 @@ from ..dialects.source import (
     DomainOp,
     ElementOp,
     IndexReadOp,
+    IterationOp,
     MaskCombineOp,
     MaskOp,
     MaterializeMaskOp,
     MatmulOp,
-    PipelineOp,
     PredicateOp,
     ProgramOp,
     ReduceOp,
@@ -92,7 +92,6 @@ class NativeStructure:
     module: ModuleOp
     recipes: Mapping[Operation, recipes.RecipeResult]
     loops: Mapping[Operation, Operation]
-    domains: Mapping[DomainOp, ActorDomainOp]
     values: Mapping[SSAValue, TileDefinition | LastTile]
     uses: tuple[TileUse, ...]
     task_scopes: Mapping[TaskOp, ValueScope]
@@ -111,7 +110,7 @@ class _Scope:
     # cache across a stage would retain that stage's g in an address like g%2.
     pure: dict[SSAValue, SSAValue] = field(default_factory=dict)
     stage: int = 0
-    pipeline: PipelineOp | None = None
+    pipeline: IterationOp | None = None
     family: str | None = None
 
     def child(
@@ -141,12 +140,11 @@ class _Scope:
 
 
 class _Lowerer:
-    def __init__(self, source, program, controls):
-        self.source, self.program, self.controls = source, program, controls
+    def __init__(self, source, program):
+        self.source, self.program = source, program
         self.roots = {}
         self.results = {}
         self.loops = {}
-        self.domains = {}
         self.family_work = Counter()
         self.task_scopes = {}
         self.needs_fix = False
@@ -434,7 +432,7 @@ class _Lowerer:
             # A symbolic predicate owns no native until it is materialized or
             # consumed by a picked masked recipe.
             op.program()
-        elif isinstance(op, PipelineOp):
+        elif isinstance(op, IterationOp):
             self.pipeline(op, scope)
         elif isinstance(op, scf.ForOp):
             self.serial(op, scope)
@@ -446,7 +444,6 @@ class _Lowerer:
                 domain = ActorDomainOp.build(attributes={"kind": op.kind}, regions=[Region(block)])
                 domain.location = op.location
                 scope.block.add_op(domain)
-                self.domains[op] = domain
                 nested = scope.child(
                     block,
                     [(op.body.block.args[0], block.args[0])],
@@ -553,14 +550,24 @@ class _Lowerer:
         loop.attributes["npu.loop_id"] = StringAttr(f"loop{len(self.loops)}")
         scope.block.add_op(loop)
         self.loops[op] = loop
-        stages, ordinary, stage_families = [], [], {}
+        stages, stage_families = [], {}
         loop_scope = scope.child(body, control=loop)
 
-        def stage(operations, offset, label):
+        def stage(operations, offset, label, actor=None):
             before = dict(self.family_work)
             block = Block(arg_types=[IndexType()])
             physical = PipelineStageOp.build(
-                attributes={"offset": IntAttr(offset), "label": StringAttr(label)},
+                attributes={
+                    "offset": IntAttr(offset),
+                    "label": StringAttr(label),
+                    **(
+                        {"family": actor.kind}
+                        if actor is not None
+                        else {"family": StringAttr(scope.family)}
+                        if scope.family is not None
+                        else {}
+                    ),
+                },
                 regions=[Region(block)],
             )
             body.add_op(physical)
@@ -571,8 +578,31 @@ class _Lowerer:
                 pipeline=op,
                 control=physical,
             )
+            mixed_actor = actor is not None and self.program.kind.data == "mixed"
+            if mixed_actor:
+                actor_body = Block(arg_types=[IndexType()])
+                domain = ActorDomainOp.build(
+                    attributes={"kind": actor.kind}, regions=[Region(actor_body)]
+                )
+                domain.location = actor.location
+                block.add_op(domain)
+                nested = nested.child(
+                    actor_body,
+                    [(actor.body.block.args[0], actor_body.args[0])],
+                    family=actor.kind.data,
+                    control=domain,
+                )
+            elif actor is not None:
+                _unsupported(
+                    actor.kind == self.program.kind,
+                    "execution domain belongs to another actor family",
+                    actor,
+                )
+                nested = nested.child(block, [(actor.body.block.args[0], nested.constant(0))])
             for operation in operations:
                 self.operation(operation, nested)
+            if mixed_actor:
+                actor_body.add_op(EndOp())
             block.add_op(EndOp())
             stages.append(physical)
             stage_families[physical] = frozenset(
@@ -581,22 +611,33 @@ class _Lowerer:
                 if count > before.get(family, 0)
             )
 
-        def flush():
-            if ordinary:
-                stage(ordinary, 0, "ordinary")
-                ordinary.clear()
-
         descriptors = (ViewOp, YieldOp, PredicateOp, arith.ConstantOp, arith.CmpiOp)
-        for child in op.body.block.ops:
-            if isinstance(child, StageOp):
-                flush()
-                self.work["source_operations"] += 1
-                stage(child.body.block.ops, child.offset.data, child.label.data)
-            elif isinstance(child, descriptors) or type(child) in ARITHMETIC:
-                self.work["source_operations"] += 1
-            else:
-                ordinary.append(child)
-        flush()
+
+        def collect(source, actor=None):
+            ordinary = []
+
+            def flush():
+                if ordinary:
+                    stage(ordinary, 0, "", actor)
+                    ordinary.clear()
+
+            for child in source.ops:
+                if isinstance(child, StageOp):
+                    flush()
+                    self.work["source_operations"] += 1
+                    stage(child.body.block.ops, child.offset.data, child.label.data, actor)
+                elif isinstance(child, DomainOp):
+                    flush()
+                    self.work["source_operations"] += 1
+                    _unsupported(actor is None, "actor domains cannot nest", child)
+                    collect(child.body.block, child)
+                elif isinstance(child, descriptors) or type(child) in ARITHMETIC:
+                    self.work["source_operations"] += 1
+                else:
+                    ordinary.append(child)
+            flush()
+
+        collect(op.body.block)
         if op.issue_order is not None:
             for family, labels in op.issue_order.data.items():
                 names = [label.data for label in labels]
@@ -632,7 +673,7 @@ def lower_native_structure(source) -> NativeStructure:
         "expected one typed source program",
     )
     controls = normalize_loop_controls(source)
-    validate_source_arithmetic(program)
+    validate_source_arithmetic(program, controls)
     body = Block()
     attrs = {
         "sym_name": program.sym_name,
@@ -656,7 +697,7 @@ def lower_native_structure(source) -> NativeStructure:
         ValueScope(None, kernel),
         family=None if mixed else program.kind.data,
     )
-    lowerer = _Lowerer(source, program, controls)
+    lowerer = _Lowerer(source, program)
     lowerer.block(program.body.block, scope)
     if lowerer.needs_fix:
         # One actual invariant register initializer dominates every Fixpipe
@@ -688,7 +729,6 @@ def lower_native_structure(source) -> NativeStructure:
         module,
         MappingProxyType(lowerer.results),
         MappingProxyType(lowerer.loops),
-        MappingProxyType(lowerer.domains),
         MappingProxyType(values),
         uses,
         MappingProxyType(lowerer.task_scopes),

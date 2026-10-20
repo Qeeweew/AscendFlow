@@ -86,10 +86,10 @@ def test_zero_loop_is_identity_between_actual_parent_writer_and_reader():
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
                 N.fill(x,0.0)
-                for j in N.Pipelined(0,stages=1):
+                for j in N.Pipelined(0):
                     N.fill(x,1.0)
                 N.mul(x,2.0,out=y)
-    """)
+""")
     before, empty, after = (t.operation for t in result.memory.templates)
     assert [(n.kind, n.source.operation, n.consumer.operation) for n in result.needs] == [
         (HazardKind.RAW, before, after)
@@ -105,10 +105,10 @@ def test_read_only_child_captures_every_reader_before_parent_overwrite():
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
                 N.fill(x,0.0)
-                for j in N.Pipelined(n,stages=1):
+                for j in N.Pipelined(n):
                     N.mul(x,2.0,out=y)
                 N.fill(x,1.0)
-    """
+"""
     plan = synchronize_structure(N.from_source(source))
     release = next(n for n in plan.dependencies.needs if n.kind is HazardKind.WAR)
     assert isinstance(release.source.endpoint, QueueEndpoint)
@@ -123,9 +123,9 @@ def test_rmw_same_task_next_generation_is_a_real_dependency():
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 N.fill(x,1.0)
-                for j in N.Pipelined(n,stages=1):
+                for j in N.Pipelined(n):
                     N.mul(x,2.0,out=x)
-    """)
+""")
     loop_raw = next(
         n
         for n in result.needs
@@ -141,13 +141,13 @@ def test_first_and_last_branches_preserve_values_without_phase_case_products():
         def phases(n:N.int64):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
-                for j in N.Pipelined(n,stages=1):
+                for j in N.Pipelined(n):
                     if j == 0:
                         N.fill(x,1.0)
                     N.mul(x,2.0,out=x)
                     if j == n-1:
                         N.copy(x,y)
-    """
+"""
     plan = synchronize_structure(N.from_source(source))
     for count in range(6):
         check_compiled_events(plan, {"n": count}, invocations=2)
@@ -160,11 +160,11 @@ def test_compound_slot_short_and_long_children_preserve_actual_byte_values(width
             with N.Kernel():
                 x,y=N.alloc_ub(({width},64)),N.alloc_ub(({width},64))
                 for parent in N.serial(q):
-                    for child in N.Pipelined(k,stages=1):
+                    for child in N.Pipelined(k):
                         slot=(parent*k+child)%{width}
                         N.fill(x[slot,:],1.0)
                         N.mul(x[slot,:],2.0,out=y[slot,:])
-    """
+"""
     plan = synchronize_structure(N.from_source(source))
     assert plan.dependencies.work.cells <= 2 * width**2
     child = next(
@@ -238,10 +238,10 @@ def test_loop_work_depends_on_templates_and_ring_slots_not_trip_count():
             def bounded():
                 with N.Kernel():
                     x,y=N.alloc_ub((2,64)),N.alloc_ub((2,64))
-                    for j in N.Pipelined({count},stages=1):
+                    for j in N.Pipelined({count}):
                         N.fill(x[j%2,:],1.0)
                         N.mul(x[j%2,:],2.0,out=y[j%2,:])
-        """
+"""
 
     short, huge = (dependencies(source(count)) for count in (4, 10**9))
     assert short.work == huge.work
@@ -269,12 +269,12 @@ def test_parent_dependent_possibly_empty_child_does_not_invent_last_writer():
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
                 N.fill(x,1.0)
-                for parent in N.Pipelined(n,stages=1):
+                for parent in N.Pipelined(n):
                     N.mul(x,2.0,out=y)
-                    for child in N.Pipelined(parent%2,stages=1):
+                    for child in N.Pipelined(parent%2):
                         N.fill(x,2.0)
                     N.mul(x,3.0,out=y)
-    """)
+""")
     from ascendflow.analysis.access_frontier import QueueEndpoint
 
     assert any(
@@ -290,10 +290,10 @@ def test_contracted_family_preserves_order_for_shifted_or_invariant_aliases(read
         def shifted():
             with N.Kernel():
                 x,y=N.alloc_ub((5,64)),N.alloc_ub((64,))
-                for j in N.Pipelined(4,stages=1):
+                for j in N.Pipelined(4):
                     N.fill(x[j,:],1.0)
                     N.mul(x[{reader},:],2.0,out=y)
-    """)
+""")
     assert result.work.alias_regions == 1
     assert any(isinstance(n.cell, AliasRegion) and n.kind is HazardKind.RAW for n in result.needs)
     assert any(need.kind is HazardKind.WAR and need.distance == 1 for need in result.required)

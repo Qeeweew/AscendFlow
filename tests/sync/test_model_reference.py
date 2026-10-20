@@ -66,12 +66,12 @@ def local_pipeline():
                    Y:N.Tensor((n,2,64),N.f32,access="write"),n:N.int64):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
-                for t in N.Pipelined(n,stages=1):
+                for t in N.Pipelined(n):
                     N.copy(X[t,:],x)
                     N.mul(x,2.0,out=y)
                     if t < n:
                         N.copy(y,Y[t,0,:])
-    """)
+""")
     complete_each_native(memory)
     memory.module.verify()
     return memory, reference

@@ -9,6 +9,61 @@ from examples.gemm.schedule import l2_tile
 # ruff: noqa: F821
 
 
+@T.inline
+def import_panel(inputs, buffers, geometry, coordinates):
+    A, B = inputs
+    a1, b1 = buffers
+    mvalid, kvalid, nvalid = geometry
+    row, k, panel, column = coordinates
+    T.copy(
+        A[row : row + mvalid, k : k + kvalid],
+        a1[panel % 2, :, :],
+        pad_value=0,
+    )
+    T.copy(
+        B[k : k + kvalid, column : column + nvalid],
+        b1[panel % 2, :, :],
+        pad_value=0,
+    )
+
+
+@T.inline
+def accumulate_panel(inputs, buffers, geometry, coordinates):
+    (C,) = inputs
+    a1, a0, b1, b0, c0 = buffers
+    BK, CK, parts, BN, final, nvalid, mvalid = geometry
+    panel, kbase, panels, column, row = coordinates
+    for chunk in T.unroll(BK // CK):
+        aa = T.copy(
+            a1[panel % 2, :, chunk * CK : (chunk + 1) * CK],
+            a0[chunk % 2, :, :],
+        )
+        for part in T.unroll(parts):
+            bb = T.copy(
+                b1[
+                    panel % 2,
+                    chunk * CK : (chunk + 1) * CK,
+                    part * BN : (part + 1) * BN,
+                ],
+                b0[(chunk * parts + part) % 2, :, :],
+            )
+            T.matmul(
+                aa,
+                bb,
+                accum=c0[part, :, :],
+                initialize=(panel == 0) if chunk == 0 and kbase == 0 else False,
+            )
+    if final:  # noqa: SIM102 - constexpr then device predicate
+        if panel == panels - 1:
+            for part in T.unroll(parts):
+                left = column + part * BN
+                valid = T.min(BN, nvalid - part * BN)
+                T.copy(
+                    c0[part, :, :],
+                    C[row : row + mvalid, left : left + valid],
+                )
+
+
 @T.prim_func(disjoint_external=True)
 def gemm(
     A: T.Tensor((M, K), DTYPE),
@@ -65,48 +120,19 @@ def gemm(
                         column = nbase + col_start + (0 if balanced else col * BN * COL_PARTS)
                         for kbase, panels, kvalid in T.tile_ranges(K, BK):
                             final = kbase + panels * BK >= K
-                            for panel in T.Pipelined(panels, stages=2):
+                            for panel in T.Pipelined(panels):
                                 k = kbase + panel * BK
                                 with T.Stage(0, name="load"):
-                                    T.copy(
-                                        A[row : row + mvalid, k : k + kvalid],
-                                        a1[panel % 2, :, :],
-                                        pad_value=0,
-                                    )
-                                    T.copy(
-                                        B[k : k + kvalid, column : column + nvalid],
-                                        b1[panel % 2, :, :],
-                                        pad_value=0,
+                                    import_panel(
+                                        (A, B),
+                                        (a1, b1),
+                                        (mvalid, kvalid, nvalid),
+                                        (row, k, panel, column),
                                     )
                                 with T.Stage(1, name="compute"):
-                                    for chunk in T.unroll(BK // CK):
-                                        aa = T.copy(
-                                            a1[panel % 2, :, chunk * CK : (chunk + 1) * CK],
-                                            a0[chunk % 2, :, :],
-                                        )
-                                        for part in T.unroll(parts):
-                                            bb = T.copy(
-                                                b1[
-                                                    panel % 2,
-                                                    chunk * CK : (chunk + 1) * CK,
-                                                    part * BN : (part + 1) * BN,
-                                                ],
-                                                b0[(chunk * parts + part) % 2, :, :],
-                                            )
-                                            T.matmul(
-                                                aa,
-                                                bb,
-                                                accum=c0[part, :, :],
-                                                initialize=(panel == 0)
-                                                if chunk == 0 and kbase == 0
-                                                else False,
-                                            )
-                                    if final:  # noqa: SIM102 - constexpr then device predicate
-                                        if panel == panels - 1:
-                                            for part in T.unroll(parts):
-                                                left = column + part * BN
-                                                valid = T.min(BN, nvalid - part * BN)
-                                                T.copy(
-                                                    c0[part, :, :],
-                                                    C[row : row + mvalid, left : left + valid],
-                                                )
+                                    accumulate_panel(
+                                        (C,),
+                                        (a1, a0, b1, b0, c0),
+                                        (BK, CK, parts, BN, final, nvalid, mvalid),
+                                        (panel, kbase, panels, column, row),
+                                    )

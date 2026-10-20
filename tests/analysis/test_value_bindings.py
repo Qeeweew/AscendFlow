@@ -22,7 +22,7 @@ from ascendflow.analysis.value_bindings import (
 )
 from ascendflow.diagnostics import CompileError, ErrorKind
 from ascendflow.dialects.physical import BufferOp, EndOp, TaskOp, task_attrs
-from ascendflow.dialects.source import CopyOp, DomainOp, ElementOp, PipelineOp, StageOp
+from ascendflow.dialects.source import CopyOp, DomainOp, ElementOp, IterationOp, StageOp
 from ascendflow.dialects.structured import PipelineLoopOp
 from ascendflow.dialects.types import TaskType, ref_type
 from ascendflow.passes.native_recipes import NativeRead, RecipeResult
@@ -31,10 +31,10 @@ STAGED = """
 def staged(X:N.Tensor((3,64),N.f32)):
     with N.Kernel():
         x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
-        for g in N.Pipelined(3,stages=2):
-            with N.Stage(0),N.Vector():
+        for g in N.Pipelined(3):
+            with N.Vector(), N.Stage(0):
                 a=N.copy(X[g,:],x)
-            with N.Stage(1),N.Vector():
+            with N.Vector(), N.Stage(1):
                 b=N.mul(a,2.0,out=y)
 """
 
@@ -77,7 +77,7 @@ def anchors(module):
         )
     loops = {}
     for operation in module.walk():
-        if not isinstance(operation, PipelineOp):
+        if not isinstance(operation, IterationOp):
             continue
         zero = arith.ConstantOp.from_int_and_width(0, IndexType())
         count = arith.ConstantOp.from_int_and_width(operation.count.data, IndexType())
@@ -100,15 +100,15 @@ def test_stage_domain_yields_forward_one_definition_and_keep_real_source_use():
     binding = values[writer.value]
     assert isinstance(binding, TileDefinition)
     assert binding.operation is recipes[writer].definition and binding.operand == 2
-    domain, stage = writer.parent_op(), writer.parent_op().parent_op()
+    stage, domain = writer.parent_op(), writer.parent_op().parent_op()
     assert isinstance(domain, DomainOp) and isinstance(stage, StageOp)
     assert values[domain.values[0]] is values[stage.values[0]] is binding
     (use,) = uses
     assert use.expected is binding
-    assert use.source is reader.dependencies[0] is stage.values[0]
+    assert use.source is reader.dependencies[0] is domain.values[0]
     assert use.source_input == 0
     assert use.reader is recipes[reader].definition and use.operand == 0
-    pipeline = next(op for op in module.walk() if isinstance(op, PipelineOp))
+    pipeline = next(op for op in module.walk() if isinstance(op, IterationOp))
     assert values[pipeline.values[0]].loop is loops[pipeline]
     assert values[pipeline.values[0]].value is binding
 
@@ -118,11 +118,11 @@ def test_multiple_inputs_and_native_readers_keep_distinct_use_contracts():
         def inputs(X:N.Tensor((1,64),N.f32)):
             with N.Kernel():
                 x,y,z=N.alloc_ub((64,)),N.alloc_ub((64,)),N.alloc_ub((64,))
-                for g in N.Pipelined(1,stages=1):
+                for g in N.Pipelined(1):
                     left=N.copy(X[0,:],x)
                     right=N.copy(X[0,:],y)
                     N.add(left,right,out=z)
-    """)
+""")
     recipes, loops = anchors(module)
     consumer = next(op for op in recipes if isinstance(op, ElementOp))
     recipe = recipes[consumer]
@@ -148,10 +148,10 @@ def test_nested_last_selections_preserve_each_actual_loop_without_readiness(coun
         def nested():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for g in N.Pipelined(3,stages=1):
-                    for h in N.Pipelined({count},stages=1):
+                for g in N.Pipelined(3):
+                    for h in N.Pipelined({count}):
                         N.fill(x,0.0)
-    """)
+""")
     recipes, loops = anchors(module)
     values, uses = bind_values(module, recipes, loops)
     outer, inner = tuple(loops)
@@ -169,12 +169,12 @@ def test_real_use_of_empty_pipeline_result_remains_an_unresolved_obligation():
         def empty(X:N.Tensor((1,64),N.f32),Y:N.Tensor((1,64),N.f32,access="write")):
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for g in N.Pipelined(0,stages=1):
+                for g in N.Pipelined(0):
                     N.copy(X[0,:],x)
-                for h in N.Pipelined(1,stages=1):
+                for h in N.Pipelined(1):
                     N.copy(x,Y[0,:])
-    """)
-    first, second = tuple(op for op in module.walk() if isinstance(op, PipelineOp))
+""")
+    first, second = tuple(op for op in module.walk() if isinstance(op, IterationOp))
     consumer = next(op for op in second.walk() if isinstance(op, CopyOp))
     replacement = CopyOp.build(
         operands=[consumer.source, consumer.destination, [first.values[0]]],
@@ -200,11 +200,11 @@ def test_stale_tile_is_not_rebound_to_the_later_storage_writer():
         def stale(X:N.Tensor((1,64),N.f32)):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
-                for g in N.Pipelined(1,stages=1):
+                for g in N.Pipelined(1):
                     old=N.copy(X[0,:],x)
                     changed=N.mul(old,2.0,out=x)
                     N.add(old,1.0,out=y)
-    """)
+""")
     recipes, loops = anchors(module)
     values, uses = bind_values(module, recipes, loops)
     original = next(op for op in recipes if isinstance(op, CopyOp))

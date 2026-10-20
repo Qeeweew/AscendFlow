@@ -24,8 +24,9 @@
 | `T.Cube()` / `T.Vector() as lane` | actor域，具体engine由原语确定 |
 | `T.serial(N)` | 源顺序循环，退出无隐式drain |
 | `T.tile_ranges(E, B)` | constexpr 整块/尾块区间 `(base, count, valid)`，最多两份 body；省略空区间 |
-| `T.Pipelined(N, stages=S, issue_order=...)` | 有限stage政策；保留runtime循环 |
-| `T.Stage(s, name=...)` | 当前pipeline的逻辑偏移，不是完成边界 |
+| `T.Dataflow(count, issue_order=...)` | 共享逻辑迭代域；允许 C/V 代码交替 |
+| `T.Pipelined(count, issue_order=...)` | 单 actor 迭代与本地流水；降低到同一逻辑域表示 |
+| `T.Stage(offset, name=...)` | 最近迭代域内当前 actor 的发射偏移，不是完成边界 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理容量、布局、slot与别名 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
 | `alloc_mask(shape)` | 显式 UB packed predicate 存储，64 lane 一个 32 B 块 |
@@ -35,17 +36,17 @@
 | `where(p, x, y, out=...)` | 两路均已定义的完整选择，不短路非法load |
 | `fill/mul/add/sub/div/maximum/exp/sqrt/rsqrt(..., mask=p)` | 显式谓词更新；mask=False lane保留目标旧值 |
 
-stage数、buffer slot数、event width互不等同。`cube.task/vector.task`已经移除且不恢复兼容。内部physical Task IR不属于旧公开语法。
+本地 stage 偏移、buffer slot 数、event width 互不等同。没有 `stages=` 声明。`cube.task/vector.task`已经移除且不恢复兼容。内部physical Task IR不属于旧公开语法。
 
 ## 2. 双缓冲示例
 
 完整当前源码：[scale.py](../../examples/vector/scale.py)。核心结构如下：
 
 ```python
-for t in T.Pipelined(tiles, stages=3):
+for t in T.Pipelined(tiles):
     with T.Stage(0, name="load"):
         T.copy(X[t, :], x[t % 2, :])
-    with T.Stage(1, name="compute"), T.Vector():
+    with T.Vector(), T.Stage(1, name="compute"):
         T.mul(x[t % 2, :], 2.0, out=y[t % 2, :])
     with T.Stage(2, name="store"):
         T.copy(y[t % 2, :], Y[t, :])
@@ -60,6 +61,36 @@ pipeline在actor-local step j执行 `t=j-s`，仅在合法域内激活。issue_o
 覆盖前的最后读取，仍由实际 effects 推导同步。stage 不是硬件 pipe 或完成边界。
 
 ## 3. CV与嵌套语义
+
+mixed kernel 先进入 actor，再声明 Stage；一处 Stage 不能包住两种 actor。
+单 actor Kernel 或外层 Cube/Vector scope 提供隐式 actor。Stage 绑定最近的
+Dataflow/Pipelined；不能跨 serial、分支或另一个 Stage 绑定外层迭代。
+
+```python
+for task in T.Dataflow(count):
+    with T.Cube(), T.Stage(0, name="load"):
+        import_inputs(...)
+    with T.Cube(), T.Stage(1, name="products"):
+        compute_products(...)
+    with T.Vector() as lane, T.Stage(0, name="import"):
+        import_products(...)
+    with T.Vector(), T.Stage(1, name="merge"):
+        merge_products(...)
+```
+
+上例是排步示意；完整输入及 helper 见
+[KDA output](../../examples/kda/prefill_output.py)。同一个 task 绑定同代数据，
+Cube@1 → Vector@0 由真实 workspace 访问推导同步，不比较裸 offset 大小。
+每个 actor 有自己的 clock 和本地 horizon；两个 AIV 仍共用一份模板。
+
+`Dataflow.issue_order` 是 `{"cube": ("load", "products"), ...}` 映射，
+`Pipelined.issue_order` 是当前 actor 的名字 tuple。默认保持该 actor 的源码顺序，
+不按 offset 排序。显式政策须完整覆盖该 actor 的实际块；未命名或隐式 offset 0
+块不能通过猜测生成名字重排。名字在 actor 和迭代域内解析，两侧或父子域可同名。
+偏移为 0..32 的 constexpr，count 保留 int64 范围、定义性与 uniformity 检查。
+Dataflow 不声明迭代独立：状态、归约、最后 reader 和跨代复用仍按实际访问保持。
+纯任务坐标可以写在 Stage 外；S 读取等 effects 保留实际定义位置。
+
 
 FA的真实数学主体在[attention.py](../../examples/flash_attention/attention.py)。四个stage是QK、softmax、PV、output update；内部还有Cube分块和Vector行块pipeline。用户政策可令AIC先新QK后旧PV、AIV先新softmax后旧update。
 

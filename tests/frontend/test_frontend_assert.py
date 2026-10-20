@@ -13,12 +13,11 @@ from ascendflow.dialects.io import dump
 from ascendflow.dialects.source import PredicateOp
 from ascendflow.frontend import FrontendError
 
-SOURCE = """\
-def asserted(n:N.int64, B:N.constexpr=64):
+SOURCE = """def asserted(n:N.int64, B:N.constexpr=64):
     ASSERTION
     with N.Kernel():
         x=N.alloc_ub((B,),N.f32)
-        for i in N.Pipelined(n,stages=1):
+        for i in N.Pipelined(n):
             N.fill(x,1.0)
 """
 

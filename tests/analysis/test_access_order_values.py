@@ -22,12 +22,12 @@ def test_equivalent_affine_residues_keep_their_real_storage_identity(step, bias,
     def residues(Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
         with N.Kernel():
             x=N.alloc_ub(({modulus},64),N.f32)
-            for i in N.Pipelined(n,stages=2,issue_order={{"vector":("store","fill")}}):
+            for i in N.Pipelined(n,issue_order=("store","fill")):
                 with N.Stage(0,name="fill"):
                     N.fill(x[({step}*i+{bias})%{modulus},:],1.0)
                 with N.Stage(1,name="store"):
                     N.copy(x[({step}*i+{bias})%{modulus},:],Out[i,:])
-    """)
+""")
     )
     cells = {
         cell
@@ -51,14 +51,14 @@ def scratch():
                 B:N.Tensor((n,64),N.f32,access="write"),n:N.int64):
         with N.Kernel():
             x=N.alloc_ub((64,))
-            for g in N.Pipelined(n,stages=2):
+            for g in N.Pipelined(n):
                 with N.Stage(0):
                     N.copy(X[g,:],x)
                     N.copy(x,A[g,:])
                 with N.Stage(1):
                     N.fill(x,1.0)
                     N.copy(x,B[g,:])
-    """,
+""",
             disjoint_external=True,
         )
     )
@@ -101,7 +101,7 @@ def recurrence():
             a0=N.alloc_l0a((16,16),N.f16)
             b0=N.alloc_l0b((16,16),N.f16)
             c0=N.alloc_l0c((16,16),N.f32)
-            for k in N.Pipelined(n,stages=3):
+            for k in N.Pipelined(n):
                 with N.Stage(0):
                     av=N.copy(A[k,:,:],a1)
                     bv=N.copy(B[k,:,:],b1)
@@ -111,7 +111,7 @@ def recurrence():
                 with N.Stage(2):
                     N.matmul(aa,bb,accum=c0,initialize=(k==0))
                     N.copy(c0,O[k,:,:])
-    """,
+""",
             disjoint_external=True,
         )
     )

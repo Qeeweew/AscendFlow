@@ -32,7 +32,7 @@ def _source(offsets, reverse):
     return f"""def scratch(O:N.Tensor((n,{len(offsets)},64),N.f32,access="write"),n:N.int64):
     with N.Kernel():
         x=N.alloc_ub((64,),name="scratch")
-        for g in N.Pipelined(n,stages={max(offsets) + 1},issue_order={{"vector":{order!r}}}):
+        for g in N.Pipelined(n,issue_order={order!r}):
 {body}
 """
 

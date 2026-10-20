@@ -17,7 +17,7 @@ def parts(X:N.Tensor((n,8,4,64),N.f32),
         scratch=N.alloc_ub((2,4,64),N.f32)
         with N.Vector():
             for outer in N.serial(n):
-                for inner in N.Pipelined(8,stages=3):
+                for inner in N.Pipelined(8):
                     with N.Stage(0,name="load"):
                         for part in N.unroll(4):
                             N.copy(X[outer,inner,part,:],scratch[inner%2,part,:])

@@ -225,10 +225,7 @@ def test_a_finite_credit_fragment_cannot_license_sharing_its_later_loop():
         'def finite(O:N.Tensor((9,64),N.f32,access="write")):',
         'def finite(O:N.Tensor((9,64),N.f32,access="write"),n:N.int64):',
     )
-    source += (
-        "        for j in N.Pipelined(n,stages=1):\n"
-        "            N.fill(x0,2.0)\n            N.load_scalar(x0[:1])\n"
-    )
+    source += "        for j in N.Pipelined(n):\n            N.fill(x0,2.0)\n            N.load_scalar(x0[:1])\n"
     plan = synchronize_structure(N.from_source(source, disjoint_external=True))
     channel = next(c for c in plan.generation.channels if len(c.members) > 1)
     ids = {

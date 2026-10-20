@@ -58,11 +58,11 @@ def test_distinct_loop_operations_never_share_a_clock_by_label_or_bound():
         def sibling(n:N.int64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for a in N.Pipelined(n,stages=1):
+                for a in N.Pipelined(n):
                     N.fill(x,1.0)
-                for b in N.Pipelined(n,stages=1):
+                for b in N.Pipelined(n):
                     N.fill(x,2.0)
-    """)
+""")
     plan = lower_native_structure(source)
     first, second = build_control_facts(plan.module).loops.values()
     assert first.operation is not second.operation
@@ -119,9 +119,9 @@ def test_scalar_carry_retains_unknown_range_instead_of_an_assumed_nonnegative_va
                 count=0
                 for i in N.serial(n):
                     count=count-1
-                for j in N.Pipelined(count,stages=1):
+                for j in N.Pipelined(count):
                     pass
-    """)
+""")
     control = build_control_facts(lower_native_structure(source).module)
     serial, pipeline = control.loops.values()
     carry = control.environment.expression(serial.operation.results[0])
@@ -194,9 +194,9 @@ def test_complete_tiles_use_floor_bound_without_requiring_length_multiple():
         def full_tiles(X:N.Tensor((n,),N.f32),n:N.int64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for i in N.Pipelined(n//64,stages=1):
+                for i in N.Pipelined(n//64):
                     N.copy(X[i*64:(i+1)*64],x)
-    """)
+""")
     memory = collect_native_memory(lower_native_structure(source).module)
     bounds = admit_memory_bounds(memory)
     assert bounds.checked_accesses == 2

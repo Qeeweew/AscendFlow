@@ -30,7 +30,7 @@ def hierarchical_gemm(
         b0 = T.alloc_l0b((2, BK, N), DTYPE, name="b0")
         c0 = T.alloc_l0c((M, N), T.f32, name="c0")
         for output in T.serial(outputs):
-            for k in T.Pipelined(panels, stages=3):
+            for k in T.Pipelined(panels):
                 with T.Stage(0, name="load"):
                     av = T.copy(A[group, output, k, :, :], a1[k % 3, :, :])
                     bv = T.copy(B[group, output, k, :, :], b1[k % 3, :, :])

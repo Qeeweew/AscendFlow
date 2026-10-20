@@ -23,10 +23,10 @@ from ..dialects.source import (
     DomainOp,
     ElementOp,
     IndexReadOp,
+    IterationOp,
     MaskOp,
     MaterializeMaskOp,
     MatmulOp,
-    PipelineOp,
     PredicateOp,
     ProgramOp,
     ReduceOp,
@@ -255,7 +255,7 @@ class _Trace:
         self.blocks = [block]
         self.values = [[]]
         self.aliases = {}
-        self.pipelines = []
+        self.iterations = []
         self.kernel_entered = False
         self.counter = 0
         self.sizes = {}
@@ -403,7 +403,7 @@ class _Trace:
             if isinstance(owner, Block):
                 region = owner.parent_op()
                 require(
-                    isinstance(region, PipelineOp),
+                    isinstance(region, IterationOp),
                     "execution-owner coordinate escaped its source scope",
                 )
                 require(
@@ -1112,15 +1112,29 @@ class _RegionScope:
 class Stage(_RegionScope):
     def __init__(self, offset, *, name=None):
         trace = _trace()
-        require(trace.pipelines, "Stage requires an enclosing Pipelined")
+        require(trace.iterations, "Stage requires an enclosing Dataflow or Pipelined")
         require(
-            type(offset) is int and 0 <= offset < trace.pipelines[-1].stages.data,
-            "Stage exceeds this pipeline's horizon",
+            type(offset) is int and 0 <= offset <= 32,
+            "Stage offset must be a constexpr integer in [0,32]",
         )
+        parent = trace.blocks[-1].parent_op()
+        while isinstance(parent, DomainOp):
+            parent = parent.parent_op()
+        require(
+            parent is trace.iterations[-1],
+            "Stage must belong to its iteration through actor scopes",
+        )
+        family = _actor_family(trace)
+        require(
+            family is not None,
+            "mixed Stage requires an enclosing Cube or Vector scope",
+        )
+        require(name is None or type(name) is str and bool(name), "Stage name must be nonempty")
         self.op = StageOp.create(
             attributes={
                 "offset": IntAttr(offset),
-                "label": StringAttr(name or trace.name("stage")),
+                "label": StringAttr(name or ""),
+                "family": StringAttr(family),
             },
             regions=[Region(Block())],
         )
@@ -1144,30 +1158,48 @@ class Vector(Cube):
         self.op.attributes["kind"] = StringAttr("vector")
 
 
+def _actor_family(trace):
+    for block in reversed(trace.blocks):
+        owner = block.parent_op()
+        if isinstance(owner, DomainOp):
+            return owner.kind.data
+    return None if trace.op.kind.data == "mixed" else trace.op.kind.data
+
+
+def _iteration(count, issue_order):
+    trace = _trace()
+    if type(count) is int:
+        require(
+            0 <= count <= (1 << 63) - 1,
+            "iteration count must be a nonnegative int64",
+        )
+    return IterationOp.create(
+        operands=[] if type(count) is int else [trace.scalar(count)],
+        attributes={
+            "uid": StringAttr(trace.name("iteration")),
+            **({"count": IntAttr(count)} if type(count) is int else {}),
+            **_issue_order(issue_order),
+        },
+        regions=[Region(Block(arg_types=[IndexType()]))],
+    )
+
+
+class Dataflow:
+    def __init__(self, count, *, issue_order=None):
+        self.op = _iteration(count, issue_order)
+
+
 class Pipelined:
-    def __init__(self, count, *, stages, order="source", issue_order=None):
-        trace = _trace()
+    def __init__(self, count, *, issue_order=None):
+        family = _actor_family(_trace())
+        require(family is not None, "Pipelined is actor-local; use Dataflow for mixed iterations")
         require(
-            (type(count) is int and 0 <= count <= (1 << 63) - 1) or isinstance(count, _Dimension),
-            "pipeline limit must be an integer or explicit runtime size",
+            issue_order is None
+            or type(issue_order) is tuple
+            and all(type(name) is str for name in issue_order),
+            "Pipelined issue_order must be a tuple of local stage names",
         )
-        if isinstance(count, _Dimension):
-            require(count.scale == 1, "runtime pipeline limit must be an unscaled size")
-        require(
-            order == "source",
-            "automatic schedule is not implemented; use explicit Stage/source order",
-        )
-        self.op = PipelineOp.create(
-            operands=[trace.size(count)] if isinstance(count, _Dimension) else [],
-            attributes={
-                "uid": StringAttr(trace.name("pipeline")),
-                **({} if isinstance(count, _Dimension) else {"count": IntAttr(count)}),
-                "stages": IntAttr(stages),
-                "order": StringAttr(order),
-                **_issue_order(issue_order),
-            },
-            regions=[Region(Block(arg_types=[IndexType()]))],
-        )
+        self.op = _iteration(count, None if issue_order is None else {family: issue_order})
 
 
 def _issue_order(order):
@@ -1178,7 +1210,7 @@ def _issue_order(order):
         and all(
             type(key) is str
             and type(labels) is tuple
-            and all(type(label) is str for label in labels)
+            and all(type(label) is str and bool(label) for label in labels)
             for key, labels in order.items()
         ),
         "issue_order requires a literal actor-to-stage-label mapping",

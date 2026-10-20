@@ -242,9 +242,9 @@ def selected_last_identity():
     source = N.from_source("""
     def clocks(extent:N.int64(multiple_of=8)):
         with N.Kernel():
-            for p in N.Pipelined(extent//8,stages=1):
+            for p in N.Pipelined(extent//8):
                 pass
-    """)
+""")
     control = build_control_facts(lower_native_structure(source).module)
     (loop,) = control.loops.values()
     queries = IntegerFacts(control.environment.facts)

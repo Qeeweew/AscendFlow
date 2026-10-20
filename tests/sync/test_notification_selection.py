@@ -208,12 +208,12 @@ def test_unordered_same_engine_dependency_cannot_be_repaired_by_a_fence():
         def bad(n:N.int64):
             with N.Kernel():
                 x=N.alloc_ub((2,64))
-                for t in N.Pipelined(n,stages=3):
+                for t in N.Pipelined(n):
                     with N.Stage(2,name="first"):
                         N.fill(x[t%2,:],1.0)
                     with N.Stage(0,name="later"):
                         N.mul(x[t%2,:],2.0,out=x[t%2,:])
-        """)
+""")
 
 
 def test_selection_reuses_owned_memory_dependency_and_native_facts(monkeypatch):

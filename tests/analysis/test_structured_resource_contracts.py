@@ -35,7 +35,7 @@ FINITE = """
 def finite(X:N.Tensor((3,64),N.f32),O:N.Tensor((3,64),N.f32,access="write")):
     with N.Kernel():
         x,y=N.alloc_ub((3,64)),N.alloc_ub((3,64))
-        for j in N.Pipelined(3,stages=3):
+        for j in N.Pipelined(3):
             with N.Stage(0,name="load"):
                 value=N.copy(X[j,:],x[j,:])
             with N.Stage(1,name="compute"):
@@ -117,11 +117,11 @@ def finite_ports(*, at_most_one=False):
     def anchors(X:N.Tensor((n,64),N.f32),n:N.int64):
         with N.Kernel():
             a,b=N.alloc_ub((2,64)),N.alloc_ub((2,64))
-            for j in N.Pipelined(n,stages=1):
+            for j in N.Pipelined(n):
                 N.fill(a[j%2,:],1.0)
                 N.fill(b[j%2,:],1.0)
                 N.copy(X[j,:],a[j%2,:])
-    """)
+""")
     memory = selection.dependencies.memory
     logical = next(iter(memory.control.loops.values()))
     loop, ordinal, count = logical.operation, logical.ordinal, logical.count

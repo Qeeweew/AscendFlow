@@ -91,11 +91,11 @@ def test_actual_addresses_notifications_native_packets_and_pipeline_keep_identit
         def repeated():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for i in N.Pipelined(3, stages=2):
+                for i in N.Pipelined(3):
                     with N.Stage(1, name="write"):
                         N.fill(x, 1.0)
                         N.fill(x, 1.0)
-        """)
+""")
     )
     module = structure.module
     addresses = tuple(op for op in module.walk() if isinstance(op, AddressOp))
@@ -470,9 +470,9 @@ def test_public_admission_rejects_original_unsigned_expression_before_unit_foldi
         def invalid():
             with N.Kernel():
                 x=N.alloc_ub((2,64))
-                for i in N.Pipelined(2,stages=1):
+                for i in N.Pipelined(2):
                     N.fill(x[(i-1)//1,:],1.0)
-    """)
+""")
     with pytest.raises(CompileError, match="nonnegative dividend"):
         compile(source)
 
@@ -543,9 +543,9 @@ def test_public_compile_simplifies_final_ssa_once_after_notification_materializa
         def wired(n: N.int64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for i in N.Pipelined(n, stages=1):
+                for i in N.Pipelined(n):
                     N.fill(x, 1.0)
-    """)
+""")
     calls = []
     condition_calls = []
     original_conditions = structured_sync.simplify_conditions

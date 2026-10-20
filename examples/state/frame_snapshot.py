@@ -21,10 +21,10 @@ def frame_state_sum(
         for output in T.serial(outputs):
             T.copy(Initial[group, output, :], state)
             T.copy(state, Output[group, output, :])
-            for t in T.Pipelined(tiles, stages=2):
+            for t in T.Pipelined(tiles):
                 with T.Stage(0, name="load"):
                     T.copy(X[group, output, t, :], x[t % 2, :])
-                with T.Stage(1, name="update"), T.Vector():
+                with T.Vector(), T.Stage(1, name="update"):
                     T.add(state, x[t % 2, :], out=state)
             T.copy(Output[group, output, :], x[0, :])
             T.add(state, x[0, :], out=state)

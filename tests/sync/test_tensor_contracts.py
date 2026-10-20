@@ -22,7 +22,7 @@ def permuted(X:N.Tensor((8,64),N.f32),
              p:N.int64):
     with N.Kernel(3) as group:
         x=N.alloc_ub((64,))
-        for i in N.Pipelined(N.ceildiv(N.max(0,8-group),3),stages=1):
+        for i in N.Pipelined(N.ceildiv(N.max(0,8-group),3)):
             flat=group+i*3
             row=(flat*(2*p+1))%8
             N.copy(X[row,:],x)

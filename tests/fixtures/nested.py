@@ -25,19 +25,19 @@ def partitioned_cv(
         receive = N.alloc_l1((2, 16, 16), N.f16)
         u = N.alloc_ub((16, 16), N.f32)
         v = N.alloc_ub((16, 16), N.f16)
-        for t in N.Pipelined(n, stages=3):
-            with N.Stage(0, name="produce"), N.Cube():
+        for t in N.Dataflow(n):
+            with N.Cube(), N.Stage(0, name="produce"):
                 for part in N.unroll(2):
                     x = N.copy(X[t, part, :, :], l1[part, :, :])
                     aa = N.copy(x, a[part, :, :])
                     bb = N.copy(x, b[part, :, :], transpose=True)
                     z = N.matmul(aa, bb, accum=c[part, :, :], initialize=True)
                     N.copy(z, Exchange[t % 2, part * 16 : (part + 1) * 16, :])
-            with N.Stage(1, name="transform"), N.Vector() as lane:
+            with N.Vector() as lane, N.Stage(1, name="transform"):
                 x = N.copy(Exchange[t % 2, lane * 16 : (lane + 1) * 16, :], u)
                 y = N.cast(x, out=v)
                 N.copy(y, Back[t % 2, lane * 16 : (lane + 1) * 16, :])
-            with N.Stage(2, name="consume"), N.Cube():
+            with N.Cube(), N.Stage(2, name="consume"):
                 for part in N.unroll(2):
                     N.copy(Back[t % 2, part * 16 : (part + 1) * 16, :], receive[part, :, :])
 
@@ -51,15 +51,15 @@ def nested_copy(
 ):
     with N.Kernel():
         x = N.alloc_ub((2, 2, 8))
-        for t in N.Pipelined(n, stages=2):
+        for t in N.Pipelined(n):
             with N.Stage(0, name="produce"):
-                for j in N.Pipelined(4, stages=2):
+                for j in N.Pipelined(4):
                     with N.Stage(0, name="load"):
                         z = N.copy(X[t, j, :], x[t % 2, j % 2, :])
                     with N.Stage(1, name="store"):
                         N.copy(z, Y[t, j, :])
             with N.Stage(1, name="consume"):
-                for j in N.Pipelined(4, stages=2):
+                for j in N.Pipelined(4):
                     with N.Stage(0, name="load"):
                         z = N.copy(Y[t, j, :], x[t % 2, j % 2, :])
                     with N.Stage(1, name="store"):
@@ -81,12 +81,11 @@ def shared_l0c_qk_pv(
         pv_a = N.alloc_l0a((2, 16, 16), name="pv_a")
         pv_b = N.alloc_l0b((2, 16, 16), name="pv_b")
         c = N.alloc_l0c((2, 16, 16), name="c")
-        for t in N.Pipelined(n, stages=2, issue_order={"cube": ("qk", "pv")}):
+        for t in N.Pipelined(n, issue_order=("qk", "pv")):
             with N.Stage(0, name="qk"):
                 for j in N.Pipelined(
                     8,
-                    stages=4,
-                    issue_order={"cube": ("load", "mad", "operands", "export")},
+                    issue_order=("load", "mad", "operands", "export"),
                 ):
                     with N.Stage(0, name="load"):
                         x = N.copy(X[group, t, j, :, :], qk_l1[j % 2, :, :])
@@ -98,7 +97,7 @@ def shared_l0c_qk_pv(
                     with N.Stage(3, name="export"):
                         N.copy(z, Score[group, t % 2, :, j * 16 : (j + 1) * 16])
             with N.Stage(1, name="pv"):
-                for j in N.Pipelined(8, stages=1):
+                for j in N.Pipelined(8):
                     x = N.copy(X[group, t, j, :, :], pv_l1[j % 2, :, :])
                     a = N.copy(x, pv_a[j % 2, :, :])
                     b = N.copy(x, pv_b[j % 2, :, :], transpose=True)

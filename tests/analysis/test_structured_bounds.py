@@ -472,9 +472,9 @@ def test_statically_empty_access_skips_bounds_but_retains_real_local_allocation(
         def empty():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for i in N.Pipelined(0,stages=1):
+                for i in N.Pipelined(0):
                     N.fill(x,0.0)
-    """)
+""")
     plan = lower_native_structure(source)
     address = next(op for op in plan.module.walk() if isinstance(op, AddressOp))
     bad_offset = arith.ConstantOp.from_int_and_width(100_000, IndexType())
@@ -492,9 +492,9 @@ def test_empty_loop_does_not_excuse_invalid_native_geometry():
         def empty():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for i in N.Pipelined(0,stages=1):
+                for i in N.Pipelined(0):
                     N.fill(x,0.0)
-    """)
+""")
     plan = lower_native_structure(source)
     address = next(op for op in plan.module.walk() if isinstance(op, AddressOp))
     address.attributes["nbytes"] = IntAttr(0)
@@ -508,9 +508,9 @@ def test_unused_local_capacity_is_not_excused_by_an_empty_loop():
             with N.Kernel():
                 unused=N.alloc_ub((50000,))
                 x=N.alloc_ub((64,))
-                for i in N.Pipelined(0,stages=1):
+                for i in N.Pipelined(0):
                     N.fill(x,0.0)
-    """)
+""")
     memory = native_memory(source)
     with pytest.raises(CompileError, match="UB capacity exceeded") as error:
         admit_memory_bounds(memory)

@@ -6,7 +6,7 @@ from xdsl.dialects import arith, scf
 from ascendflow import compile
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import dump, parse
-from ascendflow.dialects.source import PipelineOp, SizeOp, YieldOp
+from ascendflow.dialects.source import IterationOp, SizeOp, YieldOp
 from ascendflow.frontend import FrontendError, from_source
 
 
@@ -45,7 +45,7 @@ def interpret(block, values, arguments):
             result = state
         elif isinstance(op, scf.YieldOp):
             return tuple(values[value] for value in op.arguments)
-        elif isinstance(op, PipelineOp):
+        elif isinstance(op, IterationOp):
             return values[op.limit] if op.limit is not None else op.count.data
         elif isinstance(op, YieldOp):
             return None
@@ -65,9 +65,9 @@ def test_serial_loop_carries_ssa_through_if_and_preserves_zero_iteration_value(n
                         total = total + i
                     else:
                         total = total + 1
-                for k in N.Pipelined(total, stages=1):
+                for k in N.Pipelined(total):
                     pass
-    """)
+""")
     source = parse(dump(definition.to_ir()))
     loop = next(op for op in source.walk() if isinstance(op, scf.ForOp))
     conditional = next(op for op in source.walk() if isinstance(op, scf.IfOp))
@@ -86,9 +86,9 @@ def test_serial_bound_is_captured_at_entry_even_when_carried_value_changes():
                 remaining = n
                 for i in N.serial(remaining):
                     remaining = remaining - 1
-                for k in N.Pipelined(remaining, stages=1):
+                for k in N.Pipelined(remaining):
                     pass
-    """).to_ir()
+""").to_ir()
     for n in (0, 1, 17):
         assert interpret(source.body.block.first_op.body.block, {}, {"n": n}) == 0
 
@@ -101,9 +101,9 @@ def test_if_can_define_a_new_scalar_on_both_paths_and_merge_it():
                     count = 2
                 else:
                     count = n
-                for k in N.Pipelined(count, stages=1):
+                for k in N.Pipelined(count):
                     pass
-    """).to_ir()
+""").to_ir()
     for n in (0, 3, 4, 17):
         assert interpret(source.body.block.first_op.body.block, {}, {"n": n}) == (2 if n < 4 else n)
 
@@ -114,9 +114,9 @@ def test_one_sided_definition_is_not_exported_as_an_initialized_scalar():
             with N.Kernel():
                 if n < 4:
                     count = 2
-                for k in N.Pipelined(count, stages=1):
+                for k in N.Pipelined(count):
                     pass
-    """)
+""")
     with pytest.raises(FrontendError, match="undefined DSL name count"):
         definition.to_ir()
 
@@ -130,9 +130,9 @@ def test_explicit_unroll_preserves_constant_updates(count):
                 total = 2
                 for i in N.unroll(COUNT):
                     total = total + 1
-                for k in N.Pipelined(total, stages=1):
+                for k in N.Pipelined(total):
                     pass
-    """,
+""",
         constants={"COUNT": count},
     ).to_ir()
     assert interpret(source.body.block.first_op.body.block, {}, {}) == count + 2
@@ -149,8 +149,8 @@ def test_boolean_merge_is_not_a_host_boolean():
                     count = 2
                 else:
                     count = 5
-                for k in N.Pipelined(count, stages=1):
+                for k in N.Pipelined(count):
                     pass
-    """).to_ir()
+""").to_ir()
     for n in (1, 5):
         assert interpret(source.body.block.first_op.body.block, {}, {"n": n}) == (2 if n < 4 else 5)

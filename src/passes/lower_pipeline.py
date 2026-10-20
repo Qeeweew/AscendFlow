@@ -19,8 +19,7 @@ from xdsl.dialects.builtin import ModuleOp
 from xdsl.passes import ModulePass
 
 from ..analysis.iteration import LoopControl, LoopControls, iteration_domain
-from ..diagnostics import require
-from ..dialects.source import PipelineOp, StageOp
+from ..dialects.source import IterationOp
 
 
 def normalize_loop_controls(module: ModuleOp) -> LoopControls:
@@ -32,43 +31,25 @@ def normalize_loop_controls(module: ModuleOp) -> LoopControls:
     loops, index = [], {}
     visited = 0
 
-    def visit(operation, parent=None, stage=0):
+    def visit(operation, parent=None):
         nonlocal visited
         visited += 1
-        child_parent, child_stage = parent, stage
-        if isinstance(operation, (PipelineOp, scf.ForOp)):
+        child_parent = parent
+        if isinstance(operation, (IterationOp, scf.ForOp)):
             domain = iteration_domain(operation)
-            horizon = (
-                max(
-                    (op.offset.data for op in operation.body.block.ops if isinstance(op, StageOp)),
-                    default=0,
-                )
-                if isinstance(operation, PipelineOp)
-                else 0
-            )
             control = LoopControl(
                 operation,
                 domain,
-                horizon,
                 parent,
-                stage,
                 1 if parent is None else parent.depth + 1,
             )
             loops.append(control)
             index[operation] = control
-            child_parent, child_stage = control, 0
-        elif isinstance(operation, StageOp):
-            require(
-                parent is not None and operation.parent_op() is parent.operation,
-                "Stage must belong to its actual enclosing loop",
-                phase="loop-control",
-                location=str(operation.location),
-            )
-            child_stage = operation.offset.data
+            child_parent = control
         for region in operation.regions:
             for block in region.blocks:
                 for child in block.ops:
-                    visit(child, child_parent, child_stage)
+                    visit(child, child_parent)
 
     visit(module)
     return LoopControls(module, tuple(loops), MappingProxyType(index), visited)

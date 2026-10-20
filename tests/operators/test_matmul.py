@@ -10,6 +10,7 @@ from ascendflow.build import build_file
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import parse
 from ascendflow.target.native import NativeGeometry, native_contract
+from examples.gemm.matmul import accumulate_panel, import_panel
 from examples.gemm.schedule import l2_tile
 from tests.models.structured_events import check_structured_events
 
@@ -105,9 +106,15 @@ def test_group_dependent_first_iteration_cannot_hide_owner_collisions(mapping):
     text = text[text.index("def gemm(") :].replace(
         "group + tile * GROUPS", "(" + mapping + ") % count"
     )
-    source = T.from_source(text, functions={"l2_tile": l2_tile}, disjoint_external=True).specialize(
-        M=64, N=80, K=16, BM=16, BN=16, BK=16, CK=16, GROUPS=3
-    )
+    source = T.from_source(
+        text,
+        functions={
+            "l2_tile": l2_tile,
+            "import_panel": import_panel,
+            "accumulate_panel": accumulate_panel,
+        },
+        disjoint_external=True,
+    ).specialize(M=64, N=80, K=16, BM=16, BN=16, BK=16, CK=16, GROUPS=3)
     memory = collect_native_memory(compile(source).plan)
     with pytest.raises(EventModelError, match="unordered physical WAW"):
         check_structured_events(memory, groups=(0, 1, 2))
@@ -240,9 +247,15 @@ def test_swizzle_collisions_are_not_an_ownership_contract(before, after):
     text = text[text.index("def gemm(") :]
     assert before in l2_tile.source
     broken = replace(l2_tile, source=l2_tile.source.replace(before, after))
-    source = T.from_source(text, functions={"l2_tile": broken}, disjoint_external=True).specialize(
-        M=64, N=128, K=16, BM=16, BN=16, BK=16, CK=16, GROUPS=3, L2_TILE=2
-    )
+    source = T.from_source(
+        text,
+        functions={
+            "l2_tile": broken,
+            "import_panel": import_panel,
+            "accumulate_panel": accumulate_panel,
+        },
+        disjoint_external=True,
+    ).specialize(M=64, N=128, K=16, BM=16, BN=16, BK=16, CK=16, GROUPS=3, L2_TILE=2)
     memory = collect_native_memory(compile(source).plan)
     with pytest.raises(EventModelError, match="unordered physical WAW"):
         check_structured_events(memory, groups=(0, 1, 2))

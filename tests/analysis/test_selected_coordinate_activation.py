@@ -50,13 +50,13 @@ def selected_context():
     def selected_clocks(X:N.Tensor((64,),N.f32),n:N.int64,m:N.int64):
         with N.Kernel():
             x=N.alloc_ub((64,))
-            for p in N.Pipelined(n,stages=1):
-                for g in N.Pipelined(m,stages=2):
+            for p in N.Pipelined(n):
+                for g in N.Pipelined(m):
                     with N.Stage(0):
                         value=N.copy(X[:],x[:])
                     with N.Stage(1):
                         N.mul(value,2.0,out=x[:])
-    """)
+""")
     memory = collect_native_memory(lower_native_structure(source).module)
     dependencies = build_structured_dependencies(memory)
     base = dependencies.required[0]

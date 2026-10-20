@@ -6,7 +6,7 @@ from xdsl.utils.exceptions import VerifyException
 
 from ascendflow import language as N
 from ascendflow.dialects.io import dump, parse
-from ascendflow.dialects.source import AllocationOp, DomainOp, PipelineOp, StageOp, ViewOp
+from ascendflow.dialects.source import AllocationOp, DomainOp, IterationOp, StageOp, ViewOp
 from ascendflow.dialects.types import TileType
 from ascendflow.frontend import FrontendError
 from tests.fixtures.source_programs import cv_source, vector_source
@@ -17,9 +17,9 @@ def test_typed_copy_requires_an_explicit_rounding_conversion():
         def invalid(X:N.Tensor((1,64),N.f32)):
             with N.Kernel():
                 output=N.alloc_ub((64,),N.f16)
-                for task in N.Pipelined(1,stages=1):
+                for task in N.Pipelined(1):
                     N.copy(X[task,:],output)
-    """)
+""")
     with pytest.raises(FrontendError, match="explicit cast"):
         definition.to_ir()
 
@@ -29,9 +29,9 @@ def test_source_axis_bounds_are_checked_before_flattening_addresses():
         def invalid(X:N.Tensor((2,64),N.f32)):
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for task in N.Pipelined(1,stages=1):
+                for task in N.Pipelined(1):
                     N.copy(X[task,64:128],x)
-    """)
+""")
     with pytest.raises(FrontendError, match="logical axis"):
         definition.to_ir()
 
@@ -41,10 +41,10 @@ def test_incompatible_domain_is_rejected_without_silently_dropping_work():
         def invalid(X:N.Tensor((1,64),N.f32)):
             with N.Kernel(kind="vector"):
                 x=N.alloc_ub((64,))
-                for task in N.Pipelined(1,stages=1):
+                for task in N.Pipelined(1):
                     with N.Cube():
                         N.copy(X[task,:],x)
-    """)
+""")
     with pytest.raises(VerifyException, match="kernel kind"):
         definition.to_ir()
 
@@ -52,8 +52,8 @@ def test_incompatible_domain_is_rejected_without_silently_dropping_work():
 @pytest.mark.parametrize("count", [0, 1, 2, 4])
 def test_ast_stages_retain_one_task_coordinate_and_explicit_slot_axes(count):
     source = parse(dump(vector_source(count)))
-    pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
-    stages = [op for op in pipeline.body.block.ops if isinstance(op, StageOp)]
+    pipeline = next(op for op in source.walk() if isinstance(op, IterationOp))
+    stages = [op for op in pipeline.walk() if isinstance(op, StageOp)]
     assert pipeline.count.data == count
     assert [op.offset.data for op in stages] == [0, 1, 2]
     assert len(pipeline.body.block.args) == 1
@@ -68,8 +68,8 @@ def test_ast_stages_retain_one_task_coordinate_and_explicit_slot_axes(count):
 
 def test_ast_cv_regions_share_stage_one_without_merging_their_semantics():
     source = parse(dump(cv_source()))
-    pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
-    stages = [op for op in pipeline.body.block.ops if isinstance(op, StageOp)]
+    pipeline = next(op for op in source.walk() if isinstance(op, IterationOp))
+    stages = [op for op in pipeline.walk() if isinstance(op, StageOp)]
     assert [op.offset.data for op in stages] == [0, 1, 1, 2]
     assert [op.label.data for op in stages] == ["qk", "vector", "pv", "output"]
     assert [op.kind.data for op in source.walk() if isinstance(op, DomainOp)] == [
@@ -95,10 +95,15 @@ def test_ast_cv_regions_share_stage_one_without_merging_their_semantics():
 
 def test_stage_depth_does_not_silently_change_explicit_buffer_slots():
     source = vector_source()
-    pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
-    pipeline.attributes["stages"] = IntAttr(2)
-    with pytest.raises(VerifyException, match="stage horizon"):
-        source.verify()
+    pipeline = next(op for op in source.walk() if isinstance(op, IterationOp))
+    stage = next(op for op in pipeline.walk() if isinstance(op, StageOp))
+    stage.offset = IntAttr(32)
+    source.verify()
+    assert {
+        tuple(n.data for n in op.ref.type.shape)
+        for op in source.walk()
+        if isinstance(op, AllocationOp) and op.ref.type.memory.data == "UB"
+    } == {(2, 64)}
 
 
 def test_region_yield_types_are_verified_after_source_roundtrip():

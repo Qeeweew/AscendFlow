@@ -12,14 +12,14 @@ def pitched_children(
     with N.Kernel(2, kind="vector") as group:
         tiles = N.alloc_ub((2, 4, 8), N.f32)
         full = N.alloc_ub((4, 32), N.f32)
-        for j in N.Pipelined(4, stages=3):
+        for j in N.Pipelined(4):
             with N.Stage(0, name="load"):
                 value = N.copy(X[group, :, j * 8 : (j + 1) * 8], tiles[j % 2, :, :])
             with N.Stage(1, name="scale"):
                 scaled = N.mul(value, 2.0, out=tiles[j % 2, :, :])
             with N.Stage(2, name="store"):
                 N.copy(scaled, Y[group, :, j * 8 : (j + 1) * 8])
-        for k in N.Pipelined(1, stages=1):
+        for k in N.Pipelined(1):
             imported = N.copy(Y[group, :, :], full)
             N.copy(imported, O[group, :, :])
 
@@ -34,7 +34,7 @@ def cube_columns(
         a = N.alloc_l0a((2, 16, 16))
         b = N.alloc_l0b((2, 16, 16))
         c = N.alloc_l0c((2, 16, 16))
-        for i in N.Pipelined(8, stages=4):
+        for i in N.Pipelined(8):
             with N.Stage(0, name="load"):
                 x = N.copy(X[group, i, :, :], l1[i % 2, :, :])
             with N.Stage(1, name="operands"):

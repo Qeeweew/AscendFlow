@@ -18,12 +18,12 @@ def base():
     def clocks(X:N.Tensor((n,64),N.f32),n:N.int64,m:N.int64):
         with N.Kernel():
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
-            for p in N.Pipelined(n,stages=2):
+            for p in N.Pipelined(n):
                 with N.Stage(0):
                     value=N.copy(X[p,:],x[:])
                 with N.Stage(1):
                     N.mul(value,2.0,out=y[:])
-    """)
+""")
 
 
 def parameter_domain(base, period):

@@ -271,13 +271,13 @@ class SizeOp(IRDLOperation):
 
 
 @irdl_op_definition
-class PipelineOp(IRDLOperation):
-    name = "npu_source.pipeline"
+class IterationOp(IRDLOperation):
+    """A logical iteration domain, independent of any actor's issue clock."""
+
+    name = "npu_source.iteration"
     uid = attr_def(StringAttr)
     count = opt_attr_def(IntAttr)
     limit = opt_operand_def(IndexType)
-    stages = attr_def(IntAttr)
-    order = attr_def(StringAttr)
     issue_order = opt_attr_def(DictionaryAttr)
     body = region_def("single_block")
     values = var_result_def(TileType)
@@ -285,27 +285,19 @@ class PipelineOp(IRDLOperation):
 
     def verify_(self):
         _verify_yield(self)
-        if (
-            (self.count is None) == (self.limit is None)
-            or (self.count is not None and not 0 <= self.count.data <= (1 << 63) - 1)
-            or not 1 <= self.stages.data <= 33
-            or self.order.data != "source"
+        if (self.count is None) == (self.limit is None) or (
+            self.count is not None and not 0 <= self.count.data <= (1 << 63) - 1
         ):
-            raise VerifyException(
-                "fixed pipeline needs bounded count/stage horizon and source order"
-            )
+            raise VerifyException("iteration needs one bounded static or runtime count")
         # Arithmetic bounds stay in source SSA. Target lowering must separately
         # prove uniformity/range and reject unsupported expressions.
         if len(self.body.block.args) != 1 or not isinstance(
             self.body.block.args[0].type, IndexType
         ):
-            raise VerifyException("pipeline region has one logical task coordinate")
-        for op in self.body.block.ops:
-            if isinstance(op, StageOp) and not 0 <= op.offset.data < self.stages.data:
-                raise VerifyException("Stage offset lies outside this pipeline's stage horizon")
+            raise VerifyException("iteration region has one logical task coordinate")
         if self.issue_order is not None:
             parent = self.parent_op()
-            while parent is not None and not isinstance(parent, ProgramOp):
+            while parent is not None and not isinstance(parent, (DomainOp, ProgramOp)):
                 parent = parent.parent_op()
             allowed = (
                 {"cube", "vector"}
@@ -316,7 +308,7 @@ class PipelineOp(IRDLOperation):
                 if (
                     actor not in allowed
                     or not isinstance(labels, ArrayAttr)
-                    or any(not isinstance(label, StringAttr) for label in labels)
+                    or any(not isinstance(label, StringAttr) or not label.data for label in labels)
                 ):
                     raise VerifyException("issue_order needs actor names and stage label arrays")
                 if len({label.data for label in labels}) != len(labels):
@@ -328,6 +320,7 @@ class StageOp(IRDLOperation):
     name = "npu_source.stage"
     offset = attr_def(IntAttr)
     label = attr_def(StringAttr)
+    family = attr_def(StringAttr)
     body = region_def("single_block")
     values = var_result_def(TileType)
     traits = traits_def(RecursiveMemoryEffect())
@@ -335,8 +328,26 @@ class StageOp(IRDLOperation):
     def verify_(self):
         _verify_yield(self)
         parent = self.parent_op()
-        if not isinstance(parent, PipelineOp) or not 0 <= self.offset.data < parent.stages.data:
-            raise VerifyException("Stage must be directly inside its pipeline's stage horizon")
+        family = None
+        while isinstance(parent, DomainOp):
+            family = parent.kind.data
+            parent = parent.parent_op()
+        if not isinstance(parent, IterationOp) or not 0 <= self.offset.data <= 32:
+            raise VerifyException(
+                "Stage needs its iteration through actor scopes and offset in [0,32]"
+            )
+        if family is None:
+            context = self.parent_op()
+            while context is not None:
+                if isinstance(context, DomainOp):
+                    family = context.kind.data
+                    break
+                if isinstance(context, ProgramOp):
+                    family = context.kind.data
+                    break
+                context = context.parent_op()
+        if family not in {"cube", "vector"} or self.family.data != family:
+            raise VerifyException("Stage must belong to its actual Cube or Vector actor")
         if self.body.block.args:
             raise VerifyException("Stage inherits its pipeline coordinate")
 
@@ -404,7 +415,7 @@ def _verify_index_provenance(value, use, seen, active, positions, ancestors, dep
     if isinstance(owner, Block):
         region = owner.parent_op()
         if (
-            not isinstance(region, (ProgramOp, PipelineOp, DomainOp, scf.ForOp))
+            not isinstance(region, (ProgramOp, IterationOp, DomainOp, scf.ForOp))
             or value is not owner.args[0]
         ):
             raise VerifyException("view index needs a declared source coordinate")
@@ -1179,7 +1190,7 @@ SOURCE = Dialect(
         ProgramOp,
         AllocationOp,
         SizeOp,
-        PipelineOp,
+        IterationOp,
         StageOp,
         DomainOp,
         ViewOp,

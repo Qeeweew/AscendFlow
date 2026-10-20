@@ -11,7 +11,7 @@ def nested(X:N.Tensor((n,2,64),N.f32),n:N.int64):
     with N.Kernel():
         x=N.alloc_ub((2,64))
         for outer in N.serial(n):
-            for inner in N.Pipelined(2,stages=2):
+            for inner in N.Pipelined(2):
                 with N.Stage(0):
                     value=N.copy(X[outer,inner,:],x[inner,:])
                 with N.Stage(1):

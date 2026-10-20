@@ -13,7 +13,7 @@ def test_exact_and_shifted_overlaps_are_refused_without_memmove_assumptions(dest
 def overlap(n:N.int64):
     with N.Kernel():
         x=N.alloc_ub((32,),N.f32)
-        for tile in N.Pipelined(n,stages=1):
+        for tile in N.Pipelined(n):
             N.fill(x,1.0)
             N.copy(x[0:16],x[{destination}])
 """
@@ -26,7 +26,7 @@ def test_generation_dependent_aliases_are_not_assumed_disjoint():
 def changing(n:N.int64):
     with N.Kernel():
         x=N.alloc_ub((3,8),N.f32)
-        for tile in N.Pipelined(n,stages=1):
+        for tile in N.Pipelined(n):
             N.fill(x,1.0)
             N.copy(x[tile%2,:],x[tile%3,:])
 """

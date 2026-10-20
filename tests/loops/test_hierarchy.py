@@ -3,7 +3,7 @@
 from xdsl.dialects import arith, scf
 
 from ascendflow.dialects.io import dump, parse
-from ascendflow.dialects.source import AllocationOp, PipelineOp, ProgramOp, SizeOp, ViewOp
+from ascendflow.dialects.source import AllocationOp, IterationOp, ProgramOp, SizeOp, ViewOp
 from examples.gemm.hierarchical import hierarchical_gemm
 
 
@@ -51,7 +51,7 @@ def test_parent_and_child_coordinates_and_axis_extents_are_retained_in_ir():
     program = module.body.block.first_op
     assert isinstance(program, ProgramOp)
     parents = [op for op in module.walk() if isinstance(op, scf.ForOp)]
-    children = [op for op in module.walk() if isinstance(op, PipelineOp)]
+    children = [op for op in module.walk() if isinstance(op, IterationOp)]
     assert len(parents) == len(children) == 1
     parent, child = parents[0], children[0]
     assert child.parent_op() is parent

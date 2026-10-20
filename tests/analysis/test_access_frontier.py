@@ -20,7 +20,7 @@ from ascendflow.target.ascend910b import Actor
 
 @pytest.mark.parametrize("serial", [False, True])
 def test_actual_loop_selection_guards_empty_and_short_before_last_ordinal(serial):
-    loop_source = "N.serial(3,10,2)" if serial else "N.Pipelined(7,stages=1)"
+    loop_source = "N.serial(3,10,2)" if serial else "N.Pipelined(7)"
     plan = lower_native_structure(
         N.from_source(f"""
         def select():
@@ -52,11 +52,11 @@ def test_residue_selection_preserves_loop_identity_and_rejects_bad_domains():
         N.from_source("""
         def loops():
             with N.Kernel():
-                for a in N.Pipelined(2,stages=1):
+                for a in N.Pipelined(2):
                     pass
-                for b in N.Pipelined(2,stages=1):
+                for b in N.Pipelined(2):
                     pass
-    """)
+""")
     )
     first, second = tuple(plan.loops.values())
     a = LoopResidueSelection(first, 2, 0, ResiduePosition.LAST)

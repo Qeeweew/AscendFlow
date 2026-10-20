@@ -14,7 +14,7 @@ from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import parse
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.scalar import expression, literal
-from examples.gemm.dense import dense_gemm
+from examples.gemm.dense import accumulate_panel, dense_gemm, import_panel
 from tests.models.structured_events import EventModelError, check_structured_events
 
 EXAMPLE = Path(__file__).parents[2] / "examples/gemm/dense.py"
@@ -110,7 +110,11 @@ def test_aliasing_owner_maps_violate_the_source_parallel_contract(mapping):
         "index = group + tile * GROUPS", "index = (" + mapping + ") % tiles"
     )
     text = text[text.index("def dense_gemm(") :]
-    source = T.from_source(text, disjoint_external=True)
+    source = T.from_source(
+        text,
+        functions={"import_panel": import_panel, "accumulate_panel": accumulate_panel},
+        disjoint_external=True,
+    )
     source = source.specialize(M=64, N=80, K=16, BM=16, BN=16, BK=16, CK=16, COL_PARTS=1, GROUPS=3)
     memory = collect_native_memory(compile(source).plan)
     with pytest.raises(EventModelError, match="unordered physical WAW"):

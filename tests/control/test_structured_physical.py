@@ -150,7 +150,7 @@ def test_nonzero_lower_and_step_bind_stage_local_ordinal_and_iv(upper):
     module.verify()
     count = len(range(2, upper, 3))
     actual = []
-    for physical_step in range(count + loop.horizon):
+    for physical_step in range(count + max(work.offset.data for work in stages)):
         for rank, work in enumerate(stages):
             ordinal = physical_step - work.offset.data
             if 0 <= ordinal < count:

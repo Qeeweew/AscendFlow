@@ -31,14 +31,14 @@ def contract_source(*, minimum=1, multiple=4):
             with T.Kernel():
                 x=T.alloc_ub((2,B))
                 y=T.alloc_ub((2,B))
-                for i in T.Pipelined(n,stages=3):
+                for i in T.Pipelined(n):
                     with T.Stage(0):
                         T.copy(X[i,:],x[i%2,:])
                     with T.Stage(1):
                         T.mul(x[i%2,:],2.0,out=y[i%2,:])
                     with T.Stage(2):
                         T.copy(y[i%2,:],Y[i,:])
-        """,
+""",
         disjoint_external=True,
     ).specialize(MINIMUM=minimum, MULTIPLE=multiple)
 
@@ -164,9 +164,9 @@ def test_positive_input_contract_does_not_require_nonempty_kernel_work(tmp_path)
         def empty(n:T.int64(minimum=1)):
             with T.Kernel(2):
                 x=T.alloc_ub((64,))
-                for i in T.Pipelined(0,stages=1):
+                for i in T.Pipelined(0):
                     T.fill(x,0.0)
-    """)
+""")
     )
     library, launch = host_launcher(artifact, tmp_path)
     assert contracts(parse(artifact.plan_ir), RuntimeSizeOp) == {"n": (1, 1)}

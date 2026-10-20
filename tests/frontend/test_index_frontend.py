@@ -12,7 +12,7 @@ from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import dump, parse
 from ascendflow.dialects.source import (
     AllocationOp,
-    PipelineOp,
+    IterationOp,
     ProgramOp,
     SizeOp,
     StageOp,
@@ -34,7 +34,7 @@ BNSD_COPY = """
             x=N.alloc_ub((2,R,D))
             tiles=S//R
             work=N.ceildiv(N.max(0,B*H*tiles-group),GROUPS)
-            for task in N.Pipelined(work,stages=2):
+            for task in N.Pipelined(work):
                 flat=group+task*GROUPS
                 batch=flat//(H*tiles)
                 head=(flat//tiles)%H
@@ -50,7 +50,7 @@ BNSD_COPY = """
 def test_runtime_bnsd_coordinates_retain_each_original_axis_and_cover_uneven_work():
     module = parse(dump(N.from_source(BNSD_COPY).to_ir()))
     program = next(op for op in module.walk() if isinstance(op, ProgramOp))
-    pipeline = next(op for op in module.walk() if isinstance(op, PipelineOp))
+    pipeline = next(op for op in module.walk() if isinstance(op, IterationOp))
     size = next(op for op in module.walk() if isinstance(op, SizeOp))
     external = {
         op.source.owner.sym_name.data: op
@@ -94,7 +94,7 @@ def test_runtime_bnsd_coordinates_retain_each_original_axis_and_cover_uneven_wor
 
 def test_index_first_used_in_stage_zero_dominates_later_stages():
     module = parse(dump(N.from_source(BNSD_COPY).to_ir()))
-    pipeline = next(op for op in module.walk() if isinstance(op, PipelineOp))
+    pipeline = next(op for op in module.walk() if isinstance(op, IterationOp))
     slot = next(
         op
         for op in pipeline.body.block.ops
@@ -121,15 +121,15 @@ def test_serial_coordinate_times_uniform_factor_and_shifted_division_use_whole_e
                     with N.Kernel():
                         x=N.alloc_ub((2,64))
                         for outer in N.serial(n):
-                            for inner in N.Pipelined(m,stages=1):
+                            for inner in N.Pipelined(m):
                                 flat=outer*m+inner+3
                                 slot=(flat//m)%2
                                 N.fill(x[slot,:],0.0)
-            """).to_ir()
+""").to_ir()
         )
     )
     serial = next(op for op in module.walk() if isinstance(op, scf.ForOp))
-    pipeline = next(op for op in module.walk() if isinstance(op, PipelineOp))
+    pipeline = next(op for op in module.walk() if isinstance(op, IterationOp))
     sizes = {op.sym_name.data: op.value for op in module.walk() if isinstance(op, SizeOp)}
     view = next(op for op in module.walk() if isinstance(op, ViewOp))
     for n, m in ((1, 1), (3, 2), (5, 7)):
@@ -174,9 +174,9 @@ def test_invalid_relative_views_and_divisors_are_rejected(view, diagnostic):
         def invalid():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for task in N.Pipelined(2,stages=1):
+                for task in N.Pipelined(2):
                     N.fill({view},0.0)
-    """)
+""")
     with pytest.raises(FrontendError, match=diagnostic):
         definition.to_ir()
 
@@ -194,9 +194,9 @@ def test_narrowing_dynamic_parent_cannot_discard_its_original_width(shape, view)
         def invalid():
             with N.Kernel():
                 x=N.alloc_ub({shape})
-                for task in N.Pipelined(2,stages=1):
+                for task in N.Pipelined(2):
                     N.fill({view},0.0)
-    """)
+""")
     with pytest.raises(FrontendError, match="dynamic origin needs a parent range proof"):
         definition.to_ir()
 
@@ -207,10 +207,10 @@ def test_dynamic_parent_may_keep_the_same_origin_and_width(selection):
         def nested():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for task in N.Pipelined(2,stages=1):
+                for task in N.Pipelined(2):
                     N.fill(x[task*16:task*16+16][{selection}],0.0)
-    """).to_ir()
-    pipeline = next(op for op in module.walk() if isinstance(op, PipelineOp))
+""").to_ir()
+    pipeline = next(op for op in module.walk() if isinstance(op, IterationOp))
     view = next(op for op in module.walk() if isinstance(op, ViewOp))
     assert tuple(width.data for width in view.widths) == (16,)
     for task in range(2):
@@ -226,10 +226,10 @@ def test_valid_prefix_is_an_explicit_index_operand_with_verified_provenance():
                     with N.Kernel():
                         x=N.alloc_ub((64,))
                         y=N.alloc_ub((64,))
-                        for task in N.Pipelined(n,stages=1):
+                        for task in N.Pipelined(n):
                             valid=N.min(64,N.max(0,n-task*64))
                             N.copy(x,y,valid=valid)
-            """).to_ir()
+""").to_ir()
         )
     )
     views = [op for op in module.walk() if isinstance(op, ViewOp)]
@@ -249,7 +249,7 @@ def escaped_child_index(count):
     trace = source_builders._Trace("exported", False)
     token = source_builders._current.set(trace)
     try:
-        child = source_builders.Pipelined(count, stages=1).op
+        child = source_builders.Pipelined(count).op
         trace.enter(child)
         coordinate = source_builders._coordinate(child.body.block.args[0])
         index = ((coordinate + 1) % 2) * 16
@@ -365,7 +365,7 @@ def test_real_attention_math_and_descriptors_reach_verified_source_ir(continuous
     source.verify()
     assert sum(isinstance(op, MatmulOp) for op in source.walk()) == 4
     assert sum(isinstance(op, ReduceOp) for op in source.walk()) == 2
-    assert sum(isinstance(op, PipelineOp) for op in source.walk()) == 5
+    assert sum(isinstance(op, IterationOp) for op in source.walk()) == 5
     assert any(
         isinstance(op, ElementOp)
         and op.kind.data == "fill"

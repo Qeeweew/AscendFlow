@@ -22,7 +22,7 @@ def chain(A:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write"),n:N.int
     result += "        N.copy(A,x)\n"
     for i in range(streams):
         result += (
-            f"        for t{i} in N.Pipelined(n,stages=1):\n"
+            f"        for t{i} in N.Pipelined(n):\n"
             f'            with N.Stage(0,name="scale{i}"):\n'
             "                N.mul(x,2.0,out=x)\n"
         )

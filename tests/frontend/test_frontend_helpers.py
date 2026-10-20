@@ -7,7 +7,7 @@ from ascendflow import language as T
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import parse
-from ascendflow.dialects.source import PipelineOp
+from ascendflow.dialects.source import IterationOp
 from ascendflow.frontend import FrontendError
 from tests.models.structured_events import check_structured_events
 
@@ -25,13 +25,13 @@ def test_edge_ranges_and_inline_copies_preserve_byte_versions_and_consumed_event
             with T.Kernel(1):
                 for base,count,valid in T.tile_ranges(E,64):
                     x=T.alloc_ub((2,valid),T.f32)
-                    for i in T.Pipelined(count,stages=2):
+                    for i in T.Pipelined(count):
                         start=base+i*64
                         with T.Stage(0,name="load"):
                             helper(A[start:start+valid], x[i%2,:])
                         with T.Stage(1,name="store"):
                             helper(x[i%2,:], C[start:start+valid])
-        """,
+""",
         constants={"E": extent},
         functions={"helper": _copy},
         disjoint_external=True,
@@ -51,12 +51,12 @@ def test_static_ranges_skip_empty_work_and_retain_large_device_loops(extent):
             with T.Kernel():
                 x=T.alloc_ub((64,),T.f32)
                 for base,count,valid in T.tile_ranges(E,64):
-                    for i in T.Pipelined(count,stages=1):
+                    for i in T.Pipelined(count):
                         T.fill(x,1.0)
-        """,
+""",
         constants={"E": extent},
     )
-    pipelines = [op for op in program.to_ir().walk() if isinstance(op, PipelineOp)]
+    pipelines = [op for op in program.to_ir().walk() if isinstance(op, IterationOp)]
     assert sum(op.count.data for op in pipelines) == (extent + 63) // 64
     assert len(pipelines) <= 2
 
@@ -189,10 +189,10 @@ def test_inline_cannot_mask_an_undefined_unsigned_divisor():
         def invalid(A:T.Tensor((64,),T.f32)):
             with T.Kernel():
                 x=T.alloc_ub((64,),T.f32)
-                for i in T.Pipelined(1,stages=1):
+                for i in T.Pipelined(1):
                     start=offset(i)
                     T.copy(A[start:start+64],x)
-        """,
+""",
         functions={"offset": offset},
     )
     with pytest.raises(CompileError, match="divisor|division|unsigned"):

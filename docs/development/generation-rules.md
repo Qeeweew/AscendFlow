@@ -14,7 +14,7 @@
 | 私有 packet 的物理复用 | 局部完整写入、内部读绑定及实际 stage 顺序 | storage_packets / storage_word；局部完整 packet 的实际邻接 | access_order | 改 native 覆盖、slot、dispatch、packet 前提 |
 | 真实 Set/Wait 位置和覆盖 | 上述必要依赖 | notification binding；保留原始 ownership edge，可增加 coverage | 域、阶段序、credit | 改捕获/等待位置或 activation |
 | 存在域、配对、原式定义性 | 实际位置、祖先坐标、有序 guard | EventDomains；一次建立的 cases/windows | credit、资源和物化 | 改位置、坐标、guard、ordinal |
-| 无循环等待 | actual physical step、queue/controller 路由 | queue_order；每层 phase rank 和 child may-block cuts | credit 构造及输出合同 | 改排步、路由、参与者、Wait 位置 |
+| 无循环等待 | actor-local epoch、queue/controller 路由 | queue_order；每层 phase rank 和 child may-block cuts | credit 构造及输出合同 | 改排步、路由、参与者、Wait 位置 |
 | 消费先于复用 | 原始 ownership edge、完整邻接 lifetime，或明确 queue handback | cell_channels / notification_lifetimes；完整事件生命周期 | bank 分配 | 改 credit 成员、width、ordinal、原始 edge |
 | bank/ID/共享 | 已确定生命周期、配置和最终 drain 预留 | structured_resources；实际 ID 台账及新增共享关系 | 物化 | 改 namespace、ID、共享成员、width |
 | 输出对应 | 唯一生成计划及本次拥有的 IR | materialize；实际 NotificationOp | scalar 化简、ASC | 移动/删除 native 或同步、改 guard |
@@ -57,16 +57,28 @@ source，每个 receiver 的已有 acquire 都先于所需 consumer，才能复�
 相同 Stage、ActorDomain 或共同写入某个 cell 都不授权合并独立完成边界；
 不能为了节省 ID 将多个独立通知改成「最后 capture → 最早 acquire」。
 
-## 2. physical-step 和局部阶段序
+## 2. actor 本地时钟和局部阶段序
 
-在每个共同祖先从外向内比较 `actual ordinal + stage`。严格前进即进入下一
-physical step；相等时继续进入同一 child，或在当前层的真实 direct child / native
-端点间加入 publication。负向或不能证明非负的 publication 具体拒绝。
+源逻辑代次与 actor 发射时钟分离。在每个共同祖先域中，端点的本地 epoch 为
+`mapped ordinal + local offset`；不同 actor 的裸 epoch 不构成先后关系。
+生成器为最多三个实际 actor 推导常量原点 beta，仅用于进展证明：
 
-本层只加入真实 queue/controller 的 Wait→Set 派发阻塞关系。native end 之间没有
-FIFO 边。所有可能的零 step 关系必须有一个 DAG phase rank；非零关系严格增加
-外层 physical step。因此完整命令有良基的分层次序。两个端都先 Wait 对方、
-后 Set 自己，会在同 step 形成环，被生成规则拒绝，不能由配对计数放行。
+```text
+proof_epoch(p) = local_epoch(p) + beta[actor(p)]
+k + beta[destination] - beta[source] >= 0
+```
+
+k 是实际配对 publication 的 epoch 差下界。常数差直接使用；有限符号差从
+已有整数事实和实际 guard 建立下界，未知时明确拒绝。用有限差约束松弛求解
+原点，不枚举运行时代次、不选择执行排步。不可满足时报告实际端点形成的原点环。
+本地 queue/controller 的 Wait→Set 关系及 child may-block transfers 使用相同原点；
+忽略 child 的跨 actor 项会破坏循环权重的相消，因此不能省略。
+
+平移后的严格正距离边前进，零距离边必须形成一个 phase DAG。
+同 actor 的真实 clock/lexical issue 顺序保持；native end 之间不增加 FIFO 边。
+两个 controller 均先 Wait 对方、后 Set 自己仍被拒绝，配对数量不能放行等待环。
+原点不进入设备代码，不改变 Set/Wait 发射位置、完成前缀或物理 buffer 使用。
+例如 Cube products@1 → Vector import@0 可通过 Vector 原点平移获得证明。
 
 独立通知不共用裸 canonical generation。重复端口的同 step 派发关系直接
 来自实际 lexical rank；返回较早 rank 至少前进一个 step。有限 FIRST/LAST

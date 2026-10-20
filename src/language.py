@@ -7,6 +7,7 @@ from .frontend.parser import capture as _capture
 from .frontend.parser import from_source
 from .frontend.syntax import (
     Cube,
+    Dataflow,
     DType,
     Kernel,
     Pipelined,
@@ -80,6 +81,7 @@ def inline(function):
 __all__ = [
     "Cube",
     "DType",
+    "Dataflow",
     "Kernel",
     "Pipelined",
     "Stage",

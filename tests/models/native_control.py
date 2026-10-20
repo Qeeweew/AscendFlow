@@ -59,14 +59,20 @@ def interpret(block, values, arguments, trace):
             return tuple(values[value] for value in op.arguments)
         elif isinstance(op, PipelineLoopOp):
             iterations = list(range(max(0, values[op.count])))
-            stages = [stage for stage in op.body.block.ops if isinstance(stage, PipelineStageOp)]
+            stages = [
+                stage
+                for stage in op.body.block.ops
+                if isinstance(stage, PipelineStageOp)
+                and (stage.family is None or stage.family.data == arguments.get("actor"))
+            ]
             if (
                 op.issue_order is not None
                 and (policy := op.issue_order.data.get(arguments.get("actor"))) is not None
             ):
                 by_name = {stage.label.data: stage for stage in stages}
                 stages = [by_name[label.data] for label in policy]
-            for clock in range(len(iterations) + op.horizon):
+            horizon = max((stage.offset.data for stage in stages), default=0)
+            for clock in range(len(iterations) + horizon):
                 for stage in stages:
                     g = clock - stage.offset.data
                     if 0 <= g < len(iterations):

@@ -9,8 +9,16 @@ import ast
 from pathlib import Path
 
 from ascendflow import language as N
-from examples.flash_attention.attention import NEG_INF
+from examples.flash_attention.attention import (
+    NEG_INF,
+    online_softmax_rows,
+    pv_tiles,
+    qk_tiles,
+    update_output_rows,
+)
 from examples.flash_attention.attention import attention_target as _attention_target
+
+ALGORITHM = (qk_tiles, online_softmax_rows, pv_tiles, update_output_rows)
 
 
 def target_source(*, continuous=False):
@@ -107,6 +115,7 @@ def attention_target(*, continuous=False):
     return N.from_source(
         target_source(continuous=True),
         constants={"NEG_INF": NEG_INF},
+        functions={ast.parse(helper.source).body[0].name: helper for helper in ALGORITHM},
         filename="<attention-target:continuous>",
         disjoint_external=True,
     )
@@ -146,10 +155,18 @@ def activation_trace(queries, kv_tiles, *, continuous=False):
             if set(value := ast.literal_eval(node.value)) == {"cube", "vector"}
         )
     )
-    offsets = {"qk": 0, "softmax": 1, "pv": 1, "update": 2}
+    offsets = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "Stage"
+        ):
+            label = next(k.value.value for k in node.keywords if k.arg == "name")
+            offsets[label] = ast.literal_eval(node.args[0])
     lengths = [queries * kv_tiles] if continuous else [kv_tiles] * queries
     for call, count in enumerate(lengths):
-        for step in range(count + 2):
+        for step in range(count + max(offsets.values())):
             for actor, names in policy.items():
                 for name in names:
                     offset = offsets[name]

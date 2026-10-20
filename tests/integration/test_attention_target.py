@@ -7,7 +7,12 @@ import pytest
 
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.source import AllocationOp
-from tests.fixtures.attention_target import activation_trace, attention_target, target_source
+from tests.fixtures.attention_target import (
+    ALGORITHM,
+    activation_trace,
+    attention_target,
+    target_source,
+)
 
 
 def tree(mode):
@@ -53,7 +58,8 @@ def test_both_organizations_share_actual_algorithm_and_explicit_operations():
     def operations(module):
         return Counter(
             ast.dump(node, include_attributes=False)
-            for node in ast.walk(module)
+            for fragment in (module, *(ast.parse(helper.source) for helper in ALGORITHM))
+            for node in ast.walk(fragment)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in primitives
@@ -63,7 +69,8 @@ def test_both_organizations_share_actual_algorithm_and_explicit_operations():
     for mode in (False, True):
         names = [
             node.func.attr
-            for node in ast.walk(tree(mode))
+            for fragment in (tree(mode), *(ast.parse(helper.source) for helper in ALGORITHM))
+            for node in ast.walk(fragment)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         ]
         assert "exp" in names and "reduce_sum" in names and "reduce_max" in names

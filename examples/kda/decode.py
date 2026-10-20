@@ -83,8 +83,7 @@ def decode_kda(
             for token in N.serial(bos, eos):
                 for item in N.Pipelined(
                     HV // HEAD_GROUPS,
-                    stages=3,
-                    issue_order={"vector": ("store", "load", "compute")},
+                    issue_order=("store", "load", "compute"),
                 ):
                     head = owner % HEAD_GROUPS + item * HEAD_GROUPS
                     qhead = head // (HV // H)
@@ -105,7 +104,7 @@ def decode_kda(
                         else:
                             N.copy(State[slot, head, :, :], state_input[ring, :, :])
                         N.copy(Value[token, head, :], inputs[ring, :])
-                    with N.Stage(1, name="compute"), N.Vector():
+                    with N.Vector(), N.Stage(1, name="compute"):
                         if DTYPE != N.f32:
                             N.cast(q_input[ring, :], out=q[ring, :])
                             N.cast(k_input[ring, :], out=k[ring, :])

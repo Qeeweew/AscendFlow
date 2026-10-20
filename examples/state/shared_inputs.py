@@ -20,9 +20,9 @@ def shared_state_sum(
         x = T.alloc_ub((2, B), T.f32, name="inputs")
         for output in T.serial(outputs):
             T.copy(Initial[group, :], state)
-            for t in T.Pipelined(tiles, stages=2):
+            for t in T.Pipelined(tiles):
                 with T.Stage(0, name="load"):
                     T.copy(X[group, t, :], x[t % 2, :])
-                with T.Stage(1, name="update"), T.Vector():
+                with T.Vector(), T.Stage(1, name="update"):
                     T.add(state, x[t % 2, :], out=state)
             T.copy(state, Output[group, output, :])

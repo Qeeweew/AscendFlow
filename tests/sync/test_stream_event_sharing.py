@@ -19,7 +19,7 @@ def repeated(X:N.Tensor((n,m,9,64),N.f32),
     with N.Kernel(1,kind="vector"):
         x=N.alloc_ub(({buffers},64),N.f32)
         with N.Vector():
-            for outer in N.Pipelined(n,stages=1):
+            for outer in N.Pipelined(n):
                 for inner in N.serial(m):
                     for panel in N.unroll(9):
                         N.copy(X[outer,inner,panel,:],x[{index},:])

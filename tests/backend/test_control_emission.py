@@ -35,7 +35,7 @@ def test_nested_pipelines_have_one_clock_loop_and_no_phase_controllers(depth):
     for level in range(depth):
         indent = " " * (8 + 8 * level)
         source += [
-            indent + f"for i{level} in N.Pipelined(n,stages=3):",
+            indent + f"for i{level} in N.Pipelined(n):",
             indent + "    with N.Stage(2,name='work'):",
         ]
     source.append(" " * (8 + 8 * depth) + "N.fill(x,1.0)")
@@ -54,10 +54,10 @@ def test_static_empty_and_nonempty_pipelines_use_one_dispatch_rule(count, prints
         def fixed():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for t in N.Pipelined({count},stages=4):
+                for t in N.Pipelined({count}):
                     with N.Stage(3,name="work"):
                         N.fill(x,1.0)
-    """)
+""")
     )
     work = EmissionWork()
     asc = emit_structure_debug(facts, work=work)

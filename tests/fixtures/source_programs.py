@@ -13,10 +13,10 @@ def vector_source(count=4):
             with T.Kernel(2) as group:
                 inputs=T.alloc_ub((2,64),name="inputs")
                 outputs=T.alloc_ub((2,64),name="outputs")
-                for task in T.Pipelined({name if runtime else count},stages=3):
+                for task in T.Pipelined({name if runtime else count}):
                     with T.Stage(0,name="load"):
                         value=T.copy(X[group,task,:],inputs[task%2,:])
-                    with T.Stage(1,name="compute"),T.Vector():
+                    with T.Vector(),T.Stage(1,name="compute"):
                         value=T.mul(value,2.0,out=outputs[task%2,:])
                     with T.Stage(2,name="store"):
                         T.copy(value,Y[group,task,:])
@@ -51,28 +51,28 @@ def cv_source(count=4):
                 su=T.alloc_ub((2,8,16))
                 pu=T.alloc_ub((2,8,16),T.f16)
                 ou=T.alloc_ub((2,8,16))
-                for task in T.Pipelined({name if runtime else count},stages=3):
+                for task in T.Dataflow({name if runtime else count}):
                     slot=task%2
-                    with T.Stage(0,name="qk"),T.Cube():
+                    with T.Cube(),T.Stage(0,name="qk"):
                         T.copy(Q[group,task,:,:],q)
                         T.copy(K[group,task,:,:],k[slot,:,:])
                         T.copy(q,qa)
                         T.copy(k[slot,:,:],kb,transpose=True)
                         score=T.matmul(qa,kb,accum=sc,initialize=True)
                         T.copy(score,scores[group,slot,:,:])
-                    with T.Stage(1,name="vector"),T.Vector() as lane:
+                    with T.Vector() as lane,T.Stage(1,name="vector"):
                         value=T.copy(scores[group,slot,lane*8:lane*8+8,:],su[slot,:,:])
                         value=T.mul(value,2.0,out=su[slot,:,:])
                         value=T.cast(value,out=pu[slot,:,:])
                         T.copy(value,probabilities[group,slot,lane*8:lane*8+8,:])
-                    with T.Stage(1,name="pv"),T.Cube():
+                    with T.Cube(),T.Stage(1,name="pv"):
                         T.copy(probabilities[group,slot,:,:],p[slot,:,:])
                         T.copy(V[group,task,:,:],v[slot,:,:])
                         T.copy(p[slot,:,:],pa)
                         T.copy(v[slot,:,:],vb)
                         result=T.matmul(pa,vb,accum=pc,initialize=True)
                         T.copy(result,pv[group,slot,:,:])
-                    with T.Stage(2,name="output"),T.Vector() as lane:
+                    with T.Vector() as lane,T.Stage(2,name="output"):
                         result=T.copy(pv[group,slot,lane*8:lane*8+8,:],ou[slot,:,:])
                         T.copy(result,O[group,task,lane*8:lane*8+8,:])
         """.replace("EXTENT", name if runtime else str(max(1, count))),

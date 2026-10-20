@@ -34,9 +34,7 @@ def batched_matmul(
         a0 = T.alloc_l0a((L0_SLOTS, M, K), DTYPE, name="a0")
         b0 = T.alloc_l0b((L0_SLOTS, K, N), DTYPE, name="b0")
         c0 = T.alloc_l0c((C_SLOTS, M, N), T.f32, name="c0")
-        for t in T.Pipelined(
-            tiles, stages=4, issue_order={"cube": ("export", "load", "operands", "compute")}
-        ):
+        for t in T.Pipelined(tiles, issue_order=("export", "load", "operands", "compute")):
             with T.Stage(0, name="load"):
                 av = T.copy(A[group, t, :, :], a1[t % L1_SLOTS, :, :])
                 bv = T.copy(B[group, t, :, :], b1[t % L1_SLOTS, :, :])

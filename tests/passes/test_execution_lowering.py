@@ -23,11 +23,11 @@ NESTED = """
 def clocks(n:N.int64,m:N.int64):
     with N.Kernel():
         x=N.alloc_ub((64,))
-        for i in N.Pipelined(n,stages=4,issue_order={"vector":("late","early")}):
+        for i in N.Pipelined(n,issue_order=("late","early")):
             with N.Stage(0,name="early"):
                 N.fill(x,1.0)
             with N.Stage(3,name="late"):
-                for j in N.Pipelined(m,stages=3):
+                for j in N.Pipelined(m):
                     with N.Stage(2,name="inner"):
                         N.fill(x,2.0)
 """
@@ -84,13 +84,13 @@ def test_unbounded_count_clock_has_defined_arithmetic_at_int64_edges():
         def edges(n:N.int64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for g in N.Pipelined(n,stages=4):
+                for g in N.Pipelined(n):
                     with N.Stage(0,name="early"):
                         if g==0:
                             N.fill(x,1.0)
                     with N.Stage(3,name="late"):
                         N.fill(x,2.0)
-    """)
+""")
         ).module
     )
     facts = ScalarFacts.from_control(memory.control)
@@ -148,10 +148,10 @@ def test_public_static_int64_count_does_not_require_an_overflowing_count_plus_ho
         def large():
             with N.Kernel():
                 x=N.alloc_ub((64,))
-                for g in N.Pipelined({maximum},stages=4):
+                for g in N.Pipelined({maximum}):
                     with N.Stage(3,name="work"):
                         N.fill(x,1.0)
-    """)
+""")
     compiled = compile(source)
     assert compiled.report["native_templates"] == 1
     assert compiled.report["analysis_work"]["emission"]["native_prints"] == 1
@@ -169,9 +169,9 @@ def test_cyclic_owner_range_simplifies_a_constant_quotient_on_the_public_path():
                 for local in N.serial(N.ceildiv(N.max(0,n-group),7)):
                     index=group+7*local
                     plane=index//n
-                    for g in N.Pipelined(1,stages=1):
+                    for g in N.Pipelined(1):
                         N.copy(X[index+plane,:],x)
-    """,
+""",
         disjoint_external=True,
     )
     compiled = compile(source)

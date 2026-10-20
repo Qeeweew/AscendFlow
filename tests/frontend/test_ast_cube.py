@@ -9,7 +9,7 @@ from xdsl.utils.exceptions import VerifyException
 from ascendflow import compile
 from ascendflow import language as N
 from ascendflow.diagnostics import CompileError
-from ascendflow.dialects.source import CopyOp, MatmulOp, PipelineOp
+from ascendflow.dialects.source import CopyOp, IterationOp, MatmulOp
 from ascendflow.dialects.source import ViewOp as SourceViewOp
 from ascendflow.frontend import FrontendError
 from examples.gemm.batched import batched_matmul
@@ -48,7 +48,7 @@ def test_first_mad_cannot_accumulate_uninitialized_local_storage():
 def test_serialized_ast_cannot_bypass_explicit_operand_contract(sequence):
     source = batched_matmul.to_ir()
     if sequence:
-        pipeline = next(op for op in source.walk() if isinstance(op, PipelineOp))
+        pipeline = next(op for op in source.walk() if isinstance(op, IterationOp))
         pipeline.parent.insert_op_after(pipeline.clone(), pipeline)
     matmul = next(op for op in source.walk() if isinstance(op, MatmulOp))
     a1 = next(

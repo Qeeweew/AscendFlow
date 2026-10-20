@@ -33,13 +33,13 @@ def test_real_compound_two_slot_source_reaches_notification_selection(minimum):
         with N.Kernel():
             x,y=N.alloc_ub((2,64)),N.alloc_ub((2,64))
             for p in N.serial(n):
-                for g in N.Pipelined(m,stages=2):
+                for g in N.Pipelined(m):
                     slot=(p*m+g)%2
                     with N.Stage(0,name="load"):
                         N.copy(X[p,g,:],x[slot,:])
                     with N.Stage(1,name="read"):
                         N.mul(x[slot,:],2.0,out=y[slot,:])
-    """)
+""")
     assert len(selection.dependencies.memory.templates) == 2
     assert len(selection.coverage) == len(selection.dependencies.required)
     assert {id(item.requirement) for item in selection.coverage} == {
@@ -87,11 +87,11 @@ def clocks():
     def clocks(n:N.int64):
         with N.Kernel(kind="mixed"):
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
-            for i in N.Pipelined(n,stages=1):
+            for i in N.Dataflow(n):
                 with N.Vector():
                     N.fill(x,1.0)
                     N.mul(x,2.0,out=y)
-    """)
+""")
     memory = selection.dependencies.memory
     loop = next(iter(memory.control.loops.values()))
     need = next(
@@ -217,11 +217,11 @@ def test_real_branch_premise_is_not_reused_after_its_removal():
     def branch(n:N.int64):
         with N.Kernel():
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
-            for i in N.Pipelined(n,stages=1):
+            for i in N.Pipelined(n):
                 N.fill(x,1.0)
                 if n>=3:
                     N.mul(x,2.0,out=y)
-    """)
+""")
     memory = selection.dependencies.memory
     loop = next(iter(memory.control.loops.values()))
     n = next(name for name in memory.control.environment.facts if name.name == "n")

@@ -14,7 +14,7 @@ from xdsl.dialects.builtin import ModuleOp
 from xdsl.ir import Operation, SSAValue
 
 from ..diagnostics import CompileError, ErrorKind, require
-from ..dialects.source import PipelineOp
+from ..dialects.source import IterationOp
 
 Bound = int | SSAValue
 
@@ -51,25 +51,18 @@ class IterationDomain:
 
 @dataclass(frozen=True, slots=True)
 class LoopControl:
-    operation: PipelineOp | scf.ForOp
+    operation: IterationOp | scf.ForOp
     domain: IterationDomain
-    max_offset: int
     parent: LoopControl | None
-    parent_stage: int
     depth: int
 
     @property
     def coordinate(self) -> SSAValue:
         return self.operation.body.block.args[0]
 
-    def source_iteration(self, physical_step, stage, values):
-        """Guard before computing addresses, including nonzero serial bounds."""
-        require(
-            type(stage) is int and 0 <= stage <= self.max_offset,
-            "stage is outside the loop schedule",
-        )
+    def source_iteration(self, ordinal, values):
+        """Bind one logical ordinal, without choosing any actor's clock."""
         count = self.domain.trip_count(values)
-        ordinal = physical_step - stage
         if not 0 <= ordinal < count:
             return None
         lower, _, stride = self.domain.concrete(values)
@@ -96,8 +89,8 @@ class LoopControls:
         }
 
 
-def iteration_domain(operation: PipelineOp | scf.ForOp) -> IterationDomain:
-    if isinstance(operation, PipelineOp):
+def iteration_domain(operation: IterationOp | scf.ForOp) -> IterationDomain:
+    if isinstance(operation, IterationOp):
         upper = operation.limit if operation.limit is not None else operation.count.data
         return IterationDomain(0, upper, 1)
     require(isinstance(operation, scf.ForOp), "expected a structured loop")

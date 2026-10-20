@@ -71,7 +71,7 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 - N=0透传原状态；N=1的FIRST/LAST重合不重不漏；短循环不能假借稳态条件。不得按runtime长度展开。
 - 父层绑定child的真实外部端口和祖先代次，不重新求其内部路径历史；不同代次不能共用裸ordinal条件得出矛盾。
 - 循环控制退出不证明native完成。跨loop的旧reader与未消费event仍通过对应端口传递，不加统一loop drain。
-- 每个pipeline输出一个物理时钟循环，stage以`g=j-offset`及其存在条件执行。首末条件属于同一生命周期，不能独立seed/drain。kernel最终收尾单独处理。
+- 每个逻辑迭代域按 actor family 输出各自的物理时钟循环，stage 以 `g=j_actor-offset` 及其存在条件执行。首末条件属于同一生命周期，不能独立seed/drain。kernel最终收尾单独处理。
 - buffer slot数、stage偏移、event width互不代替；跨AIC/AIV使用实际参与者与GM可见性，不能丢掉第二个AIV贡献。
 - 选择 child FIRST/LAST 时，先用已解析的全部祖先坐标特化 child header，包括祖先自身的 FIRST/LAST；已经写为 Expr 的计算 LAST 也要解析 selected ancestor。已由 region binding 处理的普通 j-d 平移不能再应用一次。
 - 有界 dense read prefix 可用 count 上界形成保守空间联合；native 仍读取真实分块，family、LAST 和 release 使用实际 count。不能用于动态写或假设上界代次被执行。

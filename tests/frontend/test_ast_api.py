@@ -35,7 +35,7 @@ def test_pipeline_has_no_python_tracing_iterator():
 
 @pytest.mark.parametrize(
     "operation",
-    [lambda: N.Kernel(), lambda: N.alloc_ub((64,)), lambda: N.Pipelined(2, stages=1)],
+    [lambda: N.Kernel(), lambda: N.alloc_ub((64,)), lambda: N.Pipelined(2)],
 )
 def test_device_syntax_cannot_start_executable_python_tracing(operation):
     with pytest.raises(CompileError, match="AST capture"):
@@ -82,9 +82,9 @@ def test_actor_local_allocation_cannot_escape_to_another_source_region():
             with N.Kernel():
                 with N.Vector():
                     x=N.alloc_ub((64,),name="private")
-                for i in N.Pipelined(1,stages=1):
+                for i in N.Pipelined(1):
                     N.fill(x,0.0)
-    """)
+""")
     with pytest.raises(FrontendError, match="allocation private escaped its source region"):
         definition.to_ir()
 
@@ -93,11 +93,11 @@ def test_source_local_allocation_does_not_grant_runtime_allocation_support():
     definition = N.from_source("""
         def local():
             with N.Kernel():
-                for i in N.Pipelined(1,stages=1):
+                for i in N.Pipelined(1):
                     with N.Vector():
                         x=N.alloc_ub((64,))
                         N.fill(x,0.0)
-    """)
+""")
     definition.to_ir().verify()  # Its source scope is valid.
     with pytest.raises(CompileError, match="allocations must be declared at kernel entry"):
         compile(definition)

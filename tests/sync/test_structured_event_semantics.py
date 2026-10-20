@@ -252,10 +252,10 @@ def test_finite_zero_single_and_short_actual_pipeline_instances(count):
         def short(n:N.int64):
             with N.Kernel():
                 x=N.alloc_ub((8,))
-                for t in N.Pipelined(n,stages=3):
+                for t in N.Pipelined(n):
                     with N.Stage(2,name="work"):
                         N.fill(x,1.0)
-    """)
+""")
     )
     task = facts.templates[0].operation
     notify(task, SyncKind.LOCAL_SET, Engine.MTE2, Engine.S)

@@ -11,6 +11,297 @@ from ascendflow import language as N
 # ruff: noqa: F821
 
 
+@N.inline
+def scan_prefetch_vector(inputs, buffers, geometry, coordinates):
+    Lengths, Gp, U = inputs
+    last_gate, u16 = buffers
+    BT, BV = geometry
+    chunk, head, ring, lane = coordinates
+    valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
+    N.copy(Gp[chunk, head, valid - 1, :], last_gate[ring, :])
+    N.exp(last_gate[ring, :], out=last_gate[ring, :])
+    N.copy(U[chunk, head, :, lane * BV : (lane + 1) * BV], u16[ring, :, :])
+
+
+@N.inline
+def scan_prefetch_cube(K, CK, W32, a32_1, chunk, head, ring, KG, kg1):
+    for part in N.unroll(K // CK):
+        N.copy(
+            W32[chunk, head, :, part * CK : (part + 1) * CK],
+            a32_1[ring, part, :, :],
+        )
+    N.copy(KG[chunk, head, :, :], kg1[ring, :, :])
+
+
+@N.inline
+def publish_history_and_snapshot(carry, History, seq, head, lane, BV, state16, Snapshot, chunk):
+    N.copy(carry, History[seq, head, lane * BV : (lane + 1) * BV, :])
+    N.cast(carry, out=state16)
+    N.copy(state16, Snapshot[chunk, head, lane * BV : (lane + 1) * BV, :])
+
+
+@N.inline
+def project_history(inputs, buffers, geometry, coordinates):
+    History, Projection = inputs
+    b32_1, a32_0, b32_0, a32_1, score0 = buffers
+    K, CK = geometry
+    seq, head, ring, chunk = coordinates
+    for part in N.unroll(K // CK):
+        bb = N.copy(History[seq, head, :, part * CK : (part + 1) * CK], b32_1)
+        aa = N.copy(a32_1[ring, part, :, :], a32_0)
+        bb = N.copy(bb, b32_0, transpose=True)
+        N.matmul(aa, bb, accum=score0, initialize=part == 0)
+    N.copy(score0, Projection[chunk, head, :, :])
+
+
+@N.inline
+def form_residual(inputs, buffers, geometry, coordinates):
+    Projection, Residual = inputs
+    u16, other, scratch, r16 = buffers
+    (BV,) = geometry
+    ring, chunk, head, lane = coordinates
+    N.cast(u16[ring, :, :], out=other)
+    N.copy(Projection[chunk, head, :, lane * BV : (lane + 1) * BV], scratch)
+    N.sub(other, scratch, out=scratch)
+    N.cast(scratch, out=r16)
+    N.copy(r16, Residual[chunk, head, :, lane * BV : (lane + 1) * BV])
+
+
+@N.inline
+def form_state_delta(inputs, buffers, coordinates):
+    Residual, Delta = inputs
+    res1, update_a0, right0, kg1, state0 = buffers
+    chunk, head, ring = coordinates
+    rr = N.copy(Residual[chunk, head, :, :], res1)
+    aa = N.copy(rr, update_a0, transpose=True)
+    bb = N.copy(kg1[ring, :, :], right0)
+    N.matmul(aa, bb, accum=state0, initialize=True)
+    N.copy(state0, Delta[chunk, head, :, :])
+
+
+@N.inline
+def update_fp32_carry(last_gate, ring, carry, update, Delta, chunk, head, lane, BV):
+    decay = last_gate[ring, :]
+    N.mul(carry, decay[None, :], out=carry)
+    N.copy(Delta[chunk, head, lane * BV : (lane + 1) * BV, :], update)
+    N.add(carry, update, out=carry)
+
+
+@N.inline
+def diagonal_gram(buffers, geometry, coordinates):
+    (
+        keys16,
+        keys,
+        betas,
+        weighted,
+        rows,
+        queries16,
+        queries,
+        steps,
+        gates,
+        decay,
+        diagonal,
+        attention,
+        product,
+        scores,
+        partial,
+        upper,
+        mask_zero,
+        strict_upper,
+        inverse,
+    ) = buffers
+    SCALE, K = geometry
+    ring, block, valid = coordinates
+    N.cast(keys16[ring, :, :], out=keys)
+    N.mul(keys, betas[block : block + 16, None], out=weighted, scratch=rows)
+    N.cast(queries16[ring, :, :], out=queries)
+    N.fill(steps[0, :], 1.0)
+    N.mul(gates[ring, :15, :], -1.0, out=steps[1:16, :])
+    N.add(steps[1:16, :], gates[ring, 1:16, :], out=steps[1:16, :])
+    N.exp(steps[1:16, :], out=steps[1:16, :])
+    N.copy(keys, decay)
+    N.fill(diagonal, 0.0)
+    N.fill(attention[ring, :, :], 0.0)
+    # Four causal prefixes avoid evaluating most upper-triangle
+    # exp/products, retaining the same FP32 per-score sum tree.
+    for quarter in N.unroll(4):
+        extent = (quarter + 1) * 4
+        panel = N.ceildiv(extent, 8) * 8
+        for local in N.serial(quarter * 4, N.min(extent, N.max(0, valid - block))):
+            key_row = weighted[local, :]
+            query_row = queries[local, :]
+            step_row = steps[local, :]
+            # Carry k_j * exp(G_i-G_j) forward one row. Each
+            # diagonal resets to k_i; upper entries are discarded
+            # by the final masks after both score reductions.
+            N.mul(decay[:extent, :], step_row[None, :], out=decay[:extent, :])
+            N.copy(keys[local, :], decay[local, :])
+            N.mul(decay[:extent, :], key_row[None, :], out=product[:extent, :])
+            N.mul(
+                decay[:extent, :],
+                query_row[None, :],
+                out=product[panel : panel + extent, :],
+            )
+            N.reduce_sum(
+                product[: 2 * panel, :],
+                axis=1,
+                out=scores[: 2 * panel],
+                scratch=partial[: 2 * panel * (K // 8)],
+                order="block8_then_packed_merge",
+            )
+            N.copy(scores[:16], diagonal[local, :])
+            N.mul(
+                scores[panel : panel + 16],
+                SCALE,
+                out=scores[panel : panel + 16],
+            )
+            N.copy(scores[panel : panel + 16], attention[ring, local, :])
+    N.fill(diagonal, 0.0, mask=upper, scratch=mask_zero)
+    N.fill(attention[ring, :, :], 0.0, mask=strict_upper, scratch=mask_zero)
+    N.copy(diagonal, inverse[:, block : block + 16])
+
+
+@N.inline
+def wu_import(Inverse, a1, chunk, head, ring, Right, b1):
+    N.copy(Inverse[chunk, head, :, :], a1[ring, :, :])
+    for part in N.unroll(2):
+        N.copy(Right[chunk, head, part, :, :], b1[ring, part, :, :])
+
+
+@N.inline
+def wu_products(inputs, buffers, coordinates):
+    W16Ring, U = inputs
+    a0, a1, b0, b1, c0 = buffers
+    ring, owner, chunk, head = coordinates
+    aa = N.copy(a1[ring, :, :], a0)
+    ww = N.copy(b1[ring, 0, :, :], b0)
+    N.matmul(aa, ww, accum=c0, initialize=True)
+    N.copy(c0, W16Ring[owner, ring, :, :])
+    uu = N.copy(b1[ring, 1, :, :], b0)
+    N.matmul(aa, uu, accum=c0, initialize=True)
+    N.copy(c0, U[chunk, head, :, :])
+
+
+@N.inline
+def publish_rounded_weights(inputs, buffers, geometry, coordinates):
+    W16Ring, W32 = inputs
+    w16, w32 = buffers
+    (BT,) = geometry
+    owner, ring, lane, chunk, head = coordinates
+    N.copy(
+        W16Ring[owner, ring, lane * (BT // 2) : (lane + 1) * (BT // 2), :],
+        w16[ring, :, :],
+    )
+    N.cast(w16[ring, :, :], out=w32[ring, :, :])
+    N.copy(w32[ring, :, :], W32[chunk, head, lane * (BT // 2) : (lane + 1) * (BT // 2), :])
+
+
+@N.inline
+def diagonal_inverse(inputs, buffers, geometry, coordinates):
+    Ai32, Diagonal = inputs
+    (
+        inverse,
+        coefficients,
+        coefficient_matrix,
+        expanded,
+        inverse_rows,
+        weighted_inverse,
+        inverse_tree,
+        identities,
+    ) = buffers
+    (BT,) = geometry
+    chunk, head = coordinates
+    N.mul(inverse, -1.0, out=inverse)
+    for inverse_row in N.serial(2, 16):
+        N.copy(inverse[inverse_row, :], coefficients)
+        N.broadcast(coefficients[:, None], out=expanded, scratch=inverse_rows)
+        for plane in N.unroll(BT // 16):
+            N.copy(
+                expanded[plane * 16 : plane * 16 + 16, :16],
+                coefficient_matrix[:, plane * 16 : plane * 16 + 16],
+            )
+        N.mul(inverse, coefficient_matrix, out=weighted_inverse)
+        N.add(weighted_inverse[:8, :], weighted_inverse[8:16, :], out=inverse_tree)
+        N.add(inverse_tree[:4, :], inverse_tree[4:8, :], out=inverse_tree[:4, :])
+        N.add(inverse_tree[:2, :], inverse_tree[2:4, :], out=inverse_tree[:2, :])
+        N.add(inverse_tree[0, :], inverse_tree[1, :], out=inverse_tree[0, :])
+        N.add(coefficients, inverse_tree[0, :], out=inverse[inverse_row, :])
+    N.add(inverse, identities, out=inverse)
+    for plane in N.unroll(BT // 16):
+        block = plane * 16
+        N.copy(
+            inverse[:, block : block + 16],
+            Ai32[chunk, head, block : block + 16, block : block + 16],
+        )
+        N.copy(
+            inverse[:, block : block + 16],
+            Diagonal[chunk, head, block : block + 16, block : block + 16],
+        )
+
+
+@N.inline
+def transform_prefix(inputs, buffers, geometry, coordinates):
+    Lengths, Bp, Gp = inputs
+    beta, gates, last, factor = buffers
+    (BT,) = geometry
+    chunk, head = coordinates
+    valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
+    N.copy(Bp[chunk, head, :], beta)
+    N.copy(Gp[chunk, head, :, :], gates)
+    N.copy(Gp[chunk, head, valid - 1, :], last)
+    N.exp(gates, out=factor)
+
+
+@N.inline
+def form_right_inputs(inputs, buffers, coordinates):
+    Kp, Right, Vp = inputs
+    raw, work, beta, rows, factor, packed = buffers
+    chunk, head = coordinates
+    N.copy(Kp[chunk, head, :, :], raw)
+    N.cast(raw, out=work)
+    N.mul(work, beta[:, None], out=work, scratch=rows)
+    N.mul(work, factor, out=work)
+    N.cast(work, out=packed)
+    N.copy(packed, Right[chunk, head, 0, :, :])
+    N.copy(Vp[chunk, head, :, :], raw)
+    N.cast(raw, out=work)
+    N.mul(work, beta[:, None], out=work, scratch=rows)
+    N.cast(work, out=packed)
+    N.copy(packed, Right[chunk, head, 1, :, :])
+
+
+@N.inline
+def form_decayed_keys(inputs, buffers, coordinates):
+    Kp, KG = inputs
+    gates, factor, last, raw, work, packed = buffers
+    chunk, head = coordinates
+    N.mul(gates, -1.0, out=factor)
+    N.add(factor, last[None, :], out=factor)
+    N.exp(factor, out=factor)
+    N.copy(Kp[chunk, head, :, :], raw)
+    N.cast(raw, out=work)
+    N.mul(work, factor, out=work)
+    N.cast(work, out=packed)
+    N.copy(packed, KG[chunk, head, :, :])
+
+
+@N.inline
+def form_scaled_queries(inputs, buffers, geometry, coordinates):
+    Qp, QG = inputs
+    raw, work, packed, gates, factor = buffers
+    (SCALE,) = geometry
+    chunk, head = coordinates
+    N.copy(Qp[chunk, head, :, :], raw)
+    N.cast(raw, out=work)
+    N.mul(work, SCALE, out=work)
+    N.cast(work, out=packed)
+    N.cast(packed, out=work)
+    N.exp(gates, out=factor)
+    N.mul(work, factor, out=work)
+    N.cast(work, out=packed)
+    N.copy(packed, QG[chunk, head, :, :])
+
+
 @N.prim_func(disjoint_external=True)
 def prefill_prepare(
     Q: N.Tensor((TOKENS, H, K), DTYPE),
@@ -65,7 +356,7 @@ def prefill_prepare(
             N.copy(q, Gp[chunk, head, :, :])
             N.fill(cumulative, 0.0)
             N.fill(betas, 0.0)
-            for row in N.Pipelined(valid, stages=3):
+            for row in N.Pipelined(valid):
                 token = start + row
                 ring = row % 2
                 with N.Stage(0, name="load"):
@@ -174,9 +465,7 @@ def prefill_gram(
             N.copy(zeros, Aqk[chunk, head, :, :])
             N.copy(zeros, Diagonal[chunk, head, :, :])
             N.copy(zeros, Ai32[chunk, head, :, :])
-            for block_index in N.Pipelined(
-                BT // 16, stages=3, issue_order={"vector": ("prefetch", "store", "gram")}
-            ):
+            for block_index in N.Pipelined(BT // 16, issue_order=("prefetch", "store", "gram")):
                 block = block_index * 16
                 ring = block_index % 2
                 with N.Stage(0, name="prefetch"):
@@ -184,53 +473,31 @@ def prefill_gram(
                     N.copy(Qp[chunk, head, block : block + 16, :], queries16[ring, :, :])
                     N.copy(Gp[chunk, head, block : block + 16, :], gates[ring, :, :])
                 with N.Stage(1, name="gram"):
-                    N.cast(keys16[ring, :, :], out=keys)
-                    N.mul(keys, betas[block : block + 16, None], out=weighted, scratch=rows)
-                    N.cast(queries16[ring, :, :], out=queries)
-                    N.fill(steps[0, :], 1.0)
-                    N.mul(gates[ring, :15, :], -1.0, out=steps[1:16, :])
-                    N.add(steps[1:16, :], gates[ring, 1:16, :], out=steps[1:16, :])
-                    N.exp(steps[1:16, :], out=steps[1:16, :])
-                    N.copy(keys, decay)
-                    N.fill(diagonal, 0.0)
-                    N.fill(attention[ring, :, :], 0.0)
-                    # Four causal prefixes avoid evaluating most upper-triangle
-                    # exp/products, retaining the same FP32 per-score sum tree.
-                    for quarter in N.unroll(4):
-                        extent = (quarter + 1) * 4
-                        panel = N.ceildiv(extent, 8) * 8
-                        for local in N.serial(quarter * 4, N.min(extent, N.max(0, valid - block))):
-                            key_row = weighted[local, :]
-                            query_row = queries[local, :]
-                            step_row = steps[local, :]
-                            # Carry k_j * exp(G_i-G_j) forward one row. Each
-                            # diagonal resets to k_i; upper entries are discarded
-                            # by the final masks after both score reductions.
-                            N.mul(decay[:extent, :], step_row[None, :], out=decay[:extent, :])
-                            N.copy(keys[local, :], decay[local, :])
-                            N.mul(decay[:extent, :], key_row[None, :], out=product[:extent, :])
-                            N.mul(
-                                decay[:extent, :],
-                                query_row[None, :],
-                                out=product[panel : panel + extent, :],
-                            )
-                            N.reduce_sum(
-                                product[: 2 * panel, :],
-                                axis=1,
-                                out=scores[: 2 * panel],
-                                scratch=partial[: 2 * panel * (K // 8)],
-                                order="block8_then_packed_merge",
-                            )
-                            N.copy(scores[:16], diagonal[local, :])
-                            N.mul(
-                                scores[panel : panel + 16],
-                                SCALE,
-                                out=scores[panel : panel + 16],
-                            )
-                            N.copy(scores[panel : panel + 16], attention[ring, local, :])
-                    N.fill(diagonal, 0.0, mask=upper, scratch=mask_zero)
-                    N.fill(attention[ring, :, :], 0.0, mask=strict_upper, scratch=mask_zero)
-                    N.copy(diagonal, inverse[:, block : block + 16])
+                    diagonal_gram(
+                        (
+                            keys16,
+                            keys,
+                            betas,
+                            weighted,
+                            rows,
+                            queries16,
+                            queries,
+                            steps,
+                            gates,
+                            decay,
+                            diagonal,
+                            attention,
+                            product,
+                            scores,
+                            partial,
+                            upper,
+                            mask_zero,
+                            strict_upper,
+                            inverse,
+                        ),
+                        (SCALE, K),
+                        (ring, block, valid),
+                    )
                 with N.Stage(2, name="store"):
                     N.copy(
                         attention[ring, :, :],
@@ -239,32 +506,21 @@ def prefill_gram(
             # Four independent 16x16 blocks share one row recurrence. The
             # 64-wide row layout keeps the multiply and every sum-tree level
             # on complete Vector repeats, preserving each block's FP32 tree.
-            N.mul(inverse, -1.0, out=inverse)
-            for inverse_row in N.serial(2, 16):
-                N.copy(inverse[inverse_row, :], coefficients)
-                N.broadcast(coefficients[:, None], out=expanded, scratch=inverse_rows)
-                for plane in N.unroll(BT // 16):
-                    N.copy(
-                        expanded[plane * 16 : plane * 16 + 16, :16],
-                        coefficient_matrix[:, plane * 16 : plane * 16 + 16],
-                    )
-                N.mul(inverse, coefficient_matrix, out=weighted_inverse)
-                N.add(weighted_inverse[:8, :], weighted_inverse[8:16, :], out=inverse_tree)
-                N.add(inverse_tree[:4, :], inverse_tree[4:8, :], out=inverse_tree[:4, :])
-                N.add(inverse_tree[:2, :], inverse_tree[2:4, :], out=inverse_tree[:2, :])
-                N.add(inverse_tree[0, :], inverse_tree[1, :], out=inverse_tree[0, :])
-                N.add(coefficients, inverse_tree[0, :], out=inverse[inverse_row, :])
-            N.add(inverse, identities, out=inverse)
-            for plane in N.unroll(BT // 16):
-                block = plane * 16
-                N.copy(
-                    inverse[:, block : block + 16],
-                    Ai32[chunk, head, block : block + 16, block : block + 16],
-                )
-                N.copy(
-                    inverse[:, block : block + 16],
-                    Diagonal[chunk, head, block : block + 16, block : block + 16],
-                )
+            diagonal_inverse(
+                (Ai32, Diagonal),
+                (
+                    inverse,
+                    coefficients,
+                    coefficient_matrix,
+                    expanded,
+                    inverse_rows,
+                    weighted_inverse,
+                    inverse_tree,
+                    identities,
+                ),
+                (BT,),
+                (chunk, head),
+            )
 
 
 @N.prim_func(disjoint_external=True)
@@ -302,39 +558,14 @@ def prefill_transform(
         for task in N.serial(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
-            valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
-            N.copy(Bp[chunk, head, :], beta)
-            N.copy(Gp[chunk, head, :, :], gates)
-            N.copy(Gp[chunk, head, valid - 1, :], last)
-            N.exp(gates, out=factor)
-            N.copy(Kp[chunk, head, :, :], raw)
-            N.cast(raw, out=work)
-            N.mul(work, beta[:, None], out=work, scratch=rows)
-            N.mul(work, factor, out=work)
-            N.cast(work, out=packed)
-            N.copy(packed, Right[chunk, head, 0, :, :])
-            N.copy(Vp[chunk, head, :, :], raw)
-            N.cast(raw, out=work)
-            N.mul(work, beta[:, None], out=work, scratch=rows)
-            N.cast(work, out=packed)
-            N.copy(packed, Right[chunk, head, 1, :, :])
-            N.mul(gates, -1.0, out=factor)
-            N.add(factor, last[None, :], out=factor)
-            N.exp(factor, out=factor)
-            N.copy(Kp[chunk, head, :, :], raw)
-            N.cast(raw, out=work)
-            N.mul(work, factor, out=work)
-            N.cast(work, out=packed)
-            N.copy(packed, KG[chunk, head, :, :])
-            N.copy(Qp[chunk, head, :, :], raw)
-            N.cast(raw, out=work)
-            N.mul(work, SCALE, out=work)
-            N.cast(work, out=packed)
-            N.cast(packed, out=work)
-            N.exp(gates, out=factor)
-            N.mul(work, factor, out=work)
-            N.cast(work, out=packed)
-            N.copy(packed, QG[chunk, head, :, :])
+            transform_prefix((Lengths, Bp, Gp), (beta, gates, last, factor), (BT,), (chunk, head))
+            form_right_inputs(
+                (Kp, Right, Vp), (raw, work, beta, rows, factor, packed), (chunk, head)
+            )
+            form_decayed_keys((Kp, KG), (gates, factor, last, raw, work, packed), (chunk, head))
+            form_scaled_queries(
+                (Qp, QG), (raw, work, packed, gates, factor), (SCALE,), (chunk, head)
+            )
             N.copy(Aqk[chunk, head, :, :], af32)
             N.cast(af32, out=af16)
             N.copy(af16, A16[chunk, head, :, :])
@@ -362,31 +593,18 @@ def prefill_wu(
         c0 = N.alloc_l0c((BT, K), N.f32)
         w16 = N.alloc_ub((2, BT // 2, K), DTYPE)
         w32 = N.alloc_ub((2, BT // 2, K), N.f32)
-        for task in N.Pipelined(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS), stages=3):
+        for task in N.Dataflow(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
             ring = task % 2
-            with N.Stage(0, name="load"), N.Cube():
-                N.copy(Inverse[chunk, head, :, :], a1[ring, :, :])
-                for part in N.unroll(2):
-                    N.copy(Right[chunk, head, part, :, :], b1[ring, part, :, :])
-            with N.Stage(1, name="compute"), N.Cube():
-                aa = N.copy(a1[ring, :, :], a0)
-                ww = N.copy(b1[ring, 0, :, :], b0)
-                N.matmul(aa, ww, accum=c0, initialize=True)
-                N.copy(c0, W16Ring[owner, ring, :, :])
-                uu = N.copy(b1[ring, 1, :, :], b0)
-                N.matmul(aa, uu, accum=c0, initialize=True)
-                N.copy(c0, U[chunk, head, :, :])
-            with N.Stage(2, name="cast"), N.Vector() as lane:
+            with N.Cube(), N.Stage(0, name="load"):
+                wu_import(Inverse, a1, chunk, head, ring, Right, b1)
+            with N.Cube(), N.Stage(1, name="compute"):
+                wu_products((W16Ring, U), (a0, a1, b0, b1, c0), (ring, owner, chunk, head))
+            with N.Vector() as lane, N.Stage(2, name="cast"):
                 # Preserve the low-precision W rounding before its FP32 projection.
-                N.copy(
-                    W16Ring[owner, ring, lane * (BT // 2) : (lane + 1) * (BT // 2), :],
-                    w16[ring, :, :],
-                )
-                N.cast(w16[ring, :, :], out=w32[ring, :, :])
-                N.copy(
-                    w32[ring, :, :], W32[chunk, head, lane * (BT // 2) : (lane + 1) * (BT // 2), :]
+                publish_rounded_weights(
+                    (W16Ring, W32), (w16, w32), (BT,), (owner, ring, lane, chunk, head)
                 )
 
 
@@ -441,50 +659,40 @@ def prefill_scan(
             seq, head = flat // H, flat % H
             with N.Vector() as initial_lane:
                 N.copy(Initial[seq, head, initial_lane * BV : (initial_lane + 1) * BV, :], carry)
-            for local in N.Pipelined(NC, stages=2):
+            for local in N.Dataflow(NC):
                 chunk = seq * NC + local
                 ring = local % 2
-                with N.Stage(0, name="prefetch"):
-                    with N.Vector() as lane:
-                        valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
-                        N.copy(Gp[chunk, head, valid - 1, :], last_gate[ring, :])
-                        N.exp(last_gate[ring, :], out=last_gate[ring, :])
-                        N.copy(U[chunk, head, :, lane * BV : (lane + 1) * BV], u16[ring, :, :])
-                    with N.Cube():
-                        for part in N.unroll(K // CK):
-                            N.copy(
-                                W32[chunk, head, :, part * CK : (part + 1) * CK],
-                                a32_1[ring, part, :, :],
-                            )
-                        N.copy(KG[chunk, head, :, :], kg1[ring, :, :])
-                with N.Stage(1, name="recur"):
-                    with N.Vector() as lane:
-                        N.copy(carry, History[seq, head, lane * BV : (lane + 1) * BV, :])
-                        N.cast(carry, out=state16)
-                        N.copy(state16, Snapshot[chunk, head, lane * BV : (lane + 1) * BV, :])
-                    with N.Cube():
-                        for part in N.unroll(K // CK):
-                            bb = N.copy(History[seq, head, :, part * CK : (part + 1) * CK], b32_1)
-                            aa = N.copy(a32_1[ring, part, :, :], a32_0)
-                            bb = N.copy(bb, b32_0, transpose=True)
-                            N.matmul(aa, bb, accum=score0, initialize=part == 0)
-                        N.copy(score0, Projection[chunk, head, :, :])
-                    with N.Vector() as lane:
-                        N.cast(u16[ring, :, :], out=other)
-                        N.copy(Projection[chunk, head, :, lane * BV : (lane + 1) * BV], scratch)
-                        N.sub(other, scratch, out=scratch)
-                        N.cast(scratch, out=r16)
-                        N.copy(r16, Residual[chunk, head, :, lane * BV : (lane + 1) * BV])
-                    with N.Cube():
-                        rr = N.copy(Residual[chunk, head, :, :], res1)
-                        aa = N.copy(rr, update_a0, transpose=True)
-                        bb = N.copy(kg1[ring, :, :], right0)
-                        N.matmul(aa, bb, accum=state0, initialize=True)
-                        N.copy(state0, Delta[chunk, head, :, :])
-                    with N.Vector() as lane:
-                        decay = last_gate[ring, :]
-                        N.mul(carry, decay[None, :], out=carry)
-                        N.copy(Delta[chunk, head, lane * BV : (lane + 1) * BV, :], update)
-                        N.add(carry, update, out=carry)
+                with N.Vector() as lane, N.Stage(0, name="prefetch_vector"):
+                    scan_prefetch_vector(
+                        (Lengths, Gp, U), (last_gate, u16), (BT, BV), (chunk, head, ring, lane)
+                    )
+                with N.Cube(), N.Stage(0, name="prefetch_cube"):
+                    scan_prefetch_cube(K, CK, W32, a32_1, chunk, head, ring, KG, kg1)
+                with N.Vector() as lane, N.Stage(1, name="history"):
+                    publish_history_and_snapshot(
+                        carry, History, seq, head, lane, BV, state16, Snapshot, chunk
+                    )
+                with N.Cube(), N.Stage(1, name="projection"):
+                    project_history(
+                        (History, Projection),
+                        (b32_1, a32_0, b32_0, a32_1, score0),
+                        (K, CK),
+                        (seq, head, ring, chunk),
+                    )
+                with N.Vector() as lane, N.Stage(1, name="residual"):
+                    form_residual(
+                        (Projection, Residual),
+                        (u16, other, scratch, r16),
+                        (BV,),
+                        (ring, chunk, head, lane),
+                    )
+                with N.Cube(), N.Stage(1, name="delta"):
+                    form_state_delta(
+                        (Residual, Delta),
+                        (res1, update_a0, right0, kg1, state0),
+                        (chunk, head, ring),
+                    )
+                with N.Vector() as lane, N.Stage(1, name="carry"):
+                    update_fp32_carry(last_gate, ring, carry, update, Delta, chunk, head, lane, BV)
             with N.Vector() as final_lane:
                 N.copy(carry, Final[seq, head, final_lane * BV : (final_lane + 1) * BV, :])

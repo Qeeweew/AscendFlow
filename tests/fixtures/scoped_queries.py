@@ -28,11 +28,11 @@ def scoped_query_recurrence(
         state = N.alloc_ub((2, 4, 32), N.f32, name="state")
         for query in N.serial(N.ceildiv(N.max(0, total_queries - group), GROUPS)):
             flat = group + query * GROUPS
-            for kv in N.Pipelined(kv_tiles, stages=2):
+            for kv in N.Dataflow(kv_tiles):
                 task = query * kv_tiles + kv
                 slot = task % 2
-                with N.Stage(0, name="cube"), N.Cube():
-                    for j in N.Pipelined(2, stages=4):
+                with N.Cube(), N.Stage(0, name="cube"):
+                    for j in N.Pipelined(2):
                         with N.Stage(0, name="load"):
                             q = N.copy(Q[flat, j, :, :], q_l1[j % 2, :, :])
                             k = N.copy(K[kv, j, :, :], k_l1[j % 2, :, :])
@@ -43,8 +43,8 @@ def scoped_query_recurrence(
                             z = N.matmul(aa, bb, accum=c[j % 2, :, :], initialize=True)
                         with N.Stage(3, name="export"):
                             N.copy(z, Score[group, slot, :, j * 16 : (j + 1) * 16])
-                with N.Stage(1, name="vector"), N.Vector() as lane:
-                    for r in N.Pipelined(2, stages=3):
+                with N.Vector() as lane, N.Stage(1, name="vector"):
+                    for r in N.Pipelined(2):
                         row = lane * 8 + r * 4
                         with N.Stage(0, name="load"):
                             N.copy(Score[group, slot, row : row + 4, :], loaded[r % 2, :, :])

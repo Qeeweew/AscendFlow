@@ -45,10 +45,10 @@ def test_source_division_contract_survives_frontend_constant_cancellation(cancel
         def bad_index():
             with T.Kernel():
                 x = T.alloc_ub((64,))
-                for t in T.Pipelined(2, stages=1):
+                for t in T.Pipelined(2):
                     bad = (t - 1) // 2
                     offset = {cancel}
                     T.fill(x[offset:offset+64], 0.0)
-    """)
+""")
     with pytest.raises(CompileError, match="source unsigned division"):
         compile(definition)

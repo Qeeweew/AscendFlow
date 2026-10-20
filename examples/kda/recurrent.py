@@ -9,8 +9,42 @@ immutable device metadata, not host-expanded token schedules.
 from __future__ import annotations
 
 from ascendflow import language as N
+from examples.kda.ops import normalize_qk
 
 # ruff: noqa: F821 - constexpr names in captured DSL annotations.
+
+
+@N.inline
+def recurrent_update(inputs, buffers, geometry, coordinates):
+    (Beta,) = inputs
+    q, g, state, k, product, projected, reduction, v, update, row_scratch, out = buffers
+    (SCALE,) = geometry
+    token, head = coordinates
+    N.mul(q, SCALE, out=q)
+    N.exp(g, out=g)
+    N.mul(state, g[None, :], out=state)
+    N.mul(state, k[None, :], out=product)
+    N.reduce_sum(
+        product,
+        axis=1,
+        out=projected,
+        scratch=reduction,
+        order="block8_then_packed_merge",
+    )
+    N.sub(v, projected, out=v)
+    beta = N.load_scalar(Beta[token, head : head + 1])
+    N.mul(v, beta, out=v)
+    N.broadcast(k[None, :], out=update)
+    N.mul(update, v[:, None], out=update, scratch=row_scratch)
+    N.add(state, update, out=state)
+    N.mul(state, q[None, :], out=product)
+    N.reduce_sum(
+        product,
+        axis=1,
+        out=out,
+        scratch=reduction,
+        order="block8_then_packed_merge",
+    )
 
 
 @N.prim_func(disjoint_external=True)
@@ -126,54 +160,24 @@ def recurrent_kda(
                         N.copy(Gate[token, head, :], gate_input)
                         N.cast(gate_input, out=g)
                     if NORMALIZE:
-                        N.mul(q, q, out=norm_work)
-                        N.reduce_sum(
-                            norm_work,
-                            axis=0,
-                            out=norm_stat[:1],
-                            scratch=norm_partial[: K // 64],
-                            order="r64_then_native_merge",
-                        )
-                        N.add(norm_stat[:1], 1e-6, out=norm_stat[:1])
-                        N.rsqrt(norm_stat[:1], out=norm_stat[:1])
-                        q_inverse = N.load_scalar(norm_stat[:1])
-                        N.mul(q, q_inverse, out=q)
-                        N.mul(k, k, out=norm_work)
-                        N.reduce_sum(
-                            norm_work,
-                            axis=0,
-                            out=norm_stat[:1],
-                            scratch=norm_partial[: K // 64],
-                            order="r64_then_native_merge",
-                        )
-                        N.add(norm_stat[:1], 1e-6, out=norm_stat[:1])
-                        N.rsqrt(norm_stat[:1], out=norm_stat[:1])
-                        k_inverse = N.load_scalar(norm_stat[:1])
-                        N.mul(k, k_inverse, out=k)
-                    N.mul(q, SCALE, out=q)
-                    N.exp(g, out=g)
-                    N.mul(state, g[None, :], out=state)
-                    N.mul(state, k[None, :], out=product)
-                    N.reduce_sum(
-                        product,
-                        axis=1,
-                        out=projected,
-                        scratch=reduction,
-                        order="block8_then_packed_merge",
-                    )
-                    N.sub(v, projected, out=v)
-                    beta = N.load_scalar(Beta[token, head : head + 1])
-                    N.mul(v, beta, out=v)
-                    N.broadcast(k[None, :], out=update)
-                    N.mul(update, v[:, None], out=update, scratch=row_scratch)
-                    N.add(state, update, out=state)
-                    N.mul(state, q[None, :], out=product)
-                    N.reduce_sum(
-                        product,
-                        axis=1,
-                        out=out,
-                        scratch=reduction,
-                        order="block8_then_packed_merge",
+                        normalize_qk(q, k, norm_work, norm_partial, norm_stat, K)
+                    recurrent_update(
+                        (Beta,),
+                        (
+                            q,
+                            g,
+                            state,
+                            k,
+                            product,
+                            projected,
+                            reduction,
+                            v,
+                            update,
+                            row_scratch,
+                            out,
+                        ),
+                        (SCALE,),
+                        (token, head),
                     )
                     if DTYPE == N.f32:
                         N.copy(out, Output[token, head, col : col + BV])

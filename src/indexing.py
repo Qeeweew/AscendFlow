@@ -594,7 +594,7 @@ def check_axis(origin, width, extent, domains, facts):
     )
 
 
-def validate_source_arithmetic(program):
+def validate_source_arithmetic(program, controls):
     """Check every original division before value/address simplification.
 
     Even an unused div followed by ``bad-bad`` must satisfy its source domain.
@@ -603,8 +603,7 @@ def validate_source_arithmetic(program):
     """
     from xdsl.dialects import arith, scf
 
-    from .analysis.iteration import iteration_domain
-    from .dialects.source import DomainOp, IndexReadOp, PipelineOp
+    from .dialects.source import DomainOp, IndexReadOp, IterationOp
     from .scalar import Fact, facts_from_sizes, from_ssa, positive
 
     # Only unsigned divisions need these range premises. Keep all of them,
@@ -686,7 +685,7 @@ def validate_source_arithmetic(program):
                     "source index divisor must be provably positive and uniform",
                 )
             local, ranges = coordinates, domains
-            if isinstance(op, (PipelineOp, DomainOp, scf.ForOp)):
+            if isinstance(op, (IterationOp, DomainOp, scf.ForOp)):
                 name = Symbol(
                     f"$index{number}",
                     SymbolKind.PARTICIPANT if isinstance(op, DomainOp) else SymbolKind.ORDINAL,
@@ -700,7 +699,7 @@ def validate_source_arithmetic(program):
                         2 if program.kind.data == "mixed" and op.kind.data == "vector" else 1
                     )
                 else:
-                    domain = iteration_domain(op)
+                    domain = controls.by_operation[op].domain
                     lower = (
                         literal(domain.lower)
                         if type(domain.lower) is int

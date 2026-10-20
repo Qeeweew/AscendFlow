@@ -28,7 +28,7 @@ def infinite_fill(Y: N.Tensor((2, 64), N.f32, access="write")):
     """Primitive device fixture: Y[0] is +Inf and Y[1] is -Inf."""
     with N.Kernel(1, kind="vector"):
         values = N.alloc_ub((2, 64), N.f32)
-        for task in N.Pipelined(1, stages=2):
+        for task in N.Pipelined(1):
             with N.Stage(0):
                 N.fill(values[0, :], POS_INF)
                 N.fill(values[1, :], NEG_INF)
@@ -44,7 +44,7 @@ def scalar_source(value, operation="fill", dtype="f32"):
         def scalar_constant():
             with N.Kernel():
                 x = N.alloc_ub((64,), N.{dtype})
-                for task in N.Pipelined(1, stages=1):
+                for task in N.Pipelined(1):
                     {statement}
         """,
         constants={"VALUE": value},

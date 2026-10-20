@@ -27,7 +27,7 @@ def grouped_scale(
         tiles = S // ROWS
         total = B * H * tiles
         count = T.ceildiv(T.max(0, total - group), GROUPS)
-        for task in T.Pipelined(count, stages=3):
+        for task in T.Pipelined(count):
             flat = group + task * GROUPS
             batch = flat // (H * tiles)
             head = (flat // tiles) % H
@@ -35,7 +35,7 @@ def grouped_scale(
             slot = task % 2
             with T.Stage(0, name="load"):
                 value = T.copy(X[batch, head, row : row + ROWS, :], x[slot, :, :])
-            with T.Stage(1, name="scale"), T.Vector():
+            with T.Vector(), T.Stage(1, name="scale"):
                 value = T.mul(value, 2.0, out=y[slot, :, :])
             with T.Stage(2, name="store"):
                 T.copy(value, Y[batch, head, row : row + ROWS, :])
