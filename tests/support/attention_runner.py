@@ -4,10 +4,14 @@ import ctypes as ct
 import json
 import math
 from dataclasses import replace
+from io import StringIO
 from types import SimpleNamespace
 
 import pytest
+from xdsl.printer import Printer
 
+from ascendflow import language as N
+from ascendflow.dialects.source import ElementOp, SizeOp
 from benchmarks.attention import run
 
 GENERATED_ORDER = ("Q", "K", "Score", "P", "V", "PV", "O")
@@ -23,12 +27,12 @@ def generated_source(order=GENERATED_ORDER):
 
 def metadata_ir(policy=run.DEFAULT_POLICY):
     physical = [
-        f'%sq = "npu.runtime_size"() {{sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<{policy.query_tile}>}} : () -> index',
-        '%sk = "npu.runtime_size"() {sym_name="Sk", minimum=#builtin.int<1>, multiple=#builtin.int<1024>} : () -> index',
+        '%sq = "npu.runtime_size"() {sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<1>} : () -> index',
+        '%sk = "npu.runtime_size"() {sym_name="Sk", minimum=#builtin.int<1>, multiple=#builtin.int<1>} : () -> index',
     ]
     logical = [
-        f'%sq = "npu_source.size"() {{sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<{policy.query_tile}>}} : () -> index',
-        '%sk = "npu_source.size"() {sym_name="Sk", minimum=#builtin.int<1>, multiple=#builtin.int<1024>} : () -> index',
+        '%sq = "npu_source.size"() {sym_name="Sq", minimum=#builtin.int<1>, multiple=#builtin.int<1>} : () -> index',
+        '%sk = "npu_source.size"() {sym_name="Sk", minimum=#builtin.int<1>, multiple=#builtin.int<1>} : () -> index',
     ]
     for tensor in policy.tensors:
         name, shape, dtype, extent = tensor.name, tensor.shape, tensor.dtype, tensor.extent
@@ -113,6 +117,30 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
         f"dependency_inputs=[], scalar={run.SCALE} : f32, operandSegmentSizes=array<i32: 1, 1, 0, 0, 0, 0, 0>}} "
         f': ({score_type}, {score_type}) -> !npu_source.tile<[#builtin.int<8>, #builtin.int<1024>], "f32">'
     )
+    # Metadata-only masks come from real source syntax. They are not an
+    # executable kernel or synchronization oracle for this fake artifact.
+    probe = N.from_source(
+        """
+def metadata(Sk:N.int64):
+    with N.Kernel():
+        work=N.alloc_ub((8,1024))
+        N.fill(work,NEG_INF,mask=N.arange(1024)[None,:] >= Sk)
+""",
+        constants={"NEG_INF": float("-inf")},
+    ).to_ir()
+    fill = next(op for op in probe.walk() if isinstance(op, ElementOp))
+    next(op for op in probe.walk() if isinstance(op, SizeOp)).value.name_hint = "sk"
+    fill.destination.name_hint = "score_work"
+    suffix = StringIO()
+    printer = Printer(stream=suffix)
+    for _ in range(1 + int(policy.causal)):
+        mask = fill.mask.owner.clone()
+        update = fill.clone({fill.mask: mask.results[0]})
+        printer.print_op(mask)
+        suffix.write("\n")
+        printer.print_op(update)
+        suffix.write("\n")
+    logical.append(suffix.getvalue())
     before = (
         'builtin.module { "npu.mixed"() ({\n'
         + "\n".join(physical)

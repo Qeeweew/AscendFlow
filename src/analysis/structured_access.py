@@ -522,6 +522,9 @@ class _Partitioner:
                     instances.setdefault(identity, {}).setdefault(
                         (template.operation, participant), (template, [])
                     )[1].append(access)
+                    if access.address.valid_rows is not None and private is None:
+                        ordered.add(identity)
+                        continue  # Prefix envelopes are may-accesses, not exact cell kills.
                     projections = self._slots(template, access, participant)
                     if projections is None:
                         ordered.add(identity)

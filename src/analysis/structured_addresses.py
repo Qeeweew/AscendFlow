@@ -89,6 +89,7 @@ class AddressFacts:
     geometry: NativeGeometry
     axes: AxisFacts | None
     rectangle: NDRectangle | None
+    valid_rows: Expr | None = None
 
 
 class ScalarEnvironment:
@@ -184,7 +185,16 @@ class StructuredAddresses:
                 operation.displacement.data,
             )
         offset = self.environment.expression(operation.offset)
-        rectangle = nd_rectangle(offset, geometry, axes, self.environment.facts)
+        valid_rows = (
+            None
+            if operation.valid_rows is None
+            else self.environment.expression(operation.valid_rows)
+        )
+        rectangle = (
+            None
+            if valid_rows is not None
+            else nd_rectangle(offset, geometry, axes, self.environment.facts)
+        )
         result = AddressFacts(
             operation,
             operation.source,
@@ -192,6 +202,7 @@ class StructuredAddresses:
             geometry,
             axes,
             rectangle,
+            valid_rows,
         )
         self._addresses[ref] = result
         return result
@@ -238,21 +249,42 @@ class StructuredAddresses:
             location=str(address.operation.location),
         )
         assert address.axes is not None
+        valid_rows = address.valid_rows
+        if valid_rows is not None:
+            from ..indexing import domain_nonnegative
+
+            require(
+                domain_nonnegative(valid_rows, domains, self.environment.facts)
+                and domain_nonnegative(
+                    expression("sub", literal(address.geometry.rows), valid_rows),
+                    domains,
+                    self.environment.facts,
+                ),
+                "runtime row count must stay within its declared capacity",
+            )
+            # Empty prefixes perform no access. This predicate does not
+            # authorize the original scalar arithmetic outside that access.
+            domains = (*domains, (valid_rows, literal(1), literal(address.geometry.rows)))
         for axis, (origin, width, extent) in enumerate(
             zip(address.axes.origins, address.axes.widths, address.axes.extents, strict=True)
         ):
+            if valid_rows is not None and axis == address.axes.axes[0]:
+                width = valid_rows
             try:
                 check_axis(origin, width, extent, domains, self.environment.facts)
             except CompileError as error:
                 start, size = origin.constant, extent.constant
+                width_value = width if type(width) is int else width.constant
                 constant_violation = (
                     start is not None
                     and start < 0
                     or size is not None
-                    and size < width
+                    and width_value is not None
+                    and size < width_value
                     or start is not None
                     and size is not None
-                    and start + width > size
+                    and width_value is not None
+                    and start + width_value > size
                 )
                 kind = error.kind
                 if kind is ErrorKind.INVALID and not constant_violation:

@@ -168,6 +168,36 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
         "copy needs compatible extents/types, explicit padding or cast",
     )
     banks = op.source.type.memory.data, op.destination.type.memory.data
+    prefix = op.source.owner.valid
+    if prefix is not None and len(source_shape(op.source)) == 2:
+        require(context.operand is not None, "runtime row copies need their actual scalar operand")
+        if banks == ("GM", "L1"):
+            require(
+                op.zero_pad is not None and op.destination.owner.valid is None,
+                "runtime GM→L1 row copies must define the whole destination with zero padding",
+            )
+            native = "nd2nz_rows"
+            destination = context.view(op.destination)
+            params = source_shape(op.source) + source_shape(op.destination)
+        else:
+            require(
+                banks == ("UB", "GM")
+                and op.destination.owner.valid is prefix
+                and op.zero_pad is None,
+                "runtime output rows require the same UB→GM prefix",
+            )
+            native = "copy_rows_prefix"
+            destination = context.view(op.destination, matrix=True)
+            params = ()
+        task = context.emit(
+            "_copy",
+            native,
+            context.view(op.source, matrix=True),
+            destination,
+            params=params,
+            operands=(context.operand(prefix),),
+        )
+        return RecipeResult((task,), task, 1, (NativeRead(0, task, 0),))
     if banks == ("GM", "L1"):
         require(len(source_shape(op.source)) == 2, "ND→NZ copy requires a matrix")
         padded = op.zero_pad is not None and source_shape(op.source) != source_shape(op.destination)

@@ -85,7 +85,7 @@ def _last_source(minimum, *, overwritten=False):
     [
         (scale, 3, 3),
         (batched_matmul, 6, 7),
-        (attention_target, 52, 100),
+        (attention_target, 53, 102),
         (N.from_source(SHARED, disjoint_external=True), 9, 13),
     ],
 )

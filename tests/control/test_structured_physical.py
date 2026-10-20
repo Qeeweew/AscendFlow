@@ -109,7 +109,7 @@ def address(
     if displacement is not None:
         attrs["displacement"] = IntAttr(displacement)
     return AddressOp.build(
-        operands=[root, offset, origins, extents],
+        operands=[root, offset, origins, extents, None],
         attributes=attrs,
         result_types=[root.type if result_type is None else result_type],
     )

@@ -119,12 +119,16 @@ def test_ambiguous_missing_duplicate_or_foreign_launcher_abi_is_rejected(source)
         run.launcher_abi(source, "attention_target", generated=True)
 
 
-@pytest.mark.parametrize(
-    "case", ("0:1024", "128:0", "127:1024", "128:1023", "128", "-128:1024", f"{2**64}:1024")
-)
+@pytest.mark.parametrize("case", ("0:1024", "128:0", "128", "-128:1024", f"{2**64}:1024"))
 def test_invalid_shape_is_rejected_before_loading_any_artifact(tmp_path, case):
     with pytest.raises(SystemExit):
         run.parse_args(["--output", str(tmp_path), "--cases", case])
+
+
+@pytest.mark.parametrize("sq,sk", [(1, 1), (127, 1024), (128, 1023), (384, 769)])
+def test_runtime_lengths_are_accepted_without_rounding_to_tiles(tmp_path, sq, sk):
+    args = run.parse_args(["--output", str(tmp_path), "--cases", f"{sq}:{sk}"])
+    assert args.cases == [(sq, sk)]
 
 
 @pytest.mark.parametrize(
@@ -141,7 +145,6 @@ def test_invalid_shape_is_rejected_before_loading_any_artifact(tmp_path, case):
         (("--kv-heads", "4"), "fixed attention policy"),
         (("--query-tile", "64"), "fixed attention policy"),
         (("--query-tile", "512"), "fixed attention policy"),
-        (("--query-tile", "256", "--cases", "128:1024"), "BQ256"),
         (("--backend", "ascendc"), "reference-output"),
         (("--backend", "aclnn", "--build"), "only the generated"),
         (("--reference-output", "/unused"), "only to the AscendC"),
@@ -501,11 +504,10 @@ def test_query_tile_controls_default_cases_without_rounding_explicit_cases(tmp_p
         ["--output", str(tmp_path), "--query-tile", str(bq), "--cases", "768:2048"]
     )
     assert explicit.cases == [(768, 2048)]
-    if bq == 256:
-        with pytest.raises(CompileError, match="BQ256"):
-            run.parse_args(
-                ["--output", str(tmp_path), "--query-tile", "256", "--cases", "384:1024"]
-            )
+    tail = run.parse_args(
+        ["--output", str(tmp_path), "--query-tile", str(bq), "--cases", "384:1023"]
+    )
+    assert tail.cases == [(384, 1023)]
 
 
 def test_bq256_local_geometry_keeps_native_rows_and_reuses_score_storage():
@@ -539,7 +541,9 @@ def test_bq256_rejects_stale_source_or_physical_local_storage(tmp_path, field):
         ]
     elif field in {"source-sq", "physical-sq"}:
         lines = [
-            line.replace("multiple=#builtin.int<256>", "multiple=#builtin.int<128>")
+            line.replace("multiple=#builtin.int<1>", "multiple=#builtin.int<128>")
+            if line.startswith("%sq =")
+            else line
             for line in lines
         ]
     elif field == "missing-vector":
@@ -598,7 +602,12 @@ def test_selected_variant_rechecks_source_and_physical_contracts(tmp_path, field
     elif field == "source-axis":
         text = text.replace("dynamic_axes=[#builtin.int<2>]", "dynamic_axes=[#builtin.int<0>]", 1)
     else:
-        text = text.replace("multiple=#builtin.int<1024>", "multiple=#builtin.int<512>", 1)
+        text = "\n".join(
+            line.replace("multiple=#builtin.int<1>", "multiple=#builtin.int<512>")
+            if line.startswith("%sk =")
+            else line
+            for line in text.splitlines()
+        )
     assert text != path.read_text()
     path.write_text(text)
     with pytest.raises(

@@ -267,6 +267,24 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             "native memory operands must retain reference types",
         )
         refs = tuple(decoder.decode(value) for value in operands)
+        prefix_indices = (
+            (0,)
+            if operation.native.data == "nd2nz_rows"
+            else (0, 1)
+            if operation.native.data == "copy_rows_prefix"
+            else ()
+        )
+        require(
+            tuple(i for i, ref in enumerate(refs) if ref.valid_rows is not None) == prefix_indices,
+            "runtime row-prefix addresses require their matching native instruction",
+        )
+        if prefix_indices:
+            require(len(atoms) == 1, "runtime row copy needs one actual row count")
+            count = control.environment.expression(atoms[0])
+            require(
+                all(refs[i].valid_rows == count for i in prefix_indices),
+                "runtime row address and instruction counts disagree",
+            )
         addresses.update(zip(operands, refs, strict=True))
         params = tuple(value.data for value in operation.params)
         geometries = tuple(ref.geometry for ref in refs)

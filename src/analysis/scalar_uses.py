@@ -56,7 +56,14 @@ class ScalarUses:
                 return
             if isinstance(owner, AddressOp):
                 operands = (
-                    (owner.offset, *owner.origins, *owner.extents) if metadata else (owner.offset,)
+                    (
+                        owner.offset,
+                        *owner.origins,
+                        *owner.extents,
+                        *((owner.valid_rows,) if owner.valid_rows is not None else ()),
+                    )
+                    if metadata
+                    else (owner.offset,)
                 )
             elif isinstance(owner, (scf.IfOp, scf.ForOp)):
                 mark(owner, family)

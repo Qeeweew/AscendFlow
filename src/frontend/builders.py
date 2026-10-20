@@ -1222,7 +1222,7 @@ def _issue_order(order):
     }
 
 
-def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
+def copy(source, destination, *, valid=None, valid_rows=None, transpose=False, pad_value=None):
     src, dst = _view(source), _view(destination).bound()
     require(dst.buffer.op.access.data != "read", "copy cannot write a read-only tensor")
     require(type(transpose) is bool, "copy transpose policy must be constexpr boolean")
@@ -1230,6 +1230,19 @@ def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
         pad_value is None or type(pad_value) in {int, float} and pad_value == 0,
         "copy padding currently requires pad_value=0",
     )
+    if valid_rows is not None:
+        require(
+            valid is None
+            and not transpose
+            and len(src.shape) == len(dst.shape) == 2
+            and (
+                (src.buffer.memory, dst.buffer.memory) == ("GM", "L1")
+                and pad_value == 0
+                or (src.buffer.memory, dst.buffer.memory) == ("UB", "GM")
+                and pad_value is None
+            ),
+            "valid_rows requires a zero-padded GM→L1 or UB→GM matrix copy",
+        )
     if transpose:
         require(
             src.buffer.memory == "L1"
@@ -1248,7 +1261,17 @@ def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
         "copy requires compatible extents/types; use explicit cast or pad_value=0",
     )
     op = CopyOp.build(
-        operands=[src.emit(valid), dst.emit(valid), _deps([source])],
+        operands=[
+            src.emit(valid_rows if valid_rows is not None else valid),
+            dst.emit(
+                None
+                if valid_rows is not None and pad_value is not None
+                else valid_rows
+                if valid_rows is not None
+                else valid
+            ),
+            _deps([source]),
+        ],
         result_types=[_tile(dst)],
         attributes={
             "dependency_inputs": _dependency_inputs([source]),

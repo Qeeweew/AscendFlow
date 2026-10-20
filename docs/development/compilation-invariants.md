@@ -38,6 +38,11 @@ active domain 检查。编译器不反解 GEMM swizzle、排列 mixed-radix digi
 tile-grid 的逆坐标。简单矩形分离不能排除冲突时保留 AliasRegion 及必要访问
 顺序；write_disjoint 仅按源声明使用，真实原轴范围与字节地址不变。
 
+二维 runtime 行前缀的地址容量、实际 count SSA 和 native scalar operand 必须
+对应。bounds 检查 count 范围和实际非空访问；部分写不授权完整初始化。
+补零 GM→L1 的 L1 完整写与 GM 部分读分别建模，不能通过缩小地址 metadata
+让后端仍执行整块搬运。具体合同见[memory-contracts.md](memory-contracts.md)。
+
 公共编译在独立 expression scope 内驻留完全相同的原始 `(kind, args)` 节点，
 退出、异常或取消时释放节点表，嵌套 scope 恢复外层。它不保存 range、guard、
 alias 或完成证据；数学等价的不同原式不会在此合并。所有原始 SSA 使用仍检查

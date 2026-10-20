@@ -168,6 +168,7 @@ class AddressOp(IRDLOperation):
     offset = operand_def(IndexType)
     origins = var_operand_def(IndexType)
     extents = var_operand_def(IndexType)
+    valid_rows = opt_operand_def(IndexType)
     nbytes = attr_def(IntAttr)
     rows = attr_def(IntAttr)
     row_stride = attr_def(IntAttr)
@@ -190,6 +191,8 @@ class AddressOp(IRDLOperation):
             raise VerifyException("address needs positive row width/count and non-overlapping rows")
         metadata = (self.widths, self.axes, self.displacement)
         if not self.origins and not self.extents and all(value is None for value in metadata):
+            if self.valid_rows is not None:
+                raise VerifyException("runtime row prefixes require original-axis metadata")
             return  # Structurally valid external input, with no bounds admission.
         if (
             not self.origins
@@ -211,6 +214,13 @@ class AddressOp(IRDLOperation):
             )
         if self.displacement.data < 0:
             raise VerifyException("address displacement must be nonnegative")
+        if self.valid_rows is not None and (
+            self.source.type.layout.data != "linear"
+            or len(axes) != 2
+            or self.displacement.data != 0
+            or rows != widths[axes[0]]
+        ):
+            raise VerifyException("runtime row prefixes require an original linear matrix view")
 
 
 @irdl_op_definition

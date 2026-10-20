@@ -58,6 +58,20 @@ LAST，不把退出视作完成。多个 reader engine 和两个 AIV 始终保�
 AliasRegion 和控制端口都不直接使用稳定物理 cell credit；它们继续建立有限
 使用或实际 queue handback，包含消费先于复用的关系。
 
+## Runtime 行前缀
+
+二维 `copy(valid_rows=r)` 保留静态物理容量及实际 `r` 两种事实。AddressOp
+携带原始轴、容量和真实行数 SSA；native 同时消费同一行数。地址前缀与指令
+操作数不一致、无上界/负行数或将前缀地址交给整块 native 时明确拒绝。
+原轴与 allocation bounds 检查实际非空前缀，0行没有该侧访问；这不豁免原始
+标量算术的定义性、溢出或求值域检查，也不允许静态 subview 丢掉前缀。
+
+GM→L1 的补零目标是完整写入；GM输入只有实际行数的读取。UB→GM 的目标
+只是部分写，不能把其容量上界当成完整初始化或整片 Tile producer。GM前缀
+使用保守 AliasRegion 保持可能重叠的源码顺序，不虚构精确覆盖/KILL；私有
+UB的保守读取上界仍保持真实最后 reader。有限执行模型按实际行数解释字节，
+并覆盖零行、部分行、完整行和重入。
+
 未知区域关系可能减少可用并行性。固定排步不兼容、事件容量不足或控制协议
 不能组合时具体拒绝，不加全局 barrier 或改排步。普通 loop 出口没有统一 drain；
 kernel 最终退休仍独立保留。

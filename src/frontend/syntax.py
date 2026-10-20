@@ -108,11 +108,13 @@ class Dataflow:
         _ast_only()
 
 
-def copy(source, destination, *, valid=None, transpose=False, pad_value=None):
+def copy(source, destination, *, valid=None, valid_rows=None, transpose=False, pad_value=None):
     """Copy tiles; GM→L1 can zero-pad and L0C→GM converts to the output dtype.
 
     ``pad_value=0`` explicitly defines the complete destination NZ plane.
     A smaller GM destination exports the top-left accumulator rectangle.
+    ``valid_rows`` copies a runtime leading-row prefix of a static matrix:
+    GM→L1 requires zero padding; UB→GM writes only that prefix.
     """
     _ast_only()
 

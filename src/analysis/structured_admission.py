@@ -231,6 +231,8 @@ def _writer_span(
     ignore_guards=False,
     logical_value=False,
 ):
+    if access.address.valid_rows is not None:
+        return None  # A partial write cannot initialize its static upper envelope.
     environment, facts = memory.control.environment, memory.control.environment.facts
     bindings = _participant(actor, memory.control.sid) | dict(selections)
     writer_loops, reader_loops = writer.frame.loops(), reader.frame.loops()

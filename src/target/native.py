@@ -799,6 +799,28 @@ def native_contract(
             "statistics recipe needs aligned f32 words per row",
         )
         return "V", ("W",) if arity == 1 else ("R", "R", "W")
+    if native == "copy_rows_prefix":
+        require(tuple(r.bank for r in refs) == ("UB", "GM"), "runtime row output requires UB→GM")
+        return native_contract("copy_rows", refs, params)
+    if native == "nd2nz_rows":
+        require(len(params) == 4, "runtime ND2NZ needs capacity and resident dimensions")
+        m, n, pm, pn = params
+        require(
+            1 <= m <= pm <= 256
+            and 1 <= n <= pn <= 256
+            and pm % 16 == pn % 16 == 0
+            and banks == ("GM", "L1")
+            and layouts == ("linear", "NZ")
+            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and refs[0].rows == m
+            and refs[0].nbytes == n * 2
+            and refs[0].row_stride % 2 == 0
+            and refs[0].row_stride >= n * 2
+            and refs[1].contiguous
+            and lengths == (m * n * 2, pm * pn * 2),
+            "runtime ND2NZ requires bounded GM rows and a fully zero-defined NZ destination",
+        )
+        return "MTE2", ("R", "W")
     if native == "nd2nz_pad":
         require(len(params) == 4, "padded ND2NZ requires valid and resident dimensions")
         m, n, pm, pn = params

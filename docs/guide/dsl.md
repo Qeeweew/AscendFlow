@@ -29,6 +29,7 @@
 | `T.Stage(offset, name=...)` | 最近迭代域内当前 actor 的发射偏移，不是完成边界 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理容量、布局、slot与别名 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
+| `copy(..., valid_rows=r)` | 二维矩阵的 runtime 有效行前缀；支持零填充 GM→L1 和部分 UB→GM |
 | `alloc_mask(shape)` | 显式 UB packed predicate 存储，64 lane 一个 32 B 块 |
 | `arange(n)`、比较、`& \| ~` | 精确整数逻辑 lane 坐标与带shape谓词，支持singleton轴广播 |
 | `compare(x, threshold, kind=..., out=...)` | f32逐lane比较写入packed predicate；结果绑定该次实际读写 |
@@ -123,7 +124,8 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 | FIRST/LAST/受限边界guard | 已有子集，组合限制存在 | 空/短/重合/孔洞的统一存在域 |
 | 可能重叠的符号地址、错位 ring 访问 | 按源码内存顺序处理 | 不虚构精确 producer 或完整覆盖；仍须满足现有控制与事件规则 |
 | 数据相关分支、间接alias/owner、任意多时钟连续任务 | 未普遍支持 | 明确可验证输入合同或具体拒绝 |
-| prefix native 地址、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
+| 二维 `copy(valid_rows=...)` | 零填充 GM→L1、部分 UB→GM 已实现 | 静态容量、真实行数、补零写入及 DMA 几何分别检查 |
+| 一维 `valid=` prefix、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
 | 透明 `@T.inline` helper / 静态尾块区间 | 已实现 | 同一 AST、native lowering、访问检查和同步链；不引入设备 call |
 | opaque Python函数/任意宏 | 不支持 | 不以 host 执行隐藏原语或 effects |
 
@@ -144,6 +146,26 @@ Tensor 默认 `access="read"`，入口已初始化且禁止写；`write` 表示�
 内部 reader 的输出消除写间依赖。详见[内存合同](../development/memory-contracts.md)。
 
 runtime输入的minimum/multiple支持除数正性和整除推导；非法的原始除法不能因为后续乘0或相减化简而逃过admission。地址化简须说明数学整数、设备i64、溢出、除法和guard支配条件。调用方满足合法 int64 索引求值前提，launcher 不检查运行时溢出。
+
+二维矩阵尾块用静态 tile 容量与实际有效行数分别表达。例如 `length` 为 runtime
+长度，`base` 是当前块起点，`x/y` 是固定128行的本地 tile：
+
+```python
+rows = N.min(128, N.max(0, length - base))
+N.copy(X[base:base + 128, :], x, valid_rows=rows, pad_value=0)
+# 使用完整、已经补零的 L1 tile 计算；y 为已定义的 UB 输出。
+N.copy(y, Y[base:base + 128, :], valid_rows=rows)
+```
+
+`valid_rows` 只选择二维 view 第一轴的连续前缀，不改变物理计算 tile 的形状。
+行数须证明在 `[0, 静态行容量]` 内，真实非空访问仍检查原始 tensor 各轴。
+GM→L1 支持 f16/bf16，必须显式 `pad_value=0`：整个 NZ 目标有定义，缺失的
+行和扩展列为零；0行只填零、不读取 GM，行列均完整的 tile 不发额外填零。
+UB→GM 不接受 `pad_value`，只读取/写出有效行；0行不发 DMA，目标剩余字节
+保持原值。这一路仍要求普通 DMA 的32 B行宽、地址和步长合同，不能据此
+支持任意列尾块。转置搬运、其他内存路由及一维 `valid=` 不取得该支持。
+补零 packet 的内部 MTE2 fence 保持 fill→ND2NZ 顺序，外部 ready 和最后 reader
+仍由同一自动同步链生成。输入不需要额外 host padding 或 packing kernel。
 
 `load_index` 的值范围可引用先前支配该读取的 index SSA；范围只对实际读取后的词法域有效，
 不是全局 host 参数，也不证明不同元数据取值互不相等。元数据在 kernel 内必须不可变。

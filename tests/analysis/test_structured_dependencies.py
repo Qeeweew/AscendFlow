@@ -198,7 +198,7 @@ def test_compound_slot_short_and_long_children_preserve_actual_byte_values(width
 
 def test_default_flash_attention_closes_in_compact_actual_fragment_families():
     result = dependencies(attention_target)
-    assert result.work.native_templates == 52
+    assert result.work.native_templates == 53
     assert result.work.projected_accesses < 500
     assert result.work.cells < 200
     assert result.work.needs < 1500

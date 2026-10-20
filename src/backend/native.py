@@ -99,6 +99,17 @@ def native_line(task, *, pointer_renderer, generation):
             f"asc_copy({bits[1]}, {bits[0]}, uint8_t({refs[0].rows}), "
             f"1, 1, {strides[1]}, {strides[0]});"
         )
+    if task.spec.native == "copy_rows_prefix":
+        rows = task.operands[0]
+        if all(ref.contiguous for ref in refs):
+            call = f"asc_copy_ub2gm({p[1]}, {p[0]}, uint32_t(({rows}) * {refs[0].nbytes}));"
+        else:
+            gaps = [(r.row_stride - r.nbytes) // 32 if r.rows > 1 else 0 for r in refs]
+            call = (
+                f"asc_copy_ub2gm({p[1]}, {p[0]}, uint16_t({rows}), "
+                f"uint16_t({refs[0].nbytes // 32}), uint16_t({gaps[0]}), uint16_t({gaps[1]}));"
+            )
+        return f"if (({rows}) > 0) {{ {call} }}"
     if task.spec.native == "copy_rows":
         function = "asc_copy_gm2ub" if refs[0].bank == "GM" else "asc_copy_ub2gm"
         gaps = [(r.row_stride - r.nbytes) // 32 if r.rows > 1 else 0 for r in refs]
@@ -325,6 +336,32 @@ def native_line(task, *, pointer_renderer, generation):
         else:
             call = f"asc_div({pp[2]}, {pp[0]}, {pp[1]}, uint32_t(1));"
         return f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ {call} }}"
+    if task.spec.native == "nd2nz_rows":
+        maximum, cols, resident_rows, resident_cols = task.spec.params
+        rows = task.operands[0]
+        copy = (
+            f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, uint16_t({rows}), {cols}, 0, "
+            f"{refs[0].row_stride // 2}, {resident_rows}, 1, 0);"
+        )
+        if refs[0].row_stride // 2 > 65535:
+            source = ptr(0, extra=f"npu_row * {refs[0].row_stride}")
+            destination = ptr(1, extra="npu_row * 32")
+            copy = (
+                f"for (int64_t npu_row = 0; npu_row < ({rows}); ++npu_row) {{ "
+                f"asc_copy_gm2l1_nd2nz({destination}, {source}, 1, 1, {cols}, 0, "
+                f"0, {resident_rows}, 1, 0); }}"
+            )
+        zero = (
+            "asc_fill_value_config npu_zero = { .config = uint64_t(1) | "
+            f"(uint64_t({refs[1].total_nbytes // 32}) << 16) }}; "
+            f"asc_fill_l1({p[1]}, uint32_t(0), npu_zero);"
+        )
+        tail = f"{{ {zero} if (({rows}) > 0) {{ asc_sync_pipe(PIPE_MTE2); {copy} }} }}"
+        return (
+            f"if (({rows}) == {resident_rows}) {{ {copy} }} else {tail}"
+            if maximum == resident_rows and cols == resident_cols
+            else tail
+        )
     if task.spec.native in {"nd2nz", "nd2nz_pad"}:
         rows, cols = task.spec.params[:2]
         padded = task.spec.native == "nd2nz_pad"

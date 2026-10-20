@@ -581,13 +581,15 @@ def check_axis(origin, width, extent, domains, facts):
                 "unsigned index division has an unproven nonnegative dividend",
             )
 
+    width = literal(width) if type(width) is int else width
     divisions(origin)
+    divisions(width)
     lower, _ = interval(origin, domains, facts)
     require(
         domain_nonnegative(origin, domains, facts) or domain_nonnegative(lower, domains, facts),
         "logical axis origin may be negative",
     )
-    remaining = expression("sub", extent, expression("add", origin, literal(width)))
+    remaining = expression("sub", extent, expression("add", origin, width))
     require(
         domain_nonnegative(remaining, domains, facts),
         "logical axis access is not bounded by its tensor extent",

@@ -6,7 +6,7 @@
 
 - dense、无mask forward，BNSD，f16输入输出，B1/Hq8/Hkv8/D128。
 - BQ256/BM128/BK1024/CK128/VR8，20组AIC/双AIV。
-- Sq/Sk为runtime参数，满足`Sq>0且Sq%BQ==0`、`Sk>0且Sk%BK==0`；空owner不发任务。
+- Sq/Sk为任意正整数runtime参数，声明均为 `N.int64(minimum=1)`，没有倍数限制；空owner不发任务。
 - 每组串行处理分配到的Q块，每个Q块遍历KV块，内部Cube/Vector再分块。这里的Q块不是编译器应特殊识别的控制类型。
 
 | 显式workspace | shape | dtype |
@@ -47,6 +47,21 @@ denominator归约之前，归约继续读取原始FP32 work，不读取转换后
 归一化、RN cast 和 GM 写回在 accumulate 末尾的同一个 LAST 条件内执行；
 Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
 
+## Runtime 长度与尾块
+
+query/KV 块数分别为 `ceildiv(Sq,BQ)` 和 `ceildiv(Sk,BK)`。同一份已编译产物
+处理不同 Sq/Sk，不按长度展开循环，也不在 host 侧补齐输入。
+每个 Q 的 BM片、K/V 的 CK片使用 `copy(valid_rows=..., pad_value=0)`：
+GM只读实际行数，完整 L1 tile 的其余行补零，0行不发 GM读取。
+QK/PV 仍在固定物理 tile 上计算；softmax 在真实 key 尾块将 `j>=Sk` 的 score
+填为负无穷，因此 padded key 的概率为零，不进入 denominator 或 PV结果。
+causal mask 另按 `j>i` 更新，两种 mask 都发生在 reduce_max 之前。
+
+最后的 O 搬运使用 `copy(valid_rows=...)`，只写有效 query 行，不触及下一头或
+allocation 末尾。无效 query 行仍可计算，但不写回。只要 Sk>0，实际 query
+总有可见 key；这一路不增加全mask/空序列的数值合同。动态行数搬运、地址
+bounds、补零effects、初始化和最后 reader 都经过同一编译链。
+
 ## Causal 模式
 
 同一入口用 `CAUSAL=True` 特化，runner 使用 `--causal`。语义为左上对齐
@@ -63,19 +78,20 @@ Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
 | ≥8192 | 1024 | 8 |
 
 BQ256/BM128/CK128、20 组不变。每份产物内 Sq/Sk 仍为 runtime，要求
-`Sq>0, Sq%256==0, Sk>0, Sk%1024==0`。显式指定其他参数不取得同等资格。
+`Sq>0, Sk>0`；不要求 query/KV tile 的倍数。显式指定其他参数不取得同等资格。
 编译器没有按 attention 或 shape 选择政策。
 
-每个 query 块遍历 `min(Sk/BK, ceildiv(query_row+BQ, BK))` 个 KV 块，不增加
-完全位于未来的 padding 块。PV 子循环再按实际可见列裁剪，允许单个 CK；
+每个 query 块遍历 `min(ceildiv(Sk,BK), ceildiv(query_row+BQ, BK))` 个 KV 块，不增加
+完全位于未来的 padding 块。PV 子循环按物理 query tile 的可见前缀裁剪，允许单个 CK；
 QK/softmax 保持完整 BK。GM 两槽与 L1 operand 两槽分别按实际访问同步，
 不要求每次父调用触达全部槽；未访问槽保留原来的 ownership 和最后 reader。
 读取前缀的物理 footprint 不变，GM 槽由实际最后 reader 释放。
 
 slot 必访与初始化非空证明使用控制分析保留的祖先调用域。例如 BQ256、
-BK256/512/1024、CK128 的活跃 KV 中，剩余可见列是正的256倍数，因此 PV
+BK256/512/1024、CK128 的活跃 KV 中，物理 query tile 的剩余可见列是正的256倍数，因此 PV
 至少有两个 CK；BQ128 则允许实际只有一个 CK。前者不生成虚假的稀疏私有
 credit，后者保留实际跨空调用的释放协议；两者使用同一编译路径和有限事件 bank。
+真实 Sk 尾部以 V补零和 P的 key mask处理，不改变上述物理循环前缀。
 
 score 缩放后、reduce_max 前用普通逻辑lane坐标表达causal条件
 `(kv*BK + c) > (query_row + g + r)`，并调用通用masked `N.fill` 将选中lane
@@ -107,7 +123,12 @@ masked fill仍是需要初始化目标的读写更新，不是隐藏mask workspa
 这些记录只覆盖对应配置和产物；BQ128 及其他政策的历史记录不代替当前默认配置。
 连续 fence 合并的规则见[同步优化边界](../development/sync-optimizations.md)。
 
-runner能接受某些dtype/head/tile参数不代表其全部通过。causal 的资格单独记录；任意外部 mask、tail、空序列、varlen、paged/sparse、persistent及continuous多时钟状态不在上述资格内。后续变体应通过通用控制/访问合同表达，不创建attention专属pass。
+runtime 尾块另有完整输出设备检查，覆盖 dense、causal、BQ128/256、
+BK256/512/1024 和 BF16/GQA 的选定组合；包含1:1、127:129、129:127、
+257:513、769:385及4077:4093等非对齐长度。对应构建、输入、误差和guard
+保存在各次实际设备记录中，不外推全部组合或性能。
+
+runner能接受某些dtype/head/tile参数不代表其全部通过。causal 的资格单独记录；任意外部 mask、空序列、varlen、paged/sparse、persistent及continuous多时钟状态不在上述资格内。后续变体应通过通用控制/访问合同表达，不创建attention专属pass。
 
 ## 复现入口
 

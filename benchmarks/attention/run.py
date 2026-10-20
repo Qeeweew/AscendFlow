@@ -249,7 +249,7 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
     local_bytes = local_contract(program, root, policy)
     require(
         sum(isinstance(op, ElementOp) and op.mask is not None for op in logical.walk())
-        == int(policy.causal),
+        == 1 + int(policy.causal),
         "compiled attention causal mask differs from selected policy",
     )
     scale_operations = [
@@ -289,7 +289,7 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
         and all(
             dimension[name].minimum.data == 1 and dimension[name].multiple.data == multiple
             for dimension in (sizes, source_sizes)
-            for name, multiple in (("Sq", policy.query_tile), ("Sk", 1024))
+            for name, multiple in (("Sq", 1), ("Sk", 1))
         ),
         "compiled attention runtime tile contracts differ",
     )
@@ -464,10 +464,8 @@ def case_shape(value):
     if match is None:
         raise argparse.ArgumentTypeError("cases must be positive Sq:Sk")
     sq, sk = map(int, match.groups())
-    if sq % 128 or sk % 256 or max(sq, sk) > 2**63 - 1:
-        raise argparse.ArgumentTypeError(
-            "cases require complete BQ128/BK256 tiles within int64 extents"
-        )
+    if max(sq, sk) > 2**63 - 1:
+        raise argparse.ArgumentTypeError("cases require positive Sq:Sk within int64 extents")
     return sq, sk
 
 

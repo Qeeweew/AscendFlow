@@ -326,7 +326,8 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                 512
                 if bank != "GM" and engine in {Engine.M, Engine.MTE1, Engine.FIX}
                 else ITEMSIZE[access.address.geometry.dtype]
-                if bank == "GM" and template.operation.native.data in {"nd2nz", "nd2nz_pad", "fix"}
+                if bank == "GM"
+                and template.operation.native.data in {"nd2nz", "nd2nz_pad", "nd2nz_rows", "fix"}
                 else ITEMSIZE[access.address.geometry.dtype]
                 if engine is Engine.S
                 else 32
@@ -345,7 +346,7 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
         # lowering produced several SSA AddressOps. Include original axes and
         # raw offset DAG, not just the flattened footprint. Each distinct
         # active domain still adds its own obligation below.
-        key = address.root, address.offset, address.geometry, address.axes
+        key = address.root, address.offset, address.geometry, address.axes, address.valid_rows
         views.setdefault(key, []).append(admitted[value])
     domain_contracts = 0
     for members in views.values():
@@ -403,14 +404,33 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                 remaining = expression(
                     "sub",
                     allocations[address.root],
-                    expression("add", address.offset, literal(span)),
+                    expression(
+                        "add",
+                        address.offset,
+                        literal(span)
+                        if address.valid_rows is None
+                        else expression(
+                            "add",
+                            literal(address.geometry.nbytes),
+                            expression(
+                                "mul",
+                                expression("sub", address.valid_rows, literal(1)),
+                                literal(address.geometry.row_stride),
+                            ),
+                        ),
+                    ),
                 )
                 _nonnegative(
                     remaining,
                     facts,
                     operation,
                     "native byte footprint is not bounded by its allocation",
-                    domains=domain,
+                    domains=domain
+                    if address.valid_rows is None
+                    else (
+                        *domain,
+                        (address.valid_rows, literal(1), literal(address.geometry.rows)),
+                    ),
                     witness=(f"span={span}", f"allocation={allocations[address.root].text()}"),
                 )
         except CompileError as error:

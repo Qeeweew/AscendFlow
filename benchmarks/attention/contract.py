@@ -164,12 +164,8 @@ class AttentionPolicy:
 
     def validate_case(self, sq, sk):
         require(
-            type(sq) is int
-            and type(sk) is int
-            and sq > 0
-            and sk > 0
-            and sq % self.query_tile == sk % 1024 == 0,
-            f"attention cases require positive complete BQ{self.query_tile}/Sk1024 tiles",
+            type(sq) is int and type(sk) is int and sq > 0 and sk > 0,
+            "attention cases require positive runtime Sq and Sk",
         )
         require(
             all(tensor.nbytes(sq, sk) <= 2**63 - 1 for tensor in self.tensors),

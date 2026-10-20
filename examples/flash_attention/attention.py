@@ -30,7 +30,7 @@ def causal_policy(sq, sk):
 def qk_tiles(inputs, buffers, task, geometry):
     K, Score = inputs
     q1, k1, a0, b0, c0 = buffers
-    batch, kv_head, group, s, kv = task
+    batch, kv_head, group, s, kv, Sk = task
     parts, BM, BK, CK = geometry
     if parts == 2:
         # PV overwrites these slots between QK phases, but
@@ -43,7 +43,12 @@ def qk_tiles(inputs, buffers, task, geometry):
     ):
         j = kv * BK + chunk * CK
         with N.Stage(0, name="load_k"):
-            N.copy(K[batch, kv_head, j : j + CK, :], k1[chunk % 2, :, :])
+            N.copy(
+                K[batch, kv_head, j : j + CK, :],
+                k1[chunk % 2, :, :],
+                valid_rows=N.min(CK, N.max(0, Sk - j)),
+                pad_value=0,
+            )
         with N.Stage(1, name="operand_k"):
             N.copy(k1[chunk % 2, :, :], b0[chunk % 2, :, :], transpose=True)
         with N.Stage(2, name="qk_emit"):
@@ -74,7 +79,7 @@ def online_softmax_rows(inputs, buffers, state, scratch, task, geometry):
     score_in, score_work, p_out = buffers
     m, l, alpha = state
     partial, next_m, row_sum, soft_broadcast = scratch
-    group, s, kv, query_row, lane = task
+    group, s, kv, query_row, lane, Sk = task
     BQ, BM, BK, VR, SCALE, CAUSAL = geometry
     for row in N.Pipelined(BQ // 2 // VR):
         r = row * VR
@@ -89,6 +94,9 @@ def online_softmax_rows(inputs, buffers, state, scratch, task, geometry):
                 # the other slot remains available to MTE2.
                 work = score_in[row % 2, :, :]
             N.mul(score_in[row % 2, :, :], SCALE, out=work)
+            if kv * BK + BK > Sk:
+                columns = N.arange(BK)[None, :]
+                N.fill(work, NEG_INF, mask=(kv * BK + columns) >= Sk)
             if CAUSAL:
                 # Ordinary logical lane coordinates, not a
                 # triangular primitive: lane (r, c) is masked
@@ -136,7 +144,7 @@ def online_softmax_rows(inputs, buffers, state, scratch, task, geometry):
 def pv_tiles(inputs, buffers, task, geometry):
     V, P, PV = inputs
     v1, p1, a0, b0, c0 = buffers
-    batch, kv_head, group, s, kv, query_row = task
+    batch, kv_head, group, s, kv, query_row, Sk = task
     parts, BQ, BM, BK, CK, CAUSAL = geometry
     if CAUSAL:
         # P is explicitly zero outside the causal prefix.
@@ -172,7 +180,12 @@ def pv_tiles(inputs, buffers, task, geometry):
                     ],
                     p1[chunk % 2, part, :, :],
                 )
-            N.copy(V[batch, kv_head, j : j + CK, :], v1[chunk % 2, :, :])
+            N.copy(
+                V[batch, kv_head, j : j + CK, :],
+                v1[chunk % 2, :, :],
+                valid_rows=N.min(CK, N.max(0, Sk - j)),
+                pad_value=0,
+            )
         with N.Stage(1, name="operand_v"):
             N.copy(v1[chunk % 2, :, :], b0[chunk % 2, :, :])
         with N.Stage(1, name="operand_p0"):
@@ -204,7 +217,7 @@ def update_output_rows(inputs, buffers, state, scratch, task, geometry):
     pv_in, o_out = buffers
     o, l, alpha = state
     out_broadcast, ones, inverse = scratch
-    batch, head, group, s, kv, query_row, lane, active_kv_tiles = task
+    batch, head, group, s, kv, query_row, lane, active_kv_tiles, Sq = task
     BQ, VR, CAUSAL = geometry
     N.mul(o, alpha[s, :, None], out=o, scratch=out_broadcast)
     for row in N.Pipelined(BQ // 2 // VR):
@@ -230,6 +243,7 @@ def update_output_rows(inputs, buffers, state, scratch, task, geometry):
                 N.copy(
                     o_out[output_slot, :, :],
                     O[batch, head, query_row + g : query_row + g + VR, :],
+                    valid_rows=N.min(VR, N.max(0, Sq - query_row - g)),
                 )
 
 
@@ -242,8 +256,8 @@ def attention_target(
     Score: N.Tensor((GROUPS, 2, BQ, BK), N.f32, access="write"),
     P: N.Tensor((GROUPS, 2, BQ, BK), DTYPE, access="write"),
     PV: N.Tensor((GROUPS, 2, BQ, D), N.f32, access="write"),
-    Sq: N.int64(minimum=1, multiple_of=BQ),
-    Sk: N.int64(minimum=1, multiple_of=1024),
+    Sq: N.int64(minimum=1),
+    Sk: N.int64(minimum=1),
     B: N.constexpr = 1,
     HQ: N.constexpr = 8,
     HKV: N.constexpr = 8,
@@ -308,11 +322,11 @@ def attention_target(
         out_broadcast = N.alloc_ub((BQ // 2, 8), N.f32)
         with N.Vector():
             N.fill(ones, 1.0)
-        query_tiles = Sq // BQ
-        kv_tiles = Sk // BK
+        query_tiles = N.ceildiv(Sq, BQ)
+        kv_tiles = N.ceildiv(Sk, BK)
         local_queries = N.ceildiv(N.max(0, B * HQ * query_tiles - group), GROUPS)
-        # Sq/Sk contracts are checked before launch; head/tile relations are checked above.
-        # Empty owners do no work. No implicit padding or global Q/K/V packing.
+        # Runtime lengths need no tile alignment. Empty owners do no work;
+        # the final physical tiles have explicit bounded reads and zero padding.
         for query in N.serial(local_queries):
             global_query = group + query * GROUPS
             if CAUSAL:
@@ -343,6 +357,8 @@ def attention_target(
                             :,
                         ],
                         q1[part, :, :],
+                        valid_rows=N.min(BM, N.max(0, Sq - query_row - part * BM)),
+                        pad_value=0,
                     )
                 if parts == 1:
                     N.copy(q1[0, :, :], a0[0, :, :])
@@ -369,7 +385,7 @@ def attention_target(
                     qk_tiles(
                         (K, Score),
                         (q1, k1, a0, b0, c0),
-                        (batch, kv_head, group, s, kv),
+                        (batch, kv_head, group, s, kv, Sk),
                         (parts, BM, BK, CK),
                     )
                 with N.Vector() as lane, N.Stage(0, name="softmax"):
@@ -378,14 +394,14 @@ def attention_target(
                         (score_in, score_work if BQ == BM else None, p_out),
                         (m, l, alpha),
                         (partial, next_m, row_sum, soft_broadcast),
-                        (group, s, kv, query_row, lane),
+                        (group, s, kv, query_row, lane, Sk),
                         (BQ, BM, BK, VR, SCALE, CAUSAL),
                     )
                 with N.Cube(), N.Stage(1, name="pv"):
                     pv_tiles(
                         (V, P, PV),
                         (v1, p1, a0, b0, c0),
-                        (batch, kv_head, group, s, kv, query_row),
+                        (batch, kv_head, group, s, kv, query_row, Sk),
                         (parts, BQ, BM, BK, CK, CAUSAL),
                     )
                 with N.Vector() as lane, N.Stage(1, name="update"):
@@ -397,6 +413,6 @@ def attention_target(
                         (pv_in, o_out),
                         (o, l, alpha),
                         (out_broadcast, ones, inverse),
-                        (batch, head, group, s, kv, query_row, lane, active_kv_tiles),
+                        (batch, head, group, s, kv, query_row, lane, active_kv_tiles, Sq),
                         (BQ, VR, CAUSAL),
                     )

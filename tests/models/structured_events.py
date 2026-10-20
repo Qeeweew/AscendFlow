@@ -171,7 +171,13 @@ class _Interpret:
                 if ordinal == 0 or operation.native.data == "mad_cycle" and ordinal % period == 0:
                     mode = "W"
             private = root.ref.type.bank.data != "GM"
-            for row in range(geometry.rows):
+            active_rows = geometry.rows
+            if address.valid_rows is not None:
+                active_rows = values[address.valid_rows]
+                _check(
+                    0 <= active_rows <= geometry.rows, "actual runtime row count exceeds capacity"
+                )
+            for row in range(active_rows):
                 start = offset + row * geometry.row_stride
                 end = start + geometry.nbytes
                 _check(

@@ -121,7 +121,9 @@ def lower_address(
     allocation = view.source.owner
     _require(isinstance(allocation, AllocationOp), "source view needs its original allocation")
     _require(
-        view.valid is None, "valid prefix native addresses are not supported", unsupported=True
+        view.valid is None or matrix and len(value.type.shape) == 2,
+        "valid prefix native addresses are not supported for this operation",
+        unsupported=True,
     )
     typ, original = value.type, allocation.ref.type
     _require(
@@ -156,12 +158,18 @@ def lower_address(
     dynamic = dict(zip(dynamic_axes, allocation.dimensions, strict=True))
     extents = tuple(dynamic.get(axis, size) for axis, size in enumerate(shape))
     static_extents = tuple(_constant(extent) for extent in extents)
-    for origin, width, extent in zip(view.origins, widths, static_extents, strict=True):
+    for axis, (origin, width, extent) in enumerate(
+        zip(view.origins, widths, static_extents, strict=True)
+    ):
         start = _constant(origin)
         _require(start is None or start >= 0, "static view origin must be nonnegative")
         _require(extent is None or extent > 0, "static allocation extent must be positive")
         _require(
-            extent is None or width <= extent and (start is None or start + width <= extent),
+            view.valid is not None
+            and axis == axes[0]
+            or extent is None
+            or width <= extent
+            and (start is None or start + width <= extent),
             "static view origin and width exceed their original axis",
         )
     strides, stride = [], itemsize
@@ -232,7 +240,13 @@ def lower_address(
         if axis:
             stride = indices.binary(arith.MuliOp, extent, stride)
     address = AddressOp.build(
-        operands=[root, indices.value(offset), origins, actual_extents],
+        operands=[
+            root,
+            indices.value(offset),
+            origins,
+            actual_extents,
+            None if view.valid is None else materialize(view.valid),
+        ],
         attributes={
             "nbytes": IntAttr(nbytes),
             "rows": IntAttr(rows),
@@ -265,6 +279,9 @@ def subview(
     origins, extents = (), ()
     widths = axes = displacement = None
     if isinstance(owner, AddressOp):
+        _require(
+            owner.valid_rows is None, "runtime row-prefix addresses cannot be statically sliced"
+        )
         _require(source is owner.ref, "native subview needs the actual address result")
         root, base = owner.source, owner.offset
         _root(root)
@@ -317,6 +334,7 @@ def subview(
             indices.value(indices.binary(arith.AddiOp, base, offset)),
             origins,
             extents,
+            None,
         ],
         attributes={
             "nbytes": IntAttr(nbytes),

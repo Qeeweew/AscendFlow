@@ -43,7 +43,12 @@ def online_attention(
         # Fully masked later tiles contribute zero and retain the prior state.
         alpha = np.exp(np.float32(maximum - next_maximum))
         probabilities = np.exp(np.float32(scores - next_maximum[:, None]))
-        partials = probabilities.reshape(rows, -1, 64).sum(axis=2, dtype=np.float32)
+        # Native reduction tiles retain zero probability outside the logical
+        # key tail. Keep that same block8 reduction domain in the oracle.
+        padded = probabilities
+        if probabilities.shape[1] != block_kv:
+            padded = np.pad(probabilities, ((0, 0), (0, block_kv - probabilities.shape[1])))
+        partials = padded.reshape(rows, -1, 64).sum(axis=2, dtype=np.float32)
         row_sum = partials.sum(axis=1, dtype=np.float32)
         denominator = np.float32(np.float32(denominator * alpha) + row_sum)
         pv = rounded(probabilities, dtype) @ v[first : first + block_kv]
@@ -56,9 +61,7 @@ def inputs_and_oracle(policy, sq, sk, *, scope="full", data_case="standard"):
     import numpy as np
 
     block_kv = policy.get("kv_tile", 1024)
-    require(
-        sq >= 0 and sq % 128 == 0 and sk > 0 and sk % block_kv == 0, "complete FA tiles required"
-    )
+    require(sq >= 0 and sk > 0, "FA lengths must be nonnegative Sq and positive Sk")
     require(
         scope in {"full", "sampled"} and data_case in {"standard", "uniform", "sharp"},
         "unknown numerical validation policy",
@@ -83,7 +86,15 @@ def inputs_and_oracle(policy, sq, sk, *, scope="full", data_case="standard"):
         np.arange(sq)
         if scope == "full"
         else np.array(
-            sorted({q * 128 + r for q in range(sq // 128) for r in (0, 7, 63, 64, 71, 127)}),
+            sorted(
+                {
+                    q * 128 + r
+                    for q in range((sq + 127) // 128)
+                    for r in (0, 7, 63, 64, 71, 127)
+                    if q * 128 + r < sq
+                }
+                | ({sq - 1} if sq else set())
+            ),
             dtype=np.int64,
         )
     )
