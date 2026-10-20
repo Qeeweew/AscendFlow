@@ -63,14 +63,19 @@ Vector→MTE3 ready 和输出 UB slot 的最后读取仍由通用同步建立。
 | ≥8192 | 1024 | 8 |
 
 BQ256/BM128/CK128、20 组不变。每份产物内 Sq/Sk 仍为 runtime，要求
-`Sq>0, Sq%256==0, Sk>=2*BK, Sk%1024==0`。显式指定其他参数不取得同等资格。
+`Sq>0, Sq%256==0, Sk>0, Sk%1024==0`。显式指定其他参数不取得同等资格。
 编译器没有按 attention 或 shape 选择政策。
 
-每个 query 块只遍历 `min(Sk/BK, max(2, ceildiv(query_row+BQ, BK)))` 个 KV 块。
-保留最少两次迭代使每个父代次都访问两个交接槽；必要时多算一个全 mask KV 块，
-不改变输出。去掉该下限会需要父循环条件激活 family 的闭合，当前仍明确拒绝。
-PV 的子循环再按实际可见列裁剪，最少保留两个 CK 槽；QK/softmax 保持完整 BK。
+每个 query 块遍历 `min(Sk/BK, ceildiv(query_row+BQ, BK))` 个 KV 块，不增加
+完全位于未来的 padding 块。PV 子循环再按实际可见列裁剪，允许单个 CK；
+QK/softmax 保持完整 BK。GM 两槽与 L1 operand 两槽分别按实际访问同步，
+不要求每次父调用触达全部槽；未访问槽保留原来的 ownership 和最后 reader。
 读取前缀的物理 footprint 不变，GM 槽由实际最后 reader 释放。
+
+slot 必访与初始化非空证明使用控制分析保留的祖先调用域。例如 BQ256、
+BK256/512/1024、CK128 的活跃 KV 中，剩余可见列是正的256倍数，因此 PV
+至少有两个 CK；BQ128 则允许实际只有一个 CK。前者不生成虚假的稀疏私有
+credit，后者保留实际跨空调用的释放协议；两者使用同一编译路径和有限事件 bank。
 
 score 缩放后、reduce_max 前用普通逻辑lane坐标表达causal条件
 `(kv*BK + c) > (query_row + g + r)`，并调用通用masked `N.fill` 将选中lane

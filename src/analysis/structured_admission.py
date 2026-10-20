@@ -167,9 +167,22 @@ def _same_guard(left, right, facts):
     )
 
 
-def _summarize(span, loop, facts, bindings):
+def _nonempty_count(loop, facts, bindings):
+    """A writer loop must run in its actual enclosing invocation.
+
+    Ancestor ranges are established by control analysis. Never borrow this
+    loop's own body ranges: that would discard an empty writer's path.
+    """
     count = substitute(loop.count, bindings)
-    if not nonnegative(expression("sub", count, literal(1)), facts):
+    domains = tuple(tuple(substitute(v, bindings) for v in domain) for domain in loop.entry_domains)
+    return (
+        count if domain_nonnegative(expression("sub", count, literal(1)), domains, facts) else None
+    )
+
+
+def _summarize(span, loop, facts, bindings):
+    count = _nonempty_count(loop, facts, bindings)
+    if count is None:
         return None
     if loop.ordinal.args[0] not in arguments(span.base):
         return span
@@ -248,13 +261,12 @@ def _writer_span(
     result = _span(access, bindings)
     for loop in reversed(writer_loops):
         if loop not in reader_loops:
-            count = substitute(loop.count, bindings)
-            if not nonnegative(expression("sub", count, literal(1)), facts):
-                return None
             if loop.ordinal not in bindings:
                 result = _summarize(result, loop, facts, bindings)
                 if result is None:
                     return None
+            elif _nonempty_count(loop, facts, bindings) is None:
+                return None
     return result
 
 

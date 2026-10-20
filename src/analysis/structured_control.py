@@ -115,6 +115,9 @@ class LogicalLoop:
     upper: Expr
     step: int
     count: Expr
+    # Ranges of the enclosing invocation, before this loop is entered.
+    # Its own ordinal domain cannot establish that the loop is nonempty.
+    entry_domains: tuple[Range, ...]
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -317,7 +320,9 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
             )
             count = extent if step == 1 else expression("ceildiv", extent, literal(step))
             induction = expression("add", lower, expression("mul", ordinal, literal(step)))
-            loop = LogicalLoop(operation, ordinal, induction, lower, upper, step, count)
+            loop = LogicalLoop(
+                operation, ordinal, induction, lower, upper, step, count, frame.domains()
+            )
             loops[operation] = loop
             joint = _division_iteration_range(lower, upper, induction, frame.domains(), facts)
             frame = ControlFrame(

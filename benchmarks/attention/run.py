@@ -287,8 +287,7 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
     require(
         sizes.keys() == source_sizes.keys() == {"Sq", "Sk"}
         and all(
-            dimension[name].minimum.data == (policy.minimum_sk if name == "Sk" else 1)
-            and dimension[name].multiple.data == multiple
+            dimension[name].minimum.data == 1 and dimension[name].multiple.data == multiple
             for dimension in (sizes, source_sizes)
             for name, multiple in (("Sq", policy.query_tile), ("Sk", 1024))
         ),
@@ -519,7 +518,7 @@ def parse_args(argv=None):
     args.policy = AttentionPolicy(**{key: getattr(args, key) for key in DEFAULT_POLICY.as_dict()})
     if args.cases is None:
         bq = args.policy.query_tile
-        sk = max(1024, args.policy.minimum_sk)
+        sk = 1024
         args.cases = [(bq, sk), (3 * bq, 3 * sk), (6 * bq, sk), (4 * bq, 2 * sk)]
     for sq, sk in args.cases:
         args.policy.validate_case(sq, sk)

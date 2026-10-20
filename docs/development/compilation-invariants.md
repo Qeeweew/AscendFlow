@@ -70,6 +70,9 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 - 每个合法逻辑代次在每个stage恰好执行一次；坐标替换同时作用于地址、guard、slot、metadata和捕获值。
 - N=0透传原状态；N=1的FIRST/LAST重合不重不漏；短循环不能假借稳态条件。不得按runtime长度展开。
 - 父层绑定child的真实外部端口和祖先代次，不重新求其内部路径历史；不同代次不能共用裸ordinal条件得出矛盾。
+- 控制分析一次保存每个循环进入前的祖先范围；初始化非空证明与slot必访判断
+  使用这份调用域，并随实际代次选择替换坐标。不能只用全局参数事实而遗失
+  父子次数的关系，也不能借用待证明循环自身的body域排除其零次路径。
 - 循环控制退出不证明native完成。跨loop的旧reader与未消费event仍通过对应端口传递，不加统一loop drain。
 - 每个逻辑迭代域按 actor family 输出各自的物理时钟循环，stage 以 `g=j_actor-offset` 及其存在条件执行。首末条件属于同一生命周期，不能独立seed/drain。kernel最终收尾单独处理。
 - buffer slot数、stage偏移、event width互不代替；跨AIC/AIV使用实际参与者与GM可见性，不能丢掉第二个AIV贡献。

@@ -180,6 +180,35 @@ def test_closed_runtime_loop_needs_a_proven_first_writer_before_an_outside_read(
             _admit(text)
 
 
+@pytest.mark.parametrize("count,accepted", [("N.min(2,parent+1)", True), ("parent%2", False)])
+def test_child_initialization_uses_parent_domain_without_erasing_empty_children(count, accepted):
+    text = _vector(
+        f"""                for parent in N.serial(n):
+                    for child in N.Pipelined({count}):
+                        N.fill(x,1.0)
+                    N.mul(x[0:64],2.0,out=y)""",
+        "n:N.int64",
+    )
+    if accepted:
+        assert _admit(text).work["read_proofs"] == 1
+    else:
+        with pytest.raises(CompileError, match="initialized writer coverage"):
+            _admit(text)
+
+
+def test_child_nonempty_in_an_active_parent_does_not_initialize_after_an_empty_parent():
+    with pytest.raises(CompileError, match="initialized writer coverage"):
+        _admit(
+            _vector(
+                """                for parent in N.serial(n):
+                    for child in N.Pipelined(N.min(2,parent+1)):
+                        N.fill(x,1.0)
+                N.mul(x[0:64],2.0,out=y)""",
+                "n:N.int64",
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "body",
     [

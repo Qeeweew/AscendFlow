@@ -27,7 +27,7 @@ def test_strided_initializer_coverage_matches_actual_bytes():
 @pytest.mark.parametrize("count", [1, 2, 16])
 def test_repeated_rectangles_preserve_row_holes_and_exact_byte_coverage(count):
     ordinal = Expr("argument", ("tile",))
-    loop = SimpleNamespace(ordinal=ordinal, count=literal(count))
+    loop = SimpleNamespace(ordinal=ordinal, count=literal(count), entry_domains=())
     source = _Span(
         expression("add", literal(256), expression("mul", ordinal, literal(96))), literal(16), 3, 32
     )
@@ -55,7 +55,7 @@ def test_repeated_rectangles_preserve_row_holes_and_exact_byte_coverage(count):
 @pytest.mark.parametrize("stride", [64, 128])
 def test_repeated_rectangles_with_different_group_pitch_still_reject(stride):
     ordinal = Expr("argument", ("tile",))
-    loop = SimpleNamespace(ordinal=ordinal, count=literal(4))
+    loop = SimpleNamespace(ordinal=ordinal, count=literal(4), entry_domains=())
     source = _Span(expression("mul", ordinal, literal(stride)), literal(16), 3, 32)
     assert _summarize(source, loop, {}, {}) is None
 

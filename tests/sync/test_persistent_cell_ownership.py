@@ -105,3 +105,31 @@ def conditional(X:N.Tensor((n,4,64),N.f32),
     assert len(plan.generation.credits) == 2
     for n in (0, 2, 7, 13):
         check_compiled_events(plan, {"n": n}, invocations=2)
+
+
+@pytest.mark.parametrize("quantum,credits", [(1, 1), (2, 0)])
+def test_slot_visits_use_parent_entry_relations_without_assuming_a_child_exists(quantum, credits):
+    # Parent visibility is aligned to quantum. An active tile has at least
+    # quantum elements left; with quantum=1 the second slot really can be
+    # absent. The loop's own body domain must not prove its slot populated.
+    source = f"""
+def prefix(X:N.Tensor((n,2,4,64),N.f32),
+           Out:N.Tensor((n,2,4,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+    with N.Kernel(1,kind="vector"):
+        scratch=N.alloc_ub((2,64),N.f32)
+        with N.Vector():
+            for parent in N.serial(n):
+                end={quantum}*(parent%4+1)
+                for tile in N.Pipelined(N.ceildiv(end,4)):
+                    with N.Stage(0):
+                        count=N.min(4,N.max(0,end-tile*4))
+                        for child in N.Pipelined(count):
+                            with N.Stage(0):
+                                N.copy(X[parent,tile,child,:],scratch[child%2,:])
+                            with N.Stage(1):
+                                N.copy(scratch[child%2,:],Out[parent,tile,child,:])
+"""
+    plan = synchronize_structure(N.from_source(source, disjoint_external=True))
+    assert len(plan.generation.credits) == credits
+    for n in (0, 1, 2, 4, 7):
+        check_compiled_events(plan, {"n": n}, invocations=2)

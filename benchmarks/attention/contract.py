@@ -114,10 +114,6 @@ class AttentionPolicy:
         }
 
     @property
-    def minimum_sk(self):
-        return 2 * self.kv_tile if self.causal else 1
-
-    @property
     def scale(self):
         return struct.unpack("<f", struct.pack("<f", self.parameters()["SCALE"]))[0]
 
@@ -171,7 +167,7 @@ class AttentionPolicy:
             type(sq) is int
             and type(sk) is int
             and sq > 0
-            and sk >= self.minimum_sk
+            and sk > 0
             and sq % self.query_tile == sk % 1024 == 0,
             f"attention cases require positive complete BQ{self.query_tile}/Sk1024 tiles",
         )

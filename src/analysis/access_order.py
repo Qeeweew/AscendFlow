@@ -17,7 +17,7 @@ from xdsl.dialects import arith, scf
 from xdsl.ir import Operation
 
 from ..diagnostics import require
-from ..indexing import arguments, nonnegative, normalize_or_identity
+from ..indexing import arguments, domain_nonnegative, normalize_or_identity
 from ..scalar import Expr, expression, literal, substitute
 from ..symbols import Symbol, SymbolKind, is_coordinate
 from .access_frontier import AccessEndpoint, LoopResidueSelection, QueueEndpoint, ResiduePosition
@@ -479,6 +479,9 @@ class _Builder:
 
     def _loop(self, operation, body, partitions):
         logical = self.memory.control.loops[operation]
+        # Slot population is a property of this invocation, under its actual
+        # ancestor coordinates. Do not use this loop's body domain: assuming
+        # an iteration exists would erase its zero-iteration path.
         result = {}
         for cell, transfer in body.items():
             period, residue = self.coordinates.pattern(cell, operation)
@@ -519,8 +522,9 @@ class _Builder:
             # Otherwise one actual invocation envelope forwards old state and
             # reader prefixes. It requires no activation history or child LAST.
             threshold = literal(residue) if type(residue) is int else residue
-            populated = nonnegative(
+            populated = domain_nonnegative(
                 expression("sub", logical.count, expression("add", threshold, literal(1))),
+                logical.entry_domains,
                 self.facts,
             )
             if not populated and isinstance(cell, StorageCell):

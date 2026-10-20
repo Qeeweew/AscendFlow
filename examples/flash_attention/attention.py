@@ -140,9 +140,9 @@ def pv_tiles(inputs, buffers, task, geometry):
     parts, BQ, BM, BK, CK, CAUSAL = geometry
     if CAUSAL:
         # P is explicitly zero outside the causal prefix.
-        # Keep both operand slots populated, including the
-        # all-masked padding tile at startup.
-        pv_chunks = N.min(BK // CK, N.max(2, N.ceildiv(N.max(0, query_row + BQ - kv * BK), CK)))
+        # Only active KV blocks reach this child. Its actual prefix,
+        # including a single CK chunk, determines operand-slot visits.
+        pv_chunks = N.min(BK // CK, N.ceildiv(N.max(0, query_row + BQ - kv * BK), CK))
     else:
         pv_chunks = BK // CK
     if parts == 1:
@@ -243,7 +243,7 @@ def attention_target(
     P: N.Tensor((GROUPS, 2, BQ, BK), DTYPE, access="write"),
     PV: N.Tensor((GROUPS, 2, BQ, D), N.f32, access="write"),
     Sq: N.int64(minimum=1, multiple_of=BQ),
-    Sk: N.int64(minimum=2 * BK if CAUSAL else 1, multiple_of=1024),
+    Sk: N.int64(minimum=1, multiple_of=1024),
     B: N.constexpr = 1,
     HQ: N.constexpr = 8,
     HKV: N.constexpr = 8,
@@ -351,9 +351,7 @@ def attention_target(
                 N.fill(l, 0.0)
                 N.fill(o, 0.0)
             if CAUSAL:
-                # Both physical handoff slots are visited in every parent.
-                # The extra startup tile, when present, is fully masked.
-                active_kv_tiles = N.min(kv_tiles, N.max(2, N.ceildiv(query_row + BQ, BK)))
+                active_kv_tiles = N.min(kv_tiles, N.ceildiv(query_row + BQ, BK))
                 kv_order = {"cube": ("qk", "pv"), "vector": ("softmax", "update")}
             else:
                 active_kv_tiles = kv_tiles
