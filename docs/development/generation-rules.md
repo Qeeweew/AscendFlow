@@ -34,6 +34,14 @@ canonical occurrence 已有的 j-d 祖先平移不重做。变化的 child 通�
 不能按余数表达式的语法将同一物理地址复制为多个独立槽。未知映射继续使用
 AliasRegion，原始算术定义性和范围检查不由周期推理代替。
 
+私有 scratch 的独立调用可以包含未访问槽。只有原始 child 接口没有输入读取、
+具有完整排序写入及 reader 链，且该 cell 的值不逃逸这组 packet 时，才允许
+按实际 dispatch 连接调用之间的物理顺序。分析保留形成队列端口之前的原始接口，
+不从端口名字或出口位置反推数据闭合。空路径仍通过真实入口/出口端口传递
+旧 ownership 和 pending reader；这些 forwarding RAW 与 WAR/WAW 一起按
+storage word 连接，packet 内的源读取关系保持。数据闭合不授权队列端口使用
+native cell 的单 ID 归纳，端口仍须取得实际 handback 和有限资源证明。
+
 字节 bounds 组合已经验证的原轴范围、真实线性化和 native 子视图；真实 root
 容量可容纳整个原 tensor 时，不重新求解等价的扁平地址边界。容量关系不成立
 或未知时仍验证实际 slice 的字节边界，不能用轴 metadata 代替真实 allocation。

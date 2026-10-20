@@ -132,6 +132,10 @@ class _Builder:
         self.work = self.accesses.work
         self.needs, self.required = [], []
         self.summaries, self.partitions = {}, []
+        # Retain the actual body behind a forwarding interface. Queue ports
+        # alone cannot distinguish an independent scratch invocation from a
+        # region that consumes state supplied by an earlier invocation.
+        self.envelopes = {}
         self.coordinates = RegionCoordinates(memory, self.accesses.patterns)
         self.facts = memory.control.environment.facts
         self.arithmetic = IntegerFacts(self.facts)
@@ -306,8 +310,9 @@ class _Builder:
                     self.required.append(need)
                 self.work.boundary_visits += 1
 
-    def _connect(self, cell, left, right, scope, *, retirement=True, **clock):
-        self._emit(cell, HazardKind.RAW, left.tail_writes, right.head_reads, scope, **clock)
+    def _connect(self, cell, left, right, scope, *, retirement=True, raw=True, **clock):
+        if raw:
+            self._emit(cell, HazardKind.RAW, left.tail_writes, right.head_reads, scope, **clock)
         if retirement:
             self._emit(
                 cell,
@@ -330,7 +335,15 @@ class _Builder:
                 for a in before.tail_writes + before.tail_reads
                 for b in after.first_writes
             )
-            self._connect(cell, before, after, scope, retirement=retirement)
+            raw = partition is None or all(
+                partition.key_for(a) == partition.key_for(b)
+                for a in before.tail_writes
+                for b in after.head_reads
+            )
+            # Independent packets have no cross-packet value input. Their
+            # queue-prefix forwarding edges, like retirement, follow the
+            # physical word established below, not the source packet order.
+            self._connect(cell, before, after, scope, retirement=retirement, raw=raw)
             result[cell] = before.join(after)
         return result
 
@@ -396,6 +409,7 @@ class _Builder:
 
         result = {}
         for cell, transfer in cells.items():
+            self.envelopes[operation, cell] = transfer
             readers = unique(transfer.head_reads + transfer.tail_reads)
             writers = unique(transfer.first_writes + transfer.tail_writes)
             result[cell] = AccessTransfer(

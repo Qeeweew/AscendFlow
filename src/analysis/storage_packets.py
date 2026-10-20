@@ -2,8 +2,9 @@
 
 This precision rule inspects immediate stage interfaces and full native writes;
 no whole-kernel value frontier or RAW object identity is an admission premise.
-A state input, conditional port, streaming cell or mixed generation declines
-packet reordering while retaining ordinary source order.
+A state input, unclosed conditional port, streaming cell or mixed generation
+declines packet reordering while retaining ordinary source order. An empty
+closed child retains its real forwarding ports; it does not write a value.
 """
 
 from __future__ import annotations
@@ -22,6 +23,9 @@ class StoragePacket:
     offset: int
     lexical: int
     summary: object
+    # Original child interfaces establish value closure. Their real queue
+    # ports remain in summary and participate in the same notification rules.
+    closed_invocations: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -69,20 +73,33 @@ def certify_packets(builder, loop, cell):
         return stage
 
     writer = None
+    closed = {}
     logical = builder.memory.control.loops[loop]
     for stage in stages:
         transfer = builder.summaries[stage][cell]
         points = (
             transfer.head_reads + transfer.first_writes + transfer.tail_writes + transfer.tail_reads
         )
-        if any(isinstance(p.endpoint, QueueEndpoint) for p in points):
-            return None
+        ports = [p for p in points if isinstance(p.endpoint, QueueEndpoint)]
+        if ports:
+            invocations = {p.operation for p in ports}
+            if len(ports) != len(points) or len(invocations) != 1:
+                return None
+            invocation = invocations.pop()
+            original = builder.envelopes[invocation, cell]
+            if (
+                original.head_reads
+                or not original.ordered_write
+                or not original.readers_follow_writes
+            ):
+                return None
+            closed[stage] = (invocation, original)
         if any(
             next((b.ordinal for b in p.bindings if b.loop is loop), None) != logical.ordinal
             for p in points
         ):
             return None
-        if transfer.head_reads:
+        if transfer.head_reads and stage not in closed:
             if writer is None:
                 return None  # Real state input, not an independent scratch value.
             parent[find(stage)] = find(writer)
@@ -92,6 +109,14 @@ def certify_packets(builder, loop, cell):
     for stage in stages:
         groups.setdefault(find(stage), []).append(stage)
     if len(groups) < 2:
+        return None
+    if closed and any(
+        cell in cells and stage_in(op, loop) is None
+        for op, cells in builder.accesses.effects.items()
+    ):
+        # A skipped scratch invocation leaves the preceding value intact.
+        # Reordering is only independent if that value cannot escape this
+        # complete set of packets, including at parent-loop reentry.
         return None
     positions = {}
     for operation, cells in builder.accesses.effects.items():
@@ -112,13 +137,23 @@ def certify_packets(builder, loop, cell):
         summary = AccessTransfer()
         for stage in members:
             summary = summary.join(builder.summaries[stage][cell])
-        if summary.head_reads or not summary.ordered_write or len(summary.first_writes) != 1:
+        input_closed = not summary.head_reads or len(members) == 1 and members[0] in closed
+        if not input_closed or not summary.ordered_write or len(summary.first_writes) != 1:
             return None
         first_frames = summary.first_writes[0].frame.ancestors()
         index = next(i for i, frame in enumerate(first_frames) if frame.operation is loop)
         if any(frame.branch is not None for frame in first_frames[index + 1 :]):
             return None
-        packets.append(StoragePacket(key, tuple(members), offsets.pop(), min(ranks), summary))
+        packets.append(
+            StoragePacket(
+                key,
+                tuple(members),
+                offsets.pop(),
+                min(ranks),
+                summary,
+                tuple(closed[stage] for stage in members if stage in closed),
+            )
+        )
     first = min(packets, key=lambda p: (p.offset, p.lexical))
     last = max(packets, key=lambda p: (p.offset, p.lexical))
     changed = first is not packets[0] or last is not packets[-1]
