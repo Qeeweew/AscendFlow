@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from xdsl.ir import Operation
 
@@ -23,6 +24,9 @@ from .structured_regions import (
     StructuredNeed,
 )
 from .structured_schedule import ActionGuard, Placement
+
+if TYPE_CHECKING:
+    from .cell_ownership import CellLifetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +165,7 @@ class NotificationCoverage:
     rule: str
     notification: LogicalNotification | None = None
     ordering: OrderingWitness | None = None
+    ownership: CellLifetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,4 +200,19 @@ class SynchronizationSelection:
             and {id(item.requirement) for item in self.coverage}
             == {id(item) for item in self.dependencies.required},
             "notification selection lost an actual memory requirement",
+        )
+        owners = {
+            need: lifetime
+            for lifetime in self.dependencies.order.cell_lifetimes
+            for need in lifetime.requirements
+        }
+        require(
+            all(
+                item.ownership is None
+                or item.ownership is owners.get(item.requirement)
+                and item.notification is None
+                and item.ordering is None
+                for item in self.coverage
+            ),
+            "ownership coverage does not belong to its actual cell lifetime",
         )

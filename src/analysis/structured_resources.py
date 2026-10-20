@@ -8,7 +8,7 @@ Materialization receives the final IDs and unchanged real instruction sites.
 
 from dataclasses import replace
 
-from ..diagnostics import require
+from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import FixConfigOp, Load3DConfigOp
 from ..scalar import expression, literal
 from ..target.ascend910b import Actor, Engine, SyncKind
@@ -18,6 +18,7 @@ from .event_contracts import (
     SUPPORTED_CROSS_IDS,
     EventBankUsage,
     EventReservation,
+    PersistentEventAssignment,
     StructuredEventAssignment,
     StructuredEventPlan,
 )
@@ -35,13 +36,13 @@ def allocate_structured_events(program) -> StructuredEventPlan:
         isinstance(program, NotificationProgram),
         "allocation requires generated notification lifetimes",
     )
-    return _EventBanks(program.domains, program.channels, program.boundaries).allocate(
-        {lease.notification: lease for lease in program.leases}, program.order
-    )
+    return _EventBanks(
+        program.domains, program.channels, program.boundaries, program.credits
+    ).allocate({lease.notification: lease for lease in program.leases}, program.order)
 
 
 class _EventBanks:
-    def __init__(self, domains, channels, boundaries):
+    def __init__(self, domains, channels, boundaries, credits):
         self.domains = domains
         self.actions, self.assignments, self.reservations, self.sharing = [], [], [], []
         self.occupied, self.cross_occupied = {}, {}
@@ -50,6 +51,8 @@ class _EventBanks:
         self.cell_channels = channels
         self.channel_ids = {}
         self.compatibility = {}
+        self.credits = credits
+        self.persistent = []
 
     def _compatible(self, left, right):
         # Candidate IDs do not change these members, domains or lifetimes.
@@ -75,6 +78,7 @@ class _EventBanks:
     def allocate(self, lifetimes, order):
         self.lifetimes = lifetimes
         self._reserve()
+        self._persistent_credits()
         for notification in self.domains.notifications:
             if notification.mechanism is NotificationKind.PIPE_FENCE:
                 self._place(notification, None)
@@ -96,11 +100,70 @@ class _EventBanks:
             work=self.domains.work,
             sharing=tuple(self.sharing),
             channels=self.cell_channels,
+            persistent=tuple(self.persistent),
             banks=tuple(
                 EventBankUsage(bank, tuple(sorted(pool))) for bank, pool in self.occupied.items()
             )
             + (EventBankUsage(None, tuple(sorted(self.cross_occupied))),),
         )
+
+    def _persistent_credits(self):
+        """One real bank slot, seed and final reclaim for each owned cell."""
+        root = self.domains.memory.module.body.block.first_op
+        for credit in self.credits:
+            lifetime = credit.lifetime
+            actor = lifetime.cell.private
+            source, destination = lifetime.source_engine, lifetime.destination_engine
+            bank = actor, source, destination
+            pool = self.occupied.setdefault(bank, {})
+            event = next((flag for flag in range(LOCAL_CAPACITY) if flag not in pool), None)
+            if event is None:
+                raise CompileError(
+                    f"persistent ownership exhausts the directed local bank {bank} within capacity 8",
+                    kind=ErrorKind.UNSUPPORTED,
+                    phase="persistent-cell-resources",
+                    location=str(credit.rounds[0].acquire.operation.location),
+                )
+            pool[event] = [None]  # Ordinary sharing cannot borrow this live token.
+            self.reservations.append(
+                EventReservation(bank, event, f"persistent ownership {credit.name}", root)
+            )
+            self.persistent.append(PersistentEventAssignment(credit, bank, event))
+            for placement, kind in (
+                (Placement.ENTRY, SyncKind.LOCAL_SET),
+                (Placement.EXIT, SyncKind.LOCAL_WAIT),
+            ):
+                self.actions.append(
+                    SyncAction(
+                        root,
+                        placement,
+                        (actor,),
+                        kind,
+                        source,
+                        destination,
+                        literal(event),
+                        protocols=(credit.name,),
+                    )
+                )
+            for body in credit.rounds:
+                for point, kind in (
+                    (body.acquire, SyncKind.LOCAL_WAIT),
+                    (body.release, SyncKind.LOCAL_SET),
+                ):
+                    self.actions.append(
+                        SyncAction(
+                            point.operation,
+                            point.placement,
+                            (actor,),
+                            kind,
+                            source,
+                            destination,
+                            literal(event),
+                            point.guard,
+                            (credit.name,),
+                        )
+                    )
+        self.domains.work.persistent_cells = len(self.credits)
 
     def _counter_backlog(self, members):
         """Count each complete physical credit once, including later members."""
@@ -223,7 +286,7 @@ class _EventBanks:
         self.domains.fail(
             notification,
             f"directed actor-local allocation cannot find {width} contiguous IDs in {banks} "
-            "within capacity 8 including initializer/drain reservations; "
+            "within capacity 8 including persistent ownership, initializer and drain reservations; "
             "the supported lifetime-sharing proofs do not establish another assignment",
         )
 

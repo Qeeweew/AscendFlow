@@ -90,6 +90,19 @@ def test_actual_captures_and_acquires_cover_sources_and_earliest_consumers(actua
         for coverage in result.coverage:
             need, notification = coverage.requirement, coverage.notification
             assert isinstance(need.source, AccessOccurrence)
+            if coverage.ownership is not None:
+                owner = coverage.ownership
+                assert owner.cell == need.cell and need in owner.requirements
+                assert owner.cell.private is not None
+                assert all(
+                    point.participant is owner.cell.private
+                    for body in owner.rounds
+                    for point in (body.writer,) + body.readers
+                )
+                # This is a complete round obligation, not one relocated
+                # capture/acquire pair. Actual tokens/bytes are checked by
+                # test_persistent_cell_ownership's independent event model.
+                continue
             for context in need_cases(need, uniform, memory):
                 source = occurrence_key(need.source, context, memory)
                 consumer = occurrence_key(need.consumer, context, memory)

@@ -12,6 +12,7 @@
 | 可能别名的源码内存顺序 | 原始次序与实际访问 | AliasRegion；不授权数值KILL或精确producer | 存储、通知；不用稳定cell credit | 改访问、guard、循环或并行合同 |
 | 可能冲突的 RAW/WAR/WAW | 实际访问、源控制和可选精确分区 | access_order；输入要求、pending reader 与共同 queue 端口 | 通知绑定与生命周期规则 | 改访问、guard、循环、slot 或 dispatch |
 | 私有 packet 的物理复用 | 局部完整写入、内部读绑定及实际 stage 顺序 | storage_packets / storage_word；局部完整 packet 的实际邻接 | access_order | 改 native 覆盖、slot、dispatch、packet 前提 |
+| 稀疏私有 cell 的完整 ownership round | 原始 body 接口、全部实际访问、相同激活域与本地派发 | cell_ownership；完整 writer/reader 轮次及被替代的原始 requirements | 通知生成、有限 bank、物化 | 改访问、guard、参与者、reader 集合或本地排步 |
 | 真实 Set/Wait 位置和覆盖 | 上述必要依赖 | notification binding；保留原始 ownership edge，可增加 coverage | 域、阶段序、credit | 改捕获/等待位置或 activation |
 | 存在域、配对、原式定义性 | 实际位置、祖先坐标、有序 guard | EventDomains；一次建立的 cases/windows | credit、资源和物化 | 改位置、坐标、guard、ordinal |
 | 无循环等待 | actor-local epoch、queue/controller 路由 | queue_order；每层 phase rank 和 child may-block cuts | credit 构造及输出合同 | 改排步、路由、参与者、Wait 位置 |
@@ -148,6 +149,54 @@ quorum 的完成覆盖与物理 ID 共享是不同的变换。前者遵守第 1 
 复用规则；后者不改变 Set/Wait 的位置和次数，遵守第 6 节的事件资源合同。
 独立发布、完整 quorum、缺第二 AIV 贡献及 ID 共享反例见
 `tests/sync/test_quorum_prefixes.py`。
+
+### 3.1 跨空调用的私有 cell 持久 free credit
+
+`cell_ownership` 对以下受限但完整的轮次建立独立合同：
+
+- 物理 origin 在 kernel invocation 中固定，存储为精确的 actor 私有 cell，
+  不使用 alias region、streaming 联合区域或条件分区冒充独占 cell。
+- 每轮只有一个不读取旧 cell 的完整 writer；全部实际 reader 位于同一 pipe。
+  writer 与所有 reader 位于同一实际直接循环，使用其真实 ordinal，
+  具有相同的分支路径。跳过共同分支时没有半轮访问。
+- 实际 dispatch 中 writer 先于全部 reader，全部 reader 又先于本 cell 周期后的
+  下一 writer。周期只取该 cell 的地址周期，不构造不同 ring 的全局 LCM。
+  不同 child invocation 是完整的 controller 调用。
+- 该 cell 的全部 native 访问均被这些轮次覆盖，没有入口状态、逃逸读取或缺失
+  reader。保留每个 reader 的原始 ready requirement；剩余 RAW/WAR/WAW 由
+  真实轮次 ownership 承担，原始 needs 仍用于诊断和 coverage 对应。
+
+由实际 ready 端点绑定每轮 acquire 和最后 reader 之后的 return。存在域和
+原式 guard 定义性仍检查；不求上一次活跃调用的 dense rank 或空域上的 LAST。
+同 pipe 多个 reader 选实际最后发射点作累计 capture，不假设 native 完成 FIFO。
+
+每个 cell 在同一有限 bank 内占一个真实二值 ID。kernel 入口在 body Wait 前
+发布 free seed；每次真实 writer 前取得它，全部 reader 退休后归还它。
+空调用或未访问槽不发通知，credit 原样保留。kernel 出口回收最后的 free credit，
+**先于目标队列的最终 queue→S drain**，保证下一次 kernel invocation 前已消费。
+seed 不初始化数据；原有 bounds、初始化和 ready 合同继续生效。
+
+二值消费的归纳是：当前 writer 先取得 free credit，reader 又取得该 writer 的
+真实 ready，因此 return Set 必须在当前 free Wait 消费之后。下一 writer 取得
+return 才能覆盖，故全部旧 reader 的 ready Wait 也先于下一 ready Set。
+每轮保持一个 free token，初始化和最终回收使 kernel 边界的余额为零。
+这些是真实 token 和字节依赖的结论，不能由数据闭合标记或阶段 rank 代替。
+
+进展有额外的充分前提：保留的每个本地通知，必须在实际 controller 上先发出
+publication、再发出 acquire。生成器保留这些实际位置的 OrderingWitness。
+新 free Wait 的来源也总是较早发出的实际 return，或入口 seed。
+于是本地队列不依赖未来 controller 发射才能退休；cross Wait 已阻塞 controller，
+后续本地 native 之前的 cross gate 必须已消费。跨 controller 进展仍由原来的
+queue_order 检查。无法建立这个本地前提时明确报告支持边界，不用新 credit
+跳过进展检查。
+
+持久 ID 与配置、普通通知及最终 drain 使用同一资源台账，普通共享不能借走
+仍有 token 的 ID。超出八个本地 ID 时明确拒绝。两个 AIV 的私有 UB 和 bank
+分别处理、相同指令可共用一份 body；本规则尚不自动生成共享 GM 的 mode-2
+持久 credit。多 writer、不同 reader pipe、未闭合的嵌套 family 和变化 quorum
+继续保留原来的必要检查，不能由此规则取得支持。
+声明旧态读取的 RMW native 也不进入此规则；某个边界代次 clear 不表示每轮
+都能独立覆盖，更不能用 free seed 代替递推状态或低精度 snapshot 的定义。
 
 ## 4. 无稳定 cell 的通知
 

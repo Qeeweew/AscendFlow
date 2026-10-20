@@ -42,6 +42,7 @@ from .structured_regions import (
 from .structured_schedule import Comparison, Placement
 
 if TYPE_CHECKING:
+    from .cell_ownership import CellLifetime
     from .storage_packets import PacketPartition
     from .structured_admission import StructuredAdmission
 
@@ -115,6 +116,7 @@ class AccessOrder:
     needs: tuple[StructuredNeed, ...]
     required: tuple[StructuredNeed, ...]
     packet_partitions: tuple[PacketPartition, ...]
+    cell_lifetimes: tuple[CellLifetime, ...]
     work: DependencyWork
 
 
@@ -136,6 +138,7 @@ class _Builder:
         # alone cannot distinguish an independent scratch invocation from a
         # region that consumes state supplied by an earlier invocation.
         self.envelopes = {}
+        self.round_interfaces = []
         self.coordinates = RegionCoordinates(memory, self.accesses.patterns)
         self.facts = memory.control.environment.facts
         self.arithmetic = IntegerFacts(self.facts)
@@ -555,6 +558,19 @@ class _Builder:
                 for test in self._activation(point)
                 for value in (test.lhs, test.rhs)
             )
+            self.round_interfaces.append(
+                (
+                    operation,
+                    cell,
+                    transfer,
+                    period,
+                    residue,
+                    not populated
+                    and not self.memory.control.invariant_over(
+                        logical.count, self.memory.module.body.block.first_op
+                    ),
+                )
+            )
             if (
                 not populated
                 or not stable
@@ -736,6 +752,9 @@ class _Builder:
 
     def build(self):
         self._node(self.memory.module)
+        from .cell_ownership import infer_cell_lifetimes
+
+        lifetimes = infer_cell_lifetimes(self)
         self.work.needs = len(self.needs)
         self.work.loop_carries = sum(
             n.loop is not None and n.distance not in (None, 0) for n in self.needs
@@ -748,5 +767,6 @@ class _Builder:
             tuple(self.needs),
             tuple(self.required),
             tuple(self.partitions),
+            lifetimes,
             self.work,
         )

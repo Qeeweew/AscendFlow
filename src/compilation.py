@@ -93,6 +93,7 @@ class Compilation:
                 "generation": {
                     **asdict(plan.generation.order.work),
                     "cell_channels": len(plan.generation.channels),
+                    "persistent_cells": len(plan.generation.credits),
                     "cell_fragments": sum(len(c.members) for c in plan.generation.channels),
                     "handback_rings": len(plan.generation.leases)
                     - sum(len(c.members) for c in plan.generation.channels),

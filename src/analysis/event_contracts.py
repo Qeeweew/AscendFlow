@@ -14,6 +14,7 @@ from .structured_schedule import SyncAction
 
 if TYPE_CHECKING:
     from .cell_channels import CellChannel
+    from .cell_ownership import PersistentCellCredit
     from .event_domains import EventCase
     from .event_sharing import CounterSharing, EventSharing
     from .event_windows import EventWindow
@@ -68,6 +69,13 @@ class EventBankUsage:
     ids: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PersistentEventAssignment:
+    credit: PersistentCellCredit
+    bank: LocalBank
+    event: int
+
+
 @dataclass(slots=True)
 class ResourceWork:
     notifications: int = 0
@@ -90,6 +98,7 @@ class ResourceWork:
     allocated_local_ids: int = 0
     allocated_cross_ids: int = 0
     maximum_counter_backlog: int = 0
+    persistent_cells: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,3 +113,4 @@ class StructuredEventPlan:
     channels: tuple[CellChannel, ...]
     banks: tuple[EventBankUsage, ...]
     sharing: tuple[EventSharing | CounterSharing, ...] = ()
+    persistent: tuple[PersistentEventAssignment, ...] = ()

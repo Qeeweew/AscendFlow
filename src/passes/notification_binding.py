@@ -888,8 +888,20 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     )
     order = _IssueOrder(dispatch)
     notifications, coverage, unresolved = [], [], []
+    owned = {
+        need: lifetime
+        for lifetime in dependencies.order.cell_lifetimes
+        for need in lifetime.requirements
+    }
     bundles = {}
     for need in dependencies.required:
+        if need in owned:
+            coverage.append(
+                NotificationCoverage(
+                    need, "persistent private-cell ownership round", ownership=owned[need]
+                )
+            )
+            continue
         key = (
             need.source,
             need.consumer,

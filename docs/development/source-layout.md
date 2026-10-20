@@ -45,6 +45,7 @@ compile / Compilation
     generate_notifications
       bind_notifications                 # 覆盖、真实位置及原始 ownership edges
       EventDomains                       # 有序原式定义性、坐标往返、配对
+      bind_cell_credits                  # 稀疏私有轮次的端点与本地发射前提
       establish_queue_order              # 逐层 physical-step / phase 准入
       construct_cell_channels            # 物理 lifetime credit 归纳
       HandbackRule                       # 无稳定 cell 的有限/ring 生命周期
@@ -78,8 +79,9 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |
 | `analysis/queue_order.py` | 每层 actor clock-origin 差约束、零距离 DAG 与正距离前进；child 仅导出 open ports 和 may-block cuts |
 | `analysis/cell_channels.py` | 相同完整物理 ownership 集合和 role 的非重复 credit；原始值/存储 lifetime 归纳 |
+| `analysis/cell_ownership.py` | 从原始 body/全部 effects 建立闭合私有轮次，绑定真实 acquire/return、校验实际本地发射前提；不将队列端口当成 native lifetime |
 | `analysis/notification_lifetimes.py` | 有限使用或明确 queue handback，连接实际首末端口，无任意路径搜索 |
-| `analysis/event_sharing.py`、`structured_resources.py`、`event_contracts.py` | 有限 bank、配置/drain 台账；固定成员的兼容关系只建立一次，候选 ID 分配复用真实 handback 或单发布者 FIFO，并检查完整 counter 积压 |
+| `analysis/event_sharing.py`、`structured_resources.py`、`event_contracts.py` | 有限 bank、持久 cell token、配置/drain 台账；固定成员的兼容关系只建立一次，候选 ID 分配复用真实 handback 或单发布者 FIFO，并检查完整 counter 积压 |
 | `passes/materialize_structure.py` | 插入确定动作、共享同位置短路 guard 前缀；不改变 native 或 issue order |
 | `passes/executable.py` | 终端模块、native 对应、共享 NativeSpec 与最终 SSA 范围；不携带逻辑控制、地址证明或同步求解入口 |
 | `passes/lower_execution.py` | 将 count/stage 表示降为实际 arith/scf；按 family 保持 issue order，移动原 native，不复制双 AIV body |

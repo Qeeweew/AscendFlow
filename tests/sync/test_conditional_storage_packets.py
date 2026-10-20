@@ -16,6 +16,7 @@ from ascendflow.analysis.structured_resources import allocate_structured_events
 from ascendflow.passes.generate_notifications import _complete_bindings
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.materialize_structure import materialize_notifications
+from ascendflow.passes.notification_binding import bind_notifications
 from ascendflow.passes.structured_sync import synchronize_structure
 from ascendflow.scalar import literal
 from tests.models.structured_events import (
@@ -23,7 +24,7 @@ from tests.models.structured_events import (
     check_compiled_events,
     check_structured_events,
 )
-from tests.support.structured import selected
+from tests.support.structured import native_memory
 
 SCRATCH_CALLS = """
 def scratch_calls(X:N.Tensor((n,2,4,64),N.f32),
@@ -59,6 +60,7 @@ def compiled_calls(request):
 def test_closed_calls_keep_real_prefixes_across_empty_and_short_children(compiled_calls, n):
     packets = compiled_calls.dependencies.order.packet_partitions
     assert any(packet.closed_invocations for partition in packets for packet in partition.packets)
+    assert len(compiled_calls.generation.credits) == 2
     check_compiled_events(compiled_calls, {"n": n}, invocations=2)
 
 
@@ -81,7 +83,12 @@ def test_closed_prefixes_do_not_license_one_binary_id_for_a_whole_cell():
     # value. Unlike a native reader, that forwarding does not itself return
     # the consumption of an earlier flag. Remove only this lifetime protection
     # by coalescing the actual ready instructions for one physical cell.
-    selection = selected(N.from_source(SCRATCH_CALLS, disjoint_external=True))
+    memory = native_memory(N.from_source(SCRATCH_CALLS, disjoint_external=True))
+    dependencies = build_structured_dependencies(memory)
+    # Exercise the general forwarding-prefix rule without taking the new
+    # optional closed-round precision. All original requirements remain.
+    dependencies = replace(dependencies, order=replace(dependencies.order, cell_lifetimes=()))
+    selection = bind_notifications(dependencies, dependencies.dispatch)
     resources = allocate_structured_events(_complete_bindings(selection))
     groups = {}
     for assignment in resources.assignments:

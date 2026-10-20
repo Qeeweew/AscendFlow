@@ -275,7 +275,7 @@ def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch)
         return original(domains, notification)
 
     monkeypatch.setattr(event_families, "build_event_family", only_new_premises)
-    allocator = _EventBanks(program.domains, program.channels, program.boundaries)
+    allocator = _EventBanks(program.domains, program.channels, program.boundaries, program.credits)
     for notification, cases in program.boundaries:
         assert allocator.handbacks._cases(notification) is cases
     allocator.allocate({lease.notification: lease for lease in program.leases}, program.order)
