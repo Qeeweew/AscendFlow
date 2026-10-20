@@ -256,17 +256,22 @@ kernel 返回才执行每个实际异步 engine 的 Set→S Wait drain；配置 
 台账从第一次分配就占用完整 credit 的所有成员；对后来才物化的成员也逐一检查
 新共享约束，不能以第一片的有限 handback 授权整个循环 credit。
 
-mode-2 计数器还允许一种独立的 FIFO 共享规则：两个完整通道只有一个实际
-发布者，source pipe、接收者集合、clock、坐标、激活域、边界 family 和 case
-一致，且发布顺序与每个接收者的消费顺序严格一致。证明使用各端已建立的
-实际 issue 关系和同 source pipe 的计数贡献 FIFO；不把普通 native end 当作
-FIFO，也不移动、合并或减少 Set/Wait。每个接收者仍消费各自完整消息。
+mode-2 计数器还允许一种独立的 FIFO 共享规则：两个完整通道的实际发送者和
+接收者集合、source pipe、clock、坐标、激活域、边界 family 和 case 一致，
+且逐发送者的发布顺序与每个接收者的消费顺序严格一致。证明使用各端已建立
+的实际 issue 关系和每个发送者同 source pipe 的计数贡献 FIFO；不把普通
+native end 当作 FIFO，也不移动、合并或减少 Set/Wait。
+
+该规则同时接受一个 AIC 发布给两个 AIV、两个 AIV 发布给一个 AIC。mode-2
+按发送者/接收者保留贡献流；AIC 的第 k 次 Wait 消费两个 AIV 各自的第 k 份
+贡献。两个发送者可以以不同速度前进，快发送者的后续贡献不能替代慢发送者
+的缺席贡献。逐端同序与相同激活域使这些贡献对应同一完整消息，不额外插入
+AIV 间的轮次 barrier，也不丢掉任一 AIV 的原始发布或完成前缀。
 
 分配候选 ID 时，对全部已占用与将占用的完整 credit 求积压上界之和；同一个
 物理 credit 只计一次，总和不得超过 15。未知积压不是 0。容量检查覆盖之后
-才物化的 credit 成员，不只检查当前通知。多个 AIV 共同发布尚无独立的
-quorum 轮次证明，因此不采用此 FIFO 规则共享 ID；每个发送者自身有序不足以
-证明快发送者的下一轮贡献不会被消费到另一发送者的上一轮。
+才物化的 credit 成员，不只检查当前通知。参与者、激活域或任一发送者/接收者
+的消息顺序不一致时不能套用该规则；缺少一个 AIV 贡献仍是协议错误。
 
 本地 bank 是 `(physical actor, source engine, destination engine)`，每 bank 八 ID。
 mode-2 的十六个 base ID 来自安装 CANN 9.1 的 2201 `GetfftsConfig` 四位编码；

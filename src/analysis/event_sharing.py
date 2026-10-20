@@ -21,9 +21,10 @@ class EventSharing:
 class CounterSharing:
     """Two aligned FIFO messages, without merging their publications/waits.
 
-    One publisher's same-pipe contributions retain effect FIFO. Every receiver
-    must consume in the corresponding issue order. The allocator separately
-    bounds the backlog of the complete set of credits placed on this ID.
+    Each publisher's same-pipe contributions retain effect FIFO. Every receiver
+    consumes one contribution from each required publisher in that order;
+    a faster publisher cannot substitute for another quorum member. The
+    allocator separately bounds the complete credits placed on this ID.
     """
 
     earlier: object
@@ -68,11 +69,6 @@ def share_counters(domains, left, right):
     """
     if any(n.mechanism is not NotificationKind.CROSS_EVENT for n in (left, right)):
         return None
-    if any(len(n.sources) != 1 for n in (left, right)):
-        # Multiple publishers need a separate quorum-round proof: agreement
-        # of each sender's FIFO alone cannot establish that a fast sender's
-        # later contribution is not consumed in another sender's old round.
-        return None
     if _counter_shape(left) != _counter_shape(right):
         return None
     a, b = domains.cases[left], domains.cases[right]
@@ -87,6 +83,10 @@ def share_counters(domains, left, right):
 
     def ordered(earlier, ec, later, lc):
         result = []
+        # EventDomains already admitted the complete mode-2 quorum. The shape
+        # retains its actual actors and activation. Check each publisher and
+        # receiver, so their per-source FIFO streams have the same message word
+        # even when the two AIVs make progress at different speeds.
         for phase in ("sources", "consumers"):
             old = sorted(getattr(earlier, phase), key=lambda p: p.actor.value)
             new = sorted(getattr(later, phase), key=lambda p: p.actor.value)

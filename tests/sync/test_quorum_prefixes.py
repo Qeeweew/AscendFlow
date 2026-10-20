@@ -57,7 +57,11 @@ def messages(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
     from ascendflow.passes.structured_sync import synchronize_structure
 
     plan = synchronize_structure(source)
-    packed = [witness for witness in plan.resources.sharing if isinstance(witness, CounterSharing)]
+    packed = [
+        witness
+        for witness in plan.resources.sharing
+        if isinstance(witness, CounterSharing) and witness.earlier.sources[0].actor is Actor.AIC
+    ]
     assert bool(packed) != reverse
     assert all(
         len(witness.earlier.sources) == len(witness.later.sources) == 1 for witness in packed
@@ -86,16 +90,17 @@ def messages(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
             assert not execution.happens_before(publications[1].end, first_import.begin)
 
 
-def test_two_publishers_retain_separate_counters_without_a_quorum_round_proof():
+@pytest.mark.parametrize("messages,reverse", [(2, False), (2, True), (4, False)])
+def test_two_publishers_share_only_with_matching_fifo_and_complete_quorums(messages, reverse):
     source = N.from_source(
-        """
-def messages(A:N.Tensor((n,2,32,16),N.f16),B:N.Tensor((16,16),N.f16),
-             Work:N.Tensor((2,2,32,16),N.f16,access="write"),
-             Out:N.Tensor((n,2,32,16),N.f32,access="write",write_disjoint=True),
+        f"""
+def messages(A:N.Tensor((n,{messages},32,16),N.f16),B:N.Tensor((16,16),N.f16),
+             Work:N.Tensor((2,{messages},32,16),N.f16,access="write"),
+             Out:N.Tensor((n,{messages},32,16),N.f32,access="write",write_disjoint=True),
              n:N.int64):
     with N.Kernel(1,kind="mixed"):
         x=N.alloc_ub((16,16),N.f16)
-        a1=N.alloc_l1((2,32,16),N.f16)
+        a1=N.alloc_l1(({messages},32,16),N.f16)
         b1=N.alloc_l1((16,16),N.f16)
         a0=N.alloc_l0a((32,16),N.f16)
         b0=N.alloc_l0b((16,16),N.f16)
@@ -105,35 +110,99 @@ def messages(A:N.Tensor((n,2,32,16),N.f16),B:N.Tensor((16,16),N.f16),
             N.copy(b1,b0)
         for i in N.Dataflow(n):
             with N.Vector() as lane, N.Stage(0):
-                for panel in N.unroll(2):
+                for panel in N.unroll({messages}):
                     N.copy(A[i,panel,lane*16:lane*16+16,:],x)
                     N.copy(x,Work[i%2,panel,lane*16:lane*16+16,:])
             with N.Cube(), N.Stage(1):
-                for panel in N.unroll(2):
-                    N.copy(Work[i%2,panel,:,:],a1[panel,:,:])
-                    N.copy(a1[panel,:,:],a0)
+                for panel in N.unroll({messages}):
+                    column={messages}-1-panel if {reverse} else panel
+                    N.copy(Work[i%2,column,:,:],a1[column,:,:])
+                    N.copy(a1[column,:,:],a0)
                     N.matmul(a0,b0,accum=c0,initialize=True)
-                    N.copy(c0,Out[i,panel,:,:])
+                    N.copy(c0,Out[i,column,:,:])
 """,
         disjoint_external=True,
     )
     from ascendflow.passes.structured_sync import synchronize_structure
 
     plan = synchronize_structure(source)
-    publications = [
-        assignment
-        for assignment in plan.resources.assignments
-        if len(assignment.notification.sources) == 2
-    ]
-    assert len(publications) >= 2
-    assert len({assignment.ids for assignment in publications}) >= 2
-    assert all(
-        len(witness.earlier.sources) == len(witness.later.sources) == 1
+    packed = [
+        witness
         for witness in plan.resources.sharing
-        if isinstance(witness, CounterSharing)
-    )
+        if isinstance(witness, CounterSharing) and len(witness.earlier.sources) == 2
+    ]
+    assert bool(packed) != reverse
+    assignments = {
+        assignment.notification: assignment.ids for assignment in plan.resources.assignments
+    }
+    for witness in packed:
+        assert assignments[witness.earlier] == assignments[witness.later]
+        assert {point.actor for point in witness.earlier.sources} == {Actor.AIV0, Actor.AIV1}
+        assert len(witness.later.sources) == 2
+    assert 0 < plan.resources.work.maximum_counter_backlog <= 15
     for count in (0, 1, 3):
-        check_compiled_events(plan, {"n": count})
+        checked = check_compiled_events(plan, {"n": count})
+        if count != 1:
+            continue
+        readers = [
+            command
+            for command in checked.natives
+            if command.occurrence.actor is Actor.AIC
+            and any(
+                span.root.sym_name.data == "Work" and "R" in span.mode for span in command.spans
+            )
+        ]
+        writers = {
+            actor: [
+                command
+                for command in checked.natives
+                if command.occurrence.actor is actor
+                and command.source is Engine.MTE3
+                and any(
+                    span.root.sym_name.data == "Work" and "W" in span.mode for span in command.spans
+                )
+            ]
+            for actor in (Actor.AIV0, Actor.AIV1)
+        }
+        assert len(readers) == messages
+        for actor, publications in writers.items():
+            assert len(publications) == messages
+            for writer in publications:
+                written = next(span for span in writer.spans if span.root.sym_name.data == "Work")
+                reader = next(
+                    command
+                    for command in readers
+                    if any(
+                        span.root is written.root and span.start <= written.start < span.end
+                        for span in command.spans
+                    )
+                )
+                assert checked.happens_before(writer.end, reader.begin)
+            if not reverse:
+                assert not checked.happens_before(publications[1].end, readers[0].begin), (
+                    "the first acquire must not wait for a later message's data"
+                )
+                other = Actor.AIV1 if actor is Actor.AIV0 else Actor.AIV0
+                assert not checked.happens_before(writers[other][0].end, publications[1].end), (
+                    "one AIV may publish its second message before its peer publishes the first"
+                )
+
+    if messages == 2 and not reverse:
+        damaged = plan.module.clone()
+        publication = next(
+            operation
+            for operation in damaged.walk()
+            if isinstance(operation, NotificationOp)
+            and operation.kind.data == SyncKind.CROSS_SET.value
+            and operation.source.data == Engine.MTE3.value
+        )
+        publication.attributes["participants"] = ArrayAttr([StringAttr(Actor.AIV0.value)])
+        with pytest.raises(EventModelError, match="quorum|contribution"):
+            check_structured_events(
+                collect_native_memory(damaged),
+                {"n": 3},
+                logical_reference=collect_native_memory(parse(plan.before_ir)),
+            )
 
 
 @pytest.mark.parametrize("cube", [False, True])

@@ -2,7 +2,7 @@
 
 No domain, memory or progress graph is rebuilt here. A cell credit's members
 already share one lifetime; other ID sharing establishes a consume-to-Set
-handback or aligned single-publisher counter FIFO with a whole-credit budget.
+handback or aligned per-participant counter FIFO with a whole-credit budget.
 Materialization receives the final IDs and unchanged real instruction sites.
 """
 

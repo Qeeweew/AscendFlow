@@ -65,7 +65,7 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 | ready/release覆盖 | notification binding | 真实 capture/acquire、独立覆盖及原始 ownership edges |
 | 配对与事件消费/复用 | 生成器的域、cell credit 与 handback 规则 | 域只检查一次；物理 lifetime 归纳或明确消费回传，rank 不提供消费证据 |
 | 可进展 | queue_order 的分层生成准入 | 零 step phase DAG、正 step 前进；父层只组合 child may-block 边界 |
-| bank/ID/width/quorum | 分配器消费已建生命周期，建立新增资源约束 | 不默认ID共享只是改名；单发布者counter FIFO需逐接收者同序且完整积压≤15；不每候选重新搜索整套路径 |
+| bank/ID/width/quorum | 分配器消费已建生命周期，建立新增资源约束 | 不默认ID共享只是改名；counter FIFO需逐发送者和接收者同序、完整quorum且完整积压≤15；不每候选重新搜索整套路径 |
 | 输出对应 | 物化与后端 | 不重选同步，不改native/控制/guard语义 |
 
 上表不表示所有已存在的前置分析都应重写。先对源码确认真实职责，只删除被替代的机制。
