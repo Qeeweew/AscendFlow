@@ -6,6 +6,7 @@ from xdsl.dialects import arith, scf
 
 from ascendflow import compile
 from ascendflow import language as N
+from ascendflow.analysis.local_schedule import bind_local_schedules
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.dialects.io import dump, parse
 from ascendflow.dialects.physical import BufferOp, CoreIdOp, EndOp, RuntimeSizeOp, TaskOp
@@ -13,6 +14,8 @@ from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoo
 from ascendflow.passes.lower_execution import lower_execution
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.simplify_scalars import ScalarFacts, simplify_scalars
+from ascendflow.target.ascend910b import Actor
+from examples.cv.nested import nested_cv
 from tests.models.structured_events import _Interpret, check_structured_events
 from tests.models.terminal_trace import trace
 
@@ -30,12 +33,41 @@ def clocks(n:N.int64,m:N.int64):
 """
 
 
+def test_mixed_actors_keep_independent_horizons_and_nested_instruction_generations():
+    memory = collect_native_memory(lower_native_structure(nested_cv).module)
+    original = dump(memory.module)
+    schedules = bind_local_schedules(memory)
+    outer = next(op for op in memory.module.walk() if isinstance(op, PipelineLoopOp))
+    assert schedules[outer, "cube"].horizon == 0
+    assert schedules[outer, "vector"].horizon == 1
+    native_ids = {id(template.operation) for template in memory.templates}
+    facts = ScalarFacts.from_control(memory.control)
+    lower_execution(memory.module, memory.templates, facts, schedules)
+    simplify_scalars(memory.module, facts=facts)
+    memory.module.verify()
+    root = memory.module.body.block.first_op
+    clocks = {
+        domain.kind.data: next(op for op in domain.body.block.ops if isinstance(op, scf.ForOp))
+        for domain in root.body.block.ops
+        if isinstance(domain, ActorDomainOp)
+    }
+    assert {family: loop.lb.owner.value.value.data for family, loop in clocks.items()} == {
+        "cube": 0,
+        "vector": -1,
+    }
+    assert {id(op) for op in memory.module.walk() if isinstance(op, TaskOp)} == native_ids
+    for count, actor in itertools.product((0, 1, 2, 3, 5), tuple(Actor)):
+        assert trace(memory.module, {"n": count}, actor) == trace(
+            parse(original), {"n": count}, actor
+        )
+
+
 def test_nested_short_empty_and_sparse_offsets_preserve_the_actor_instruction_trace():
     memory = collect_native_memory(lower_native_structure(N.from_source(NESTED)).module)
     original = dump(memory.module)
     native_ids = {id(template.operation) for template in memory.templates}
     facts = ScalarFacts.from_control(memory.control)
-    lower_execution(memory.module, memory.templates, facts)
+    lower_execution(memory.module, memory.templates, facts, bind_local_schedules(memory))
     simplify_scalars(memory.module, facts=facts)
     memory.module.verify()
     assert not any(isinstance(op, PipelineLoopOp) for op in memory.module.walk())
@@ -62,7 +94,7 @@ def test_unbounded_count_clock_has_defined_arithmetic_at_int64_edges():
         ).module
     )
     facts = ScalarFacts.from_control(memory.control)
-    lower_execution(memory.module, memory.templates, facts)
+    lower_execution(memory.module, memory.templates, facts, bind_local_schedules(memory))
     simplify_scalars(memory.module, facts=facts)
     memory.module.verify()
     root = memory.module.body.block.first_op

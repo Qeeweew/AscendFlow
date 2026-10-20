@@ -20,6 +20,7 @@ from ..dialects.physical import KernelOp, MixedOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ..target.ascend910b import Actor, Engine
 from .access_frontier import QueueEndpoint
+from .local_schedule import LocalSchedule, bind_local_schedules
 from .structured_memory import MemoryTemplate, NativeMemoryFacts
 from .structured_schedule import Placement
 
@@ -85,6 +86,7 @@ class StructuredDispatch:
     bodies: Mapping[DispatchScope, tuple[StructuredTask, ...]]
     projected_operations: int
     boundaries: Mapping[tuple[Operation, Actor], tuple[DispatchScope, int, int, int]]
+    schedules: Mapping[tuple[PipelineLoopOp, str], LocalSchedule]
 
     def site(self, point):
         occurrence = getattr(point, "occurrence", point)
@@ -108,6 +110,7 @@ def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:
     root = memory.module.body.block.first_op
     templates = {template.operation: template for template in memory.templates}
     scopes, tasks, bodies, boundaries = {}, {}, {}, {}
+    schedules = bind_local_schedules(memory)
     projected = 0
     actors = (
         (Actor.AIC, Actor.AIV0, Actor.AIV1)
@@ -153,35 +156,8 @@ def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:
             elif isinstance(operation, PipelineStageOp):
                 stage = operation.offset.data
             if isinstance(operation, PipelineLoopOp):
-                children = tuple(
-                    child
-                    for child in operation.body.block.ops
-                    if isinstance(child, PipelineStageOp)
-                )
-                policy = (
-                    None
-                    if operation.issue_order is None
-                    else operation.issue_order.data.get(family)
-                )
-                if policy is not None:
-                    by_name = {child.label.data: child for child in children}
-                    require(
-                        len(by_name) == len(children),
-                        "physical stage order requires unambiguous labels",
-                    )
-                    selected = tuple(by_name[label.data] for label in policy)
-                    omitted = set(children) - set(selected)
-                    require(
-                        not any(
-                            actor in templates[op].participants
-                            for child in omitted
-                            for op in child.walk()
-                            if isinstance(op, TaskOp)
-                        ),
-                        "physical stage order omitted work for its participant",
-                    )
-                    children = selected
-                for child in children:
+                schedule = schedules.get((operation, family))
+                for child in () if schedule is None else schedule.stages:
                     visit(child, scope, stage)
             else:
                 for region in operation.regions:
@@ -205,4 +181,5 @@ def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:
         MappingProxyType({scope: tuple(body) for scope, body in bodies.items()}),
         projected,
         MappingProxyType(boundaries),
+        schedules,
     )

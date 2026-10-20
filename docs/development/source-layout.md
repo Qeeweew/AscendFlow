@@ -72,7 +72,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/structured_bounds.py`、`structured_admission.py`、`structured_host.py` | bounds、外部别名、实际存储实例、初始化、借用 Tile 及整数范围前提；group/peer 独立性属于源程序合同 |
 | `analysis/structured_access.py`、`structured_regions.py` | 按真实地址周期建立可选精确 cell 与可能别名的 AliasRegion；保留实际 native 访问，不将 may-write 当完整定义 |
 | `analysis/access_order.py`、`storage_packets.py`、`storage_word.py`、`structured_dependencies.py` | 可能冲突的 RAW/WAR/WAW、条件访问的并集及完整入口可用域、单次激活证明、共同队列端口、局部完整 packet 的实际复用 |
-| `analysis/structured_dispatch.py` | 实际 actor、stage、issue_order、native 与控制入口/出口的位置 |
+| `analysis/local_schedule.py`、`structured_dispatch.py` | 按迭代域和 actor family 建立本地 stage 顺序与 horizon；派发消费该顺序并绑定 native、控制入口/出口的位置 |
 | `passes/notification_binding.py`、`analysis/structured_protocols.py` | 复用已经必要的 capture/acquire、建立完整 quorum；保留自身 origin，不将新增 coverage 当作 ownership，不按 Stage 合并独立完成边界 |
 | `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期 |
 | `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |
@@ -127,8 +127,13 @@ UB 的跨步矩形 `N.copy` 使用有完整 mask 设置的 Vector bitwise copy�
 仍保留自己的 lower/upper/step；pipeline 不重复保存这些字段，也没有 phase 表。
 最大偏移由实际 stage 推导，声明的 stage 数只用于前端校验。
 
+派发时建立的 `LocalSchedule` 只引用该逻辑循环内实际参与的 actor stage，
+保存本地发射顺序并推导本地 horizon；它不建立完成或事件消费证据。
+物化后的 owned clone 显式映射该排步，终端 lowering 不重新选择 issue order。
+
 `lower_execution` 在同步与事件分配之后，把该表示降为 `arith/scf`。
-每个 actor 的 clock 独立推进；同一物理 IR 保留 Cube/Vector 的发射政策，
+每个 actor family 生成自己的 clock loop，使用自己的 horizon 和安全移位范围；
+同一物理 IR 保留 Cube/Vector 的发射政策，
 两个 AIV 共用一个 Vector body。只有纯 SSA 和控制壳按 family 投影，
 native 和保留的通知移动原对象；地址 operands 显式映射到新的 SSA。
 配置等有 effects 的操作必须明确处理，未知操作拒绝降低。

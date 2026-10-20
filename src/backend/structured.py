@@ -521,12 +521,13 @@ class _Emitter:
 
 def emit_structure_debug(memory, *, work=None):
     """Explicit non-executable inspection; no launcher or completion claim."""
+    from ..analysis.local_schedule import bind_local_schedules
     from ..passes.lower_execution import lower_execution
     from ..passes.simplify_scalars import ScalarFacts, simplify_scalars
 
     facts = ScalarFacts()
     natives = tuple(NativeExecution.from_template(t, t.operation) for t in memory.templates)
-    lower_execution(memory.module, natives, facts)
+    lower_execution(memory.module, natives, facts, bind_local_schedules(memory))
     simplify_scalars(memory.module, facts=facts)
     work = EmissionWork() if work is None else work
     return _Emitter(ExecutablePlan(memory.module, natives, facts.ranges), work).render()

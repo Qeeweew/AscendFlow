@@ -22,7 +22,7 @@ from ..dialects.structured import (
 )
 
 
-def lower_execution(module, natives, facts):
+def lower_execution(module, natives, facts, schedules):
     uses = ScalarUses(module, natives, metadata=True)
     root = module.body.block.first_op
 
@@ -91,30 +91,6 @@ def lower_execution(module, natives, facts):
                 require(False, f"unmodeled terminal execution operation {op.name}")
 
     def clock(op, target, bindings, family=None, sid=None):
-        raw = remap(op.count, bindings)
-        zero, one = index(target, 0), index(target, 1)
-        count = arithmetic(target, arith.MaxSIOp, raw, zero)
-        horizon = op.horizon
-        raw_range = facts.ranges.get(raw, facts.ranges.get(op.count, (0, (1 << 63) - 1)))
-        if isinstance(raw.owner, arith.ConstantOp):
-            value = raw.owner.value.value.data
-            raw_range = value, value
-        # The shifted clock also handles legal counts near INT64_MAX without
-        # creating an overflowing N+horizon intermediate or runtime dispatch.
-        shifted = raw_range[1] > (1 << 63) - 1 - horizon
-        lower = index(target, -horizon) if shifted else zero
-        end = (
-            count
-            if shifted or horizon == 0
-            else arithmetic(target, arith.AddiOp, count, index(target, horizon))
-        )
-        body = Block(arg_types=[IndexType()])
-        loop = scf.ForOp(lower, end, one, [], body)
-        loop.attributes["npu.pipeline_clock"] = IntAttr(-horizon if shifted else 0)
-        if "npu.loop_id" in op.attributes:
-            loop.attributes["npu.loop_id"] = op.attributes["npu.loop_id"]
-        target.add_op(loop)
-        tick = body.args[0]
         families = (
             (family,)
             if family
@@ -122,46 +98,76 @@ def lower_execution(module, natives, facts):
             if isinstance(root, MixedOp)
             else ("cube" if root.core.data == "aic" else "vector",)
         )
-        stages = tuple(stage for stage in op.body.block.ops if isinstance(stage, PipelineStageOp))
         for current in families:
             if current not in uses.operations[op]:
                 continue
-            destination, lane = body, sid
+            destination, lane = target, sid
             if family is None and isinstance(root, MixedOp):
                 destination = Block(arg_types=[IndexType()])
                 domain = ActorDomainOp.build(
                     attributes={"kind": StringAttr(current)}, regions=[Region(destination)]
                 )
-                body.add_op(domain)
+                target.add_op(domain)
                 lane = destination.args[0]
-            elif lane is None:
+            schedule = schedules.get((op, current))
+            require(schedule is not None, "terminal actor has no admitted local schedule")
+            require(
+                set(schedule.stages)
+                == {
+                    stage
+                    for stage in op.body.block.ops
+                    if isinstance(stage, PipelineStageOp) and current in uses.operations[stage]
+                },
+                "notification insertion changed a stage's participating actor families",
+            )
+            raw = remap(op.count, bindings)
+            zero, one = index(destination, 0), index(destination, 1)
+            count = arithmetic(destination, arith.MaxSIOp, raw, zero)
+            horizon = schedule.horizon
+            raw_range = facts.ranges.get(raw, facts.ranges.get(op.count, (0, (1 << 63) - 1)))
+            if isinstance(raw.owner, arith.ConstantOp):
+                value = raw.owner.value.value.data
+                raw_range = value, value
+            # Each actor chooses its own defined clock range. A second actor's
+            # horizon cannot enlarge this loop or its shifted-ordinal arithmetic.
+            shifted = raw_range[1] > (1 << 63) - 1 - horizon
+            lower = index(destination, -horizon) if shifted else zero
+            end = (
+                count
+                if shifted or horizon == 0
+                else arithmetic(destination, arith.AddiOp, count, index(destination, horizon))
+            )
+            body = Block(arg_types=[IndexType()])
+            loop = scf.ForOp(lower, end, one, [], body)
+            loop.attributes["npu.pipeline_clock"] = IntAttr(-horizon if shifted else 0)
+            if "npu.loop_id" in op.attributes:
+                loop.attributes["npu.loop_id"] = op.attributes["npu.loop_id"]
+            destination.add_op(loop)
+            tick = body.args[0]
+            if lane is None:
                 lane = zero
-            ordered = [stage for stage in stages if current in uses.operations[stage]]
-            if op.issue_order is not None and current in op.issue_order.data:
-                ranks = {name.data: i for i, name in enumerate(op.issue_order.data[current])}
-                ordered.sort(key=lambda stage: ranks[stage.label.data])
-            for stage in ordered:
+            for stage in schedule.stages:
                 shift = horizon - stage.offset.data if shifted else -stage.offset.data
                 # Guard before evaluating a potentially overflowing shifted
                 # ordinal. The tick inequalities are equivalent to 0<=g<N.
-                minimum = index(destination, -shift)
+                minimum = index(body, -shift)
                 limit = (
                     count
                     if shift == 0
                     else arithmetic(
-                        destination,
+                        body,
                         arith.SubiOp if shift > 0 else arith.AddiOp,
                         count,
-                        index(destination, abs(shift)),
+                        index(body, abs(shift)),
                     )
                 )
                 first, last = arith.CmpiOp(tick, minimum, "sge"), arith.CmpiOp(tick, limit, "slt")
-                destination.add_ops((first, last))
-                active = arithmetic(destination, arith.AndIOp, first.result, last.result)
+                body.add_ops((first, last))
+                active = arithmetic(body, arith.AndIOp, first.result, last.result)
                 guarded = Block()
                 condition = scf.IfOp(active, [], Region(guarded), Region())
                 condition.attributes["npu.stage_offset"] = IntAttr(stage.offset.data)
-                destination.add_op(condition)
+                body.add_op(condition)
                 generation = (
                     tick
                     if shift == 0
@@ -170,10 +176,9 @@ def lower_execution(module, natives, facts):
                 local = bindings | {stage.body.block.args[0]: generation}
                 project(stage.body.block, guarded, current, local, lane)
                 guarded.add_op(scf.YieldOp())
+            body.add_op(scf.YieldOp())
             if family is None and isinstance(root, MixedOp):
                 destination.add_op(EndOp())
-        body.add_op(scf.YieldOp())
-        return loop
 
     def visit(block):
         for op in tuple(block.ops):

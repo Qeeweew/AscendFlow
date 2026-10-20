@@ -98,7 +98,11 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
         dict(admitted.limits), {values[v]: bounds for v, bounds in admitted.ranges.items()}
     )
     projected = perf_counter()
-    lower_execution(module, natives, scalar_facts)
+    schedules = {
+        (operations[loop], family): schedule.project(operations)
+        for (loop, family), schedule in selection.dispatch.schedules.items()
+    }
+    lower_execution(module, natives, scalar_facts, schedules)
     lowered = perf_counter()
     simplify_scalars(module, facts=scalar_facts, finalize=False)
     simplified = perf_counter()
