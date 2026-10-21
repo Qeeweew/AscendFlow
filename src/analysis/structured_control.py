@@ -306,7 +306,12 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                 and isinstance(operation.value.type, IndexType),
                 "index metadata load lost its signed value domain",
             )
-            unknown_scalar(operation.value, frame, SymbolKind.METADATA)
+            # A local read snapshots its actual storage generation. It is not
+            # immutable input metadata and cannot acquire that invariance.
+            bank = operation.refs[0].type.bank.data
+            unknown_scalar(
+                operation.value, frame, SymbolKind.METADATA if bank == "GM" else SymbolKind.CARRY
+            )
             coordinate = bindings[operation.value]
             lower, upper = scalar(operation.refs[1]), scalar(operation.refs[2])
             frame = ControlFrame(

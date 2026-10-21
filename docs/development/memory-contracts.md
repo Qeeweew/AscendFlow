@@ -64,12 +64,15 @@ write_disjoint 不保证每次写完整 tensor、全部输出都被写到、初�
 
 ## 访问顺序与数值定义
 
-只读 INT32 / INT64 元数据由同一个 `index_load` 原语读取一个实际元素，effects
+只读 GM 或已初始化 UB 中的 INT32 / INT64 由同一个 `index_load` 原语读取一个实际元素，effects
 分别为 4 / 8 字节，返回有符号扩展后的 index SSA。`load_index` 的 inclusive
 `minimum/maximum` 都可省略，缺省使用源 dtype 的完整有符号值域。显式范围是
 调用方输入合同，不生成 clamp，也不授予写权限或不同索引的唯一性。
 范围事实保留真实支配关系和动态捕获，不能授权此前求值或未执行 load；
 它们不代替初始化合流、存储分区或通知生命周期准入。
+UB 可通过普通 DMA 批量预取整数元数据；Scalar 读取捕获当前存储代次的值，
+后续覆盖 UB 不改变该 SSA。它保留普通 Tile 来源、初始化、MTE2→S readiness
+和 S→writer 退休义务，不把可写 UB 当作不可变输入元数据。
 
 `structured_access` 是实际 native footprint 的唯一输入。StorageCell 表示可选的
 精确字节区域；AliasRegion 表示无法排除重叠的同一存储实例。两者都由

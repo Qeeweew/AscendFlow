@@ -423,12 +423,12 @@ def native_contract(
     if native == "index_load":
         require(
             len(refs) == 1
-            and banks == ("GM",)
+            and banks[0] in {"GM", "UB"}
             and dtypes[0] in {"i32", "i64"}
             and layouts == ("linear",)
             and lengths == (ITEMSIZE[dtypes[0]],)
             and not params,
-            "index load requires exactly one immutable GM int32/int64",
+            "index load requires exactly one GM/UB int32/int64",
         )
         return "S", ("R",)
     if native in {"mul_columns", "add_columns", "broadcast_columns", "broadcast_rows"}:

@@ -12,8 +12,8 @@
 | `@T.inline` | 词法作用域的透明 AST 内联；不执行 Python helper |
 | `T.Tensor` / `T.int64` | 外部tensor与runtime标量；长度不是constexpr |
 | `T.int64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
-| `T.i64` | GM tensor 的 int64 元素类型；与 runtime 参数声明 `T.int64` 职责不同 |
-| `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 单个 int32/int64 的 S 读取，按有符号值扩展为 index SSA；inclusive 值合同不生成 clamp |
+| `T.i64` | GM/UB tensor 的 int64 元素类型；与 runtime 参数声明 `T.int64` 职责不同 |
+| `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 或已初始化 UB 单个 int32/int64 的 S 读取，捕获有符号 index SSA；inclusive 值合同不生成 clamp |
 | `T.load_scalar(view)` | f32 UB 或浮点 GM 单元素的 S 读取，返回 f32 SSA |
 | `T.store_scalar(value, out=view)` | 将已读取的 f32 SSA 写入单个 f32 UB 元素，保留真实 4 B S 写入效果 |
 | `T.broadcast(v[None,:], out=...)` / `v[:,None]` | 显式 f32 行/列展开；行展开需要 `(rows,8)` scratch |
@@ -49,8 +49,8 @@
 | helper 太长、tuple 参数过多 | 透明 inline、具名参数、按数学职责拆小并去掉未用参数 | 现有前端已经支持；无需模型专属 pass |
 | 两页拼成一个 L1 NZ tile | 计算两段地址、有效行数和目标行偏移 | 普通 `copy(valid_rows=...)` 已有补零与保留其余行两种合同；部分写不提供完整初始化 |
 | 逐行 sparse gather 改成双行搬运 | 计算两个真实地址、判断合法间隙与边界，选择一条或两条搬运 | 当前行距为静态整数；runtime source stride 尚未支持。扩大连续 slice 不能代表两条不连续源 |
-| 有效行压紧 | 无效项处理、输出行位置、mask 和消费者的有效行数 | Scalar carry 影响地址而无范围合同时仍拒绝；动态发布前缀和定义集合需有对应合同 |
-| 索引/页表块预取到 UB | 预取块、时机、UB 环与双缓冲 | 当前 `load_index` 仅接受只读 GM；尚缺整数 UB DMA/Scalar load 及其值来源、初始化和退休合同 |
+| 有效行压紧 | 无效项处理、输出行位置、mask 和消费者的有效行数 | 保持 Scalar carry 的实际地址；动态发布前缀和定义集合需有对应 effects 合同，不重复证明调用方动态访问合法性 |
+| 索引/页表块预取到 UB | 预取块、时机、UB 环与双缓冲 | 普通整数 DMA 与 `load_index(UB)`；编译器保持真实值来源、初始化、readiness 和最后读取退休 |
 | 提前发布 P、减少广播和初始化 | 显式排列原语、分开递推 carry 与跨 Stage snapshot；无 mask 的 b16 清零可用普通 fill | 保持实际 dtype、数值次序、scratch 和定义集合；其他新指令/几何需对应 native 合同 |
 | runtime metadata 跨作用域、最后 reader 退休、双 AIV quorum | 保留所有真实读取、地址和参与者 | 通用作用域与生命周期分析；改名 buffer 不会改变物理身份 |
 | event 不足或编号改变 | 根据诊断评估流水宽度或值 lifetime | 核对[完整 credit、消费、预留与资源约束](../development/event-resources.md)；DSL 不填写 ID |

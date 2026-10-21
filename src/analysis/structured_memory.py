@@ -326,9 +326,10 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                     "index load needs its two bounds and an index result",
                 )
                 require(
-                    refs[0].root.owner.access is not None
+                    refs[0].geometry.bank == "UB"
+                    or refs[0].root.owner.access is not None
                     and refs[0].root.owner.access.data == "read",
-                    "index metadata must be immutable",
+                    "GM index metadata must be immutable",
                 )
             else:
                 require(operation.value.type == f32, "floating Scalar load must produce f32")

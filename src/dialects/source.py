@@ -225,7 +225,7 @@ class AllocationOp(IRDLOperation):
             or any(n.data == 0 or n.data < -1 for n in typ.shape)
             or typ.dtype.data not in {"f16", "bf16", "f32", "u8", "i32", "i64"}
             or typ.dtype.data in {"i32", "i64"}
-            and typ.memory.data != "GM"
+            and typ.memory.data not in {"GM", "UB"}
             or typ.dtype.data == "u8"
             and typ.memory.data != "UB"
             or typ.memory.data not in {"GM", "UB", "L1", "L0A", "L0B", "L0C"}
@@ -1096,17 +1096,20 @@ class IndexReadOp(IRDLOperation):
     source = operand_def(TensorType)
     minimum = operand_def(IndexType)
     maximum = operand_def(IndexType)
+    dependencies = var_operand_def(TileType)
+    dependency_inputs = attr_def(ArrayAttr[IntAttr])
     value = result_def(IndexType)
     traits = traits_def(AsyncEffects())
 
     def verify_(self):
+        _verify_dependencies(self, [self.source])
         if (
-            self.source.type.memory.data != "GM"
+            self.source.type.memory.data not in {"GM", "UB"}
             or self.source.type.dtype.data not in {"i32", "i64"}
             or any(n.data != 1 for n in self.source.type.shape)
         ):
             raise VerifyException(
-                "index read requires exactly one immutable GM int32/int64 element"
+                "index read requires exactly one GM/UB int32/int64 element"
             )
 
 

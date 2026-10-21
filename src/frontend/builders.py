@@ -1670,15 +1670,17 @@ def store_scalar(value, *, out):
 def load_index(source, *, minimum=None, maximum=None):
     src = _view(source)
     require(
-        src.buffer.op.access.data == "read", "index metadata must be immutable during the kernel"
+        src.buffer.memory == "UB" or src.buffer.op.access.data == "read",
+        "GM index metadata must be immutable during the kernel",
     )
     require(src.buffer.dtype in {i32, i64}, "index metadata needs int32 or int64")
     bits = 32 if src.buffer.dtype == i32 else 64
     minimum = -(1 << (bits - 1)) if minimum is None else minimum
     maximum = (1 << (bits - 1)) - 1 if maximum is None else maximum
     op = IndexReadOp.build(
-        operands=[src.emit(), _trace().scalar(minimum), _trace().scalar(maximum)],
+        operands=[src.emit(), _trace().scalar(minimum), _trace().scalar(maximum), _deps([source])],
         result_types=[IndexType()],
+        attributes={"dependency_inputs": _dependency_inputs([source])},
     )
     _trace().add(op)
     return _Index(op.value)

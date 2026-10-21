@@ -7,6 +7,120 @@ from ascendflow.passes.structured_sync import synchronize_structure
 from tests.models.structured_events import _Interpret, check_compiled_events
 
 
+@pytest.mark.parametrize("dtype,width", [("i32", 4), ("i64", 8)])
+def test_local_integer_capture_keeps_snapshot_and_retires_each_generation(
+    monkeypatch, dtype, width
+):
+    from ascendflow import compile
+    from ascendflow.analysis.structured_memory import collect_native_memory
+    from ascendflow.dialects.io import parse
+    from tests.models.structured_events import check_structured_events
+
+    native = _Interpret.native
+    contents = {}
+    inputs = [[[3, -1, 7][i]] * (32 // width) for i in range(3)]
+    raw = b"".join(v.to_bytes(width, "little", signed=True) for row in inputs for v in row)
+
+    def capture(self, operation, values, invocation, group, actor, coordinates):
+        native(self, operation, values, invocation, group, actor, coordinates)
+        if operation.native.data == "copy":
+            source, offset, _ = values[operation.refs[0]]
+            destination, target, size = values[operation.refs[1]]
+            if source.sym_name.data == "Meta":
+                key = (self, invocation, group, actor, destination)
+                contents.setdefault(key, bytearray(size))[target : target + 32] = raw[
+                    offset : offset + 32
+                ]
+        if operation.native.data == "index_load":
+            root, offset, _ = values[operation.refs[0]]
+            key = (self, invocation, group, actor, root)
+            values[operation.value] = int.from_bytes(
+                contents[key][offset : offset + width], "little", signed=True
+            )
+
+    monkeypatch.setattr(_Interpret, "native", capture)
+    result = compile(
+        N.from_source(
+            f"""
+def cached(Meta:N.Tensor((3,{32 // width}),N.{dtype}),X:N.Tensor((8,64),N.f32),
+           Out:N.Tensor((3,64),N.f32,access="write",write_disjoint=True)):
+    with N.Kernel():
+        cache=N.alloc_ub(({32 // width},),N.{dtype})
+        row=N.alloc_ub((64,),N.f32)
+        for i in N.Pipelined(3):
+            with N.Stage(0):
+                N.copy(Meta[i,:],cache)
+                index=N.load_index(cache[0:1])
+                # Reusing the storage does not change the captured SSA value.
+                N.copy(Meta[(i+1)%3,:],cache)
+                N.fill(row,0.0)
+                if index>=0:
+                    N.copy(X[index,:],row)
+                N.copy(row,Out[i,:])
+""",
+            disjoint_external=True,
+        )
+    )
+    trace = check_structured_events(
+        collect_native_memory(result.plan),
+        logical_reference=collect_native_memory(parse(result.before_ir)),
+        invocations=2,
+    )
+    reads = [
+        span.start // 256
+        for command in trace.natives
+        for span in command.spans
+        if span.root.sym_name.data == "X"
+    ]
+    assert reads == [3, 7, 3, 7]
+    assert f"__ubuf__ volatile int{width * 8}_t" in result.asc
+
+
+def test_local_index_capture_still_requires_initialized_storage():
+    from ascendflow import compile
+    from ascendflow.diagnostics import CompileError
+
+    with pytest.raises(CompileError, match="initialized writer coverage"):
+        compile(
+            N.from_source(
+                """
+def invalid(X:N.Tensor((8,64),N.f32),Out:N.Tensor((64,),N.f32,access="write")):
+    with N.Kernel():
+        cache=N.alloc_ub((8,),N.i32)
+        row=N.alloc_ub((64,),N.f32)
+        index=N.load_index(cache[0:1])
+        N.copy(X[index,:],row)
+        N.copy(row,Out)
+""",
+                disjoint_external=True,
+            )
+        )
+
+
+def test_local_index_capture_does_not_read_an_overwritten_tile_version():
+    from ascendflow import compile
+    from ascendflow.diagnostics import CompileError
+
+    with pytest.raises(CompileError, match="overwrit|value|version|writer"):
+        compile(
+            N.from_source(
+                """
+def stale(Meta:N.Tensor((2,8),N.i32),X:N.Tensor((8,64),N.f32),
+          Out:N.Tensor((64,),N.f32,access="write")):
+    with N.Kernel():
+        cache=N.alloc_ub((8,),N.i32)
+        row=N.alloc_ub((64,),N.f32)
+        first=N.copy(Meta[0,:],cache)
+        N.copy(Meta[1,:],cache)
+        index=N.load_index(first[0:1])
+        N.copy(X[index,:],row)
+        N.copy(row,Out)
+""",
+                disjoint_external=True,
+            )
+        )
+
+
 @pytest.fixture
 def metadata_values(monkeypatch):
     native = _Interpret.native

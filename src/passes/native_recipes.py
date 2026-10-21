@@ -634,7 +634,11 @@ def lower_scalar_write(
 
 
 def lower_index_read(op: IndexReadOp, context: RecipeContext, *, minimum, maximum) -> RecipeResult:
-    require(source_allocation(op.source).access.data == "read", "index metadata must be immutable")
+    root = source_allocation(op.source)
+    require(
+        root.ref.type.memory.data == "UB" or root.access.data == "read",
+        "GM index metadata must be immutable",
+    )
     task = context.emit(
         "_index", "index_load", context.view(op.source), operands=(minimum, maximum)
     )

@@ -206,11 +206,13 @@ def store_scalar(value, *, out):
 
 
 def load_index(source, *, minimum=None, maximum=None):
-    """Read one immutable GM int32/int64; optional inclusive input bounds.
+    """Read one immutable GM or initialized UB int32/int64 element.
 
     Bounds describe the caller's metadata, and may use preceding index loads.
     They are not runtime clamps or promises of unique ownership. Without hints
-    the full signed source dtype range is retained.
+    the full signed source dtype range is retained. A UB read captures the
+    current storage generation through ordinary readiness/retirement checks;
+    it does not make the UB allocation immutable.
     """
     _ast_only()
 
