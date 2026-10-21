@@ -17,19 +17,23 @@ from ascendflow.runtime.process import kill_process_group
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def summarize(directory, warmup, repeats, backend):
+def summarize(directory, warmup, repeats, backend, *, cache_eviction=False):
     paths = list(directory.rglob("op_summary*.csv"))
     require(len(paths) == 1, "expected exactly one msprof operator summary")
     rows = list(csv.DictReader(paths[0].open()))
     expected = {"sparse_mla_decode"} if backend == "ascendflow" else {"SparseFlashMla"}
     groups = {}
     setup = []
+    evictions = []
     first_main = min(
         float(row["Task Start Time(us)"].strip()) for row in rows if row["OP Type"] in expected
     )
     for row in rows:
         name = row["OP Type"]
         if name not in expected:
+            if cache_eviction and name == "state_sum":
+                evictions.append(row)
+                continue
             require(
                 float(row["Task Start Time(us)"].strip()) < first_main,
                 f"unexpected task during measured calls: {name}",
@@ -41,6 +45,24 @@ def summarize(directory, warmup, repeats, backend):
         require(row["Task Type"] in {"AI_VECTOR_CORE", "MIX_AIC"}, "unexpected task type")
         groups.setdefault(name, []).append(row)
     require(groups, "no device tasks collected")
+    if cache_eviction:
+        require(len(evictions) == warmup + repeats + 1, "eviction launch count differs")
+        sequence = sorted(
+            [row for launches in groups.values() for row in launches] + evictions,
+            key=lambda row: float(row["Task Start Time(us)"]),
+        )
+        for i, row in enumerate(sequence):
+            if row["OP Type"] in expected:
+                require(
+                    i > 0 and sequence[i - 1]["OP Type"] == "state_sum",
+                    "attention launch was not immediately preceded by eviction",
+                )
+                previous = sequence[i - 1]
+                require(
+                    float(previous["Task Start Time(us)"]) + float(previous["Task Duration(us)"])
+                    <= float(row["Task Start Time(us)"]) + 0.1,
+                    "eviction overlapped the measured attention kernel",
+                )
     samples, operators = [], {}
     for name, launches in groups.items():
         require(len(launches) == warmup + repeats, f"{name}: launch count differs")
@@ -65,6 +87,7 @@ def summarize(directory, warmup, repeats, backend):
     return {
         "scope": "sum of device task durations per call; excludes setup and host gaps",
         "setup_tasks_excluded": setup,
+        "eviction_tasks_excluded": len(evictions),
         "summary_csv": str(paths[0].resolve()),
         "summary_sha256": hashlib.sha256(paths[0].read_bytes()).hexdigest(),
         "operators": operators,
@@ -127,6 +150,8 @@ def profile(args, backend, batch, context, trial):
         worker += ["--artifacts", str(artifact)]
     else:
         worker += ["--reference-artifacts", str(args.reference_artifacts)]
+    if args.cache_evict_artifacts is not None:
+        worker += ["--cache-evict-artifacts", str(args.cache_evict_artifacts)]
     command = [
         "msprof",
         "--output=" + str(output / "profile"),
@@ -153,7 +178,13 @@ def profile(args, backend, batch, context, trial):
         require(code == 0, f"msprof failed: {output / 'msprof.log'}")
     device = json.loads((output / "device/device.json").read_text())
     require(device["status"] == "passed", "device validation failed")
-    result = summarize(output / "profile", args.warmup, args.repeats, backend)
+    result = summarize(
+        output / "profile",
+        args.warmup,
+        args.repeats,
+        backend,
+        cache_eviction=args.cache_evict_artifacts is not None,
+    )
     result.update(
         batch=batch,
         context=context,
@@ -164,6 +195,8 @@ def profile(args, backend, batch, context, trial):
         device_record=str(output / "device/device.json"),
         input_identity=device["input_identity"],
         max_abs_error=device["max_abs_error"],
+        cache_scope=device["cache_scope"],
+        cache_eviction=device.get("cache_eviction"),
     )
     (output / "measurement.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -188,6 +221,7 @@ def main(argv=None):
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--metrics", default="PipeUtilization")
     parser.add_argument("--rotations", type=int, default=1)
+    parser.add_argument("--cache-evict-artifacts", type=Path)
     args = parser.parse_args(argv)
     require(args.trials > 0 and args.repeats > 0 and args.warmup >= 0, "invalid repetition counts")
     require(
@@ -198,6 +232,8 @@ def main(argv=None):
     args.artifacts = args.artifacts.resolve()
     if args.reference_artifacts is not None:
         args.reference_artifacts = args.reference_artifacts.resolve()
+    if args.cache_evict_artifacts is not None:
+        args.cache_evict_artifacts = args.cache_evict_artifacts.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     measurements = []
     for batch in args.batches:

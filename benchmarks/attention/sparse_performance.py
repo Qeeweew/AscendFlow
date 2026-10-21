@@ -170,6 +170,7 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--rotations", type=int, default=1)
+    parser.add_argument("--cache-evict-artifacts", type=Path)
     parser.add_argument("--seed", type=int, default=4102026)
     parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     args = parser.parse_args(argv)
@@ -295,9 +296,22 @@ def main(argv=None):
         record["launch_rotation"] = "invocation % rotations; includes warmup"
         if references:
             record["reference"] = [reference.identity() for reference in references]
+        eviction = None
+        if args.cache_evict_artifacts is not None:
+            from benchmarks.cache import CacheEviction
+
+            eviction = CacheEviction(
+                runtime, args.cache_evict_artifacts, record["hardware"]["l2_bytes"]
+            )
+            record["cache_scope"] = "disjoint full-buffer L2 eviction before every attention launch"
+            record["cache_eviction"] = eviction.identity
         for invocation in range(args.warmup + args.repeats):
+            if eviction is not None:
+                eviction()
             cases[invocation % args.rotations]["launch"]()
         runtime.synchronize()
+        if eviction is not None:
+            record["cache_eviction"]["launches"] = eviction.calls
         errors, outputs = [], []
         for rotation, case in enumerate(cases):
             pointers, arrays, raw, selected = (
