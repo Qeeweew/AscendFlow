@@ -22,7 +22,9 @@ from ..dialects.structured import AddressOp
 from ..indexing import equivalent, exact_constant, normalize
 from ..scalar import Expr, Fact, expression, from_ssa, literal
 from ..symbols import Symbol
+from ..target.layout import NZLayout
 from ..target.native import ITEMSIZE, NativeGeometry
+from .matrix_regions import MatrixRegion
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +93,7 @@ class AddressFacts:
     axes: AxisFacts | None
     rectangle: NDRectangle | None
     valid_rows: Expr | None = None
+    matrix: MatrixRegion | None = None
 
     @property
     def row_capacity(self):
@@ -164,6 +167,7 @@ class StructuredAddresses:
     def __init__(self, environment: ScalarEnvironment):
         self.environment = environment
         self._addresses: dict[SSAValue, AddressFacts] = {}
+        self._layouts: dict[SSAValue, NZLayout] = {}
 
     @property
     def decode_count(self) -> int:
@@ -190,6 +194,21 @@ class StructuredAddresses:
             ) from error
 
         typ = operation.source.type
+        layout = None
+        if typ.bank.data == "L1" and typ.layout.data == "NZ":
+            if operation.source not in self._layouts:
+                root = operation.source.owner
+                require(
+                    root.matrix_shape is not None, "L1 NZ allocation lost its physical matrix shape"
+                )
+                layout = NZLayout(
+                    tuple(v.data for v in root.matrix_shape), ITEMSIZE[typ.dtype.data]
+                )
+                require(
+                    layout.nbytes == root.nbytes.data, "L1 NZ layout differs from allocation size"
+                )
+                self._layouts[operation.source] = layout
+            layout = self._layouts[operation.source]
         geometry = NativeGeometry(
             typ.bank.data,
             typ.dtype.data,
@@ -197,6 +216,7 @@ class StructuredAddresses:
             operation.nbytes.data,
             operation.rows.data,
             operation.row_stride.data,
+            None if layout is None else layout.shape[-2:],
         )
         axes = None
         if operation.widths is not None:
@@ -219,6 +239,26 @@ class StructuredAddresses:
             if valid_rows is not None
             else nd_rectangle(offset, geometry, axes, self.environment.facts)
         )
+        matrix = None
+        if layout is not None:
+            require(
+                axes is not None
+                and len(axes.extents) == len(layout.shape)
+                and axes.displacement == 0
+                and tuple(v.constant for v in axes.extents) == layout.shape,
+                "L1 view must retain its allocation layout and original coordinates",
+            )
+            widths = list(map(literal, axes.widths))
+            if valid_rows is not None:
+                widths[-2] = valid_rows
+            matrix = MatrixRegion(
+                layout,
+                axes.origins,
+                tuple(
+                    expression("add", start, width)
+                    for start, width in zip(axes.origins, widths, strict=True)
+                ),
+            )
         result = AddressFacts(
             operation,
             operation.source,
@@ -227,6 +267,7 @@ class StructuredAddresses:
             axes,
             rectangle,
             valid_rows,
+            matrix,
         )
         self._addresses[ref] = result
         return result

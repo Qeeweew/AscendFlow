@@ -18,7 +18,7 @@ from math import prod
 from types import MappingProxyType
 
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import IndexType, IntAttr, ModuleOp, StringAttr, f32
+from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, ModuleOp, StringAttr, f32
 from xdsl.ir import Block, Operation, Region, SSAValue
 
 from ..analysis.value_bindings import LastTile, TileDefinition, TileUse, ValueScope, bind_values
@@ -156,12 +156,20 @@ class _Lowerer:
             width for op in source.walk() if (width := recipes.strided_b_width(op)) is not None
         }
         self.load3d_b_width = next(iter(widths)) if len(widths) == 1 else None
-        a_widths = {
-            width for op in source.walk() if (width := recipes.compact_a_width(op)) is not None
-        }
+        a_copies = [
+            (op, width)
+            for op in source.walk()
+            if (width := recipes.compact_a_width(op)) is not None
+        ]
+        a_widths = {width for _, width in a_copies}
         self.load3d_a_width = (
             next(iter(a_widths))
-            if len(a_widths) == 1 and (self.load3d_b_width is not None or self.needs_fp32)
+            if len(a_widths) == 1
+            and (
+                self.load3d_b_width is not None
+                or self.needs_fp32
+                or any(op.source.type.dtype.data == "f32" for op, _ in a_copies)
+            )
             else None
         )
         self.needs_load3d = False
@@ -243,6 +251,8 @@ class _Lowerer:
             "initialized": IntAttr(int(op.access.data in {"read", "read_write"})),
             "access": op.access,
         }
+        if op.ref.type.memory.data == "L1" and op.ref.type.layout.data == "NZ":
+            attrs["matrix_shape"] = ArrayAttr(IntAttr(n.data) for n in op.ref.type.shape)
         if op.write_disjoint is not None:
             attrs["write_disjoint"] = op.write_disjoint
         if op.cache is not None:

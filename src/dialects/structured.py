@@ -30,6 +30,7 @@ from xdsl.irdl import (
 from xdsl.traits import RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
+from ..target.native import nz_columns
 from .types import AsyncEffects, RefType
 
 
@@ -215,16 +216,26 @@ class AddressOp(IRDLOperation):
         if self.displacement.data < 0:
             raise VerifyException("address displacement must be nonnegative")
         if self.valid_rows is not None:
-            linear = len(axes) == 2 and self.source.type.layout.data == "linear" and rows == widths[axes[0]]
+            linear = (
+                len(axes) == 2
+                and self.source.type.layout.data == "linear"
+                and rows == widths[axes[0]]
+            )
             nz = (
-                self.source.type.bank.data == "L1"
-                and self.source.type.layout.data == "NZ"
-                and self.source.type.dtype.data in {"f16", "bf16"}
-                and width == widths[axes[0]] * 32
-                and rows * 16 == widths[axes[1]]
-            ) if len(axes) == 2 else False
+                (
+                    self.source.type.bank.data == "L1"
+                    and self.source.type.layout.data == "NZ"
+                    and self.source.type.dtype.data in {"f16", "bf16", "f32"}
+                    and width == widths[axes[0]] * 32
+                    and rows * nz_columns("L1", self.source.type.dtype.data) == widths[axes[1]]
+                )
+                if len(axes) == 2
+                else False
+            )
             if len(axes) != 2 or self.displacement.data != 0 or not (linear or nz):
-                raise VerifyException("runtime row prefixes require an original linear or L1 NZ matrix view")
+                raise VerifyException(
+                    "runtime row prefixes require an original linear or L1 NZ matrix view"
+                )
 
 
 @irdl_op_definition

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from math import isinf
 
-from ..target.native import ITEMSIZE, nz_columns
+from ..target.native import ITEMSIZE
 
 QUALIFIER = {
     "GM": "__gm__",
@@ -362,13 +362,15 @@ def native_line(task, *, pointer_renderer, generation):
             call = f"asc_div({pp[2]}, {pp[0]}, {pp[1]}, uint32_t(1));"
         return f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ {call} }}"
     if task.spec.native == "nd2nz_overlay":
-        maximum, cols, resident_rows = task.spec.params
+        maximum, cols, _ = task.spec.params
+        resident_rows = refs[1].leading_rows
         rows = task.operands[0]
+        itemsize = ITEMSIZE[refs[0].dtype]
         copy = (
             f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, uint16_t({rows}), {cols}, 0, "
-            f"{refs[0].row_stride // 2}, {resident_rows}, 1, 0);"
+            f"{refs[0].row_stride // itemsize}, {resident_rows}, 1, 0);"
         )
-        if refs[0].row_stride // 2 > 65535:
+        if refs[0].row_stride // itemsize > 65535:
             source = ptr(0, extra="npu_row * " + str(refs[0].row_stride))
             destination = ptr(1, extra="npu_row * 32")
             copy = (
@@ -377,7 +379,8 @@ def native_line(task, *, pointer_renderer, generation):
             )
         return f"if (({rows}) > 0) {{ {copy} }}"
     if task.spec.native == "nd2nz_rows":
-        maximum, cols, resident_rows, resident_cols = task.spec.params
+        maximum, cols, _, resident_cols = task.spec.params
+        resident_rows = refs[1].leading_rows
         rows = task.operands[0]
         copy = (
             f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, uint16_t({rows}), {cols}, 0, "
@@ -405,13 +408,7 @@ def native_line(task, *, pointer_renderer, generation):
     if task.spec.native in {"nd2nz", "nd2nz_pad"}:
         rows, cols = task.spec.params[:2]
         padded = task.spec.native == "nd2nz_pad"
-        resident_rows = (
-            task.spec.params[2]
-            if padded
-            else rows
-            if refs[1].contiguous
-            else refs[1].row_stride // (nz_columns("L1", refs[1].dtype) * ITEMSIZE[refs[1].dtype])
-        )
+        resident_rows = refs[1].leading_rows
         setup = ""
         if padded:
             setup = (
@@ -449,7 +446,7 @@ def native_line(task, *, pointer_renderer, generation):
         rows, cols = task.spec.params
         src = ptr(0, extra="npu_chunk * 512")
         dst = ptr(1, extra=f"npu_chunk * {cols * 32}")
-        stride = refs[0].row_stride // 512 if not refs[0].contiguous else rows // 16
+        stride = refs[0].leading_rows // 16
         return (
             f"for (int npu_chunk = 0; npu_chunk < {rows // 16}; ++npu_chunk) {{ "
             f"asc_copy_l12l0a({dst}, {src}, 0, {cols // 16}, {stride}, 0); }}"
@@ -464,7 +461,7 @@ def native_line(task, *, pointer_renderer, generation):
         rows, cols = task.spec.params  # B[K,N] compact zN -> L0B ZN
         src = ptr(0, extra="npu_chunk * 512")
         dst = ptr(1, extra=f"npu_chunk * {cols * 32}")
-        stride = refs[0].row_stride // 512 if not refs[0].contiguous else rows // 16
+        stride = refs[0].leading_rows // 16
         # CANN 9.1/2201's public asc_copy_l12l0b has no classic transpose
         # parameter; the similarly named *_transpose is a 3510 API. Use
         # the exact audited dav_c220 LoadData2D intrinsic with transpose=true,

@@ -187,6 +187,37 @@ def _original_view(address: AddressFacts, facts):
             else Expr("argument", (Symbol("$axis", SymbolKind.SSA, value),))
         )
     actual = from_ssa(operation.offset, memo=dict(anchors))
+    if address.matrix is not None:
+        layout = address.matrix.layout
+        expected = literal(0)
+        for origin, stride in zip(operation.origins, layout.strides, strict=True):
+            expected = expression(
+                "add", expected, expression("mul", anchors[origin], literal(stride))
+            )
+        _require(
+            equivalent(actual, expected, {}),
+            "address offset does not match its L1 allocation layout",
+            operation,
+        )
+        rank = len(layout.shape)
+        _require(
+            axes.axes == (rank - 2, rank - 1)
+            and all(width == 1 for width in axes.widths[:-2])
+            and axes.widths[-1] % layout.c0 == 0
+            and multiple_of(axes.origins[-1], layout.c0, facts),
+            "native access needs an aligned L1 NZ rectangle",
+            operation,
+            kind=ErrorKind.UNSUPPORTED,
+        )
+        expected_geometry = layout.geometry(
+            *axes.widths[-2:], prefix=address.valid_rows is not None
+        )
+        _require(
+            (geometry.nbytes, geometry.rows, geometry.row_stride) == expected_geometry,
+            "L1 native footprint differs from its allocation layout and view",
+            operation,
+        )
+        return expected_geometry
     stride = literal(itemsize)
     base = literal(0)
     pairs = tuple(
@@ -244,24 +275,19 @@ def _original_view(address: AddressFacts, facts):
     if geometry.layout != "linear":
         rank = len(axes.origins)
         extents = tuple(exact_constant(extent, facts) for extent in axes.extents[-2:])
-        column_slice = geometry.bank == "L1" and geometry.layout == "NZ"
         accumulator_columns = geometry.bank == "L0C" and geometry.layout == "NZ"
         _require(
             rank >= 2
             and selected == (rank - 2, rank - 1)
-            and (column_slice or equivalent(axes.origins[-2], literal(0), facts))
-            and (
-                column_slice
-                or accumulator_columns
-                or equivalent(axes.origins[-1], literal(0), facts)
-            )
+            and equivalent(axes.origins[-2], literal(0), facts)
+            and (accumulator_columns or equivalent(axes.origins[-1], literal(0), facts))
             and all(extent is not None and extent > 0 and extent % 16 == 0 for extent in extents)
-            and (column_slice or axes.widths[-2] == extents[0])
-            and (column_slice or axes.widths[-2] % 16 == 0)
-            and (column_slice or multiple_of(axes.origins[-2], 16, facts))
+            and axes.widths[-2] == extents[0]
+            and axes.widths[-2] % 16 == 0
+            and multiple_of(axes.origins[-2], 16, facts)
             and axes.widths[-1] % 16 == 0
             and multiple_of(axes.origins[-1], 16, facts)
-            and (column_slice or accumulator_columns or axes.widths[-1] == extents[1]),
+            and (accumulator_columns or axes.widths[-1] == extents[1]),
             "fractal address needs a complete matrix plane, aligned L1 NZ rectangle or full-row L0C columns",
             operation,
             kind=ErrorKind.UNSUPPORTED,
@@ -275,15 +301,6 @@ def _original_view(address: AddressFacts, facts):
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )
-        if geometry.layout == "NZ" and (
-            axes.widths[-2] != extents[0] or address.valid_rows is not None
-        ):
-            c0 = nz_columns(geometry.bank, geometry.dtype)
-            return (
-                axes.widths[-2] * c0 * itemsize,
-                axes.widths[-1] // c0,
-                extents[0] * c0 * itemsize,
-            )
         return width * rows, 1, 0
     return width, rows, pitch
 
@@ -331,6 +348,19 @@ def _enclosing_slices(address, facts):
     such matrix into its contiguous plane. No native footprint is enlarged.
     """
     axes = address.axes
+    if address.matrix is not None:
+        result, origin = [], literal(0)
+        for coordinate, width, stride in zip(
+            address.matrix.starts[:-2],
+            axes.widths[:-2],
+            address.matrix.layout.strides[:-2],
+            strict=True,
+        ):
+            if width != 1:
+                break
+            origin = expression("add", origin, expression("mul", coordinate, literal(stride)))
+            result.append(AddressEnclosure(origin, stride))
+        return tuple(result)
     extents = tuple(exact_constant(value, facts) for value in axes.extents)
     if any(size is None or size <= 0 for size in extents):
         return ()

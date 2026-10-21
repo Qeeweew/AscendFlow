@@ -412,6 +412,7 @@ def test_same_address_uses_the_maximum_native_alignment_without_losing_actual_sc
     block = Block()
     gm = _buffer(block, "GM", 512, dtype="f16", layout="NZ")
     l1 = _buffer(block, "L1", 512, dtype="f16", layout="NZ")
+    l1.attributes["matrix_shape"] = ArrayAttr([IntAttr(16), IntAttr(16)])
     l0 = _buffer(block, "L0A", 512, dtype="f16", layout="ZZ")
     geometry = {
         "origins": (0, 0),

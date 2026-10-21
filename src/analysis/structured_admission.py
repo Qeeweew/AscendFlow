@@ -31,6 +31,7 @@ from ..indexing import (
 from ..scalar import Expr, expression, literal, substitute
 from ..target.ascend910b import Actor
 from ..target.native import ITEMSIZE
+from .matrix_regions import RegionDefinitions
 from .native import ConditionalRead
 from .structured_bounds import MemoryBoundsFacts
 from .structured_control import LogicalLoop
@@ -224,7 +225,7 @@ def _summarize(span, loop, facts, bindings):
     return None
 
 
-def _writer_span(
+def _writer_coordinates(
     writer,
     access,
     actor,
@@ -234,12 +235,12 @@ def _writer_span(
     selections=(),
     ignore_guards=False,
     logical_value=False,
+    rectangular=False,
 ):
-    if access.address.valid_rows is not None:
-        return None  # A partial write cannot initialize its static upper envelope.
     environment, facts = memory.control.environment, memory.control.environment.facts
     bindings = _participant(actor, memory.control.sid) | dict(selections)
-    writer_loops, reader_loops = writer.frame.loops(), reader.frame.loops()
+    windows = {}
+    writer_loops = writer.frame.loops()
     reader_guards = _guards(reader.frame, environment)
     for guard in _guards(writer.frame, environment):
         if ignore_guards:
@@ -257,13 +258,67 @@ def _writer_span(
                         ):
                             first = loop
         if first is None:
-            return None
+            if not rectangular or len(guard) != 4:
+                return None
+            left, right, predicate, branch = guard
+            predicate = {0: 1, 1: 0, 2: 5, 3: 4, 4: 3, 5: 2}[predicate] if branch else predicate
+            for loop in writer_loops:
+                if (
+                    loop in reader.frame.loops()
+                    or loop.count.constant is None
+                    or loop.lower.constant is None
+                ):
+                    continue
+                for a, b, p in (
+                    (left, right, predicate),
+                    (right, left, {0: 0, 1: 1, 2: 4, 3: 5, 4: 2, 5: 3}[predicate]),
+                ):
+                    if b.constant is None or not equivalent(a, loop.induction, facts):
+                        continue
+                    low, high = windows.get(loop, (0, loop.count.constant))
+                    difference = b.constant - loop.lower.constant
+                    if p == 2:
+                        high = min(high, -(-difference // loop.step))
+                    elif p == 3:
+                        high = min(high, difference // loop.step + 1)
+                    elif p == 4:
+                        low = max(low, difference // loop.step + 1)
+                    elif p == 5:
+                        low = max(low, -(-difference // loop.step))
+                    else:
+                        continue
+                    if low >= high:
+                        return None
+                    if logical_value and loop.ordinal in bindings:
+                        selected = bindings[loop.ordinal].constant
+                        if selected is None or not low <= selected < high:
+                            return None
+                    windows[loop] = (low, high)
+                    break
+                else:
+                    continue
+                break
+            else:
+                return None
+            continue
         if logical_value and (
             first.ordinal not in bindings
             or not equivalent(bindings[first.ordinal], literal(0), facts)
         ):
             return None
         bindings[first.ordinal] = literal(0)
+    return bindings, windows
+
+
+def _writer_span(writer, access, actor, reader, memory, **options):
+    if access.address.valid_rows is not None:
+        return None  # Byte envelopes cannot describe a partial definition.
+    scope = _writer_coordinates(writer, access, actor, reader, memory, **options)
+    if scope is None:
+        return None
+    bindings, _ = scope
+    facts = memory.control.environment.facts
+    writer_loops, reader_loops = writer.frame.loops(), reader.frame.loops()
     result = _span(access, bindings)
     for loop in reversed(writer_loops):
         if loop not in reader_loops:
@@ -274,6 +329,108 @@ def _writer_span(
             elif _nonempty_count(loop, facts, bindings) is None:
                 return None
     return result
+
+
+def _writer_matrix(writer, access, actor, reader, memory, **options):
+    scope = _writer_coordinates(writer, access, actor, reader, memory, rectangular=True, **options)
+    if scope is None:
+        return None
+    bindings, windows = scope
+    region = access.address.matrix.bind(bindings)
+    facts = memory.control.environment.facts
+    for loop in reversed(writer.frame.loops()):
+        if loop in reader.frame.loops():
+            continue
+        if loop.ordinal in bindings:
+            if _nonempty_count(loop, facts, bindings) is None:
+                return None
+            continue
+        if loop in windows:
+            first, stop = windows[loop]
+            region = region.bind({loop.ordinal: expression("add", loop.ordinal, literal(first))})
+            count = literal(stop - first)
+        else:
+            count = _nonempty_count(loop, facts, bindings)
+        if count is None:
+            return None
+        region = region.sweep(loop.ordinal, count, facts)
+        if region is None:
+            return None
+    return region
+
+
+def _conditional_matrices(alternatives, reader, memory):
+    control, groups = memory.control, {}
+    facts, reader_loops = control.environment.facts, reader.frame.loops()
+    for writer, output, actor, path in alternatives:
+        region = output.address.matrix.bind(_participant(actor, control.sid))
+        loops = writer.frame.loops()
+        for loop in reversed(loops):
+            if loop in reader_loops or any(
+                len(guard) != 4
+                or not all(control.invariant_over(value, loop.operation) for value in guard[:2])
+                for guard in path
+            ):
+                break
+            count = _nonempty_count(loop, facts, _participant(actor, control.sid))
+            summary = None if count is None else region.sweep(loop.ordinal, count, facts)
+            if summary is None:
+                break
+            region, loops = summary, loops[:-1]
+        key = actor, loops, region.canonical(facts)
+        paths, writers = groups.setdefault(key, ([], []))
+        paths.append(path)
+        writers.append(writer.operation)
+    for (actor, loops, region), (paths, writers) in groups.items():
+        if not _complete_branch_paths(paths, facts):
+            continue
+        for loop in reversed(loops):
+            if loop not in reader_loops:
+                count = _nonempty_count(loop, facts, _participant(actor, control.sid))
+                region = None if count is None else region.sweep(loop.ordinal, count, facts)
+                if region is None:
+                    break
+        if region is not None:
+            yield region, tuple(writers)
+
+
+class _MatrixDefinitions:
+    """Incremental region transfers per real reader invocation/activation.
+
+    This is numerical definedness only. Storage ownership and stale Tile
+    checks continue to use the actual accesses and selected writer versions.
+    """
+
+    def __init__(self, memory, work):
+        self.memory, self.work = memory, work
+        self.writes, self.contexts = {}, {}
+
+    def write(self, instance, template, access, actor):
+        self.writes.setdefault(instance, []).append((template, access, actor))
+
+    def before(self, instance, reader):
+        memory, facts = self.memory, self.memory.control.environment.facts
+        guards = _guards(reader.frame, memory.control.environment)
+        key = instance, reader.frame.loops(), guards
+        cursor, definitions, guarded = self.contexts.setdefault(key, (0, RegionDefinitions(), []))
+        writes = self.writes.get(instance, ())
+        for writer, output, actor in writes[cursor:]:
+            self.work["l1_region_transfers"] += 1
+            region = _writer_matrix(writer, output, actor, reader, memory)
+            if region is not None:
+                definitions.add(region, (writer.operation,), facts)
+            missing = tuple(
+                guard
+                for guard in _guards(writer.frame, memory.control.environment)
+                if not any(_same_guard(guard, other, facts) for other in guards)
+            )
+            if missing:
+                guarded.append((writer, output, actor, missing))
+        if cursor != len(writes):
+            for region, writers in _conditional_matrices(guarded, reader, memory):
+                definitions.add(region, writers, facts)
+        self.contexts[key] = len(writes), definitions, guarded
+        return definitions
 
 
 def _complete_branch_paths(paths, facts):
@@ -586,9 +743,7 @@ def _configurations(memory):
                     else matching[0].b_width
                 )
                 source = template.accesses[0].address.geometry
-                actual_width = (
-                    source.row_stride // 32 if not source.contiguous else template.spec.params[0]
-                )
+                actual_width = source.leading_rows
                 _require(
                     width.data == actual_width,
                     "Load3D invariant FMATRIX width does not match the actual native",
@@ -679,6 +834,7 @@ def admit_structured_memory(
         "coverage_checks": 0,
         "row_intervals": 0,
         "expanded_iterations": 0,
+        "l1_region_transfers": 0,
     }
     for root in bounds.allocations:
         initialized = root.owner.initialized.data
@@ -711,6 +867,7 @@ def admit_structured_memory(
     configurations = _configurations(memory)
     _native_aliases(memory)
     instances, reads, prior = {}, [], {}
+    matrices = _MatrixDefinitions(memory, work)
     defined_writes = set()
     templates = {item.operation: item for item in memory.templates}
     positions = {item.operation: index for index, item in enumerate(memory.templates)}
@@ -743,6 +900,22 @@ def admit_structured_memory(
                     reads.append(
                         ReadAdmission(template, access, actor, (), initialization=initialization)
                     )
+                    continue
+                if access.address.matrix is not None:
+                    definitions = matrices.before(instance, template)
+                    needed = access.address.matrix.bind(_participant(actor, memory.control.sid))
+                    writers = definitions.covering(needed, template.frame.domains(), facts)
+                    _require(
+                        writers is not None,
+                        "native reads storage without a proved initialized writer coverage",
+                        template.operation,
+                        witness=(
+                            access.address.root.owner.sym_name.data,
+                            f"operand={access.operand_index}",
+                            actor.value,
+                        ),
+                    )
+                    reads.append(ReadAdmission(template, access, actor, writers))
                     continue
                 candidates = []
                 writers = []
@@ -789,6 +962,10 @@ def admit_structured_memory(
             # Reads of all participants precede this instruction's writes below.
         for actor in template.participants:
             for access in template.accesses:
+                if access.mode.writes and access.address.matrix is not None:
+                    key = instances[template.operation, access.operand_index, actor]
+                    matrices.write(key, template, access, actor)
+                    continue
                 # This frontier supplies complete numerical definitions only.
                 # Runtime prefixes supply none under _writer_span's contract;
                 # recording one here could suppress a later complete writer
@@ -828,7 +1005,8 @@ def admit_structured_memory(
                 "logical Tile has ambiguous producer participant ownership",
                 use.reader,
             )
-            expected = _writer_span(
+            matrix = access.address.matrix is not None
+            expected = (_writer_matrix if matrix else _writer_span)(
                 writer,
                 output,
                 participant,
@@ -837,9 +1015,22 @@ def admit_structured_memory(
                 selections=tuple(substitutions.items()),
                 logical_value=True,
             )
-            needed = _span(access, _participant(actor, memory.control.sid))
+            needed = (
+                access.address.matrix.bind(_participant(actor, memory.control.sid))
+                if matrix
+                else _span(access, _participant(actor, memory.control.sid))
+            )
+            if matrix:
+                definitions = RegionDefinitions()
+                if expected is not None:
+                    definitions.add(expected, (writer.operation,), facts)
+                covered = definitions.covering(needed, reader.frame.domains(), facts) is not None
+            else:
+                covered = expected is not None and _covers(
+                    [expected], needed, reader.frame, facts, work
+                )
             _require(
-                expected is not None and _covers([expected], needed, reader.frame, facts, work),
+                covered,
                 "logical Tile selection does not cover the consumed physical view",
                 use.reader,
             )
@@ -863,15 +1054,19 @@ def admit_structured_memory(
                 if not previous_iteration and _exclusive(other, reader, environment):
                     continue
                 if previous_iteration:
+                    coordinates = (*needed.starts, *needed.stops) if matrix else (needed.base,)
                     _require(
                         not any(
-                            loop.ordinal.args[0] in arguments(needed.base)
+                            loop.ordinal.args[0] in arguments(value)
                             for loop in borrowed_loops
+                            for value in coordinates
                         ),
                         "borrowed Tile alias needs independent cross-iteration coordinates",
                         use.reader,
                     )
-                candidate = _writer_span(other, modified, actor, reader, memory, ignore_guards=True)
+                candidate = (_writer_matrix if matrix else _writer_span)(
+                    other, modified, actor, reader, memory, ignore_guards=True
+                )
                 _require(
                     candidate is not None,
                     "logical Tile has a possible conditional or cross-iteration overwrite",
@@ -879,6 +1074,14 @@ def admit_structured_memory(
                     witness=(binding.operation.uid.data, other.operation.uid.data),
                 )
                 assert candidate is not None
+                if matrix:
+                    _require(
+                        candidate.disjoint(needed, reader.frame.domains(), facts),
+                        "logical Tile has a possible overwrite before its actual native reader",
+                        use.reader,
+                        witness=(binding.operation.uid.data, other.operation.uid.data),
+                    )
+                    continue
                 low, high = interval(
                     normalize(expression("sub", candidate.base, needed.base), facts),
                     reader.frame.domains(),
@@ -904,6 +1107,7 @@ def admit_structured_memory(
     work["storage_instances"] = len(instances)
     work["configuration_writers"] = len(configurations)
     work["defined_write_frontier"] = len(defined_writes)
+    work["l1_definition_contexts"] = len(matrices.contexts)
     return StructuredAdmission(
         structure,
         memory,

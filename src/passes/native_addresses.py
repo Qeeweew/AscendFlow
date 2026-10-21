@@ -17,6 +17,7 @@ from ..diagnostics import ErrorKind, require
 from ..dialects.physical import BufferOp
 from ..dialects.source import AllocationOp, ViewOp, _constant_index
 from ..dialects.structured import AddressOp
+from ..target.layout import NZLayout
 from ..target.native import ITEMSIZE, nz_columns
 
 Index = int | SSAValue
@@ -134,6 +135,9 @@ def lower_address(
     _require(typ.dtype.data in ITEMSIZE, "native address has an unknown element type")
     itemsize = ITEMSIZE[typ.dtype.data]
     shape = tuple(size.data for size in original.shape)
+    layout = (
+        NZLayout(shape, itemsize) if typ.memory.data == "L1" and typ.layout.data == "NZ" else None
+    )
     widths = tuple(width.data for width in view.widths)
     axes = tuple(axis.data for axis in view.axes)
     dimensions = tuple(size.data for size in typ.shape)
@@ -197,19 +201,14 @@ def lower_address(
             and dimensions[0] > 0
             and (column_slice or dimensions[0] % 16 == 0)
             and dimensions[1] > 0
-            and dimensions[1] % 16 == 0
+            and dimensions[1] % (layout.c0 if layout is not None else 16) == 0
             and (column_slice or _constant(view.origins[-2]) == 0)
             and (column_slice or accumulator_columns or _constant(view.origins[-1]) == 0),
             "fractal view needs a complete matrix plane, aligned L1 NZ rectangle or full-row L0C columns",
             unsupported=True,
         )
-    if typ.layout.data == "NZ" and (dimensions[0] != shape[-2] or view.valid is not None):
-        c0 = nz_columns(typ.memory.data, typ.dtype.data)
-        nbytes, rows, row_stride = (
-            dimensions[0] * c0 * itemsize,
-            dimensions[1] // c0,
-            shape[-2] * c0 * itemsize,
-        )
+    if layout is not None:
+        nbytes, rows, row_stride = layout.geometry(*dimensions, prefix=view.valid is not None)
     elif len(dimensions) == 2 and typ.layout.data == "linear" and (matrix or not contiguous):
         rows, columns = dimensions
         nbytes, row_stride = columns * itemsize, selected[0]
@@ -234,7 +233,9 @@ def lower_address(
     for axis in range(len(pairs) - 1, -1, -1):
         origin, extent = pairs[axis]
         physical_stride = stride
-        if typ.layout.data == "NZ" and axis == len(pairs) - 1:
+        if layout is not None:
+            physical_stride = layout.strides[axis]
+        elif typ.layout.data == "NZ" and axis == len(pairs) - 1:
             physical_stride = indices.binary(arith.MuliOp, stride, shape[-2])
         elif typ.layout.data == "NZ" and axis == len(pairs) - 2:
             physical_stride = nz_columns(typ.memory.data, typ.dtype.data) * itemsize

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 
 from ..diagnostics import CompileError, require
 from .ascend910b import Engine
+from .layout import NZLayout
 from .packets import NativePacket, audited_packet
 
 CAPACITY = {
@@ -69,8 +70,15 @@ class NativeGeometry:
     nbytes: int
     rows: int = 1
     row_stride: int = 0
+    matrix_shape: tuple[int, int] | None = None
 
     def __post_init__(self):
+        if self.matrix_shape is not None:
+            require(
+                self.bank == "L1" and self.layout == "NZ" and self.dtype in {"f16", "bf16", "f32"},
+                "physical matrix shape is an L1 NZ allocation descriptor",
+            )
+            NZLayout(self.matrix_shape, ITEMSIZE[self.dtype])
         require(
             self.nbytes > 0 and self.rows > 0,
             "native geometry requires positive row widths and row counts",
@@ -87,6 +95,14 @@ class NativeGeometry:
     @property
     def total_nbytes(self) -> int:
         return self.nbytes * self.rows
+
+    @property
+    def leading_rows(self) -> int:
+        require(
+            self.bank == "L1" and self.layout == "NZ" and self.matrix_shape is not None,
+            "L1 native requires its allocation's physical leading dimension",
+        )
+        return self.matrix_shape[0]
 
 
 # Current supported MAD clear-cycle policy, independent of finite expansion.
@@ -834,6 +850,7 @@ def native_contract(
             and refs[0].row_stride % 2 == 0
             and refs[0].row_stride >= n * 2
             and refs[1].contiguous
+            and (refs[1].matrix_shape is None or refs[1].leading_rows == pm)
             and lengths == (m * n * 2, pm * pn * 2),
             "runtime ND2NZ requires bounded GM rows and a fully zero-defined NZ destination",
         )
@@ -843,21 +860,25 @@ def native_contract(
             len(params) == 3, "ND2NZ overlay needs row capacity, columns and resident row stride"
         )
         m, n, resident = params
+        itemsize = ITEMSIZE[dtypes[0]] if dtypes else 0
+        c0 = 32 // itemsize if itemsize else 0
         require(
             1 <= m <= resident <= 256
-            and resident % 16 == n % 16 == 0
-            and 16 <= n <= 256
+            and resident % 16 == 0
             and banks == ("GM", "L1")
             and layouts == ("linear", "NZ")
-            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and dtypes[0] == dtypes[1] in {"f16", "bf16", "f32"}
+            and c0 <= n <= 256
+            and n % c0 == 0
             and refs[0].rows == m
-            and refs[0].nbytes == n * 2
-            and refs[0].row_stride >= n * 2
-            and refs[0].row_stride % 2 == 0
+            and refs[0].nbytes == n * itemsize
+            and refs[0].row_stride >= n * itemsize
+            and refs[0].row_stride % itemsize == 0
             and refs[1].nbytes == m * 32
-            and refs[1].rows == n // 16
-            and refs[1].row_stride == resident * 32,
-            "ND2NZ overlay requires exact GM rows and pitched b16 NZ row prefixes",
+            and refs[1].rows == n // c0
+            and refs[1].row_stride == resident * 32
+            and (refs[1].matrix_shape is None or refs[1].leading_rows == resident),
+            "ND2NZ overlay requires exact GM rows and C0-aligned NZ row prefixes",
         )
         return "MTE2", ("R", "W")
     if native == "nd2nz_pad":
@@ -875,6 +896,7 @@ def native_contract(
             and refs[0].row_stride % 2 == 0
             and n <= refs[0].row_stride // 2
             and refs[1].contiguous
+            and (refs[1].matrix_shape is None or refs[1].leading_rows == pm)
             and lengths == (m * n * 2, pm * pn * 2),
             "padded ND2NZ needs exact GM rows and a complete b16 NZ destination",
         )

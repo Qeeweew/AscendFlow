@@ -70,6 +70,8 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `passes/lower_pipeline.py`、`lower_native.py`、`native_recipes.py`、`native_addresses.py` | 参数化控制及 native recipe；尚未建立异步完成 |
 | `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/effects、绑定真实循环的条件读取；消费共享目标描述 |
 | `target/native.py` 的 `NativeSpec` | 一份不可变的 native opcode、参数、operand geometry/effects、packet、read reset 与完成规则；逻辑分析和终端共享，不含地址/代次 |
+| `target/layout.py`、`analysis/structured_addresses.py` | L1 NZ allocation 形状、C0、偏移与条带几何；解码一次并将物理 M 交给 native 和终端消费 |
+| `analysis/matrix_regions.py` | L1 全 rank 逻辑矩形、实际部分定义及 writer 来源、精确相邻拼接与固定连续遍历摘要；不含 ready、退休或事件事实 |
 | `analysis/smt.py`、`integer_facts.py`、`guard_cover.py` | 原式数学关系与条件覆盖共用 Z3 查询；定义性和机器范围独立，输入环境与完整前提限定缓存 |
 | `analysis/structured_bounds.py`、`structured_admission.py` | 静态非法、物理容量、源/native 对应、别名、存储实例、初始化和借用 Tile；动态源 bounds 与 group/peer 独立性属于输入合同 |
 | `analysis/structured_access.py`、`structured_regions.py` | 按真实地址周期建立可选精确 cell 与可能别名的 AliasRegion；保留实际 native 访问，不将 may-write 当完整定义 |
@@ -110,6 +112,9 @@ quorum 保持各自合同。原式数学查询与最终 SSA 条件查询共用 S
 native、bounds、ownership、同步和资源分配链，不是第二编译路径。
 
 标准连续 b16 `C=A@B` 与尾块的合同见 [标准 GEMM](../operators/gemm.md)。
+L1 NZ 的 FP16/BF16 C0=16、FP32 C0=8，由 allocation 的 `matrix_shape` 统一建模。
+view 保留原 M，初始化在矩阵坐标中组合实际部分写；同步仍消费真实物理访问及
+原有 actor/代次。完整合同见[内存合同](memory-contracts.md#l1-nz-布局与区域定义)。
 类型转换、补零及 strided NZ 几何经过相同 native/effects、bounds、ownership
 和同步链；封闭 packet 的内部顺序不提供外部异步完成保证。
 L0C NZ 允许保留全部 M 行的、按 16 列对齐的列切片；它仍是紧凑物理平面，

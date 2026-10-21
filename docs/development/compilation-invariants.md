@@ -48,6 +48,9 @@ AST 和 lowering 保持条件、mask、求值顺序。已有且支配插入点�
 
 二维前缀保留实际 count SSA 与静态容量，native 使用同一个 count。部分写不
 授权完整初始化；显式补零的 GM 部分读和 L1 完整写分别建模，禁止整块 DMA 多读。
+L1 NZ allocation 的物理 shape 和 C0 经统一布局传递，子视图不改变 leading M。
+初始化按真实矩形联合及 writer 来源建立；相邻部分写可以拼满，矩形包围盒不能
+填补孔洞。完整定义不提供 ready、ownership KILL、reader 退休或事件消费事实。
 
 公共编译在独立 expression scope 内驻留完全相同的原始 `(kind, args)` 节点，
 退出、异常或取消时释放节点表，嵌套 scope 恢复外层。它不保存 range、guard、

@@ -262,7 +262,7 @@ def test_complete_fractal_plane_uses_only_its_leading_slot_coordinate(layout, ba
     ]
 
 
-@pytest.mark.parametrize("bank,dtype", [("L1", "f16"), ("L0C", "f32")])
+@pytest.mark.parametrize("bank,dtype", [("L1", "f16"), ("L1", "f32"), ("L0C", "f32")])
 def test_nz_column_slice_retains_axes_and_uses_fractal_byte_coordinates(bank, dtype):
     source = Block(arg_types=[IndexType()])
     allocation = _allocation((2, 32, 128), dtype=dtype, bank=bank, layout="NZ")
@@ -286,22 +286,31 @@ def test_nz_column_slice_retains_axes_and_uses_fractal_byte_coordinates(bank, dt
     ]
 
 
-def test_l1_nz_row_and_column_slice_keeps_physical_fractal_gaps():
+@pytest.mark.parametrize("dtype,c0", [("f16", 16), ("f32", 8)])
+def test_l1_nz_row_and_column_slice_keeps_physical_fractal_gaps(dtype, c0):
     source = Block(arg_types=[IndexType()])
-    allocation = _allocation((2, 256, 128), dtype="f16", bank="L1", layout="NZ")
+    allocation = _allocation((2, 256, 128), dtype=dtype, bank="L1", layout="NZ")
     view = _view(
         source,
         allocation,
         (1, 128, 32),
         (1, 2),
-        (source.args[0], index_constant(source, 128), index_constant(source, 16)),
+        (source.args[0], index_constant(source, 128), index_constant(source, c0)),
     )
     output = Block(arg_types=[IndexType()])
     address, _, _ = _lower(
         view, matrix=True, bindings=[(source.args[0], output.args[0])], output=output
     )
-    assert (address.nbytes.data, address.rows.data, address.row_stride.data) == (4096, 2, 8192)
-    assert [_evaluate(address.offset, {output.args[0]: slot}) for slot in (0, 1)] == [12288, 77824]
+    assert (address.nbytes.data, address.rows.data, address.row_stride.data) == (
+        4096,
+        32 // c0,
+        8192,
+    )
+    plane_bytes = 256 * 128 * ITEMSIZE[dtype]
+    assert [_evaluate(address.offset, {output.args[0]: slot}) for slot in (0, 1)] == [
+        12288,
+        plane_bytes + 12288,
+    ]
 
 
 def test_nested_subviews_keep_the_original_root_and_axis_metadata():

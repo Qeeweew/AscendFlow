@@ -61,6 +61,7 @@ class BufferOp(IRDLOperation):
     cache = opt_attr_def(StringAttr)
     access = opt_attr_def(StringAttr)
     write_disjoint = opt_attr_def(IntAttr)
+    matrix_shape = opt_attr_def(ArrayAttr[IntAttr])
     ref = result_def(RefType)
     traits = traits_def(AsyncEffects())
 
