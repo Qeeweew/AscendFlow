@@ -6,7 +6,7 @@ NEG_INF = float("-inf")
 
 
 @N.inline
-def query_metadata(cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, MAX_SEQ, WINDOW):
+def query_metadata(cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, WINDOW):
     # upper_bound(Cu, token)-1, including empty requests. The constexpr span
     # halves on each expansion; only ceil(log2(B)) GM loads survive.
     batch = 0
@@ -37,7 +37,7 @@ def query_metadata(cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, M
 
 @N.inline
 def copy_window_pages(
-    Ori, OriTable, destination, batch, length, visible, feature, PAGE, C, MAX_SEQ, ORI_BLOCKS
+    Ori, OriTable, destination, batch, length, visible, feature, PAGE, C, MAX_SEQ
 ):
     position = N.max(0, length - visible)
     first_rows = N.min(visible, PAGE - position % PAGE)
@@ -70,21 +70,16 @@ def gather_compressed(
     zeros,
     rows,
     masks,
-    batch,
-    token,
     available,
     cutoff,
     group,
     slot,
-    tile,
     sid,
     BK,
     ROWS,
     SLOTS,
     PAGE,
     RATIO,
-    MAX_SEQ,
-    CMP_BLOCKS,
     TOPK,
 ):
     count = N.min(TOPK, N.min(available, cutoff))
@@ -97,7 +92,7 @@ def gather_compressed(
         start = sid * (BK // 2) + block * ROWS
         with N.Stage(0, name="sparse_load"):
             for row in N.serial(ROWS):
-                index_slot = tile * BK + start + row
+                index_slot = start + row
                 if index_slot < count:
                     index = N.load_index(Indices[index_slot : index_slot + 1])
                     if index >= 0 and index < cutoff:

@@ -37,7 +37,6 @@ def window_import(
             PAGE=128,
             C=128,
             MAX_SEQ=256,
-            ORI_BLOCKS=2,
         )
         N.copy(x, a0)
 
