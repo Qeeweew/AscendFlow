@@ -36,10 +36,13 @@ def load_cache(cache, geometry, position, destination, first, feature, IS_WINDOW
 
 
 @N.inline
-def qk_tiles(cache, geometry, position, Score, l1, l0, S, PAGE, D, C, MAX_SEQ, KEEP):
+def qk_tiles(cache, geometry, position, Score, l1, l0, S, PAGE, D, C, MAX_SEQ, KEEP, CACHE_Q):
     q1, k1, resident = l1
     q0, b0, c0 = l0
     group, _cache_slot, slot = position
+    if CACHE_Q:
+        for part in N.unroll(D // C):
+            N.copy(q1[:, part * C : (part + 1) * C], q0[part, :, :])
     # Window first, then sparse rows: window QK can overlap the AIV gather.
     for plane in N.unroll(2):
         WIDTH = 128 if plane == 0 else S - 128
@@ -80,7 +83,8 @@ def qk_tiles(cache, geometry, position, Score, l1, l0, S, PAGE, D, C, MAX_SEQ, K
                     for part in N.unroll(LC // C):
                         bank = part if LC > C else panel % 2
                         k = d + part * C
-                        N.copy(q1[:, k : k + C], q0[bank, :, :])
+                        if CACHE_Q == 0:
+                            N.copy(q1[:, k : k + C], q0[bank, :, :])
                         if n + OFFSET // 128 < KEEP:
                             N.copy(
                                 resident[n + OFFSET // 128, :, k : k + C],
@@ -96,8 +100,9 @@ def qk_tiles(cache, geometry, position, Score, l1, l0, S, PAGE, D, C, MAX_SEQ, K
                 with N.Stage(2, name="qk_dot"):
                     for part in N.unroll(LC // C):
                         bank = part if LC > C else panel % 2
+                        k = d + part * C
                         N.matmul(
-                            q0[bank, :, :],
+                            q0[k // C if CACHE_Q else bank, :, :],
                             b0[bank, :, :],
                             accum=c0[:, (n % 2) * 128 : (n % 2 + 1) * 128],
                             initialize=panel == 0 if part == 0 else False,
@@ -237,7 +242,9 @@ def sparse_mla_decode(
         else:
             resident = kv1
         p1 = N.alloc_l1((2, BM, 128), DTYPE)
-        a0 = N.alloc_l0a((2, BM, C), DTYPE)
+        CACHE_Q = BM * D * 2 <= 64 * 1024
+        Q_SLOTS = N.max(2, D // C) if CACHE_Q else 2
+        a0 = N.alloc_l0a((Q_SLOTS, BM, C), DTYPE)
         b0 = N.alloc_l0b((2, 128, C), DTYPE)
         c0 = N.alloc_l0c((BM, 2 * C), N.f32)
         gather_zeros = N.alloc_ub((2, 8), N.f32)
@@ -344,6 +351,7 @@ def sparse_mla_decode(
                     C=C,
                     MAX_SEQ=MAX_SEQ,
                     KEEP=KEEP,
+                    CACHE_Q=CACHE_Q,
                 )
             with N.Vector() as sid, N.Stage(1, name="softmax"):
                 batch, qlen, offset, length, visible = query_metadata(

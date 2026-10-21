@@ -131,7 +131,13 @@ def test_four_verification_tokens_have_individual_windows_indices_and_compressio
 
 @pytest.mark.parametrize(
     "features,topk,bm,vr,batch",
-    [(128, 512, 32, 8, 1), (128, 2048, 32, 8, 1), (512, 512, 64, 8, 1), (512, 512, 64, 16, 4)],
+    [
+        (128, 512, 32, 8, 1),
+        (128, 2048, 32, 8, 1),
+        (512, 512, 64, 8, 1),
+        (512, 512, 64, 16, 4),
+        (640, 512, 64, 8, 1),
+    ],
 )
 def test_native_mixed_pipeline_has_complete_quorums_and_retirement(
     features, topk, bm, vr, batch, monkeypatch

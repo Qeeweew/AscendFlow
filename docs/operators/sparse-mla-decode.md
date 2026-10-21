@@ -90,7 +90,12 @@ L1 流式槽及常驻 KV 块在 kernel 入口用 `N.fill(...,0)` 初始化，此
 QK 先计算 window 的 Score `[0,WINDOW)`，与两个 AIV 的压缩 gather 重叠，
 随后计算压缩 Score `[WINDOW,S)`。D 可被 256 整除时，每个 L1 panel 一次
 搬运 256 维，供按原顺序执行的两次 128 维 L0 MAD 使用；其余完整 128 维
-特征块使用 128 维搬运。L0 容量、MAD 数量和 K 维累加次序不变。
+特征块使用 128 维搬运。若完整 Q tile 的 b16 数据不超过 64 KiB，QK 将其
+按 `BM×128` 的紧凑平面一次装入 L0A，供全部 window/压缩块复用；否则
+继续使用原双槽流式装载。默认 Q 的 L1→L0A 搬运由 320 KiB 降为 64 KiB，
+相应 128 维 Q operand 装载由 20 次降为 4 次。L0A 默认使用 64 KiB，未提高硬件容量；
+MAD 数量、K 维累加次序及输入精度保持。PV 随后复用前两个 L0A 平面，
+覆写仍等待全部真实 MAD reader 退休。
 最后一个压缩 FIX 的完成前缀经过全部压缩
 QK 输入，包含双方 AIV 的 gather 发布。softmax **先获取完整 Score，再读取 Bias**；
 仅获取提前完成的 window Score 不提供这条交接。普通 AIV peer GM 访问没有直接
