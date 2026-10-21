@@ -13,7 +13,7 @@
 | `T.Tensor` / `T.int64` | 外部tensor与runtime标量；长度不是constexpr |
 | `T.int64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
 | `T.i64` | GM tensor 的 int64 元素类型；与 runtime 参数声明 `T.int64` 职责不同 |
-| `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 单个 int64 的 S 读取，返回 index SSA；inclusive 值合同不生成 clamp |
+| `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 单个 int32/int64 的 S 读取，按有符号值扩展为 index SSA；inclusive 值合同不生成 clamp |
 | `T.load_scalar(view)` | f32 UB 或浮点 GM 单元素的 S 读取，返回 f32 SSA |
 | `T.store_scalar(value, out=view)` | 将已读取的 f32 SSA 写入单个 f32 UB 元素，保留真实 4 B S 写入效果 |
 | `T.broadcast(v[None,:], out=...)` / `v[:,None]` | 显式 f32 行/列展开；行展开需要 `(rows,8)` scratch |
@@ -29,8 +29,9 @@
 | `T.Stage(offset, name=...)` | 最近迭代域内当前 actor 的发射偏移，不是完成边界 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理容量、布局、slot与别名 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
-| `copy(..., valid_rows=r)` | 二维矩阵的 runtime 有效行前缀；支持零填充 GM→L1 和部分 UB→GM |
+| `copy(..., valid_rows=r)` | 二维 runtime 行前缀；GM→L1 可补零或保留其余 NZ 行，UB→GM 部分写 |
 | `alloc_mask(shape)` | 显式 UB packed predicate 存储，64 lane 一个 32 B 块 |
+| `fill(destination, value)` | 连续 f32/f16/bf16 UB view 的完整写入；b16 使用精确 16 位 Vector Dup |
 | `arange(n)`、比较、`& \| ~` | 精确整数逻辑 lane 坐标与带shape谓词，支持singleton轴广播 |
 | `compare(x, threshold, kind=..., out=...)` | f32逐lane比较写入packed predicate；结果绑定该次实际读写 |
 | `materialize/mask_and/mask_or/mask_not(..., out=...)` | 显式物化与packed位布尔组合；mask_and/mask_or/mask_not的out需独立存储 |
@@ -38,6 +39,34 @@
 | `fill/mul/add/sub/div/maximum/exp/sqrt/rsqrt(..., mask=p)` | 显式谓词更新；mask=False lane保留目标旧值 |
 
 本地 stage 偏移、buffer slot 数、event width 互不等同。没有 `stages=` 声明。`cube.task/vector.task`已经移除且不恢复兼容。内部physical Task IR不属于旧公开语法。
+
+调整算子时按下面的边界选择修改位置：
+
+| 需求 | 算子 DSL 负责 | 编译器负责或当前缺口 |
+|---|---|---|
+| tile、worker、batch/head 映射 | constexpr、索引和分支 | 原式求值、真实地址范围和机器整数语义 |
+| gather/预取位置、buffer 环、Stage 偏移、融合或分 kernel | 实际数据流、容量与发射政策，保持数值合同 | 由实际访问建立必要 ready/release；Stage 不声明完成 |
+| helper 太长、tuple 参数过多 | 透明 inline、具名参数、按数学职责拆小并去掉未用参数 | 现有前端已经支持；无需模型专属 pass |
+| 两页拼成一个 L1 NZ tile | 计算两段地址、有效行数和目标行偏移 | 普通 `copy(valid_rows=...)` 已有补零与保留其余行两种合同；部分写不提供完整初始化 |
+| 逐行 sparse gather 改成双行搬运 | 计算两个真实地址、判断合法间隙与边界，选择一条或两条搬运 | 当前行距为静态整数；runtime source stride 尚未支持。扩大连续 slice 不能代表两条不连续源 |
+| 有效行压紧 | 无效项处理、输出行位置、mask 和消费者的有效行数 | Scalar carry 影响地址而无范围合同时仍拒绝；动态发布前缀和定义集合需有对应合同 |
+| 索引/页表块预取到 UB | 预取块、时机、UB 环与双缓冲 | 当前 `load_index` 仅接受只读 GM；尚缺整数 UB DMA/Scalar load 及其值来源、初始化和退休合同 |
+| 提前发布 P、减少广播和初始化 | 显式排列原语、分开递推 carry 与跨 Stage snapshot；无 mask 的 b16 清零可用普通 fill | 保持实际 dtype、数值次序、scratch 和定义集合；其他新指令/几何需对应 native 合同 |
+| runtime metadata 跨作用域、最后 reader 退休、双 AIV quorum | 保留所有真实读取、地址和参与者 | 通用作用域与生命周期分析；改名 buffer 不会改变物理身份 |
+| event 不足或编号改变 | 根据诊断评估流水宽度或值 lifetime | 核对[完整 credit、消费、预留与资源约束](../development/event-resources.md)；DSL 不填写 ID |
+
+Stage 表达发射政策，不能当作完成声明。增加输入承诺、隐藏实际访问或制造空 Stage
+来影响 event 分配，都不属于保持原算法的 DSL 改写。
+
+判断边界时，从期望的实际指令和访问开始：现有原语能准确表达地址、读写集合和
+排步，就修改 example；缺少指令、部分写语义或生命周期合同，才补通用底层能力。
+能够用更多计算绕开限制，不表示原先期望的高性能路径已经受支持。
+
+无 mask 的 `fill` 对整个目标 view 写入，不读取旧值。常量先按既有规则舍入为
+FP32，f16/bf16 再按 round-to-nearest ties-to-even 编码，保留 signed zero、
+subnormal 和 Inf；有限值超出目标舍入范围时得到 Inf，NaN 拒绝。b16 使用
+count-mode 16 位 Vector Dup，计数以元素为单位，不扩大到完整 repeat，也不
+隐含临时 FP32 tile。带 mask 的 fill 和其他算术仍要求显式 f32 目标。
 
 ## 2. 双缓冲示例
 
@@ -124,7 +153,7 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 | FIRST/LAST/受限边界guard | 已有子集，组合限制存在 | 空/短/重合/孔洞的统一存在域 |
 | 可能重叠的符号地址、错位 ring 访问 | 按源码内存顺序处理 | 不虚构精确 producer 或完整覆盖；仍须满足现有控制与事件规则 |
 | 数据相关分支、间接alias/owner、任意多时钟连续任务 | 未普遍支持 | 明确可验证输入合同或具体拒绝 |
-| 二维 `copy(valid_rows=...)` | 零填充 GM→L1、部分 UB→GM 已实现 | 静态容量、真实行数、补零写入及 DMA 几何分别检查 |
+| 二维 `copy(valid_rows=...)` | 补零或保留其余行的 GM→L1、部分 UB→GM 已实现 | 静态容量、真实行数、NZ footprint、初始化与 DMA 几何分别检查 |
 | 一维 `valid=` prefix、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
 | 透明 `@T.inline` helper / 静态尾块区间 | 已实现 | 同一 AST、native lowering、访问检查和同步链；不引入设备 call |
 | opaque Python函数/任意宏 | 不支持 | 不以 host 执行隐藏原语或 effects |
@@ -159,7 +188,7 @@ N.copy(y, Y[base:base + 128, :], valid_rows=rows)
 
 `valid_rows` 只选择二维 view 第一轴的连续前缀，不改变物理计算 tile 的形状。
 行数须证明在 `[0, 静态行容量]` 内，真实非空访问仍检查原始 tensor 各轴。
-GM→L1 支持 f16/bf16，必须显式 `pad_value=0`：整个 NZ 目标有定义，缺失的
+GM→L1 支持 f16/bf16，指定 `pad_value=0` 时整个 NZ 目标有定义，缺失的
 行和扩展列为零；0行只填零、不读取 GM，行列均完整的 tile 不发额外填零。
 UB→GM 不接受 `pad_value`，只读取/写出有效行；0行不发 DMA，目标剩余字节
 保持原值。这一路仍要求普通 DMA 的32 B行宽、地址和步长合同，不能据此
@@ -167,8 +196,17 @@ UB→GM 不接受 `pad_value`，只读取/写出有效行；0行不发 DMA，目
 补零 packet 的内部 MTE2 fence 保持 fill→ND2NZ 顺序，外部 ready 和最后 reader
 仍由同一自动同步链生成。输入不需要额外 host padding 或 packing kernel。
 
+GM→L1 省略 `pad_value` 时只覆盖有效前缀，其他 NZ 行保持。目标可有真实行偏移，
+例如已初始化 `x` 后执行 `N.copy(B[:27,:], x[5:32,:], valid_rows=N.min(n,27))`。
+当前要求列数按 16 对齐、b16 NZ、至多 256 行/列；0 行不发指令。这次部分写
+不能授权读取先前未定义的剩余行。GM 与 NZ 的不同物理几何由同一 native 合同
+建模，无需拆成 1/2/4 行静态循环。
+
 `load_index` 的值范围可引用先前支配该读取的 index SSA；范围只对实际读取后的词法域有效，
 不是全局 host 参数，也不证明不同元数据取值互不相等。元数据在 kernel 内必须不可变。
+`T.i32` / `T.i64` 只用于 GM 元数据；真实读取分别为 4 / 8 字节。
+原式整数运算在准入前保留求值作用域。已求值的 signed 比较可细化其 true/false
+region 的访问范围；分支自身的计算、分支之前或合流之后的表达式不能借用该条件。
 S 读取使用既有有序执行语义；条件 reader、异步 producer 和最后 reader 的完成仍由公共同步规则处理。
 S store→S load 按已证明的发射顺序执行，跨循环端口也不生成硬件不支持的
 `PIPE_S` barrier。Scalar 写入 UB 后交给 Vector/MTE3 仍需实际的跨管线发布；

@@ -38,3 +38,11 @@ def selected(source):
 
 def prepared(selected):
     return EventDomains(selected, ResourceWork(notifications=len(selected.notifications)))
+
+
+def allocated(program):
+    """Use both production stages; coverage alone cannot bypass generation."""
+    from ascendflow.analysis.event_planning import plan_event_resources
+    from ascendflow.analysis.structured_resources import allocate_structured_events
+
+    return allocate_structured_events(plan_event_resources(program))

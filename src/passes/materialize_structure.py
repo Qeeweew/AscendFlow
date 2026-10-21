@@ -55,7 +55,12 @@ def _bindings(memory, block, before, container):
 
     def bind(value):
         if isinstance(value.type, IndexType):
-            memo[control.environment.expression(value)] = value
+            expression = control.environment.expression(value)
+            # A known mathematical value is not necessarily literal SSA.
+            # Keep planned literals constant so unrelated source CSE cannot
+            # change immediate event lowering into dynamic-ID selection.
+            if expression.constant is None or isinstance(value.owner, arith.ConstantOp):
+                memo[expression] = value
 
     def visit_scope(current, stop):
         owner = current.parent_op()

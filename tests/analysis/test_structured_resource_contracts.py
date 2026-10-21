@@ -5,13 +5,14 @@ from dataclasses import replace
 import pytest
 
 from ascendflow.analysis.access_frontier import AccessEndpoint
+from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_protocols import (
     BoundPlacement,
     LogicalNotification,
     NotificationKind,
+    SynchronizationSelection,
 )
 from ascendflow.analysis.structured_regions import AccessOccurrence, LoopBinding
-from ascendflow.analysis.structured_resources import allocate_structured_events
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement
 from ascendflow.diagnostics import CompileError
 from ascendflow.passes.generate_notifications import _complete_bindings
@@ -20,7 +21,7 @@ from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from examples.vector.scale import scale
 from tests.fixtures.nested import nested_copy
 from tests.models.structured_domains import actual_dispatch, need_cases
-from tests.support.structured import selected
+from tests.support.structured import allocated, native_memory, prepared, selected
 
 POINT = """
 def point(X:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write")):
@@ -45,6 +46,106 @@ def finite(X:N.Tensor((3,64),N.f32),O:N.Tensor((3,64),N.f32,access="write")):
 """
 
 
+def test_selected_boundary_facts_keep_case_guards_and_lazy_terminal_selection():
+    from ascendflow.analysis.notification_lifetimes import HandbackRule
+
+    domains = prepared(selected(scale))
+    notification = next(
+        n
+        for n in domains.notifications
+        if n.mechanism is NotificationKind.LOCAL_EVENT and n.source_engine is Engine.MTE2
+    )
+    case = next(c for c in HandbackRule(domains)._cases(notification) if c.windows and not c.empty)
+    first = next(domains._instances(notification, case, None, 0))
+    terminal = tuple(domains._instances(notification, case, None, 0, terminal=True))
+    assert len(terminal) == 1 and terminal[0] is first
+    count = domains.control.loops[case.windows[0].loop].count
+    strict = replace(
+        case,
+        condition=ActionGuard(case.condition.comparisons + (Comparison(count, ">", literal(1)),)),
+    )
+    other = next(domains._instances(notification, strict, None, 0))
+    assert other is not first
+    for tiles in (0, 1, 2, 3):
+        parameters = {"tiles": tiles, "$group": 0, "$sid": 0}
+        original = first[0][0].guard.evaluate(parameters)
+        restricted = other[0][0].guard.evaluate(parameters)
+        assert restricted == (original and count.evaluate(parameters) > 1)
+    # LAST remains a separate selected port, including after FIRST was reused.
+    both = tuple(domains._instances(notification, case, None, 0))
+    assert len(both) == 2 and both[0] is first
+    assert len(tuple(domains._instances(notification, case, None, 0, terminal=True))) == 1
+
+
+@pytest.mark.parametrize("scope", ["branch", "loop"])
+def test_conditional_input_contract_cannot_prove_the_guard_that_precedes_its_load(scope):
+    from ascendflow import language as N
+
+    header, upper = (
+        ("if condition==0:", "1-condition")
+        if scope == "branch"
+        else ("for i in N.serial(condition):", "condition")
+    )
+    memory = native_memory(
+        N.from_source(
+            f"""
+def conditional(Meta:N.Tensor((1,),N.i64),Inner:N.Tensor((1,),N.i64),
+                Out:N.Tensor((64,),N.f32,access="write")):
+    with N.Kernel(1,kind="vector"):
+        row=N.alloc_ub((64,),N.f32)
+        N.fill(row,0.0)
+        condition=N.load_index(Meta[:],minimum=0,maximum=1)
+        {header}
+            dependent=N.load_index(Inner[:],minimum=1,maximum={upper})
+            N.fill(row,1.0)
+        N.copy(row,Out)
+""",
+            disjoint_external=True,
+        )
+    )
+    dependencies = build_structured_dependencies(memory)
+    writer = [t for t in memory.templates if t.spec.engine is Engine.V][-1]
+    reader = next(t for t in memory.templates if t.spec.engine is Engine.MTE3)
+
+    def point(template, placement):
+        loops = template.frame.loops()
+        return BoundPlacement(
+            AccessOccurrence(AccessEndpoint.from_template(template, Actor.AIV0), ()),
+            placement,
+            ActionGuard(),
+            tuple((loop.ordinal, literal(0)) for loop in loops),
+            (),
+            (),
+            tuple((loop.operation, literal(0)) for loop in loops),
+        )
+
+    # Isolate endpoint validation on real instructions. The proposed source
+    # Set is conditional, while its Wait is unconditional. A contract loaded
+    # inside the branch/loop holds only after entering it and cannot prove
+    # that entry. This is an adversarial protocol, not a DSL support fixture.
+    notification = LogicalNotification(
+        "conditional_input",
+        (point(writer, Placement.AFTER),),
+        (point(reader, Placement.BEFORE),),
+        Engine.V,
+        Engine.MTE3,
+        NotificationKind.LOCAL_EVENT,
+        (),
+        None,
+        literal(0),
+        1,
+        None,
+    )
+    selection = SynchronizationSelection(
+        replace(dependencies, required=()),
+        dependencies.dispatch,
+        (notification,),
+        (),
+    )
+    with pytest.raises(CompileError, match="activation domains.*equivalent"):
+        prepared(selection)
+
+
 def replaced_notification(selection, original, changed):
     return replace(
         selection,
@@ -67,9 +168,7 @@ def test_single_use_requires_a_wait_for_every_set():
         ),
     )
     with pytest.raises(CompileError):
-        allocate_structured_events(
-            _complete_bindings(replaced_notification(selection, original, changed))
-        )
+        allocated(_complete_bindings(replaced_notification(selection, original, changed)))
 
 
 def test_valid_first_and_last_ports_do_not_hide_a_missing_middle_wait():
@@ -87,9 +186,7 @@ def test_valid_first_and_last_ports_do_not_hide_a_missing_middle_wait():
         ),
     )
     with pytest.raises(CompileError):
-        allocate_structured_events(
-            _complete_bindings(replaced_notification(selection, original, changed))
-        )
+        allocated(_complete_bindings(replaced_notification(selection, original, changed)))
 
 
 def test_event_binding_must_preserve_the_same_generation_at_both_ends():
@@ -107,9 +204,7 @@ def test_event_binding_must_preserve_the_same_generation_at_both_ends():
         ),
     )
     with pytest.raises(CompileError):
-        allocate_structured_events(
-            _complete_bindings(replaced_notification(selection, original, changed))
-        )
+        allocated(_complete_bindings(replaced_notification(selection, original, changed)))
 
 
 def finite_ports(*, at_most_one=False):
@@ -211,20 +306,20 @@ def test_parameter_dependent_blocking_order_cannot_be_dropped_from_progress():
     assert not actual_port_cycle(selection, 1)
     assert actual_port_cycle(selection, 2)
     with pytest.raises(CompileError):
-        allocate_structured_events(_complete_bindings(selection))
+        allocated(_complete_bindings(selection))
 
 
 def test_restricting_the_finite_ports_to_one_iteration_removes_the_cycle():
     selection = finite_ports(at_most_one=True)
     assert not actual_port_cycle(selection, 1)
-    plan = allocate_structured_events(_complete_bindings(selection))
+    plan = allocated(_complete_bindings(selection))
     assert plan.order.root.points
 
 
 @pytest.mark.parametrize("source", [scale, nested_copy])
 def test_emitted_ring_ids_pair_each_actual_generation_across_clocks(source):
     selection = selected(source)
-    plan = allocate_structured_events(_complete_bindings(selection))
+    plan = allocated(_complete_bindings(selection))
     memory = selection.dependencies.memory
     actors = {actor for _, actor in selection.dispatch.tasks}
     for count in (0, 1, 2, 3):

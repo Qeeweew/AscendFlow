@@ -172,13 +172,16 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
     if prefix is not None and len(source_shape(op.source)) == 2:
         require(context.operand is not None, "runtime row copies need their actual scalar operand")
         if banks == ("GM", "L1"):
-            require(
-                op.zero_pad is not None and op.destination.owner.valid is None,
-                "runtime GM→L1 row copies must define the whole destination with zero padding",
-            )
-            native = "nd2nz_rows"
-            destination = context.view(op.destination)
-            params = source_shape(op.source) + source_shape(op.destination)
+            if op.zero_pad is not None:
+                require(op.destination.owner.valid is None, "padded ND2NZ defines the complete destination")
+                native = "nd2nz_rows"
+                destination = context.view(op.destination)
+                params = source_shape(op.source) + source_shape(op.destination)
+            else:
+                require(op.destination.owner.valid is prefix, "ND2NZ overlay requires the same runtime prefix")
+                native = "nd2nz_overlay"
+                destination = context.view(op.destination, matrix=True)
+                params = source_shape(op.source) + (source_allocation(op.destination).ref.type.shape.data[-2].data,)
         else:
             require(
                 banks == ("UB", "GM")

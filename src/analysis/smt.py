@@ -51,9 +51,9 @@ from xdsl.dialects.builtin import IndexType
 from xdsl.ir import SSAValue
 from z3 import (
     Z3_OP_UNINTERPRETED,
-    And,
     BitVec,
     BitVecVal,
+    BoolRef,
     BoolVal,
     Function,
     If,
@@ -61,14 +61,16 @@ from z3 import (
     IntSort,
     IntVal,
     Not,
-    Or,
     Solver,
     URem,
     is_bv_value,
     is_true,
+    main_ctx,
     sat,
     unsat,
 )
+from z3.z3 import _to_ast_array
+from z3.z3core import Z3_mk_and, Z3_mk_or
 
 from ..budget import poll, remaining
 from ..diagnostics import require
@@ -305,6 +307,32 @@ def _cmp(left, predicate, right):
     return _PREDICATES[predicate](left, right)
 
 
+def _boolean_packet(native, values):
+    """Construct the exact AST from this closed encoder's typed BoolRefs.
+
+    Every child comes from an integer comparison or another Boolean packet,
+    never a caller-provided Z3 expression. Keep the same native constructor,
+    operand order and nesting as Z3's general Python And/Or without repeating
+    its arithmetic sort coercion. The pinned Z3 binding owns AST references.
+    """
+    require(not values or isinstance(values[0], BoolRef), "math packet needs typed BoolRefs")
+    context = values[0].ctx if values else main_ctx()
+    require(
+        all(isinstance(value, BoolRef) and value.ctx is context for value in values),
+        "math packet needs BoolRefs in one context",
+    )
+    arguments, size = _to_ast_array(values)
+    return BoolRef(native(context.ref(), size, arguments), context)
+
+
+def _and(*values):
+    return _boolean_packet(Z3_mk_and, values)
+
+
+def _or(*values):
+    return _boolean_packet(Z3_mk_or, values)
+
+
 class IntegerQueryService:
     """Decide integer/boolean questions under one immutable input environment."""
 
@@ -408,11 +436,11 @@ class IntegerQueryService:
             result = BoolVal(True)
         else:
             a, b = value.args
-            result = And(self._def(a), self._def(b))
+            result = _and(self._def(a), self._def(b))
             if value.kind in DIVISION:
                 # Source unsigned division: nonnegative numerator, positive
                 # divisor. Z3's total division is not source legality.
-                result = And(result, self._integer(a) >= 0, self._integer(b) > 0)
+                result = _and(result, self._integer(a) >= 0, self._integer(b) > 0)
         self._defined[value] = result
         return result
 
@@ -422,7 +450,7 @@ class IntegerQueryService:
             if type(test) is bool:
                 result = BoolVal(test)
             elif isinstance(test, Boolean):
-                operation = And if test.kind == "and" else Or
+                operation = _and if test.kind == "and" else _or
                 result = operation(*(self._comparison(value) for value in test.operands))
             else:
                 result = _cmp(self._integer(test.lhs), test.predicate, self._integer(test.rhs))
@@ -445,7 +473,7 @@ class IntegerQueryService:
         cached = self._contexts.get(assumptions)
         if cached is not None:
             return cached
-        encoded = (And(*(self._comparison(test) for test in assumptions)),)
+        encoded = (_and(*(self._comparison(test) for test in assumptions)),)
         self._contexts[assumptions] = encoded
         return encoded
 
@@ -468,7 +496,7 @@ class IntegerQueryService:
         solver = self._solver
         solver.set(timeout=self._local_timeout(), random_seed=0)
         started = perf_counter()
-        question = And(*self._context(assumptions), goal())
+        question = _and(*self._context(assumptions), goal())
         # An already obtained SMT model can witness another question only if
         # that exact model satisfies its COMPLETE context and counterexample
         # formula. This never proves a universal claim, never samples inputs,
@@ -553,9 +581,9 @@ class IntegerQueryService:
 
         def goal():
             return Not(
-                Or(
+                _or(
                     *(
-                        And(*(self._comparison(test) for test in guard.comparisons))
+                        _and(*(self._comparison(test) for test in guard.comparisons))
                         for guard in alternatives
                     )
                 )
@@ -574,7 +602,7 @@ class IntegerQueryService:
         require(type(width) is int and width > 0, "physical overlap query needs a positive width")
 
         def goal():
-            return And(
+            return _and(
                 self._integer(left) < self._integer(right) + IntVal(width),
                 self._integer(right) < self._integer(left) + IntVal(width),
             )
@@ -589,7 +617,7 @@ class IntegerQueryService:
         tests = tuple(tests)
 
         def goal():
-            return And(*(self._comparison(test) for test in tests))
+            return _and(*(self._comparison(test) for test in tests))
 
         return self._decide("satisfies", assumptions, ("satisfies", tests), goal, universal=False)
 
@@ -609,8 +637,8 @@ class IntegerQueryService:
         )
 
         def guarded():
-            return And(
-                Or(*(Not(self._def(value)) for test in tests for value in (test.lhs, test.rhs))),
+            return _and(
+                _or(*(Not(self._def(value)) for test in tests for value in (test.lhs, test.rhs))),
                 *(self._def(value) for test in premises for value in (test.lhs, test.rhs)),
             )
 
@@ -622,9 +650,9 @@ class IntegerQueryService:
         nodes = tuple(_nodes(value))
 
         def goal():
-            return Or(
+            return _or(
                 *(
-                    Or(self._integer(node) < INT64_MIN, self._integer(node) > INT64_MAX)
+                    _or(self._integer(node) < INT64_MIN, self._integer(node) > INT64_MAX)
                     for node in nodes
                 )
             )

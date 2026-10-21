@@ -206,6 +206,7 @@ _MASK_FREE = frozenset(
         "nd2nz",
         "nd2nz_pad",
         "nd2nz_rows",
+        "nd2nz_overlay",
         "load2d_a",
         "load2d_a_t",
         "load2d_b_nt",

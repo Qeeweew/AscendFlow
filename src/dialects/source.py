@@ -223,8 +223,8 @@ class AllocationOp(IRDLOperation):
         if (
             not typ.shape
             or any(n.data == 0 or n.data < -1 for n in typ.shape)
-            or typ.dtype.data not in {"f16", "bf16", "f32", "u8", "i64"}
-            or typ.dtype.data == "i64"
+            or typ.dtype.data not in {"f16", "bf16", "f32", "u8", "i32", "i64"}
+            or typ.dtype.data in {"i32", "i64"}
             and typ.memory.data != "GM"
             or typ.dtype.data == "u8"
             and typ.memory.data != "UB"
@@ -945,7 +945,10 @@ class ElementOp(IRDLOperation):
             raise VerifyException("element operands require equal tile shape")
         if (self.kind.data in {"fill", "mul_scalar", "add_scalar"}) != (self.scalar is not None):
             raise VerifyException("scalar policy must match element operation")
-        if self.kind.data != "cast" and any(
+        if self.kind.data == "fill" and self.mask is None:
+            if self.destination.type.dtype.data not in {"f32", "f16", "bf16"}:
+                raise VerifyException("fill requires f32, f16 or bf16 operands")
+        elif self.kind.data != "cast" and any(
             v.type.dtype.data != "f32" for v in (*self.inputs, self.destination)
         ):
             raise VerifyException("arithmetic currently requires explicit f32 operands")
@@ -1115,10 +1118,10 @@ class IndexReadOp(IRDLOperation):
     def verify_(self):
         if (
             self.source.type.memory.data != "GM"
-            or self.source.type.dtype.data != "i64"
+            or self.source.type.dtype.data not in {"i32", "i64"}
             or any(n.data != 1 for n in self.source.type.shape)
         ):
-            raise VerifyException("index read requires exactly one immutable GM int64 element")
+            raise VerifyException("index read requires exactly one immutable GM int32/int64 element")
 
 
 @irdl_op_definition

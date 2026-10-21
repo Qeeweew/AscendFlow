@@ -16,9 +16,11 @@ group/Vector peer 的并行独立性属于[源内存合同](memory-contracts.md)
 不传播给 scratch，也不提供 ready、release 或事件消费保证。
 
 当前生成器先绑定覆盖与真实位置，检查域和 physical-step/phase 适用前提，
-然后以物理 cell credit 或有限 queue handback 建立生命周期。分配器消费
-完整 `NotificationProgram`，仅引入有限 bank、ID 和共享约束；它不重新建立
-依赖/进展图。父层只消费 child 的真实端口和 may-block cuts。
+然后以物理 cell credit 或有限 queue handback 建立生命周期，输出完整
+`NotificationProgram`。资源规划消费该结果，冻结协议选项、虚拟动作、复用
+关系、完整 counter 组和 AIV peer 约束。编号分配器只消费 `EventResourceProblem`
+并检查有限映射，不查询域或建立新的共享关系。父层只消费 child 的真实端口
+和 may-block cuts，不重新建立依赖/进展图。
 
 ## 2. 规则正确性与输入前提
 
@@ -61,7 +63,9 @@ Scalar、Vector、MTE1/2/3、Cube和Fixpipe使用dav-2201的真实契约。Set�
 
 ## 5. 资源、优化与物化
 
-协议生成/组合明确其生命周期要求，分配器处理有限bank、配置预留、ID/width和共享约束。改变共享成员或width属于新的合法性义务；单纯ID改名不应重新证明内存与进展。
+协议生成/组合明确其生命周期要求；资源规划建立有限 bank、预留、width/phase、
+共享及整组 counter 约束，编号分配器只在已冻结的选项中选择合法映射。
+改变共享成员或 width 属于新的合法性义务；单纯 ID 改名不应重新证明内存与进展。
 
 省略同步直接使用既有覆盖及其前提，不试删后全图验证。不得以减少buffer复用、额外搬运、全局barrier或静默fallback换取易于证明。
 

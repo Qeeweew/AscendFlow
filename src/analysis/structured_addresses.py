@@ -91,6 +91,23 @@ class AddressFacts:
     rectangle: NDRectangle | None
     valid_rows: Expr | None = None
 
+    @property
+    def row_capacity(self):
+        # Prefix counts are logical matrix rows. NZ represents those rows
+        # as a byte prefix in each physical column-block segment.
+        return self.geometry.nbytes // 32 if self.geometry.layout == "NZ" else self.geometry.rows
+
+    def prefix_span(self):
+        if self.geometry.layout == "NZ":
+            return expression(
+                "add", expression("mul", self.valid_rows, literal(32)),
+                literal((self.geometry.rows - 1) * self.geometry.row_stride),
+            )
+        return expression(
+            "add", literal(self.geometry.nbytes),
+            expression("mul", expression("sub", self.valid_rows, literal(1)), literal(self.geometry.row_stride)),
+        )
+
 
 class ScalarEnvironment:
     """Shared SSA expressions under immutable uniform-input contracts.
@@ -232,6 +249,8 @@ class StructuredAddresses:
         self,
         address: AddressFacts,
         domains: Sequence[tuple[Expr, Expr, Expr]],
+        *,
+        assumptions=(),
     ) -> None:
         """Check every original axis under the caller's actual active domain.
 
@@ -254,24 +273,29 @@ class StructuredAddresses:
             from ..indexing import domain_nonnegative
 
             require(
-                domain_nonnegative(valid_rows, domains, self.environment.facts)
+                domain_nonnegative(
+                    valid_rows, domains, self.environment.facts, assumptions=assumptions
+                )
                 and domain_nonnegative(
-                    expression("sub", literal(address.geometry.rows), valid_rows),
+                    expression("sub", literal(address.row_capacity), valid_rows),
                     domains,
                     self.environment.facts,
+                    assumptions=assumptions,
                 ),
                 "runtime row count must stay within its declared capacity",
             )
             # Empty prefixes perform no access. This predicate does not
             # authorize the original scalar arithmetic outside that access.
-            domains = (*domains, (valid_rows, literal(1), literal(address.geometry.rows)))
+            domains = (*domains, (valid_rows, literal(1), literal(address.row_capacity)))
         for axis, (origin, width, extent) in enumerate(
             zip(address.axes.origins, address.axes.widths, address.axes.extents, strict=True)
         ):
             if valid_rows is not None and axis == address.axes.axes[0]:
                 width = valid_rows
             try:
-                check_axis(origin, width, extent, domains, self.environment.facts)
+                check_axis(
+                    origin, width, extent, domains, self.environment.facts, assumptions=assumptions
+                )
             except CompileError as error:
                 start, size = origin.constant, extent.constant
                 width_value = width if type(width) is int else width.constant

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from ..scalar import expression, literal
+from ..scalar import expression
 from ..target.ascend910b import Actor, Engine
 from .notification_lifetimes import HandbackRule
 from .structured_protocols import NotificationKind
@@ -19,17 +19,32 @@ class EventSharing:
 
 @dataclass(frozen=True, slots=True)
 class CounterSharing:
-    """Two aligned FIFO messages, without merging their publications/waits.
+    """Pairwise order premises, not a certificate for a whole FIFO group.
 
-    Each publisher's same-pipe contributions retain effect FIFO. Every receiver
-    consumes one contribution from each required publisher in that order;
-    a faster publisher cannot substitute for another quorum member. The
-    allocator separately bounds the complete credits placed on this ID.
+    Packing imposes same-ID effect FIFO on each publisher's same pipe. A
+    CounterGroup must additionally establish the complete word, progress and
+    per-publisher backlog before allocation may use these pairwise premises.
+    Publications/waits and every required quorum member remain distinct.
     """
 
     earlier: object
     later: object
     ordered_points: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class CounterReuse:
+    """Complete mode-2 episodes separated by every receiver's consumption.
+
+    The proof uses only required handoffs before ID assignment. Different
+    credits cannot have outstanding contributions together, so their bound
+    is the maximum per-credit backlog, with every publisher kept distinct.
+    """
+
+    earlier: object
+    later: object
+    handbacks: tuple
+    rule: str
 
 
 def _counter_shape(notification):
@@ -69,6 +84,9 @@ def share_counters(domains, left, right):
     """
     if any(n.mechanism is not NotificationKind.CROSS_EVENT for n in (left, right)):
         return None
+    coincident = _coincident_counter_points(domains, left, right)
+    if coincident is not None:
+        return CounterSharing(left, right, coincident)
     if _counter_shape(left) != _counter_shape(right):
         return None
     a, b = domains.cases[left], domains.cases[right]
@@ -118,6 +136,55 @@ def share_counters(domains, left, right):
     return None
 
 
+def _coincident_counter_points(domains, left, right):
+    """Disjoint activations at identical real send/receive occurrences.
+
+    Each channel has already established pairing and its complete quorum.
+    Their common coordinate map and identical sites put both subsets in the
+    same per-actor FIFO order. Disjoint guards ensure at most one member at
+    each occurrence, so this rule needs no new action-order decision.
+    """
+    if (left.source_engine, left.destination_engine, domains.clocks[left]) != (
+        right.source_engine,
+        right.destination_engine,
+        domains.clocks[right],
+    ):
+        return None
+    points = []
+    for phase in ("sources", "consumers"):
+        a = sorted(getattr(left, phase), key=lambda p: p.actor.value)
+        b = sorted(getattr(right, phase), key=lambda p: p.actor.value)
+        if len(a) != len(b):
+            return None
+        for before, after in zip(a, b, strict=True):
+
+            def site(p):
+                return (
+                    p.operation,
+                    p.actor,
+                    p.placement,
+                    p.coordinates,
+                    p.coordinate_guards,
+                    p.families,
+                    p.selected,
+                )
+
+            if site(before) != site(after):
+                return None
+            for ac in domains.cases[left]:
+                for bc in domains.cases[right]:
+                    if ac.empty or bc.empty:
+                        continue
+                    x = domains._instance(before, {}, case=ac)
+                    y = domains._instance(after, {}, case=bc)
+                    if not domains.arithmetic.queries.satisfies(
+                        x.guard.comparisons + y.guard.comparisons
+                    ).impossible:
+                        return None
+            points.append((before, after))
+    return tuple(points)
+
+
 def _single(domains, notification):
     cases = domains.cases[notification]
     if len(cases) != 1 or cases[0].empty or cases[0].windows:
@@ -137,88 +204,208 @@ def _single(domains, notification):
     return case
 
 
-def _same_iteration_streams(domains, rule, left, right):
-    """One publication per member of the same exact nested iteration domain.
+def _ordered_stream(domains, notification, case):
+    """Canonical clocks advance the real sites by unit translations.
 
-    Selected boundaries and translated stages need a different correspondence.
-    In particular, a finite fragment never licenses an entire cell channel.
+    Selected child FIRST/LAST coordinates are allowed only when independent
+    of that child clock. Reversed or mixed coordinate maps are not episodes.
     """
-    clocks = domains.clocks[left]
-    if not clocks or clocks != domains.clocks[right]:
-        return None
-    expected = tuple((loop, domains.control.loops[loop].ordinal) for loop in clocks)
-    if any(
-        point.coordinates != expected or point.families
-        for notification in (left, right)
-        for point in notification.sources + notification.consumers
-    ):
-        return None
+    clocks = domains.clocks[notification]
+    if not clocks or tuple(w.loop for w in case.windows) != clocks:
+        return False
+    for point in notification.sources + notification.consumers:
+        if point.families:
+            return False
+        actual = dict(point.coordinates)
+        for loop in clocks:
+            if loop not in actual:
+                return False
+            shift = domains.arithmetic.normalize(
+                expression("sub", actual[loop], domains.control.loops[loop].ordinal)
+            )
+            if not domains.control.invariant_over(shift, loop):
+                return False
+        if any(
+            not domains.control.invariant_over(value, loop)
+            for loop, value in point.coordinates
+            if loop not in clocks
+        ):
+            return False
+    return True
+
+
+def _same_iteration_streams(domains, rule, left, right):
+    """Exact common invocation clocks, with optional descendant bursts.
+
+    Complete windows keep selected boundaries and unit-translated sites.
+    A missing prefix is allowed only when one window contains the other;
+    every handback still retains the actual member guards.
+    """
     a, b = rule._cases(left), rule._cases(right)
     if len(a) != 1 or len(b) != 1:
         return None
     a, b = a[0], b[0]
-    if a.empty or b.empty or not a.windows or a.windows != b.windows:
+    if a.empty or b.empty or not a.windows or not b.windows:
         return None
     if a.condition != b.condition or a.substitutions != b.substitutions:
         return None
-    if tuple(window.loop for window in a.windows) != clocks:
+    for notification, case in ((left, a), (right, b)):
+        if not _ordered_stream(domains, notification, case):
+            return None
+    common = []
+    for aw, bw in zip(a.windows, b.windows):
+        if aw == bw:
+            common.append(aw)
+            continue
+        if (aw.loop, aw.count) != (bw.loop, bw.count):
+            break
+        if domains.arithmetic.queries.covers((aw.membership,), bw.membership.comparisons).proved:
+            common.append(aw)
+        elif domains.arithmetic.queries.covers((bw.membership,), aw.membership.comparisons).proved:
+            common.append(bw)
+        else:
+            break
+    return (a, b, tuple(common)) if common else None
+
+
+def _handback(domains, rule, earlier, old, later, target, assumptions, **reuse):
+    # Binary sharing additionally requires forward issue on its controller.
+    # Cross consumption blocks the whole controller, so the supported mode-2
+    # rule uses one opposite-direction, complete-quorum return. Its receiver
+    # must precede the new Set. Do not search compositions across unrelated
+    # queue stages when that direct return cannot be established.
+    if (
+        earlier.mechanism is NotificationKind.LOCAL_EVENT
+        and not domains.arithmetic.queries.covers(
+            domains._order_conditions(old, target), assumptions
+        ).proved
+    ):
         return None
-    return a, b
+    return rule.establish(
+        earlier,
+        old,
+        later,
+        target,
+        assumptions,
+        max_relays=1 if earlier.mechanism is NotificationKind.CROSS_EVENT else 2,
+        **reuse,
+    )
 
 
-def _stream_handbacks(domains, rule, earlier, ec, later, lc):
+def _stream_handbacks(domains, rule, earlier, ec, later, lc, windows):
     """Order both episodes, including the last/first of each nested reentry.
 
     Inside an iteration, consume earlier before publishing later. At every
     possible successor iteration, consume later before publishing earlier.
-    Exact equal windows make these the adjacent episodes of the merged word;
+    Exact common windows make these the adjacent episodes of the merged word;
+    FIRST/LAST consume every descendant use inside each invocation burst.
     zero/one-trip windows add no fictitious successor. Nothing is emitted.
     """
     handbacks = []
 
-    def connect(old_channel, old, target_channel, target, condition, loop, delta, reentry):
-        assumptions = tuple(
-            dict.fromkeys(condition.comparisons + old.guard.comparisons + target.guard.comparisons)
-        )
-        result = rule.establish(
-            old_channel,
-            old,
-            target_channel,
-            target,
-            assumptions,
-            loop=loop,
-            delta=delta,
-            reentry=reentry,
-        )
-        if result is None:
-            return False
-        handbacks.extend(result)
+    def connect(old_channel, olds, target_channel, targets, condition, loop, delta, reentry):
+        for old in olds:
+            for target in targets:
+                assumptions = tuple(
+                    dict.fromkeys(
+                        condition.comparisons + old.guard.comparisons + target.guard.comparisons
+                    )
+                )
+                result = _handback(
+                    domains,
+                    rule,
+                    old_channel,
+                    old,
+                    target_channel,
+                    target,
+                    assumptions,
+                    loop=loop,
+                    delta=delta,
+                    reentry=reentry,
+                )
+                if result is None:
+                    return False
+                handbacks.extend(result)
         return True
 
-    old = domains._instance(earlier.consumers[0], {}, case=ec)
-    target = domains._instance(later.sources[0], {}, case=lc)
-    if not connect(earlier, old, later, target, ec.condition, ec.windows[-1].loop, 0, False):
+    loop = windows[-1].loop
+    _, old_waits = list(domains._instances(earlier, ec, loop, 0))[-1]
+    next_sources, _ = next(domains._instances(later, lc, loop, 0))
+    if not connect(earlier, old_waits, later, next_sources, ec.condition, loop, 0, False):
         return None
-    for index, window in enumerate(ec.windows):
+    for index, window in enumerate(windows):
         if window.upper is not None and window.upper <= 1:
             continue
-        reentry = index < len(ec.windows) - 1
+        reentry = index < len(ec.windows) - 1 or index < len(lc.windows) - 1
         for phase, delta in window.reuse_phases(1):
-            if reentry:
-                _, old_waits = list(domains._instances(later, lc, window.loop, 0))[-1]
-                next_sources, _ = next(domains._instances(earlier, ec, window.loop, delta))
-                old, target = old_waits[0], next_sources[0]
-            else:
-                ordinal = domains.control.loops[window.loop].ordinal
-                old = domains._instance(later.consumers[0], {}, case=lc)
-                target = domains._instance(
-                    earlier.sources[0],
-                    {ordinal: expression("add", ordinal, literal(delta))},
-                    case=ec,
-                )
+            _, old_waits = list(domains._instances(later, lc, window.loop, 0))[-1]
+            next_sources, _ = next(domains._instances(earlier, ec, window.loop, delta))
             condition = ActionGuard(ec.condition.comparisons + phase.comparisons)
-            if not connect(later, old, earlier, target, condition, window.loop, delta, reentry):
+            if not connect(
+                later, old_waits, earlier, next_sources, condition, window.loop, delta, reentry
+            ):
                 return None
+            if reentry:
+                # Unequal contained windows can end/start with either member
+                # when a descendant is absent. Cover the opposite crossing
+                # too; a selected empty child supplies no invented handback.
+                _, other_waits = list(domains._instances(earlier, ec, window.loop, 0))[-1]
+                other_sources, _ = next(domains._instances(later, lc, window.loop, delta))
+                if not connect(
+                    earlier, other_waits, later, other_sources, condition, window.loop, delta, True
+                ):
+                    return None
+    return tuple(handbacks)
+
+
+def _invocation_handbacks(domains, rule, earlier, later):
+    """Disjoint whole-invocation episodes, including every nested use.
+
+    Exact event windows select the last consumption of the entire earlier
+    member and the first publication of the entire later member. In-order
+    queues put all of their other uses on the respective sides of these
+    endpoints. A real consumption handback must bridge the two; source order
+    or disjoint loop predicates do not establish this relation.
+
+    This never extends a finite fragment's permission to its cell channel:
+    the allocator checks every member of both complete credits separately.
+    """
+    a, b = rule._cases(earlier), rule._cases(later)
+    if not a or not b:
+        return None
+    handbacks = []
+    for ec in a:
+        if ec.empty:
+            continue
+        if domains.clocks[earlier] and not ec.windows:
+            return None
+        _, waits = list(domains._instances(earlier, ec, None, 0))[-1]
+        for lc in b:
+            if lc.empty:
+                continue
+            if domains.clocks[later] and not lc.windows:
+                return None
+            sources, _ = next(domains._instances(later, lc, None, 0))
+            for old in waits:
+                for target in sources:
+                    assumptions = tuple(
+                        dict.fromkeys(old.guard.comparisons + target.guard.comparisons)
+                    )
+                    result = _handback(
+                        domains,
+                        rule,
+                        earlier,
+                        old,
+                        later,
+                        target,
+                        assumptions,
+                        loop=None,
+                        delta=0,
+                        reentry=False,
+                    )
+                    if result is None:
+                        return None
+                    handbacks.extend(result)
     return tuple(handbacks)
 
 
@@ -245,9 +432,59 @@ def share_events(domains, rule: HandbackRule, left, right):
         return None
     cases = _same_iteration_streams(domains, rule, left, right)
     if cases is not None:
-        a, b = cases
+        a, b, windows = cases
         for earlier, ec, later, lc in ((left, a, right, b), (right, b, left, a)):
-            handbacks = _stream_handbacks(domains, rule, earlier, ec, later, lc)
+            handbacks = _stream_handbacks(domains, rule, earlier, ec, later, lc, windows)
             if handbacks is not None:
                 return EventSharing(bank, earlier, later, handbacks)
+    for earlier, later in ((left, right), (right, left)):
+        handbacks = _invocation_handbacks(domains, rule, earlier, later)
+        if handbacks is not None:
+            return EventSharing(bank, earlier, later, handbacks)
+    return None
+
+
+def share_counter_time(domains, rule: HandbackRule, left, right):
+    """Time-share matching mode-2 routes without adding completion order.
+
+    Each receiver must consume before *every* publisher of the next episode.
+    Existing cross handoffs may establish this relation across controllers;
+    same-actor issue order alone cannot. Unit clock maps and exact boundaries
+    keep all uses, including empty invocations and each level of reentry.
+    """
+    if any(n.mechanism is not NotificationKind.CROSS_EVENT for n in (left, right)):
+        return None
+
+    def route(n):
+        return (
+            n.source_engine,
+            n.destination_engine,
+            tuple(p.actor for p in n.sources),
+            tuple(p.actor for p in n.consumers),
+        )
+
+    if route(left) != route(right):
+        return None
+    if domains._exclusive(left, right):
+        return CounterReuse(left, right, (), "uniform-exclusive")
+    cases = _same_iteration_streams(domains, rule, left, right)
+    if cases is not None:
+        a, b, windows = cases
+        for earlier, ec, later, lc in ((left, a, right, b), (right, b, left, a)):
+            handbacks = _stream_handbacks(domains, rule, earlier, ec, later, lc, windows)
+            if handbacks is not None:
+                return CounterReuse(earlier, later, handbacks, "clock-handback")
+    for notification in (left, right):
+        if domains.clocks[notification]:
+            if not all(
+                case.empty or _ordered_stream(domains, notification, case)
+                for case in rule._cases(notification)
+            ):
+                return None
+        elif _single(domains, notification) is None:
+            return None
+    for earlier, later in ((left, right), (right, left)):
+        handbacks = _invocation_handbacks(domains, rule, earlier, later)
+        if handbacks is not None:
+            return CounterReuse(earlier, later, handbacks, "invocation-handback")
     return None

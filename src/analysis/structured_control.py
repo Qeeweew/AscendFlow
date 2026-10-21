@@ -22,11 +22,19 @@ from xdsl.ir import Operation
 from ..diagnostics import ErrorKind, require
 from ..dialects.physical import CoreIdOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
-from ..indexing import arguments, domain_nonnegative, equivalent, interval, nonnegative
+from ..indexing import (
+    arguments,
+    branch_comparison,
+    domain_nonnegative,
+    equivalent,
+    interval,
+    nonnegative,
+)
 from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
 from ..symbols import Symbol, SymbolKind, is_coordinate
 from ..target.ascend910b import Actor
 from .structured_addresses import ScalarEnvironment
+from .structured_schedule import Comparison
 
 Range = tuple[Expr, Expr, Expr]
 
@@ -128,6 +136,7 @@ class ControlFrame:
     ranges: tuple[Range, ...] = ()
     loop: LogicalLoop | None = None
     branch: int | None = None
+    comparisons: tuple[Comparison, ...] = ()
 
     def ancestors(self) -> tuple[ControlFrame, ...]:
         """The one retained lexical scope chain, including this frame."""
@@ -143,6 +152,10 @@ class ControlFrame:
     def domains(self) -> tuple[Range, ...]:
         """Only lexical depth, with no replay of executed iterations."""
         return tuple(domain for frame in self.ancestors() for domain in frame.ranges)
+
+    def predicates(self):
+        """Relations of already evaluated branches in this lexical scope."""
+        return tuple(test for frame in self.ancestors() for test in frame.comparisons)
 
     @property
     def statically_empty(self):
@@ -160,6 +173,7 @@ class ControlFacts:
     environment: ScalarEnvironment
     loops: Mapping[Operation, LogicalLoop]
     frames: Mapping[Operation, ControlFrame]
+    branches: Mapping[tuple[Operation, int], tuple[Comparison, ...]]
     group: Expr
     sid: Expr
     operations_visited: int
@@ -230,7 +244,7 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
         group.args[0]: Fact(maximum=groups - 1),
         sid.args[0]: Fact(maximum=1 if mixed else 0),
     }
-    bindings, loops, frames = {}, {}, {}
+    bindings, loops, frames, branches = {}, {}, {}, {}
     runtime_names = set()
     visited = unknown = 0
 
@@ -352,10 +366,18 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
         frames[operation] = frame
         for branch, region in enumerate(operation.regions):
             child_frame = (
-                ControlFrame(frame, operation, frame.participants, branch=branch)
+                ControlFrame(
+                    frame,
+                    operation,
+                    frame.participants,
+                    branch=branch,
+                    comparisons=branch_comparison(operation.cond, scalar, branch),
+                )
                 if isinstance(operation, scf.IfOp)
                 else frame
             )
+            if isinstance(operation, scf.IfOp):
+                branches[operation, branch] = child_frame.comparisons
             for block in region.blocks:
                 local = child_frame
                 for child in block.ops:
@@ -377,6 +399,7 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
         ScalarEnvironment(bindings, facts),
         MappingProxyType(loops),
         MappingProxyType(frames),
+        MappingProxyType(branches),
         group,
         sid,
         visited,

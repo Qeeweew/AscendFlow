@@ -368,7 +368,7 @@ def test_unrepresented_address_geometry_fails_explicitly(case, diagnostic):
         view = _view(source, _allocation((64,)), (64,), (0,), valid=source.args[0])
     elif case == "fractal":
         view = _view(
-            source, _allocation((16, 16), bank="L1", dtype="f16", layout="NZ"), (8, 16), (0, 1)
+            source, _allocation((16, 16), bank="L1", dtype="f16", layout="NZ"), (16, 8), (0, 1)
         )
     elif case == "pitch":
         allocation = _allocation((4, -1), dimensions=[source.args[0]], bank="GM")

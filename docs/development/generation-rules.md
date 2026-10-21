@@ -56,6 +56,13 @@ queue，S Wait 及 2201 `wait_flag_dev(flag)` 阻塞 controller。SSA use-def �
 这些完成关系。只有明确声明 implicit completion 的 native 才能省对应事件；
 Vector 等同 pipe 依赖保留实际 pipe fence。
 
+Scalar EXIT 端口可保留其全部来源的同步退休前缀；dispatch 逐来源、逐 actor
+核对实际 native 的 Scalar 与 implicit-completion 合同。只有来源均满足该合同
+才允许沿用同步退休，不能从 EXIT 位置本身推出完成。空路径仍通过入口获取
+需要的旧前缀；原接口没有输入读取的同步尾部观察不新建输入 reader。真正的
+head reader、异步 reader 和未知来源仍保留。ENTRY、Scalar store 及 Vector/Cube
+端口不从这条规则取得同步完成。
+
 完全相同的端点/domain 前提先 bundle，RAW/WAR/WAW 诊断仍分别保留。累计捕获
 只选已经需要且确实更晚发射的 source；复用 acquire 只使用已经存在的更早同
 queue acquire。被选通知保留它自身的原始 ownership edge，不把新增 coverage
@@ -202,8 +209,15 @@ queue_order 检查。无法建立这个本地前提时明确报告支持边界�
 
 真正 streaming 地址之间没有物理 slot 可提供上述归纳。它们使用明确的有限使用
 上界，或真实 queue handback：旧 Wait 直接阻塞下一 Set 的 source queue/controller，
-或经已经需要的同步返回。两次 handoff 的组合只在同一实际 native occurrence 上
-相接，检查坐标、存在域和 queue 次序；不建立全程序任意路径证明器。
+或经已经需要的同步返回。两次 handoff 可在同一实际 native occurrence 上相接，
+也可经同一 stage 内同一队列的后续发布相接；后者独立检查实际坐标、存在域及
+Wait 到发布之间的 queue 次序。只组合两次既有 handoff，不建立任意路径搜索。
+
+环政策与规则能力分开：先用有限次数或 native 边界 handback 构造首选协议；
+该流自身无法在容量内构造时才直接用 queue-composition。已有合法首选环的
+额外缩环只作为受压时的有限资源选项。每个选项保留原语、动作位置和激活，
+冻结自己的 phase/handback；纯编号阶段先试首选，失败后再试它们，不能回调
+域分析。选择次序、工作上限及当前支持子集见[事件资源](event-resources.md)。
 
 每个 case 的 radix/window 单独保持。首末选取先检查非空，外层 reentry 连接真实
 的最后消费与下一 invocation 的首次发出。无法在有限 bank/backlog 内建立合同，
@@ -214,8 +228,9 @@ handoff，其成员和 FIRST/LAST 边界才按需建立；已有普遍配对在�
 精确 projection 消去被选中的内部时钟，父层保留自由祖先的 membership，
 不从展开的 LAST 算式重新推导其已成立的范围。候选 handoff 只在旧 Wait 与
 下一 Set 的 physical-step 区间内，范围由有限 width 决定，不随 runtime 长度展开。
-已建立的边界 cases 随 `NotificationProgram.boundaries` 传给分配器，原式、
-坐标和成员未变时直接消费。分配新共享关系所需的新增边界在分配器内只建立一次。
+已建立的边界 cases 随 `NotificationProgram.boundaries` 传给资源规划器，原式、
+坐标和成员未变时直接消费。新共享关系所需的新增边界在资源规划阶段只建立一次，
+编号分配不查询域或 handback。
 
 如果旧 Wait 与返回发布对应同一个实际 native 或控制位置，优先复用已建立的
 坐标映射和配对，将返回端直接绑定到该 occurrence，不恢复整个 child 的成员
@@ -256,6 +271,25 @@ kernel 返回才执行每个实际异步 engine 的 Set→S Wait drain；配置 
 台账从第一次分配就占用完整 credit 的所有成员；对后来才物化的成员也逐一检查
 新共享约束，不能以第一片的有限 handback 授权整个循环 credit。
 
+完整的前后两段可用精确 window 选择最后 Wait 与首次 Set，证明消费回传后共享。
+相同外层 invocation 内的两个 child burst 还须证明本次前后关系，以及每层下一次
+invocation 的最后消费到首次发布；空、短和稀疏 window 不假借稳态存在性。
+同一循环、相同 count 的窗口允许成员集合包含关系，共同调用域取较宽窗口，
+各个真实端点仍保留自己的 guard。规范时钟到实际端点只能是单位平移；选中的
+child FIRST/LAST 还须对该 child 时钟不变。内层 burst 的边界使用自身的精确
+FIRST/LAST；外层重入检查两个方向的最后消费到首次发布，覆盖子窗口缺席的情形。
+共享候选先检查端点的发射先后关系，再建立实际 queue/controller 消费回传；
+发射先后本身不能授权事件共享。无法建立这些前提时继续使用独立 ID 或明确拒绝。
+mode-2 在完全相同的实际发布/等待位置、参与者和坐标映射下，还允许互斥槽位
+子集组成同一个 FIFO；每对成员分别检查源端和接收端的 guard 互斥，保留各自
+完整配对和 quorum。台账仍限制同一 ID 全部完整 credit 的积压。
+
+mode-2 首先允许基于完整消费的时间复用：同路由/参与者的每个旧接收者都经
+已经需要的一条完整 quorum 反向回传，先消费再进入每个新发布。各层 LAST/FIRST
+及重入均须覆盖；同号的全部完整 credit 两两不干涉，积压取最大值。这个合同
+没有新增 Wait 或完成约束，不用 FIFO packing 的积压求和代替。具体边界见
+[事件资源](event-resources.md)。
+
 mode-2 计数器还允许一种独立的 FIFO 共享规则：两个完整通道的实际发送者和
 接收者集合、source pipe、clock、坐标、激活域、边界 family 和 case 一致，
 且逐发送者的发布顺序与每个接收者的消费顺序严格一致。证明使用各端已建立
@@ -268,6 +302,10 @@ native end 当作 FIFO，也不移动、合并或减少 Set/Wait。
 的缺席贡献。逐端同序与相同激活域使这些贡献对应同一完整消息，不额外插入
 AIV 间的轮次 barrier，也不丢掉任一 AIV 的原始发布或完成前缀。
 
+同号新增的是 counter 效果 FIFO，不能宣称不同 ID 的 Set 效果原本已按发射顺序
+完成。当前整组规则核对实际 clock 单位平移和各参与者完整 word，借同 source
+pipe 的单调 native 前缀及有限积压建立新增 FIFO 的局部进展；见[事件资源](event-resources.md)。
+
 分配候选 ID 时，对全部已占用与将占用的完整 credit 求积压上界之和；同一个
 物理 credit 只计一次，总和不得超过 15。未知积压不是 0。容量检查覆盖之后
 才物化的 credit 成员，不只检查当前通知。参与者、激活域或任一发送者/接收者
@@ -278,10 +316,11 @@ mode-2 的十六个 base ID 来自安装 CANN 9.1 的 2201 `GetfftsConfig` 四�
 它们在所有 mode 间共用，超出 15 会 alias。使用真实 namespace 不是放宽 solver
 预算；不允许 overflow ID、忽略配置预留或静默重排。
 
-同一实际插入点的两个 AIV 使用相同有序指令序列时，代码只输出一份。比较包括
-指令种类、方向、已分配 ID 表达式及有序 guard，保留每个 actor 的原有顺序和
-重复次数；分析协议名仅作为诊断来源保留，不阻止共享。ID、guard 或顺序不同时
-保留原有参与者限制。这里共享的是代码，不合并私有 event bank 或 mode-2 贡献。
+同一实际插入点的两个 AIV 在规划阶段比较完整虚拟动作序列，保留指令种类、方向、
+资源/phase、guard、顺序和重复次数；镜像私有资源取得编号相等约束后输出一份代码。
+编号后不再因整数恰好相同产生新的合并机会。这里共享的是代码，不合并私有
+event bank 或 mode-2 贡献。专属政策和整组 FIFO 的支持边界见
+[事件资源](event-resources.md)。
 
 `N.Vector() as lane` 的 lane 就是 runtime SID。共同动作直接在共享 Vector body
 执行；只有单 actor 动作才在物化时生成一次 SID 控制，且该控制先于 guard 和

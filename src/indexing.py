@@ -10,6 +10,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from fractions import Fraction
 from itertools import product
+from types import MappingProxyType
 
 from .diagnostics import CompileError, require
 from .scalar import DIVISION, Expr, expression, literal
@@ -484,66 +485,120 @@ def _bounds_hold(expr, bounds, coordinate, lower, upper, queries):
     )
 
 
-def interval(expr, domains, facts, *, queries=None):
-    """Inclusive symbolic range on an active loop iteration.
+class IndexRanges:
+    """Owned active-range DAGs under one immutable input-fact snapshot.
 
-    Each domain entry is (expression, lower, upper). It can describe a joint
-    coordinate such as core + g*groups, preserving cyclic ownership information
-    which separate core/g intervals would lose.
+    A lexical domain includes its joint owner/iteration coordinates. Only
+    exactly that domain may reuse a constructed bound. This view does not
+    authorize the original expression's evaluation or export executable
+    polynomial representatives. Uniform host extrema have a separate empty-
+    domain contract and cannot seed these active-iteration facts.
     """
-    matched = None
-    for coordinate, lower, upper in domains:
-        if equivalent(expr, coordinate, facts):
-            matched = (
-                (lower, upper)
-                if matched is None
-                else (expression("max", matched[0], lower), expression("min", matched[1], upper))
+
+    def __init__(self, facts, *, queries=None):
+        self.facts = MappingProxyType(dict(facts))
+        self.queries = queries
+        self._domains = {}
+
+    def interval(self, expr, domains):
+        domains = tuple(domains)
+        ranges = self._domains.setdefault(domains, {})
+        if expr not in ranges:
+            ranges[expr] = self._construct(expr, domains)
+        return ranges[expr]
+
+    def _construct(self, expr, domains):
+        facts = self.facts
+        matched = None
+        for coordinate, lower, upper in domains:
+            if equivalent(expr, coordinate, facts):
+                matched = (
+                    (lower, upper)
+                    if matched is None
+                    else (expression("max", matched[0], lower), expression("min", matched[1], upper))
+                )
+        if matched is not None:
+            return matched
+        correlated = _joint_affine_interval(expr, domains, facts, queries=self.queries)
+        if correlated is not None:
+            return correlated
+        if expr.kind in {"constant", "argument"}:
+            return expr, expr
+        a, b = expr.args
+        al, ah = self.interval(a, domains)
+        bl, bh = self.interval(b, domains)
+        if expr.kind in {"add", "min", "max"}:
+            return expression(expr.kind, al, bl), expression(expr.kind, ah, bh)
+        if expr.kind == "mul":
+            if a.constant is not None:
+                low, high = (bh, bl) if a.constant < 0 else (bl, bh)
+                return expression("mul", a, low), expression("mul", a, high)
+            if b.constant is not None:
+                low, high = (ah, al) if b.constant < 0 else (al, ah)
+                return expression("mul", b, low), expression("mul", b, high)
+            require(
+                domain_nonnegative(al, domains, facts) and domain_nonnegative(bl, domains, facts),
+                "index product has an unproven sign",
+                witness=(
+                    f"product={expr.text()}",
+                    f"lower_left={al.text()}",
+                    f"lower_right={bl.text()}",
+                ),
             )
-    if matched is not None:
-        return matched
-    correlated = _joint_affine_interval(expr, domains, facts, queries=queries)
-    if correlated is not None:
-        return correlated
-    if expr.kind in {"constant", "argument"}:
-        return expr, expr
-    a, b = expr.args
-    al, ah = interval(a, domains, facts)
-    bl, bh = interval(b, domains, facts)
-    if expr.kind in {"add", "min", "max"}:
-        return expression(expr.kind, al, bl), expression(expr.kind, ah, bh)
-    if expr.kind == "mul":
-        if a.constant is not None:
-            low, high = (bh, bl) if a.constant < 0 else (bl, bh)
-            return expression("mul", a, low), expression("mul", a, high)
-        if b.constant is not None:
-            low, high = (ah, al) if b.constant < 0 else (al, ah)
-            return expression("mul", b, low), expression("mul", b, high)
-        require(
-            domain_nonnegative(al, domains, facts) and domain_nonnegative(bl, domains, facts),
-            "index product has an unproven sign",
-            witness=(
-                f"product={expr.text()}",
-                f"lower_left={al.text()}",
-                f"lower_right={bl.text()}",
-            ),
-        )
-        return expression("mul", al, bl), expression("mul", ah, bh)
-    if expr.kind in {"floordiv", "ceildiv", "rem"}:
-        from .scalar import positive
+            return expression("mul", al, bl), expression("mul", ah, bh)
+        if expr.kind in {"floordiv", "ceildiv", "rem"}:
+            from .scalar import positive
 
-        require(
-            domain_nonnegative(al, domains, facts),
-            "unsigned index division has an unproven nonnegative dividend",
-        )
-        require(al == ah or b == bl == bh, "index divisor is not uniform")
-        require(positive(b, facts), "index divisor must be provably positive and uniform")
-        if expr.kind == "rem":
-            return literal(0), expression("sub", b, literal(1))
-        return expression(expr.kind, al, b), expression(expr.kind, ah, b)
-    require(False, f"unsupported index range operation {expr.kind}")
+            require(
+                domain_nonnegative(al, domains, facts),
+                "unsigned index division has an unproven nonnegative dividend",
+            )
+            require(al == ah or b == bl == bh, "index divisor is not uniform")
+            require(positive(b, facts), "index divisor must be provably positive and uniform")
+            if expr.kind == "rem":
+                return literal(0), expression("sub", b, literal(1))
+            return expression(expr.kind, al, b), expression(expr.kind, ah, b)
+        require(False, f"unsupported index range operation {expr.kind}")
 
 
-def domain_nonnegative(expr, domains, facts):
+def interval(expr, domains, facts, *, queries=None):
+    """Inclusive symbolic range of one expression on an active iteration.
+
+    Consumers of several values in the same immutable environment own an
+    ``IndexRanges`` instance so common subexpressions are established once.
+    """
+    return IndexRanges(facts, queries=queries).interval(expr, domains)
+
+
+def branch_comparison(condition, decode, branch):
+    """Decode a signed integer branch in its actual SSA environment.
+
+    The condition is evaluated before either region. Its arithmetic must be
+    checked at that earlier point; this relation applies only inside the
+    selected region, never to the condition's own evaluation or a merge.
+    """
+    from xdsl.dialects import arith
+
+    from .analysis.structured_schedule import Comparison
+
+    compare = condition.owner
+    predicates = ("==", "!=", "<", "<=", ">", ">=")
+    if not isinstance(compare, arith.CmpiOp) or compare.predicate.value.data >= len(predicates):
+        return ()
+    predicate = predicates[compare.predicate.value.data]
+    if branch:
+        predicate = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}[predicate]
+    try:
+        lhs, rhs = decode(compare.lhs), decode(compare.rhs)
+    except CompileError:
+        # Optional access premises cannot reinterpret opaque integer/bitwise
+        # expressions. Keep the branch, but obtain no address fact from it.
+        # Original arithmetic is checked separately before any region entry.
+        return ()
+    return (Comparison(lhs, predicate, rhs),)
+
+
+def domain_nonnegative(expr, domains, facts, *, assumptions=()):
     """Keep the complete lexical range relations in one sign query.
 
     Loaded metadata and ancestor/child coordinates keep their actual identities.
@@ -553,15 +608,18 @@ def domain_nonnegative(expr, domains, facts):
     from .analysis.smt import query_service
     from .analysis.structured_schedule import Comparison
 
-    premises = tuple(
-        test
-        for coordinate, lower, upper in domains
-        for test in (Comparison(coordinate, ">=", lower), Comparison(coordinate, "<=", upper))
+    premises = (
+        tuple(
+            test
+            for coordinate, lower, upper in domains
+            for test in (Comparison(coordinate, ">=", lower), Comparison(coordinate, "<=", upper))
+        )
+        + assumptions
     )
     return query_service(facts).implies(Comparison(expr, ">=", literal(0)), premises).proved
 
 
-def check_axis(origin, width, extent, domains, facts):
+def check_axis(origin, width, extent, domains, facts, *, assumptions=()):
     # Validate the original DAG before algebra can cancel an invalid unsigned
     # division. For example divmod(g-5, 3) recombines mathematically, but g-5
     # cannot be an unsigned dividend on the first iterations.
@@ -575,23 +633,26 @@ def check_axis(origin, width, extent, domains, facts):
             if isinstance(arg, Expr):
                 divisions(arg)
         if expr.kind in {"floordiv", "rem", "ceildiv"}:
-            lower, _ = interval(expr.args[0], domains, facts)
+            from .scalar import positive
+
             require(
-                domain_nonnegative(lower, domains, facts),
+                domain_nonnegative(expr.args[0], domains, facts, assumptions=assumptions),
                 "unsigned index division has an unproven nonnegative dividend",
+            )
+            require(
+                positive(expr.args[1], facts), "index divisor must be provably positive and uniform"
             )
 
     width = literal(width) if type(width) is int else width
     divisions(origin)
     divisions(width)
-    lower, _ = interval(origin, domains, facts)
     require(
-        domain_nonnegative(origin, domains, facts) or domain_nonnegative(lower, domains, facts),
+        domain_nonnegative(origin, domains, facts, assumptions=assumptions),
         "logical axis origin may be negative",
     )
     remaining = expression("sub", extent, expression("add", origin, width))
     require(
-        domain_nonnegative(remaining, domains, facts),
+        domain_nonnegative(remaining, domains, facts, assumptions=assumptions),
         "logical axis access is not bounded by its tensor extent",
     )
 
@@ -601,7 +662,7 @@ def validate_source_arithmetic(program, controls):
 
     Even an unused div followed by ``bad-bad`` must satisfy its source domain.
     Walking the retained scopes avoids mistaking a simplified Expr DAG for the
-    original SSA. Branch predicates do not silently grant stronger ranges.
+    original SSA. Only already evaluated enclosing branches supply premises.
     """
     from xdsl.dialects import arith, scf
 
@@ -626,7 +687,7 @@ def validate_source_arithmetic(program, controls):
     facts[core.args[0]] = Fact(maximum=program.groups.data - 1)
     number = 0
 
-    def walk(block, coordinates, domains):
+    def walk(block, coordinates, domains, assumptions=()):
         nonlocal number
         for op in block.ops:
             if isinstance(op, IndexReadOp):
@@ -665,22 +726,11 @@ def validate_source_arithmetic(program, controls):
                 lhs, rhs = (
                     from_ssa(value, coordinates=coordinates, facts=facts) for value in op.operands
                 )
-                try:
-                    lower, _ = interval(lhs, domains, facts)
-                    for _ in range(len(domains) + 1):
-                        bound = interval(lower, domains, facts)[0]
-                        if bound == lower:
-                            break
-                        lower = bound
-                except CompileError as error:
-                    raise CompileError(
-                        f"{op.location}: source unsigned division: {error}"
-                    ) from None
                 require(
-                    nonnegative(lower, facts),
+                    domain_nonnegative(lhs, domains, facts, assumptions=assumptions),
                     "source unsigned division has an unproven nonnegative dividend",
                     location=str(op.location),
-                    witness=(f"dividend={lhs.text()}", f"lower={lower.text()}"),
+                    witness=(f"dividend={lhs.text()}",),
                 )
                 require(
                     positive(rhs, facts),
@@ -723,9 +773,18 @@ def validate_source_arithmetic(program, controls):
                     *domains,
                     (Expr("argument", (name,)), lower, expression("sub", bound, literal(1))),
                 ]
-            for region in op.regions:
+            for branch, region in enumerate(op.regions):
+                tests = assumptions
+                if isinstance(op, scf.IfOp):
+                    tests += branch_comparison(
+                        op.cond,
+                        lambda value, coordinates=coordinates: from_ssa(
+                            value, coordinates=coordinates, facts=facts
+                        ),
+                        branch,
+                    )
                 for child in region.blocks:
-                    walk(child, local, ranges)
+                    walk(child, local, ranges, tests)
 
     walk(
         program.body.block,

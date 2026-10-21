@@ -172,14 +172,20 @@ class _Interpret:
                     mode = "W"
             private = root.ref.type.bank.data != "GM"
             active_rows = geometry.rows
+            active_bytes = geometry.nbytes
             if address.valid_rows is not None:
-                active_rows = values[address.valid_rows]
+                count = values[address.valid_rows]
                 _check(
-                    0 <= active_rows <= geometry.rows, "actual runtime row count exceeds capacity"
+                    0 <= count <= access.address.row_capacity, "actual runtime row count exceeds capacity"
                 )
+                if geometry.layout == "NZ":
+                    active_bytes = count * 32
+                    active_rows = geometry.rows if count else 0
+                else:
+                    active_rows = count
             for row in range(active_rows):
                 start = offset + row * geometry.row_stride
-                end = start + geometry.nbytes
+                end = start + active_bytes
                 _check(
                     0 <= start < end <= allocation,
                     f"actual address out of bounds: {root.sym_name.data}",
@@ -422,6 +428,22 @@ def _causality(commands):
             edges[source].add(destination)
 
     controllers, gates, queues, ends, implicit = {}, {}, {}, defaultdict(list), {}
+    prefixes = {}
+
+    def capture(queue, label):
+        # Factor the union of prior native completions, not prior Set effects.
+        # A synthetic prefix has exactly the incoming native-end edges that
+        # each subsequent capture used to repeat. Real notifications remain
+        # unordered unless their hardware rule supplies an edge separately.
+        if ends[queue]:
+            completed = node(label)
+            edge(prefixes.get(queue), completed)
+            for previous in ends[queue]:
+                edge(previous, completed)
+            ends[queue].clear()
+            prefixes[queue] = completed
+        return prefixes.get(queue)
+
     local_sets, local_waits, cross_sets, cross_waits = (defaultdict(list) for _ in range(4))
     previous_counter = {}
     for command in commands:
@@ -451,15 +473,11 @@ def _causality(commands):
             edge(implicit.get(queue), command.begin)
             ends[queue].append(command.end)
             if command.implicit:
-                completed = node(point.label + ":implicit-prefix")
-                for previous in ends[queue]:
-                    edge(previous, completed)
-                implicit[queue] = completed
+                implicit[queue] = capture(queue, point.label + ":implicit-prefix")
             if pipe is Engine.S:
                 gates[controller] = command.end
         elif kind in {SyncKind.LOCAL_SET.value, SyncKind.CROSS_SET.value, SyncKind.FENCE.value}:
-            for previous in ends[queue]:
-                edge(previous, command.end)
+            edge(capture(queue, point.label + ":captured-prefix"), command.end)
         if (
             kind == SyncKind.CROSS_WAIT.value
             or kind == SyncKind.LOCAL_WAIT.value
@@ -544,14 +562,19 @@ def _accesses(logical, physical, reach, order):
         )
         for span in command.spans:
             boundaries[span.storage].update((span.start, span.end))
-    atoms = {storage: tuple(pairwise(sorted(points))) for storage, points in boundaries.items()}
+    points = {storage: tuple(sorted(values)) for storage, values in boundaries.items()}
+    atoms = {storage: tuple(pairwise(values)) for storage, values in points.items()}
+    positions = {storage: {value: i for i, value in enumerate(values)} for storage, values in points.items()}
     touches = {}
     for command in logical:
         touched = defaultdict(set)
         for span in command.spans:
-            for start, end in atoms[span.storage]:
-                if span.start <= start and end <= span.end:
-                    touched[span.storage, start, end].update(span.mode)
+            # Every endpoint was inserted above. The exact same partition
+            # atoms are covered; avoid scanning the entire tensor's atoms for
+            # every small native row (quadratic in large sparse/Gram cases).
+            first, last = positions[span.storage][span.start], positions[span.storage][span.end]
+            for start, end in atoms[span.storage][first:last]:
+                touched[span.storage, start, end].update(span.mode)
         touches[command.occurrence] = touched
     bindings, writers, writes = [], {}, defaultdict(list)
     bytes_read = bytes_written = 0

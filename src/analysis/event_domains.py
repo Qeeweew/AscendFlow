@@ -13,11 +13,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
-from xdsl.dialects import arith
-
 from ..diagnostics import CompileError, ErrorKind, require
+from ..dialects.physical import TaskOp
 from ..indexing import arguments
 from ..scalar import Expr, Fact, expression, literal
+from ..symbols import Symbol, SymbolKind
 from ..target.ascend910b import Actor, Engine
 from .access_frontier import QueueEndpoint
 from .event_contracts import ResourceWork
@@ -34,7 +34,7 @@ from .structured_protocols import (
     SynchronizationSelection,
     substitute,
 )
-from .structured_schedule import ActionGuard, Comparison
+from .structured_schedule import ActionGuard, Comparison, Placement
 
 
 def _loop_ancestors(control, operation):
@@ -71,6 +71,23 @@ class EventCase:
         return substitute(value, dict(self.substitutions))
 
 
+@dataclass(frozen=True, slots=True)
+class _InputActivation:
+    """Activation simplified only by the real dominating input loads.
+
+    Keep each original ordered guard and the loads preceding its evaluation.
+    These are per-occurrence input contracts, never global assumptions or
+    facts borrowed from a load inside the guarded region.
+    Loop/branch activation is not an input contract and cannot discharge
+    itself. In particular a child's body cannot establish its own existence.
+    """
+
+    original: tuple[Comparison, ...]
+    contracts: tuple[tuple[Comparison, tuple[tuple[TaskOp, tuple[Comparison, ...]], ...]], ...]
+    discharged: tuple[Comparison, ...]
+    tests: tuple[Comparison, ...]
+
+
 @dataclass(frozen=True, init=False)
 class EventDomains:
     """One owned collection of event-domain and physical ordering facts.
@@ -95,6 +112,10 @@ class EventDomains:
     endpoints: Mapping[tuple[BoundPlacement, EventCase], BoundPlacement]
     active: Mapping[tuple[LogicalNotification, EventCase], bool]
     _order_facts: dict[tuple, tuple[ActionGuard, ...]] = field(compare=False, repr=False)
+    _activations: dict[tuple, _InputActivation] = field(compare=False, repr=False)
+    _guard_inputs: dict[tuple, tuple] = field(compare=False, repr=False)
+    _input_ranges_cache: dict[BoundPlacement, tuple] = field(compare=False, repr=False)
+    _boundary_instances: dict[tuple, tuple] = field(compare=False, repr=False)
 
     def __init__(self, selection: SynchronizationSelection, work: ResourceWork):
         memory = selection.dependencies.memory
@@ -113,6 +134,10 @@ class EventDomains:
             ("endpoints", {}),
             ("active", {}),
             ("_order_facts", {}),
+            ("_activations", {}),
+            ("_guard_inputs", {}),
+            ("_input_ranges_cache", {}),
+            ("_boundary_instances", {}),
         ):
             object.__setattr__(self, name, value)
         self.work.notifications = len(self.notifications)
@@ -215,7 +240,11 @@ class EventDomains:
                         ),
                     )
             self.tests[notification] = tuple(
-                dict.fromkeys(test for tests in endpoints for test in tests)
+                dict.fromkeys(
+                    test
+                    for bound in notification.sources + notification.consumers
+                    for test in self._activation(bound)
+                )
             )
             for bound in notification.sources + notification.consumers:
                 bindings = {
@@ -332,6 +361,48 @@ class EventDomains:
         )
 
     def _ambient(self, placement, *, extra_coordinate_guards=()):
+        return tuple(
+            test
+            for test, _ in self._guarded_inputs(
+                placement, extra_coordinate_guards=extra_coordinate_guards
+            )
+        )
+
+    def _input_ranges(self, placement):
+        """Load contracts known when this actual endpoint executes.
+
+        These are local premises for an already active occurrence, not facts
+        establishing its activation or authorizing an earlier guard. Bind the
+        physical load's original scope directly to actual coordinates once;
+        an instantiated placement's guard must not be translated again.
+        """
+        if placement in self._input_ranges_cache:
+            return self._input_ranges_cache[placement]
+        bindings = {
+            self.control.loops[loop].ordinal: value for loop, value in placement.coordinates
+        }
+        bindings[self.control.sid] = literal(1 if placement.actor is Actor.AIV1 else 0)
+        tests = []
+        for frame in placement.occurrence.frame.ancestors():
+            operation = frame.operation
+            if not isinstance(operation, TaskOp) or operation.native.data != "index_load":
+                continue
+            if operation is placement.operation and placement.placement is Placement.BEFORE:
+                continue
+            for value, lower, upper in frame.ranges:
+                tests.extend(
+                    Comparison(substitute(value, bindings), predicate, substitute(bound, bindings))
+                    for predicate, bound in ((">=", lower), ("<=", upper))
+                )
+        result = tuple(dict.fromkeys(tests))
+        self._input_ranges_cache[placement] = result
+        return result
+
+    def _guarded_inputs(self, placement, *, extra_coordinate_guards=()):
+        """Bind each real guard with only its dominating input-load prefix."""
+        key = placement, extra_coordinate_guards
+        if key in self._guard_inputs:
+            return self._guard_inputs[key]
         bindings = {
             self.control.loops[loop].ordinal: value for loop, value in placement.coordinates
         }
@@ -340,7 +411,13 @@ class EventDomains:
         for loop, guard in extra_coordinate_guards:
             prior = coordinate_guards.get(loop, ActionGuard())
             coordinate_guards[loop] = ActionGuard(prior.comparisons + guard.comparisons)
-        tests = []
+        tests, contracts = {}, []
+
+        def append(values):
+            for test in values:
+                # A later repeated predicate cannot borrow a larger input
+                # prefix to erase its earlier activation obligation.
+                tests.setdefault(test, tuple(contracts))
 
         def bind(test, substitutions):
             return Comparison(
@@ -356,10 +433,23 @@ class EventDomains:
         # coordinate map again would translate a previous invocation twice.
         canonical = {self.control.sid: bindings[self.control.sid]}
         for frame in placement.occurrence.frame.ancestors():
+            if isinstance(frame.operation, TaskOp) and frame.operation.native.data == "index_load":
+                contracts.append(
+                    (
+                        frame.operation,
+                        tuple(
+                            Comparison(
+                                substitute(value, bindings), predicate, substitute(bound, bindings)
+                            )
+                            for value, lower, upper in frame.ranges
+                            for predicate, bound in ((">=", lower), ("<=", upper))
+                        ),
+                    )
+                )
             if frame.loop is not None:
                 prerequisite = coordinate_guards.get(frame.loop.operation)
                 if prerequisite is not None:
-                    tests.extend(bind(test, canonical) for test in prerequisite.comparisons)
+                    append(bind(test, canonical) for test in prerequisite.comparisons)
                 selected = next(
                     (
                         item
@@ -379,7 +469,7 @@ class EventDomains:
                     and Comparison(selected.count, ">", selected.first) in prerequisite.comparisons
                 ):
                     continue
-                tests.extend(
+                append(
                     bind(test, bindings)
                     for test in (
                         Comparison(frame.loop.ordinal, ">=", literal(0)),
@@ -387,40 +477,54 @@ class EventDomains:
                     )
                 )
             if frame.branch is not None:
-                compare = frame.operation.cond.owner
                 require(
-                    isinstance(compare, arith.CmpiOp),
-                    "event scope needs its actual integer branch predicate",
-                )
-                predicates = ("==", "!=", "<", "<=", ">", ">=")
-                require(
-                    compare.predicate.value.data < len(predicates),
-                    "event scope unsigned predicate is unsupported",
+                    len(frame.comparisons) == 1,
+                    "event scope needs an admitted signed integer comparison",
                     kind=ErrorKind.UNSUPPORTED,
                     phase="structured-event-pairing",
                 )
-                predicate = predicates[compare.predicate.value.data]
-                if frame.branch:
-                    predicate = {
-                        "==": "!=",
-                        "!=": "==",
-                        ">": "<=",
-                        ">=": "<",
-                        "<": ">=",
-                        "<=": ">",
-                    }[predicate]
-                tests.append(
-                    bind(
-                        Comparison(
-                            self.control.environment.expression(compare.lhs),
-                            predicate,
-                            self.control.environment.expression(compare.rhs),
-                        ),
-                        bindings,
-                    )
-                )
-        tests.extend(bind(test, bindings) for test in placement.guard.comparisons)
-        return tuple(dict.fromkeys(tests))
+                append(bind(test, bindings) for test in frame.comparisons)
+        append(bind(test, bindings) for test in placement.guard.comparisons)
+        result = tuple(tests.items())
+        self._guard_inputs[key] = result
+        return result
+
+    def _activation(self, placement, *, extra_coordinate_guards=()):
+        key = placement, extra_coordinate_guards
+        if key in self._activations:
+            return self._activations[key].tests
+        contexts = self._guarded_inputs(placement, extra_coordinate_guards=extra_coordinate_guards)
+        original = tuple(test for test, _ in contexts)
+
+        def input_expression(value):
+            # Captures identify the load's invocation; they are not a bare
+            # loop variable in this expression. Never erase an actual clock
+            # predicate, even if a conditional load's range could imply it.
+            if value.kind == "argument":
+                symbol = value.args[0]
+                return not isinstance(symbol, Symbol) or symbol.kind in {
+                    SymbolKind.METADATA,
+                    SymbolKind.PARAMETER,
+                    SymbolKind.GROUP,
+                    SymbolKind.PARTICIPANT,
+                }
+            return all(input_expression(child) for child in value.args if isinstance(child, Expr))
+
+        discharged = tuple(
+            test
+            for test, contracts in contexts
+            if contracts
+            and any(
+                isinstance(symbol, Symbol) and symbol.kind is SymbolKind.METADATA
+                for symbol in arguments(test.lhs) | arguments(test.rhs)
+            )
+            and input_expression(test.lhs)
+            and input_expression(test.rhs)
+            and self.arithmetic.prove(test, tuple(t for _, tests in contracts for t in tests))
+        )
+        tests = tuple(test for test in original if test not in discharged)
+        self._activations[key] = _InputActivation(original, contexts, discharged, tests)
+        return tests
 
     def _instance(self, placement, bindings, *, case, extra_coordinate_guards=()):
         if (
@@ -432,7 +536,7 @@ class EventDomains:
         # a replacement coordinate must not itself be shifted a second time.
         tests = list(case.condition.comparisons)
         inactive = False
-        for test in self._ambient(placement, extra_coordinate_guards=extra_coordinate_guards):
+        for test in self._activation(placement, extra_coordinate_guards=extra_coordinate_guards):
             specialized = Comparison(
                 substitute(case.specialize(test.lhs), bindings),
                 test.predicate,
@@ -607,6 +711,17 @@ class EventDomains:
         ancestors = () if loop is None else _loop_ancestors(self.control, loop)
         kept = tuple(w for w in case.windows if w.loop is loop or w.loop in ancestors)
         for last in (False, True):
+            # A family port is an owned fact for these exact coordinates and
+            # active case. Keep FIRST/LAST independent and construct only the
+            # requested port: asking for FIRST must never force LAST on an
+            # empty or otherwise unavailable child.
+            key = notification, case, loop, offset, last
+            if key in self._boundary_instances:
+                self.work.boundary_instance_reuses += 1
+                yield self._boundary_instances[key]
+                if terminal:
+                    break
+                continue
             bindings = {}
             if loop is not None:
                 ordinal = self.control.loops[loop].ordinal
@@ -656,10 +771,13 @@ class EventDomains:
                 )
                 return replace(point, guard=guard)
 
-            yield (
+            result = (
                 tuple(instance(p) for p in notification.sources),
                 tuple(instance(p) for p in notification.consumers),
             )
+            self._boundary_instances[key] = result
+            self.work.boundary_instances += 1
+            yield result
             if terminal:
                 break
 

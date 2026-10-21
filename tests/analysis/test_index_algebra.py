@@ -148,6 +148,54 @@ def test_a_multiple_is_a_required_contract_and_cannot_be_invented_by_algebra():
     assert length - 4 + 4 > allocation
 
 
+def test_active_range_dags_keep_actual_lexical_domains_and_failed_unsigned_evaluations():
+    generation = argument("$g")
+    numerator = expression("sub", generation, literal(8))
+    quotient = expression("floordiv", numerator, literal(2))
+    ranges = indexing.IndexRanges({})
+    active = ((generation, literal(8), literal(15)),)
+    earlier = ((generation, literal(0), literal(7)),)
+    assert tuple(bound.constant for bound in ranges.interval(quotient, active)) == (0, 3)
+    # A proved later body must not authorize the same expression before it.
+    for _ in range(2):
+        with pytest.raises(CompileError, match="nonnegative dividend"):
+            ranges.interval(quotient, earlier)
+    assert tuple(bound.constant for bound in ranges.interval(quotient, active)) == (0, 3)
+
+
+def test_active_range_dags_retain_joint_owner_iteration_bounds():
+    owner, generation = argument("$core"), argument("$g")
+    flat = expression("add", owner, expression("mul", literal(3), generation))
+    address = expression("add", expression("mul", literal(4), flat), literal(2))
+    independent = ((owner, literal(0), literal(2)), (generation, literal(0), literal(3)))
+    joint = (*independent, (flat, literal(0), literal(7)))
+    ranges = indexing.IndexRanges({})
+    assert tuple(bound.constant for bound in ranges.interval(address, joint)) == (2, 30)
+    assert tuple(bound.constant for bound in ranges.interval(address, independent)) == (2, 46)
+    actual = [
+        address.evaluate({"$core": core, "$g": g})
+        for core in range(3)
+        for g in range(4)
+        if core + 3 * g < 8
+    ]
+    assert (min(actual), max(actual)) == (2, 30)
+
+
+def test_active_range_input_snapshot_cannot_be_strengthened_or_weakened_in_place():
+    generation, divisor = argument("$g"), argument("divisor")
+    quotient = expression("floordiv", generation, divisor)
+    facts = {"divisor": Fact(minimum=1)}
+    ranges = indexing.IndexRanges(facts)
+    domain = ((generation, literal(0), literal(7)),)
+    original = ranges.interval(quotient, domain)
+    facts["divisor"] = Fact(minimum=0)
+    assert ranges.interval(quotient, domain) == original
+    with pytest.raises(CompileError, match="divisor.*positive"):
+        indexing.IndexRanges(facts).interval(quotient, domain)
+    with pytest.raises(TypeError):
+        ranges.facts["divisor"] = Fact(minimum=0)
+
+
 @pytest.mark.parametrize("width,scale", [(3, 1), (4, 512), (64, 32)])
 def test_expanded_scaled_remainder_retains_its_one_sided_sign(width, scale):
     value = argument("slab")

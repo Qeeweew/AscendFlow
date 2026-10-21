@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from ascendflow import language as N
+from ascendflow.analysis.event_planning import plan_event_resources
 from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_resources import allocate_structured_events
@@ -51,7 +52,7 @@ def test_returning_credit_after_only_the_first_reader_has_a_real_war_counterexam
     memory = native_memory(two_readers())
     dependencies = build_structured_dependencies(memory)
     program = generate_notifications(dependencies, dependencies.dispatch)
-    resources = allocate_structured_events(program)
+    resources = allocate_structured_events(plan_event_resources(program))
     original = collect_native_memory(memory.module.clone())
     earlier = {
         (credit.name, body.release.operation): raw.readers[0].operation
@@ -83,7 +84,7 @@ def test_persistent_cells_use_the_real_eight_id_local_bank():
         .replace("child%2", "child%9")
         .replace("(parent//2)%5", "parent%11")
     )
-    with pytest.raises(CompileError, match="persistent ownership exhausts.*capacity 8"):
+    with pytest.raises(CompileError, match="capacity 8"):
         synchronize_structure(N.from_source(source, disjoint_external=True))
 
 

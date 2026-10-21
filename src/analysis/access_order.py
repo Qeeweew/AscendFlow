@@ -20,6 +20,7 @@ from ..diagnostics import require
 from ..indexing import arguments, domain_nonnegative, normalize_or_identity
 from ..scalar import Expr, expression, literal, substitute
 from ..symbols import Symbol, SymbolKind, is_coordinate
+from ..target.ascend910b import Engine
 from .access_frontier import AccessEndpoint, LoopResidueSelection, QueueEndpoint, ResiduePosition
 from .guard_cover import opposite
 from .hazards import HazardKind
@@ -402,21 +403,51 @@ class _Builder:
         bindings = tuple(LoopBinding(l.operation, l.ordinal) for l in frame.loops())
 
         def ports(points, placement):
-            return unique(
-                AccessOccurrence(
-                    QueueEndpoint(operation, p.participant, frame, self._engine(p), placement),
-                    bindings,
+            groups = {}
+            for point in points:
+                groups.setdefault((point.participant, self._engine(point)), []).append(point)
+            result = []
+            for (actor, engine), sources in groups.items():
+                retired = []
+                if engine is Engine.S and placement is Placement.EXIT:
+                    for point in sources:
+                        if isinstance(point.endpoint, QueueEndpoint):
+                            covered = point.endpoint.retirements
+                        else:
+                            task = self.dispatch.tasks[point.operation, actor]
+                            covered = (point.operation,) if task.implicit_completion else ()
+                        if not covered:
+                            retired = []
+                            break
+                        retired.extend(covered)
+                result.append(
+                    AccessOccurrence(
+                        QueueEndpoint(operation, actor, frame, engine, placement, unique(retired)),
+                        bindings,
+                    )
                 )
-                for p in points
-            )
+            return tuple(result)
 
         result = {}
         for cell, transfer in cells.items():
             self.envelopes[operation, cell] = transfer
             readers = unique(transfer.head_reads + transfer.tail_reads)
+            # Asynchronous reader ports also forward acquired prefixes on
+            # empty paths. A synchronous Scalar observation retires at its
+            # actual execution; when it has no input read, it carries no old
+            # value or unconsumed queue prefix through this invocation.
+            # Keep true head reads and every asynchronous/unknown reader.
+            def synchronous(point):
+                if self._engine(point) is not Engine.S:
+                    return False
+                if isinstance(point.endpoint, QueueEndpoint):
+                    return bool(point.endpoint.retirements)
+                return self.dispatch.tasks[point.operation, point.participant].implicit_completion
+
+            inputs = unique(transfer.head_reads + tuple(p for p in transfer.tail_reads if not synchronous(p)))
             writers = unique(transfer.first_writes + transfer.tail_writes)
             result[cell] = AccessTransfer(
-                ports(readers, Placement.ENTRY),
+                ports(inputs, Placement.ENTRY),
                 ports(writers, Placement.ENTRY),
                 ports(writers, Placement.EXIT),
                 ports(readers, Placement.EXIT),

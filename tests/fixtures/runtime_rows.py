@@ -36,3 +36,27 @@ def rows_output(O:N.Tensor((n,16),N.f32,access="write",write_disjoint=True),n:N.
 """,
         disjoint_external=True,
     )
+
+
+def matrix_overlay():
+    """Identity GEMM exposes every preserved/overlaid NZ row and column."""
+    return N.from_source(
+        '''
+def overlay(A:N.Tensor((32,64),N.f16), B:N.Tensor((32,64),N.f16),
+            Identity:N.Tensor((64,64),N.f16),
+            O:N.Tensor((32,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+    with N.Kernel(kind="cube"):
+        a1=N.alloc_l1((32,64),N.f16)
+        b1=N.alloc_l1((64,64),N.f16)
+        a0=N.alloc_l0a((32,64),N.f16)
+        b0=N.alloc_l0b((64,64),N.f16)
+        c0=N.alloc_l0c((32,64),N.f32)
+        N.copy(A,a1)
+        N.copy(B[:27,:],a1[5:32,:],valid_rows=N.min(n,27))
+        N.copy(Identity,b1)
+        aa=N.copy(a1,a0)
+        bb=N.copy(b1,b0)
+        N.matmul(aa,bb,accum=c0,initialize=True)
+        N.copy(c0,O)
+''', disjoint_external=True,
+    )

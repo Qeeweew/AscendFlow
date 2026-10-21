@@ -23,10 +23,12 @@ from .structured_regions import (
     LoopDomain,
     StructuredNeed,
 )
-from .structured_schedule import ActionGuard, Placement
+from .structured_schedule import ActionGuard, Comparison, Placement
 
 if TYPE_CHECKING:
     from .cell_ownership import CellLifetime
+    from .region_coordinates import ScalarScope
+    from .smt import Exists
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +70,7 @@ class BoundPlacement:
     # Selection happens exactly once. Resource proofs consume these values.
     coordinates: tuple[tuple[Operation, Expr], ...]
     selected: tuple[SelectedOrdinal, ...] = ()
+    scope: ScalarScope | None = None
     _hash: int | None = field(default=None, init=False, compare=False, repr=False)
 
     def __hash__(self):
@@ -83,6 +86,7 @@ class BoundPlacement:
                     self.families,
                     self.coordinates,
                     self.selected,
+                    self.scope,
                 )
             )
             object.__setattr__(self, "_hash", value)
@@ -97,7 +101,8 @@ class BoundPlacement:
         return self.occurrence.participant
 
     def expression(self, value):
-        return substitute(value, dict(self.substitutions))
+        result = substitute(value, dict(self.substitutions))
+        return result if self.scope is None else self.scope.resolve(result)
 
 
 class NotificationKind(str, Enum):
@@ -160,12 +165,28 @@ class OrderingWitness:
 
 
 @dataclass(frozen=True, slots=True)
+class EmptyOrdinalDomain:
+    """Owned UNSAT query from the two occurrences' actual loop headers.
+
+    This is an input-domain fact, never a completion or a verified label.
+    Source arithmetic was already admitted. No source LAST is constructed for
+    an occurrence which has no legal consumer ordinal.
+    """
+
+    requirement: StructuredNeed
+    dispatch: StructuredDispatch
+    premises: tuple[Comparison, ...]
+    answer: Exists
+
+
+@dataclass(frozen=True, slots=True)
 class NotificationCoverage:
     requirement: StructuredNeed
     rule: str
     notification: LogicalNotification | None = None
     ordering: OrderingWitness | None = None
     ownership: CellLifetime | None = None
+    absence: EmptyOrdinalDomain | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,4 +236,21 @@ class SynchronizationSelection:
                 for item in self.coverage
             ),
             "ownership coverage does not belong to its actual cell lifetime",
+        )
+        require(
+            all(
+                sum(
+                    item is not None
+                    for item in (c.notification, c.ordering, c.ownership, c.absence)
+                )
+                == 1
+                and (
+                    c.absence is None
+                    or c.absence.requirement is c.requirement
+                    and c.absence.dispatch is self.dispatch
+                    and c.absence.answer.impossible
+                )
+                for c in self.coverage
+            ),
+            "coverage lacks an owned notification, ordering, ownership, or empty-domain fact",
         )

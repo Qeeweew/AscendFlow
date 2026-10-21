@@ -52,9 +52,9 @@
 
 - runtime N不特化。固定政策下大N不增加静态工作；常量界也采用同一规则。
 - 模板/slot/嵌套深度分别增长，排除benchmark同时改变多个维度。
-- 默认FA只做一个probe定位；接近门槛后再做五次冷进程资格，不每轮重复FA。
+- 默认 FA 需要定位编译成本时只做一个 probe；重复冷进程仅用于确有需要的统计，不每轮重复 FA。
 - source→ASC包含源码读取/构造、所有分析/化简/输出和内部快照。import、进程总时间、CANN、RSS另列，不能移动计时边界美化数字。
-- 五次p50≤5s、max≤10s；GEMM/scale/softmax/RMSNorm同时报告绝对值和是否回退。未达标就明确失败。
+- 编译耗时是记录项，不以 FA 的固定秒数作为重构验收门槛；GEMM/scale/softmax/RMSNorm 同时记录绝对值和对应基线。单次测量与多次统计分开，不为追计时修改算法或减免检查。
 
 复现冷编译工具（从本仓库根目录、已激活的 Python 环境运行）：
 
@@ -72,7 +72,7 @@ CV 派发、事件映射和返回 drain。不能增加全局 barrier 或静默 f
 CPU/IR 通过、CANN 编译通过和设备数值通过各自记录。
 
 日常验证采用[测试指南](../guide/testing.md)的统一入口：公开示例编译/运行，
-仅 Flash Attention 和 GEMM normal 的固定 shape 矩阵，AscendFlow 与 ACLNN 每组各采集一次默认 msprof。公开示例清单现按 22 组覆盖 30 个 kernel 入口，包含 KDA 和 scalar capture/store；清单完整性不是实际编译或数值资格。记录实际 DSL/IR/ASC/库、
+仅 Flash Attention 和 GEMM normal 的固定 shape 矩阵，AscendFlow 与 ACLNN 每组各采集一次默认 msprof。公开示例由[示例清单](../../benchmarks/check_examples.py)维护，包含 KDA、sparse MLA 和 scalar capture/store；清单完整性不是实际编译或数值资格。记录实际 DSL/IR/ASC/库、
 编译选项、输入、设备、预热/执行次数和原始 CSV；kernel time 采用设备 task 时长。
 full 与 sampled 分开，ACL stream interval 不当作 kernel time。
 

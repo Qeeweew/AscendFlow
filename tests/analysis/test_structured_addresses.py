@@ -349,7 +349,7 @@ def test_axis_failure_classification_preserves_an_explicit_analysis_limit(monkey
     decoder = _decoder()
     address = decoder.decode(operation.ref)
 
-    def limited(*args):
+    def limited(*args, **kwargs):
         raise CompileError("algebra limit", kind=ErrorKind.ANALYSIS_LIMIT, witness=("budget",))
 
     monkeypatch.setattr(structured_addresses, "check_axis", limited)

@@ -3,7 +3,8 @@
 Memory/version facts are inputs. Binding establishes the real capture/acquire
 positions; the physical-step rule admits their queue/controller schedule; the
 queue handback rule constructs each finite/loop/reentry ring. An allocator may
-rename these rings and establish sharing constraints, not rediscover progress.
+map these rings to IDs; sharing constraints belong to resource planning, not
+allocation or a rediscovery of progress.
 """
 
 from dataclasses import dataclass

@@ -28,6 +28,21 @@ SSA/代次。opcode、参数或地址 operand 数量改变必须更新描述，�
 构造标量范围 DAG，保留 owner/iteration 的联合区间；原始除法和源码算术仍独立
 检查。Expr 的 free variables 在节点构造时建立，不依赖 range/guard 环境。
 
+AST 捕获在准入前只将常量放到根作用域，其余整数原式保留实际求值位置；operand
+已经可用不授权跨分支或空循环提前求值。后续 pass 仍按已建立的范围与机器语义
+决定外提。原式 unsigned 检查消费完整 lexical 元数据关系，而不将相关端点独立
+代入后丢掉关系。每个条件先检查自身求值；其 signed 比较仅对选中 region 的后续
+访问提供前提，不传播到 sibling 或 merge。bounds 以完整域及条件共同区分义务；
+无法解释的条件不提供范围事实，保留原控制及独立原式检查。
+
+事件成员域对每个 guard 保留其求值前的实际 metadata load/range 前缀。范围即使
+支配最终端点，也不能用于消去在该 load 之前求值的条件。原始 guard 的有序
+定义性先检查，再使用相应输入前缀；不以分支/body 内 load 的合同证明其自身激活。
+在已经假设两个实际端点执行的 handback 子问题内，端点支配 load 的局部范围仍须
+传递，即使 activation 中对应的恒真条件已经消去。范围从真实物理 scope 按端点
+实际坐标和 SID 绑定，不再次平移已实例化的 guard，不注册为全局输入事实。
+原始有序定义性检查和完成/消费约束保留；输入范围本身不提供任何完成边。
+
 原轴范围、实际线性化和 native 子视图已经检查后，若真实 allocation 能容纳
 整个原 tensor，就组合这些事实推出 native 字节边界，不再独立求解展开后的
 非线性 offset。无法建立完整 tensor 容量关系时，仍检查实际 slice 的字节界；
@@ -65,7 +80,7 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 | ready/release覆盖 | notification binding | 真实 capture/acquire、独立覆盖及原始 ownership edges |
 | 配对与事件消费/复用 | 生成器的域、cell credit 与 handback 规则 | 域只检查一次；物理 lifetime 归纳或明确消费回传，rank 不提供消费证据 |
 | 可进展 | queue_order 的分层生成准入 | 零 step phase DAG、正 step 前进；父层只组合 child may-block 边界 |
-| bank/ID/width/quorum | 分配器消费已建生命周期，建立新增资源约束 | 不默认ID共享只是改名；counter FIFO需逐发送者和接收者同序、完整quorum且完整积压≤15；不每候选重新搜索整套路径 |
+| bank/ID/width/quorum | 资源规划建立协议及复用约束；编号分配器检查冻结的有限映射 | 不默认ID共享只是改名；counter 时间复用覆盖每个旧receiver至每个新publisher的消费回传并取最大积压；FIFO需逐端同序、完整quorum及求和积压≤15；编号候选不触发域或handback求解 |
 | 输出对应 | 物化与后端 | 不重选同步，不改native/控制/guard语义 |
 
 上表不表示所有已存在的前置分析都应重写。先对源码确认真实职责，只删除被替代的机制。
@@ -119,6 +134,9 @@ release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继�
 条件首clear和后续RMW保持各自读写合同。private packet的独立性须由精确cell、已定义读、跨代RAW及外部可见状态等前提建立；private或admission成功本身不够。只允许已经论证独立的生命周期按给定dispatch组织。
 
 分支合流不能拼接互斥路径的完成证据。零次路径保留进入前已有的RAW/WAR/WAW。
+数值初始化可由同一 participant 的完整有序分支树建立；变化条件先在共同逐代
+footprint 闭合，再检查实际调用非空并汇总循环，不合并不同 AIV 的独立条件。
+这项定义事实不提供异步完成、所有权退休或事件消费证据。
 区域关系未知时 AliasRegion 保留源码内存顺序，不声称精确 RAW/KILL，也不进入
 稳定 cell credit 或 private packet 重排。外部 write_disjoint 合同只用于没有
 内部 reader 的输出，不免除 scratch 复用、输入退休或双 AIV quorum。
@@ -145,7 +163,12 @@ release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继�
 
 `IntegerFacts`的答案依赖不可变输入环境和完整有序前提；不同环境、绑定或前提不互借，未知不是安全，异常不缓存失败答案。数学规范化不等于原式可以求值。
 
-无符号floor/ceil/rem必须保留原始有序guard的定义性：例如先证明选择非空，再求LAST；不能先代数消去或合取后续条件，掩盖此前非法求值。prefix变化时重新检查受影响原式，同一prefix内共享DAG只需访问一次。运行期guard的短路次序不由数学集合排序决定。
+封闭数学编码器从已编码比较和布尔子式构造 Z3 BoolRef packet，检查其布尔类型与
+共同 context，使用所固定 Z3 版本的同一个原生 AST 构造器。空式、单元素式、
+操作数顺序、重复项和嵌套保持，不重复执行通用 Python 接口的算术 sort 强制转换。
+这不改变输入前提、查询、求解预算或答案；原式定义性和机器范围继续独立检查。
+
+无符号floor/ceil/rem必须保留原始有序guard的定义性：例如先证明选择非空，再求LAST；不能先代数消去或合取后续条件，掩盖此前非法求值。前提变化时重新检查受影响原式；同一有序合取内，后续前缀只追加已成立条件，先前已检查的原始 DAG 节点可保持定义性。该复用不跨 guard 调用，不借后续条件证明更早表达式。运行期guard的短路次序不由数学集合排序决定。
 
 输入/输出IR由本次编译拥有，受控变换保持的事实可继续使用；外部或被修改的物理IR不能借旧结果。当前公共compile拒绝外部物理快照，debug_verify也只有xDSL结构检查，不能宣传为独立同步证明。
 
@@ -156,6 +179,10 @@ release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继�
 的 SSA 范围。逻辑分析记录不随终端重写变成失真的最终事实。后端只消费
 `ExecutablePlan` 中的实际 SSA、静态 geometry/packet 和只读范围，不持有源
 地址或逻辑 frame。终端 native 对应检查不是重新运行同步证明。
+通知物化时，计划中的字面常量只复用支配的 `arith.constant`，缺少时创建常量。
+数学值相同的 actor SID 块参数或算术结果不能替代该表示；动态表达式仍复用真实
+支配 SSA。这样纯标量去重不会经由常量别名把静态 event 指令改成动态 ID 指令，
+也不改变原始 guard、通知动作、编号或事件资源政策。
 标量定义移动到更大执行域时，原域的范围事实失效；目标域重新建立完整求值范围后才能外提。
 
 最终 `simplify_scalars` 在原式、整数范围和通知定义性准入之后执行。整数 CSE 只复用
@@ -166,11 +193,20 @@ release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继�
 完整区间可能溢出时退回未知，不重结合算式。
 unsigned 单位除法/余数使用精确位向量恒等式，不回溯豁免原 DSL 定义性检查。
 本次整数pass保留native、地址、通知和控制身份，SSA操作数只作等价替换。
+arith 的静态类型归属按 IRDL 类复用，实例的 traits、结果数和整数 operand/result
+类型仍逐项检查；此表不保存程序、范围、effects 或优化结果。
 随后的`simplify_conditions`在最终实际SSA上合并条件：保留每层loop/stage的
 独立身份和祖先前提，以差分约束保持`g<N`的关联，不枚举父子循环阶段组合。
 局部条件并集采用区间、吸收及共识化简；有限event slot保留余数之间的关联。
 未知条件保留。只有标量在共同入口完整可求值时才能提前计算，不能将原始
 unsigned LAST/rem移到其定义域之外。
+
+条件 packet 的单个 case 检查实际可达性、按固定范围求交并消去已证明冗余的谓词；
+删除非平凡谓词须由该 case 的其余条件及完整输入前提蕴含。通知分组之后，
+完整 union 的覆盖查询决定公共 guard。event 的剩余选择仍使用
+真实外层条件及完整 atom 范围、modulo 和 base 关系；unknown 保留原条件。
+原式定义性、共同入口 totality/机器范围与事件配对独立检查，该化简不建立
+ownership、完成或通知消费关系。
 
 仅供控制和通知使用的二次幂unsigned余数可精确改写为全定义的位掩码；地址、
 loop header、buffer extent及yield依赖的原式不改写。新表达式沿已有scope增量
@@ -180,6 +216,10 @@ loop header、buffer extent及yield依赖的原式不改写。新表达式沿已
 各次 Set/Wait 贡献及原次序。连续相同 pipe fence 在没有新 native 或其他通知、
 且标量在公共入口可求值时，可按幂等规则合并其执行域并保留全部来源；
 native、循环及未知 effects 结束该区间，不跨边界推断完成。
+
+终端 cross ID 的二选一常量分支使用已建立的互斥域及完整外层覆盖，逐激活选择
+原来的同一个 ID 和同一次通知；相同作用域内的 guard 必须完整可求值。它不移动
+通知、不引入新消费或完成关系，不重新选择编号或合并两个 AIV 的贡献。
 
 后端只消费最终IR。每个pipeline/family打印一个时钟循环和一份stage body，
 相邻同offset stage共用存在guard；N=0时所有stage均不执行，短循环使用同一规则。

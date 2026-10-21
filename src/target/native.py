@@ -22,7 +22,7 @@ CAPACITY = {
 }
 
 
-ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2, "u8": 1, "i64": 8}
+ITEMSIZE = {"f32": 4, "f16": 2, "bf16": 2, "u8": 1, "i32": 4, "i64": 8}
 
 
 def nz_columns(bank, dtype):
@@ -404,11 +404,11 @@ def native_contract(
         require(
             len(refs) == 1
             and banks == ("GM",)
-            and dtypes == ("i64",)
+            and dtypes[0] in {"i32", "i64"}
             and layouts == ("linear",)
-            and lengths == (8,)
+            and lengths == (ITEMSIZE[dtypes[0]],)
             and not params,
-            "index load requires exactly one immutable GM int64",
+            "index load requires exactly one immutable GM int32/int64",
         )
         return "S", ("R",)
     if native in {"mul_columns", "add_columns", "broadcast_columns", "broadcast_rows"}:
@@ -559,13 +559,13 @@ def native_contract(
         require(
             len(refs) == 1
             and banks == ("UB",)
-            and dtypes == ("f32",)
+            and dtypes in {("f32",), ("f16",), ("bf16",)}
             and layouts == ("linear",)
             and refs[0].contiguous
             and lengths[0] > 0
-            and lengths[0] % 4 == 0
+            and lengths[0] % ITEMSIZE[dtypes[0]] == 0
             and not params,
-            "Vector fill needs a contiguous f32 UB destination",
+            "Vector fill needs a contiguous f32/f16/bf16 UB destination",
         )
         return "V", ("W",)
     if native == "mul_outer":
@@ -821,6 +821,20 @@ def native_contract(
             "runtime ND2NZ requires bounded GM rows and a fully zero-defined NZ destination",
         )
         return "MTE2", ("R", "W")
+    if native == "nd2nz_overlay":
+        require(len(params) == 3, "ND2NZ overlay needs row capacity, columns and resident row stride")
+        m, n, resident = params
+        require(
+            1 <= m <= resident <= 256 and resident % 16 == n % 16 == 0
+            and 16 <= n <= 256 and banks == ("GM", "L1") and layouts == ("linear", "NZ")
+            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and refs[0].rows == m and refs[0].nbytes == n * 2
+            and refs[0].row_stride >= n * 2 and refs[0].row_stride % 2 == 0
+            and refs[1].nbytes == m * 32 and refs[1].rows == n // 16
+            and refs[1].row_stride == resident * 32,
+            "ND2NZ overlay requires exact GM rows and pitched b16 NZ row prefixes",
+        )
+        return "MTE2", ("R", "W")
     if native == "nd2nz_pad":
         require(len(params) == 4, "padded ND2NZ requires valid and resident dimensions")
         m, n, pm, pn = params
@@ -844,9 +858,10 @@ def native_contract(
         require(len(params) == 2, "matrix DMA requires (rows, columns)")
         rows, cols = params
         require(
-            16 <= rows <= 256
+            (1 if native == "nd2nz" else 16) <= rows <= 256
             and 16 <= cols <= (65520 if native == "nd2nz" else 256)
-            and rows % 16 == cols % 16 == 0,
+            and (native == "nd2nz" or rows % 16 == 0)
+            and cols % 16 == 0,
             "matrix DMA requires complete b16 fractals and bounded native dimensions",
         )
         require(
@@ -865,7 +880,14 @@ def native_contract(
                 and refs[0].nbytes == cols * ITEMSIZE[dtypes[0]]
                 and refs[0].row_stride % ITEMSIZE[dtypes[0]] == 0
                 and cols <= refs[0].row_stride // ITEMSIZE[dtypes[0]]
-                and refs[1].contiguous,
+                and (
+                    refs[1].contiguous
+                    and rows % 16 == 0
+                    or refs[1].nbytes == rows * nz_columns("L1", dtypes[1]) * ITEMSIZE[dtypes[1]]
+                    and refs[1].rows == cols // nz_columns("L1", dtypes[1])
+                    and refs[1].row_stride % 32 == 0
+                    and refs[1].row_stride >= refs[1].nbytes
+                ),
                 "ND2NZ needs precise GM rows, legal leading dimension and compact NZ output",
             )
             return "MTE2", ("R", "W")

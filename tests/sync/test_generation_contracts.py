@@ -154,13 +154,18 @@ def test_physical_cell_credit_spans_child_and_parent_invocations(parent_credit, 
 
 
 def test_allocation_rejects_coverage_only_instead_of_trusting_a_label():
+    from ascendflow.analysis.event_planning import plan_event_resources
     from ascendflow.analysis.structured_resources import allocate_structured_events
     from examples.vector.scale import scale
 
     selection = selected(scale)
-    with pytest.raises(CompileError, match="generated notification lifetimes"):
+    with pytest.raises(CompileError, match="virtual event resource problem"):
         allocate_structured_events(selection)
-    assert allocate_structured_events(_complete_bindings(selection)).assignments
+    with pytest.raises(CompileError, match="generated notification lifetimes"):
+        plan_event_resources(selection)
+    assert allocate_structured_events(
+        plan_event_resources(_complete_bindings(selection))
+    ).assignments
 
 
 def test_generated_counter_quorum_retains_two_private_actors():
@@ -217,7 +222,58 @@ def test_new_id_sharing_requires_a_real_consumption_handback():
         synchronize_structure(finite_independent_cells(scalar=False))
 
 
-def test_a_finite_credit_fragment_cannot_license_sharing_its_later_loop():
+def test_optional_sharing_knowledge_does_not_change_an_unpressured_kernel(monkeypatch):
+    from ascendflow import compile
+    from ascendflow import language as N
+    from ascendflow.analysis import event_planning
+
+    source = N.from_source(
+        """
+def exclusive():
+    with N.Kernel(1,kind="vector"):
+        cells=N.alloc_ub((3,64),N.f32)
+        for panel in N.unroll(3):
+            N.fill(cells[panel,:],1.0)
+            N.load_scalar(cells[panel,0:1])
+"""
+    )
+    baseline = compile(source)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("optional sharing must not participate without resource pressure")
+
+    monkeypatch.setattr(event_planning, "share_events", forbidden)
+    monkeypatch.setattr(event_planning, "share_counters", forbidden)
+    current = compile(source)
+    assert current.asc == baseline.asc
+    assert current.report["analysis_work"]["resources"]["sharing_pairs"] == 0
+
+
+def test_optional_queue_handbacks_do_not_choose_a_smaller_unpressured_ring(monkeypatch):
+    from ascendflow import compile
+    from ascendflow.analysis.notification_lifetimes import HandbackRule
+    from examples.gemm.hierarchical import hierarchical_gemm
+
+    source = hierarchical_gemm.specialize(M=16, N=16, BK=16, GROUPS=1)
+    baseline = compile(source)
+    assert any(s["width"] == 2 for s in baseline.report["event_resources"]["streams"])
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("optional protocol proofs cannot choose an unpressured ring")
+
+    monkeypatch.setattr(HandbackRule, "smaller_lease", forbidden)
+    current = compile(source)
+    assert current.asc == baseline.asc
+    selection = current.report["event_resources"]["protocol_selection"]
+    assert selection == {
+        "candidates": 1,
+        "selected_option": 0,
+        "changed_streams": [],
+        "preferred_changes": [],
+    }
+
+
+def test_finite_fragment_sharing_also_checks_its_later_loop():
     from ascendflow import language as N
 
     source = finite_independent_cells(scalar=True).source
@@ -232,11 +288,13 @@ def test_a_finite_credit_fragment_cannot_license_sharing_its_later_loop():
         i for a in plan.resources.assignments if a.notification in channel.members for i in a.ids
     }
     assert len(ids) == 1
-    assert all(
-        not ids.intersection(a.ids)
-        for a in plan.resources.assignments
-        if a.notification not in channel.members
-    )
+    shared = {frozenset((w.earlier, w.later)) for w in plan.resources.sharing}
+    for assignment in plan.resources.assignments:
+        if assignment.notification not in channel.members and ids.intersection(assignment.ids):
+            # A proof for the startup member cannot license the later loop.
+            assert all(
+                frozenset((member, assignment.notification)) in shared for member in channel.members
+            )
     for count in (0, 1, 3):
         check_compiled_events(plan, {"n": count}, invocations=2)
 
@@ -262,7 +320,8 @@ def test_a_proved_absent_domain_does_not_consume_finite_event_capacity():
 
 def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch):
     from ascendflow.analysis import event_families
-    from ascendflow.analysis.structured_resources import _EventBanks
+    from ascendflow.analysis.event_planning import plan_event_resources
+    from ascendflow.analysis.structured_resources import allocate_structured_events
     from tests.fixtures.nested import nested_copy
 
     program = _complete_bindings(selected(nested_copy))
@@ -275,18 +334,23 @@ def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch)
         return original(domains, notification)
 
     monkeypatch.setattr(event_families, "build_event_family", only_new_premises)
-    allocator = _EventBanks(program.domains, program.channels, program.boundaries, program.credits)
-    for notification, cases in program.boundaries:
-        assert allocator.handbacks._cases(notification) is cases
-    allocator.allocate({lease.notification: lease for lease in program.leases}, program.order)
+    problem = plan_event_resources(program)
+
+    def no_queries(*args, **kwargs):
+        raise AssertionError("numeric assignment must consume frozen resource premises")
+
+    monkeypatch.setattr(event_families, "build_event_family", no_queries)
+    monkeypatch.setattr(type(program.domains), "_following_conditions", no_queries)
+    allocate_structured_events(problem)
 
 
 def test_configuration_and_final_drain_have_explicit_unborrowed_bank_entries():
+    from ascendflow.analysis.event_planning import plan_event_resources
     from ascendflow.analysis.structured_resources import allocate_structured_events
     from examples.gemm.batched import batched_matmul
 
     program = _complete_bindings(selected(batched_matmul.specialize(M=16, N=16, K=16, GROUPS=1)))
-    plan = allocate_structured_events(program)
+    plan = allocate_structured_events(plan_event_resources(program))
     configuration = [r for r in plan.reservations if r.bank[1] is Engine.S]
     drains = [r for r in plan.reservations if r.bank[2] is Engine.S]
     assert configuration and drains

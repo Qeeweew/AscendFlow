@@ -60,6 +60,32 @@ def complete_each_native(memory):
     materialize_notifications(memory, actions)
 
 
+def test_captured_native_prefix_does_not_invent_fifo_between_distinct_local_set_effects():
+    memory, reference = snapshots('''
+def independent(X:N.Tensor((2,64),N.f32)):
+    with N.Kernel(1,kind="vector"):
+        a=N.alloc_ub((64,),N.f32)
+        b=N.alloc_ub((64,),N.f32)
+        N.copy(X[0,:],a)
+        N.copy(X[1,:],b)
+''')
+    actions = [
+        action(t.operation, Placement.AFTER, SyncKind.LOCAL_SET, Engine.MTE2, Engine.V, (Actor.AIV0,), i)
+        for i, t in enumerate(memory.templates)
+    ]
+    actions.extend(
+        action(memory.templates[-1].operation, Placement.AFTER, SyncKind.LOCAL_WAIT, Engine.MTE2, Engine.V, (Actor.AIV0,), i)
+        for i in range(2)
+    )
+    materialize_notifications(memory, actions)
+    checked = check_structured_events(collect_native_memory(memory.module), logical_reference=reference)
+    sends = [c for c in checked.commands if c.kind == SyncKind.LOCAL_SET.value]
+    assert len(sends) == 2
+    assert all(checked.happens_before(c.end, sends[1].end) for c in checked.natives)
+    assert not checked.happens_before(sends[0].end, sends[1].end)
+    assert not checked.happens_before(sends[1].end, sends[0].end)
+
+
 def local_pipeline():
     memory, reference = snapshots("""
         def stream(X:N.Tensor((n,64),N.f32),

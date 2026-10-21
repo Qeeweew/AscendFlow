@@ -94,7 +94,13 @@ class StructuredDispatch:
         if isinstance(endpoint, QueueEndpoint):
             scope, stage, entry, exit = self.boundaries[endpoint.operation, endpoint.participant]
             lexical = entry * 3 if endpoint.placement is Placement.ENTRY else exit * 3 + 2
-            return IssueSite(scope, stage, lexical, endpoint.engine)
+            for origin in endpoint.retirements:
+                task = self.tasks[origin, endpoint.participant]
+                require(
+                    task.engine is Engine.S and task.implicit_completion,
+                    "queue prefix retirement lost its admitted Scalar source contract",
+                )
+            return IssueSite(scope, stage, lexical, endpoint.engine, bool(endpoint.retirements))
         task = self.tasks[occurrence.operation, occurrence.participant]
         placement = getattr(point, "placement", Placement.BEFORE)
         return IssueSite(

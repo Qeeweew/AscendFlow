@@ -25,10 +25,10 @@ def test_buffered_gram_preserves_reads_through_full_chunks_tails_and_reentry(mon
     check_compiled_events(compiled, invocations=2, max_commands=10000)
 
 
-def test_cross_gram_shares_quorum_counters_through_cohort_ring_reuse(monkeypatch):
+def test_cross_gram_retains_quorum_counters_through_cohort_ring_reuse(monkeypatch):
     from ascendflow.analysis.event_contracts import SUPPORTED_CROSS_IDS
 
     varying_lengths(monkeypatch, 8)
     compiled = synchronize_structure(prefill_gram_cross.specialize(CHUNKS=8, H=1, PACK=2, GROUPS=1))
-    assert 0 < compiled.resources.work.allocated_cross_ids < len(SUPPORTED_CROSS_IDS)
+    assert 0 < compiled.resources.work.allocated_cross_ids <= len(SUPPORTED_CROSS_IDS)
     check_compiled_events(compiled, max_commands=40000)

@@ -86,7 +86,7 @@ _SYNTAX = {
     "int64",
     "constexpr",
 }
-_CONSTANTS = {"f32", "f16", "bf16", "i64"}
+_CONSTANTS = {"f32", "f16", "bf16", "i32", "i64"}
 _BINARY = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,

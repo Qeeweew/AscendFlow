@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from math import isinf
 
-from ..target.native import ITEMSIZE
+from ..target.native import ITEMSIZE, nz_columns
 
 QUALIFIER = {
     "GM": "__gm__",
@@ -19,7 +19,14 @@ QUALIFIER = {
     "L0B": "__cb__",
     "L0C": "__cc__",
 }
-CTYPE = {"f32": "float", "f16": "half", "bf16": "bfloat16_t", "u8": "uint8_t", "i64": "int64_t"}
+CTYPE = {
+    "f32": "float",
+    "f16": "half",
+    "bf16": "bfloat16_t",
+    "u8": "uint8_t",
+    "i32": "int32_t",
+    "i64": "int64_t",
+}
 
 
 _MASKED_ELEMENTS = frozenset(
@@ -180,6 +187,13 @@ def native_line(task, *, pointer_renderer, generation):
             f"asc_copy({bits[1]}, {bits[0]}, uint8_t({task.spec.params[0]}), 1, 0, 8, 1);"
         )
     if task.spec.native in {"fill", "fill_neg_inf"}:
+        if refs[0].dtype in {"f16", "bf16"}:
+            from ..target.scalars import b16_fill_bits
+
+            value = float("-inf") if task.spec.native == "fill_neg_inf" else task.scalar
+            bits = b16_fill_bits(value, refs[0].dtype)
+            destination = p[0].replace(CTYPE[refs[0].dtype] + "*", "uint16_t*")
+            return f"asc_duplicate({destination}, uint16_t({bits}), uint32_t({length(refs[0], 2)}));"
         value = (
             "-__builtin_inff()" if task.spec.native == "fill_neg_inf" else f"float({task.scalar!r})"
         )
@@ -336,6 +350,21 @@ def native_line(task, *, pointer_renderer, generation):
         else:
             call = f"asc_div({pp[2]}, {pp[0]}, {pp[1]}, uint32_t(1));"
         return f"for (int npu_row = 0; npu_row < {rows}; ++npu_row) {{ {call} }}"
+    if task.spec.native == "nd2nz_overlay":
+        maximum, cols, resident_rows = task.spec.params
+        rows = task.operands[0]
+        copy = (
+            f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, uint16_t({rows}), {cols}, 0, "
+            f"{refs[0].row_stride // 2}, {resident_rows}, 1, 0);"
+        )
+        if refs[0].row_stride // 2 > 65535:
+            source = ptr(0, extra="npu_row * " + str(refs[0].row_stride))
+            destination = ptr(1, extra="npu_row * 32")
+            copy = (
+                f"for (int64_t npu_row = 0; npu_row < ({rows}); ++npu_row) {{ "
+                f"asc_copy_gm2l1_nd2nz({destination}, {source}, 1, 1, {cols}, 0, 0, {resident_rows}, 1, 0); }}"
+            )
+        return f"if (({rows}) > 0) {{ {copy} }}"
     if task.spec.native == "nd2nz_rows":
         maximum, cols, resident_rows, resident_cols = task.spec.params
         rows = task.operands[0]
@@ -365,7 +394,13 @@ def native_line(task, *, pointer_renderer, generation):
     if task.spec.native in {"nd2nz", "nd2nz_pad"}:
         rows, cols = task.spec.params[:2]
         padded = task.spec.native == "nd2nz_pad"
-        resident_rows = task.spec.params[2] if padded else rows
+        resident_rows = (
+            task.spec.params[2]
+            if padded
+            else rows
+            if refs[1].contiguous
+            else refs[1].row_stride // (nz_columns("L1", refs[1].dtype) * ITEMSIZE[refs[1].dtype])
+        )
         setup = ""
         if padded:
             setup = (

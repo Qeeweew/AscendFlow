@@ -10,8 +10,9 @@ obligations before executable admission.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
+from math import prod
 from types import MappingProxyType
 
 from xdsl.ir import SSAValue
@@ -28,12 +29,25 @@ from .structured_memory import NativeMemoryFacts
 
 
 @dataclass(frozen=True, slots=True)
+class AddressEnclosure:
+    """An enclosing slice established by checked original-axis bounds.
+
+    Its interval can contain untouched holes. It supplies only spatial
+    separation, never actual effects, initialization, or reader retirement.
+    """
+
+    origin: Expr
+    nbytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class AddressBounds:
     """Bounds and maximum native alignment over listed nonempty use scopes."""
 
     address: AddressFacts
     alignment: int
     frames: tuple[ControlFrame, ...]
+    enclosures: tuple[AddressEnclosure, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,8 +84,8 @@ def _multiple_of(value: Expr, alignment: int, facts: Mapping[str, Fact]) -> bool
     return True
 
 
-def _nonnegative(value, facts, operation, message, *, witness=(), domains=()):
-    if domain_nonnegative(value, domains, facts):
+def _nonnegative(value, facts, operation, message, *, witness=(), domains=(), assumptions=()):
+    if domain_nonnegative(value, domains, facts, assumptions=assumptions):
         return
     constant = exact_constant(value, facts)
     _require(
@@ -245,8 +259,8 @@ def _original_view(address: AddressFacts, facts):
             )
             and all(extent is not None and extent > 0 and extent % 16 == 0 for extent in extents)
             and (column_slice or axes.widths[-2] == extents[0])
-            and axes.widths[-2] % 16 == 0
-            and _multiple_of(axes.origins[-2], 16, facts)
+            and (column_slice or axes.widths[-2] % 16 == 0)
+            and (column_slice or _multiple_of(axes.origins[-2], 16, facts))
             and axes.widths[-1] % 16 == 0
             and _multiple_of(axes.origins[-1], 16, facts)
             and (column_slice or accumulator_columns or axes.widths[-1] == extents[1]),
@@ -263,7 +277,7 @@ def _original_view(address: AddressFacts, facts):
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )
-        if geometry.layout == "NZ" and axes.widths[-2] != extents[0]:
+        if geometry.layout == "NZ" and (axes.widths[-2] != extents[0] or address.valid_rows is not None):
             c0 = nz_columns(geometry.bank, geometry.dtype)
             return (
                 axes.widths[-2] * c0 * itemsize,
@@ -309,6 +323,29 @@ def _subview(address, parent):
     return span
 
 
+def _enclosing_slices(address, facts):
+    """Compose checked axes into contiguous enclosing allocation slices.
+
+    Linear storage permits any fixed leading prefix. Fractal matrices retain
+    their final two axes together; the already checked layout maps every
+    such matrix into its contiguous plane. No native footprint is enlarged.
+    """
+    axes = address.axes
+    extents = tuple(exact_constant(value, facts) for value in axes.extents)
+    if any(size is None or size <= 0 for size in extents):
+        return ()
+    limit = len(extents) - (1 if address.geometry.layout == "linear" else 2)
+    result, origin = [], literal(0)
+    for depth in range(1, limit + 1):
+        axis = depth - 1
+        if axes.widths[axis] != 1 or axis in axes.axes:
+            break
+        stride = prod(extents[depth:]) * ITEMSIZE[address.geometry.dtype]
+        origin = expression("add", origin, expression("mul", axes.origins[axis], literal(stride)))
+        result.append(AddressEnclosure(origin, stride))
+    return tuple(result)
+
+
 def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
     """Prove each actual address once, then check its real nonempty use domains."""
     environment = memory.control.environment
@@ -327,7 +364,7 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                 if bank != "GM" and engine in {Engine.M, Engine.MTE1, Engine.FIX}
                 else ITEMSIZE[access.address.geometry.dtype]
                 if bank == "GM"
-                and template.operation.native.data in {"nd2nz", "nd2nz_pad", "nd2nz_rows", "fix"}
+                and template.operation.native.data in {"nd2nz", "nd2nz_pad", "nd2nz_rows", "nd2nz_overlay", "fix"}
                 else ITEMSIZE[access.address.geometry.dtype]
                 if engine is Engine.S
                 else 32
@@ -352,7 +389,9 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
     for members in views.values():
         address = members[0].address
         alignment = max(item.alignment for item in members)
-        domains = dict.fromkeys(frame.domains() for item in members for frame in item.frames)
+        domains = dict.fromkeys(
+            (frame.domains(), frame.predicates()) for item in members for frame in item.frames
+        )
         operation = address.operation
         _require(
             address.root in allocations, "address has no actual declared allocation", operation
@@ -383,11 +422,14 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                     f"row_stride={address.geometry.row_stride}",
                 ),
             )
-            for domain in domains:
+            for domain, assumptions in domains:
                 domain_contracts += 1
-                checker.check_axes(address, domain)
+                checker.check_axes(address, domain, assumptions=assumptions)
                 if full_tensor or domain_nonnegative(
-                    expression("sub", capacity, tensor_bytes), domain, facts
+                    expression("sub", capacity, tensor_bytes),
+                    domain,
+                    facts,
+                    assumptions=assumptions,
                 ):
                     # The checked linearization maps the bounded original
                     # axes into this tensor; _subview keeps every native byte
@@ -400,6 +442,7 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                     operation,
                     "native byte origin may be negative",
                     domains=domain,
+                    assumptions=assumptions,
                 )
                 remaining = expression(
                     "sub",
@@ -409,15 +452,7 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                         address.offset,
                         literal(span)
                         if address.valid_rows is None
-                        else expression(
-                            "add",
-                            literal(address.geometry.nbytes),
-                            expression(
-                                "mul",
-                                expression("sub", address.valid_rows, literal(1)),
-                                literal(address.geometry.row_stride),
-                            ),
-                        ),
+                        else address.prefix_span(),
                     ),
                 )
                 _nonnegative(
@@ -429,9 +464,10 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                     if address.valid_rows is None
                     else (
                         *domain,
-                        (address.valid_rows, literal(1), literal(address.geometry.rows)),
+                        (address.valid_rows, literal(1), literal(address.row_capacity)),
                     ),
                     witness=(f"span={span}", f"allocation={allocations[address.root].text()}"),
+                    assumptions=assumptions,
                 )
         except CompileError as error:
             if error.phase == "structured-bounds":
@@ -443,6 +479,9 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                 location=str(operation.location),
                 witness=error.witness,
             ) from error
+        enclosures = _enclosing_slices(address, facts)
+        for member in members:
+            admitted[member.address.operation.ref] = replace(member, enclosures=enclosures)
     return MemoryBoundsFacts(
         memory,
         MappingProxyType(allocations),

@@ -271,7 +271,7 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             (0,)
             if operation.native.data == "nd2nz_rows"
             else (0, 1)
-            if operation.native.data == "copy_rows_prefix"
+            if operation.native.data in {"copy_rows_prefix", "nd2nz_overlay"}
             else ()
         )
         require(

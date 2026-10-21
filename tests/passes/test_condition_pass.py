@@ -59,6 +59,64 @@ def action(
     )
 
 
+@pytest.mark.parametrize("events", [(0, 0), (1, 3), (3, 1)])
+def test_mutually_exclusive_notifications_share_for_any_physical_numbers(events):
+    module, memory, task, _, _, g = packet_program()
+    slot = expression("rem", g, literal(2))
+    actions = tuple(
+        action(task, event, (Comparison(slot, "==", literal(i)),)) for i, event in enumerate(events)
+    )
+    materialize_notifications(memory, actions)
+    original = dump(module)
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    assert work.output_notifications == 1
+    for qcount, n in itertools.product(range(3), repeat=2):
+        assert trace(module, {"q": qcount, "n": n}) == trace(parse(original), {"q": qcount, "n": n})
+
+
+@pytest.mark.parametrize("kind", (SyncKind.CROSS_SET, SyncKind.CROSS_WAIT))
+@pytest.mark.parametrize("events", ((0, 1), (11, 3), (7, 7)))
+def test_binary_cross_ids_keep_constant_operands_and_the_actual_notification_word(kind, events):
+    module, memory, task, _, _, g = packet_program()
+    slot = expression("rem", g, literal(2))
+    materialize_notifications(
+        memory,
+        tuple(action(task, event, (Comparison(slot, "==", literal(i)),), kind=kind)
+              for i, event in enumerate(events)),
+    )
+    original = dump(module)
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    notifications = [op for op in module.walk() if isinstance(op, NotificationOp)]
+    assert work.output_notifications == len(notifications) == len(set(events))
+    assert all(isinstance(op.event.owner, arith.ConstantOp) for op in notifications)
+    for qcount, n in itertools.product(range(3), repeat=2):
+        inputs = {"q": qcount, "n": n}
+        assert trace(module, inputs) == trace(parse(original), inputs)
+
+
+@pytest.mark.parametrize("kind", (SyncKind.CROSS_SET, SyncKind.CROSS_WAIT))
+def test_binary_cross_selection_preserves_holes_and_multiple_cases_of_one_id(kind):
+    module, memory, task, _, _, g = packet_program()
+    slot = expression("rem", g, literal(4))
+    materialize_notifications(
+        memory,
+        tuple(action(task, event, (Comparison(slot, "==", literal(i)),), kind=kind)
+              for i, event in ((0, 3), (1, 11), (3, 3))),
+    )
+    original = dump(module)
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    assert work.output_notifications == 2
+    for qcount, n in itertools.product(range(3), repeat=2):
+        inputs = {"q": qcount, "n": n}
+        assert trace(module, inputs) == trace(parse(original), inputs)
+
+
 def test_nested_first_previous_and_slot_cases_become_one_guarded_instruction():
     module, memory, task, q, kv, g = packet_program()
     slot = expression("rem", g, literal(2))
@@ -83,6 +141,50 @@ def test_nested_first_previous_and_slot_cases_become_one_guarded_instruction():
     module.verify()
     assert work.input_notifications == 6 and work.output_notifications == 1
     assert sum(isinstance(op, NotificationOp) for op in module.walk()) == 1
+    for qcount, n in itertools.product(range(4), repeat=2):
+        parameters = {"q": qcount, "n": n}
+        assert trace(module, parameters) == trace(parse(original), parameters)
+
+
+def test_a_constant_id_covering_both_phases_keeps_its_word_and_guard_hole():
+    module, memory, task, q, _, g = packet_program()
+    actions = (
+        action(task, 0, (Comparison(g, ">=", literal(4)),)),
+        action(task, 1, (Comparison(g, "==", literal(3)),)),
+        action(task, 2, (Comparison(q, ">=", literal(1)), Comparison(g, "==", literal(0)))),
+        action(task, 3, (Comparison(q, ">=", literal(1)), Comparison(g, "==", literal(1)))),
+    )
+    materialize_notifications(memory, actions)
+    original = dump(module)
+    simplify_scalars(module)
+    simplify_conditions(module)
+    module.verify()
+    for qcount, n in itertools.product(range(4), repeat=2):
+        parameters = {"q": qcount, "n": n}
+        assert trace(module, parameters) == trace(parse(original), parameters)
+
+
+@pytest.mark.parametrize(
+    "steady,boundary", [((0, 1), (2, 3)), ((4, 5), (0, 1)), ((3, 4), (6, 7))]
+)
+def test_four_ids_with_a_shared_phase_preserve_boundaries_holes_and_every_notification(
+    steady, boundary,
+):
+    module, memory, task, q, _, g = packet_program()
+    slot = expression("rem", g, literal(2))
+    actions = tuple(
+        action(task, event, (Comparison(g, ">=", literal(2)), Comparison(slot, "==", literal(r))))
+        for r, event in enumerate(steady)
+    ) + tuple(
+        action(task, event, (Comparison(q, ">=", literal(1)), Comparison(g, "==", literal(r))))
+        for r, event in enumerate(boundary)
+    )
+    materialize_notifications(memory, actions)
+    original = dump(module)
+    simplify_scalars(module)
+    work = simplify_conditions(module)
+    module.verify()
+    assert work.output_notifications == 1
     for qcount, n in itertools.product(range(4), repeat=2):
         parameters = {"q": qcount, "n": n}
         assert trace(module, parameters) == trace(parse(original), parameters)

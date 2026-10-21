@@ -14,13 +14,13 @@ from ascendflow.analysis.structured_bounds import admit_memory_bounds
 from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
 from ascendflow.analysis.structured_memory import collect_native_memory
-from ascendflow.analysis.structured_resources import allocate_structured_events
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement, SyncAction
 from ascendflow.passes.generate_notifications import generate_notifications
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.structured_sync import _materialize_owned
 from ascendflow.scalar import expression, literal
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
+from tests.support.structured import allocated
 
 LOCAL_SOURCE = """
 def local_free(X:N.Tensor((n,4,64),N.f32),
@@ -76,7 +76,7 @@ def seeded_credit_probe(*, cross=False, remove=None, missing_lane=False, late_re
     dispatch = bind_structured_dispatch(memory)
     dependencies = build_structured_dependencies(memory, admission=admission, dispatch=dispatch)
     generation = generate_notifications(dependencies, dispatch)
-    resources = allocate_structured_events(generation)
+    resources = allocated(generation)
     original = collect_native_memory(structure.module.clone())
     root = structure.module.body.block.first_op
     if cross:

@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from xdsl.ir import Operation
 
 from ..scalar import Expr
-from ..target.ascend910b import Actor, Engine
+from ..target.ascend910b import Actor, Engine, SyncKind
 from .structured_protocols import LogicalNotification, SynchronizationSelection
-from .structured_schedule import SyncAction
+from .structured_schedule import ActionGuard, Placement, SyncAction
 
 if TYPE_CHECKING:
     from .cell_channels import CellChannel
     from .cell_ownership import PersistentCellCredit
+    from .event_counter_groups import CounterGroup
     from .event_domains import EventCase
-    from .event_sharing import CounterSharing, EventSharing
+    from .event_sharing import CounterReuse, CounterSharing, EventSharing
     from .event_windows import EventWindow
     from .notification_lifetimes import Reuse
     from .queue_order import QueueOrder
@@ -38,6 +40,7 @@ class CaseLease:
     inside: tuple[Reuse, ...]
     reentries: tuple[Reuse, ...]
     backlog: int | None = None
+    policy: str = "cell-ownership"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +79,85 @@ class PersistentEventAssignment:
     event: int
 
 
+@dataclass(frozen=True, slots=True)
+class EventDemand:
+    """One complete credit's virtual lanes, independent of hardware numbers."""
+
+    members: tuple[LogicalNotification, ...]
+    width: int
+    banks: tuple[LocalBank, ...]
+    backlog: int | None = None
+    persistent: PersistentCellCredit | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VirtualEventAction:
+    """A fixed real instruction site with a virtual lane or target-fixed ID."""
+
+    anchor: Operation
+    placement: Placement
+    participants: tuple[Actor, ...]
+    kind: SyncKind
+    source: Engine
+    destination: Engine
+    guard: ActionGuard
+    protocols: tuple[str, ...]
+    resource: int | None = None
+    phase: Expr | None = None
+    fixed_id: int | None = None
+
+
+@dataclass(frozen=True, init=False)
+class EventResourceProblem:
+    """Owned, frozen resource premises; no domain or solver service is exposed.
+
+    Construct with plan_event_resources. Relations cover all members of each
+    complete credit. A missing/None relation supplies no reuse permission.
+    CounterSharing pairs still require a whole CounterGroup for FIFO packing.
+    Work is diagnostic accounting only and never an allocation premise.
+    """
+
+    selection: SynchronizationSelection
+    order: QueueOrder
+    leases: tuple[StructuredEventLease, ...]
+    channels: tuple[CellChannel, ...]
+    demands: tuple[EventDemand, ...]
+    uses: tuple[tuple[LogicalNotification, int | None], ...]
+    actions: tuple[VirtualEventAction, ...]
+    peers: tuple[tuple[int, int], ...]
+    counter_groups: tuple[CounterGroup, ...]
+    counter_reuses: Mapping[tuple[int, int], tuple[CounterReuse, ...]]
+    reservations: tuple[EventReservation, ...]
+    relations: Mapping[tuple[int, int], tuple[EventSharing | CounterSharing, ...] | None]
+    work: ResourceWork
+    # Frozen smaller protocols, in cumulative structural order. They carry
+    # their own phases and constraints; allocation never asks for more facts.
+    alternatives: tuple[EventResourceProblem, ...]
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError("construct event resources with plan_event_resources")
+
+
+@dataclass(frozen=True, slots=True)
+class EventAllocation:
+    """A checked finite mapping of every demand's virtual lanes to real IDs."""
+
+    ids: tuple[tuple[int, ...], ...]
+    sharing: tuple[EventSharing | CounterSharing | CounterReuse, ...]
+    counter_groups: tuple = ()
+    option: int = 0
+    counter_reuse_groups: tuple[CounterReuseGroup, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CounterReuseGroup:
+    event: int
+    resources: tuple[int, ...]
+    messages: tuple[tuple[int, LogicalNotification], ...]
+    backlog: int
+    witnesses: tuple[CounterReuse, ...]
+
+
 @dataclass(slots=True)
 class ResourceWork:
     notifications: int = 0
@@ -99,6 +181,15 @@ class ResourceWork:
     allocated_cross_ids: int = 0
     maximum_counter_backlog: int = 0
     persistent_cells: int = 0
+    coloring_nodes: int = 0
+    peer_equalities: int = 0
+    counter_groups: int = 0
+    protocol_candidates: int = 0
+    selected_protocol_option: int = 0
+    counter_time_pairs: int = 0
+    counter_time_cache_hits: int = 0
+    boundary_instances: int = 0
+    boundary_instance_reuses: int = 0
 
 
 @dataclass(frozen=True)
@@ -112,5 +203,8 @@ class StructuredEventPlan:
     work: ResourceWork
     channels: tuple[CellChannel, ...]
     banks: tuple[EventBankUsage, ...]
-    sharing: tuple[EventSharing | CounterSharing, ...] = ()
+    sharing: tuple[EventSharing | CounterSharing | CounterReuse, ...] = ()
     persistent: tuple[PersistentEventAssignment, ...] = ()
+    counter_groups: tuple = ()
+    preferred_leases: tuple[StructuredEventLease, ...] = ()
+    counter_reuse_groups: tuple[CounterReuseGroup, ...] = ()

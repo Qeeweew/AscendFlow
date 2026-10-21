@@ -15,11 +15,12 @@ class DType(StrEnum):
     F32 = "f32"
     F16 = "f16"
     BF16 = "bf16"
+    I32 = "i32"
     I64 = "i64"
 
 
 f32, f16, bf16 = DType.F32, DType.F16, DType.BF16
-i64 = DType.I64
+i32, i64 = DType.I32, DType.I64
 
 
 class _ParameterType(StrEnum):
@@ -114,7 +115,8 @@ def copy(source, destination, *, valid=None, valid_rows=None, transpose=False, p
     ``pad_value=0`` explicitly defines the complete destination NZ plane.
     A smaller GM destination exports the top-left accumulator rectangle.
     ``valid_rows`` copies a runtime leading-row prefix of a static matrix:
-    GM→L1 requires zero padding; UB→GM writes only that prefix.
+    GM→L1 with pad_value=0 defines the full destination; without padding it
+    preserves the remaining NZ rows. UB→GM writes only that prefix.
     """
     _ast_only()
 
@@ -204,7 +206,7 @@ def store_scalar(value, *, out):
 
 
 def load_index(source, *, minimum=0, maximum):
-    """Read one immutable GM int64 with an inclusive input value contract.
+    """Read one immutable GM int32/int64 with an inclusive input value contract.
 
     Bounds describe the caller's metadata, and may use preceding index loads.
     They are not runtime clamps or promises of unique ownership.
@@ -238,7 +240,11 @@ def cast(source, *, out, mask=None, scratch=None):
 
 
 def fill(destination, value, *, mask=None, scratch=None):
-    """Fill a complete f32 UB tile, or its predicate-selected lanes only.
+    """Fill a contiguous f32/f16/bf16 UB tile; masked updates require f32.
+
+    Constants first round to f32, then b16 destinations round RN ties to even.
+    Signed zero, subnormals and infinities retain their IEEE representation;
+    finite b16 overflow rounds to infinity. NaN is not accepted.
 
     ``mask=False`` lanes keep their old destination value, so masked fills and
     masked arithmetic require an already initialized destination. Coordinate

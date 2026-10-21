@@ -49,6 +49,10 @@ AscendFlow 在 example 表达裁剪、对角 mask 和任务顺序，通用编译
   计数器 ID 共享须保持完整 quorum、相同激活域，逐发送者和接收者证明消息
   同序，并检查完整积压不超过 15；两个 AIV 发送者本身不构成拒绝理由。
 - GM→UB/UB→GM的burst/gap单位、L1→L0转置和Fixpipe配置以2201头文件为准；原生recipe精确effects必须涵盖内部展开。
+- 2201 `vector_compute/asc_duplicate` 的 uint16 count 重载建立 count mask、执行
+  16 位 Vector Dup 后恢复 Normal 模式。b16 fill 按目标 IEEE 位型使用此重载，
+  count 是 16 位元素数，effects 为目标 view 的完整 W；不把剩余 repeat lane
+  算作写入，也不从包内 mask 设置推导异步完成。恢复 Normal 不恢复旧 bitmap。
 - ready、reader release、event credit、最终drain不是同一种里程碑。仅在原语有明确合同的情况下使用内部早读完成；默认不猜指令内部退休时间。
 - kernel初始化、控制寄存器状态及返回drain保留已有必要合同；局部循环边界不引入PIPE_ALL。
 - CANN 9.1 `asc/impl/basic_api/kernel_reg.h` 明确禁止 `PipeBarrier<PIPE_S>`。

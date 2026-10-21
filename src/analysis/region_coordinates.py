@@ -7,11 +7,12 @@ or perform notification/lifetime analysis.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 from ..diagnostics import require
-from ..indexing import normalize_or_identity
+from ..indexing import arguments, equivalent, normalize_or_identity
 from ..scalar import Expr, expression, infer, literal, substitute
+from ..symbols import Symbol
 from .access_frontier import LoopResidueSelection, ResiduePosition
 from .structured_regions import (
     BranchGuard,
@@ -22,6 +23,44 @@ from .structured_regions import (
     StructuredNeed,
 )
 from .structured_schedule import Comparison
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarScope:
+    """Actual dominating values available after an occurrence coordinate map.
+
+    A metadata symbol names both its load and its invocation coordinates.
+    Translating j to j-1 and back may leave algebraically equal captures with
+    different DAGs. Rebind only to the same real definition with every capture
+    proved equal. Matching the diagnostic name or the origin alone is unsafe.
+    Facts are the one owned environment; this never authorizes a new load or
+    changes evaluation/activation of a source arithmetic expression.
+    """
+
+    values: tuple[Expr, ...]
+    facts: object = field(compare=False, hash=False, repr=False)
+
+    def resolve(self, value):
+        if not self.values:
+            return value
+        bindings = {}
+        for symbol in arguments(value):
+            if not isinstance(symbol, Symbol) or not symbol.captures:
+                continue
+            for available in self.values:
+                target = available.args[0]
+                if (
+                    symbol.kind is target.kind
+                    and symbol._identity == target._identity
+                    and len(symbol.captures) == len(target.captures)
+                    and all(
+                        equivalent(a, b, self.facts)
+                        for a, b in zip(symbol.captures, target.captures, strict=True)
+                    )
+                ):
+                    bindings[Expr("argument", (symbol,))] = available
+                    break
+        return substitute(value, bindings)
 
 
 class RegionCoordinates:

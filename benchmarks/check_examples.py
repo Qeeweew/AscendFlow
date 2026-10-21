@@ -269,6 +269,15 @@ def examples():
             "validation/results.json",
         )
     )
+    result.append(
+        Example(
+            "sparse-mla-decode",
+            (("examples/sparse_attention/decode.py", "sparse_mla_decode"),),
+            ("benchmarks.attention.run_sparse", "--build"),
+            ("benchmarks.attention.run_sparse",),
+            result_glob="device.json",
+        )
+    )
     return tuple(result)
 
 

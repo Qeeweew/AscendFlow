@@ -6,8 +6,9 @@ import pytest
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType
 
-from ascendflow.analysis.structured_resources import _combine_actions
-from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement, SyncAction
+from ascendflow.analysis.event_contracts import EventDemand, VirtualEventAction
+from ascendflow.analysis.event_peers import bind_event_peers
+from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement
 from ascendflow.scalar import Expr, literal
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 
@@ -20,21 +21,26 @@ def anchor():
 
 
 def action(anchor, actor, event, *, label):
-    return SyncAction(
+    return VirtualEventAction(
         anchor,
         Placement.BEFORE,
         (actor,),
         SyncKind.LOCAL_WAIT,
         Engine.MTE2,
         Engine.MTE1 if actor is Actor.AIC else Engine.V,
-        literal(event),
+        ActionGuard(),
         protocols=(label,),
+        fixed_id=event,
     )
+
+
+def _combine_actions(actions):
+    return bind_event_peers((), actions)[1]
 
 
 def trace(actions, actor, **values):
     return [
-        (a.anchor, a.placement, a.kind, a.source, a.destination, a.event.evaluate(values))
+        (a.anchor, a.placement, a.kind, a.source, a.destination, a.fixed_id)
         for a in actions
         if actor in a.participants and a.guard.evaluate(values)
     ]
@@ -73,7 +79,7 @@ def test_real_participant_differences_keep_their_own_execution(anchor, differenc
     left = action(anchor, Actor.AIV0, 0, label="left")
     right = action(anchor, Actor.AIV1, 0, label="right")
     if difference == "id":
-        right = replace(right, event=literal(1))
+        right = replace(right, fixed_id=1)
     elif difference == "guard":
         right = replace(
             right, guard=ActionGuard((Comparison(Expr("argument", ("n",)), ">", literal(0)),))
@@ -128,3 +134,25 @@ def test_equal_actions_on_one_actor_are_never_deduplicated(anchor):
     assert _combine_actions(original) == original
     vector = (action(anchor, Actor.AIV0, 0, label="vector"),) * 2
     assert _combine_actions(vector) == vector
+
+
+def test_private_peers_request_equal_numbers_before_mapping_and_keep_separate_banks(anchor):
+    demands = tuple(
+        EventDemand((), 1, ((actor, Engine.MTE2, Engine.V),)) for actor in (Actor.AIV0, Actor.AIV1)
+    )
+    actions = tuple(
+        replace(
+            action(anchor, actor, 0, label=actor.value), fixed_id=None, resource=i, phase=literal(0)
+        )
+        for i, actor in enumerate((Actor.AIV0, Actor.AIV1))
+    )
+    peers, combined = bind_event_peers(demands, actions)
+    assert peers == ((0, 1),)
+    assert len(combined) == 1 and combined[0].participants == (Actor.AIV0, Actor.AIV1)
+    assert demands[0].banks != demands[1].banks
+
+    # An unmatched second use makes these different virtual streams, even
+    # if a later allocation happens to assign both the integer zero.
+    other = replace(actions[1], anchor=arith.ConstantOp.from_int_and_width(1, IndexType()))
+    peers, combined = bind_event_peers(demands, (*actions, other))
+    assert peers == () and len(combined) == 3

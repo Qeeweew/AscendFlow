@@ -9,6 +9,7 @@ notification and control operations keep their identities.
 
 from dataclasses import dataclass, field
 from fractions import Fraction
+from functools import cache
 from math import gcd
 from types import MappingProxyType
 from typing import Self
@@ -61,7 +62,7 @@ class ScalarFacts:
         result = cls(_runtime_limits(index_extrema))
         if control is None:
             return result
-        from ..indexing import interval, nonnegative, normalize, polynomial
+        from ..indexing import IndexRanges, nonnegative, normalize, polynomial
 
         facts = {
             name: Fact(
@@ -133,6 +134,7 @@ class ScalarFacts:
             return answer
 
         symbolic = {}
+        active_ranges = IndexRanges(facts)
         for operation, frame in control.frames.items():
             for value in (
                 *operation.results,
@@ -156,10 +158,10 @@ class ScalarFacts:
                             continue
                     key = expr, frame.domains()
                     if key not in symbolic:
-                        low, high = interval(expr, frame.domains(), facts)
+                        low, high = active_ranges.interval(expr, frame.domains())
                         if expr.kind == "floordiv":
                             numerator, divisor = expr.args
-                            nl, nh = interval(numerator, frame.domains(), facts)
+                            nl, nh = active_ranges.interval(numerator, frame.domains())
                             gap = Expr("add", (divisor, Expr("mul", (literal(-1), nh))))
                             if nonnegative(nl, facts) and nonnegative(
                                 Expr("add", (gap, literal(-1))), facts
@@ -185,6 +187,12 @@ class ScalarFacts:
 _ARITH_OPERATIONS = tuple(arith.Arith.operations)
 _UNSIGNED = (arith.DivUIOp, arith.CeilDivUIOp, arith.RemUIOp)
 _SIGNS = ({0}, {-1, 1}, {-1}, {-1, 0}, {1}, {0, 1})
+
+
+@cache
+def _arithmetic_type(operation_type):
+    """Static IRDL membership only; no instance trait or program fact."""
+    return issubclass(operation_type, _ARITH_OPERATIONS)
 
 
 def _constant(value):
@@ -214,7 +222,7 @@ def _limits(value):
 
 def _scalar_arithmetic(op):
     return (
-        isinstance(op, _ARITH_OPERATIONS)
+        _arithmetic_type(type(op))
         and (op.has_trait(Pure) or isinstance(op, _UNSIGNED))
         and len(op.results) == 1
         and all(

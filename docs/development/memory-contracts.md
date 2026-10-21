@@ -35,11 +35,38 @@ write_disjoint 不保证每次写完整 tensor、全部输出都被写到、初�
 
 ## 访问顺序与数值定义
 
+只读 INT32 / INT64 元数据由同一个 `index_load` 原语读取一个实际元素，effects
+分别为 4 / 8 字节，返回有符号扩展后的 index SSA。其 inclusive 最小/最大值是
+调用方输入合同，不生成 clamp，也不授予写权限或不同索引的唯一性。
+原轴访问检查保留支配读取的范围关系及已求值分支条件，不能借用随后条件证明
+更早的 unsigned 运算合法。条件访问的范围通过不代替初始化合流、存储分区或
+通知生命周期准入。
+
 `structured_access` 是实际 native footprint 的唯一输入。StorageCell 表示可选的
 精确字节区域；AliasRegion 表示无法排除重叠的同一存储实例。两者都由
 `access_order` 建立可能冲突的 RAW/WAR/WAW；RAW 在这里是顺序义务，不宣称
 某个 writer 是唯一数值 producer。初始化、源 Tile 借用与原式定义性由 admission
 独立负责，部分写不能代替完整初始化。
+
+完整分支树可以共同定义读取区域，但合流只在同一实际 participant 内进行。
+条件保留实际 SSA、metadata 捕获坐标和有序前缀；逐代写入须覆盖相同的真实
+footprint，再沿可证明非空的 writer loop 汇总。对 child loop 不变的条件，
+允许先汇总各分支自己的完整循环。循环的非空性使用调用入口域，不借循环
+body 内的范围排除零次路径。不同 AIV 的独立条件、不同 metadata 定义、
+缺少的叶分支、错位或不完整写入不能拼接成完整定义。
+
+这里建立的是数值初始化，不是异步 ready、精确 ownership KILL 或事件消费。
+masked/RW 更新先需要旧值有定义；runtime 部分写不以容量上界提供完整定义。
+完整数值定义前沿不收录 runtime 部分写，避免它按相同静态几何去重掉后续完整写。
+这不删除真实写入的 effects、可能覆盖关系或同步义务。
+同一只读源可以有多个 reader，实际覆盖前仍须保留所有 reader 的退休义务。
+
+原轴、布局、子视图和 allocation bounds 通过后，bounds 可以给出连续的外包切片。
+例如环形 NZ 矩阵的部分行访问仍被包含在自己的矩阵平面内。分区器可用这些切片
+保留有限槽位的分离；它们只划分 AliasRegion 的顺序域，不扩大真实读写字节，
+不提供完整初始化、精确 KILL 或持久 cell credit。公共原点必须在 kernel group 内
+不变，所有访问使用同一原点及对齐的有限切片；未知时继续保守处理整个 allocation。
+共享 GM 每个切片仍保留两个 AIV 的独立域，Cube 参与双方，不能少一个 quorum 贡献。
 
 `AccessTransfer` 保存 head reader、首次可能写、尾部可能写和未退休 reader。
 条件写取静态候选的并集，保留输入 writer/reader；不构造条件摘要的笛卡尔积。
@@ -71,6 +98,27 @@ GM→L1 的补零目标是完整写入；GM输入只有实际行数的读取。U
 使用保守 AliasRegion 保持可能重叠的源码顺序，不虚构精确覆盖/KILL；私有
 UB的保守读取上界仍保持真实最后 reader。有限执行模型按实际行数解释字节，
 并覆盖零行、部分行、完整行和重入。
+
+GM→L1 不指定 `pad_value` 时，`copy(valid_rows=r)` 只覆盖目标的逻辑行前缀，
+其余目标保持。当前支持 b16、16 列对齐、至多 256 行/列的 L1 NZ view。
+GM 读取是 ND 的 `r` 行；NZ 写入是每个列块内的 `r*32` 字节前缀，保留 resident
+行距和真实行偏移。两侧 count 必须对应同一实际 SSA，0 行不发 DMA。部分写
+不能初始化完整矩阵，也不能按静态容量建立精确 KILL 或持久 credit。
+需要完整定义的调用先补零或拷入完整矩阵，再覆盖已定义存储。
+
+metadata 的范围属于真实 load 及其 SID、祖先迭代坐标。事件分析逐 guard 保存
+求值前已经支配它的 load/range 前缀，只用这份前缀消去恒真的 metadata 条件，
+保留原始有序 guard。支配端点不表示支配此前的 guard：分支或 loop body 内的
+load 不能反过来证明该分支会进入或该 loop 非空；未执行的 load 不限制外部输入。
+重复出现的 guard 保留最早求值点的前提。不把局部范围注册为全局 constexpr。
+事件 handback 已假设旧消费和新发布两个实际端点执行时，分别消费它们的支配
+load 范围，按真实 SID 和各层实际坐标绑定一次。消去恒真 activation 不丢弃这份
+局部输入合同；不同代次仍可读取不同值。自己的 load 之前没有自己的范围事实。
+这些前提不用于证明先前 guard 的可求值性，不借用尚未执行的可选 relay，也不
+建立异步完成关系或新的事件共享政策。
+同步 Scalar 的 EXIT 可保留实际已退休的 load 身份；没有入口旧值读取的同步
+观察无需导出额外入口 reader。异步 reader、真正 head read 和 Scalar store
+继续保留各自的前缀与完成义务。
 
 未知区域关系可能减少可用并行性。固定排步不兼容、事件容量不足或控制协议
 不能组合时具体拒绝，不加全局 barrier 或改排步。普通 loop 出口没有统一 drain；

@@ -87,7 +87,7 @@ def test_nonfill_language_scalars_and_default_rounding_remain_finite(value):
         with pytest.raises(FrontendError, match="Vector scalar must be finite"):
             scalar_source(value, operation).to_ir()
     with pytest.raises(FrontendError, match="requires f32"):
-        scalar_source(value, dtype="f16").to_ir()
+        scalar_source(value, operation="mul", dtype="f16").to_ir()
 
 
 def fill_literals(asc):

@@ -193,13 +193,16 @@ def lower_address(
             and axes == (len(shape) - 2, len(shape) - 1)
             and (column_slice or dimensions[0] == shape[-2])
             and (column_slice or accumulator_columns or dimensions[1] == shape[-1])
-            and all(size > 0 and size % 16 == 0 for size in dimensions)
+            and dimensions[0] > 0
+            and (column_slice or dimensions[0] % 16 == 0)
+            and dimensions[1] > 0
+            and dimensions[1] % 16 == 0
             and (column_slice or _constant(view.origins[-2]) == 0)
             and (column_slice or accumulator_columns or _constant(view.origins[-1]) == 0),
             "fractal view needs a complete matrix plane, aligned L1 NZ rectangle or full-row L0C columns",
             unsupported=True,
         )
-    if typ.layout.data == "NZ" and dimensions[0] != shape[-2]:
+    if typ.layout.data == "NZ" and (dimensions[0] != shape[-2] or view.valid is not None):
         c0 = nz_columns(typ.memory.data, typ.dtype.data)
         nbytes, rows, row_stride = (
             dimensions[0] * c0 * itemsize,

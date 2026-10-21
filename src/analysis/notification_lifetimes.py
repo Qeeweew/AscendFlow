@@ -9,7 +9,7 @@ including outer reentry. A finite upper bound can instead give one ID per use.
 
 from dataclasses import dataclass
 
-from ..diagnostics import CompileError, ErrorKind
+from ..diagnostics import CompileError, ErrorKind, require
 from ..scalar import expression, literal, substitute
 from .event_contracts import CROSS_BACKLOG, LOCAL_CAPACITY, CaseLease, StructuredEventLease
 from .guard_cover import opposite, prove_guard_cover
@@ -45,6 +45,7 @@ class HandbackRule:
             n for n in domains.notifications if n.mechanism is not NotificationKind.PIPE_FENCE
         )
         self.at_native = {}
+        self.at_queue = {}
         self.boundary_cases = dict(boundaries)
         self.declined_boundaries = {}
         for peer in self.peers:
@@ -52,6 +53,10 @@ class HandbackRule:
                 self.at_native.setdefault((source.operation, source.actor), []).append(
                     (peer, source)
                 )
+                site = domains.dispatch.site(source)
+                self.at_queue.setdefault(
+                    (site.scope, site.stage, source.actor, peer.source_engine), []
+                ).append((peer, source))
 
     def _eligible(self, old_channel, old, target_channel, target, peer):
         return (
@@ -177,8 +182,29 @@ class HandbackRule:
                         for sources, consumers in d._instances(peer, case, loop, offset)
                     )
 
-    def establish(self, channel, old, target_channel, target, assumptions, *, loop, delta, reentry):
+    def establish(
+        self,
+        channel,
+        old,
+        target_channel,
+        target,
+        assumptions,
+        *,
+        loop,
+        delta,
+        reentry,
+        queue_composition=True,
+        max_relays=2,
+    ):
+        require(max_relays in (1, 2), "handback rule supports one or two required relays")
         d = self.domains
+        # This reuse domain already assumes both actual endpoints execute.
+        # Their dominating load contracts survive activation simplification,
+        # remain specific to their SID/generation, and provide no completion
+        # edge or premise for an optional relay that has not yet executed.
+        assumptions = tuple(
+            dict.fromkeys(assumptions + d._input_ranges(old) + d._input_ranges(target))
+        )
         conditions, handbacks = [], []
 
         def add(guard, relay=None, source=None, wait=None):
@@ -243,9 +269,13 @@ class HandbackRule:
                             add(guard, peer, source, wait)
             if covered():
                 return tuple(handbacks)
-        # Compose two required handoffs at one *actual native occurrence*.
-        # This is the MTE2 -> Vector -> MTE3 rule (and the same general
-        # native-boundary rule on Cube), not arbitrary interface path search.
+        if max_relays == 1:
+            return None
+        # Compose two required handoffs through one actual intermediate queue.
+        # Publications at the same native remain the narrowest case. A later
+        # publication in the same stage/queue can also carry the consumption,
+        # but only with its own checked queue order and occurrence binding.
+        # This is a bounded two-handoff rule, not arbitrary path search.
         first_peers = tuple(
             p
             for p in self.peers
@@ -257,9 +287,20 @@ class HandbackRule:
             first_peers, loop, delta, reentry=reentry, old=old, target=target
         ):
             for middle in consumers:
-                for second, second_source in self.at_native.get(
-                    (middle.operation, middle.actor), ()
-                ):
+                site = d.dispatch.site(middle)
+                seconds = dict.fromkeys(
+                    (
+                        *self.at_native.get((middle.operation, middle.actor), ()),
+                        *(
+                            self.at_queue.get(
+                                (site.scope, site.stage, middle.actor, peer.destination_engine), ()
+                            )
+                            if queue_composition
+                            else ()
+                        ),
+                    )
+                )
+                for second, second_source in seconds:
                     if (
                         second in (channel, peer)
                         or not any(target.actor is w.actor for w in second.consumers)
@@ -279,6 +320,9 @@ class HandbackRule:
                             continue
                         d.work.handback_compositions += 1
                         ss = d._instance(second_source, bindings, case=case)
+                        via = d._following_conditions(peer, middle, second, ss)
+                        if not via:
+                            continue
                         match = tuple(
                             Comparison(v, "==", dict(ss.coordinates)[l])
                             for l, v in middle.coordinates
@@ -297,23 +341,25 @@ class HandbackRule:
                             ):
                                 last = d._following_conditions(second, wait, target_channel, target)
                                 for a in first:
-                                    for b in last:
-                                        guard = ActionGuard(
-                                            tuple(
-                                                dict.fromkeys(
-                                                    active
-                                                    + wait.guard.comparisons
-                                                    + a.comparisons
-                                                    + b.comparisons
+                                    for middle_order in via:
+                                        for b in last:
+                                            guard = ActionGuard(
+                                                tuple(
+                                                    dict.fromkeys(
+                                                        active
+                                                        + wait.guard.comparisons
+                                                        + a.comparisons
+                                                        + middle_order.comparisons
+                                                        + b.comparisons
+                                                    )
                                                 )
                                             )
-                                        )
-                                        add(guard, (peer, second), (source, ss), (middle, wait))
+                                            add(guard, (peer, second), (source, ss), (middle, wait))
                         if covered():
                             return tuple(handbacks)
         return None
 
-    def reuse(self, channel, case, window, width, *, reentry):
+    def reuse(self, channel, case, window, width, *, reentry, queue_composition=True):
         d, loop = self.domains, window.loop
         ordinal = d.control.loops[loop].ordinal
         result = []
@@ -352,6 +398,7 @@ class HandbackRule:
                         loop=loop,
                         delta=delta,
                         reentry=reentry,
+                        queue_composition=queue_composition,
                     )
                     if rule is None:
                         return None
@@ -359,40 +406,23 @@ class HandbackRule:
             result.append(Reuse(loop, delta, None, condition, tuple(handbacks)))
         return tuple(result)
 
-    def case(self, channel, case):
-        d = self.domains
-        d.work.ring_cases += 1
-        cross = channel.mechanism is NotificationKind.CROSS_EVENT
-        capacity = CROSS_BACKLOG if cross else LOCAL_CAPACITY
-        width, rings, inside, reentries = 1, [], [], []
-        if not case.windows:
-            inside.append(Reuse(None, 0, 1, case.condition))
-        for index in reversed(range(len(case.windows))):
-            window = case.windows[index]
-            for candidate in range(1, capacity // width + 1):
-                if window.upper is not None and window.upper <= candidate:
-                    uses = (Reuse(window.loop, 0, window.upper, case.condition),)
-                else:
-                    uses = self.reuse(
-                        channel, case, window, candidate, reentry=index < len(case.windows) - 1
-                    )
-                if uses is not None:
-                    break
-            else:
-                d.fail(
-                    channel,
-                    "queue handback rule cannot establish consumption before reuse within event capacity",
-                    phase="notification-generation-lifetime",
-                    witness=tuple(
-                        f"optional relay {n.name}: {e.phase}"
-                        for n, e in self.declined_boundaries.items()
-                    ),
-                )
-            width *= candidate
-            rings.insert(0, (window, candidate))
-            (inside if index == len(case.windows) - 1 else reentries).extend(uses)
-        ordinal = literal(0)
+    def _uses(self, channel, case, window, width, *, reentry, queue_composition):
+        if window.upper is not None and window.upper <= width:
+            return (Reuse(window.loop, 0, window.upper, case.condition),)
+        return self.reuse(
+            channel,
+            case,
+            window,
+            width,
+            reentry=reentry,
+            queue_composition=queue_composition,
+        )
+
+    @staticmethod
+    def _case_lease(case, rings, uses, *, cross, policy):
+        width, ordinal = 1, literal(0)
         for window, ring in rings:
+            width *= ring
             local = (
                 literal(0)
                 if window.single or ring == 1
@@ -404,13 +434,114 @@ class HandbackRule:
             1 if cross else width,
             ordinal,
             tuple(rings),
-            tuple(inside),
-            tuple(reentries),
+            tuple(uses[-1]) if uses else (Reuse(None, 0, 1, case.condition),),
+            tuple(r for group in uses[:-1] for r in group),
             width if cross else None,
+            policy,
         )
 
-    def leases(self):
-        return tuple(self.lease(n) for n in self.peers)
+    def case(self, channel, case):
+        """Preferred protocol: finite uses and native-boundary handbacks.
+
+        Later queue-composition knowledge is an optional resource premise.
+        It must not silently choose a narrower ring for an accepted preferred
+        protocol. A failed whole case may require smaller earlier dimensions;
+        retry once with queue-composition allowed throughout. The resource
+        planner separately requests optional changes to accepted protocols.
+        """
+        d = self.domains
+        d.work.ring_cases += 1
+        cross = channel.mechanism is NotificationKind.CROSS_EVENT
+        capacity = CROSS_BACKLOG if cross else LOCAL_CAPACITY
+        proofs = {}
+
+        def construct(modes):
+            width, rings, uses = 1, [], []
+            policy = "native-handback"
+            for index in reversed(range(len(case.windows))):
+                window = case.windows[index]
+                for queue_composition in modes:
+                    proof = None
+                    for candidate in range(1, capacity // width + 1):
+                        key = index, candidate, queue_composition
+                        if key not in proofs:
+                            proofs[key] = self._uses(
+                                channel,
+                                case,
+                                window,
+                                candidate,
+                                reentry=index < len(case.windows) - 1,
+                                queue_composition=queue_composition,
+                            )
+                        proof = proofs[key]
+                        if proof is not None:
+                            break
+                    if proof is not None:
+                        if queue_composition:
+                            policy = "required-queue-handback"
+                        break
+                else:
+                    return None
+                width *= candidate
+                rings.insert(0, (window, candidate))
+                uses.insert(0, proof)
+            return self._case_lease(case, rings, uses, cross=cross, policy=policy)
+
+        preferred = construct((False, True))
+        if preferred is not None:
+            return preferred
+        # A dimension's handback depends on its real endpoints and width,
+        # never the other ring digits. Their independently smallest proved
+        # widths minimize the product, without a Cartesian protocol search.
+        required = construct((True,))
+        if required is not None:
+            return required
+        d.fail(
+            channel,
+            "queue handback rule cannot establish consumption before reuse within event capacity",
+            phase="notification-generation-lifetime",
+            witness=tuple(
+                f"optional relay {n.name}: {e.phase}"
+                for n, e in self.declined_boundaries.items()
+            ),
+        )
+
+    def smaller_lease(self, lease):
+        """One finite, monotonically smaller option; no ring Cartesian product.
+
+        Change a dimension only with its own complete handback. Unchanged
+        dimensions retain their original facts, including outer reentry.
+        Optional queue relays never insert or move an instruction.
+        """
+        channel, cases = lease.notification, []
+        cross = channel.mechanism is NotificationKind.CROSS_EVENT
+        for old in lease.cases:
+            rings = list(old.rings)
+            uses = [
+                tuple(r for r in (*old.reentries, *old.inside) if r.loop is window.loop)
+                for window, _ in rings
+            ]
+            for index in reversed(range(len(rings))):
+                window, width = rings[index]
+                for candidate in range(1, width):
+                    proof = self._uses(
+                        channel,
+                        old.case,
+                        window,
+                        candidate,
+                        reentry=index < len(rings) - 1,
+                        queue_composition=True,
+                    )
+                    if proof is not None:
+                        rings[index] = window, candidate
+                        uses[index] = proof
+                        break
+            cases.append(
+                old
+                if tuple(rings) == old.rings
+                else self._case_lease(old.case, rings, uses, cross=cross, policy="resource-shrink")
+            )
+        return StructuredEventLease(channel, max((c.width for c in cases), default=0), tuple(cases))
 
     def lease(self, notification):
         cases = tuple(

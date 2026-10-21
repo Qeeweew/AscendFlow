@@ -60,6 +60,7 @@ class Compilation:
         """Orchestrate the sole source pipeline; print its final physical IR."""
         from dataclasses import asdict
 
+        from .analysis.resource_report import event_resource_report
         from .backend.structured import EmissionWork, _emit_owned
         from .passes.structured_sync import synchronize_structure
 
@@ -114,6 +115,7 @@ class Compilation:
             "required_dependencies": len(plan.dependencies.required),
             "selected_protocols": len(plan.selection.notifications),
             "sync_instructions": len(plan.resources.actions),
+            "event_resources": event_resource_report(plan.resources),
             "witnesses": [
                 {
                     "source": getattr(coverage.requirement.source, "operation", None).uid.data

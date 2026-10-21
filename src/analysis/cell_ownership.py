@@ -200,6 +200,18 @@ def bind_cell_credits(domains):
                     kind=ErrorKind.UNSUPPORTED,
                     phase="persistent-cell-order",
                     location=str(consumer.operation.location),
+                    witness=(
+                        f"{item.name}: {need.kind.value} on {need.cell.root.owner.sym_name.data}",
+                        (
+                            f"{item.source_engine.value}->{item.destination_engine.value}; "
+                            f"source={source.placement.value} {source.operation.location}; "
+                            f"consumer={consumer.placement.value} {consumer.operation.location}"
+                        ),
+                        "source coordinates: "
+                        + ", ".join(value.text() for _, value in source.coordinates),
+                        "consumer coordinates: "
+                        + ", ".join(value.text() for _, value in consumer.coordinates),
+                    ),
                 )
             witnesses.append(
                 OrderingWitness(

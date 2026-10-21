@@ -227,8 +227,9 @@ def rotated(X:N.Tensor((3,n,64),N.f32),Out:N.Tensor((3,n,64),N.f32,access="write
     memory = native_memory(source)
     nonnegative = structured_bounds.domain_nonnegative
 
-    def capacity_query(value, domains, facts):
+    def capacity_query(value, domains, facts, *, assumptions=()):
         assert not domains, "bounded axes must not be re-proved as one flat nonlinear address"
+        assert not assumptions
         return nonnegative(value, domains, facts)
 
     monkeypatch.setattr(structured_bounds, "domain_nonnegative", capacity_query)

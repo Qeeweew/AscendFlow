@@ -327,13 +327,18 @@ class _Trace:
         return self._pure(op)
 
     def _pure(self, op):
-        """Place pure arithmetic where all its operands first become available."""
-        scopes = []
+        """Keep original arithmetic in its evaluation scope until admission.
+
+        Operand availability alone does not authorize speculative division or
+        overflowing arithmetic before a branch or an empty loop. Constants
+        may be shared at the root; later scalar passes hoist admitted work.
+        """
+        from xdsl.dialects import arith
+
         for value in op.operands:
             block = value.owner if isinstance(value.owner, Block) else value.owner.parent
             require(block in self.blocks, "index expression escaped its source scope")
-            scopes.append(self.blocks.index(block))
-        depth = max(scopes, default=0)
+        depth = 0 if isinstance(op, arith.ConstantOp) else len(self.blocks) - 1
         block = self.blocks[depth]
         key = (
             block,
@@ -1237,11 +1242,10 @@ def copy(source, destination, *, valid=None, valid_rows=None, transpose=False, p
             and len(src.shape) == len(dst.shape) == 2
             and (
                 (src.buffer.memory, dst.buffer.memory) == ("GM", "L1")
-                and pad_value == 0
                 or (src.buffer.memory, dst.buffer.memory) == ("UB", "GM")
                 and pad_value is None
             ),
-            "valid_rows requires a zero-padded GM→L1 or UB→GM matrix copy",
+            "valid_rows requires a GM→L1 or UB→GM matrix copy",
         )
     if transpose:
         require(
@@ -1329,7 +1333,12 @@ def _element(kind, values, out, scalar=None, valid=None, scratch=None, mask=None
             all(v.shape == dst.shape for v in inputs),
             "elementwise operands require equal tile shape",
         )
-    if kind != "cast":
+    if kind == "fill" and mask is None:
+        require(
+            dst.buffer.dtype in {f32, f16, bf16},
+            "fill requires f32, f16 or bf16",
+        )
+    elif kind != "cast":
         require(
             dst.buffer.dtype == f32 and all(v.buffer.dtype == f32 for v in inputs),
             "arithmetic currently requires f32; use explicit cast",

@@ -553,6 +553,27 @@ class _Build:
         for op in reversed(tuple(self.block.ops)):
             self.block.erase_op(op, safe_erase=False)
 
+    def static_binary_event(self, cases):
+        """Encode two constant mode-2 IDs as one branch, preserving the word.
+
+        Variable wait_flag_dev/config operands are costly on 2201. The packet
+        already established mutual exclusion and a covering outer guard; its
+        first alternative therefore selects one of exactly these two IDs.
+        This changes only the terminal encoding, never allocation or sharing.
+        Larger/variable selectors retain the ordinary scalar representation.
+        """
+        alternatives = {}
+        for cube, op in cases:
+            event = _constant(op.event)
+            if event is None:
+                return None
+            alternatives.setdefault(event, []).append((cube, op))
+        if len(alternatives) != 2:
+            return None
+        left, right = alternatives.values()
+        condition = self.guard(self.domains.union([cube for cube, _ in left]))
+        return condition, (left, right)
+
     def event(self, cases):
         events = [op.event for _, op in cases]
         if (
@@ -626,6 +647,10 @@ class _Build:
 
 
 def _instruction(op):
+    # Instruction sharing depends only on route and mutually exclusive
+    # execution domains, never numeric IDs or virtual credit identity.
+    # Allocation may simplify the resulting scalar selector, but cannot
+    # decide which notifications are grouped or change their contributions.
     return op.kind, op.source, op.destination, op.participants
 
 
@@ -745,6 +770,7 @@ def _packet(operations, scope, work, ranks, changed):
             original = group[0][1]
             event = original.event
             event_builder = None
+            static_event = None
             if event is not None and len(group) > 1:
                 nested = _Domains(contexts[-1], ranks)
                 nested.tests.update(domains.tests)
@@ -758,7 +784,12 @@ def _packet(operations, scope, work, ranks, changed):
                 ]
                 event_builder = _Build(nested)
                 try:
-                    event = event_builder.event(relative)
+                    if original.kind.data in {
+                        SyncKind.CROSS_SET.value, SyncKind.CROSS_WAIT.value
+                    }:
+                        static_event = event_builder.static_binary_event(relative)
+                    if static_event is None:
+                        event = event_builder.event(relative)
                 except _Unchanged:
                     event_builder.discard()
                     raise
@@ -766,6 +797,19 @@ def _packet(operations, scope, work, ranks, changed):
                     event_builder.block.detach_op(scalar)
                     blocks[-1].add_op(scalar)
                     contexts[-1].defined.update(scalar.results)
+            if static_event is not None:
+                condition, alternatives = static_event
+                branches = (Block(), Block())
+                blocks[-1].add_op(scf.IfOp(condition, [], *(Region(b) for b in branches)))
+                for branch, members in zip(branches, alternatives, strict=True):
+                    selected = members[0][1]
+                    placeholder = selected.clone()
+                    placeholder.attributes["protocol"] = StringAttr(
+                        ", ".join(dict.fromkeys(op.protocol.data for _, op in members))
+                    )
+                    branch.add_ops((placeholder, scf.YieldOp()))
+                    replacements.append((selected, placeholder))
+                continue
             placeholder = original.clone()
             if event is not None:
                 placeholder.operands = (event,)
@@ -800,7 +844,7 @@ def _packet(operations, scope, work, ranks, changed):
         builder.detach_op(op)
     work.packets += 1
     work.input_notifications += len(cases)
-    work.output_notifications += len(groups)
+    work.output_notifications += len(replacements)
     work.removed_fences += sum(
         len(group) - 1 for group in groups if group[0][1].kind.data == SyncKind.FENCE.value
     )

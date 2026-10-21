@@ -59,7 +59,7 @@ def test_shared_raw_dag_work_follows_unique_nodes_across_both_operands(monkeypat
     assert unique_nodes <= calls <= 2 * unique_nodes
 
 
-def test_each_comparison_establishes_shared_nodes_under_its_own_complete_prefix(monkeypatch):
+def test_shared_nodes_keep_definedness_through_prefix_extensions_only(monkeypatch):
     queries = IntegerFacts({"y": Fact()})
     value = Expr("rem", (X, D))
     nonnegative = Comparison(X, ">=", literal(0))
@@ -80,9 +80,9 @@ def test_each_comparison_establishes_shared_nodes_under_its_own_complete_prefix(
     assert prefixes == [
         (nonnegative, positive),
         (nonnegative, positive),
-        (nonnegative, positive, first, extra),
-        (nonnegative, positive, first, extra),
     ]
+    # The earlier checks imply definedness under the extended prefix. A
+    # separate call still checks its own first use, without future premises.
     assert queries.ordered_definedness((first, nonnegative, positive)) == (nonnegative, ())
     assert queries.ordered_definedness((nonnegative, first, positive)) == (
         positive,

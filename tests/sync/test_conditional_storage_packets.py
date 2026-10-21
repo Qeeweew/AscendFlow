@@ -12,7 +12,6 @@ from ascendflow import language as N
 from ascendflow.analysis.access_frontier import QueueEndpoint
 from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_memory import collect_native_memory
-from ascendflow.analysis.structured_resources import allocate_structured_events
 from ascendflow.passes.generate_notifications import _complete_bindings
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.materialize_structure import materialize_notifications
@@ -24,7 +23,7 @@ from tests.models.structured_events import (
     check_compiled_events,
     check_structured_events,
 )
-from tests.support.structured import native_memory
+from tests.support.structured import allocated, native_memory
 
 SCRATCH_CALLS = """
 def scratch_calls(X:N.Tensor((n,2,4,64),N.f32),
@@ -89,7 +88,7 @@ def test_closed_prefixes_do_not_license_one_binary_id_for_a_whole_cell():
     # optional closed-round precision. All original requirements remain.
     dependencies = replace(dependencies, order=replace(dependencies.order, cell_lifetimes=()))
     selection = bind_notifications(dependencies, dependencies.dispatch)
-    resources = allocate_structured_events(_complete_bindings(selection))
+    resources = allocated(_complete_bindings(selection))
     groups = {}
     for assignment in resources.assignments:
         item = assignment.notification

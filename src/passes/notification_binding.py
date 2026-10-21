@@ -11,15 +11,15 @@ from __future__ import annotations
 from dataclasses import replace
 from math import gcd, lcm
 
-from xdsl.dialects import arith
-
 from ..analysis.access_frontier import LoopResidueSelection, QueueEndpoint, ResiduePosition
 from ..analysis.integer_facts import IntegerFacts
+from ..analysis.region_coordinates import ScalarScope
 from ..analysis.smt import all_of, any_of
 from ..analysis.structured_dependencies import StructuredDependencies
 from ..analysis.structured_dispatch import StructuredDispatch
 from ..analysis.structured_protocols import (
     BoundPlacement,
+    EmptyOrdinalDomain,
     FamilyCapture,
     LogicalNotification,
     NotificationCoverage,
@@ -41,7 +41,7 @@ from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import TaskOp
 from ..indexing import arguments, equivalent, nonnegative, normalize
 from ..scalar import Expr, expression, literal
-from ..symbols import is_coordinate
+from ..symbols import Symbol, is_coordinate, symbol_order
 from ..target.ascend910b import Actor, Engine
 
 
@@ -62,24 +62,15 @@ def _comparison(test, substitutions, facts):
     return Comparison(lhs, test.predicate, rhs)
 
 
-def _branch_test(operation, branch, environment):
-    comparison = operation.cond.owner
+def _branch_test(operation, branch, control):
+    tests = control.branches[operation, branch]
     require(
-        isinstance(comparison, arith.CmpiOp),
-        "notification branch guard needs an actual integer comparison",
+        len(tests) == 1, "notification branch guard needs an admitted signed integer comparison"
     )
-    predicates = ("==", "!=", "<", "<=", ">", ">=")
-    predicate = comparison.predicate.value.data
-    require(predicate < len(predicates), "unsigned notification branch guard is unsupported")
-    op = predicates[predicate]
-    if branch:
-        op = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}[op]
-    return Comparison(
-        environment.expression(comparison.lhs), op, environment.expression(comparison.rhs)
-    )
+    return tests[0]
 
 
-def _case_tests(guards, environment):
+def _case_tests(guards, control):
     """Retain effect predicates in the requirement's consumer coordinates."""
     for guard in guards:
         if isinstance(guard, LoopCountGuard):
@@ -88,7 +79,7 @@ def _case_tests(guards, environment):
             yield guard.comparison
         else:
             assert isinstance(guard, BranchGuard)
-            yield _branch_test(guard.operation, guard.branch, environment)
+            yield _branch_test(guard.operation, guard.branch, control)
 
 
 def _guard(tests):
@@ -216,6 +207,14 @@ def _bind_endpoint(
             # This load dominates the actual insertion scope. Its SSA result
             # may be consumed here; no reload or different iteration is used.
             available.update(arguments(environment.expression(operation.value)))
+    scalar_scope = ScalarScope(
+        tuple(
+            Expr("argument", (symbol,))
+            for symbol in sorted(available, key=symbol_order)
+            if isinstance(symbol, Symbol) and symbol.captures
+        ),
+        environment.facts,
+    )
     for binding in occurrence.bindings:
         logical = control.loops[binding.loop]
         available.add(logical.ordinal.args[0])
@@ -355,14 +354,14 @@ def _bind_endpoint(
     tests.extend(
         _case_tests(
             _effective_guards(need, memory) if effective_guards is None else effective_guards,
-            environment,
+            control,
         )
     )
 
     # Selector equalities compare the current actual ordinal, whereas every
     # other test is phrased in the requirement's logical consumer coordinates.
     rendered = [
-        _branch_test(frame.operation, frame.branch, environment)
+        _branch_test(frame.operation, frame.branch, control)
         for frame in occurrence.frame.ancestors()
         if frame.branch is not None
     ]
@@ -371,7 +370,10 @@ def _bind_endpoint(
         Comparison(test.lhs, test.predicate, substitute(test.rhs, actual_substitutions))
         for test in selector_tests
     )
-    guard = _guard(rendered)
+    guard = _guard(
+        Comparison(scalar_scope.resolve(t.lhs), t.predicate, scalar_scope.resolve(t.rhs))
+        for t in rendered
+    )
     require(
         all(arguments(test.lhs) | arguments(test.rhs) <= available for test in guard.comparisons),
         "notification retains another invocation's unbound coordinate",
@@ -396,6 +398,7 @@ def _bind_endpoint(
         tuple(families),
         tuple(coordinates),
         tuple(selections),
+        scalar_scope,
     )
 
 
@@ -441,6 +444,8 @@ class _IssueOrder:
         self._premises = {}
         self._guards = {}
         self._positions = {}
+        self._domains = {}
+        self._occurrences = {}
 
     def guards(self, need):
         if need not in self._guards:
@@ -453,12 +458,11 @@ class _IssueOrder:
             self._positions[key] = _dispatch_path(point, self.dispatch)
         return self._positions[key]
 
-    def premises(self, need):
-        if need not in self._premises:
-            control = self.dispatch.memory.control
-            tests = list(_case_tests(need.guards, control.environment))
+    def ordinal_domain(self, need):
+        if need.domains not in self._domains:
+            tests = []
             for domain in sorted(need.domains, key=lambda item: self._loop_order[item.loop]):
-                ordinal = control.loops[domain.loop].ordinal
+                ordinal = self.dispatch.memory.control.loops[domain.loop].ordinal
                 tests.extend(
                     (
                         Comparison(ordinal, ">=", literal(max(domain.first, domain.distance))),
@@ -473,8 +477,48 @@ class _IssueOrder:
                             _integer(domain.residue),
                         )
                     )
+            self._domains[need.domains] = tuple(dict.fromkeys(tests))
+        return self._domains[need.domains]
+
+    def premises(self, need):
+        if need not in self._premises:
+            tests = (
+                *_case_tests(need.guards, self.dispatch.memory.control),
+                *self.ordinal_domain(need),
+            )
             self._premises[need] = tuple(dict.fromkeys(tests))
         return self._premises[need]
+
+    def occurrence_domain(self, need):
+        """Overapproximate real endpoint activation from actual loop headers.
+
+        Advisory need domains cannot prove an occurrence absent. Bind the
+        source and consumer separately, retaining their distinct invocations.
+        Stop before a FIRST/LAST selector: no selected value is evaluated to
+        decide whether that very occurrence exists.
+        """
+        key = need.source, need.consumer
+        if key not in self._occurrences:
+            tests = []
+            control = self.dispatch.memory.control
+            for point in key:
+                if not isinstance(point, AccessOccurrence):
+                    continue
+                coordinates = {}
+                for binding in point.bindings:
+                    if not isinstance(binding.ordinal, Expr):
+                        break
+                    logical = control.loops[binding.loop]
+                    count = substitute(logical.count, coordinates)
+                    tests.extend(
+                        (
+                            Comparison(binding.ordinal, ">=", literal(0)),
+                            Comparison(binding.ordinal, "<", count),
+                        )
+                    )
+                    coordinates[logical.ordinal] = binding.ordinal
+            self._occurrences[key] = tuple(dict.fromkeys(tests))
+        return self._occurrences[key]
 
     def compare(self, before, after, need):
         """Return -1/0/1 only for proved order on one actual controller."""
@@ -633,12 +677,8 @@ def _implicit(notification, order):
         # do not materialize PIPE_S fences for a Scalar store/load through a
         # loop output port. Publication to Vector still needs S->V below.
         return "ordered Scalar memory instructions before later Scalar admission"
-    if (
-        native.engine is Engine.S
-        and native.implicit_completion
-        and not isinstance(source.occurrence.endpoint, QueueEndpoint)
-    ):
-        return "synchronous Scalar native end before controller dispatch"
+    if native.engine is Engine.S and native.implicit_completion:
+        return "synchronous Scalar source retirement before controller dispatch"
     if native.engine is notification.destination_engine and native.implicit_completion:
         return "qualified native completion before later same-engine admission"
     return None
@@ -915,6 +955,22 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
         bundles.setdefault(key, []).append(need)
     for bundle in bundles.values():
         need = bundle[0]
+        # Branch predicates from distinct invocations are deliberately absent
+        # from this query. Only the actual canonical ordinal domain can prove
+        # that no consumer exists; original source arithmetic remains checked.
+        domain = order.occurrence_domain(need)
+        if domain:
+            answer = order.arithmetic.queries.satisfies(domain)
+            if answer.impossible:
+                coverage.extend(
+                    NotificationCoverage(
+                        n,
+                        "empty actual ordinal domain",
+                        absence=EmptyOrdinalDomain(n, dispatch, domain, answer),
+                    )
+                    for n in bundle
+                )
+                continue
         if not isinstance(need.source, AccessOccurrence):
             unresolved.extend(
                 UnresolvedSynchronization(n, "incoming memory port is not bound") for n in bundle
@@ -953,8 +1009,8 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
                 notifications.append(item)
         except CompileError as error:
             unresolved.append(UnresolvedSynchronization(need, error.message))
-    # Physical cells own binary credits. Keep disjoint slot residues here;
-    # allocation may unite their instruction spelling after assigning IDs.
+    # Physical cells own complete credits. Keep slot-residue notifications
+    # distinct; resource planning establishes virtual peers before numbering.
     grouped = _group_captures(notifications, order)
     grouped, quorum_issues = _quorums(grouped, order)
     grouped = _group_captures(grouped, order)

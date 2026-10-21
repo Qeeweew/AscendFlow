@@ -63,6 +63,10 @@ class QueueEndpoint:
     frame: ControlFrame
     engine: Engine
     placement: Placement
+    # Source identities covered by synchronous Scalar retirement at EXIT.
+    # A plain queue cut carries no such completion fact. ENTRY, Vector/Cube
+    # work and Scalar stores never gain this controller-completion contract.
+    retirements: tuple[TaskOp, ...] = ()
 
     def __post_init__(self):
         require(
@@ -70,6 +74,16 @@ class QueueEndpoint:
             and self.placement in (Placement.ENTRY, Placement.EXIT)
             and supports_engine(self.participant, self.engine),
             "queue endpoint needs a real region boundary and participant queue",
+        )
+        require(
+            isinstance(self.retirements, tuple)
+            and (
+                not self.retirements
+                or self.engine is Engine.S
+                and self.placement is Placement.EXIT
+                and all(isinstance(op, TaskOp) for op in self.retirements)
+            ),
+            "only a Scalar EXIT prefix can retain synchronous source retirements",
         )
 
 

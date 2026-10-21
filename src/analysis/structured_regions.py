@@ -152,6 +152,11 @@ class AliasRegion:
     # source access domains; an AIC access participates in every such domain.
     # This preserves both AIV contributions without inventing peer ordering.
     peer: Actor | None = None
+    # Optional disjoint enclosing interval established from bounded original
+    # axes. It partitions ordering only: actual byte effects and
+    # partial-write definedness remain on MemoryAccess, never a cell KILL.
+    interval: tuple[int, int] | None = None
+    origin: Expr | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,7 +18,9 @@ from tests.models.structured_events import (
 )
 
 
-@pytest.mark.parametrize("messages,reverse", [(2, False), (2, True), (16, False)])
+@pytest.mark.parametrize(
+    "messages,reverse", [(2, False), (2, True), (16, False), (17, False), (17, True)]
+)
 def test_counter_packing_requires_fifo_receivers_and_bounds_the_whole_backlog(messages, reverse):
     # The sixteen-message case is a finite broadcast with no feedback; the
     # two-message cases additionally exercise the reusable physical ring.
@@ -62,21 +64,42 @@ def messages(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
         for witness in plan.resources.sharing
         if isinstance(witness, CounterSharing) and witness.earlier.sources[0].actor is Actor.AIC
     ]
-    assert bool(packed) != reverse
+    # Reversing the imports needs the last publication first. Its existing
+    # prefix acquire covers the remaining imports before resource allocation.
+    assert bool(packed) == (messages > len(SUPPORTED_CROSS_IDS) and not reverse)
+    if reverse:
+        # Reversed messages may still pack mutually exclusive ring residues
+        # at identical sites; they cannot share distinct reversed messages.
+        assert all(a.operation is b.operation for w in packed for a, b in w.ordered_points)
     assert all(
         len(witness.earlier.sources) == len(witness.later.sources) == 1 for witness in packed
     )
     assert 0 < plan.resources.work.maximum_counter_backlog <= 15
-    if messages > 15:
-        # An ordered stream still needs another ID once its complete credits
-        # could collectively leave sixteen unconsumed contributions.
-        assert plan.resources.work.maximum_counter_backlog == 15
+    if messages == 16:
+        # Keep the capacity counterexample independently of the allocator's
+        # preference for exclusive IDs: forcing all sixteen messages onto
+        # one counter permits more than fifteen outstanding contributions.
+        from xdsl.dialects import arith
+        from xdsl.dialects.builtin import IndexType
+
+        mutant = plan.module.clone()
+        root = mutant.body.block.first_op.body.block
+        zero = arith.ConstantOp.from_int_and_width(0, IndexType())
+        root.insert_op_before(zero, root.first_op)
+        for op in mutant.walk():
+            if isinstance(op, NotificationOp) and op.kind.data in {
+                SyncKind.CROSS_SET.value,
+                SyncKind.CROSS_WAIT.value,
+            }:
+                op.operands = (zero.result,)
+        with pytest.raises(EventModelError, match="counter backlog"):
+            check_structured_events(collect_native_memory(mutant), {"n": 1}, max_commands=30000)
     for count in (0, 1, 2, 3):
         # One kernel invocation; count=3 also exercises physical-ring reuse.
         # Repeating complete mixed bodies without a launch completion edge
         # would let another AIC overwrite GM before the old AIV has returned.
         execution = check_compiled_events(plan, {"n": count}, max_commands=30000)
-        if count == 1 and not reverse:
+        if count == 1:
             publications = [
                 c
                 for c in execution.natives
@@ -87,11 +110,17 @@ def messages(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
                 for c in execution.natives
                 if c.source is Engine.MTE2 and c.occurrence.actor is Actor.AIV0
             )
-            assert not execution.happens_before(publications[1].end, first_import.begin)
+            if reverse:
+                assert execution.happens_before(publications[-1].end, first_import.begin)
+            else:
+                assert not execution.happens_before(publications[1].end, first_import.begin)
 
 
-@pytest.mark.parametrize("messages,reverse", [(2, False), (2, True), (4, False)])
+@pytest.mark.parametrize(
+    "messages,reverse", [(2, False), (2, True), (4, False), (5, False), (5, True), (17, False)]
+)
 def test_two_publishers_share_only_with_matching_fifo_and_complete_quorums(messages, reverse):
+    count = "N.min(n,1)" if messages > 15 else "n"
     source = N.from_source(
         f"""
 def messages(A:N.Tensor((n,{messages},32,16),N.f16),B:N.Tensor((16,16),N.f16),
@@ -108,7 +137,7 @@ def messages(A:N.Tensor((n,{messages},32,16),N.f16),B:N.Tensor((16,16),N.f16),
         with N.Cube():
             N.copy(B,b1)
             N.copy(b1,b0)
-        for i in N.Dataflow(n):
+        for i in N.Dataflow({count}):
             with N.Vector() as lane, N.Stage(0):
                 for panel in N.unroll({messages}):
                     N.copy(A[i,panel,lane*16:lane*16+16,:],x)
@@ -116,10 +145,16 @@ def messages(A:N.Tensor((n,{messages},32,16),N.f16),B:N.Tensor((16,16),N.f16),
             with N.Cube(), N.Stage(1):
                 for panel in N.unroll({messages}):
                     column={messages}-1-panel if {reverse} else panel
-                    N.copy(Work[i%2,column,:,:],a1[column,:,:])
-                    N.copy(a1[column,:,:],a0)
+                    destination=0 if {messages}>15 else column
+                    N.copy(Work[i%2,column,:,:],a1[destination,:,:])
+                    if {messages}<=15:
+                        N.copy(a1[column,:,:],a0)
+                        N.matmul(a0,b0,accum=c0,initialize=True)
+                        N.copy(c0,Out[i,column,:,:])
+                if {messages}>15:
+                    N.copy(a1[0,:,:],a0)
                     N.matmul(a0,b0,accum=c0,initialize=True)
-                    N.copy(c0,Out[i,column,:,:])
+                    N.copy(c0,Out[i,0,:,:])
 """,
         disjoint_external=True,
     )
@@ -131,7 +166,19 @@ def messages(A:N.Tensor((n,{messages},32,16),N.f16),B:N.Tensor((16,16),N.f16),
         for witness in plan.resources.sharing
         if isinstance(witness, CounterSharing) and len(witness.earlier.sources) == 2
     ]
-    assert bool(packed) != reverse
+    # Five ring-buffered panels pressure the combined namespace, but either
+    # direction's complete words may supply the necessary packing. Seventeen
+    # finite forward messages force the actual two-publisher path to pack.
+    if messages > 15:
+        assert packed
+    if messages <= 4:
+        assert not packed
+    for _, certificate, members in plan.resources.counter_groups:
+        assert set(members) <= set(certificate.resources)
+        assert all(word == certificate.words[0][2] for _, _, word in certificate.words)
+        assert all(bound <= 15 for _, bound in certificate.contributions)
+    if reverse:
+        assert all(a.operation is b.operation for w in packed for a, b in w.ordered_points)
     assignments = {
         assignment.notification: assignment.ids for assignment in plan.resources.assignments
     }

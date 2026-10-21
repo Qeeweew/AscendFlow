@@ -359,10 +359,12 @@ class _Partitioner:
                         )
         return tuple(variants)
 
-    def _slots_plain(self, template, access, participant, offset, preset, conditions):
+    def _slots_plain(
+        self, template, access, participant, offset, preset, conditions, *, geometry=None
+    ):
         address = access.address
         original_offset = offset
-        geometry = address.geometry
+        geometry = address.geometry if geometry is None else geometry
         choices, streaming, contracted = [], [], []
         # Contract a dense address family using its actual native stride.
         # One strided rectangle remains one rectangle regardless of rows or
@@ -482,6 +484,118 @@ class _Partitioner:
         self.work.projected_accesses += len(projected)
         return tuple(projected)
 
+    def _bounded_alias_regions(self, root, private, natives):
+        """Partition uncertain accesses by bounds-established slices.
+
+        Every operand keeps its actual byte effects. Only the may-alias order
+        domain uses an enclosing interval. Its finite image and slot domains
+        come from the ordinary address projection, with no cell KILL or credit.
+        Shared allocations retain their existing peer/quorum alias domains.
+        """
+        if self.admission is None:
+            return False
+        actors = {participant for _, participant in natives}
+        peers = (
+            (Actor.AIV0, Actor.AIV1)
+            if private is None and {Actor.AIV0, Actor.AIV1} <= actors
+            else (None,)
+        )
+        bounds = self.admission.bounds.addresses
+        choices = None
+        for template, accesses in natives.values():
+            for access in accesses:
+                sizes = {
+                    e.nbytes
+                    for e in bounds[access.operand].enclosures
+                    if e.nbytes < root.owner.nbytes.data
+                }
+                choices = sizes if choices is None else choices & sizes
+        for size in sorted(choices or ()):
+            effects, patterns = {}, {}
+            common_origin = None
+            supported = True
+            for (_, participant), (template, accesses) in natives.items():
+                for access in accesses:
+                    enclosure = next(
+                        e for e in bounds[access.operand].enclosures if e.nbytes == size
+                    )
+                    offset = substitute(
+                        enclosure.origin,
+                        {self.memory.control.sid: literal(1 if participant is Actor.AIV1 else 0)},
+                    )
+                    if arguments(offset) & self.indirect_values:
+                        supported = False
+                        break
+                    variants = self._compound_slots(template, offset)
+                    if variants is None or any(conditions for _, _, conditions in variants):
+                        supported = False
+                        break
+                    # This is an order-domain envelope, not an instruction's
+                    # geometry. MemoryAccess and NativeSpec remain unchanged.
+                    envelope = replace(access.address.geometry, nbytes=size, rows=1, row_stride=0)
+                    for value, slots, conditions in variants:
+                        projected = self._slots_plain(
+                            template,
+                            access,
+                            participant,
+                            value,
+                            slots,
+                            conditions,
+                            geometry=envelope,
+                        )
+                        if projected is None:
+                            supported = False
+                            break
+                        for p in projected:
+                            if (
+                                not self.memory.control.invariant_over(
+                                    p.origin, self.memory.module.body.block.first_op
+                                )
+                                or p.rows != 1
+                                or p.stop - p.start != size
+                                or p.start % size
+                                or not 0 <= p.start < p.stop <= root.owner.nbytes.data
+                            ):
+                                supported = False
+                                break
+                            if common_origin is None:
+                                common_origin = p.origin
+                            elif p.origin != common_origin:
+                                supported = False
+                                break
+                            for peer in peers:
+                                if peer is not None and participant not in {Actor.AIC, peer}:
+                                    continue
+                                cell = AliasRegion(
+                                    root, private, peer, (p.start, p.stop), common_origin
+                                )
+                                effects.setdefault(
+                                    (template.operation, cell, participant), []
+                                ).append(access)
+                                for logical in template.frame.loops():
+                                    domain = next(
+                                        (d for d in p.slots if d.loop is logical.operation),
+                                        LoopDomain(logical.operation, logical.count),
+                                    )
+                                    patterns.setdefault((cell, logical.operation), set()).add(
+                                        (domain.period, domain.residue)
+                                    )
+                    if not supported:
+                        break
+                if not supported:
+                    break
+            if not supported or any(len(values) != 1 for values in patterns.values()):
+                continue
+            templates = {t.operation: t for t, _ in natives.values()}
+            for (operation, cell, participant), accesses in effects.items():
+                self.effects.setdefault(operation, {}).setdefault(cell, []).append(
+                    CellEffect(templates[operation], participant, tuple(dict.fromkeys(accesses)))
+                )
+            self.patterns.update(patterns)
+            self.work.alias_regions += len({cell for _, cell, _ in effects})
+            return True
+        return False
+
     def _project(self):
         groups, instances, ordered = {}, {}, set()
         readers = {
@@ -522,7 +636,7 @@ class _Partitioner:
                     instances.setdefault(identity, {}).setdefault(
                         (template.operation, participant), (template, [])
                     )[1].append(access)
-                    if access.address.valid_rows is not None and private is None:
+                    if access.address.valid_rows is not None and (private is None or access.mode.writes):
                         ordered.add(identity)
                         continue  # Prefix envelopes are may-accesses, not exact cell kills.
                     projections = self._slots(template, access, participant)
@@ -602,6 +716,8 @@ class _Partitioner:
         # conservatively composed. This uses the same loop and event path.
         for (root, private), natives in instances.items():
             if (root, private) not in ordered:
+                continue
+            if self._bounded_alias_regions(root, private, natives):
                 continue
             actors = {participant for _, participant in natives}
             peers = (

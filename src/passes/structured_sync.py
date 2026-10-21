@@ -142,6 +142,7 @@ def synchronize_structure(source) -> StructuredSynchronization:
     Imported physical snapshots are not accepted by this source entry. It
     reports an unsupported contract when a required fact cannot be established.
     """
+    from ..analysis.event_planning import plan_event_resources
     from ..analysis.structured_resources import allocate_structured_events
     from .generate_notifications import generate_notifications
 
@@ -167,7 +168,8 @@ def synchronize_structure(source) -> StructuredSynchronization:
     )
     program = generate_notifications(dependencies, dispatch)
     timings.extend(program.timings)
-    resources = stage("event_banks", allocate_structured_events, program)
+    problem = stage("event_constraints", plan_event_resources, program)
+    resources = stage("event_banks", allocate_structured_events, problem)
     return _materialize_owned(
         structure, admission, dependencies, program, resources, tuple(timings)
     )

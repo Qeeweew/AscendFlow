@@ -130,15 +130,20 @@ def _guards(frame, environment):
     for scope in frame.ancestors():
         if scope.branch is None:
             continue
-        condition = scope.operation.cond.owner
-        if not isinstance(condition, arith.CmpiOp):
+        if len(scope.comparisons) != 1:
             result.append((scope.operation.cond, scope.branch))
             continue
+        (test,) = scope.comparisons
+        predicate = test.predicate
+        if scope.branch:
+            predicate = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}[
+                predicate
+            ]
         result.append(
             (
-                environment.expression(condition.lhs),
-                environment.expression(condition.rhs),
-                condition.predicate.value.data,
+                test.lhs,
+                test.rhs,
+                ("==", "!=", "<", "<=", ">", ">=").index(predicate),
                 scope.branch,
             )
         )
@@ -272,6 +277,85 @@ def _writer_span(
     return result
 
 
+def _complete_branch_paths(paths, facts):
+    """Cover a full ordered branch tree without assuming any input values.
+
+    Branch identities retain their actual SSA and captured coordinates. A
+    missing leaf stays missing; unrelated conditions are not combined into a
+    Boolean-product search. No guard is evaluated or moved by this proof.
+    """
+    if any(not path for path in paths):
+        return True
+    roots = []
+    for head, *tail in paths:
+        condition = (*head[:-1], 0)
+        for prior, branches in roots:
+            if _same_guard(condition, prior, facts):
+                break
+        else:
+            branches = ([], [])
+            roots.append((condition, branches))
+        branches[head[-1]].append(tuple(tail))
+    return any(
+        left and right
+        and _complete_branch_paths(left, facts)
+        and _complete_branch_paths(right, facts)
+        for _, (left, right) in roots
+    )
+
+
+def _conditional_spans(alternatives, reader, memory):
+    """Join complete branch definitions within one actual participant.
+
+    A condition invariant over a child loop can guard its complete summary.
+    Otherwise a common footprint and remaining loop nest make the branch proof
+    pointwise, before eliminating those loops. Equal summary envelopes alone
+    cannot join different per-row conditions or independent participants.
+    Existing nonempty/count/stride checks still apply at every elimination.
+    """
+    control, groups = memory.control, []
+    facts, reader_loops = control.environment.facts, reader.frame.loops()
+    for writer, output, actor, path in alternatives:
+        if output.address.valid_rows is not None:
+            continue
+        span = _span(output, _participant(actor, memory.control.sid))
+        loops = writer.frame.loops()
+        for loop in reversed(loops):
+            if loop in reader_loops or any(
+                len(guard) != 4
+                or not all(control.invariant_over(value, loop.operation) for value in guard[:2])
+                for guard in path
+            ):
+                break
+            summarized = _summarize(span, loop, facts, _participant(actor, control.sid))
+            if summarized is None:
+                break
+            span, loops = summarized, loops[:-1]
+        for prior, prior_loops, paths, members in groups:
+            if (
+                actor is members[0][2]
+                and loops == prior_loops
+                and (span.width, span.rows, span.pitch) == (prior.width, prior.rows, prior.pitch)
+                and equivalent(span.base, prior.base, facts)
+            ):
+                break
+        else:
+            paths, members = [], []
+            groups.append((span, loops, paths, members))
+        paths.append(path)
+        members.append((writer, output, actor))
+    for span, loops, paths, members in groups:
+        if not _complete_branch_paths(paths, facts):
+            continue
+        for loop in reversed(loops):
+            if loop not in reader_loops:
+                span = _summarize(span, loop, facts, _participant(members[0][2], control.sid))
+                if span is None:
+                    break
+        if span is not None:
+            yield span, tuple(item[0].operation for item in members)
+
+
 def _exclusive(writer, reader, environment):
     for guard in _guards(writer.frame, environment):
         opposite = (*guard[:-1], 1 - guard[-1])
@@ -321,6 +405,37 @@ def _native_aliases(memory):
 
 def _covers(spans, read, frame, facts, work):
     """Unite exact static row intervals only after proving their translations."""
+    # Join adjacent row groups with identical column footprints. This keeps
+    # their pitched holes, unlike merging their contiguous bounding boxes.
+    # The row translation is exact and static; no loop instances expand.
+    joined = []
+    for anchor in spans:
+        if anchor.pitch <= 0 or anchor.width.constant is None:
+            continue
+        intervals = []
+        for candidate in spans:
+            if candidate.pitch != anchor.pitch or candidate.width != anchor.width:
+                continue
+            delta = exact_constant(expression("sub", candidate.base, anchor.base), facts)
+            if delta is not None and delta % anchor.pitch == 0:
+                first = delta // anchor.pitch
+                intervals.append((first, first + candidate.rows))
+        merged = []
+        for start, stop in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = merged[-1][0], max(stop, merged[-1][1])
+            else:
+                merged.append((start, stop))
+        for start, stop in merged:
+            candidate = _Span(
+                expression("add", anchor.base, literal(start * anchor.pitch)),
+                anchor.width,
+                stop - start,
+                anchor.pitch,
+            )
+            if candidate not in spans and candidate not in joined:
+                joined.append(candidate)
+    spans = (*spans, *joined)
     needed_span = expression("add", read.width, literal((read.rows - 1) * read.pitch))
 
     def contained(base, start, stop):
@@ -360,6 +475,36 @@ def _covers(spans, read, frame, facts, work):
             if shift is not None and width is not None and needed_width is not None and shift >= 0:
                 row, column = divmod(shift, read.pitch)
                 if row + read.rows <= candidate.rows and column + needed_width <= width:
+                    return True
+            # A runtime row tile may move inside the same pitched rectangle.
+            # Prove an exact multiple of the row pitch and both row limits;
+            # bounding boxes alone would incorrectly define the row holes.
+            if width is not None and needed_width is not None and needed_width <= width:
+                delta = normalize(expression("sub", read.base, candidate.base), facts)
+                if (
+                    read.rows <= candidate.rows
+                    and domain_nonnegative(delta, frame.domains(), facts)
+                    and domain_nonnegative(
+                        expression("sub", literal(width - needed_width), delta),
+                        frame.domains(),
+                        facts,
+                    )
+                ):
+                    return True
+                terms = polynomial(delta, facts)
+                if (
+                    all(
+                        c.denominator == 1 and c.numerator % read.pitch == 0 for c in terms.values()
+                    )
+                    and domain_nonnegative(delta, frame.domains(), facts)
+                    and domain_nonnegative(
+                        expression(
+                            "sub", literal((candidate.rows - read.rows) * read.pitch), delta
+                        ),
+                        frame.domains(),
+                        facts,
+                    )
+                ):
                     return True
         if (
             candidate.rows == read.rows
@@ -609,11 +754,23 @@ def admit_structured_memory(
                     continue
                 candidates = []
                 writers = []
+                guarded = []
+                reader_guards = _guards(template.frame, environment)
                 for writer, output, participant in prior.get(instance, ()):
                     span = _writer_span(writer, output, participant, template, memory)
                     if span is not None:
                         candidates.append(span)
                         writers.append(writer.operation)
+                    missing = tuple(
+                        guard
+                        for guard in _guards(writer.frame, environment)
+                        if not any(_same_guard(guard, other, facts) for other in reader_guards)
+                    )
+                    if missing:
+                        guarded.append((writer, output, participant, missing))
+                for span, members in _conditional_spans(guarded, template, memory):
+                    candidates.append(span)
+                    writers.extend(members)
                 needed = _span(access, _participant(actor, memory.control.sid))
                 _require(
                     _covers(candidates, needed, template.frame, facts, work),
@@ -629,7 +786,12 @@ def admit_structured_memory(
             # Reads of all participants precede this instruction's writes below.
         for actor in template.participants:
             for access in template.accesses:
-                if access.mode.writes:
+                # This frontier supplies complete numerical definitions only.
+                # Runtime prefixes supply none under _writer_span's contract;
+                # recording one here could suppress a later complete writer
+                # with the same static geometry. All real writes remain in
+                # memory.templates and write_buckets for ordering/overwrites.
+                if access.mode.writes and access.address.valid_rows is None:
                     key = instances[template.operation, access.operand_index, actor]
                     # Numerical definedness is monotone. Repeating the exact
                     # write in the same activation frame adds no initialized

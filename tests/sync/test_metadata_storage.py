@@ -64,3 +64,45 @@ def test_a_loaded_index_still_retains_real_aliases_and_repeated_slot_values(meta
     plan = synchronize_structure(source)
     for count in (0, 1, 2, 3, 7):
         check_compiled_events(plan, {"n": count}, invocations=2)
+
+
+def test_scalar_store_exit_still_publishes_before_vector_reads(metadata_values):
+    from ascendflow.analysis.access_frontier import QueueEndpoint
+    from ascendflow.target.ascend910b import Engine
+
+    source = N.from_source(
+        """
+def store_exit(Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),
+               Meta:N.Tensor((n,),N.i64),n:N.int64):
+    with N.Kernel(1,kind="vector"):
+        scalar=N.alloc_ub((8,),N.f32)
+        row=N.alloc_ub((64,),N.f32)
+        N.fill(scalar,1.0)
+        value=N.load_scalar(scalar[0:1])
+        for i in N.Pipelined(n):
+            N.fill(row,0.0)
+            for child in N.serial(i%2+1):
+                condition=N.load_index(Meta[i:i+1],minimum=0,maximum=1)
+                if condition==0:
+                    N.store_scalar(value,out=row[0:1])
+            N.mul(row,2.0,out=row)
+            N.copy(row,Out[i,:])
+""",
+        disjoint_external=True,
+    )
+    plan = synchronize_structure(source)
+    publications = [
+        p
+        for n in plan.selection.notifications
+        if n.source_engine is Engine.S and n.destination_engine is Engine.V
+        for p in n.sources
+    ]
+    assert publications
+    exits = [
+        p.occurrence.endpoint
+        for p in publications
+        if isinstance(p.occurrence.endpoint, QueueEndpoint)
+    ]
+    assert exits and all(not point.retirements for point in exits)
+    for count in (0, 1, 2, 5):
+        check_compiled_events(plan, {"n": count}, invocations=2)

@@ -150,11 +150,13 @@ class IntegerFacts:
             completed.add(identity)
             return None
 
+        # Within this one ordered conjunction, later evaluation prefixes
+        # only add established predicates. A raw node already admitted under
+        # an earlier prefix stays defined under every extension. Keep this
+        # fact local to this call; another guard can have a weaker prefix.
+        completed = set()
         for index, test in enumerate(tests):
             prefix = tests[:index]
-            # Only these two operands share one complete ordered premise set.
-            # Another comparison must establish its raw nodes under its prefix.
-            completed = set()
             for value in (test.lhs, test.rhs):
                 if (missing := check(value, prefix, completed)) is not None:
                     return missing, prefix

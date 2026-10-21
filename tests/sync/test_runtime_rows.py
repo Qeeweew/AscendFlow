@@ -92,3 +92,81 @@ def partial(O:N.Tensor((4,16),N.f32,access="write"),n:N.int64):
     )
     with pytest.raises(CompileError, match="initialized writer coverage"):
         synchronize_structure(source)
+
+
+def test_nd2nz_single_row_preserves_nz_column_pitch_and_holes():
+    from ascendflow import compile
+
+    source = N.from_source("""
+def fragment(A:N.Tensor((16,32),N.bf16)):
+    with N.Kernel(kind="cube"):
+        x=N.alloc_l1((16,32),N.bf16)
+        N.copy(A[3:4,:],x[5:6,:])
+""")
+    result = compile(source)
+    from ascendflow.dialects.io import parse
+    from tests.models.structured_events import check_structured_events
+
+    execution = check_structured_events(
+        collect_native_memory(result.plan),
+        logical_reference=collect_native_memory(parse(result.before_ir)),
+        invocations=2,
+    )
+    writes = [s for c in execution.natives for s in c.spans if s.root.ref.type.bank.data == "L1"]
+    assert [(s.start, s.end) for s in writes] == [(160, 192), (672, 704)] * 2
+    assert "1, 1, 32, 0, 32, 16, 1, 0" in result.asc
+
+
+def test_nd2nz_row_fragment_does_not_define_other_nz_rows():
+    source = N.from_source("""
+def fragment(A:N.Tensor((16,32),N.bf16)):
+    with N.Kernel(kind="cube"):
+        x=N.alloc_l1((16,32),N.bf16)
+        y=N.alloc_l0a((16,32),N.bf16)
+        N.copy(A[3:4,:],x[5:6,:])
+        N.copy(x,y)
+""")
+    with pytest.raises(CompileError, match="initialized writer coverage"):
+        synchronize_structure(source)
+
+
+@pytest.mark.parametrize("column,accepted", [(0, True), (32, False), (64, False)])
+def test_runtime_row_tiles_require_defined_columns_without_row_holes(column, accepted):
+    source = N.from_source(f"""
+def rows(A:N.Tensor((16,128),N.f32)):
+    with N.Kernel():
+        x=N.alloc_ub((16,128),N.f32)
+        y=N.alloc_ub((4,64),N.f32)
+        N.copy(A[:,0:64],x[:,0:64])
+        for block in N.serial(4):
+            N.copy(x[block*4:block*4+4,{column}:{column + 64}],y)
+""")
+    if accepted:
+        plan = synchronize_structure(source)
+        check_compiled_events(plan, invocations=2)
+    else:
+        with pytest.raises(CompileError, match="initialized writer coverage"):
+            synchronize_structure(source)
+
+
+@pytest.mark.parametrize("other_rows,accepted", [(16, True), (8, False), (0, False)])
+def test_branch_merge_initialization_requires_both_complete_physical_writes(other_rows, accepted):
+    other = f"N.copy(A[0:{other_rows},:],x[0:{other_rows},:])" if other_rows else "pass"
+    source = N.from_source(f"""
+def branches(A:N.Tensor((16,16),N.f32),choice:N.int64):
+    with N.Kernel():
+        x=N.alloc_ub((16,16),N.f32)
+        y=N.alloc_ub((16,16),N.f32)
+        if choice == 0:
+            N.copy(A,x)
+        else:
+            {other}
+        N.copy(x,y)
+""")
+    if accepted:
+        plan = synchronize_structure(source)
+        for choice in (0, 1):
+            check_compiled_events(plan, {"choice": choice}, invocations=2)
+    else:
+        with pytest.raises(CompileError, match="initialized writer coverage"):
+            synchronize_structure(source)

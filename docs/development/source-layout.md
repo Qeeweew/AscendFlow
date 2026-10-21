@@ -49,7 +49,8 @@ compile / Compilation
       establish_queue_order              # 逐层 physical-step / phase 准入
       construct_cell_channels            # 物理 lifetime credit 归纳
       HandbackRule                       # 无稳定 cell 的有限/ring 生命周期
-    allocate_structured_events           # 消费生命周期，建立 bank/ID/共享新约束
+    plan_event_resources                # 冻结首选/有限缩环、虚拟动作、复用及整组 FIFO
+    allocate_structured_events          # 先首选后有限选项；只分配编号，不查询域或 handback
     materialize_notifications
     ScalarFacts                         # 复用原始控制和合法索引范围
     executable projection               # 独立终端模块；映射 native、geometry 与 SSA 范围
@@ -81,7 +82,8 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/cell_channels.py` | 相同完整物理 ownership 集合和 role 的非重复 credit；原始值/存储 lifetime 归纳 |
 | `analysis/cell_ownership.py` | 从原始 body/全部 effects 建立闭合私有轮次，绑定真实 acquire/return、校验实际本地发射前提；不将队列端口当成 native lifetime |
 | `analysis/notification_lifetimes.py` | 有限使用或明确 queue handback，连接实际首末端口，无任意路径搜索 |
-| `analysis/event_sharing.py`、`structured_resources.py`、`event_contracts.py` | 有限 bank、持久 cell token、配置/drain 台账；固定成员的兼容关系只建立一次，候选 ID 分配复用真实 handback 或逐参与者同序的 counter FIFO，并检查完整 quorum 与积压 |
+| `analysis/event_planning.py`、`event_sharing.py`、`event_counter_groups.py`、`event_peers.py` | 真实 handback、全部 credit 成员的兼容、counter 消费回传与整组 FIFO word/quorum/积压、虚拟 AIV 对应；为受压联合 bank 冻结有限缩环选项 |
+| `analysis/event_coloring.py`、`structured_resources.py`、`event_contracts.py` | 联合专属、时间复用、FIFO 的有限协议/约束分配；持久 token 与配置/drain 台账；全部选项共享工作上限，只消费冻结约束及物化编号 |
 | `passes/materialize_structure.py` | 插入确定动作、共享同位置短路 guard 前缀；不改变 native 或 issue order |
 | `passes/executable.py` | 终端模块、native 对应、共享 NativeSpec 与最终 SSA 范围；不携带逻辑控制、地址证明或同步求解入口 |
 | `passes/lower_execution.py` | 将 count/stage 表示降为实际 arith/scf；按 family 保持 issue order，移动原 native，不复制双 AIV body |
@@ -162,6 +164,10 @@ metadata/carry 捕获 group、SID 与祖先 loop ordinal，并随同时坐标替
 不再用手写余数符号界、min/max 候选或递归坐标消元作第二套 sign 决策。
 原式定义性先检查；数学化简不能掩盖非法 unsigned 求值或原始溢出。
 `ScalarFacts` 复用已建立的控制域、联合 owner/iteration 范围和合法索引前提。
+其 active-range 查询由 `IndexRanges` 按不可变输入快照和完整词法域建立 DAG，
+共享子表达式的范围不再逐个 SSA 递归重建。不同域、收紧后的新输入环境分别建立；
+失败不保存为成功。host extrema 的空域端点语义与活跃范围保持分离，数学范围不
+授权原始 unsigned 求值或机器整数溢出。
 整数与谓词 pass 共用以真实 SSA 为原子的仿射视图，并保留非线性、除法和余数节点。
 作用域分别记录区间、直接关系、倍数和已知谓词；通知域把实际 SSA 范围与
 合法 modulo 关系送入同一 SMT 服务，使用数学布尔组合决定可达性、蕴含与覆盖。

@@ -92,22 +92,23 @@ def test_runtime_bnsd_coordinates_retain_each_original_axis_and_cover_uneven_wor
         assert (empty_owners > 0) == (6 * (length // 16) < 20)
 
 
-def test_index_first_used_in_stage_zero_dominates_later_stages():
+def test_index_evaluation_stays_in_its_original_stage_before_admission():
     module = parse(dump(N.from_source(BNSD_COPY).to_ir()))
     pipeline = next(op for op in module.walk() if isinstance(op, IterationOp))
-    slot = next(
-        op
-        for op in pipeline.body.block.ops
-        if isinstance(op, arith.RemUIOp) and op.lhs is pipeline.body.block.args[0]
-    )
     stages = [op for op in pipeline.body.block.ops if isinstance(op, StageOp)]
-    assert list(pipeline.body.block.ops).index(slot) < list(pipeline.body.block.ops).index(
-        stages[0]
+    assert not any(
+        isinstance(op, arith.RemUIOp) and op.lhs is pipeline.body.block.args[0]
+        for op in pipeline.body.block.ops
     )
     local = [
         op for op in module.walk() if isinstance(op, ViewOp) and op.source.type.memory.data == "UB"
     ]
-    assert len(local) == 2 and all(view.origins[0] is slot.result for view in local)
+    assert len(local) == 2
+    for view, stage in zip(local, stages, strict=True):
+        slot = view.origins[0].owner
+        assert isinstance(slot, arith.RemUIOp)
+        assert slot.lhs is pipeline.body.block.args[0]
+        assert slot.parent is stage.body.block
     assert not any(
         isinstance(op, (arith.DivSIOp, arith.FloorDivSIOp, arith.RemSIOp)) for op in module.walk()
     )
