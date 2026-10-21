@@ -401,64 +401,48 @@ def _dominates(value, use, positions, ancestors):
     raise VerifyException("view operand definition must precede its use")
 
 
-def _verify_index_provenance(value, use, seen, active, positions, ancestors, depth=0):
+def _verify_index_provenance(value, use, seen, positions, ancestors):
+    """Check executable SSA structure, independently of proof expression syntax."""
     from xdsl.dialects import arith, scf
 
-    _dominates(value, use, positions, ancestors)
-    if value in active:
-        raise VerifyException("view index SSA contains a cycle")
-    if value in seen:
-        return
-    if depth > 128 or len(seen) + len(active) >= 4096:
-        raise VerifyException("view index SSA exceeds expression budget")
-    owner = value.owner
-    if isinstance(owner, Block):
-        region = owner.parent_op()
-        if (
-            not isinstance(region, (ProgramOp, IterationOp, DomainOp, scf.ForOp))
-            or value is not owner.args[0]
-        ):
-            raise VerifyException("view index needs a declared source coordinate")
+    pending = [(value, use)]
+    while pending:
+        value, use = pending.pop()
+        _dominates(value, use, positions, ancestors)
+        if value in seen:
+            continue
         seen.add(value)
-        return
-    if isinstance(owner, SizeOp):
-        if not isinstance(owner.parent_op(), ProgramOp):
-            raise VerifyException("view runtime size must be a uniform program parameter")
-        seen.add(value)
-        return
-    if isinstance(owner, IndexReadOp):
-        # A synchronous metadata value is an SSA definition. Its actual read
-        # and declared bounds are admitted later, together with every use.
-        seen.add(value)
-        return
-    if not isinstance(
-        owner,
-        (
-            arith.ConstantOp,
-            arith.AddiOp,
-            arith.SubiOp,
-            arith.MuliOp,
-            arith.DivUIOp,
-            arith.RemUIOp,
-            arith.MinSIOp,
-            arith.MaxSIOp,
-            arith.CeilDivUIOp,
-        ),
-    ):
-        raise VerifyException("view index has unsupported SSA provenance")
-    active.add(value)
-    for operand in owner.operands:
-        if not isinstance(operand.type, IndexType):
-            raise VerifyException("view index arithmetic requires index operands")
-        _verify_index_provenance(operand, owner, seen, active, positions, ancestors, depth + 1)
-    active.remove(value)
-    seen.add(value)
+        owner = value.owner
+        if isinstance(owner, Block):
+            region = owner.parent_op()
+            if not isinstance(region, (ProgramOp, IterationOp, DomainOp, scf.ForOp)) or (
+                not isinstance(region, scf.ForOp) and value is not owner.args[0]
+            ):
+                raise VerifyException("view index needs a structured scalar binding")
+            continue
+        if isinstance(owner, SizeOp):
+            if not isinstance(owner.parent_op(), ProgramOp):
+                raise VerifyException("view runtime size must be a uniform program parameter")
+            continue
+        if isinstance(owner, IndexReadOp):
+            continue
+        if isinstance(owner, (scf.IfOp, scf.ForOp)):
+            pending.extend((operand, owner) for operand in owner.operands)
+            for region in owner.regions:
+                terminator = region.block.last_op
+                if not isinstance(terminator, scf.YieldOp):
+                    raise VerifyException("structured scalar index needs yielded results")
+                pending.extend((operand, terminator) for operand in terminator.arguments)
+            continue
+        if type(owner) not in arith.Arith.operations:
+            raise VerifyException("view index needs an executable integer operation")
+        pending.extend((operand, owner) for operand in owner.operands)
 
 
-def _constant_index(value):
+def _constant_index(value, memo=None):
     from xdsl.dialects import arith
 
-    memo = {}
+    memo = {} if memo is None else memo
 
     def visit(current):
         if current in memo:
@@ -550,7 +534,7 @@ class ViewOp(IRDLOperation):
             raise VerifyException("view result shape must match its retained original axes")
         seen = set()
         for origin in (*self.origins, *((self.valid,) if self.valid is not None else ())):
-            _verify_index_provenance(origin, self, seen, set(), positions, ancestors)
+            _verify_index_provenance(origin, self, seen, positions, ancestors)
         for origin, width, extent in zip(self.origins, widths, source.shape):
             constant = _constant_index(origin)
             if constant is not None and (
@@ -1121,7 +1105,9 @@ class IndexReadOp(IRDLOperation):
             or self.source.type.dtype.data not in {"i32", "i64"}
             or any(n.data != 1 for n in self.source.type.shape)
         ):
-            raise VerifyException("index read requires exactly one immutable GM int32/int64 element")
+            raise VerifyException(
+                "index read requires exactly one immutable GM int32/int64 element"
+            )
 
 
 @irdl_op_definition

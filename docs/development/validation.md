@@ -6,7 +6,7 @@
 
 | 层 | 验证对象 | 能说明什么 |
 |---|---|---|
-| 输入/IR | 类型、source合同、effects、别名、owner、结构 | 当前输入满足分析前提；不是同步正确性证明 |
+| 输入/IR | 类型、source合同、effects、别名、owner、结构 | 结构及声明可接通，不证明运行期数据合法；不是同步正确性证明 |
 | 变换规则 | PLE实例映射、scope绑定、前沿更新、协议与资源合同 | 检查实现遵守已论证规则；normal 消费生成 credit 和保持的事实 |
 | 语义反例 | 旧read覆盖、WAR/WAW、短MAD、少一个AIV、错event ID、错误guard | 必须生成所需同步或给具体诊断；不能只测试成功例 |
 | 有限执行 | 小N、slot和分支下的实际指令/字节/event交错 | 有界范围正确；不外推任意N，不独立证明硬件前提 |
@@ -20,6 +20,12 @@
 3. full/compact共享转移函数的表示差分，只验证表示等价；不能称独立语义oracle。
 
 当前保留 `tests/models/structured_events.py` 的实际 IR 有限模型及独立 pre-sync 对照，旧 progress 图/BFS/Path 的表示测试已删除。`tests/support/structured.py` 是生产输入构造 helper，不能算独立 oracle。不能把测试总数当形式化证明。
+
+动态访问还需单独验证：无范围 hint 的 metadata、分支结果和 serial carry、
+短路/惰性求值、零/部分 prefix、静态非法诊断，以及可选范围 unknown/预算耗尽
+仍保留原实现。独立模型解释实际元数据，并同时检查原始逻辑轴和实际字节；
+落入另一 slot 但仍在总 allocation 内，也属于调用方非法访问。正常编译不因此
+恢复普遍范围证明。新通知求值的无前缀除法、溢出及条件提前计算保留破坏反例。
 
 ## 2. 最小反例矩阵
 

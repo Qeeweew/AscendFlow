@@ -2,8 +2,8 @@
 
 Exact SSA expressions reuse dominating definitions. Total integer invariants
 move to their earliest legal preheader; guarded division and overflow-prone
-arithmetic need destination-scope premises before any new evaluation. Legal
-source-index extrema and actual control supply local ranges. Native, address,
+arithmetic need destination-scope premises before any new evaluation. Optional
+source facts and actual control supply local ranges. Native, address,
 notification and control operations keep their identities.
 """
 
@@ -26,7 +26,7 @@ from xdsl.pattern_rewriter import (
 from xdsl.traits import IsolatedFromAbove, Pure
 from xdsl.transforms.canonicalize import CanonicalizationRewritePattern
 
-from ..diagnostics import CompileError
+from ..diagnostics import CompileError, ErrorKind
 from ..dialects.physical import CoreIdOp, RuntimeSizeOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ..scalar import Expr, Fact, literal
@@ -35,7 +35,7 @@ from ..symbols import is_coordinate, symbol_name
 
 @dataclass
 class ScalarFacts:
-    """Reusable admitted source ranges; execution facts are never recomputed."""
+    """Optional source ranges; absence never prevents source execution."""
 
     limits: dict = field(default_factory=dict)
     ranges: dict = field(default_factory=dict)
@@ -58,11 +58,11 @@ class ScalarFacts:
                 self.revision += 1
 
     @classmethod
-    def from_control(cls, control=None, index_extrema=()):
-        result = cls(_runtime_limits(index_extrema))
+    def from_control(cls, control=None):
+        result = cls()
         if control is None:
             return result
-        from ..indexing import IndexRanges, nonnegative, normalize, polynomial
+        from ..indexing import IndexRanges, nonnegative, normalize_or_identity, polynomial
 
         facts = {
             name: Fact(
@@ -148,6 +148,7 @@ class ScalarFacts:
                 if not isinstance(value.type, IndexType):
                     continue
                 try:
+                    domains = control.result_frames.get(value, frame).domains()
                     expr = control.environment.expression(value)
                     if not any(is_coordinate(name) for name in expr.variables):
                         uniform_range = bounds(expr)
@@ -156,12 +157,12 @@ class ScalarFacts:
                             if -(1 << 63) <= low <= high < (1 << 63):
                                 result.bind_range(value, uniform_range)
                             continue
-                    key = expr, frame.domains()
+                    key = expr, domains
                     if key not in symbolic:
-                        low, high = active_ranges.interval(expr, frame.domains())
+                        low, high = active_ranges.interval(expr, domains)
                         if expr.kind == "floordiv":
                             numerator, divisor = expr.args
-                            nl, nh = active_ranges.interval(numerator, frame.domains())
+                            nl, nh = active_ranges.interval(numerator, domains)
                             gap = Expr("add", (divisor, Expr("mul", (literal(-1), nh))))
                             if nonnegative(nl, facts) and nonnegative(
                                 Expr("add", (gap, literal(-1))), facts
@@ -169,17 +170,23 @@ class ScalarFacts:
                                 low = high = literal(0)
                         low_range, high_range = bounds(low), bounds(high)
                         symbolic[key] = (
-                            bounds(normalize(low, facts)) if low_range is None else low_range,
-                            bounds(normalize(high, facts)) if high_range is None else high_range,
+                            bounds(normalize_or_identity(low, facts))
+                            if low_range is None
+                            else low_range,
+                            bounds(normalize_or_identity(high, facts))
+                            if high_range is None
+                            else high_range,
                         )
                     left, right = symbolic[key]
                     if left is not None and right is not None:
                         low, high = max(-(1 << 63), left[0]), min((1 << 63) - 1, right[1])
                         if low <= high:
                             result.bind_range(value, (low, high))
-                except CompileError:
-                    # An opaque carry or a guarded non-affine scalar has no
-                    # exported optimization fact. Admission already checked it.
+                except CompileError as error:
+                    if error.kind is not ErrorKind.ANALYSIS_LIMIT:
+                        raise
+                    # Optional precision may exhaust its algebra budget. It
+                    # does not determine executable source admission.
                     continue
         return result
 
@@ -855,39 +862,6 @@ def _simplify_block(block, scope, runtime_limits):
         scope.defined.update(op.results)
 
 
-def _runtime_limits(expressions):
-    """Derive bounds implied by legal int64 source-index evaluations."""
-    limits, products, pending = {}, {}, list(expressions)
-
-    def product(value):
-        if value not in products:
-            result = None
-            if value.constant is not None:
-                result = value.constant, None
-            elif value.kind == "argument":
-                result = 1, symbol_name(value.args[0])
-            elif value.kind == "mul":
-                left, right = (product(child) for child in value.args)
-                if left is not None and right is not None and (left[1] is None or right[1] is None):
-                    result = left[0] * right[0], left[1] or right[1]
-            products[value] = result
-        return products[value]
-
-    seen = set()
-    while pending:
-        value = pending.pop()
-        if value in seen:
-            continue
-        seen.add(value)
-        pending.extend(child for child in value.args if isinstance(child, Expr))
-        if (scaled := product(value)) is not None:
-            scale, name = scaled
-            if name is not None and scale > 0:
-                maximum = ((1 << 63) - 1) // scale
-                limits[name] = min(limits.get(name, maximum), maximum)
-    return limits
-
-
 class _PureIntegerArithmetic(RewritePattern):
     def __init__(self):
         self.pattern = GreedyRewritePatternApplier([CanonicalizationRewritePattern()])
@@ -944,11 +918,9 @@ def _cse_block(block, scope, changed):
         scope.defined.update(op.results)
 
 
-def simplify_scalars(
-    module: ModuleOp, *, index_extrema=(), control=None, facts=None, finalize=True
-):
+def simplify_scalars(module: ModuleOp, *, control=None, facts=None, finalize=True):
     """Simplify owned arithmetic in place without revisiting execution facts."""
-    facts = ScalarFacts.from_control(control, index_extrema) if facts is None else facts
+    facts = ScalarFacts.from_control(control) if facts is None else facts
     runtime_limits = facts.limits
     for block in module.body.blocks:
         _simplify_block(block, _Scope(facts=facts), runtime_limits)

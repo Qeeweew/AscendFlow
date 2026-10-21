@@ -86,7 +86,7 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
     logical = materialize_notifications(admission.memory, resources.actions)
     require(logical is structure.module, "notification insertion changed its owned physical module")
     materialized = perf_counter()
-    admitted = ScalarFacts.from_control(admission.memory.control, admission.host_expressions)
+    admitted = ScalarFacts.from_control(admission.memory.control)
     values = {}
     module = logical.clone(value_mapper=values)
     operations = dict(zip(logical.walk(), module.walk(), strict=True))

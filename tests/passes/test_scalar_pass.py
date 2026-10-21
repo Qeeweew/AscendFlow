@@ -471,17 +471,15 @@ def test_public_admission_rejects_original_unsigned_expression_before_unit_foldi
             with N.Kernel():
                 x=N.alloc_ub((2,64))
                 for i in N.Pipelined(2):
-                    N.fill(x[(i-1)//1,:],1.0)
+                    bad=(-1)//(i+1)
+                    N.fill(x[bad-bad,:],1.0)
 """)
-    with pytest.raises(CompileError, match="nonnegative dividend"):
+    with pytest.raises(CompileError, match="nonnegative dividend|nonnegative numerator"):
         compile(source)
 
 
-@pytest.mark.parametrize("checked", [False, True])
-def test_nested_invariants_use_the_outer_iteration_and_checked_host_extrema(checked):
+def test_nested_invariants_keep_overflow_prone_extents_in_the_original_domain():
     from xdsl.dialects.builtin import IntAttr
-
-    from ascendflow.scalar import Expr, expression, literal
 
     block = Block()
     size = RuntimeSizeOp.build(
@@ -501,17 +499,16 @@ def test_nested_invariants_use_the_outer_iteration_and_checked_host_extrema(chec
     block.add_op(scf.ForOp(zero, four, one, [], outer))
     module = _function(block)
     control = _control_identity(module)
-    extrema = (expression("mul", Expr("argument", ("n",)), literal(512)),) if checked else ()
 
-    simplify_scalars(module, index_extrema=extrema)
+    simplify_scalars(module)
     module.verify()
 
     assert _control_identity(module) == control
     assert coordinate.parent is outer and coordinate.next_op is child
-    assert extent.parent is (block if checked else inner)
+    assert extent.parent is inner
     assert tuple(uses.inputs) == (coordinate.result, extent.result)
     once = dump(module)
-    simplify_scalars(module, index_extrema=extrema)
+    simplify_scalars(module)
     assert dump(module) == once
 
 

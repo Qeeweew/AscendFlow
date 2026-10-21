@@ -4,7 +4,6 @@ import pytest
 
 from ascendflow import compile
 from ascendflow import language as N
-from ascendflow.diagnostics import CompileError
 
 
 def test_window_metadata_relationship_survives_original_unsigned_page_arithmetic():
@@ -56,29 +55,28 @@ def selected(X:N.Tensor((2,8,64),N.f32), O:N.Tensor((32,64),N.f32,access="write"
     assert admit_memory_bounds(memory).checked_accesses > 0
 
 
-@pytest.mark.parametrize(
-    "body",
-    [
-        "if i > 0:\n                N.copy(X[i-1,:],row)\n            N.copy(X[i-1,:],row)",
-        "bad=(i-1)//2\n            if i > 0:\n                N.copy(X[bad,:],row)",
-        "if (i-1)//2 >= 0:\n                N.copy(X[i,:],row)",
-        "if i < 8:\n                N.copy(X[i,:],row)\n            else:\n                N.copy(X[i,:],row)",
-    ],
-)
-def test_later_sibling_or_opposite_branch_cannot_authorize_original_access(body):
+def test_only_guarded_rows_are_read_without_a_universal_axis_proof():
+    from ascendflow.analysis.structured_memory import collect_native_memory
+    from tests.models.structured_events import check_structured_events
+
     source = N.from_source(
         """
-def invalid(X:N.Tensor((8,64),N.f32), O:N.Tensor((16,64),N.f32,access="write")):
+def guarded(X:N.Tensor((8,64),N.f32), O:N.Tensor((16,64),N.f32,access="write")):
     with N.Kernel():
         row=N.alloc_ub((64,))
         for i in N.serial(16):
-            BODY
+            N.fill(row,0.0)
+            if i < 8:
+                N.copy(X[i,:],row)
             N.copy(row,O[i,:])
-""".replace("BODY", body),
+""",
         disjoint_external=True,
     )
-    with pytest.raises(CompileError, match="unsigned|axis"):
-        compile(source)
+    result = compile(source)
+    trace = check_structured_events(collect_native_memory(result.plan))
+    assert [
+        (s.start, s.end) for c in trace.natives for s in c.spans if s.root.sym_name.data == "X"
+    ] == [(i * 256, (i + 1) * 256) for i in range(8)]
 
 
 @pytest.mark.parametrize("dtype,width", [("i32", 4), ("i64", 8)])

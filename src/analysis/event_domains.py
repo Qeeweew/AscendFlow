@@ -216,28 +216,27 @@ class EventDomains:
                     ),
                     "mode-2 notification needs the actual complete 1 AIC : 2 AIV quorum",
                 )
-            endpoints = tuple(
-                dict.fromkeys(
-                    self._ambient(bound) for bound in notification.sources + notification.consumers
+            for bound in notification.sources + notification.consumers:
+                tests = self._ambient(bound)
+                before = (
+                    bound.operation
+                    if bound.placement in {Placement.BEFORE, Placement.ENTRY}
+                    else bound.operation.next_op
                 )
-            )
-            for tests in endpoints:
-                self.work.endpoint_guard_sets += 1
-                missing = self.arithmetic.ordered_definedness(tests)
+                bindings = {
+                    self.control.loops[loop].ordinal: value for loop, value in bound.coordinates
+                }
+                bindings[self.control.sid] = literal(1 if bound.actor is Actor.AIV1 else 0)
+                evaluated = frozenset(
+                    substitute(self.control.environment.expression(value), bindings)
+                    for value in self.control.dominating_scalars(bound.operation.parent, before)
+                )
+                missing = self.arithmetic.ordered_definedness(tests, evaluated)
                 if missing is not None:
-                    required, prefix = missing
                     self.fail(
                         notification,
-                        "unsigned arithmetic lacks an ordered activation prefix proof",
+                        "new notification arithmetic lacks an ordered activation prefix proof",
                         phase="structured-event-pairing",
-                        witness=(
-                            f"required: {required.lhs.text()} {required.predicate} {required.rhs.text()}",
-                            "endpoint prefix: "
-                            + "; ".join(
-                                f"{test.lhs.text()} {test.predicate} {test.rhs.text()}"
-                                for test in prefix
-                            ),
-                        ),
                     )
             self.tests[notification] = tuple(
                 dict.fromkeys(

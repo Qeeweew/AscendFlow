@@ -4,7 +4,6 @@ import pytest
 from xdsl.dialects import arith, scf
 
 from ascendflow import compile
-from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import dump, parse
 from ascendflow.dialects.source import IterationOp, SizeOp, YieldOp
 from ascendflow.frontend import FrontendError, from_source
@@ -75,8 +74,7 @@ def test_serial_loop_carries_ssa_through_if_and_preserves_zero_iteration_value(n
     assert interpret(source.body.block.first_op.body.block, {}, {"n": n}) == 7 + sum(
         i if i < 3 else 1 for i in range(n)
     )
-    with pytest.raises(CompileError, match="host integer safety lacks a uniform scalar range"):
-        compile(definition)
+    compile(definition).plan.verify()
 
 
 def test_serial_bound_is_captured_at_entry_even_when_carried_value_changes():

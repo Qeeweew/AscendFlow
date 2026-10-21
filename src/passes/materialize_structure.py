@@ -8,15 +8,16 @@ guards and observable notifications are inserted. No optimizer sees async work.
 from collections.abc import Iterable
 
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import ArrayAttr, IndexType, ModuleOp, StringAttr
+from xdsl.dialects.builtin import ArrayAttr, IndexType, ModuleOp, StringAttr, i1
 from xdsl.ir import Block, Region
 
+from ..analysis.integer_facts import IntegerFacts
 from ..analysis.structured_memory import NativeMemoryFacts
-from ..analysis.structured_schedule import Placement, SyncAction
+from ..analysis.structured_schedule import Comparison, Placement, SyncAction
 from ..diagnostics import require
 from ..dialects.physical import BufferOp, CoreIdOp, EndOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
-from ..dialects.structured import ActorDomainOp, NotificationOp, PipelineLoopOp, PipelineStageOp
-from ..scalar import literal
+from ..dialects.structured import ActorDomainOp, NotificationOp, PipelineLoopOp
+from ..scalar import DIVISION, INT64_MAX, expression, literal
 from ..target.ascend910b import Actor
 
 _BINARY = {
@@ -51,10 +52,10 @@ def _entry_target(root):
 def _bindings(memory, block, before, container):
     """Bind only original SSA values which dominate this insertion point."""
     control = memory.control
-    memo = {}
+    memo, ordinals = {}, {}
 
     def bind(value):
-        if isinstance(value.type, IndexType):
+        if isinstance(value.type, IndexType) or value.type == i1:
             expression = control.environment.expression(value)
             # A known mathematical value is not necessarily literal SSA.
             # Keep planned literals constant so unrelated source CSE cannot
@@ -62,36 +63,20 @@ def _bindings(memory, block, before, container):
             if expression.constant is None or isinstance(value.owner, arith.ConstantOp):
                 memo[expression] = value
 
-    def visit_scope(current, stop):
-        owner = current.parent_op()
-        if owner is not None and owner.parent is not None:
-            visit_scope(owner.parent, owner)
-        for argument in current.args:
-            bind(argument)
-        if isinstance(owner, scf.ForOp):
-            logical = control.loops[owner]
-            induction = current.args[0]
-            if logical.lower.constant == 0 and logical.step == 1:
-                memo[logical.ordinal] = induction
-            else:
-                delta = arith.SubiOp(induction, owner.lb)
-                division = arith.DivUIOp(delta.result, owner.step)
-                container.add_ops((delta, division))
-                memo[logical.ordinal] = division.result
-        elif isinstance(owner, PipelineStageOp):
-            logical = control.loops[owner.parent_op()]
-            memo[logical.ordinal] = current.args[0]
-        for operation in current.ops:
-            if operation is stop:
-                break
-            # Newly inserted operations are deliberately absent from the old
-            # environment. They belong to another action's evaluation scope.
-            if operation in control.frames:
-                for value in operation.results:
-                    bind(value)
-
-    visit_scope(block, before)
-    return memo
+    for value in control.dominating_scalars(block, before):
+        bind(value)
+        owner = value.owner
+        if isinstance(owner, Block) and isinstance(owner.parent_op(), scf.ForOp):
+            loop = owner.parent_op()
+            if value is owner.args[0]:
+                logical = control.loops[loop]
+                if logical.lower.constant != 0 or logical.step != 1:
+                    ordinals[logical.ordinal] = expression(
+                        "floordiv",
+                        expression("sub", logical.induction, logical.lower),
+                        literal(logical.step),
+                    )
+    return memo, ordinals
 
 
 def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncAction]) -> ModuleOp:
@@ -160,37 +145,139 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
             current, created_domain = body, True
             if family == "vector":
                 owner = body.args[0]
-        memo = _bindings(memory, block, before, current)
+        memo, ordinals = _bindings(memory, block, before, current)
         if owner is not None:
             memo[memory.control.sid] = owner
+        frame = memory.control.frames[anchor]
+        if frame.operation is anchor and (
+            frame.loop is not None
+            or isinstance(anchor, TaskOp)
+            and anchor.native.data == "index_load"
+            and placement is Placement.BEFORE
+        ):
+            frame = frame.parent
+        premises = (
+            tuple(
+                Comparison(value, predicate, bound)
+                for value, lower, upper in frame.domains()
+                for predicate, bound in ((">=", lower), ("<=", upper))
+            )
+            + frame.predicates()
+        )
+        arithmetic = IntegerFacts(memory.control.environment.facts)
 
-        def scalar(expr, current, memo):
+        def residue(value, modulus, memo, assumptions, arithmetic=arithmetic):
+            """Bound a newly generated nonnegative ring calculation before %.
+
+            For small constant moduli, reducing add/mul operands keeps every
+            intermediate representable even when an unbounded rank would not.
+            Existing SSA evaluations are always reused as written.
+            """
+            if value.constant is not None:
+                return literal(value.constant % modulus) if value.constant >= 0 else None
+            divisor = literal(modulus)
+            if value.kind == "rem" and value.args[1] == divisor:
+                return value
+            if value not in memo and value.kind in {"add", "mul"}:
+                if not all(
+                    arithmetic.prove(Comparison(v, ">=", literal(0)), assumptions)
+                    for v in value.args
+                ):
+                    return None
+                children = tuple(residue(v, modulus, memo, assumptions) for v in value.args)
+                if all(v is not None for v in children):
+                    return expression("rem", expression(value.kind, *children), divisor)
+            return expression("rem", value, divisor)
+
+        def scalar(
+            expr,
+            current,
+            memo,
+            prefix,
+            *,
+            arithmetic=arithmetic,
+            ordinals=ordinals,
+            premises=premises,
+        ):
             if expr in memo:
                 return memo[expr]
+            if expr in ordinals:
+                memo[expr] = scalar(ordinals[expr], current, memo, prefix)
+                return memo[expr]
             if expr.constant is not None:
+                require(
+                    -INT64_MAX - 1 <= expr.constant <= INT64_MAX, "generated index exceeds int64"
+                )
                 operation = arith.ConstantOp.from_int_and_width(expr.constant, IndexType())
             else:
                 require(
                     expr.kind != "argument",
                     f"sync materialization has unbound symbol {expr.text()}",
                 )
-                operation = _BINARY[expr.kind](
-                    *(scalar(child, current, memo) for child in expr.args)
+                assumptions = (
+                    *premises,
+                    *prefix,
+                    # Only bindings in this actual scope supply machine
+                    # ranges. Sibling guarded definitions cannot escape.
+                    *(
+                        Comparison(value, predicate, literal(bound))
+                        for value, ssa in memo.items()
+                        for predicate, bound in (
+                            (">=", 0 if ssa.type == i1 else -INT64_MAX - 1),
+                            ("<=", 1 if ssa.type == i1 else INT64_MAX),
+                        )
+                    ),
                 )
+                if expr.kind == "rem" and (modulus := expr.args[1].constant) is not None:
+                    numerator = expr.args[0]
+                    if (
+                        0 < modulus <= 1 << 31
+                        and numerator not in memo
+                        and not arithmetic.prove(
+                            Comparison(numerator, "<=", literal(INT64_MAX)), assumptions
+                        )
+                    ):
+                        reduced = residue(numerator, modulus, memo, assumptions)
+                        if reduced is not None and reduced != expr:
+                            memo[expr] = scalar(reduced, current, memo, prefix)
+                            return memo[expr]
+                operands = tuple(scalar(child, current, memo, prefix) for child in expr.args)
+                assumptions += tuple(
+                    Comparison(child, predicate, literal(bound))
+                    for child in expr.args
+                    for predicate, bound in ((">=", -INT64_MAX - 1), ("<=", INT64_MAX))
+                )
+                if expr.kind in DIVISION:
+                    numerator, divisor = expr.args
+                    require(
+                        arithmetic.prove(Comparison(numerator, ">=", literal(0)), assumptions)
+                        and arithmetic.prove(Comparison(divisor, ">", literal(0)), assumptions),
+                        "new notification arithmetic is not defined in its evaluation scope",
+                    )
+                if expr.kind in {"add", "mul", "ceildiv"}:
+                    require(
+                        arithmetic.prove(
+                            Comparison(expr, ">=", literal(-INT64_MAX - 1)), assumptions
+                        )
+                        and arithmetic.prove(
+                            Comparison(expr, "<=", literal(INT64_MAX)), assumptions
+                        ),
+                        "new notification arithmetic may overflow int64",
+                    )
+                operation = _BINARY[expr.kind](*operands)
             current.add_op(operation)
             memo[expr] = operation.results[0]
             return operation.results[0]
 
         prefixes, scopes = [], [(current, memo)]
         for action in group:
+            active_prefix = []
             tests = action.guard.comparisons
             if (
                 isinstance(root, MixedOp)
                 and len(action.participants) == 1
                 and action.participants[0] is not Actor.AIC
             ):
-                from ..analysis.structured_schedule import Comparison
-
                 tests = (
                     Comparison(
                         memory.control.sid, "==", literal(int(action.participants[0] is Actor.AIV1))
@@ -204,9 +291,18 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
                 prefixes.pop()
             for test in tests[common:]:
                 current, memo = scopes[-1]
+                active_prefix = prefixes[:]
+                left, right = (
+                    scalar(test.lhs, current, memo, active_prefix),
+                    scalar(test.rhs, current, memo, active_prefix),
+                )
+                if left.type != right.type and left.type == i1 and test.rhs.constant in {0, 1}:
+                    boolean = arith.ConstantOp.from_int_and_width(test.rhs.constant, i1)
+                    current.add_op(boolean)
+                    right = boolean.result
                 comparison = arith.CmpiOp(
-                    scalar(test.lhs, current, memo),
-                    scalar(test.rhs, current, memo),
+                    left,
+                    right,
                     _COMPARE[test.predicate],
                 )
                 nested = Block()
@@ -216,7 +312,10 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
                 prefixes.append(test)
                 scopes.append((nested, dict(memo)))
             current, memo = scopes[-1]
-            event = None if action.event is None else scalar(action.event, current, memo)
+            active_prefix = prefixes[:]
+            event = (
+                None if action.event is None else scalar(action.event, current, memo, active_prefix)
+            )
             current.add_op(
                 NotificationOp.build(
                     operands=[event],

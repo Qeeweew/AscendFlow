@@ -61,24 +61,42 @@ def complete_each_native(memory):
 
 
 def test_captured_native_prefix_does_not_invent_fifo_between_distinct_local_set_effects():
-    memory, reference = snapshots('''
+    memory, reference = snapshots("""
 def independent(X:N.Tensor((2,64),N.f32)):
     with N.Kernel(1,kind="vector"):
         a=N.alloc_ub((64,),N.f32)
         b=N.alloc_ub((64,),N.f32)
         N.copy(X[0,:],a)
         N.copy(X[1,:],b)
-''')
+""")
     actions = [
-        action(t.operation, Placement.AFTER, SyncKind.LOCAL_SET, Engine.MTE2, Engine.V, (Actor.AIV0,), i)
+        action(
+            t.operation,
+            Placement.AFTER,
+            SyncKind.LOCAL_SET,
+            Engine.MTE2,
+            Engine.V,
+            (Actor.AIV0,),
+            i,
+        )
         for i, t in enumerate(memory.templates)
     ]
     actions.extend(
-        action(memory.templates[-1].operation, Placement.AFTER, SyncKind.LOCAL_WAIT, Engine.MTE2, Engine.V, (Actor.AIV0,), i)
+        action(
+            memory.templates[-1].operation,
+            Placement.AFTER,
+            SyncKind.LOCAL_WAIT,
+            Engine.MTE2,
+            Engine.V,
+            (Actor.AIV0,),
+            i,
+        )
         for i in range(2)
     )
     materialize_notifications(memory, actions)
-    checked = check_structured_events(collect_native_memory(memory.module), logical_reference=reference)
+    checked = check_structured_events(
+        collect_native_memory(memory.module), logical_reference=reference
+    )
     sends = [c for c in checked.commands if c.kind == SyncKind.LOCAL_SET.value]
     assert len(sends) == 2
     assert all(checked.happens_before(c.end, sends[1].end) for c in checked.natives)
@@ -199,8 +217,12 @@ def test_reference_preserves_read_versions_when_final_native_order_changes():
     address = overwrite.refs[0].owner
     offset = address.offset.owner
     assert isinstance(offset, arith.ConstantOp)
-    block.detach_op(offset)
-    block.insert_op_before(offset, read)
+    positions = {operation: index for index, operation in enumerate(block.ops)}
+    for value in dict.fromkeys((address.offset, *address.origins, *address.extents)):
+        definition = value.owner
+        if isinstance(definition, arith.ConstantOp) and positions[definition] > positions[read]:
+            block.detach_op(definition)
+            block.insert_op_before(definition, read)
     block.detach_op(address)
     block.insert_op_before(address, read)
     block.detach_op(overwrite)

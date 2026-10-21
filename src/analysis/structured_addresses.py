@@ -3,13 +3,14 @@
 The caller supplies one canonical scalar environment for the actual structured
 control. Decoding preserves allocation identity, static native geometry, and
 original axes; it proves neither bounds nor ownership, values, or completion.
-Axis checking is a separate obligation over an explicitly supplied active
-domain. UB-copy disjointness applies only to operands of the same actual task.
+Static axis diagnostics and native correspondence are separate obligations.
+Dynamic source bounds are input contracts. UB-copy disjointness applies only
+to operands of the same actual task.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -18,7 +19,7 @@ from xdsl.utils.exceptions import VerifyException
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.structured import AddressOp
-from ..indexing import check_axis, equivalent, exact_constant, normalize
+from ..indexing import equivalent, exact_constant, normalize
 from ..scalar import Expr, Fact, expression, from_ssa, literal
 from ..symbols import Symbol
 from ..target.native import ITEMSIZE, NativeGeometry
@@ -100,12 +101,18 @@ class AddressFacts:
     def prefix_span(self):
         if self.geometry.layout == "NZ":
             return expression(
-                "add", expression("mul", self.valid_rows, literal(32)),
+                "add",
+                expression("mul", self.valid_rows, literal(32)),
                 literal((self.geometry.rows - 1) * self.geometry.row_stride),
             )
         return expression(
-            "add", literal(self.geometry.nbytes),
-            expression("mul", expression("sub", self.valid_rows, literal(1)), literal(self.geometry.row_stride)),
+            "add",
+            literal(self.geometry.nbytes),
+            expression(
+                "mul",
+                expression("sub", self.valid_rows, literal(1)),
+                literal(self.geometry.row_stride),
+            ),
         )
 
 
@@ -145,10 +152,10 @@ class ScalarEnvironment:
         """Parse each actual SSA expression through the shared scalar memo.
 
         This does not validate unsigned dividends against an active domain.
-        The consuming traversal must check the original arithmetic operations,
-        including expressions removed by scalar simplification.
+        Source dynamic definedness is an input contract, not a decoder query.
+        Newly generated evaluations retain their separate lowering obligations.
         """
-        return from_ssa(value, memo=self._memo, facts=self.facts)
+        return from_ssa(value, memo=self._memo)
 
 
 class StructuredAddresses:
@@ -245,84 +252,41 @@ class StructuredAddresses:
             left.geometry.total_nbytes, right.geometry.total_nbytes
         )
 
-    def check_axes(
-        self,
-        address: AddressFacts,
-        domains: Sequence[tuple[Expr, Expr, Expr]],
-        *,
-        assumptions=(),
-    ) -> None:
-        """Check every original axis under the caller's actual active domain.
 
-        This supplies no allocation-byte, native-alignment, subview-displacement,
-        ownership, initialization, or asynchronous completion proof. A caller
-        must exclude inactive iterations before requesting an access proof.
-        A failed dynamic range proof is unsupported; only an explicit constant
-        axis violations use the invalid-input diagnostic kind.
-        """
+def check_static_axes(address):
+    """Diagnose explicit invalid axes; dynamic accesses are source contracts."""
+    axes = address.axes
+    require(
+        axes is not None,
+        "native address has no original-axis metadata",
+        kind=ErrorKind.UNSUPPORTED,
+        phase="structured-addresses",
+    )
+    count = address.valid_rows
+    if count is not None:
         require(
-            address.axes is not None,
-            "structured address has no original-axis metadata for bounds admission",
-            kind=ErrorKind.UNSUPPORTED,
+            count.constant is None or 0 <= count.constant <= address.row_capacity,
+            "static row count exceeds its declared capacity",
+        )
+        if count.constant == 0:
+            return
+    for axis, (origin, width, extent) in enumerate(
+        zip(axes.origins, axes.widths, axes.extents, strict=True)
+    ):
+        if count is not None and axis == axes.axes[0]:
+            width = count.constant
+        start, size = origin.constant, extent.constant
+        require(
+            (start is None or start >= 0)
+            and (size is None or width is None or size >= width)
+            and (start is None or size is None or width is None or start + width <= size),
+            "static logical axis exceeds its tensor extent",
             phase="structured-addresses",
             location=str(address.operation.location),
+            witness=(
+                f"axis={axis}",
+                f"origin={origin.text()}",
+                f"width={width}",
+                f"extent={extent.text()}",
+            ),
         )
-        assert address.axes is not None
-        valid_rows = address.valid_rows
-        if valid_rows is not None:
-            from ..indexing import domain_nonnegative
-
-            require(
-                domain_nonnegative(
-                    valid_rows, domains, self.environment.facts, assumptions=assumptions
-                )
-                and domain_nonnegative(
-                    expression("sub", literal(address.row_capacity), valid_rows),
-                    domains,
-                    self.environment.facts,
-                    assumptions=assumptions,
-                ),
-                "runtime row count must stay within its declared capacity",
-            )
-            # Empty prefixes perform no access. This predicate does not
-            # authorize the original scalar arithmetic outside that access.
-            domains = (*domains, (valid_rows, literal(1), literal(address.row_capacity)))
-        for axis, (origin, width, extent) in enumerate(
-            zip(address.axes.origins, address.axes.widths, address.axes.extents, strict=True)
-        ):
-            if valid_rows is not None and axis == address.axes.axes[0]:
-                width = valid_rows
-            try:
-                check_axis(
-                    origin, width, extent, domains, self.environment.facts, assumptions=assumptions
-                )
-            except CompileError as error:
-                start, size = origin.constant, extent.constant
-                width_value = width if type(width) is int else width.constant
-                constant_violation = (
-                    start is not None
-                    and start < 0
-                    or size is not None
-                    and width_value is not None
-                    and size < width_value
-                    or start is not None
-                    and size is not None
-                    and width_value is not None
-                    and start + width_value > size
-                )
-                kind = error.kind
-                if kind is ErrorKind.INVALID and not constant_violation:
-                    kind = ErrorKind.UNSUPPORTED
-                raise CompileError(
-                    error.message,
-                    kind=kind,
-                    phase="structured-addresses",
-                    location=str(address.operation.location),
-                    witness=(
-                        *error.witness,
-                        f"axis={axis}",
-                        f"origin={origin.text()}",
-                        f"width={width}",
-                        f"extent={extent.text()}",
-                    ),
-                ) from error

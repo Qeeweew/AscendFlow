@@ -21,12 +21,12 @@ def test_cube_bf16_uses_the_same_explicit_storage_semantics():
     assert result.report["native_templates"] == 6
 
 
-def test_ast_rejects_hidden_l0_recipe_and_runtime_conditional_expressions():
+def test_ast_rejects_hidden_l0_recipe_and_dynamic_physical_allocation_shapes():
     source = batched_matmul.source.replace("T.matmul(aa, bb, accum=", "T.gemm(aa, bb, ")
     with pytest.raises(FrontendError, match="unknown DSL operation gemm"):
         replace(batched_matmul, source=source).to_ir()
     source = batched_matmul.source.replace("N if TRANSPOSE_B else K", "N if tiles > 0 else K")
-    with pytest.raises(FrontendError, match="constexpr boolean"):
+    with pytest.raises(CompileError, match="allocation dimensions"):
         replace(batched_matmul, source=source).to_ir()
 
 

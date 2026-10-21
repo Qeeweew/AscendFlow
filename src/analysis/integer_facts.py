@@ -113,7 +113,7 @@ class IntegerFacts:
 
     @_query
     def ordered_definedness(
-        self, tests: tuple[Comparison, ...]
+        self, tests: tuple[Comparison, ...], evaluated: frozenset[Expr] = frozenset()
     ) -> tuple[Comparison, tuple[Comparison, ...]] | None:
         """Return the first missing unsigned premise and its ordered prefix.
 
@@ -130,6 +130,8 @@ class IntegerFacts:
             return self.prove(test, prefix)
 
         def check(value, prefix, completed):
+            if value in evaluated:
+                return None  # The actual dominating SSA is reused, not re-evaluated.
             identity = id(value)
             if identity in completed:
                 return None

@@ -6,6 +6,7 @@ operations. Results retain actual native operations and operand positions rather
 than encoding numerical provenance in generated names.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -87,6 +88,7 @@ class RecipeContext:
     operand: "ScalarOperand | None" = None
     load3d_b_width: int | None = None
     load3d_a_width: int | None = None
+    aligned: Callable[[SSAValue, int], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -173,15 +175,23 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
         require(context.operand is not None, "runtime row copies need their actual scalar operand")
         if banks == ("GM", "L1"):
             if op.zero_pad is not None:
-                require(op.destination.owner.valid is None, "padded ND2NZ defines the complete destination")
+                require(
+                    op.destination.owner.valid is None,
+                    "padded ND2NZ defines the complete destination",
+                )
                 native = "nd2nz_rows"
                 destination = context.view(op.destination)
                 params = source_shape(op.source) + source_shape(op.destination)
             else:
-                require(op.destination.owner.valid is prefix, "ND2NZ overlay requires the same runtime prefix")
+                require(
+                    op.destination.owner.valid is prefix,
+                    "ND2NZ overlay requires the same runtime prefix",
+                )
                 native = "nd2nz_overlay"
                 destination = context.view(op.destination, matrix=True)
-                params = source_shape(op.source) + (source_allocation(op.destination).ref.type.shape.data[-2].data,)
+                params = source_shape(op.source) + (
+                    source_allocation(op.destination).ref.type.shape.data[-2].data,
+                )
         else:
             require(
                 banks == ("UB", "GM")
@@ -271,6 +281,10 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
             if padded
             else "copy"
         )
+        if native == "copy" and banks in {("GM", "UB"), ("UB", "GM")}:
+            gm = source if banks[0] == "GM" else destination
+            if context.aligned is None or not context.aligned(gm, 32):
+                native = "copy_bytes"
         task = context.emit("_copy", native, source, destination)
     return RecipeResult((task,), task, 1, (NativeRead(0, task, 0),))
 
@@ -351,6 +365,9 @@ def lower_element(op: ElementOp, context: RecipeContext) -> RecipeResult:
     if op.mask is not None:
         return lower_masked_element(op, context, native)
     require(op.scratch is None, "scratch requires a data predicate or row broadcast")
+    if native == "fill" and op.destination.type.memory.data == "L1":
+        require(op.scalar.value.data == 0.0, "L1 fill currently requires zero")
+        native = "zero_l1"
     refs = [context.view(value) for value in (*op.inputs, op.destination)]
     if native == "add" and any(ref.owner.rows.data > 1 for ref in refs):
         native = "add_strided"

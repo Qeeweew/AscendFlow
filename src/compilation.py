@@ -86,7 +86,6 @@ class Compilation:
                 "bounds": {
                     "accesses": plan.bounds.checked_accesses,
                     "view_contracts": plan.bounds.view_contracts,
-                    "domain_contracts": plan.bounds.domain_contracts,
                 },
                 "admission": dict(plan.admission.work),
                 "dependencies": asdict(plan.dependencies.work),

@@ -15,7 +15,7 @@ from types import MappingProxyType
 
 from xdsl.ir import Operation
 
-from ..diagnostics import require
+from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import TaskOp
 from ..indexing import (
     arguments,
@@ -636,10 +636,17 @@ class _Partitioner:
                     instances.setdefault(identity, {}).setdefault(
                         (template.operation, participant), (template, [])
                     )[1].append(access)
-                    if access.address.valid_rows is not None and (private is None or access.mode.writes):
+                    if access.address.valid_rows is not None and (
+                        private is None or access.mode.writes
+                    ):
                         ordered.add(identity)
                         continue  # Prefix envelopes are may-accesses, not exact cell kills.
-                    projections = self._slots(template, access, participant)
+                    try:
+                        projections = self._slots(template, access, participant)
+                    except CompileError as error:
+                        if error.kind is not ErrorKind.ANALYSIS_LIMIT:
+                            raise
+                        projections = None
                     if projections is None:
                         ordered.add(identity)
                         continue
@@ -650,6 +657,8 @@ class _Partitioner:
         for (root, private, origin, conditions), projections in groups.items():
             origins.setdefault((root, private, conditions), []).append((origin, projections))
         for (root, private, _), items in origins.items():
+            if (root, private) in ordered:
+                continue
             for (_, left), (_, right) in combinations(items, 2):
                 if any(
                     p.access.mode.writes for p in (*left, *right)

@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from xdsl.dialects import arith, scf
+from xdsl.dialects import scf
 from xdsl.ir import Operation
 
 from ..diagnostics import require
@@ -176,16 +176,14 @@ class _Builder:
         for frame in point.frame.ancestors():
             if frame.branch is None:
                 continue
-            compare = frame.operation.cond.owner
-            require(isinstance(compare, arith.CmpiOp), "access order needs an integer branch")
-            predicates = ("==", "!=", "<", "<=", ">", ">=")
-            require(compare.predicate.value.data < len(predicates), "unsupported access predicate")
-            test = Comparison(
-                substitute(self.memory.control.environment.expression(compare.lhs), substitutions),
-                predicates[compare.predicate.value.data],
-                substitute(self.memory.control.environment.expression(compare.rhs), substitutions),
+            tests.extend(
+                Comparison(
+                    substitute(test.lhs, substitutions),
+                    test.predicate,
+                    substitute(test.rhs, substitutions),
+                )
+                for test in frame.comparisons
             )
-            tests.append(opposite(test) if frame.branch else test)
         return tuple(tests)
 
     def _entry_available(self, operation, points):
@@ -216,10 +214,7 @@ class _Builder:
                 if endpoint in control.loops:
                     values.append(control.loops[endpoint].count)
                 elif isinstance(endpoint, scf.IfOp):
-                    comparison = endpoint.cond.owner
-                    values.extend(
-                        control.environment.expression(operand) for operand in comparison.operands
-                    )
+                    values.append(control.environment.expression(endpoint.cond))
         return all(arguments(value) <= available for value in values)
 
     def _single_activation(self, loop, points):
@@ -432,6 +427,7 @@ class _Builder:
         for cell, transfer in cells.items():
             self.envelopes[operation, cell] = transfer
             readers = unique(transfer.head_reads + transfer.tail_reads)
+
             # Asynchronous reader ports also forward acquired prefixes on
             # empty paths. A synchronous Scalar observation retires at its
             # actual execution; when it has no input read, it carries no old
@@ -444,7 +440,9 @@ class _Builder:
                     return bool(point.endpoint.retirements)
                 return self.dispatch.tasks[point.operation, point.participant].implicit_completion
 
-            inputs = unique(transfer.head_reads + tuple(p for p in transfer.tail_reads if not synchronous(p)))
+            inputs = unique(
+                transfer.head_reads + tuple(p for p in transfer.tail_reads if not synchronous(p))
+            )
             writers = unique(transfer.first_writes + transfer.tail_writes)
             result[cell] = AccessTransfer(
                 ports(inputs, Placement.ENTRY),
@@ -758,6 +756,35 @@ class _Builder:
                         # even when the read is skipped; no earlier Set is
                         # guarded by that not-yet-defined value.
                         cells.update(self._envelope(operation, {cell: transfer}))
+            # A data-dependent predicate may be defined after an incoming
+            # publisher. Expose the existing balanced queue-prefix interface
+            # on both paths instead of hoisting that predicate to the publisher.
+            frame = self.memory.control.frames[operation]
+            stable = self.entry_symbols | {loop.ordinal.args[0] for loop in frame.loops()}
+            (test,) = self.memory.control.branches[operation, 0]
+            if not arguments(test.lhs) | arguments(test.rhs) <= stable:
+                premises = (
+                    tuple(
+                        Comparison(value, predicate, bound)
+                        for value, lower, upper in frame.domains()
+                        for predicate, bound in ((">=", lower), ("<=", upper))
+                    )
+                    + frame.predicates()
+                )
+                if not (
+                    self.arithmetic.prove(test, premises)
+                    or self.arithmetic.prove(opposite(test), premises)
+                ):
+                    cells.update(
+                        self._envelope(
+                            operation,
+                            {
+                                cell: transfer
+                                for cell, transfer in cells.items()
+                                if (operation, cell) not in self.envelopes
+                            },
+                        )
+                    )
         else:
             children = [
                 child

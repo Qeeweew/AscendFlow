@@ -38,13 +38,13 @@ AscendFlow/
 ```text
 compile / Compilation
   synchronize_structure
-    lower_native_structure                # DSL→source、原式检查、native lowering
+    lower_native_structure                # DSL→source、静态原式诊断、native lowering
     collect_native_memory
-    bounds → admission → dispatch
+    physical contracts → admission → dispatch
     access_order → dependencies             # 可能冲突顺序、region 队列端口和局部 packet
     generate_notifications
       bind_notifications                 # 覆盖、真实位置及原始 ownership edges
-      EventDomains                       # 有序原式定义性、坐标往返、配对
+      EventDomains                       # 新 guard 定义性、复用实际 SSA、坐标往返、配对
       bind_cell_credits                  # 稀疏私有轮次的端点与本地发射前提
       establish_queue_order              # 逐层 physical-step / phase 准入
       construct_cell_channels            # 物理 lifetime credit 归纳
@@ -52,7 +52,7 @@ compile / Compilation
     plan_event_resources                # 冻结首选/有限缩环、虚拟动作、复用及整组 FIFO
     allocate_structured_events          # 先首选后有限选项；只分配编号，不查询域或 handback
     materialize_notifications
-    ScalarFacts                         # 复用原始控制和合法索引范围
+    ScalarFacts                         # 可选控制/标量优化范围
     executable projection               # 独立终端模块；映射 native、geometry 与 SSA 范围
     lower_execution                     # actor 本地时钟与存在域→arith/scf
     simplify_scalars → simplify_conditions
@@ -71,7 +71,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/effects、绑定真实循环的条件读取；消费共享目标描述 |
 | `target/native.py` 的 `NativeSpec` | 一份不可变的 native opcode、参数、operand geometry/effects、packet、read reset 与完成规则；逻辑分析和终端共享，不含地址/代次 |
 | `analysis/smt.py`、`integer_facts.py`、`guard_cover.py` | 原式数学关系与条件覆盖共用 Z3 查询；定义性和机器范围独立，输入环境与完整前提限定缓存 |
-| `analysis/structured_bounds.py`、`structured_admission.py`、`structured_host.py` | bounds、外部别名、实际存储实例、初始化、借用 Tile 及整数范围前提；group/peer 独立性属于源程序合同 |
+| `analysis/structured_bounds.py`、`structured_admission.py` | 静态非法、物理容量、源/native 对应、别名、存储实例、初始化和借用 Tile；动态源 bounds 与 group/peer 独立性属于输入合同 |
 | `analysis/structured_access.py`、`structured_regions.py` | 按真实地址周期建立可选精确 cell 与可能别名的 AliasRegion；保留实际 native 访问，不将 may-write 当完整定义 |
 | `analysis/access_order.py`、`storage_packets.py`、`storage_word.py`、`structured_dependencies.py` | 可能冲突的 RAW/WAR/WAW、条件访问的并集及完整入口可用域、单次激活证明、共同队列端口、局部完整 packet 的实际复用 |
 | `analysis/local_schedule.py`、`structured_dispatch.py` | 按迭代域和 actor family 建立本地 stage 顺序与 horizon；派发消费该顺序并绑定 native、控制入口/出口的位置 |
@@ -160,14 +160,10 @@ MAD 首轮/周期 clear 所需的 ordinal 是显式 index operand，
 `symbols.Symbol` 绑定实际 SSA/control 身份与明确种类，名字只用于诊断；
 metadata/carry 捕获 group、SID 与祖先 loop ordinal，并随同时坐标替换特化。
 `analysis.smt` 在一次编译内按完整不可变输入快照共享查询服务，不跨构建保存。
-原式索引的全局/词法域非负性也询问该服务，完整保留实际 coordinate bounds；
-不再用手写余数符号界、min/max 候选或递归坐标消元作第二套 sign 决策。
-原式定义性先检查；数学化简不能掩盖非法 unsigned 求值或原始溢出。
-`ScalarFacts` 复用已建立的控制域、联合 owner/iteration 范围和合法索引前提。
-其 active-range 查询由 `IndexRanges` 按不可变输入快照和完整词法域建立 DAG，
-共享子表达式的范围不再逐个 SSA 递归重建。不同域、收紧后的新输入环境分别建立；
-失败不保存为成功。host extrema 的空域端点语义与活跃范围保持分离，数学范围不
-授权原始 unsigned 求值或机器整数溢出。
+源动态定义性不作全局准入。`structured_host` 的统一极值遍历和
+`host_expressions/index_extrema` 传递链已经删除；范围未知的真实 SSA 可以执行。
+`ScalarFacts` 保留优化所用的联合 owner/iteration 范围，失败或预算耗尽不决定
+普通源访问能否编译。静态非法原式、lowering 新增求值与纯数学关系分别处理。
 整数与谓词 pass 共用以真实 SSA 为原子的仿射视图，并保留非线性、除法和余数节点。
 作用域分别记录区间、直接关系、倍数和已知谓词；通知域把实际 SSA 范围与
 合法 modulo 关系送入同一 SMT 服务，使用数学布尔组合决定可达性、蕴含与覆盖。
@@ -227,7 +223,7 @@ ASC emitter 只接收该终端数据，不再读取 `NativeMemoryFacts`、`Contr
 
 后端打印最终 `scf.for/scf.if` 和实际地址 SSA，不构造循环次数、stage 偏移
 或阶段状态机。表达式内联按运算代价和使用次数选择；共享的复杂谓词保留
-SSA 名称，`i1` 输出为 `bool`。只有已知 operands 非负且除数为正时才省略
-unsigned 除法/余数的显式转换。普通缓存的 launcher 只有 kernel 调用和
+SSA 名称，`i1` 输出为 `bool`。unsigned 除法/余数按 opcode 显式转换为
+`uint64_t`，不依赖范围分析决定执行含义。普通缓存的 launcher 只有 kernel 调用和
 `return 0`；显式 GM cache bypass 先查询目标 runtime 的同一 allocation 地址
 别名，错误直接返回。它不改变物理 root 或在 kernel 中增加同步。

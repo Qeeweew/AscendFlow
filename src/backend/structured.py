@@ -139,12 +139,7 @@ class _Emitter:
             code = f"({a} {predicates[predicate]} {b})"
         elif type(operation) in _BINARY:
             if isinstance(operation, (arith.DivUIOp, arith.RemUIOp)):
-                ranges = self.plan.scalar_ranges
-                if (
-                    ranges.get(operation.lhs, (-1, 0))[0] < 0
-                    or ranges.get(operation.rhs, (0, 0))[0] <= 0
-                ):
-                    a, b = f"uint64_t({a})", f"uint64_t({b})"
+                a, b = f"uint64_t({a})", f"uint64_t({b})"
             operator = _BINARY[type(operation)]
             if isinstance(operation, (arith.AndIOp, arith.OrIOp)) and not (
                 isinstance(operation.result.type, IntegerType)

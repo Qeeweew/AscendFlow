@@ -1,6 +1,6 @@
 # 编译不变量与检查职责
 
-2026-10-18。以下合同由当前唯一 source 链路保持。具体生成规则、前提及
+2026-10-21。以下合同由当前唯一 source 链路保持。具体生成规则、前提及
 归纳理由见 [generation-rules.md](generation-rules.md)，验证方法见
 [validation.md](validation.md)。设备与编译性能须对实际产物分别测量。
 
@@ -22,46 +22,37 @@ SSA/代次。opcode、参数或地址 operand 数量改变必须更新描述，�
 几何输出另一条指令。packet 仍对可信注册表核验 identity 与 closed mask；
 描述共享不取代原生硬件检查、ownership 或同步资格。
 
-当前 bounds 按完全相同的 root、原始 axes、offset DAG 和 native geometry
-建立 view 合同；每个不同 active domain 仍有自己的义务。所有真实 AddressOp
-各自保留映射，不以相同扁平字节范围代替原轴检查。host 以不变 lexical domain
-构造标量范围 DAG，保留 owner/iteration 的联合区间；原始除法和源码算术仍独立
-检查。Expr 的 free variables 在节点构造时建立，不依赖 range/guard 环境。
+源程序实际执行的访问及算术定义性属于 DSL 输入合同。编译器不证明全部
+动态原轴/byte bounds，也不要求所有 index 拥有 uniform extrema；静态非法
+原式仍在代数化简前诊断。typed SSA 保留实际执行语义，`Expr` 仅是可选分析视图。
 
-AST 捕获在准入前只将常量放到根作用域，其余整数原式保留实际求值位置；operand
-已经可用不授权跨分支或空循环提前求值。后续 pass 仍按已建立的范围与机器语义
-决定外提。原式 unsigned 检查消费完整 lexical 元数据关系，而不将相关端点独立
-代入后丢掉关系。每个条件先检查自身求值；其 signed 比较仅对选中 region 的后续
-访问提供前提，不传播到 sibling 或 merge。bounds 以完整域及条件共同区分义务；
-无法解释的条件不提供范围事实，保留原控制及独立原式检查。
+存储检查保留真实 allocation、原轴线性化、native 子视图/行间空洞、对齐及容量。
+源索引作为 SSA 原子参与对应，不展开任意数据计算；不同 active domain 仍保留
+自己的控制与 effects，但不再逐域证明调用方的数据合法性。
 
-事件成员域对每个 guard 保留其求值前的实际 metadata load/range 前缀。范围即使
-支配最终端点，也不能用于消去在该 load 之前求值的条件。原始 guard 的有序
-定义性先检查，再使用相应输入前缀；不以分支/body 内 load 的合同证明其自身激活。
-在已经假设两个实际端点执行的 handback 子问题内，端点支配 load 的局部范围仍须
-传递，即使 activation 中对应的恒真条件已经消去。范围从真实物理 scope 按端点
-实际坐标和 SID 绑定，不再次平移已实例化的 guard，不注册为全局输入事实。
-原始有序定义性检查和完成/消费约束保留；输入范围本身不提供任何完成边。
+AST 和 lowering 保持条件、mask、求值顺序。已有且支配插入点的 SSA 直接复用；
+源动态定义性不再重复求解。编译器新建的通知/时钟/地址算术另有保持义务：
+非空前缀先于 LAST、短路前项先于后项，不将 load 或部分函数外提到更大域。
+新通知算术在真实物化位置检查定义性和 int64 范围；非负加乘的常量取模可先
+约减操作数，避免事件 rank 在取模前溢出，不改变 ID、width 或共享政策。
 
-原轴范围、实际线性化和 native 子视图已经检查后，若真实 allocation 能容纳
-整个原 tensor，就组合这些事实推出 native 字节边界，不再独立求解展开后的
-非线性 offset。无法建立完整 tensor 容量关系时，仍检查实际 slice 的字节界；
-轴范围不能授权伪造 offset、过小 allocation 或跨越行间空洞的 native。
+事件域保留每个 guard 求值前的真实 metadata 前缀，不能以分支/body 内的 load
+证明自身激活。在已经假设端点实际执行的子问题内，可使用其局部输入合同；
+不能将其升级为循环非空、端点存在或完成证据。条件值在早期 publisher 尚未
+定义时，使用既有平衡的 queue-prefix 入口/出口，不提前读取条件，不添加统一 drain。
 
-地址解码保留原始 axes、真实字节 footprint 和可选 ND 矩形几何；bounds 按实际
-active domain 检查。编译器不反解 GEMM swizzle、排列 mixed-radix digit 或搜索
-tile-grid 的逆坐标。简单矩形分离不能排除冲突时保留 AliasRegion 及必要访问
-顺序；write_disjoint 仅按源声明使用，真实原轴范围与字节地址不变。
+空间 enclosure 可由合法源访问及已检查的布局对应建立，无需再证明源 bounds。
+它只提供保守空间分离，不改变真实 native 字节、不建立初始化、KILL 或 credit。
+区域关系未知或可选分析预算耗尽，保留 AliasRegion 及必要源码顺序；必要协议
+检查仍拒绝无法实现的 ownership、quorum、进展或有限事件资源。
 
-二维 runtime 行前缀的地址容量、实际 count SSA 和 native scalar operand 必须
-对应。bounds 检查 count 范围和实际非空访问；部分写不授权完整初始化。
-补零 GM→L1 的 L1 完整写与 GM 部分读分别建模，不能通过缩小地址 metadata
-让后端仍执行整块搬运。具体合同见[memory-contracts.md](memory-contracts.md)。
+二维前缀保留实际 count SSA 与静态容量，native 使用同一个 count。部分写不
+授权完整初始化；显式补零的 GM 部分读和 L1 完整写分别建模，禁止整块 DMA 多读。
 
 公共编译在独立 expression scope 内驻留完全相同的原始 `(kind, args)` 节点，
 退出、异常或取消时释放节点表，嵌套 scope 恢复外层。它不保存 range、guard、
-alias 或完成证据；数学等价的不同原式不会在此合并。所有原始 SSA 使用仍检查
-各自的有序定义性。查表前检查 key 类型，不能让 Python 的 `True == 1 == 1.0`
+alias 或完成证据；数学等价的不同原式不会在此合并。原始 SSA 的求值域继续保留，
+新求值另检查有序定义性。查表前检查 key 类型，不能让 Python 的 `True == 1 == 1.0`
 将非法常量误认为已构造的合法整数。确定性排序继续使用结构键。
 
 BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变记录中
@@ -168,7 +159,7 @@ footprint 闭合，再检查实际调用非空并汇总循环，不合并不同 
 操作数顺序、重复项和嵌套保持，不重复执行通用 Python 接口的算术 sort 强制转换。
 这不改变输入前提、查询、求解预算或答案；原式定义性和机器范围继续独立检查。
 
-无符号floor/ceil/rem必须保留原始有序guard的定义性：例如先证明选择非空，再求LAST；不能先代数消去或合取后续条件，掩盖此前非法求值。前提变化时重新检查受影响原式；同一有序合取内，后续前缀只追加已成立条件，先前已检查的原始 DAG 节点可保持定义性。该复用不跨 guard 调用，不借后续条件证明更早表达式。运行期guard的短路次序不由数学集合排序决定。
+编译器新构造的无符号floor/ceil/rem必须保持有序guard的定义性：例如先证明选择非空，再求LAST；不能先代数消去或合取后续条件，掩盖此前非法求值。前提变化时重新检查受影响原式；同一有序合取内，后续前缀只追加已成立条件，先前已检查的原始 DAG 节点可保持定义性。该复用不跨 guard 调用，不借后续条件证明更早表达式。运行期guard的短路次序不由数学集合排序决定。
 
 输入/输出IR由本次编译拥有，受控变换保持的事实可继续使用；外部或被修改的物理IR不能借旧结果。当前公共compile拒绝外部物理快照，debug_verify也只有xDSL结构检查，不能宣传为独立同步证明。
 
@@ -185,11 +176,11 @@ footprint 闭合，再检查实际调用非空并汇总循环，不合并不同 
 也不改变原始 guard、通知动作、编号或事件资源政策。
 标量定义移动到更大执行域时，原域的范围事实失效；目标域重新建立完整求值范围后才能外提。
 
-最终 `simplify_scalars` 在原式、整数范围和通知定义性准入之后执行。整数 CSE 只复用
+最终 `simplify_scalars` 在静态原式诊断和同步物化之后执行，可选范围不作为准入。整数 CSE 只复用
 真实 SSA 支配定义；不变量仅在全部操作数支配目标位置、且目标域内求值合法时
 外提，不从 sibling branch 借用定义，不处理浮点、vector 或异步操作。局部区间
-来自实际 runtime 合同、actor owner、循环边界及有序 SCF 分支。合法int64索引
-求值隐含的uniform乘积上界直接收紧参数范围，不重新建立地址或同步证明；signed 运算的
+来自实际 runtime 合同、actor owner、循环边界及有序 SCF 分支。已删除全程序 host extrema
+及由此反推全局参数上界的链路；已有源 SSA 的局部类型事实不授权更早求值。signed 运算的
 完整区间可能溢出时退回未知，不重结合算式。
 unsigned 单位除法/余数使用精确位向量恒等式，不回溯豁免原 DSL 定义性检查。
 本次整数pass保留native、地址、通知和控制身份，SSA操作数只作等价替换。
@@ -227,8 +218,8 @@ ASC不输出阶段枚举、阶段参数、stage lambda或独立的序言/稳态/
 纯整数单次使用表达式可在真实使用点内联，保留短路求值的顺序。
 生成的launcher仅转发stream、buffer指针和runtime标量并发射kernel，保留现有
 共享库ABI。尺寸、倍数、整数溢出、空指针、对齐和buffer重叠的运行时检查
-直接删除，不移动到其他入口。输入声明、原式定义性、静态越界及同步准入的
-编译期检查保留；调用方满足声明的shape/alias/对齐及合法索引求值前提。
+直接删除，不移动到其他入口。输入声明结构、静态非法、lowering 对应和同步资源检查保留；
+调用方满足声明的 shape/alias/原语对齐及实际执行的合法索引和算术前提。
 
 ## 7. 测试与正常路径
 

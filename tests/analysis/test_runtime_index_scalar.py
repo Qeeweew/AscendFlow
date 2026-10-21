@@ -105,8 +105,9 @@ def test_division_requires_positive_uniform_divisor(kind):
     assert uniform(expression(kind, a, literal(3)), {"a"})
     assert not uniform(value, {"a": Fact(), "other": Fact(minimum=1)})
     for divisor in (0, -1):
-        with pytest.raises(CompileError, match="divisor must be positive"):
-            expression(kind, a, literal(divisor))
+        raw = expression(kind, a, literal(divisor))
+        with pytest.raises(CompileError, match="positive divisor"):
+            raw.evaluate({"a": 3})
         with pytest.raises(CompileError, match="positive divisor"):
             value.evaluate({"a": 3, "b": divisor})
     with pytest.raises(CompileError, match="nonnegative numerator"):
@@ -168,16 +169,15 @@ def test_positive_derived_divisors_are_conservative():
     "operation,kind",
     [(arith.DivUIOp, "floordiv"), (arith.RemUIOp, "rem"), (arith.CeilDivUIOp, "ceildiv")],
 )
-def test_unsigned_ssa_extraction_checks_dynamic_divisors_even_with_cached_ir(operation, kind):
+def test_ssa_extraction_is_independent_of_optional_divisor_range_facts(operation, kind):
     a, b = size(SizeOp, "a"), size(RuntimeSizeOp, "b", minimum=1, multiple=8)
     value = operation(a.value, b.value).result
-    facts, memo = facts_from_sizes([a, b]), {}
-    result = from_ssa(value, facts=facts, memo=memo)
+    memo = {}
+    result = from_ssa(value, memo=memo)
     left, right = (from_ssa(op.value) for op in (a, b))
     assert result == expression(kind, left, right)
-    for environment in (None, {left.args[0]: Fact(), right.args[0]: Fact()}):
-        with pytest.raises(CompileError, match="uniform and provably positive"):
-            from_ssa(value, facts=environment, memo=memo)
+    assert from_ssa(value, memo=memo) is result
+    assert infer(result, {left.args[0]: Fact(), right.args[0]: Fact()}) is None
     constant = arith.ConstantOp.from_int_and_width(8, IndexType())
     assert from_ssa(operation(a.value, constant.result).result).kind == kind
 
@@ -188,13 +188,14 @@ def test_coordinate_numerator_uses_a_separate_range_environment():
     quotient = arith.DivUIOp(block.args[0], divisor.value).result
     facts = facts_from_sizes([divisor])
     coordinate = Symbol("$g", SymbolKind.ORDINAL, block.args[0])
-    value = from_ssa(quotient, coordinates={block.args[0]: coordinate}, facts=facts)
+    value = from_ssa(quotient, coordinates={block.args[0]: coordinate})
     assert value.evaluate({"$g": 63, "d": 8}) == 7
     assert not uniform(value, facts)
     assert infer(value, {**facts, coordinate: Fact(0, maximum=63)}).maximum == 63
-    bad = arith.DivUIOp(divisor.value, block.args[0]).result
-    with pytest.raises(CompileError, match="uniform and provably positive"):
-        from_ssa(bad, coordinates={block.args[0]: coordinate}, facts=facts)
+    dynamic = arith.DivUIOp(divisor.value, block.args[0]).result
+    result = from_ssa(dynamic, coordinates={block.args[0]: coordinate})
+    assert result.evaluate({"$g": 2, "d": 8}) == 4
+    assert infer(result, facts) is None
 
 
 def test_unknown_kinds_fail_before_any_ceildiv_emission():

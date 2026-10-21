@@ -176,13 +176,28 @@ class _Interpret:
             if address.valid_rows is not None:
                 count = values[address.valid_rows]
                 _check(
-                    0 <= count <= access.address.row_capacity, "actual runtime row count exceeds capacity"
+                    0 <= count <= access.address.row_capacity,
+                    "actual runtime row count exceeds capacity",
                 )
                 if geometry.layout == "NZ":
                     active_bytes = count * 32
                     active_rows = geometry.rows if count else 0
                 else:
                     active_rows = count
+            if active_rows and active_bytes and address.widths is not None:
+                # Validate the caller's actual logical access, independently
+                # of compiler range proofs. Staying inside a large root does
+                # not permit crossing a matrix plane or an original row.
+                for axis, (origin, extent, width) in enumerate(
+                    zip(address.origins, address.extents, address.widths, strict=True)
+                ):
+                    actual_width = width.data
+                    if address.valid_rows is not None and axis == address.axes.data[0].data:
+                        actual_width = values[address.valid_rows]
+                    _check(
+                        0 <= values[origin] and values[origin] + actual_width <= values[extent],
+                        f"actual logical axis out of bounds: {root.sym_name.data} axis={axis}",
+                    )
             for row in range(active_rows):
                 start = offset + row * geometry.row_stride
                 end = start + active_bytes
@@ -564,7 +579,9 @@ def _accesses(logical, physical, reach, order):
             boundaries[span.storage].update((span.start, span.end))
     points = {storage: tuple(sorted(values)) for storage, values in boundaries.items()}
     atoms = {storage: tuple(pairwise(values)) for storage, values in points.items()}
-    positions = {storage: {value: i for i, value in enumerate(values)} for storage, values in points.items()}
+    positions = {
+        storage: {value: i for i, value in enumerate(values)} for storage, values in points.items()
+    }
     touches = {}
     for command in logical:
         touched = defaultdict(set)

@@ -114,7 +114,8 @@ def lower_address(
 
     Static strides determine native row geometry. Dynamic leading dimensions
     remain ordinary SSA products in the full byte offset and axis metadata.
-    The caller still owes dynamic bounds, alignment, and ownership admission.
+    Dynamic source bounds belong to the input contract. Native correspondence,
+    alignment requirements and ownership remain separate compiler obligations.
     """
     view = value.owner
     _require(isinstance(view, ViewOp) and value is view.ref, "native work needs a source ViewOp")

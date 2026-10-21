@@ -547,7 +547,10 @@ class _Parser:
             self.trace.add(operation)
             self.trace.blocks.append(block)
             self.trace.values.append([])
-            self.env.update(zip(carried, block.args[1:]))
+            self.env.update(
+                (name, builders._coordinate(value) if isinstance(value.type, IndexType) else value)
+                for name, value in zip(carried, block.args[1:], strict=True)
+            )
             self.env[node.target.id] = builders._coordinate(block.args[0])
             try:
                 self.body(node.body)
@@ -559,7 +562,10 @@ class _Parser:
                 self.trace.values.pop()
                 self.trace.blocks.pop()
             self.env = original
-            self.env.update(zip(carried, operation.results))
+            self.env.update(
+                (name, builders._coordinate(value) if isinstance(value.type, IndexType) else value)
+                for name, value in zip(carried, operation.results, strict=True)
+            )
             return
         # Explicit state writes are supported; scalar/tile loop results require
         # iter_args/yields, never the last Python iteration's binding.
@@ -611,7 +617,10 @@ class _Parser:
             OpResult(value.type, operation, i) for i, value in enumerate(results[0])
         )
         self.env = before
-        self.env.update(zip(merged, operation.results))
+        self.env.update(
+            (name, builders._coordinate(value) if isinstance(value.type, IndexType) else value)
+            for name, value in zip(merged, operation.results, strict=True)
+        )
 
     def scalar_result(self, value, node):
         if type(value) is bool:
@@ -629,6 +638,46 @@ class _Parser:
     def scalar(self, value):
         return self.trace.scalar(value)
 
+    def scalar_selection(self, condition, left, right, node):
+        """Capture each expression in its selected region, including effects."""
+        if type(condition) is bool:
+            return left() if condition else right()
+        if not isinstance(condition, SSAValue) or condition.type != i1:
+            self.fail(node, "conditional expression requires a scalar predicate")
+        blocks = [Block(), Block()]
+        operation = scf.IfOp(condition, [], *(Region(block) for block in blocks))
+        self.trace.add(operation)
+        values = []
+        for block, expression in zip(blocks, (left, right), strict=True):
+            self.trace.blocks.append(block)
+            self.trace.values.append([])
+            try:
+                value = self.scalar_result(expression(), node)
+                self.trace.add(scf.YieldOp(value))
+                values.append(value)
+            finally:
+                self.trace.values.pop()
+                self.trace.blocks.pop()
+        if values[0].type != values[1].type:
+            self.fail(node, "conditional expressions require matching scalar types")
+        operation.results = SSAValues([OpResult(values[0].type, operation, 0)])
+        value = operation.results[0]
+        return builders._coordinate(value) if isinstance(value.type, IndexType) else value
+
+    def boolean_expression(self, nodes, disjunction):
+        value = self.expr(nodes[0])
+        if not (type(value) is bool or isinstance(value, SSAValue) and value.type == i1):
+            self.fail(nodes[0], "boolean expressions require scalar predicates")
+        if len(nodes) == 1:
+            return value
+        tail = lambda: self.boolean_expression(nodes[1:], disjunction)
+        return self.scalar_selection(
+            value,
+            (lambda: True) if disjunction else tail,
+            tail if disjunction else (lambda: False),
+            nodes[0],
+        )
+
     def arguments(self, node):
         if any(isinstance(arg, ast.Starred) for arg in node.args) or any(
             k.arg is None for k in node.keywords
@@ -642,15 +691,7 @@ class _Parser:
 
     def expr(self, node):
         if isinstance(node, ast.BoolOp):
-            # Specialization policies use Python's ordered short-circuiting.
-            # Device predicates remain explicit control regions.
-            for item in node.values:
-                value = self.expr(item)
-                if type(value) is not bool:
-                    self.fail(item, "boolean expressions require constexpr booleans")
-                if value == isinstance(node.op, ast.Or):
-                    return value
-            return value
+            return self.boolean_expression(node.values, isinstance(node.op, ast.Or))
         if isinstance(node, ast.Constant):
             return _constant(node.value)
         if isinstance(node, ast.Name):
@@ -672,13 +713,9 @@ class _Parser:
             return tuple(self.expr(item) for item in node.elts)
         if isinstance(node, ast.IfExp):
             condition = self.expr(node.test)
-            if type(condition) is not bool:
-                self.fail(
-                    node,
-                    "conditional expressions require a constexpr boolean; "
-                    "use structured if/else for device conditions",
-                )
-            return self.expr(node.body if condition else node.orelse)
+            return self.scalar_selection(
+                condition, lambda: self.expr(node.body), lambda: self.expr(node.orelse), node
+            )
         if isinstance(node, ast.Dict):
             if any(key is None for key in node.keys):
                 self.fail(node, "policy mappings cannot unpack host dictionaries")
@@ -717,7 +754,9 @@ class _Parser:
                 return (lhs & rhs) if isinstance(node.op, ast.BitAnd) else (lhs | rhs)
             if type(lhs) is int and type(rhs) is int:
                 return lhs & rhs if isinstance(node.op, ast.BitAnd) else lhs | rhs
-            self.fail(node, "device bitwise operations require coordinate predicates")
+            return self.trace.index_op(
+                arith.AndIOp if isinstance(node.op, ast.BitAnd) else arith.OrIOp, lhs, rhs
+            )
         if isinstance(node, ast.BinOp) and type(node.op) in _BINARY:
             lhs, rhs = self.expr(node.left), self.expr(node.right)
             if isinstance(node.op, ast.Div):
@@ -756,8 +795,8 @@ class _Parser:
                 if len(args) != 2 or kwargs:
                     self.fail(node, f"{name} requires two scalar arguments")
                 a, b = args
-                if name == "ceildiv" and (type(b) is not int or b <= 0):
-                    self.fail(node, "ceildiv requires a positive constexpr divisor")
+                if name == "ceildiv" and type(b) is int and b <= 0:
+                    self.fail(node, "ceildiv requires a positive divisor")
                 if all(type(arg) is int for arg in args):
                     return (
                         (a + b - 1) // b

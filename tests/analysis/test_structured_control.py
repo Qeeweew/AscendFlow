@@ -4,7 +4,7 @@ import pytest
 from xdsl.dialects import scf
 
 from ascendflow import language as N
-from ascendflow.analysis.structured_addresses import StructuredAddresses
+from ascendflow.analysis.structured_addresses import StructuredAddresses, check_static_axes
 from ascendflow.analysis.structured_control import _division_iteration_range, build_control_facts
 from ascendflow.dialects.physical import TaskOp
 from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
@@ -29,7 +29,7 @@ def test_real_addresses_use_their_actual_scope_ranges_once(source):
         if not isinstance(op, AddressOp):
             continue
         facts = addresses.decode(op.ref)
-        addresses.check_axes(facts, control.frames[op].domains())
+        check_static_axes(facts)
         assert addresses.decode(op.ref) is facts
         assert facts.root is op.source
     assert control.operations_visited == len(before) - 1  # module is an ownership container

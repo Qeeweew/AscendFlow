@@ -7,14 +7,15 @@ relations fail closed. A fixed term budget bounds distributive expansion.
 """
 
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from fractions import Fraction
 from itertools import product
 from types import MappingProxyType
 
-from .diagnostics import CompileError, require
-from .scalar import DIVISION, Expr, expression, literal
-from .symbols import Symbol, SymbolKind, is_coordinate
+from .diagnostics import CompileError, ErrorKind, require
+from .scalar import DIVISION, Expr, Fact, expression, infer, literal
+from .symbols import is_coordinate
 
 MAX_TERMS = 256
 MAX_WORK = 16384
@@ -22,7 +23,11 @@ MAX_WORK = 16384
 
 def _charge(work, amount):
     work[0] += amount
-    require(work[0] <= MAX_WORK, "index algebra cumulative work budget exceeded")
+    require(
+        work[0] <= MAX_WORK,
+        "index algebra cumulative work budget exceeded",
+        kind=ErrorKind.ANALYSIS_LIMIT,
+    )
 
 
 def _sum(a, b):
@@ -31,7 +36,11 @@ def _sum(a, b):
         result[term] = result.get(term, 0) + coefficient
         if not result[term]:
             del result[term]
-    require(len(result) <= MAX_TERMS, "index algebra term budget exceeded")
+    require(
+        len(result) <= MAX_TERMS,
+        "index algebra term budget exceeded",
+        kind=ErrorKind.ANALYSIS_LIMIT,
+    )
     return result
 
 
@@ -252,9 +261,12 @@ class _PolynomialQuery:
             result = {(self.atom(expr),): 1}
         elif expr.kind in {"floordiv", "rem"}:
             numerator, divisor = expr.args
-            require(
-                positive(divisor, self.facts), "index divisor must be provably positive and uniform"
-            )
+            if not positive(divisor, self.facts):
+                # A valid executable division need not be analysable under
+                # these optional facts. Retain it as a congruent integer atom.
+                result = {(self.atom(expr),): 1}
+                self.memo[expr] = result
+                return result
             coordinate = numerator
             if coordinate.kind == "floordiv" and coordinate.args[1].constant is not None:
                 coordinate = coordinate.args[0]
@@ -316,6 +328,24 @@ class _PolynomialQuery:
 def polynomial(expr, facts, *, periodic=False, retained=False):
     """Exact rational polynomial whose public term atoms remain raw Exprs."""
     return _PolynomialQuery(facts, periodic=periodic, retained=retained).visit(expr)
+
+
+def multiple_of(value: Expr, alignment: int, facts: Mapping[str, Fact]) -> bool:
+    """Prove each exact polynomial term a multiple, retaining all coordinates."""
+    try:
+        terms = polynomial(value, facts)
+    except CompileError as error:
+        if error.kind is not ErrorKind.ANALYSIS_LIMIT:
+            raise
+        return False
+    for atoms, coefficient in terms.items():
+        multiple = Fraction(coefficient)
+        for atom in atoms:
+            fact = infer(atom, facts)
+            multiple *= 1 if fact is None else fact.multiple
+        if multiple.denominator != 1 or multiple.numerator % alignment:
+            return False
+    return True
 
 
 def equivalent(a, b, facts):
@@ -491,8 +521,8 @@ class IndexRanges:
     A lexical domain includes its joint owner/iteration coordinates. Only
     exactly that domain may reuse a constructed bound. This view does not
     authorize the original expression's evaluation or export executable
-    polynomial representatives. Uniform host extrema have a separate empty-
-    domain contract and cannot seed these active-iteration facts.
+    polynomial representatives. Missing precision preserves the executable
+    SSA; it is never a source admission failure.
     """
 
     def __init__(self, facts, *, queries=None):
@@ -515,7 +545,10 @@ class IndexRanges:
                 matched = (
                     (lower, upper)
                     if matched is None
-                    else (expression("max", matched[0], lower), expression("min", matched[1], upper))
+                    else (
+                        expression("max", matched[0], lower),
+                        expression("min", matched[1], upper),
+                    )
                 )
         if matched is not None:
             return matched
@@ -536,29 +569,25 @@ class IndexRanges:
             if b.constant is not None:
                 low, high = (ah, al) if b.constant < 0 else (al, ah)
                 return expression("mul", b, low), expression("mul", b, high)
-            require(
-                domain_nonnegative(al, domains, facts) and domain_nonnegative(bl, domains, facts),
-                "index product has an unproven sign",
-                witness=(
-                    f"product={expr.text()}",
-                    f"lower_left={al.text()}",
-                    f"lower_right={bl.text()}",
-                ),
-            )
-            return expression("mul", al, bl), expression("mul", ah, bh)
+            products = [expression("mul", x, y) for x in (al, ah) for y in (bl, bh)]
+            low = high = products[0]
+            for value in products[1:]:
+                low = expression("min", low, value)
+                high = expression("max", high, value)
+            return low, high
         if expr.kind in {"floordiv", "ceildiv", "rem"}:
             from .scalar import positive
 
-            require(
-                domain_nonnegative(al, domains, facts),
-                "unsigned index division has an unproven nonnegative dividend",
-            )
-            require(al == ah or b == bl == bh, "index divisor is not uniform")
-            require(positive(b, facts), "index divisor must be provably positive and uniform")
+            if not (
+                domain_nonnegative(al, domains, facts)
+                and (al == ah or b == bl == bh)
+                and positive(b, facts)
+            ):
+                return expr, expr
             if expr.kind == "rem":
                 return literal(0), expression("sub", b, literal(1))
             return expression(expr.kind, al, b), expression(expr.kind, ah, b)
-        require(False, f"unsupported index range operation {expr.kind}")
+        return expr, expr
 
 
 def interval(expr, domains, facts, *, queries=None):
@@ -568,6 +597,37 @@ def interval(expr, domains, facts, *, queries=None):
     ``IndexRanges`` instance so common subexpressions are established once.
     """
     return IndexRanges(facts, queries=queries).interval(expr, domains)
+
+
+def merge_scalar_bounds(values, branch_domains, outer_domains, facts):
+    """Conservative bounds of an executed scalar selection.
+
+    Each arm is bounded in its own lexical scope. Only bounds expressed in
+    already available outer symbols may escape: a load in an unselected arm
+    cannot constrain the caller. This exports a range, never a selected value,
+    a branch predicate, a storage definition or a completion relationship.
+    """
+    available = set(facts)
+    for domain in outer_domains:
+        for expression_ in domain:
+            available.update(arguments(expression_))
+    bounds = []
+    for value, domains in zip(values, branch_domains, strict=True):
+        try:
+            low, high = interval(value, domains, facts)
+        except CompileError as error:
+            if error.kind is not ErrorKind.ANALYSIS_LIMIT:
+                raise
+            return None
+        if (arguments(low) | arguments(high)) - available:
+            return None
+        bounds.append((low, high))
+    if not bounds:
+        return None
+    low, high = bounds[0]
+    for left, right in bounds[1:]:
+        low, high = expression("min", low, left), expression("max", high, right)
+    return low, high
 
 
 def branch_comparison(condition, decode, branch):
@@ -584,18 +644,11 @@ def branch_comparison(condition, decode, branch):
     compare = condition.owner
     predicates = ("==", "!=", "<", "<=", ">", ">=")
     if not isinstance(compare, arith.CmpiOp) or compare.predicate.value.data >= len(predicates):
-        return ()
+        return (Comparison(decode(condition), "==" if branch else "!=", literal(0)),)
     predicate = predicates[compare.predicate.value.data]
     if branch:
         predicate = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}[predicate]
-    try:
-        lhs, rhs = decode(compare.lhs), decode(compare.rhs)
-    except CompileError:
-        # Optional access premises cannot reinterpret opaque integer/bitwise
-        # expressions. Keep the branch, but obtain no address fact from it.
-        # Original arithmetic is checked separately before any region entry.
-        return ()
-    return (Comparison(lhs, predicate, rhs),)
+    return (Comparison(decode(compare.lhs), predicate, decode(compare.rhs)),)
 
 
 def domain_nonnegative(expr, domains, facts, *, assumptions=()):
@@ -619,175 +672,32 @@ def domain_nonnegative(expr, domains, facts, *, assumptions=()):
     return query_service(facts).implies(Comparison(expr, ">=", literal(0)), premises).proved
 
 
-def check_axis(origin, width, extent, domains, facts, *, assumptions=()):
-    # Validate the original DAG before algebra can cancel an invalid unsigned
-    # division. For example divmod(g-5, 3) recombines mathematically, but g-5
-    # cannot be an unsigned dividend on the first iterations.
-    seen = set()
+def validate_static_arithmetic(program):
+    """Diagnose explicit invalid source evaluations before algebra or DCE.
 
-    def divisions(expr):
-        if expr in seen:
-            return
-        seen.add(expr)
-        for arg in expr.args:
-            if isinstance(arg, Expr):
-                divisions(arg)
-        if expr.kind in {"floordiv", "rem", "ceildiv"}:
-            from .scalar import positive
-
-            require(
-                domain_nonnegative(expr.args[0], domains, facts, assumptions=assumptions),
-                "unsigned index division has an unproven nonnegative dividend",
-            )
-            require(
-                positive(expr.args[1], facts), "index divisor must be provably positive and uniform"
-            )
-
-    width = literal(width) if type(width) is int else width
-    divisions(origin)
-    divisions(width)
-    require(
-        domain_nonnegative(origin, domains, facts, assumptions=assumptions),
-        "logical axis origin may be negative",
-    )
-    remaining = expression("sub", extent, expression("add", origin, width))
-    require(
-        domain_nonnegative(remaining, domains, facts, assumptions=assumptions),
-        "logical axis access is not bounded by its tensor extent",
-    )
-
-
-def validate_source_arithmetic(program, controls):
-    """Check every original division before value/address simplification.
-
-    Even an unused div followed by ``bad-bad`` must satisfy its source domain.
-    Walking the retained scopes avoids mistaking a simplified Expr DAG for the
-    original SSA. Only already evaluated enclosing branches supply premises.
+    Dynamic source definedness is an input contract. This walk only evaluates
+    constants; it builds no second metadata, loop, or branch environment.
     """
-    from xdsl.dialects import arith, scf
+    from xdsl.dialects import arith
+    from xdsl.dialects.builtin import IndexType
 
-    from .dialects.source import DomainOp, IndexReadOp, IterationOp
-    from .scalar import Fact, facts_from_sizes, from_ssa, positive
+    from .dialects.source import _constant_index
 
-    # Only unsigned divisions need these range premises. Keep all of them,
-    # including dead expressions, but do not demand an access-bound formula
-    # for unrelated SCF carries. Propagate relevance once up the actual IR;
-    # walking each division's ancestor chain would repeat work at every depth.
     divisions = (arith.DivUIOp, arith.RemUIOp, arith.CeilDivUIOp)
-    relevant = set()
-    for operation in reversed(tuple(program.walk())):
-        if isinstance(operation, divisions) or operation in relevant:
-            relevant.add(operation)
-            if (parent := operation.parent_op()) is not None:
-                relevant.add(parent)
-
-    facts = facts_from_sizes(program.body.block.ops)
-    owner = program.body.block.args[0]
-    core = Expr("argument", (Symbol("$core", SymbolKind.GROUP, program),))
-    facts[core.args[0]] = Fact(maximum=program.groups.data - 1)
-    number = 0
-
-    def walk(block, coordinates, domains, assumptions=()):
-        nonlocal number
-        for op in block.ops:
-            if isinstance(op, IndexReadOp):
-                name = Symbol(
-                    f"$metadata{number}",
-                    SymbolKind.METADATA,
-                    op.value,
-                    tuple(
-                        Expr("argument", (symbol,))
-                        for symbol in coordinates.values()
-                        if isinstance(symbol, Symbol)
-                        and symbol.kind
-                        in {SymbolKind.GROUP, SymbolKind.PARTICIPANT, SymbolKind.ORDINAL}
-                    ),
-                )
-                number += 1
-                lower, upper = (
-                    from_ssa(v, coordinates=coordinates, facts=facts)
-                    for v in (op.minimum, op.maximum)
-                )
-                coordinates = coordinates | {op.value: name}
-                coordinate = Expr("argument", (name,))
-                domains = [
-                    *domains,
-                    (coordinate, lower, upper),
-                    (
-                        expression("sub", coordinate, lower),
-                        literal(0),
-                        expression("sub", upper, lower),
-                    ),
-                ]
-                continue
-            if op not in relevant:
-                continue
-            if isinstance(op, divisions):
-                lhs, rhs = (
-                    from_ssa(value, coordinates=coordinates, facts=facts) for value in op.operands
-                )
-                require(
-                    domain_nonnegative(lhs, domains, facts, assumptions=assumptions),
-                    "source unsigned division has an unproven nonnegative dividend",
-                    location=str(op.location),
-                    witness=(f"dividend={lhs.text()}",),
-                )
-                require(
-                    positive(rhs, facts),
-                    "source index divisor must be provably positive and uniform",
-                )
-            local, ranges = coordinates, domains
-            if isinstance(op, (IterationOp, DomainOp, scf.ForOp)):
-                name = Symbol(
-                    f"$index{number}",
-                    SymbolKind.PARTICIPANT if isinstance(op, DomainOp) else SymbolKind.ORDINAL,
-                    op,
-                )
-                number += 1
-                value = op.body.block.args[0]
-                if isinstance(op, DomainOp):
-                    lower = literal(0)
-                    bound = literal(
-                        2 if program.kind.data == "mixed" and op.kind.data == "vector" else 1
-                    )
-                else:
-                    domain = controls.by_operation[op].domain
-                    lower = (
-                        literal(domain.lower)
-                        if type(domain.lower) is int
-                        else from_ssa(domain.lower, coordinates=coordinates, facts=facts)
-                    )
-                    bound = (
-                        literal(domain.upper)
-                        if type(domain.upper) is int
-                        else from_ssa(domain.upper, coordinates=coordinates, facts=facts)
-                    )
-                if lower == bound or (
-                    lower.constant is not None
-                    and bound.constant is not None
-                    and lower.constant >= bound.constant
-                ):
-                    continue  # No scalar operation in this loop can execute.
-                local = coordinates | {value: name}
-                ranges = [
-                    *domains,
-                    (Expr("argument", (name,)), lower, expression("sub", bound, literal(1))),
-                ]
-            for branch, region in enumerate(op.regions):
-                tests = assumptions
-                if isinstance(op, scf.IfOp):
-                    tests += branch_comparison(
-                        op.cond,
-                        lambda value, coordinates=coordinates: from_ssa(
-                            value, coordinates=coordinates, facts=facts
-                        ),
-                        branch,
-                    )
-                for child in region.blocks:
-                    walk(child, local, ranges, tests)
-
-    walk(
-        program.body.block,
-        {owner: core.args[0]},
-        [(core, literal(0), literal(program.groups.data - 1))],
-    )
+    memo = {}
+    for operation in program.walk():
+        if isinstance(operation, divisions):
+            lhs, rhs = (_constant_index(value, memo) for value in operation.operands)
+            require(
+                lhs is None or lhs >= 0,
+                "static unsigned division requires a nonnegative dividend",
+                location=str(operation.location),
+            )
+            require(
+                rhs is None or rhs > 0,
+                "static index divisor must be positive",
+                location=str(operation.location),
+            )
+        for value in operation.results:
+            if isinstance(value.type, IndexType):
+                _constant_index(value, memo)

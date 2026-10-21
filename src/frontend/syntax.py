@@ -205,11 +205,12 @@ def store_scalar(value, *, out):
     _ast_only()
 
 
-def load_index(source, *, minimum=0, maximum):
-    """Read one immutable GM int32/int64 with an inclusive input value contract.
+def load_index(source, *, minimum=None, maximum=None):
+    """Read one immutable GM int32/int64; optional inclusive input bounds.
 
     Bounds describe the caller's metadata, and may use preceding index loads.
-    They are not runtime clamps or promises of unique ownership.
+    They are not runtime clamps or promises of unique ownership. Without hints
+    the full signed source dtype range is retained.
     """
     _ast_only()
 

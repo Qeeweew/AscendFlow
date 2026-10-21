@@ -3,7 +3,27 @@
 import struct
 from math import isfinite, isinf
 
+from xdsl.dialects import arith
+
 from ..diagnostics import CompileError, require
+
+# Executable integer operations are independent of scalar.Expr's optional
+# mathematical vocabulary. Keep this capability set separate from ARITHMETIC.
+INTEGER_OPERATIONS = (
+    arith.ConstantOp,
+    arith.AddiOp,
+    arith.SubiOp,
+    arith.MuliOp,
+    arith.DivUIOp,
+    arith.RemUIOp,
+    arith.CeilDivUIOp,
+    arith.MinSIOp,
+    arith.MaxSIOp,
+    arith.CmpiOp,
+    arith.AndIOp,
+    arith.OrIOp,
+    arith.SelectOp,
+)
 
 
 def round_f32(value, *, allow_infinity=False):

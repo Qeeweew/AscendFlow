@@ -64,9 +64,9 @@ from ..mask import (
     shift,
     validate,
 )
-from ..target.scalars import round_f32
+from ..target.scalars import INTEGER_OPERATIONS, round_f32
 from .contracts import _Dimension, _ExtentProduct
-from .syntax import DType, bf16, f16, f32
+from .syntax import DType, bf16, f16, f32, i32, i64
 
 
 def _ints(values):
@@ -131,10 +131,6 @@ class _Index:
                 _trace().index_op(arith.MuliOp, self.value, other.constant),
                 self.constant * other.constant,
             )
-        require(
-            _trace().uniform(self.value) or _trace().uniform(other.value),
-            "index multiplication requires a uniform parameter factor",
-        )
         return _Index(_trace().index_op(arith.MuliOp, self, other))
 
     __rmul__ = __mul__
@@ -183,10 +179,8 @@ class _Index:
                         else self.constant % divisor.constant
                     )
                 )
-        else:
-            require(_trace().uniform(divisor.value), "index divisor must be a uniform parameter")
-        # Positive runtime divisors and nonnegative numerators require lowering
-        # proofs over the actual active coordinate domain.
+        # Actual source evaluations require a nonnegative dividend and a
+        # positive divisor. Dynamic definedness belongs to the input contract.
         return _Index(_trace().index_op(operation, self, divisor))
 
     def __bool__(self):
@@ -218,23 +212,6 @@ def _index(value):
 
 def _coordinate(value):
     return _Index(value)
-
-
-def _index_arithmetic():
-    from xdsl.dialects import arith
-
-    return (
-        arith.ConstantOp,
-        arith.AddiOp,
-        arith.SubiOp,
-        arith.MuliOp,
-        arith.DivUIOp,
-        arith.RemUIOp,
-        arith.MinSIOp,
-        arith.MaxSIOp,
-        arith.CeilDivUIOp,
-        arith.CmpiOp,
-    )
 
 
 _current = ContextVar("ascendflow_source", default=None)
@@ -361,25 +338,6 @@ class _Trace:
         self.index_ops[key] = op.results[0]
         return op.results[0]
 
-    def uniform(self, value):
-        """Whether a value depends only on declared uniform scalar parameters."""
-        seen = set()
-
-        def visit(current, depth):
-            if current in seen:
-                return True
-            if depth > 128 or len(seen) >= 4096:
-                return False
-            seen.add(current)
-            owner = current.owner
-            if isinstance(owner, SizeOp):
-                return True
-            if not isinstance(owner, _index_arithmetic()):
-                return False
-            return all(visit(operand, depth + 1) for operand in owner.operands)
-
-        return visit(value, 0)
-
     def name(self, prefix):
         self.counter += 1
         return f"{prefix}_{self.counter}"
@@ -419,7 +377,7 @@ class _Trace:
                 result = self.scalar(region.count.data - 1)
             else:
                 require(
-                    isinstance(owner, _index_arithmetic()),
+                    isinstance(owner, INTEGER_OPERATIONS),
                     "index expression escaped its source scope",
                 )
                 operands = tuple(visit(operand, depth + 1) for operand in owner.operands)
@@ -504,11 +462,6 @@ class _View:
         origins, widths, axes = list(self.origins), list(self.widths), []
         for axis, index in zip(self.axes, indices):
             size = self.widths[axis]
-            restricted = not (
-                self.origins[axis].value is None
-                and self.origins[axis].constant == 0
-                and size == self.buffer.shape[axis]
-            )
             if isinstance(index, slice):
                 require(index.step in {None, 1}, "strided source slices are not implemented")
                 if index.start is None and index.stop is None:
@@ -530,19 +483,6 @@ class _View:
                         start.constant + width <= size,
                         "source slice exceeds its logical axis",
                     )
-            else:
-                require(
-                    not restricted,
-                    "dynamic relative indexing of a restricted view needs a range proof",
-                )
-            require(
-                not restricted
-                or self.origins[axis].value is None
-                or start.value is None
-                and start.constant == 0
-                and width == size,
-                "narrowing a view with a dynamic origin needs a parent range proof",
-            )
             origins[axis] += start
             widths[axis] = width
         require(axes, "Scalar accesses need an explicit Scalar operation")
@@ -1727,11 +1667,15 @@ def store_scalar(value, *, out):
     return _Value(dst, op.value)
 
 
-def load_index(source, *, minimum=0, maximum):
+def load_index(source, *, minimum=None, maximum=None):
     src = _view(source)
     require(
         src.buffer.op.access.data == "read", "index metadata must be immutable during the kernel"
     )
+    require(src.buffer.dtype in {i32, i64}, "index metadata needs int32 or int64")
+    bits = 32 if src.buffer.dtype == i32 else 64
+    minimum = -(1 << (bits - 1)) if minimum is None else minimum
+    maximum = (1 << (bits - 1)) - 1 if maximum is None else maximum
     op = IndexReadOp.build(
         operands=[src.emit(), _trace().scalar(minimum), _trace().scalar(maximum)],
         result_types=[IndexType()],

@@ -7,11 +7,12 @@ from xdsl.dialects.builtin import IndexType
 from ascendflow import language as N
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement, SyncAction
+from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.physical import CoreIdOp
 from ascendflow.dialects.structured import ActorDomainOp, NotificationOp
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.materialize_structure import materialize_notifications
-from ascendflow.scalar import literal
+from ascendflow.scalar import INT64_MAX, expression, literal
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 from tests.models.terminal_trace import trace
 
@@ -38,8 +39,14 @@ def word(memory, event, guard=None):
     task = memory.templates[0].operation
     actions = tuple(
         SyncAction(
-            task, Placement.AFTER, (Actor.AIC,), kind, Engine.MTE2, Engine.S,
-            event, guard,
+            task,
+            Placement.AFTER,
+            (Actor.AIC,),
+            kind,
+            Engine.MTE2,
+            Engine.S,
+            event,
+            guard,
         )
         for kind in (SyncKind.LOCAL_SET, SyncKind.LOCAL_WAIT)
     )
@@ -52,6 +59,43 @@ def literal_value(value):
     return value.owner.value.value.data
 
 
+def test_new_notification_arithmetic_cannot_borrow_a_later_guard():
+    module, _, _, _ = program()
+    memory = collect_native_memory(module)
+    group = memory.control.group
+    divisor = expression("sub", group, literal(1))
+    use = Comparison(expression("floordiv", literal(1), divisor), ">=", literal(0))
+    prerequisite = Comparison(group, ">", literal(1))
+    with pytest.raises(CompileError, match="notification arithmetic.*defined"):
+        word(memory, literal(0), ActionGuard((use, prerequisite)))
+
+
+def test_new_notification_arithmetic_cannot_introduce_overflow():
+    module, _, _, _ = program()
+    memory = collect_native_memory(module)
+    with pytest.raises(CompileError, match="notification arithmetic.*overflow"):
+        word(memory, expression("add", memory.control.group, literal(INT64_MAX)))
+
+
+def test_new_notification_remainder_reduces_rank_before_overflow():
+    from tests.models.structured_events import _Interpret
+
+    module, _, _, _ = program()
+    memory = collect_native_memory(module)
+    event = expression(
+        "rem", expression("mul", memory.control.group, literal(INT64_MAX)), literal(8)
+    )
+    word(memory, event)
+    model = _Interpret(collect_native_memory(module), {}, physical=True, maximum=100)
+    model.block(module.body.block.first_op.body.block, {}, 0, 3, Actor.AIC)
+    actual = [
+        c.event
+        for c in model.commands
+        if c.kind in {SyncKind.LOCAL_SET.value, SyncKind.LOCAL_WAIT.value}
+    ]
+    assert actual == [(3 * INT64_MAX) % 8] * 2
+
+
 def test_cube_sid_does_not_replace_a_literal_after_dominating_constant_deduplication():
     module, root, _, actor = program()
     zero = arith.ConstantOp.from_int_and_width(0, IndexType())
@@ -59,17 +103,23 @@ def test_cube_sid_does_not_replace_a_literal_after_dominating_constant_deduplica
     # This valid pure-SSA transform leaves the Cube SID as the most recent
     # mathematical zero in its lexical scope. The SID is still a block arg.
     for op in tuple(module.walk()):
-        if (isinstance(op, arith.ConstantOp) and op is not zero
-                and isinstance(op.result.type, IndexType)
-                and op.value.value.data == 0):
+        if (
+            isinstance(op, arith.ConstantOp)
+            and op is not zero
+            and isinstance(op.result.type, IndexType)
+            and op.value.value.data == 0
+        ):
             op.result.replace_all_uses_with(zero.result)
             op.parent.erase_op(op)
     memory = collect_native_memory(module)
     assert memory.control.environment.expression(actor.body.block.args[0]) == literal(0)
     notifications = word(memory, literal(0))
     assert [literal_value(op.event) for op in notifications] == [0, 0]
-    events = [c[3] for c in trace(module, {}, actor=Actor.AIC)
-              if c[0] in {SyncKind.LOCAL_SET.value, SyncKind.LOCAL_WAIT.value}]
+    events = [
+        c[3]
+        for c in trace(module, {}, actor=Actor.AIC)
+        if c[0] in {SyncKind.LOCAL_SET.value, SyncKind.LOCAL_WAIT.value}
+    ]
     assert events == [0, 0]
 
 

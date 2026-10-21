@@ -196,7 +196,9 @@ _SELECT = frozenset({"select_masked", "select_masked_update"})
 _PARTIAL = frozenset({"merge_sum_packed", "merge_max_packed"})
 _MASK_FREE = frozenset(
     {
+        "zero_l1",
         "copy",
+        "copy_bytes",
         "copy_rows",
         "copy_rows_prefix",
         "scalar_load",

@@ -61,11 +61,11 @@ from ..dialects.source import (
 )
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ..dialects.types import TaskType, TileType, ref_type
-from ..indexing import validate_source_arithmetic
-from ..scalar import ARITHMETIC
+from ..indexing import multiple_of, validate_static_arithmetic
+from ..scalar import facts_from_sizes, from_ssa
 from ..target.native import ITEMSIZE
+from ..target.scalars import INTEGER_OPERATIONS
 from . import native_recipes as recipes
-from .lower_pipeline import normalize_loop_controls
 from .native_addresses import lower_address, subview
 
 
@@ -143,6 +143,7 @@ class _Lowerer:
     def __init__(self, source, program):
         self.source, self.program = source, program
         self.roots = {}
+        self.index_facts = None
         self.results = {}
         self.loops = {}
         self.family_work = Counter()
@@ -174,7 +175,7 @@ class _Lowerer:
         owner = value.owner
         _unsupported(
             isinstance(owner, (arith.ConstantOp, arith.CmpiOp, PredicateOp))
-            or type(owner) in ARITHMETIC,
+            or type(owner) in INTEGER_OPERATIONS,
             "scalar value must retain its lexical binding; asynchronous values cannot be cloned",
             owner if isinstance(owner, Operation) else None,
         )
@@ -328,6 +329,12 @@ class _Lowerer:
                 matrix=matrix,
             )
 
+        if self.index_facts is None:
+            root = scope.block.parent_op()
+            while root.parent_op() is not None and not isinstance(root, (KernelOp, MixedOp)):
+                root = root.parent_op()
+            self.index_facts = facts_from_sizes(root.body.block.ops)
+
         context = recipes.RecipeContext(
             view,
             lambda source, nbytes, **kwargs: subview(
@@ -335,6 +342,9 @@ class _Lowerer:
             ),
             emit,
             operand=lambda value: self.scalar(value, scope),
+            aligned=lambda address, alignment: multiple_of(
+                from_ssa(address.owner.offset), alignment, self.index_facts
+            ),
             load3d_b_width=self.load3d_b_width,
             load3d_a_width=self.load3d_a_width,
         )
@@ -470,7 +480,7 @@ class _Lowerer:
             scope.block.add_op(scf.YieldOp(*(self.scalar(value, scope) for value in op.arguments)))
         elif (
             isinstance(op, (YieldOp, ViewOp, PredicateOp, arith.ConstantOp, arith.CmpiOp))
-            or type(op) in ARITHMETIC
+            or type(op) in INTEGER_OPERATIONS
         ):
             # Pure scalar work is materialized at its actual use, with this
             # stage's coordinate. Tile yields are retained in the value DAG.
@@ -631,7 +641,7 @@ class _Lowerer:
                     self.work["source_operations"] += 1
                     _unsupported(actor is None, "actor domains cannot nest", child)
                     collect(child.body.block, child)
-                elif isinstance(child, descriptors) or type(child) in ARITHMETIC:
+                elif isinstance(child, descriptors) or type(child) in INTEGER_OPERATIONS:
                     self.work["source_operations"] += 1
                 else:
                     ordinary.append(child)
@@ -672,8 +682,7 @@ def lower_native_structure(source) -> NativeStructure:
         isinstance(program, ProgramOp) and len(source.body.block.ops) == 1,
         "expected one typed source program",
     )
-    controls = normalize_loop_controls(source)
-    validate_source_arithmetic(program, controls)
+    validate_static_arithmetic(program)
     body = Block()
     attrs = {
         "sym_name": program.sym_name,

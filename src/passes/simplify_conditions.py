@@ -784,9 +784,7 @@ def _packet(operations, scope, work, ranks, changed):
                 ]
                 event_builder = _Build(nested)
                 try:
-                    if original.kind.data in {
-                        SyncKind.CROSS_SET.value, SyncKind.CROSS_WAIT.value
-                    }:
+                    if original.kind.data in {SyncKind.CROSS_SET.value, SyncKind.CROSS_WAIT.value}:
                         static_event = event_builder.static_binary_event(relative)
                     if static_event is None:
                         event = event_builder.event(relative)
@@ -851,9 +849,9 @@ def _packet(operations, scope, work, ranks, changed):
     return result
 
 
-def simplify_conditions(module, *, index_extrema=(), facts=None):
+def simplify_conditions(module, *, facts=None):
     """Normalize domains and share consecutive guarded packets, in place."""
-    facts = ScalarFacts.from_control(index_extrema=index_extrema) if facts is None else facts
+    facts = ScalarFacts.from_control() if facts is None else facts
     work, limits = ConditionWork(), facts.limits
     # Notification/control-only unsigned remainders by powers of two have an
     # exact, total bit-mask form. This permits legal common-domain evaluation

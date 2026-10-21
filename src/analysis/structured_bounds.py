@@ -1,17 +1,14 @@
-"""Axis, allocation-byte, subview, and alignment proofs on retained natives.
+"""Physical capacity and source-to-native access correspondence.
 
-These facts consume already decoded memory/control facts and never rerun a
-native rule. They establish mathematical address bounds in actual active
-scopes, plus declared local-memory capacity. Integer/launcher overflow, group
-ownership, initialized values, registers, and completion remain separate
-obligations before executable admission.
+Dynamic source accesses are caller contracts. This stage diagnoses static
+illegality and checks actual allocation/layout/native requirements; optional
+spatial enclosures never supply initialization, ownership, or completion.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from fractions import Fraction
 from math import prod
 from types import MappingProxyType
 
@@ -19,18 +16,20 @@ from xdsl.ir import SSAValue
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import BufferOp, MixedOp
-from ..indexing import domain_nonnegative, equivalent, exact_constant, polynomial
-from ..scalar import Expr, Fact, expression, infer, literal
+from ..dialects.source import _constant_index
+from ..indexing import equivalent, exact_constant, multiple_of
+from ..scalar import Expr, expression, from_ssa, infer, literal
+from ..symbols import Symbol, SymbolKind
 from ..target.ascend910b import Actor, Engine
 from ..target.native import CAPACITY, ITEMSIZE, nz_columns
-from .structured_addresses import AddressFacts, StructuredAddresses
+from .structured_addresses import AddressFacts, check_static_axes
 from .structured_control import ControlFrame
 from .structured_memory import NativeMemoryFacts
 
 
 @dataclass(frozen=True, slots=True)
 class AddressEnclosure:
-    """An enclosing slice established by checked original-axis bounds.
+    """An enclosing slice from a legal source view and checked native mapping.
 
     Its interval can contain untouched holes. It supplies only spatial
     separation, never actual effects, initialization, or reader retirement.
@@ -42,7 +41,7 @@ class AddressEnclosure:
 
 @dataclass(frozen=True, slots=True)
 class AddressBounds:
-    """Bounds and maximum native alignment over listed nonempty use scopes."""
+    """Required native alignment and original nonempty use scopes."""
 
     address: AddressFacts
     alignment: int
@@ -58,7 +57,6 @@ class MemoryBoundsFacts:
     local_bytes: Mapping[tuple[Actor, str], int]
     checked_accesses: int
     view_contracts: int
-    domain_contracts: int
 
 
 def _require(condition, message, operation, *, kind=ErrorKind.INVALID, witness=()):
@@ -69,31 +67,6 @@ def _require(condition, message, operation, *, kind=ErrorKind.INVALID, witness=(
         phase="structured-bounds",
         location=str(operation.location),
         witness=witness,
-    )
-
-
-def _multiple_of(value: Expr, alignment: int, facts: Mapping[str, Fact]) -> bool:
-    """Prove each exact polynomial term a multiple, retaining all coordinates."""
-    for atoms, coefficient in polynomial(value, facts).items():
-        multiple = Fraction(coefficient)
-        for atom in atoms:
-            fact = infer(atom, facts)
-            multiple *= 1 if fact is None else fact.multiple
-        if multiple.denominator != 1 or multiple.numerator % alignment:
-            return False
-    return True
-
-
-def _nonnegative(value, facts, operation, message, *, witness=(), domains=(), assumptions=()):
-    if domain_nonnegative(value, domains, facts, assumptions=assumptions):
-        return
-    constant = exact_constant(value, facts)
-    _require(
-        False,
-        message,
-        operation,
-        kind=ErrorKind.INVALID if constant is not None and constant < 0 else ErrorKind.UNSUPPORTED,
-        witness=(*witness, f"remaining={value.text()}"),
     )
 
 
@@ -138,7 +111,16 @@ def _allocations(memory):
         size = literal(operation.nbytes.data)
         if operation.extent_count is not None:
             size = expression("mul", environment.expression(operation.extent_count), literal(scale))
-        _nonnegative(size, facts, operation, "allocation byte extent is not provably nonnegative")
+        _require(
+            size.constant is None or size.constant >= 0,
+            "negative allocation byte extent",
+            operation,
+        )
+        _require(
+            size.constant is None or size.constant < 1 << 63,
+            "static allocation byte extent exceeds int64",
+            operation,
+        )
         allocations[operation.ref] = size
         if bank == "GM":
             continue
@@ -160,7 +142,7 @@ def _allocations(memory):
             kind=ErrorKind.UNSUPPORTED,
         )
         _require(
-            _multiple_of(size, 32, facts),
+            multiple_of(size, 32, facts),
             "runtime local allocation size must remain 32-byte aligned",
             operation,
             kind=ErrorKind.UNSUPPORTED,
@@ -194,22 +176,38 @@ def _original_view(address: AddressFacts, facts):
     assert axes is not None
     geometry = address.geometry
     itemsize = ITEMSIZE[geometry.dtype]
-    strides, stride = [], literal(itemsize)
+    # Verify only the address recipe. Source indices are SSA atoms here, not
+    # proof expressions to expand or bound. Their execution remains in the IR.
+    anchors, constants = {}, {}
+    for value in (*operation.origins, *operation.extents):
+        constant = _constant_index(value, constants)
+        anchors[value] = (
+            literal(constant)
+            if constant is not None
+            else Expr("argument", (Symbol("$axis", SymbolKind.SSA, value),))
+        )
+    actual = from_ssa(operation.offset, memo=dict(anchors))
+    stride = literal(itemsize)
     base = literal(0)
-    pairs = tuple(zip(axes.origins, axes.extents, strict=True))
+    pairs = tuple(
+        (anchors[o], anchors[e]) for o, e in zip(operation.origins, operation.extents, strict=True)
+    )
     for axis in range(len(pairs) - 1, -1, -1):
         origin, extent = pairs[axis]
-        strides.insert(0, stride)
         physical_stride = stride
         if geometry.layout == "NZ" and axis == len(pairs) - 1:
-            physical_stride = expression("mul", stride, axes.extents[-2])
+            physical_stride = expression("mul", stride, anchors[operation.extents[-2]])
         elif geometry.layout == "NZ" and axis == len(pairs) - 2:
             physical_stride = literal(nz_columns(geometry.bank, geometry.dtype) * itemsize)
         base = expression("add", base, expression("mul", origin, physical_stride))
         stride = expression("mul", stride, extent)
     expected = expression("add", base, literal(axes.displacement))
-    if not equivalent(address.offset, expected, facts):
-        difference = exact_constant(expression("sub", address.offset, expected), facts)
+    strides, stride = [], literal(itemsize)
+    for extent in reversed(axes.extents):
+        strides.insert(0, stride)
+        stride = expression("mul", stride, extent)
+    if not equivalent(actual, expected, {}):
+        difference = exact_constant(expression("sub", actual, expected), {})
         _require(
             False,
             "address offset does not match original-axis linearization and displacement",
@@ -260,9 +258,9 @@ def _original_view(address: AddressFacts, facts):
             and all(extent is not None and extent > 0 and extent % 16 == 0 for extent in extents)
             and (column_slice or axes.widths[-2] == extents[0])
             and (column_slice or axes.widths[-2] % 16 == 0)
-            and (column_slice or _multiple_of(axes.origins[-2], 16, facts))
+            and (column_slice or multiple_of(axes.origins[-2], 16, facts))
             and axes.widths[-1] % 16 == 0
-            and _multiple_of(axes.origins[-1], 16, facts)
+            and multiple_of(axes.origins[-1], 16, facts)
             and (column_slice or accumulator_columns or axes.widths[-1] == extents[1]),
             "fractal address needs a complete matrix plane, aligned L1 NZ rectangle or full-row L0C columns",
             operation,
@@ -277,7 +275,9 @@ def _original_view(address: AddressFacts, facts):
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )
-        if geometry.layout == "NZ" and (axes.widths[-2] != extents[0] or address.valid_rows is not None):
+        if geometry.layout == "NZ" and (
+            axes.widths[-2] != extents[0] or address.valid_rows is not None
+        ):
             c0 = nz_columns(geometry.bank, geometry.dtype)
             return (
                 axes.widths[-2] * c0 * itemsize,
@@ -324,7 +324,7 @@ def _subview(address, parent):
 
 
 def _enclosing_slices(address, facts):
-    """Compose checked axes into contiguous enclosing allocation slices.
+    """Compose legal source axes into enclosing allocation slices.
 
     Linear storage permits any fixed leading prefix. Fractal matrices retain
     their final two axes together; the already checked layout maps every
@@ -347,7 +347,7 @@ def _enclosing_slices(address, facts):
 
 
 def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
-    """Prove each actual address once, then check its real nonempty use domains."""
+    """Check physical mappings once; retain source domains without proving data bounds."""
     environment = memory.control.environment
     facts = environment.facts
     allocations, local_bytes = _allocations(memory)
@@ -364,7 +364,8 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                 if bank != "GM" and engine in {Engine.M, Engine.MTE1, Engine.FIX}
                 else ITEMSIZE[access.address.geometry.dtype]
                 if bank == "GM"
-                and template.operation.native.data in {"nd2nz", "nd2nz_pad", "nd2nz_rows", "nd2nz_overlay", "fix"}
+                and template.operation.native.data
+                in {"nd2nz", "nd2nz_pad", "nd2nz_rows", "nd2nz_overlay", "fix", "copy_bytes"}
                 else ITEMSIZE[access.address.geometry.dtype]
                 if engine is Engine.S
                 else 32
@@ -373,7 +374,7 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
             checked_accesses += 1
             if template.frame not in frames[access.operand]:
                 frames[access.operand].append(template.frame)
-    checker, admitted, views = StructuredAddresses(environment), {}, {}
+    admitted, views = {}, {}
     for value, address in memory.addresses.items():
         active_frames, alignment = tuple(frames[value]), requirements[value]
         admitted[value] = AddressBounds(address, alignment, active_frames)
@@ -381,17 +382,13 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
             continue
         # Equal physical views have one bounds/alignment contract, even when
         # lowering produced several SSA AddressOps. Include original axes and
-        # raw offset DAG, not just the flattened footprint. Each distinct
-        # active domain still adds its own obligation below.
+        # raw offset DAG, not just the flattened footprint. Actual use scopes
+        # are retained without re-proving their dynamic source bounds.
         key = address.root, address.offset, address.geometry, address.axes, address.valid_rows
         views.setdefault(key, []).append(admitted[value])
-    domain_contracts = 0
     for members in views.values():
         address = members[0].address
         alignment = max(item.alignment for item in members)
-        domains = dict.fromkeys(
-            (frame.domains(), frame.predicates()) for item in members for frame in item.frames
-        )
         operation = address.operation
         _require(
             address.root in allocations, "address has no actual declared allocation", operation
@@ -399,12 +396,8 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
         try:
             original = _original_view(address, facts)
             span = _subview(address, original)
-            tensor_bytes = literal(ITEMSIZE[address.geometry.dtype])
-            for extent in address.axes.extents:
-                tensor_bytes = expression("mul", tensor_bytes, extent)
             capacity = allocations[address.root]
-            full_tensor = equivalent(capacity, tensor_bytes, facts)
-            aligned = _multiple_of(address.offset, alignment, facts)
+            aligned = multiple_of(address.offset, alignment, facts)
             aligned = aligned and (
                 address.geometry.rows == 1 or address.geometry.row_stride % alignment == 0
             )
@@ -422,52 +415,19 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                     f"row_stride={address.geometry.row_stride}",
                 ),
             )
-            for domain, assumptions in domains:
-                domain_contracts += 1
-                checker.check_axes(address, domain, assumptions=assumptions)
-                if full_tensor or domain_nonnegative(
-                    expression("sub", capacity, tensor_bytes),
-                    domain,
-                    facts,
-                    assumptions=assumptions,
-                ):
-                    # The checked linearization maps the bounded original
-                    # axes into this tensor; _subview keeps every native byte
-                    # in that view. Compose those facts with real capacity,
-                    # instead of re-proving the flattened nonlinear address.
-                    continue
-                _nonnegative(
-                    address.offset,
-                    facts,
+            check_static_axes(address)
+            # Source accesses must be legal when executed. Do not re-prove the
+            # caller's data contract. Still reject explicit physical capacity
+            # mismatches and native overreads introduced by lowering.
+            origin = address.offset.constant
+            limit = capacity.constant
+            actual_span = span if address.valid_rows is None else address.prefix_span().constant
+            if origin is not None and limit is not None and actual_span is not None:
+                _require(
+                    origin >= 0 and origin + actual_span <= limit,
+                    "static native byte footprint exceeds its allocation",
                     operation,
-                    "native byte origin may be negative",
-                    domains=domain,
-                    assumptions=assumptions,
-                )
-                remaining = expression(
-                    "sub",
-                    allocations[address.root],
-                    expression(
-                        "add",
-                        address.offset,
-                        literal(span)
-                        if address.valid_rows is None
-                        else address.prefix_span(),
-                    ),
-                )
-                _nonnegative(
-                    remaining,
-                    facts,
-                    operation,
-                    "native byte footprint is not bounded by its allocation",
-                    domains=domain
-                    if address.valid_rows is None
-                    else (
-                        *domain,
-                        (address.valid_rows, literal(1), literal(address.row_capacity)),
-                    ),
-                    witness=(f"span={span}", f"allocation={allocations[address.root].text()}"),
-                    assumptions=assumptions,
+                    witness=(f"span={actual_span}", f"allocation={limit}"),
                 )
         except CompileError as error:
             if error.phase == "structured-bounds":
@@ -489,5 +449,4 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
         MappingProxyType(local_bytes),
         checked_accesses,
         len(views),
-        domain_contracts,
     )

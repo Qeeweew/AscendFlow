@@ -79,6 +79,9 @@ def native_line(task, *, pointer_renderer, generation):
     def length(ref, unit=1):
         return str(ref.total_nbytes // unit)
 
+    if task.spec.native == "copy_bytes":
+        function = "asc_copy_gm2ub_align" if refs[0].bank == "GM" else "asc_copy_ub2gm_align"
+        return f"{function}({p[1]}, {p[0]}, uint32_t({length(refs[0])}));"
     if task.spec.native == "copy":
         route = tuple(r.bank for r in refs)
         function = {
@@ -186,6 +189,12 @@ def native_line(task, *, pointer_renderer, generation):
             "asc_set_mask_norm(); asc_set_vector_mask(0, UINT64_MAX); "
             f"asc_copy({bits[1]}, {bits[0]}, uint8_t({task.spec.params[0]}), 1, 0, 8, 1);"
         )
+    if task.spec.native == "zero_l1":
+        return (
+            "{ asc_fill_value_config npu_zero = { .config = uint64_t(1) | "
+            f"(uint64_t({refs[0].total_nbytes // 32}) << 16) }}; "
+            f"asc_fill_l1({p[0]}, uint32_t(0), npu_zero); }}"
+        )
     if task.spec.native in {"fill", "fill_neg_inf"}:
         if refs[0].dtype in {"f16", "bf16"}:
             from ..target.scalars import b16_fill_bits
@@ -193,7 +202,9 @@ def native_line(task, *, pointer_renderer, generation):
             value = float("-inf") if task.spec.native == "fill_neg_inf" else task.scalar
             bits = b16_fill_bits(value, refs[0].dtype)
             destination = p[0].replace(CTYPE[refs[0].dtype] + "*", "uint16_t*")
-            return f"asc_duplicate({destination}, uint16_t({bits}), uint32_t({length(refs[0], 2)}));"
+            return (
+                f"asc_duplicate({destination}, uint16_t({bits}), uint32_t({length(refs[0], 2)}));"
+            )
         value = (
             "-__builtin_inff()" if task.spec.native == "fill_neg_inf" else f"float({task.scalar!r})"
         )

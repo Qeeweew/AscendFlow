@@ -7,10 +7,33 @@ not replace the symbolic range and ownership obligations with parameter samples.
 import pytest
 
 from ascendflow import indexing
+from ascendflow.analysis.integer_facts import IntegerFacts
+from ascendflow.analysis.structured_schedule import Comparison
 from ascendflow.diagnostics import CompileError
-from ascendflow.indexing import check_axis, equivalent, physical_terms, polynomial
+from ascendflow.indexing import equivalent, physical_terms, polynomial
 from ascendflow.scalar import Expr, Fact, expression, literal
 from ascendflow.symbols import Symbol, SymbolKind
+
+
+def axis_bounds(origin, width, extent, domains, facts):
+    """Optional mathematical optimization queries, not source admission."""
+    remaining = expression("sub", extent, expression("add", origin, literal(width)))
+    return indexing.domain_nonnegative(origin, domains, facts) and indexing.domain_nonnegative(
+        remaining, domains, facts
+    )
+
+
+def defined_under(value, domains, facts):
+    prefix = tuple(
+        Comparison(v, predicate, bound)
+        for v, lo, hi in domains
+        for predicate, bound in ((">=", lo), ("<=", hi))
+    )
+    return (
+        IntegerFacts(facts).ordered_definedness((*prefix, Comparison(value, ">=", literal(0))))
+        is None
+    )
+
 
 _COORDINATES = {
     "$g": Symbol("$g", SymbolKind.ORDINAL),
@@ -96,19 +119,19 @@ def test_axis_bounds_preserve_each_mixed_radix_axis_and_complete_tiles():
     batch, head, row, _ = split(task, heads, tiles)
     total = expression("mul", expression("mul", batches, heads), tiles)
     domains = [(task, literal(0), expression("sub", total, literal(1)))]
-    check_axis(batch, 1, batches, domains, facts)
-    check_axis(head, 1, heads, domains, facts)
-    check_axis(expression("mul", row, tile), 16, expression("mul", tiles, tile), domains, facts)
+    assert axis_bounds(batch, 1, batches, domains, facts)
+    assert axis_bounds(head, 1, heads, domains, facts)
+    assert axis_bounds(
+        expression("mul", row, tile), 16, expression("mul", tiles, tile), domains, facts
+    )
     for tile_count, flat in [(1, 5), (2, 7), (5, 29)]:
         quotient, expected_row = divmod(flat, tile_count)
         expected_batch, expected_head = divmod(quotient, 3)
         assert 0 <= expected_batch < 2
         assert 0 <= expected_head < 3
         assert 0 <= expected_row * 16 <= tile_count * 16 - 16
-    with pytest.raises(CompileError, match="not bounded"):
-        check_axis(row, 1, heads, domains, facts)
-    with pytest.raises(CompileError, match="not bounded"):
-        check_axis(expression("floordiv", task, tiles), 1, batches, domains, facts)
+    assert not axis_bounds(row, 1, heads, domains, facts)
+    assert not axis_bounds(expression("floordiv", task, tiles), 1, batches, domains, facts)
 
 
 def test_changed_decode_radix_is_not_equivalent_to_original_flat_task():
@@ -136,11 +159,10 @@ def test_a_multiple_is_a_required_contract_and_cannot_be_invented_by_algebra():
     aligned = {"n": Fact(minimum=4, multiple=4)}
     unaligned = {"n": Fact(minimum=4)}
     assert equivalent(rounded, n, aligned)
-    check_axis(origin, 4, rounded, [], aligned)
+    assert axis_bounds(origin, 4, rounded, [], aligned)
     # A fresh proof with weaker facts must not inherit the previous divisibility.
     assert not equivalent(rounded, n, unaligned)
-    with pytest.raises(CompileError, match="not bounded"):
-        check_axis(origin, 4, rounded, [], unaligned)
+    assert not axis_bounds(origin, 4, rounded, [], unaligned)
     for length in (4, 8, 20):
         assert (length // 4) * 4 == length
     length = 5
@@ -158,8 +180,7 @@ def test_active_range_dags_keep_actual_lexical_domains_and_failed_unsigned_evalu
     assert tuple(bound.constant for bound in ranges.interval(quotient, active)) == (0, 3)
     # A proved later body must not authorize the same expression before it.
     for _ in range(2):
-        with pytest.raises(CompileError, match="nonnegative dividend"):
-            ranges.interval(quotient, earlier)
+        assert ranges.interval(quotient, earlier) == (quotient, quotient)
     assert tuple(bound.constant for bound in ranges.interval(quotient, active)) == (0, 3)
 
 
@@ -190,8 +211,7 @@ def test_active_range_input_snapshot_cannot_be_strengthened_or_weakened_in_place
     original = ranges.interval(quotient, domain)
     facts["divisor"] = Fact(minimum=0)
     assert ranges.interval(quotient, domain) == original
-    with pytest.raises(CompileError, match="divisor.*positive"):
-        indexing.IndexRanges(facts).interval(quotient, domain)
+    assert indexing.IndexRanges(facts).interval(quotient, domain) == (quotient, quotient)
     with pytest.raises(TypeError):
         ranges.facts["divisor"] = Fact(minimum=0)
 
@@ -219,34 +239,29 @@ def test_expanded_scaled_remainder_retains_its_one_sided_sign(width, scale):
 
 
 @pytest.mark.parametrize("kind", ["floordiv", "rem"])
-def test_unproven_positive_divisor_cannot_authorize_split_identity_or_axis(kind):
+def test_unproven_positive_divisor_keeps_an_opaque_mathematical_atom(kind):
     task, divisor = argument("$g"), argument("divisor")
     value = expression(kind, task, divisor)
     facts = {"divisor": Fact(multiple=4)}
-    domains = [(task, literal(0), literal(7))]
-    with pytest.raises(CompileError, match="divisor.*positive"):
-        equivalent(value, task, facts)
-    with pytest.raises(CompileError, match="divisor.*positive"):
-        check_axis(value, 1, literal(8), domains, facts)
+    assert not equivalent(value, task, facts)
+    assert not defined_under(value, [(task, literal(0), literal(7))], facts)
 
 
-def test_nonuniform_task_coordinate_is_not_a_runtime_radix():
+def test_nonuniform_divisor_has_normal_integer_execution_semantics():
     task = argument("$g")
-    divisor = expression("add", task, literal(1))
-    value = expression("rem", task, divisor)
-    with pytest.raises(CompileError, match="divisor.*positive"):
-        check_axis(value, 1, literal(8), [(task, literal(0), literal(7))], {})
+    value = expression("rem", task, expression("add", task, literal(1)))
+    for g in range(8):
+        assert value.evaluate({"$g": g}) == g
 
 
 @pytest.mark.parametrize("kind", ["floordiv", "rem"])
-def test_negative_unsigned_dividend_is_rejected_on_its_original_axis(kind):
+def test_optional_definedness_query_retains_a_negative_unsigned_dividend(kind):
     task, divisor = argument("$g"), argument("divisor")
-    numerator = expression("sub", task, literal(1))
-    value = expression(kind, numerator, divisor)
+    value = expression(kind, expression("sub", task, literal(1)), divisor)
     facts = {"divisor": Fact(minimum=1)}
-    with pytest.raises(CompileError, match="nonnegative dividend"):
-        check_axis(value, 1, divisor, [(task, literal(0), literal(7))], facts)
-    assert 0 - 1 < 0
+    assert not defined_under(value, [(task, literal(0), literal(7))], facts)
+    with pytest.raises(CompileError, match="nonnegative numerator"):
+        value.evaluate({"$g": 0, "divisor": 2})
 
 
 def test_flat_recombination_does_not_authorize_a_negative_unsigned_intermediate():
@@ -259,8 +274,7 @@ def test_flat_recombination_does_not_authorize_a_negative_unsigned_intermediate(
     )
     facts = {"divisor": Fact(minimum=1)}
     assert equivalent(rebuilt, task, facts)
-    with pytest.raises(CompileError, match="nonnegative dividend"):
-        check_axis(remainder, 1, divisor, [(task, literal(0), literal(7))], facts)
+    assert not defined_under(remainder, [(task, literal(0), literal(7))], facts)
 
 
 def test_child_generation_cannot_select_an_unrelated_parent_axis():
@@ -271,12 +285,10 @@ def test_child_generation_cannot_select_an_unrelated_parent_axis():
         (parent, literal(0), expression("sub", parents, literal(1))),
         (task, literal(0), expression("sub", children, literal(1))),
     ]
-    check_axis(parent, 1, parents, domains, facts)
-    check_axis(task, 1, children, domains, facts)
-    with pytest.raises(CompileError, match="not bounded"):
-        check_axis(task, 1, parents, domains, facts)
-    with pytest.raises(CompileError, match="not bounded"):
-        check_axis(parent, 1, children, domains, facts)
+    assert axis_bounds(parent, 1, parents, domains, facts)
+    assert axis_bounds(task, 1, children, domains, facts)
+    assert not axis_bounds(task, 1, parents, domains, facts)
+    assert not axis_bounds(parent, 1, children, domains, facts)
     parent_count, child_count, child = 2, 5, 4
     assert child < child_count and child >= parent_count
 
@@ -289,9 +301,8 @@ def test_flat_address_in_allocation_cannot_hide_an_out_of_range_head_axis():
     total = expression("mul", expression("mul", batches, heads), tiles)
     next_batch = expression("mul", expression("mul", literal(1), heads), tiles)
     assert equivalent(flat, next_batch, facts)
-    check_axis(flat, 1, total, [], facts)
-    with pytest.raises(CompileError, match="not bounded"):
-        check_axis(invalid_head, 1, heads, [], facts)
+    assert axis_bounds(flat, 1, total, [], facts)
+    assert not axis_bounds(invalid_head, 1, heads, [], facts)
     batch, head, tile_count = 0, 3, 5
     address = (batch * 3 + head) * tile_count
     assert address == (1 * 3 + 0) * tile_count
@@ -469,8 +480,7 @@ def test_axis_checks_raw_unsigned_atoms_before_their_mathematical_zero(wrapper):
         else expression("rem", inner, literal(1))
     )
     assert equivalent(origin, literal(0), facts)
-    with pytest.raises(CompileError, match="nonnegative dividend|unproven sign"):
-        check_axis(origin, 1, literal(1), [(task, literal(0), literal(3))], facts)
+    assert not defined_under(origin, [(task, literal(0), literal(3))], facts)
     with pytest.raises(CompileError, match="nonnegative numerator"):
         origin.evaluate({"$g": 0, "size": 4})
-    check_axis(origin, 1, literal(1), [(task, literal(1), literal(3))], facts)
+    assert defined_under(origin, [(task, literal(1), literal(3))], facts)

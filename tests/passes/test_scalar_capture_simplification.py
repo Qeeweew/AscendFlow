@@ -5,8 +5,9 @@ import subprocess
 
 import pytest
 
+from ascendflow.analysis.integer_facts import IntegerFacts
+from ascendflow.analysis.structured_schedule import Comparison
 from ascendflow.diagnostics import CompileError
-from ascendflow.indexing import check_axis
 from ascendflow.scalar import INT64_MAX, Expr, bindings, expression, literal
 
 
@@ -24,8 +25,16 @@ def test_unit_division_renders_its_identity_without_erasing_unsigned_proof(kind)
     # The final expression cancels algebraically. Its original unsigned
     # division must still reject a negative dividend at generation zero.
     canceled = expression("sub", quotient, numerator)
-    with pytest.raises(CompileError, match="unproven nonnegative dividend"):
-        check_axis(canceled, 1, literal(1), [(coordinate, literal(0), literal(3))], {})
+    assert (
+        IntegerFacts({}).ordered_definedness(
+            (
+                Comparison(coordinate, ">=", literal(0)),
+                Comparison(coordinate, "<=", literal(3)),
+                Comparison(canceled, "==", literal(0)),
+            )
+        )
+        is not None
+    )
     assert quotient.c({quotient: "already_checked"}) == "already_checked"
 
 

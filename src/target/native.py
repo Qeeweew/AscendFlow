@@ -231,7 +231,7 @@ def native_contract(
     dtypes = tuple(r.dtype for r in refs)
     lengths = tuple(r.total_nbytes for r in refs)
     layouts = tuple(r.layout for r in refs)
-    if native == "copy":
+    if native in {"copy", "copy_bytes"}:
         require(all(r.contiguous for r in refs), "DMA recipe requires contiguous physical views")
         require(len(refs) == 2 and lengths[0] == lengths[1], "copy needs equal native footprints")
         require(dtypes[0] == dtypes[1], "copy cannot silently convert dtype")
@@ -245,6 +245,10 @@ def native_contract(
         }
         require(banks in routes, f"unsupported dav-2201 DMA route {banks}; no hidden GM staging")
         require(not params, "copy has no unchecked native parameters")
+        require(
+            native != "copy_bytes" or banks in {("GM", "UB"), ("UB", "GM")},
+            "byte-addressed DMA needs a GM/UB route",
+        )
         if banks[0] == "L1":
             expected = ("NZ", "ZZ" if banks[1] == "L0A" else "ZN")
             require(
@@ -555,6 +559,19 @@ def native_contract(
             "predicate selection needs packed blocks and whole f32 chunks",
         )
         return "V", ("R", "R", "RW") if update else ("R", "R", "R", "W")
+    if native == "zero_l1":
+        require(
+            len(refs) == 1
+            and banks == ("L1",)
+            and layouts == ("NZ",)
+            and dtypes[0] in {"f16", "bf16", "f32"}
+            and refs[0].contiguous
+            and 0 < lengths[0] <= CAPACITY["L1"]
+            and lengths[0] % 32 == 0
+            and not params,
+            "L1 zero fill needs a contiguous NZ plane in physical L1 capacity",
+        )
+        return "MTE2", ("W",)
     if native in {"fill", "fill_neg_inf"}:
         require(
             len(refs) == 1
@@ -822,15 +839,23 @@ def native_contract(
         )
         return "MTE2", ("R", "W")
     if native == "nd2nz_overlay":
-        require(len(params) == 3, "ND2NZ overlay needs row capacity, columns and resident row stride")
+        require(
+            len(params) == 3, "ND2NZ overlay needs row capacity, columns and resident row stride"
+        )
         m, n, resident = params
         require(
-            1 <= m <= resident <= 256 and resident % 16 == n % 16 == 0
-            and 16 <= n <= 256 and banks == ("GM", "L1") and layouts == ("linear", "NZ")
+            1 <= m <= resident <= 256
+            and resident % 16 == n % 16 == 0
+            and 16 <= n <= 256
+            and banks == ("GM", "L1")
+            and layouts == ("linear", "NZ")
             and dtypes[0] == dtypes[1] in {"f16", "bf16"}
-            and refs[0].rows == m and refs[0].nbytes == n * 2
-            and refs[0].row_stride >= n * 2 and refs[0].row_stride % 2 == 0
-            and refs[1].nbytes == m * 32 and refs[1].rows == n // 16
+            and refs[0].rows == m
+            and refs[0].nbytes == n * 2
+            and refs[0].row_stride >= n * 2
+            and refs[0].row_stride % 2 == 0
+            and refs[1].nbytes == m * 32
+            and refs[1].rows == n // 16
             and refs[1].row_stride == resident * 32,
             "ND2NZ overlay requires exact GM rows and pitched b16 NZ row prefixes",
         )

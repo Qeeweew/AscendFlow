@@ -11,9 +11,7 @@ from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.diagnostics import CompileError, ErrorKind
 from ascendflow.dialects.physical import FixConfigOp
 from ascendflow.dialects.source import ElementOp, IterationOp
-from ascendflow.indexing import arguments
 from ascendflow.passes.lower_native import lower_native_structure
-from ascendflow.symbols import is_coordinate
 from ascendflow.target import native
 from ascendflow.target.ascend910b import Actor
 from examples.flash_attention.attention import attention_target
@@ -108,10 +106,6 @@ def test_real_dsl_admission_keeps_owned_facts_and_reuses_native_address_control(
     assert admission.work["native_templates"] == templates
     assert admission.work["read_proofs"] == reads
     assert admission.work["expanded_iterations"] == 0
-    assert all(
-        not any(is_coordinate(name) for name in arguments(value))
-        for value in admission.host_expressions
-    )
     assert not hasattr(admission, "completion") and not hasattr(admission, "asc")
     with pytest.raises(TypeError):
         admission.instances[next(iter(admission.instances))] = None
@@ -390,22 +384,20 @@ def test_register_configuration_has_one_actual_invariant_writer():
         admit_structured_memory(structure, memory, bounds)
 
 
-def test_host_contract_includes_negative_actual_intermediates_and_large_products():
+def test_dynamic_scalar_ranges_do_not_create_a_host_admission_contract():
     admission = _admit("""
-        def host(n:N.int64(minimum=1)):
+        def dynamic(n:N.int64(minimum=1)):
             with N.Kernel(20) as group:
                 x=N.alloc_ub((64,))
                 for i in N.serial(N.ceildiv(N.max(0,n*n-group),20)):
                     N.fill(x,1.0)
     """)
-    expressions = admission.host_expressions
-    assert any(value.evaluate({"n": 1}) < 0 for value in expressions)
-    assert any(value.evaluate({"n": 1 << 40}) > (1 << 63) - 1 for value in expressions)
-    assert all(not any(is_coordinate(name) for name in arguments(value)) for value in expressions)
+    assert not hasattr(admission, "host_expressions")
+    assert "host_expressions" not in admission.work
 
 
 def test_host_contract_rejects_a_static_allocation_byte_extent_outside_int64():
-    with pytest.raises(CompileError, match="static host index exceeds signed int64") as error:
+    with pytest.raises(CompileError, match="int64|index range") as error:
         _admit("""
             def huge(X:N.Tensor((4611686018427387904,),N.f32)):
                 with N.Kernel():

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from xdsl.dialects import arith
 from xdsl.ir import SSAValue
 
-from ..diagnostics import CompileError, ErrorKind, require
+from ..diagnostics import ErrorKind, require
 from ..dialects.physical import FixConfigOp, Load3DConfigOp, TaskOp
 from ..indexing import (
     arguments,
@@ -30,10 +30,10 @@ from ..indexing import (
 )
 from ..scalar import Expr, expression, literal, substitute
 from ..target.ascend910b import Actor
+from ..target.native import ITEMSIZE
 from .native import ConditionalRead
 from .structured_bounds import MemoryBoundsFacts
 from .structured_control import LogicalLoop
-from .structured_host import build_host_expressions
 from .structured_memory import MemoryAccess, MemoryTemplate, NativeMemoryFacts
 from .value_bindings import LastTile, TileDefinition, TileUse
 
@@ -79,7 +79,6 @@ class StructuredAdmission:
     reads: tuple[ReadAdmission, ...]
     values: tuple[TileAdmission, ...]
     configurations: tuple[FixConfigOp | Load3DConfigOp, ...]
-    host_expressions: tuple[Expr, ...]
     work: Mapping[str, int]
 
 
@@ -297,7 +296,8 @@ def _complete_branch_paths(paths, facts):
             roots.append((condition, branches))
         branches[head[-1]].append(tuple(tail))
     return any(
-        left and right
+        left
+        and right
         and _complete_branch_paths(left, facts)
         and _complete_branch_paths(right, facts)
         for _, (left, right) in roots
@@ -444,22 +444,14 @@ def _covers(spans, read, frame, facts, work):
         for form in dict.fromkeys((reduced, delta)):
             # Cancellation exposes common translations; the original form
             # also retains rem ranges that polynomial expansion can obscure.
-            try:
-                if domain_nonnegative(
-                    expression("sub", form, start), frame.domains(), facts
-                ) and domain_nonnegative(
-                    expression("sub", stop, expression("add", form, needed_span)),
-                    frame.domains(),
-                    facts,
-                ):
-                    return True
-            except CompileError as error:
-                # A candidate translation is a mathematical comparison, not
-                # a source address. A normalized division may lack a sign
-                # outside this candidate's region; it supplies no coverage.
-                # Required original-address definedness was checked by bounds.
-                if error.message != "unsigned index division has an unproven nonnegative dividend":
-                    raise
+            if domain_nonnegative(
+                expression("sub", form, start), frame.domains(), facts
+            ) and domain_nonnegative(
+                expression("sub", stop, expression("add", form, needed_span)),
+                frame.domains(),
+                facts,
+            ):
+                return True
         return False
 
     for candidate in spans:
@@ -772,8 +764,19 @@ def admit_structured_memory(
                     candidates.append(span)
                     writers.extend(members)
                 needed = _span(access, _participant(actor, memory.control.sid))
+                # The checked source/native mapping keeps every legal read
+                # inside the logical allocation. Once real writers define all
+                # of it, querying the dynamic read's bounds would duplicate the
+                # caller's access contract. Do not include allocation padding,
+                # or turn this numerical fact into readiness/ownership/KILL.
+                size = literal(ITEMSIZE[access.address.geometry.dtype])
+                for extent in access.address.axes.extents:
+                    size = expression("mul", size, extent)
+                whole = _Span(literal(0), size)
                 _require(
-                    _covers(candidates, needed, template.frame, facts, work),
+                    _covers(candidates, whole, template.frame, facts, work)
+                    or needed != whole
+                    and _covers(candidates, needed, template.frame, facts, work),
                     "native reads storage without a proved initialized writer coverage",
                     template.operation,
                     witness=(
@@ -900,8 +903,6 @@ def admit_structured_memory(
     work["read_proofs"], work["tile_uses"] = len(reads), len(values)
     work["storage_instances"] = len(instances)
     work["configuration_writers"] = len(configurations)
-    host_expressions = build_host_expressions(memory, bounds)
-    work["host_expressions"] = len(host_expressions)
     work["defined_write_frontier"] = len(defined_writes)
     return StructuredAdmission(
         structure,
@@ -911,6 +912,5 @@ def admit_structured_memory(
         tuple(reads),
         tuple(values),
         configurations,
-        host_expressions,
         MappingProxyType(work),
     )

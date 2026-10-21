@@ -6,7 +6,7 @@ from ascendflow import compile
 from ascendflow import language as N
 from ascendflow.diagnostics import CompileError
 from ascendflow.passes.structured_sync import synchronize_structure
-from tests.models.structured_events import check_compiled_events
+from tests.models.structured_events import EventModelError, check_compiled_events
 
 SOURCE = """
 def overlay(A:N.Tensor((32,64),N.bf16), B:N.Tensor((32,64),N.bf16), n:N.int64):
@@ -62,8 +62,10 @@ def test_partial_overlay_does_not_define_the_remaining_nz_rows():
 
 def test_overlay_capacity_checks_real_rows_after_the_dynamic_destination_origin():
     unsafe = SOURCE.replace("N.min(n,27)", "N.min(n,28)")
-    with pytest.raises(CompileError, match="axis|extent|bounds|capacity"):
-        synchronize_structure(N.from_source(unsafe))
+    plan = synchronize_structure(N.from_source(unsafe))
+    check_compiled_events(plan, {"n": 27})
+    with pytest.raises(EventModelError, match="row count|axis"):
+        check_compiled_events(plan, {"n": 28})
 
 
 def test_overlay_emits_runtime_nd2nz_without_a_second_clear():

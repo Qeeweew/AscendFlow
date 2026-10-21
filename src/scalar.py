@@ -1,9 +1,8 @@
-"""Small, explicit index expressions shared by access proofs and ASC emission.
+"""Optional mathematical views of executable integer SSA.
 
-This is not a general integer solver. Uniform index expressions use nonnegative
-integers and provably positive divisors. Facts belong to a proof environment,
-not expression identity. Affine expressions additionally describe a task's valid
-prefix; unsupported domains fail explicitly.
+Expression identity contains no range or evaluation certificate. Projections
+may mention inactive/undefined coordinates; source static diagnostics and
+new machine evaluations are checked separately. Unknown facts keep the SSA.
 """
 
 from collections.abc import Mapping
@@ -14,7 +13,7 @@ from math import gcd
 
 from xdsl.dialects import arith
 
-from .diagnostics import CompileError, require
+from .diagnostics import CompileError, ErrorKind, require
 from .dialects.physical import RuntimeSizeOp
 from .symbols import Symbol, SymbolKind, symbol_name, symbol_order
 
@@ -166,22 +165,13 @@ class Expr(metaclass=_ExprType):
                 len(self.args) == 2 and all(isinstance(arg, Expr) for arg in self.args),
                 "binary scalar expression needs two expressions",
             )
-        if self.kind in DIVISION:
-            numerator, divisor = self.args
-            require(
-                divisor.constant is None or divisor.constant > 0,
-                "scalar divisor must be positive",
-            )
-            require(
-                numerator.constant is None or numerator.constant >= 0,
-                "scalar division numerator must be nonnegative",
-            )
         children = [arg for arg in self.args if isinstance(arg, Expr)]
         weight = 1 + sum(arg.weight for arg in children)
         depth = 1 + max((arg.depth for arg in children), default=0)
         require(
             weight <= 4096 and depth <= 128,
             "scalar expression proof budget exceeded (4096 terms / depth 128)",
+            kind=ErrorKind.ANALYSIS_LIMIT,
         )
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "depth", depth)
@@ -324,9 +314,11 @@ def expression(kind, a, b):
     if a.constant is not None and b.constant is not None:
         require(kind in BINARY, f"unsupported scalar expression kind: {kind}")
         x, y = a.constant, b.constant
-        if kind in DIVISION:
-            require(y > 0, "scalar divisor must be positive")
-            require(x >= 0, "scalar division numerator must be nonnegative")
+        if kind in DIVISION and (x < 0 or y <= 0):
+            # A mathematical projection can mention an inactive coordinate.
+            # Keep its raw DAG; actual source/static and newly emitted machine
+            # evaluations have their own definedness checks.
+            return Expr(kind, (a, b))
         if kind == "add":
             return literal(x + y)
         if kind == "mul":
@@ -380,16 +372,15 @@ ARITHMETIC = {
 }
 
 
-def from_ssa(value, *, coordinates=None, memo=None, facts=None):
-    """Extract an expression, validating every divisor in its uniform scope.
+def from_ssa(value, *, coordinates=None, memo=None):
+    """Optional mathematical view of executable SSA, without input admission.
 
-    Coordinate names may occur in numerators. ``facts`` only declares uniform
-    inputs; coordinate range facts belong to a separate call to ``infer``.
+    Unmodelled operations retain their SSA identity and operand captures. This
+    is not a range, invariance, or source-definedness certificate.
     """
     from .dialects.source import SizeOp
 
     memo = {} if memo is None else memo
-    environment = {} if facts is None else _facts(facts)
 
     def visit(value):
         if value in memo:
@@ -404,35 +395,19 @@ def from_ssa(value, *, coordinates=None, memo=None, facts=None):
             result = literal(value.owner.value.value.data)
         else:
             op = value.owner
-            require(
-                type(op) in ARITHMETIC, "unsupported scalar expression in access/bound contract"
-            )
-            a, b = (visit(v) for v in op.operands)
-            result = expression(ARITHMETIC[type(op)], a, b)
+            operands = tuple(visit(v) for v in getattr(op, "operands", ()))
+            if (
+                type(op) in ARITHMETIC
+                and 1 + sum(v.weight for v in operands) <= 4096
+                and max(v.depth for v in operands) < 128
+            ):
+                result = expression(ARITHMETIC[type(op)], *operands)
+            else:
+                result = Expr("argument", (Symbol("$ssa", SymbolKind.SSA, value, operands),))
         memo[value] = result
         return result
 
-    result = visit(value)
-    seen = set()
-
-    def validate(expr):
-        if expr in seen:
-            return
-        seen.add(expr)
-        if expr.kind in DIVISION:
-            divisor = expr.args[1]
-            require(
-                uniform(divisor, environment) and positive(divisor, environment),
-                "scalar divisor must be uniform and provably positive",
-            )
-        for arg in expr.args:
-            if isinstance(arg, Expr):
-                validate(arg)
-
-    # Validate cached expressions too: an extraction cache is not a certificate
-    # that a divisor remains positive in another proof environment.
-    validate(result)
-    return result
+    return visit(value)
 
 
 def infer(expr, facts):

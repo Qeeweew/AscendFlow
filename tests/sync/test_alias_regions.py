@@ -256,12 +256,12 @@ def test_enclosing_region_cannot_initialize_untouched_nz_rows():
         _memory(_fragment_ring(3, complete=False))
 
 
-def test_enclosing_region_does_not_authorize_an_out_of_bounds_fragment():
-    from ascendflow.diagnostics import CompileError
-
+def test_independent_axis_check_catches_a_fragment_that_spills_into_another_slot(monkeypatch):
     source = _fragment_ring(3).replace("maximum=15", "maximum=16")
-    with pytest.raises(CompileError, match="axis|bound|allocation"):
-        _memory(source)
+    _metadata_rows(monkeypatch, (16, 0, 0, 0))
+    final, original = _memory(source)
+    with pytest.raises(EventModelError, match="logical axis"):
+        check_structured_events(final, {"n": 1}, logical_reference=original)
 
 
 def test_single_slot_keeps_the_old_reader_retirement(monkeypatch):

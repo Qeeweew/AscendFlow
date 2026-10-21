@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from xdsl.dialects import scf
-from xdsl.dialects.builtin import IndexType, ModuleOp
-from xdsl.ir import Operation
+from xdsl.dialects.builtin import IndexType, ModuleOp, i1
+from xdsl.ir import Operation, SSAValue
 
-from ..diagnostics import ErrorKind, require
+from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import CoreIdOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
 from ..indexing import (
@@ -28,6 +28,7 @@ from ..indexing import (
     domain_nonnegative,
     equivalent,
     interval,
+    merge_scalar_bounds,
     nonnegative,
 )
 from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
@@ -173,10 +174,33 @@ class ControlFacts:
     environment: ScalarEnvironment
     loops: Mapping[Operation, LogicalLoop]
     frames: Mapping[Operation, ControlFrame]
+    result_frames: Mapping[SSAValue, ControlFrame]
     branches: Mapping[tuple[Operation, int], tuple[Comparison, ...]]
     group: Expr
     sid: Expr
     operations_visited: int
+
+    def dominating_scalars(self, block, before):
+        """Actual scalar definitions available at this lexical insertion point.
+
+        Newly inserted notifications are absent from this owned input snapshot.
+        No range query or claim of cross-invocation equality is involved.
+        """
+        values = []
+
+        def visit(block, stop):
+            owner = block.parent_op()
+            if owner is not None and owner.parent is not None:
+                visit(owner.parent, owner)
+            values.extend(block.args)
+            for operation in block.ops:
+                if operation is stop:
+                    break
+                if operation in self.frames:
+                    values.extend(operation.results)
+
+        visit(block, before)
+        return tuple(v for v in values if isinstance(v.type, IndexType) or v.type == i1)
 
     def invariant_over(self, value: Expr, operation: Operation) -> bool:
         """Whether an expression is fixed throughout this actual invocation.
@@ -226,8 +250,8 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
     """Bind one owned, structurally verified module without cloning its IR.
 
     Unknown SCF scalar carries/results retain distinct symbols with no assumed
-    range. Their use in an address must obtain a range contract later; an empty
-    or unrelated scalar loop is not rejected merely for containing such carry.
+    range. They remain executable without an explicit range contract. Optional
+    range enrichment never changes the accepted source language.
     """
     root = module.body.block.first_op
     require(
@@ -244,16 +268,16 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
         group.args[0]: Fact(maximum=groups - 1),
         sid.args[0]: Fact(maximum=1 if mixed else 0),
     }
-    bindings, loops, frames, branches = {}, {}, {}, {}
+    bindings, loops, frames, branches, result_frames = {}, {}, {}, {}, {}
     runtime_names = set()
     visited = unknown = 0
 
     def scalar(value):
-        return from_ssa(value, memo=bindings, facts=facts)
+        return from_ssa(value, memo=bindings)
 
     def unknown_scalar(value, frame, kind=SymbolKind.CARRY):
         nonlocal unknown
-        if isinstance(value.type, IndexType):
+        if isinstance(value.type, IndexType) or value.type == i1:
             captures = (group, sid, *(loop.ordinal for loop in frame.loops()))
             bindings[value] = Expr(
                 "argument", (Symbol(f"$scalar{unknown}", kind, value, captures),)
@@ -280,7 +304,7 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                 and len(operation.refs) == 3
                 and operation.value is not None
                 and isinstance(operation.value.type, IndexType),
-                "index metadata load lost its explicit bounds",
+                "index metadata load lost its signed value domain",
             )
             unknown_scalar(operation.value, frame, SymbolKind.METADATA)
             coordinate = bindings[operation.value]
@@ -338,7 +362,12 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                 operation, ordinal, induction, lower, upper, step, count, frame.domains()
             )
             loops[operation] = loop
-            joint = _division_iteration_range(lower, upper, induction, frame.domains(), facts)
+            try:
+                joint = _division_iteration_range(lower, upper, induction, frame.domains(), facts)
+            except CompileError as error:
+                if error.kind is not ErrorKind.ANALYSIS_LIMIT:
+                    raise
+                joint = ()
             frame = ControlFrame(
                 frame,
                 operation,
@@ -382,8 +411,28 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
                 local = child_frame
                 for child in block.ops:
                     visited_frame = visit(child, local)
-                    if isinstance(child, TaskOp) and child.native.data == "index_load":
+                    if (isinstance(child, TaskOp) and child.native.data == "index_load") or (
+                        isinstance(child, scf.IfOp) and child.results
+                    ):
                         local = visited_frame
+        if isinstance(operation, scf.IfOp):
+            ranges = []
+            for i, value in enumerate(operation.results):
+                if not isinstance(value.type, IndexType):
+                    continue
+                exits = [region.block.last_op for region in operation.regions]
+                bounds = merge_scalar_bounds(
+                    [scalar(exit_.arguments[i]) for exit_ in exits],
+                    [frames[exit_].domains() for exit_ in exits],
+                    frame.domains(),
+                    facts,
+                )
+                if bounds is not None:
+                    ranges.append((bindings[value], *bounds))
+            if ranges:
+                exit_frame = ControlFrame(frame, operation, frame.participants, tuple(ranges))
+                result_frames.update((value, exit_frame) for value in operation.results)
+                return exit_frame
         return frame
 
     participants = () if mixed else (Actor.AIC,) if root.core.data == "aic" else (Actor.AIV0,)
@@ -399,6 +448,7 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
         ScalarEnvironment(bindings, facts),
         MappingProxyType(loops),
         MappingProxyType(frames),
+        MappingProxyType(result_frames),
         MappingProxyType(branches),
         group,
         sid,

@@ -193,7 +193,7 @@ def test_original_axes_do_not_certify_an_undersized_real_allocation():
     gm, ub = _buffer(block, "GM", 128), _buffer(block, "UB", 256)
     source, destination = _address(block, gm), _address(block, ub)
     _task(block, "copy", source, destination)
-    with pytest.raises(CompileError, match="not bounded by its allocation") as error:
+    with pytest.raises(CompileError, match="static native byte footprint") as error:
         admit_memory_bounds(collect_native_memory(_module(block)))
     assert error.value.kind == ErrorKind.INVALID
 
@@ -208,7 +208,6 @@ def test_a_smaller_allocation_can_still_contain_the_actual_native_slice():
 
 
 def test_rotated_runtime_grid_composes_axes_with_real_capacity(monkeypatch):
-    from ascendflow.analysis import structured_bounds
 
     source = N.from_source("""
 def rotated(X:N.Tensor((3,n,64),N.f32),Out:N.Tensor((3,n,64),N.f32,access="write"),
@@ -225,14 +224,12 @@ def rotated(X:N.Tensor((3,n,64),N.f32),Out:N.Tensor((3,n,64),N.f32,access="write
             N.copy(tile,Out[head,row:row+64,:])
 """)
     memory = native_memory(source)
-    nonnegative = structured_bounds.domain_nonnegative
+    from ascendflow import indexing
 
-    def capacity_query(value, domains, facts, *, assumptions=()):
-        assert not domains, "bounded axes must not be re-proved as one flat nonlinear address"
-        assert not assumptions
-        return nonnegative(value, domains, facts)
+    def no_source_bounds(*args, **kwargs):
+        raise AssertionError("memory contracts must not re-prove dynamic source bounds")
 
-    monkeypatch.setattr(structured_bounds, "domain_nonnegative", capacity_query)
+    monkeypatch.setattr(indexing, "domain_nonnegative", no_source_bounds)
     bounds = admit_memory_bounds(memory)
     assert bounds.checked_accesses == 4
     assert all(bound.frames for bound in bounds.addresses.values())
@@ -244,7 +241,7 @@ def test_large_byte_allocation_cannot_hide_an_invalid_original_axis():
     source = _address(block, gm, origins=(32,))
     destination = _address(block, ub)
     _task(block, "copy", source, destination)
-    with pytest.raises(CompileError, match="not bounded by its tensor extent") as error:
+    with pytest.raises(CompileError, match="static logical axis") as error:
         admit_memory_bounds(collect_native_memory(_module(block)))
     assert "axis=0" in error.value.witness
 
@@ -277,7 +274,7 @@ def test_pitched_byte_bounds_include_row_gaps_in_the_last_endpoint():
     _task(block, "copy_rows", source, destination)
     memory = collect_native_memory(_module(block))
     assert memory.addresses[source.ref].geometry.total_nbytes == 512
-    with pytest.raises(CompileError, match="not bounded by its allocation") as error:
+    with pytest.raises(CompileError, match="static native byte footprint") as error:
         admit_memory_bounds(memory)
     assert "span=768" in error.value.witness
 
@@ -581,6 +578,5 @@ def test_runtime_capacity_cannot_be_replaced_with_the_static_prototype_size():
     ub = _buffer(block, "UB", 256)
     source, destination = _address(block, gm), _address(block, ub)
     _task(block, "copy", source, destination)
-    with pytest.raises(CompileError, match="not bounded by its allocation") as error:
-        admit_memory_bounds(collect_native_memory(_module(block)))
-    assert error.value.kind == ErrorKind.UNSUPPORTED
+    facts = admit_memory_bounds(collect_native_memory(_module(block)))
+    assert facts.allocations[gm.ref].evaluate({"n": 2}) == 256

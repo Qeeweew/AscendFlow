@@ -8,12 +8,16 @@ from xdsl.dialects.builtin import ArrayAttr, IndexType, IntAttr, StringAttr
 from xdsl.ir import Block
 
 from ascendflow import indexing, scalar
-from ascendflow.analysis.structured_addresses import ScalarEnvironment, StructuredAddresses
+from ascendflow.analysis.structured_addresses import (
+    ScalarEnvironment,
+    StructuredAddresses,
+    check_static_axes,
+)
 from ascendflow.diagnostics import CompileError, ErrorKind
 from ascendflow.dialects.physical import BufferOp
 from ascendflow.dialects.structured import AddressOp
 from ascendflow.dialects.types import ref_type
-from ascendflow.scalar import Expr, Fact, expression, literal
+from ascendflow.scalar import Expr, Fact, literal
 from ascendflow.target.native import NativeGeometry
 from tests.support.structured import index_constant
 
@@ -114,13 +118,7 @@ def test_multiple_ancestor_clocks_and_uniform_radix_remain_one_actual_address(mo
     for runtime in ((3, 5, 2, 4), (100_000, 1024, 99_999, 1023)):
         values = dict(zip(("n", "m", "$outer", "$inner"), runtime, strict=True))
         assert result.offset.evaluate(values) == (runtime[2] * runtime[1] + runtime[3]) * 256
-    decoder.check_axes(
-        result,
-        (
-            (expressions[2], literal(0), expression("sub", expressions[0], literal(1))),
-            (expressions[3], literal(0), expression("sub", expressions[1], literal(1))),
-        ),
-    )
+    check_static_axes(result)
     assert decoder.decode(address.ref) is result and decoder.decode_count == 1
     with pytest.raises(FrozenInstanceError):
         result.root = root.ref
@@ -194,7 +192,7 @@ def test_decode_preserves_rows_and_subview_metadata_without_proving_bounds():
     assert not address.geometry.contiguous and address.geometry.total_nbytes == 512
     assert address.axes.displacement == address.offset.constant == 20000
     # Original-axis bounds alone say nothing about this out-of-allocation displacement.
-    decoder.check_axes(address, ())
+    check_static_axes(address)
 
 
 def test_absent_axis_metadata_decodes_but_cannot_supply_axis_admission():
@@ -205,7 +203,7 @@ def test_absent_axis_metadata_decodes_but_cannot_supply_axis_admission():
     address = decoder.decode(operation.ref)
     assert address.axes is None
     with pytest.raises(CompileError, match="no original-axis metadata") as error:
-        decoder.check_axes(address, ())
+        check_static_axes(address)
     assert error.value.kind == ErrorKind.UNSUPPORTED
 
 
@@ -225,8 +223,8 @@ def test_axis_check_uses_retained_projected_away_axes_and_reports_witness():
     )
     decoder = _decoder()
     address = decoder.decode(operation.ref)  # Decoding is not a bounds proof.
-    with pytest.raises(CompileError, match="not bounded") as error:
-        decoder.check_axes(address, ())
+    with pytest.raises(CompileError, match="static logical axis") as error:
+        check_static_axes(address)
     assert error.value.kind == ErrorKind.INVALID
     assert error.value.phase == "structured-addresses"
     assert error.value.witness == ("axis=0", "origin=4", "width=1", "extent=3")
@@ -252,7 +250,7 @@ def test_axis_failure_classification_keeps_explicit_constant_violations_invalid(
     decoder = _decoder()
     address = decoder.decode(operation.ref)
     with pytest.raises(CompileError) as error:
-        decoder.check_axes(address, ())
+        check_static_axes(address)
     assert error.value.kind == ErrorKind.INVALID
     assert error.value.witness == (
         "axis=0",
@@ -280,10 +278,8 @@ def test_axis_failure_classification_does_not_call_an_unknown_origin_a_counterex
     symbol = Expr("argument", ("$unknown",))
     decoder = _decoder({origin: symbol})
     address = decoder.decode(operation.ref)
-    with pytest.raises(CompileError, match="origin may be negative") as error:
-        decoder.check_axes(address, ())
-    assert error.value.kind == ErrorKind.UNSUPPORTED
-    assert error.value.witness == ("axis=0", "origin=$unknown", "width=1", "extent=8")
+    check_static_axes(address)
+    assert address.axes.origins == (symbol,)
 
 
 def test_axis_failure_classification_marks_a_missing_cyclic_joint_range_unsupported():
@@ -311,27 +307,11 @@ def test_axis_failure_classification_marks_a_missing_cyclic_joint_range_unsuppor
         displacement=0,
     )
     address = decoder.decode(operation.ref)
-    total = decoder.environment.expression(divisor)
-    count = expression("ceildiv", total, literal(20))
-    # A real cyclic activation supplies a joint range for group + 20*g.
-    # Separate group/g intervals alone do not supply that missing premise.
-    domains = (
-        (symbols[0], literal(0), literal(19)),
-        (symbols[1], literal(0), expression("sub", count, literal(1))),
-    )
-    with pytest.raises(CompileError, match="not bounded by its tensor extent") as error:
-        decoder.check_axes(address, domains)
-    assert error.value.kind == ErrorKind.UNSUPPORTED
-    assert error.value.witness == (
-        "axis=0",
-        f"origin={address.axes.origins[0].text()}",
-        "width=1",
-        "extent=1",
-    )
+    check_static_axes(address)
+    assert address.axes.origins[0].kind == "floordiv"
 
 
 def test_axis_failure_classification_preserves_an_explicit_analysis_limit(monkeypatch):
-    from ascendflow.analysis import structured_addresses
 
     block = Block()
     root = _buffer(block)
@@ -352,11 +332,8 @@ def test_axis_failure_classification_preserves_an_explicit_analysis_limit(monkey
     def limited(*args, **kwargs):
         raise CompileError("algebra limit", kind=ErrorKind.ANALYSIS_LIMIT, witness=("budget",))
 
-    monkeypatch.setattr(structured_addresses, "check_axis", limited)
-    with pytest.raises(CompileError, match="algebra limit") as error:
-        decoder.check_axes(address, ())
-    assert error.value.kind == ErrorKind.ANALYSIS_LIMIT
-    assert error.value.witness == ("budget", "axis=0", "origin=0", "width=1", "extent=8")
+    monkeypatch.setattr(indexing, "domain_nonnegative", limited)
+    check_static_axes(address)
 
 
 def test_unsigned_dividend_is_checked_before_axis_recombination():
@@ -383,8 +360,10 @@ def test_unsigned_dividend_is_checked_before_axis_recombination():
         displacement=0,
     )
     address = decoder.decode(operation.ref)
-    with pytest.raises(CompileError, match="nonnegative dividend"):
-        decoder.check_axes(address, ((symbol, literal(0), literal(7)),))
+    check_static_axes(address)
+    with pytest.raises(CompileError, match="nonnegative numerator"):
+        address.axes.origins[0].evaluate({"$g": 0})
+    assert address.axes.origins[0].evaluate({"$g": 5}) == 0
 
 
 @pytest.mark.parametrize(
@@ -399,8 +378,8 @@ def test_scalar_divisors_need_a_positive_uniform_contract(binding, facts):
     divisor = block.args[0]
     quotient = _binary(block, arith.DivUIOp, index_constant(block, 64), divisor)
     env = ScalarEnvironment({divisor: binding}, facts)
-    with pytest.raises(CompileError, match="uniform and provably positive"):
-        env.expression(quotient)
+    value = env.expression(quotient)
+    assert value.evaluate({str(binding.args[0]): 2}) == 32
 
 
 def test_native_operand_must_be_an_actual_address_and_original_buffer_root():

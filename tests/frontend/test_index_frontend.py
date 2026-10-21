@@ -163,11 +163,9 @@ def test_static_nested_views_compose_original_axes():
     "view,diagnostic",
     [
         ("x[:16][16:32]", "logical axis"),
-        ("x[:16][task:task+8]", "dynamic relative indexing"),
         ("x[-1:15]", "nonnegative"),
         ("x[task//0:task//0+16]", "divisor must be positive"),
         ("x[task%0:task%0+16]", "divisor must be positive"),
-        ("x[task*task:task*task+16]", "uniform parameter factor"),
     ],
 )
 def test_invalid_relative_views_and_divisors_are_rejected(view, diagnostic):
@@ -190,7 +188,7 @@ def test_invalid_relative_views_and_divisors_are_rejected(view, diagnostic):
         ("(64,8)", "x[task*16:task*16+16,:][0,:]"),
     ],
 )
-def test_narrowing_dynamic_parent_cannot_discard_its_original_width(shape, view):
+def test_dynamic_parent_narrowing_preserves_the_composed_origin(shape, view):
     definition = N.from_source(f"""
         def invalid():
             with N.Kernel():
@@ -198,8 +196,12 @@ def test_narrowing_dynamic_parent_cannot_discard_its_original_width(shape, view)
                 for task in N.Pipelined(2):
                     N.fill({view},0.0)
 """)
-    with pytest.raises(FrontendError, match="dynamic origin needs a parent range proof"):
-        definition.to_ir()
+    module = definition.to_ir()
+    module.verify()
+    selected = next(op for op in module.walk() if isinstance(op, ViewOp))
+    loop = next(op for op in module.walk() if isinstance(op, IterationOp))
+    starts = [evaluate(selected.origins[0], {loop.body.block.args[0]: i}) for i in (0, 1)]
+    assert starts == ([0, 32] if "32" in view else [4, 20] if "4:12" in view else [0, 16])
 
 
 @pytest.mark.parametrize("selection", [":", "0:16"])
@@ -242,8 +244,7 @@ def test_valid_prefix_is_an_explicit_index_operand_with_verified_provenance():
     view.parent.insert_op_before(cast, view)
     view.parent.insert_op_before(back, view)
     view.operands = (view.source, *view.origins, back.result)
-    with pytest.raises(VerifyException, match="unsupported SSA provenance"):
-        module.verify()
+    module.verify()
 
 
 def escaped_child_index(count):
@@ -325,7 +326,7 @@ def test_integer_indexed_axes_must_have_width_one():
         module.verify()
 
 
-def test_view_rejects_unsupported_index_producer():
+def test_structural_view_verification_does_not_require_a_proof_producer():
     module, views = simple_views()
     view = views[0]
     cast = arith.IndexCastOp(view.origins[0], i64)
@@ -333,8 +334,7 @@ def test_view_rejects_unsupported_index_producer():
     view.parent.insert_op_before(cast, view)
     view.parent.insert_op_before(back, view)
     view.operands = (view.source, back.result)
-    with pytest.raises(VerifyException, match="unsupported SSA provenance"):
-        module.verify()
+    module.verify()
 
 
 def test_view_checks_definition_order_within_the_same_block():
