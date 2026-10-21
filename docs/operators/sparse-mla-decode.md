@@ -50,63 +50,74 @@ R 支持 1、2；原始页大小 PAGE，压缩页大小 PAGE/R，对应同一数
 
 ## 流水与数值
 
-`sparse_mla_decode` 是一个混合核 kernel：两个 AIV 读取压缩索引和页表，将选中行
-经双槽 16 行 UB 流水物化到三槽 GM KV，并发布有效为 0、填充为 −∞ 的 Bias。
-同一 head tile 的各个 head 共用这次 gather。滑窗直接从原始分页 KV 搬到 L1。
-Cube 执行 QK/PV，两个 AIV 共用代码、按 runtime SID 处理各自一半 head 的
-online softmax 和 FP32 输出更新。GM 交接由编译器推导完整双 AIV quorum。
+`sparse_mla_decode` 是一个 mixed kernel。每个请求先 gather 所有选中的压缩 KV，
+再把 window 与压缩行的 Score 放在同一逻辑矩阵中，只做一次 softmax 和 PV。
+它不再分别计算 window/压缩 tile 的 PV 后维护在线 numerator、alpha 和 max carry。
+两个 AIV 共用代码，按 runtime SID 处理各自一半 head；每个 head 仍只计一次 sink。
 
-gather、cache 搬运、QK、PV 和 softmax 使用透明 inline helper；调用处以具名实参
-列出真实存储、任务坐标和分块参数。helper 不隐藏同步或额外存储，metadata
-读取保留在相应计算作用域内，Stage 只表达发射偏移。
+令 `CP=ceil(TOPK/512)*512`、`S=WINDOW+CP`、`W=ceil(S/512)*512`。
+压缩 gather 使用双槽 16 行 UB，逐行读取索引和页表；无效槽清零并产生 −∞ Bias，
+合法槽 Bias 为 0。重复索引仍逐次参与。窗口继续从分页 GM 直接进入 L1，
+没有为合并 softmax 新增窗口 gather。算法不要求索引排序。
 
-示例至多使用 20 个 mixed group，按 owner 轮转处理请求和 head tile。一个 worker
-的所有请求共用一条连续 tile 流水，GM/UB 槽按全局 tile 编号轮换，只在整个 worker
-结束时收尾。新请求分别在 QK 和 softmax 前重载 Q、sink 和分母；输出累计状态
-在该请求首次 update 前清零。softmax 的 FP32 分母按 tile 保存到双槽快照，与
-递推 carry 分离，因此旧请求最后一次归一化允许与新请求 softmax 交叠。
+QK 先计算压缩行，最后计算 window，将结果分别写入 Score 的 `[WINDOW,S)` 和
+`[0,WINDOW)`。window 的最后 FIX 完成前缀经过全部压缩 QK 输入，因此包含双方
+AIV 的 gather 发布。softmax **先获取完整 Score，再读取 Bias**。普通 AIV peer GM
+访问没有直接交接协议；不能把 Bias DMA 提到 Score acquire 前。
 
-Score、P、PV 是每 group 双槽 GM workspace，调用方分别分配
-`[B*(H/BM),2,BM,BK]` FP32、同形 b16、`[B*(H/BM),2,BM,D]` FP32。
-KV/Bias 分别为 `[B*(H/BM),3,BK,D]` b16 和 `[B*(H/BM),3,BK]` FP32。
-QK/PV 共用 KV L1 池、双槽 L0A/B 和一份按输出列分片的 L0C。D 能被 256 整除
-时，PV 复用一次 P 装载计算两个相邻 128 列输出，再一次 FIX 写出 256 列；
-两个 MAD 使用各自的 L0C 列切片。128×128 分块的 L1 最后读取在 MTE1，双槽
-允许其与下一次 MTE2 装载重叠。源码不指定事件或全核 barrier。
+AIV 将 S 列 Score 读入 W 列 UB，额外列填 −∞，仅在 UB 内参与归约；这些列
+不增加 KV 读取、MAD 或 GM 的 Score/P 容量。默认每组处理 16 行 softmax。
+Bias 直接按行加到 Score，不物化完整 Bias 矩阵。先计算包含 sink 的 FP32 最大值，
+再计算概率、FP32 分母和 b16 P。分母保存为每请求的双槽私有 UB 快照。
 
-行状态 `(max,denominator,numerator)` 以 `(sink,1,0)` 初始化，FP32 递推。
-QK/PV 使用 b16 输入与 FP32 累加；P 在 PV 前显式舍入成输入 dtype，分母读取
-未舍入的 FP32 概率，最终输出保持输入 dtype。不同合法分块可改变 FP32 求和
-次序；设备 runner 使用独立 FP64 公式参考，以 `atol=0.005, rtol=0.02` 检查，
-这不是任意输入的误差上界证明或 upstream 位精确资格。
+Cube 的 PV 从 window 开始，随后按原压缩顺序累加全部行，FP32 L0C 只在首次
+MAD 清零。D 可被 256 整除时，一次 128×256 L1 搬运供两个相邻 128 列输出，
+共用 P 装载，再一次 FIX 写出 256 列。finish 每次处理 8 行，只做 FP32 分母
+归一化、转换与最终写出。QK/PV 共用双槽 L1 KV 池、L0A/B 和按输出列切分的 L0C。
+L1 的真正最后 reader 是 MTE1，源码不指定事件 ID 或全核 barrier。
+
+每个 worker 持续处理自己拥有的请求，默认至多 20 个 mixed group。发射顺序为
+Cube 的 `pv→qk`、Vector 的 `gather→softmax→finish`，阶段偏移分别为 0/1/2。
+KV/Bias 使用 `query%3`，Score/P/PV 和分母快照使用 `query%2`，不能共用一个 slot 时钟。
+
+三槽还保护 **两个 AIV 对 Bias 的最后读取**。Cube 先执行 PV(q)，再执行 QK(q+1)；
+后者的最终 Score 完成前缀经过读取双方 P(q) 的 PV，因此已经涵盖双方 Bias(q)
+读取。每个 AIV 在下一轮 gather 前已获取该 Score。到 q+3 覆盖旧 Bias(q) 时，
+这条中转已经发生；两槽在 q+2 覆盖时尚没有这一保证。KV 的 Cube reader 退休
+本身不能授权覆盖 Bias。回归用独立有限模型保留提前读取和两槽覆盖的 RAW/WAR
+反例，不以普通编译成功代替 peer 访问证明。
+
+调用方分配以下 GM workspace，其中 `G=B*(H/BM)`，实际只使用 resident worker
+对应的 group 切片：
+
+| workspace | 形状和 dtype |
+| --- | --- |
+| KV / Bias | `[G,3,CP,D]` b16 / `[G,3,CP]` FP32 |
+| Score / P | `[G,2,BM,S]` FP32 / b16 |
+| PV | `[G,2,BM,D]` FP32 |
+
+QK/PV 使用 b16 输入和 FP32 累加。P 在 PV 前显式舍入成输入 dtype；分母使用
+未舍入的 FP32 概率，最终输出仍是输入 dtype。统一最大值后舍入 P，与原先
+分 tile 舍入再重缩放的实现不位等价。设备 runner 按独立 FP64 公式使用既定
+`atol=0.005, rtol=0.02` 检查；这不是任意输入的误差上界或 upstream 位精确资格。
+最大值、分母、矩阵累加和最终归一化保持 FP32。Sinks、Q/KV 及实际 FP32 运算仍须满足有限性
+与不溢出合同，SCALE 必须为正。
 
 默认验收政策为 B=4、H=64、D=512、WINDOW=128、TOPK=512、S=640、
-BM=64、BK=512、C=128、PAGE=128、MAX_SEQ=4096。它是显式示例政策，不由编译器
-按模型名称选择。资源超限会被拒绝，不扩大硬件容量。
+BM=64、VR=16、BK=512、C=128、PAGE=128、MAX_SEQ=4096。UB 内 W=1024；
+更宽的 Score 使用 8 行组和显式 512 列 UB 工作块处理行广播。当前 W 至多 4096，
+且所有具体组合仍需通过 192KB UB、L1/L0 和有限事件资源检查；不是所有 D/TOPK
+组合均能 resident，不自动切换到另一编译路径。
 
-这是 CSA 计算与流水结构的移植，当前 sparse gather 逐行搬运并保留无效索引的
-空槽和 mask；官方实现还使用合法时的双行 DMA 及有效行压紧。因此数值集合相同，
-不声称搬运指令与官方逐条一致。
-当前压缩 gather 集中在对应 compressed tile。所测官方 arch22 CSA 在 window
-任务将 `v0S2DealSize` 设为 0，同样不在该任务执行 compressed gather。
-每块 16 行 UB 使用一次 b16 `fill` 完整清零，再由真实有效行搬运覆盖；满有效块
-仍执行初始化。它减少对 FP32 零缓冲的读取和转换工作，不减少稀疏 GM 读取量，也不
-采用有效行压紧或只清无效行的策略。
+与官方 CSA 保持相同的选中行、分页和共享 KV 语义，计算组织改为每请求联合
+softmax。官方 gather 还在合法时用双行 runtime-stride DMA 并压紧有效行；这里
+仍逐行搬运并保留无效槽，不声称逐指令复刻。满有效块仍执行 b16 清零。
 
-算法政策和编译器能力按实际机器工作区分：
-
-| 改动 | 职责及当前边界 |
-|---|---|
-| tile、worker 映射、slot、预取、QK/PV 复用和递推快照 | 在 example DSL 中声明；实际读写及排步改变后重新推导依赖 |
-| 两段 GM 页放入同一 L1 NZ tile | example 选择布局；首段补零、后段 runtime 前缀覆盖经过真实 pitched effects、容量和初始化合同 |
-| 官方双行 DMA | 需要 runtime source stride 及两段精确 effects；当前静态行距 view 不能直接表达，尚未支持 |
-| 官方有效行压紧 | 政策在 example；底层还需 count 归纳范围、已定义前缀、发布数据/count 对应和退休合同，当前未开放 |
-| UB 缓存元数据后 Scalar 读取 | 缓存时机属于 example；当前 index load 只接受只读 GM，不支持把 UB view 直接替换进去 |
-
-稀疏只读输入允许多个 reader 和重复地址。ownership 约束的是哪代物理存储仍被
-哪些 reader 使用；覆盖槽位前必须等待所有相关读取退休，不能把两个 AIV 的
-私有 UB 或共享 GM 的两份贡献合并。event ID 不由 DSL 指定，资源分配失败不
-授权扩大 bank、插入全局 barrier 或自动改变算法排步。
+算法分块、slot、任务顺序、QK/PV 复用和快照都在 example DSL 中表达。runtime
+NZ 前缀覆盖、真实 pitched effects、初始化、ownership 和有限事件分配继续使用
+同一编译路径；这项优化没有修改编译器或 event sharing。官方动态 stride、
+有效行压紧和 UB metadata Scalar cache 仍未开放，不以扩大硬件容量、全局 barrier
+或静默 fallback 绕过拒绝。
 
 ## 运行与边界
 

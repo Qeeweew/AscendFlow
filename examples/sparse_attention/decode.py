@@ -1,8 +1,7 @@
-"""CSA sparse MLA: direct window, compressed gather, QK/softmax/PV/update.
+"""Sparse decode with one softmax over the window and selected compressed KV.
 
-Follows vllm-ascend's dav-2201 CSA structure: one shared KV gather for all
-heads, 512-row compressed tiles, triple GM slots and double 16-row UB streams.
-Window pages go directly to L1. FP32 online state includes exactly one sink.
+Sparse rows are gathered once for all heads; window pages go directly to L1.
+QK and PV keep explicit L1/L0 rings, with one persistent query pipeline.
 """
 
 from __future__ import annotations
@@ -22,9 +21,9 @@ def load_cache(
     visible,
     KV,
     destination,
+    cache_slot,
     batch,
     group,
-    cache_slot,
     first,
     feature,
     IS_WINDOW,
@@ -70,6 +69,7 @@ def qk_tile(
     slot,
     IS_WINDOW,
     WIDTH,
+    OFFSET,
     PAGE,
     D,
     C,
@@ -115,7 +115,8 @@ def qk_tile(
                     initialize=chunk == 0,
                 )
         N.copy(
-            c0[:, (n % 2) * 128 : (n % 2 + 1) * 128], Score[group, slot, :, n * 128 : (n + 1) * 128]
+            c0[:, (n % 2) * 128 : (n % 2 + 1) * 128],
+            Score[group, slot, :, OFFSET + n * 128 : OFFSET + (n + 1) * 128],
         )
 
 
@@ -137,8 +138,7 @@ def pv_tile(
     group,
     cache_slot,
     slot,
-    IS_WINDOW,
-    WIDTH,
+    S,
     PAGE,
     D,
     C,
@@ -153,30 +153,29 @@ def pv_tile(
     NC = 2 if D % (2 * C) == 0 else 1
     for column in N.serial(D // (NC * C)):
         d = column * (NC * C)
-        for chunk in N.Pipelined(WIDTH // 128, issue_order=("pv_load", "pv_dot", "pv_operand")):
+        for chunk in N.Pipelined(S // 128, issue_order=("pv_load", "pv_dot", "pv_operand")):
             j = chunk * 128
             bank = chunk % 2
             with N.Stage(0, name="pv_load"):
                 N.copy(P[group, slot, :, j : j + 128], p1[bank, :, :])
-                for c in N.unroll(NC):
-                    load_cache(
-                        Ori=Ori,
-                        OriTable=OriTable,
-                        length=length,
-                        visible=visible,
-                        KV=KV,
-                        destination=v1[bank, :, c * C : (c + 1) * C],
-                        batch=batch,
-                        group=group,
-                        cache_slot=cache_slot,
-                        first=j,
-                        feature=d + c * C,
-                        IS_WINDOW=IS_WINDOW,
-                        PAGE=PAGE,
-                        C=C,
-                        MAX_SEQ=MAX_SEQ,
-                        ORI_BLOCKS=ORI_BLOCKS,
-                    )
+                load_cache(
+                    Ori=Ori,
+                    OriTable=OriTable,
+                    length=length,
+                    visible=visible,
+                    KV=KV,
+                    destination=v1[bank, :, :],
+                    batch=batch,
+                    group=group,
+                    cache_slot=cache_slot,
+                    IS_WINDOW=chunk == 0,
+                    first=N.max(0, j - 128),
+                    feature=d,
+                    PAGE=PAGE,
+                    C=NC * C,
+                    MAX_SEQ=MAX_SEQ,
+                    ORI_BLOCKS=ORI_BLOCKS,
+                )
             with N.Stage(1, name="pv_operand"):
                 N.copy(p1[bank, :, :], a0[bank, :, :])
                 for c in N.unroll(NC):
@@ -198,115 +197,6 @@ def pv_tile(
             N.copy(c0[:, (column % 2) * C : (column % 2 + 1) * C], PV[group, slot, :, d : d + C])
 
 
-@N.inline
-def update_online_softmax(
-    score,
-    probabilities,
-    m,
-    l,
-    alpha,
-    next_m,
-    row_sum,
-    partial,
-    broadcast,
-    local,
-    slot,
-    VR,
-    WIDTH,
-):
-    N.reduce_max(
-        score,
-        axis=1,
-        out=next_m,
-        scratch=partial[0 : VR * (WIDTH // 8)],
-        order="block8_then_packed_merge",
-    )
-    N.maximum(m[local : local + VR], next_m, out=next_m)
-    N.sub(m[local : local + VR], next_m, out=alpha[slot, local : local + VR])
-    N.exp(alpha[slot, local : local + VR], out=alpha[slot, local : local + VR])
-    N.sub(score, next_m[:, None], out=score, scratch=broadcast)
-    N.exp(score, out=score)
-    N.cast(score, out=probabilities)
-    N.reduce_sum(
-        score,
-        axis=1,
-        out=row_sum,
-        scratch=partial[0 : VR * (WIDTH // 8)],
-        order="block8_then_packed_merge",
-    )
-    N.mul(l[local : local + VR], alpha[slot, local : local + VR], out=l[local : local + VR])
-    N.add(l[local : local + VR], row_sum, out=l[local : local + VR])
-    N.copy(next_m, m[local : local + VR])
-
-
-@N.inline
-def softmax_tile(
-    Score,
-    Bias,
-    P,
-    WindowLengths,
-    Lengths,
-    score,
-    bias,
-    bias_rows,
-    probabilities,
-    m,
-    l,
-    alpha,
-    next_m,
-    row_sum,
-    partial,
-    broadcast,
-    batch,
-    group,
-    cache_slot,
-    slot,
-    sid,
-    IS_WINDOW,
-    BM,
-    WIDTH,
-    VR,
-    MAX_SEQ,
-    WINDOW,
-    SCALE,
-):
-    N.copy(Score[group, slot, sid * (BM // 2) : sid * (BM // 2) + VR, 0:WIDTH], score)
-    if IS_WINDOW:
-        length = N.load_index(Lengths[batch : batch + 1], minimum=0, maximum=MAX_SEQ)
-        visible = N.load_index(
-            WindowLengths[batch : batch + 1], minimum=0, maximum=N.min(WINDOW, length)
-        )
-    else:
-        N.copy(Bias[group, cache_slot, :], bias)
-        N.broadcast(bias[None, :], out=bias_rows)
-    for block in N.serial(BM // 2 // VR):
-        local = block * VR
-        r = sid * (BM // 2) + local
-        if block > 0:
-            N.copy(Score[group, slot, r : r + VR, 0:WIDTH], score)
-        N.mul(score, SCALE, out=score)
-        if IS_WINDOW:
-            N.fill(score, NEG_INF, mask=N.arange(WIDTH)[None, :] >= visible)
-        else:
-            N.add(score, bias_rows, out=score)
-        update_online_softmax(
-            score=score,
-            probabilities=probabilities,
-            m=m,
-            l=l,
-            alpha=alpha,
-            next_m=next_m,
-            row_sum=row_sum,
-            partial=partial,
-            broadcast=broadcast,
-            local=local,
-            slot=slot,
-            VR=VR,
-            WIDTH=WIDTH,
-        )
-        N.copy(probabilities, P[group, slot, r : r + VR, 0:WIDTH])
-
-
 @N.prim_func(disjoint_external=True)
 def sparse_mla_decode(
     Q: N.Tensor((B, H, D), DTYPE),
@@ -320,10 +210,10 @@ def sparse_mla_decode(
     Indices: N.Tensor((B, TOPK), N.i32),
     Sinks: N.Tensor((H,), N.f32),
     O: N.Tensor((B, H, D), DTYPE, access="write", write_disjoint=True),
-    KV: N.Tensor((B * (H // BM), 3, BK, D), DTYPE, access="write"),
-    Bias: N.Tensor((B * (H // BM), 3, BK), N.f32, access="write"),
-    Score: N.Tensor((B * (H // BM), 2, BM, BK), N.f32, access="write"),
-    P: N.Tensor((B * (H // BM), 2, BM, BK), DTYPE, access="write"),
+    KV: N.Tensor((B * (H // BM), 3, S - WINDOW, D), DTYPE, access="write"),
+    Bias: N.Tensor((B * (H // BM), 3, S - WINDOW), N.f32, access="write"),
+    Score: N.Tensor((B * (H // BM), 2, BM, S), N.f32, access="write"),
+    P: N.Tensor((B * (H // BM), 2, BM, S), DTYPE, access="write"),
     PV: N.Tensor((B * (H // BM), 2, BM, D), N.f32, access="write"),
     B: N.constexpr = 4,
     H: N.constexpr = 64,
@@ -340,314 +230,236 @@ def sparse_mla_decode(
     BM: N.constexpr = 64,
     PARTS: N.constexpr = 1,
     GROUPS: N.constexpr = 20,
-    VR: N.constexpr = 8,
+    VR: N.constexpr = 16,
     BK: N.constexpr = 512,
     C: N.constexpr = 128,
     DTYPE: N.constexpr = N.bf16,
     SCALE: N.constexpr = 0.04419417382415922,
 ):
     with N.Kernel(N.min(GROUPS, B * (H // BM)), kind="mixed") as group:
-        assert H % BM == 0 and (BM == 32 or BM == 64), "CSA requires complete head tiles"
-        assert WINDOW == 128 and PAGE == 128 and BK == 512 and C == 128, "CSA page/tile geometry"
-        assert D % C == 0 and S == WINDOW + N.ceildiv(TOPK, BK) * BK, "complete CSA capacities"
-        assert PARTS == 1 and ROWS == 16 and VR == 8, "CSA baseline policy"
-        assert GROUPS > 0, "positive CSA worker count"
+        assert H % BM == 0 and (BM == 32 or BM == 64), "complete head tiles"
+        assert WINDOW == 128 and PAGE == 128 and BK == 512 and C == 128, "cache/tile geometry"
+        assert D % C == 0 and S == WINDOW + N.ceildiv(TOPK, BK) * BK, "complete selected capacities"
+        assert PARTS == 1 and ROWS == 16 and GROUPS > 0, "sparse query policy"
+        assert (VR == 4 or VR == 8 or VR == 16) and (BM // 2) % VR == 0, "softmax row groups"
         assert (RATIO == 1 or RATIO == 2) and MAX_SEQ % PAGE == 0, "complete C1/C2 pages"
+        WIDTH = N.ceildiv(S, 512) * 512
+        assert WIDTH <= 4096, "resident softmax capacity"
+        assert SCALE > 0.0, "positive attention scale"
+        UR = 8
+        NC = 2 if D % (2 * C) == 0 else 1
         q1 = N.alloc_l1((BM, D), DTYPE)
-        # QK and PV run as consecutive Cube children. Their MTE1 reads
-        # share one KV pool. At this example's 128x128 load granularity,
-        # Stage 1 is its last reader, so two planes overlap Stage 0 loads
-        # with MTE1 without tying L1 retirement to the Stage 2 MAD.
-        PV_COLUMNS = 2 if D % (2 * C) == 0 else 1
-        kv1 = N.alloc_l1((2, 128, PV_COLUMNS * C), DTYPE)
+        kv1 = N.alloc_l1((2, 128, NC * C), DTYPE)
         p1 = N.alloc_l1((2, BM, 128), DTYPE)
         a0 = N.alloc_l0a((2, BM, C), DTYPE)
         b0 = N.alloc_l0b((2, 128, C), DTYPE)
         c0 = N.alloc_l0c((BM, 2 * C), N.f32)
-        gather_zeros = N.alloc_ub((8, D), N.f32)
+        gather_zeros = N.alloc_ub((1, 8), N.f32)
         gather_rows = N.alloc_ub((2, ROWS, D), DTYPE)
         gather_masks = N.alloc_ub((2, ROWS), N.f32)
-        window_score = N.alloc_ub((VR, WINDOW), N.f32)
-        window_p = N.alloc_ub((VR, WINDOW), DTYPE)
-        score = N.alloc_ub((VR, BK), N.f32)
-        bias = N.alloc_ub((BK,), N.f32)
-        bias_rows = N.alloc_ub((VR, BK), N.f32)
-        probabilities = N.alloc_ub((VR, BK), DTYPE)
-        pv = N.alloc_ub((VR, D), N.f32)
-        output = N.alloc_ub((VR, D), DTYPE)
-        m = N.alloc_ub((BM // 2,), N.f32)
-        l = N.alloc_ub((BM // 2,), N.f32)
-        final_l = N.alloc_ub((2, BM // 2), N.f32)
-        o = N.alloc_ub((BM // 2, D), N.f32)
-        alpha = N.alloc_ub((2, BM // 2), N.f32)
-        next_m = N.alloc_ub((VR,), N.f32)
+        score = N.alloc_ub((VR, WIDTH), N.f32)
+        bias = N.alloc_ub((WIDTH,), N.f32)
+        probabilities = N.alloc_ub((VR, WIDTH), DTYPE)
+        sink = N.alloc_ub((VR,), N.f32)
+        maximum = N.alloc_ub((VR,), N.f32)
         row_sum = N.alloc_ub((VR,), N.f32)
-        partial = N.alloc_ub((VR * (BK // 8),), N.f32)
+        final_l = N.alloc_ub((2, BM // 2), N.f32)
+        partial = N.alloc_ub((VR * (WIDTH // 8 + (WIDTH // 64 if WIDTH > 512 else 0)),), N.f32)
         broadcast = N.alloc_ub((VR, 8), N.f32)
-        update_broadcast = N.alloc_ub((VR, 8), N.f32)
-        ones = N.alloc_ub((VR,), N.f32)
-        inverse = N.alloc_ub((VR,), N.f32)
-        initial_batch = group // (H // BM)
-        initial_head = (group % (H // BM)) * BM
-        with N.Cube():
-            N.copy(Q[initial_batch, initial_head : initial_head + BM, :], q1)
-        with N.Vector() as initial_sid:
+        if WIDTH > 1024:
+            softmax_work = N.alloc_ub((VR, 512), N.f32)
+        pv = N.alloc_ub((UR, D), N.f32)
+        output = N.alloc_ub((UR, D), DTYPE)
+        inverse = N.alloc_ub((UR,), N.f32)
+        ones = N.alloc_ub((UR,), N.f32)
+        update_broadcast = N.alloc_ub((UR, 8), N.f32)
+        with N.Vector():
             N.fill(gather_zeros, 0.0)
-            N.copy(
-                Sinks[
-                    initial_head + initial_sid * (BM // 2) : initial_head
-                    + (initial_sid + 1) * (BM // 2)
-                ],
-                m,
-            )
-            N.fill(l, 1.0)
-            N.fill(o, 0.0)
             N.fill(ones, 1.0)
         WORKERS = N.min(GROUPS, B * (H // BM))
-        TILES = 1 + N.ceildiv(TOPK, BK)
-        # Continue one tile pipeline across requests owned by this worker.
-        # Its fill/drain occurs once, as in CSA's persistent core schedule.
-        for tile in N.Dataflow(
-            N.ceildiv(B * (H // BM) - group, WORKERS) * TILES,
-            issue_order={"cube": ("pv", "qk"), "vector": ("gather", "softmax", "update")},
+        for query in N.Dataflow(
+            N.ceildiv(B * (H // BM) - group, WORKERS),
+            issue_order={"cube": ("pv", "qk"), "vector": ("gather", "softmax", "finish")},
         ):
-            local_tile = tile % TILES
-            owner = group + (tile // TILES) * WORKERS
+            owner = group + query * WORKERS
             batch = owner // (H // BM)
             head = (owner % (H // BM)) * BM
-            slot = tile % 2
-            cache_slot = tile % 3
+            slot = query % 2
+            cache_slot = query % 3
             with N.Vector() as sid, N.Stage(0, name="gather"):
-                if local_tile == 0:
-                    pass
-                else:
-                    gather_compressed(
-                        Cmp=Cmp,
-                        CmpTable=CmpTable,
-                        Lengths=Lengths,
-                        Counts=Counts,
-                        Indices=Indices,
-                        KV=KV,
-                        Bias=Bias,
-                        zeros=gather_zeros,
-                        rows=gather_rows,
-                        masks=gather_masks,
-                        batch=batch,
-                        group=group,
-                        slot=cache_slot,
-                        tile=local_tile - 1,
-                        sid=sid,
-                        BK=BK,
-                        ROWS=ROWS,
-                        PAGE=PAGE,
-                        RATIO=RATIO,
-                        MAX_SEQ=MAX_SEQ,
-                        CMP_BLOCKS=CMP_BLOCKS,
-                        TOPK=TOPK,
-                    )
+                gather_compressed(
+                    Cmp=Cmp,
+                    CmpTable=CmpTable,
+                    Lengths=Lengths,
+                    Counts=Counts,
+                    Indices=Indices,
+                    KV=KV,
+                    Bias=Bias,
+                    zeros=gather_zeros,
+                    rows=gather_rows,
+                    masks=gather_masks,
+                    batch=batch,
+                    group=group,
+                    slot=cache_slot,
+                    tile=0,
+                    sid=sid,
+                    BK=S - WINDOW,
+                    ROWS=ROWS,
+                    PAGE=PAGE,
+                    RATIO=RATIO,
+                    MAX_SEQ=MAX_SEQ,
+                    CMP_BLOCKS=CMP_BLOCKS,
+                    TOPK=TOPK,
+                )
             with N.Cube(), N.Stage(0, name="qk"):
-                if local_tile == 0:
-                    if tile > 0:
-                        N.copy(Q[batch, head : head + BM, :], q1)
-                    qk_tile(
-                        Ori=Ori,
-                        OriTable=OriTable,
-                        Lengths=Lengths,
-                        WindowLengths=WindowLengths,
-                        KV=KV,
-                        Score=Score,
-                        q1=q1,
-                        k1=kv1,
-                        q0=a0,
-                        b0=b0,
-                        c0=c0,
-                        batch=batch,
-                        group=group,
-                        cache_slot=cache_slot,
-                        slot=slot,
-                        IS_WINDOW=True,
-                        WIDTH=WINDOW,
-                        PAGE=PAGE,
-                        D=D,
-                        C=C,
-                        WINDOW=WINDOW,
-                        MAX_SEQ=MAX_SEQ,
-                        ORI_BLOCKS=ORI_BLOCKS,
-                    )
-                else:
-                    qk_tile(
-                        Ori=Ori,
-                        OriTable=OriTable,
-                        Lengths=Lengths,
-                        WindowLengths=WindowLengths,
-                        KV=KV,
-                        Score=Score,
-                        q1=q1,
-                        k1=kv1,
-                        q0=a0,
-                        b0=b0,
-                        c0=c0,
-                        batch=batch,
-                        group=group,
-                        cache_slot=cache_slot,
-                        slot=slot,
-                        IS_WINDOW=False,
-                        WIDTH=BK,
-                        PAGE=PAGE,
-                        D=D,
-                        C=C,
-                        WINDOW=WINDOW,
-                        MAX_SEQ=MAX_SEQ,
-                        ORI_BLOCKS=ORI_BLOCKS,
-                    )
+                N.copy(Q[batch, head : head + BM, :], q1)
+                # Publish the window score last. Its M/FIX prefix follows
+                # every compressed QK read, joining both gather publishers
+                # before either AIV consumes the complete Bias and Score.
+                qk_tile(
+                    Ori=Ori,
+                    OriTable=OriTable,
+                    Lengths=Lengths,
+                    WindowLengths=WindowLengths,
+                    KV=KV,
+                    Score=Score,
+                    q1=q1,
+                    k1=kv1,
+                    q0=a0,
+                    b0=b0,
+                    c0=c0,
+                    batch=batch,
+                    group=group,
+                    cache_slot=cache_slot,
+                    slot=slot,
+                    IS_WINDOW=False,
+                    WIDTH=S - WINDOW,
+                    OFFSET=WINDOW,
+                    PAGE=PAGE,
+                    D=D,
+                    C=C,
+                    WINDOW=WINDOW,
+                    MAX_SEQ=MAX_SEQ,
+                    ORI_BLOCKS=ORI_BLOCKS,
+                )
+                qk_tile(
+                    Ori=Ori,
+                    OriTable=OriTable,
+                    Lengths=Lengths,
+                    WindowLengths=WindowLengths,
+                    KV=KV,
+                    Score=Score,
+                    q1=q1,
+                    k1=kv1,
+                    q0=a0,
+                    b0=b0,
+                    c0=c0,
+                    batch=batch,
+                    group=group,
+                    cache_slot=cache_slot,
+                    slot=slot,
+                    IS_WINDOW=True,
+                    WIDTH=WINDOW,
+                    OFFSET=0,
+                    PAGE=PAGE,
+                    D=D,
+                    C=C,
+                    WINDOW=WINDOW,
+                    MAX_SEQ=MAX_SEQ,
+                    ORI_BLOCKS=ORI_BLOCKS,
+                )
             with N.Vector() as sid, N.Stage(1, name="softmax"):
-                if local_tile == 0:
-                    if tile > 0:
-                        N.copy(Sinks[head + sid * (BM // 2) : head + (sid + 1) * (BM // 2)], m)
-                        N.fill(l, 1.0)
-                    softmax_tile(
-                        Score=Score,
-                        Bias=Bias,
-                        P=P,
-                        WindowLengths=WindowLengths,
-                        Lengths=Lengths,
-                        score=window_score,
-                        bias=bias,
-                        bias_rows=bias_rows,
-                        probabilities=window_p,
-                        m=m,
-                        l=l,
-                        alpha=alpha,
-                        next_m=next_m,
-                        row_sum=row_sum,
-                        partial=partial,
-                        broadcast=broadcast,
-                        batch=batch,
-                        group=group,
-                        cache_slot=cache_slot,
-                        slot=slot,
-                        sid=sid,
-                        IS_WINDOW=True,
-                        BM=BM,
-                        WIDTH=WINDOW,
-                        VR=VR,
-                        MAX_SEQ=MAX_SEQ,
-                        WINDOW=WINDOW,
-                        SCALE=SCALE,
-                    )
-                else:
-                    softmax_tile(
-                        Score=Score,
-                        Bias=Bias,
-                        P=P,
-                        WindowLengths=WindowLengths,
-                        Lengths=Lengths,
-                        score=score,
-                        bias=bias,
-                        bias_rows=bias_rows,
-                        probabilities=probabilities,
-                        m=m,
-                        l=l,
-                        alpha=alpha,
-                        next_m=next_m,
-                        row_sum=row_sum,
-                        partial=partial,
-                        broadcast=broadcast,
-                        batch=batch,
-                        group=group,
-                        cache_slot=cache_slot,
-                        slot=slot,
-                        sid=sid,
-                        IS_WINDOW=False,
-                        BM=BM,
-                        WIDTH=BK,
-                        VR=VR,
-                        MAX_SEQ=MAX_SEQ,
-                        WINDOW=WINDOW,
-                        SCALE=SCALE,
-                    )
-                # Like alpha, each tile's exact FP32 denominator is a value
-                # for the following update, separate from softmax's carry.
-                N.copy(l, final_l[slot, :])
-            with N.Cube(), N.Stage(1, name="pv"):
-                if local_tile == 0:
-                    pv_tile(
-                        Ori=Ori,
-                        OriTable=OriTable,
-                        Lengths=Lengths,
-                        WindowLengths=WindowLengths,
-                        KV=KV,
-                        P=P,
-                        PV=PV,
-                        p1=p1,
-                        v1=kv1,
-                        a0=a0,
-                        b0=b0,
-                        c0=c0,
-                        batch=batch,
-                        group=group,
-                        cache_slot=cache_slot,
-                        slot=slot,
-                        IS_WINDOW=True,
-                        WIDTH=WINDOW,
-                        PAGE=PAGE,
-                        D=D,
-                        C=C,
-                        WINDOW=WINDOW,
-                        MAX_SEQ=MAX_SEQ,
-                        ORI_BLOCKS=ORI_BLOCKS,
-                    )
-                else:
-                    pv_tile(
-                        Ori=Ori,
-                        OriTable=OriTable,
-                        Lengths=Lengths,
-                        WindowLengths=WindowLengths,
-                        KV=KV,
-                        P=P,
-                        PV=PV,
-                        p1=p1,
-                        v1=kv1,
-                        a0=a0,
-                        b0=b0,
-                        c0=c0,
-                        batch=batch,
-                        group=group,
-                        cache_slot=cache_slot,
-                        slot=slot,
-                        IS_WINDOW=False,
-                        WIDTH=BK,
-                        PAGE=PAGE,
-                        D=D,
-                        C=C,
-                        WINDOW=WINDOW,
-                        MAX_SEQ=MAX_SEQ,
-                        ORI_BLOCKS=ORI_BLOCKS,
-                    )
-            with N.Vector() as sid, N.Stage(2, name="update"):
-                if local_tile == 0:  # noqa: SIM102 - keep ordered DSL control regions
-                    if tile > 0:
-                        # Old output state retires only at the previous
-                        # request's final update, after its last softmax.
-                        N.fill(o, 0.0)
+                length = N.load_index(Lengths[batch : batch + 1], minimum=0, maximum=MAX_SEQ)
+                visible = N.load_index(
+                    WindowLengths[batch : batch + 1], minimum=0, maximum=N.min(WINDOW, length)
+                )
+                # Acquire the complete Cube score before reading the mask
+                # published by both AIVs in that Cube input prefix.
+                N.fill(score, NEG_INF)
+                N.copy(Score[group, slot, sid * (BM // 2) : sid * (BM // 2) + VR, :], score[:, 0:S])
+                N.fill(bias, NEG_INF)
+                N.fill(bias[0:WINDOW], 0.0)
+                N.fill(bias[0:WINDOW], NEG_INF, mask=N.arange(WINDOW) >= visible)
+                N.copy(Bias[group, cache_slot, :], bias[WINDOW:S])
                 for block in N.serial(BM // 2 // VR):
                     local = block * VR
                     r = sid * (BM // 2) + local
-                    N.copy(PV[group, slot, r : r + VR, :], pv)
-                    N.mul(
-                        o[local : local + VR, :],
-                        alpha[slot, local : local + VR, None],
-                        out=o[local : local + VR, :],
-                        scratch=update_broadcast,
+                    if block > 0:
+                        N.fill(score, NEG_INF)
+                        N.copy(Score[group, slot, r : r + VR, :], score[:, 0:S])
+                    N.copy(Sinks[head + r : head + r + VR], sink)
+                    N.mul(score, SCALE, out=score)
+                    for row in N.serial(VR):
+                        N.add(score[row, :], bias, out=score[row, :])
+                    N.reduce_max(
+                        score,
+                        axis=1,
+                        out=maximum,
+                        scratch=partial,
+                        order="block8_then_packed_merge",
                     )
-                    N.add(o[local : local + VR, :], pv, out=o[local : local + VR, :])
-                    if local_tile == N.ceildiv(TOPK, BK):
-                        N.div(ones, final_l[slot, local : local + VR], out=inverse)
-                        N.mul(
-                            o[local : local + VR, :],
-                            inverse[:, None],
-                            out=pv,
-                            scratch=update_broadcast,
-                        )
-                        N.cast(pv, out=output)
-                        N.copy(output, O[batch, head + r : head + r + VR, :])
+                    N.maximum(maximum, sink, out=maximum)
+                    N.sub(sink, maximum, out=sink)
+                    N.exp(sink, out=sink)
+                    if WIDTH <= 1024:
+                        N.sub(score, maximum[:, None], out=score, scratch=broadcast)
+                    else:
+                        for part in N.serial(WIDTH // 512):
+                            for row in N.serial(VR):
+                                N.copy(
+                                    score[row, part * 512 : (part + 1) * 512], softmax_work[row, :]
+                                )
+                            N.sub(
+                                softmax_work, maximum[:, None], out=softmax_work, scratch=broadcast
+                            )
+                            for row in N.serial(VR):
+                                N.copy(
+                                    softmax_work[row, :], score[row, part * 512 : (part + 1) * 512]
+                                )
+                    N.exp(score, out=score)
+                    N.cast(score, out=probabilities)
+                    N.reduce_sum(
+                        score,
+                        axis=1,
+                        out=row_sum,
+                        scratch=partial,
+                        order="block8_then_packed_merge",
+                    )
+                    N.add(row_sum, sink, out=row_sum)
+                    N.copy(row_sum, final_l[slot, local : local + VR])
+                    N.copy(probabilities[:, 0:S], P[group, slot, r : r + VR, :])
+            with N.Cube(), N.Stage(1, name="pv"):
+                pv_tile(
+                    Ori=Ori,
+                    OriTable=OriTable,
+                    Lengths=Lengths,
+                    WindowLengths=WindowLengths,
+                    KV=KV,
+                    P=P,
+                    PV=PV,
+                    p1=p1,
+                    v1=kv1,
+                    a0=a0,
+                    b0=b0,
+                    c0=c0,
+                    batch=batch,
+                    group=group,
+                    cache_slot=cache_slot,
+                    slot=slot,
+                    S=S,
+                    PAGE=PAGE,
+                    D=D,
+                    C=C,
+                    WINDOW=WINDOW,
+                    MAX_SEQ=MAX_SEQ,
+                    ORI_BLOCKS=ORI_BLOCKS,
+                )
+            with N.Vector() as sid, N.Stage(2, name="finish"):
+                for block in N.serial(BM // 2 // UR):
+                    local = block * UR
+                    r = sid * (BM // 2) + local
+                    N.copy(PV[group, slot, r : r + UR, :], pv)
+                    N.div(ones, final_l[slot, local : local + UR], out=inverse)
+                    N.mul(pv, inverse[:, None], out=pv, scratch=update_broadcast)
+                    N.cast(pv, out=output)
+                    N.copy(output, O[batch, head + r : head + r + UR, :])

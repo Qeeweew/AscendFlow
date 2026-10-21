@@ -89,8 +89,13 @@ def test_padding_is_not_read_and_replay_window_is_respected(problem):
     assert np.array_equal(rows[0], data["Ori"][0, 0])
 
 
-@pytest.mark.parametrize("features,topk,bm", [(128, 512, 32), (128, 2048, 32), (512, 512, 64)])
-def test_native_mixed_pipeline_has_complete_quorums_and_retirement(features, topk, bm, monkeypatch):
+@pytest.mark.parametrize(
+    "features,topk,bm,vr,batch",
+    [(128, 512, 32, 8, 1), (128, 2048, 32, 8, 1), (512, 512, 64, 8, 1), (512, 512, 64, 16, 4)],
+)
+def test_native_mixed_pipeline_has_complete_quorums_and_retirement(
+    features, topk, bm, vr, batch, monkeypatch
+):
     from tests.models.structured_events import _Interpret
 
     native = _Interpret.native
@@ -112,10 +117,11 @@ def test_native_mixed_pipeline_has_complete_quorums_and_retirement(features, top
     monkeypatch.setattr(_Interpret, "native", metadata)
     result = compile(
         sparse_mla_decode.specialize(
-            B=1,
+            B=batch,
+            GROUPS=1,
             H=bm,
             BM=bm,
-            VR=8,
+            VR=vr,
             D=features,
             S=128 + topk,
             WINDOW=128,
@@ -127,8 +133,8 @@ def test_native_mixed_pipeline_has_complete_quorums_and_retirement(features, top
     trace = check_structured_events(
         collect_native_memory(result.plan),
         logical_reference=collect_native_memory(parse(result.before_ir)),
-        invocations=1 if topk > 512 else 2,
-        max_commands=40000 if topk > 512 else 10000,
+        invocations=1 if topk > 512 or batch > 1 else 2,
+        max_commands=40000 if topk > 512 or batch > 1 else 10000,
     )
     assert trace.bytes_read and trace.bytes_written and trace.consumptions
     if features == 512:

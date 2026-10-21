@@ -54,6 +54,8 @@ def policy_for(args):
     require(args.window == page, "CSA currently requires a 128-token window capacity")
     parts = getattr(args, "kv_parts", None) or 1
     require(parts == 1, "CSA baseline has one request owner")
+    selected = args.window + ((args.topk + bk - 1) // bk) * bk
+    require(selected <= 4096, "resident sparse softmax requires at most 4096 padded columns")
     return {
         "B": args.batch,
         "H": args.heads,
@@ -65,9 +67,9 @@ def policy_for(args):
         "CMP_BLOCKS": args.batch * (args.max_seq // page),
         "WINDOW": args.window,
         "TOPK": args.topk,
-        "S": args.window + ((args.topk + bk - 1) // bk) * bk,
+        "S": selected,
         "BM": bm,
-        "VR": 8,
+        "VR": 16 if selected <= 1024 else 8,
         "PARTS": parts,
         "BK": bk,
         "C": 128,
@@ -83,29 +85,24 @@ def sources_for(policy):
 def workspace_shapes(policy):
     groups = policy["B"] * (policy["H"] // policy["BM"])
     return {
-        "KV": (groups, 3, policy["BK"], policy["D"]),
-        "Bias": (groups, 3, policy["BK"]),
+        "KV": (groups, 3, policy["S"] - policy["WINDOW"], policy["D"]),
+        "Bias": (groups, 3, policy["S"] - policy["WINDOW"]),
         "O": (policy["B"], policy["H"], policy["D"]),
-        "Score": (groups, 2, policy["BM"], policy["BK"]),
-        "P": (groups, 2, policy["BM"], policy["BK"]),
+        "Score": (groups, 2, policy["BM"], policy["S"]),
+        "P": (groups, 2, policy["BM"], policy["S"]),
         "PV": (groups, 2, policy["BM"], policy["D"]),
     }
 
 
 def check_gathered(gathered, bias, expected_kv, expected_bias, policy, workers):
-    tiles = (policy["TOPK"] + policy["BK"] - 1) // policy["BK"]
     owners = policy["B"] * (policy["H"] // policy["BM"])
     require(0 < workers <= owners, "invalid artifact worker count")
     for group in range(workers):
         retained = {}
         for request, owner in enumerate(range(group, owners, workers)):
-            batch = owner // (policy["H"] // policy["BM"])
-            for tile in range(tiles):
-                slot = (request * (tiles + 1) + tile + 1) % 3
-                retained[slot] = batch, tile
-        for slot, (batch, tile) in retained.items():
-            start = policy["WINDOW"] + tile * policy["BK"]
-            selection = slice(start, start + policy["BK"])
+            retained[request % 3] = owner // (policy["H"] // policy["BM"])
+        for slot, batch in retained.items():
+            selection = slice(policy["WINDOW"], policy["S"])
             require(
                 np.array_equal(gathered[group, slot], expected_kv[batch, selection]),
                 "gathered KV differs",
