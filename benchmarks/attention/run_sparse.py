@@ -116,10 +116,12 @@ def check_gathered(gathered, bias, expected_kv, expected_bias, policy, workers):
             retained[request % 3] = owner // (policy["H"] // policy["BM"])
         for slot, batch in retained.items():
             selection = slice(policy["WINDOW"], policy["S"])
+            active = np.isfinite(expected_bias[batch, selection])
             require(
-                np.array_equal(gathered[group, slot], expected_kv[batch, selection]),
+                np.array_equal(gathered[group, slot, active], expected_kv[batch, selection][active]),
                 "gathered KV differs",
             )
+            require(np.isfinite(gathered[group, slot]).all(), "gathered KV must remain finite")
             require(
                 np.array_equal(bias[group, slot], expected_bias[batch, selection]),
                 "gathered mask differs",

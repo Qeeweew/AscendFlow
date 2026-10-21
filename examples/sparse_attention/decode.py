@@ -60,6 +60,7 @@ def qk_tile(
     Score,
     q1,
     k1,
+    resident,
     q0,
     b0,
     c0,
@@ -76,40 +77,86 @@ def qk_tile(
     WINDOW,
     MAX_SEQ,
     ORI_BLOCKS,
+    KEEP,
 ):
-    for n in N.serial(WIDTH // 128):
-        for chunk in N.Pipelined(D // C, issue_order=("qk_load", "qk_dot", "qk_operand")):
-            d = chunk * C
-            bank = chunk % 2
+    # Transfer one L1 panel for two consecutive 128-wide L0 operands.
+    LC = 2 * C if D % (2 * C) == 0 else C
+    for n in N.unroll(WIDTH // 128):
+        for panel in N.Pipelined(D // LC, issue_order=("qk_load", "qk_dot", "qk_operand")):
+            d = panel * LC
             with N.Stage(0, name="qk_load"):
-                load_cache(
-                    ori_kv=ori_kv,
-                    ori_block_table=ori_block_table,
-                    length=length,
-                    visible=visible,
-                    KV=KV,
-                    destination=k1[chunk % 2, :, 0:C],
-                    batch=batch,
-                    group=group,
-                    cache_slot=cache_slot,
-                    first=n * 128,
-                    feature=d,
-                    IS_WINDOW=IS_WINDOW,
-                    PAGE=PAGE,
-                    C=C,
-                    MAX_SEQ=MAX_SEQ,
-                    ORI_BLOCKS=ORI_BLOCKS,
-                )
+                if n + OFFSET // 128 < KEEP:
+                    load_cache(
+                        ori_kv=ori_kv,
+                        ori_block_table=ori_block_table,
+                        length=length,
+                        visible=visible,
+                        KV=KV,
+                        destination=resident[n + OFFSET // 128, :, d : d + LC],
+                        batch=batch,
+                        group=group,
+                        cache_slot=cache_slot,
+                        first=n * 128,
+                        feature=d,
+                        IS_WINDOW=IS_WINDOW,
+                        PAGE=PAGE,
+                        C=LC,
+                        MAX_SEQ=MAX_SEQ,
+                        ORI_BLOCKS=ORI_BLOCKS,
+                    )
+                else:
+                    load_cache(
+                        ori_kv=ori_kv,
+                        ori_block_table=ori_block_table,
+                        length=length,
+                        visible=visible,
+                        KV=KV,
+                        destination=k1[panel % 2, :, 0:LC],
+                        batch=batch,
+                        group=group,
+                        cache_slot=cache_slot,
+                        first=n * 128,
+                        feature=d,
+                        IS_WINDOW=IS_WINDOW,
+                        PAGE=PAGE,
+                        C=LC,
+                        MAX_SEQ=MAX_SEQ,
+                        ORI_BLOCKS=ORI_BLOCKS,
+                    )
             with N.Stage(1, name="qk_operand"):
-                N.copy(q1[:, d : d + C], q0[bank, :, :])
-                N.copy(k1[chunk % 2, :, 0:C], b0[bank, :, :], transpose=True)
+                for part in N.unroll(LC // C):
+                    bank = part if LC > C else panel % 2
+                    k = d + part * C
+                    N.copy(q1[:, k : k + C], q0[bank, :, :])
+                    if n + OFFSET // 128 < KEEP:
+                        N.copy(
+                            resident[n + OFFSET // 128, :, k : k + C],
+                            b0[bank, :, :],
+                            transpose=True,
+                        )
+                    else:
+                        N.copy(
+                            k1[panel % 2, :, part * C : (part + 1) * C],
+                            b0[bank, :, :],
+                            transpose=True,
+                        )
             with N.Stage(2, name="qk_dot"):
-                N.matmul(
-                    q0[bank, :, :],
-                    b0[bank, :, :],
-                    accum=c0[:, (n % 2) * 128 : (n % 2 + 1) * 128],
-                    initialize=chunk == 0,
-                )
+                for part in N.unroll(LC // C):
+                    bank = part if LC > C else panel % 2
+                    if part == 0:
+                        N.matmul(
+                            q0[bank, :, :],
+                            b0[bank, :, :],
+                            accum=c0[:, (n % 2) * 128 : (n % 2 + 1) * 128],
+                            initialize=panel == 0,
+                        )
+                    else:
+                        N.matmul(
+                            q0[bank, :, :],
+                            b0[bank, :, :],
+                            accum=c0[:, (n % 2) * 128 : (n % 2 + 1) * 128],
+                            initialize=False,
+                        )
         N.copy(
             c0[:, (n % 2) * 128 : (n % 2 + 1) * 128],
             Score[group, slot, :, OFFSET + n * 128 : OFFSET + (n + 1) * 128],
@@ -126,7 +173,9 @@ def pv_tile(
     P,
     PV,
     p1,
+    cached_p,
     v1,
+    resident,
     a0,
     b0,
     c0,
@@ -141,38 +190,57 @@ def pv_tile(
     WINDOW,
     MAX_SEQ,
     ORI_BLOCKS,
+    KEEP,
 ):
     NC = 2 if D % (2 * C) == 0 else 1
+    PC = N.min(D, S)
+    # Reuse Q storage after its last MTE1 reader; each cached P panel serves all columns.
+    N.copy(P[group, slot, :, 0:PC], cached_p[:, 0:PC])
     for column in N.serial(D // (NC * C)):
         d = column * (NC * C)
         for chunk in N.Pipelined(S // 128, issue_order=("pv_load", "pv_dot", "pv_operand")):
             j = chunk * 128
             bank = chunk % 2
             with N.Stage(0, name="pv_load"):
-                N.copy(P[group, slot, :, j : j + 128], p1[bank, :, :])
-                load_cache(
-                    ori_kv=ori_kv,
-                    ori_block_table=ori_block_table,
-                    length=length,
-                    visible=visible,
-                    KV=KV,
-                    destination=v1[bank, :, :],
-                    batch=batch,
-                    group=group,
-                    cache_slot=cache_slot,
-                    IS_WINDOW=chunk == 0,
-                    first=N.max(0, j - 128),
-                    feature=d,
-                    PAGE=PAGE,
-                    C=NC * C,
-                    MAX_SEQ=MAX_SEQ,
-                    ORI_BLOCKS=ORI_BLOCKS,
-                )
+                if chunk >= PC // 128:
+                    N.copy(P[group, slot, :, j : j + 128], p1[bank, :, :])
+                if KEEP > 0:
+                    if chunk >= KEEP:
+                        first = N.max(0, j - 128)
+                        N.copy(
+                            KV[group, cache_slot, first : first + 128, d : d + NC * C],
+                            v1[bank, :, :],
+                        )
+                else:
+                    load_cache(
+                        ori_kv=ori_kv,
+                        ori_block_table=ori_block_table,
+                        length=length,
+                        visible=visible,
+                        KV=KV,
+                        destination=v1[bank, :, :],
+                        batch=batch,
+                        group=group,
+                        cache_slot=cache_slot,
+                        IS_WINDOW=chunk == 0,
+                        first=N.max(0, j - 128),
+                        feature=d,
+                        PAGE=PAGE,
+                        C=NC * C,
+                        MAX_SEQ=MAX_SEQ,
+                        ORI_BLOCKS=ORI_BLOCKS,
+                    )
             with N.Stage(1, name="pv_operand"):
-                N.copy(p1[bank, :, :], a0[bank, :, :])
+                if chunk >= PC // 128:
+                    N.copy(p1[bank, :, :], a0[bank, :, :])
+                else:
+                    N.copy(cached_p[:, j : j + 128], a0[bank, :, :])
                 for c in N.unroll(NC):
                     b = bank if NC == 1 else c
-                    N.copy(v1[bank, :, c * C : (c + 1) * C], b0[b, :, :])
+                    if chunk < KEEP:
+                        N.copy(resident[chunk, :, d + c * C : d + (c + 1) * C], b0[b, :, :])
+                    else:
+                        N.copy(v1[bank, :, c * C : (c + 1) * C], b0[b, :, :])
             with N.Stage(2, name="pv_dot"):
                 for c in N.unroll(NC):
                     b = bank if NC == 1 else c
@@ -220,7 +288,7 @@ def sparse_mla_decode(
     CMP_BLOCKS: N.constexpr = 128,
     WINDOW: N.constexpr = 128,
     TOPK: N.constexpr = 512,
-    ROWS: N.constexpr = 16,
+    ROWS: N.constexpr = 32,
     S: N.constexpr = 640,
     BM: N.constexpr = 64,
     PARTS: N.constexpr = 1,
@@ -236,26 +304,39 @@ def sparse_mla_decode(
         assert H % BM == 0 and (BM == 32 or BM == 64), "complete head tiles"
         assert WINDOW == 128 and PAGE == 128 and BK == 512 and C == 128, "cache/tile geometry"
         assert D % C == 0 and S == WINDOW + N.ceildiv(TOPK, BK) * BK, "complete selected capacities"
-        assert PARTS == 1 and ROWS == 16 and GROUPS > 0, "sparse query policy"
+        assert PARTS == 1 and (ROWS == 16 or ROWS == 32) and GROUPS > 0, "sparse query policy"
         assert (VR == 4 or VR == 8 or VR == 16) and (BM // 2) % VR == 0, "softmax row groups"
         assert (RATIO == 1 or RATIO == 2) and MAX_SEQ % PAGE == 0, "complete C1/C2 pages"
-        WIDTH = N.ceildiv(S, 512) * 512
-        assert WIDTH <= 4096, "resident softmax capacity"
+        WIDTH = S - WINDOW
+        assert N.ceildiv(S, 512) * 512 <= 4096, "resident softmax capacity"
         assert SCALE > 0.0, "positive attention scale"
         UR = 8
         NC = 2 if D % (2 * C) == 0 else 1
+        BASE_L1 = 2 * (BM * D + 2 * 128 * NC * C + 2 * BM * 128)
+        KEEP = N.min(S // 128, N.min(2, (512 * 1024 - BASE_L1) // (128 * D * 2)))
         q1 = N.alloc_l1((BM, D), DTYPE)
         kv1 = N.alloc_l1((2, 128, NC * C), DTYPE)
+        if KEEP > 0:
+            resident = N.alloc_l1((KEEP, 128, D), DTYPE, name="resident_compressed")
+        else:
+            resident = kv1
         p1 = N.alloc_l1((2, BM, 128), DTYPE)
         a0 = N.alloc_l0a((2, BM, C), DTYPE)
         b0 = N.alloc_l0b((2, 128, C), DTYPE)
         c0 = N.alloc_l0c((BM, 2 * C), N.f32)
-        gather_zeros = N.alloc_ub((1, 8), N.f32)
-        gather_rows = N.alloc_ub((2, ROWS, D), DTYPE)
-        gather_masks = N.alloc_ub((2, ROWS), N.f32)
+        gather_zeros = N.alloc_ub((2, 8), N.f32)
+        GATHER_SLOTS = 2
+        gather_rows = N.alloc_ub((GATHER_SLOTS, ROWS, D), DTYPE)
+        gather_masks = N.alloc_ub((GATHER_SLOTS, ROWS), N.f32)
+        indices = N.alloc_ub((TOPK,), N.i32, name="cached_indices")
+        pages = N.alloc_ub((MAX_SEQ // PAGE,), N.i32, name="cached_pages")
         score = N.alloc_ub((VR, WIDTH), N.f32)
+        window_score = N.alloc_ub((VR, WINDOW), N.f32)
         bias = N.alloc_ub((WIDTH,), N.f32)
+        window_bias = N.alloc_ub((WINDOW,), N.f32)
         probabilities = N.alloc_ub((VR, WIDTH), DTYPE)
+        window_probabilities = N.alloc_ub((VR, WINDOW), DTYPE)
+        window_stat = N.alloc_ub((VR,), N.f32)
         sink = N.alloc_ub((VR,), N.f32)
         maximum = N.alloc_ub((VR,), N.f32)
         row_sum = N.alloc_ub((VR,), N.f32)
@@ -272,8 +353,14 @@ def sparse_mla_decode(
         with N.Cube():
             for bank in N.unroll(2):
                 N.fill(kv1[bank, :, :], 0.0)
+            if KEEP > 0:
+                for bank in N.unroll(KEEP):
+                    N.fill(resident[bank, :, :], 0.0)
         with N.Vector():
-            N.fill(gather_zeros, 0.0)
+            N.fill(gather_zeros[0, :], 0.0)
+            N.fill(gather_zeros[1, :], NEG_INF)
+            for bank in N.unroll(GATHER_SLOTS):
+                N.fill(gather_rows[bank, :, :], 0.0)
             N.fill(ones, 1.0)
         WORKERS = N.min(GROUPS, T * (H // BM))
         for query in N.Dataflow(
@@ -292,10 +379,12 @@ def sparse_mla_decode(
                 available = N.load_index(seqused_cmp_kv[batch : batch + 1])
                 residual = N.load_index(cmp_residual_kv[batch : batch + 1])
                 cutoff = N.max(0, available * RATIO + residual - qlen + offset + 1) // RATIO
+                N.copy(cmp_sparse_indices[token, 0, :], indices)
+                N.copy(cmp_block_table[batch, :], pages)
                 gather_compressed(
                     Cmp=cmp_kv,
-                    CmpTable=cmp_block_table,
-                    Indices=cmp_sparse_indices,
+                    CmpTable=pages,
+                    Indices=indices,
                     token=token,
                     available=available,
                     cutoff=cutoff,
@@ -311,6 +400,7 @@ def sparse_mla_decode(
                     sid=sid,
                     BK=S - WINDOW,
                     ROWS=ROWS,
+                    SLOTS=GATHER_SLOTS,
                     PAGE=PAGE,
                     RATIO=RATIO,
                     MAX_SEQ=MAX_SEQ,
@@ -334,6 +424,7 @@ def sparse_mla_decode(
                     Score=Score,
                     q1=q1,
                     k1=kv1,
+                    resident=resident,
                     q0=a0,
                     b0=b0,
                     c0=c0,
@@ -350,6 +441,7 @@ def sparse_mla_decode(
                     WINDOW=WINDOW,
                     MAX_SEQ=MAX_SEQ,
                     ORI_BLOCKS=ORI_BLOCKS,
+                    KEEP=KEEP,
                 )
                 qk_tile(
                     ori_kv=ori_kv,
@@ -360,6 +452,7 @@ def sparse_mla_decode(
                     Score=Score,
                     q1=q1,
                     k1=kv1,
+                    resident=resident,
                     q0=a0,
                     b0=b0,
                     c0=c0,
@@ -376,29 +469,44 @@ def sparse_mla_decode(
                     WINDOW=WINDOW,
                     MAX_SEQ=MAX_SEQ,
                     ORI_BLOCKS=ORI_BLOCKS,
+                    KEEP=KEEP,
                 )
             with N.Vector() as sid, N.Stage(1, name="softmax"):
                 batch, qlen, offset, length, visible = query_metadata(
                     cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, MAX_SEQ, WINDOW
                 )
-                # Acquire the complete Cube score before reading the mask
-                # published by both AIVs in that Cube input prefix.
-                N.fill(score, NEG_INF)
-                N.copy(Score[group, slot, sid * (BM // 2) : sid * (BM // 2) + VR, :], score[:, 0:S])
-                N.fill(bias, NEG_INF)
-                N.fill(bias[0:WINDOW], 0.0)
-                N.fill(bias[0:WINDOW], NEG_INF, mask=N.arange(WINDOW) >= visible)
-                N.copy(Bias[group, cache_slot, :], bias[WINDOW:S])
+                # Acquire the complete compressed score prefix before Bias;
+                # this includes both gather publishers, even for window-only inputs.
+                N.copy(Score[group, slot, sid * (BM // 2) : sid * (BM // 2) + VR, WINDOW:S], score)
+                N.copy(
+                    Score[group, slot, sid * (BM // 2) : sid * (BM // 2) + VR, 0:WINDOW],
+                    window_score,
+                )
+                N.fill(window_bias, 0.0)
+                N.fill(window_bias, NEG_INF, mask=N.arange(WINDOW) >= visible)
+                N.copy(Bias[group, cache_slot, :], bias)
                 for block in N.serial(BM // 2 // VR):
                     local = block * VR
                     r = sid * (BM // 2) + local
                     if block > 0:
-                        N.fill(score, NEG_INF)
-                        N.copy(Score[group, slot, r : r + VR, :], score[:, 0:S])
+                        N.copy(Score[group, slot, r : r + VR, WINDOW:S], score)
+                        N.copy(Score[group, slot, r : r + VR, 0:WINDOW], window_score)
                     N.copy(sinks[head + r : head + r + VR], sink)
                     N.mul(score, SCALE, out=score)
-                    for row in N.serial(VR):
-                        N.add(score[row, :], bias, out=score[row, :])
+                    N.mul(window_score, SCALE, out=window_score)
+                    if WIDTH <= 1024:
+                        N.add(score, bias[None, :], out=score)
+                    else:
+                        for row in N.serial(VR):
+                            N.add(score[row, :], bias, out=score[row, :])
+                    N.add(window_score, window_bias[None, :], out=window_score)
+                    N.reduce_max(
+                        window_score,
+                        axis=1,
+                        out=window_stat,
+                        scratch=partial[0 : VR * (WINDOW // 8)],
+                        order="block8_then_packed_merge",
+                    )
                     N.reduce_max(
                         score,
                         axis=1,
@@ -406,9 +514,11 @@ def sparse_mla_decode(
                         scratch=partial,
                         order="block8_then_packed_merge",
                     )
+                    N.maximum(maximum, window_stat, out=maximum)
                     N.maximum(maximum, sink, out=maximum)
                     N.sub(sink, maximum, out=sink)
                     N.exp(sink, out=sink)
+                    N.sub(window_score, maximum[:, None], out=window_score, scratch=broadcast)
                     if WIDTH <= 1024:
                         N.sub(score, maximum[:, None], out=score, scratch=broadcast)
                     else:
@@ -425,7 +535,16 @@ def sparse_mla_decode(
                                     softmax_work[row, :], score[row, part * 512 : (part + 1) * 512]
                                 )
                     N.exp(score, out=score)
+                    N.exp(window_score, out=window_score)
                     N.cast(score, out=probabilities)
+                    N.cast(window_score, out=window_probabilities)
+                    N.reduce_sum(
+                        window_score,
+                        axis=1,
+                        out=window_stat,
+                        scratch=partial[0 : VR * (WINDOW // 8)],
+                        order="block8_then_packed_merge",
+                    )
                     N.reduce_sum(
                         score,
                         axis=1,
@@ -433,13 +552,20 @@ def sparse_mla_decode(
                         scratch=partial,
                         order="block8_then_packed_merge",
                     )
+                    N.add(row_sum, window_stat, out=row_sum)
                     N.add(row_sum, sink, out=row_sum)
                     N.copy(row_sum, final_l[slot, local : local + VR])
-                    N.copy(probabilities[:, 0:S], P[group, slot, r : r + VR, :])
+                    N.copy(window_probabilities, P[group, slot, r : r + VR, 0:WINDOW])
+                    N.copy(probabilities, P[group, slot, r : r + VR, WINDOW:S])
             with N.Cube(), N.Stage(1, name="pv"):
-                batch, qlen, offset, length, visible = query_metadata(
-                    cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, MAX_SEQ, WINDOW
-                )
+                if KEEP == 0:
+                    batch, qlen, offset, length, visible = query_metadata(
+                        cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, MAX_SEQ, WINDOW
+                    )
+                else:
+                    batch = 0
+                    length = 0
+                    visible = 0
                 pv_tile(
                     ori_kv=ori_kv,
                     ori_block_table=ori_block_table,
@@ -449,7 +575,9 @@ def sparse_mla_decode(
                     P=P,
                     PV=PV,
                     p1=p1,
+                    cached_p=q1,
                     v1=kv1,
+                    resident=resident,
                     a0=a0,
                     b0=b0,
                     c0=c0,
@@ -464,6 +592,7 @@ def sparse_mla_decode(
                     WINDOW=WINDOW,
                     MAX_SEQ=MAX_SEQ,
                     ORI_BLOCKS=ORI_BLOCKS,
+                    KEEP=KEEP,
                 )
             with N.Vector() as sid, N.Stage(2, name="finish"):
                 for block in N.serial(BM // 2 // UR):

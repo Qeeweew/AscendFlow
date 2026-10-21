@@ -80,6 +80,7 @@ def gather_compressed(
     sid,
     BK,
     ROWS,
+    SLOTS,
     PAGE,
     RATIO,
     MAX_SEQ,
@@ -88,25 +89,27 @@ def gather_compressed(
 ):
     count = N.min(TOPK, N.min(available, cutoff))
     zero = N.load_scalar(zeros[0, 0:1])
-    for block in N.Pipelined(BK // 2 // ROWS):
-        bank = block % 2
+    masked = N.load_scalar(zeros[1, 0:1])
+    # With one slot, publish the previous block before reusing its storage.
+    ORDER = ("sparse_publish", "sparse_load") if SLOTS == 1 else ("sparse_load", "sparse_publish")
+    for block in N.Pipelined(BK // 2 // ROWS, issue_order=ORDER):
+        bank = block % SLOTS
         start = sid * (BK // 2) + block * ROWS
         with N.Stage(0, name="sparse_load"):
-            N.fill(rows[bank, :, :], 0.0)
-            N.fill(masks[bank, :], NEG_INF)
             for row in N.serial(ROWS):
                 index_slot = tile * BK + start + row
                 if index_slot < count:
-                    index = N.load_index(Indices[token, 0, index_slot : index_slot + 1])
-                    if index >= 0:  # noqa: SIM102 - each guard retains its address premises.
-                        if index < cutoff:
-                            page = N.load_index(
-                                CmpTable[
-                                    batch, index // (PAGE // RATIO) : index // (PAGE // RATIO) + 1
-                                ]
-                            )
-                            N.copy(Cmp[page, index % (PAGE // RATIO), 0, :], rows[bank, row, :])
-                            N.store_scalar(zero, out=masks[bank, row : row + 1])
+                    index = N.load_index(Indices[index_slot : index_slot + 1])
+                    if index >= 0 and index < cutoff:
+                        page = N.load_index(
+                            CmpTable[index // (PAGE // RATIO) : index // (PAGE // RATIO) + 1]
+                        )
+                        N.copy(Cmp[page, index % (PAGE // RATIO), 0, :], rows[bank, row, :])
+                        N.store_scalar(zero, out=masks[bank, row : row + 1])
+                    else:
+                        N.store_scalar(masked, out=masks[bank, row : row + 1])
+                else:
+                    N.store_scalar(masked, out=masks[bank, row : row + 1])
         with N.Stage(1, name="sparse_publish"):
             # Masks and rows are in the same MTE3 publication prefix.
             N.copy(masks[bank, :], Bias[group, slot, start : start + ROWS])

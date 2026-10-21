@@ -75,28 +75,46 @@ B、T、H、容量及页大小是 constexpr，同一二进制复用不同请求�
 它不再分别计算 window/压缩 tile 的 PV 后维护在线 numerator、alpha 和 max carry。
 两个 AIV 共用代码，按 runtime SID 处理各自一半 head；每个 head 仍只计一次 sink。
 
-令 `CP=ceil(TOPK/512)*512`、`S=WINDOW+CP`、`W=ceil(S/512)*512`。
-压缩 gather 使用双槽 16 行 UB，逐行读取索引和页表；无效槽清零并产生 −∞ Bias，
-合法槽 Bias 为 0。重复索引仍逐次参与。窗口继续从分页 GM 直接进入 L1。
-L1 KV 池在 kernel 入口用两条 `N.fill(...,0)` 初始化，此后仅覆盖真实页片段，
+令 `CP=ceil(TOPK/512)*512`、`S=WINDOW+CP`。窗口和压缩 Score 使用各自
+连续的 `VR×WINDOW`、`VR×CP` UB 矩阵，不再将拼接的 S 列扩展到 512 的倍数。
+压缩 gather 默认使用双槽 32 行 UB，索引及请求的压缩页表先批量载入私有 UB，
+再由 Scalar 逐行读取；有效槽 Bias 为 0，无效槽 Bias 为 −∞。
+行缓冲仅在 kernel 入口清零，无效槽随后保留有限的旧值，并由 Bias 排除权重。
+双槽保留旧块发布与新块预取的重叠，复用仍等待旧 MTE3 读取退休。
+`ROWS=16` 政策也使用同一条双槽流水；具体组合仍检查真实 UB 容量。
+重复索引仍逐次参与。窗口继续从分页 GM 直接进入 L1。
+L1 流式槽及常驻 KV 块在 kernel 入口用 `N.fill(...,0)` 初始化，此后仅覆盖真实页片段，
 不为每个跨页窗口重新清零。未覆盖行保留已定义的旧值，但不会获得 softmax 权重；
 初始化和全部部分写仍经过同一 effects、ownership 和同步检查。算法不要求索引排序。
 
 QK 先计算 window 的 Score `[0,WINDOW)`，与两个 AIV 的压缩 gather 重叠，
-随后计算压缩 Score `[WINDOW,S)`。最后一个压缩 FIX 的完成前缀经过全部压缩
+随后计算压缩 Score `[WINDOW,S)`。D 可被 256 整除时，每个 L1 panel 一次
+搬运 256 维，供按原顺序执行的两次 128 维 L0 MAD 使用；其余完整 128 维
+特征块使用 128 维搬运。L0 容量、MAD 数量和 K 维累加次序不变。
+最后一个压缩 FIX 的完成前缀经过全部压缩
 QK 输入，包含双方 AIV 的 gather 发布。softmax **先获取完整 Score，再读取 Bias**；
 仅获取提前完成的 window Score 不提供这条交接。普通 AIV peer GM 访问没有直接
 交接协议；不能把 Bias DMA 提到完整 Score acquire 前。
 
-AIV 将 S 列 Score 读入 W 列 UB，额外列填 −∞，仅在 UB 内参与归约；这些列
-不增加 KV 读取、MAD 或 GM 的 Score/P 容量。默认每组处理 16 行 softmax。
-Bias 直接按行加到 Score，不物化完整 Bias 矩阵。先计算包含 sink 的 FP32 最大值，
-再计算概率、FP32 分母和 b16 P。分母保存为每 token/head tile 的双槽私有 UB 快照。
+AIV 先获取压缩 Score 的完整发布前缀，再读取窗口 Score 和 Bias。默认每组处理
+16 行 softmax。两份 Score 分别加 Bias、求行最大值，再与同一个 sink 合并为
+共同最大值；两份概率均减去该值后计算，两个 FP32 行和相加，sink 只计一次分母。
+两份 b16 P 分别写回原 GM 矩阵的窗口列和压缩列，后续 PV 顺序不变。
+这不恢复在线 max/numerator 递推，也不分别归一化两个集合。Bias 使用普通
+向量广播或逐行加法，不物化完整 Bias 矩阵。分母保存为每 token/head tile 的
+双槽私有 UB 快照。
 
 Cube 的 PV 从 window 开始，随后按原压缩顺序累加全部行，FP32 L0C 只在首次
 MAD 清零。D 可被 256 整除时，一次 128×256 L1 搬运供两个相邻 128 列输出，
 共用 P 装载，再一次 FIX 写出 256 列。finish 每次处理 8 行，只做 FP32 分母
 归一化、转换与最终写出。QK/PV 共用双槽 L1 KV 池、L0A/B 和按输出列切分的 L0C。
+PV 将前 `min(D,S)` 列 P 存入已经完成 QK 读取的 Q L1 allocation，供所有输出列块
+复用；其余 P 继续按 128 列流入双槽。默认 D=512、S=640 时，P 的 GM→L1 搬运
+从十次 128 列变为一次 512 列和两次 128 列；没有增加 L1 分配，Q/P 的存储复用
+经过普通 MTE1 最后读取与 MTE2 覆写依赖，不能只凭源码阶段退出认定已经退休。
+容量允许时，窗口及最前面的压缩块按 128 行、完整 D 维保留在 L1，最多两块，
+由 PV 复用；其余压缩块继续从 gather workspace 载入。常驻块也保留原来的
+MTE1 最后读取与跨 query 覆盖约束，不按存储中已有数据推断异步完成。
 L1 的真正最后 reader 是 MTE1，源码不指定事件 ID 或全核 barrier。
 
 每个 worker 持续处理自己拥有的 token/head tile，默认至多 20 个 mixed group。
@@ -123,24 +141,27 @@ KV/Bias 使用 `query%3`，Score/P/PV 和分母快照使用 `query%2`，不能�
 QK/PV 使用 b16 输入和 FP32 累加。P 在 PV 前显式舍入成输入 dtype；分母使用
 未舍入的 FP32 概率，最终输出仍是输入 dtype。统一最大值后舍入 P，与原先
 分 tile 舍入再重缩放的实现不位等价。设备 runner 按独立 FP64 公式使用既定
-`atol=0.005, rtol=0.02` 检查；这不是任意输入的误差上界或 upstream 位精确资格。
+`atol=0.005, rtol=0.02` 检查；窗口和压缩分别求 FP32 行和、再相加也遵守这份
+误差合同，不承诺与原拼接归约树位等价。这不是任意输入的误差上界或 upstream 位精确资格。
 最大值、分母、矩阵累加和最终归一化保持 FP32。Sinks、Q/KV 及实际 FP32 运算仍须满足有限性
 与不溢出合同，SCALE 必须为正。
 
 默认政策为 B=4、T=16、H=64、D=512、WINDOW=128、TOPK=512、S=640、
-BM=64、VR=16、BK=512、C=128、PAGE=128、MAX_SEQ=4096。UB 内 W=1024；
-更宽的 Score 使用 8 行组和显式 512 列 UB 工作块处理行广播。当前 W 至多 4096，
+BM=64、VR=16、ROWS=32、BK=512、C=128、PAGE=128、MAX_SEQ=4096。默认
+UB 内为窗口 128 列及压缩 512 列；更宽的压缩 Score 使用 8 行组和显式 512 列
+UB 工作块处理行广播。当前仍要求 `ceil(S/512)*512 <= 4096`，
 且所有具体组合仍需通过 192KB UB、L1/L0 和有限事件资源检查；不是所有 D/TOPK
 组合均能 resident，不自动切换到另一编译路径。
 
 与官方 CSA 保持相同的选中行、分页和共享 KV 语义，计算组织改为每 query 联合
 softmax。官方 gather 还在合法时用双行 runtime-stride DMA 并压紧有效行；这里
-仍逐行搬运并保留无效槽，不声称逐指令复刻。满有效块仍执行 b16 清零。
+仍逐行搬运并保留无效槽，不声称逐指令复刻；满有效块不再重复清零行缓冲。
 
 算法分块、slot、任务顺序、QK/PV 复用和快照都在 example DSL 中表达。runtime
 NZ 前缀覆盖、真实 pitched effects、初始化、ownership 和有限事件分配继续使用
 同一编译路径。通用标量分支结果范围和 L1 清零原语不改变 event sharing 政策。官方动态 stride、
-有效行压紧和 UB metadata Scalar cache 仍未开放，不以扩大硬件容量、全局 barrier
+有效行压紧仍未开放；UB 整数元数据读取使用普通初始化、Tile 来源及 Scalar
+代次捕获合同，不以扩大硬件容量、全局 barrier
 或静默 fallback 绕过拒绝。
 
 ## 运行与边界

@@ -48,13 +48,31 @@ def bind_metadata(monkeypatch, data):
     from tests.models.structured_events import _Interpret
 
     original = _Interpret.native
+    contents = {}
 
     def metadata(self, operation, values, invocation, group, actor, coordinates):
         original(self, operation, values, invocation, group, actor, coordinates)
+        if operation.native.data in {"copy", "copy_bytes"}:
+            source, offset, _ = values[operation.refs[0]]
+            target, destination, size = values[operation.refs[1]]
+            if source.sym_name.data in data and target.ref.type.bank.data == "UB":
+                key = (self, invocation, group, actor, target)
+                width = self.templates[operation].accesses[0].address.geometry.total_nbytes
+                raw = data[source.sym_name.data].tobytes()
+                contents.setdefault(key, bytearray(size))[destination : destination + width] = raw[
+                    offset : offset + width
+                ]
         if operation.native.data == "index_load":
             root, offset, _ = values[operation.refs[0]]
-            array = data[root.sym_name.data]
-            values[operation.value] = int(array.reshape(-1)[offset // array.itemsize])
+            if root.ref.type.bank.data == "UB":
+                key = (self, invocation, group, actor, root)
+                width = self.templates[operation].accesses[0].address.geometry.nbytes
+                values[operation.value] = int.from_bytes(
+                    contents[key][offset : offset + width], "little", signed=True
+                )
+            else:
+                array = data[root.sym_name.data]
+                values[operation.value] = int(array.reshape(-1)[offset // array.itemsize])
 
     monkeypatch.setattr(_Interpret, "native", metadata)
 
@@ -116,20 +134,29 @@ def test_new_softmax_cannot_overwrite_previous_token_denominator():
         compile(specialize(replace(sparse_mla_decode, source=source)), timeout_s=300)
 
 
-def test_two_cache_slots_do_not_retire_the_other_aiv_mask_reader(monkeypatch):
+@pytest.mark.parametrize("gather_first", (False, True))
+def test_two_cache_slots_require_prior_score_acquire_before_gather(monkeypatch, gather_first):
     source = sparse_mla_decode.source.replace("3, S - WINDOW", "2, S - WINDOW").replace(
         "cache_slot = query % 3", "cache_slot = query % 2"
     )
+    if not gather_first:
+        source = source.replace(
+            '"vector": ("gather", "softmax", "finish")',
+            '"vector": ("softmax", "gather", "finish")',
+        )
     result = compile(specialize(replace(sparse_mla_decode, source=source)), timeout_s=300)
     bind_metadata(monkeypatch, metadata_inputs())
-    with pytest.raises(EventModelError, match="unordered physical WAR: Bias"):
+    if gather_first:
+        with pytest.raises(EventModelError, match="unordered physical WAR: Bias"):
+            check_trace(result)
+    else:
         check_trace(result)
 
 
 def test_mask_read_before_cube_score_acquire_has_no_peer_publication(monkeypatch):
     source = sparse_mla_decode.source
-    start = source.index("                # Acquire the complete Cube score")
-    middle = source.index("                N.fill(bias, NEG_INF)", start)
+    start = source.index("                # Acquire the complete compressed score")
+    middle = source.index("                N.fill(window_bias, 0.0)", start)
     end = source.index("                for block in N.serial", middle)
     source = source[:start] + source[middle:end] + source[start:middle] + source[end:]
     result = compile(specialize(replace(sparse_mla_decode, source=source)), timeout_s=300)
