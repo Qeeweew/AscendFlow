@@ -137,7 +137,7 @@ def copy_compatible(source, destination, *, transpose=False, zero_pad=False):
             not transpose
             and route == ("GM", "L1")
             and source.dtype == destination.dtype
-            and source.dtype.data in {"f16", "bf16"}
+            and source.dtype.data in {"f16", "bf16", "f32"}
             and len(shape) == len(target) == 2
             and all(0 < a <= b and b % 16 == 0 for a, b in zip(shape, target, strict=True))
         )

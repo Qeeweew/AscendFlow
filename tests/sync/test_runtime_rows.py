@@ -8,14 +8,16 @@ from ascendflow import language as N
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.diagnostics import CompileError
 from ascendflow.passes.structured_sync import synchronize_structure
-from tests.fixtures.runtime_rows import matrix_import, row_output
+from tests.fixtures.runtime_rows import fp32_padding, matrix_import, row_output
 from tests.models.structured_events import EventModelError, check_compiled_events
 from tests.support.structured import native_memory
 
 
-@pytest.fixture(scope="module", params=[matrix_import, row_output])
+@pytest.fixture(scope="module", params=["f16", "f32", "output"])
 def rows(request):
-    return synchronize_structure(request.param())
+    return synchronize_structure(
+        row_output() if request.param == "output" else matrix_import(request.param)
+    )
 
 
 @pytest.mark.parametrize("count", (0, 1, 3, 4, 7, 15, 16, 17))
@@ -24,8 +26,45 @@ def test_bounded_rows_keep_exact_bytes_for_empty_partial_and_full_transfers(rows
     for command in checked.natives:
         for span in command.spans:
             if span.root.sym_name.data in {"A", "O"} and span.root.extent_count is not None:
-                stride = 32 if span.root.sym_name.data == "A" else 64
+                stride = 16 * (2 if span.root.ref.type.dtype.data == "f16" else 4)
                 assert 0 <= span.start < span.end <= count * stride
+        if command.occurrence.operation.native.data == "nd2nz_rows":
+            itemsize = 2 if command.spans[0].root.ref.type.dtype.data == "f16" else 4
+            reads = [s for s in command.spans if s.root.sym_name.data == "A"]
+            writes = [s for s in command.spans if s.root.ref.type.bank.data == "L1"]
+            assert sum(s.end - s.start for s in reads) == min(count, 16) * 16 * itemsize
+            assert sum(s.end - s.start for s in writes) == 16 * 16 * itemsize
+
+
+@pytest.mark.parametrize("runtime", [False, True])
+@pytest.mark.parametrize("pitch", [19, 65536])
+def test_fp32_padding_defines_all_nz_bytes_but_only_reads_real_gm_rows(runtime, pitch):
+    from ascendflow import compile
+    from ascendflow.dialects.io import parse
+    from tests.models.structured_events import check_structured_events
+
+    result = compile(fp32_padding(runtime=runtime, pitch=pitch))
+    before = collect_native_memory(parse(result.before_ir))
+    after = collect_native_memory(result.plan)
+    for n in (0, 1, 3, 4):
+        execution = check_structured_events(
+            after, {"n": n}, logical_reference=before, invocations=2
+        )
+        for command in execution.natives:
+            if command.occurrence.operation.native.data not in {"nd2nz_pad", "nd2nz_rows"}:
+                continue
+            actual_rows = min(n, 3) if runtime else 3
+            reads = [s for s in command.spans if s.root.sym_name.data == "A"]
+            writes = [s for s in command.spans if s.root.ref.type.bank.data == "L1"]
+            assert [(s.start, s.end) for s in reads] == [
+                (row * pitch * 4, row * pitch * 4 + 5 * 4) for row in range(actual_rows)
+            ]
+            assert [(s.start, s.end) for s in writes] == [(0, 16 * 16 * 4)]
+    assert "asc_fill_l1" in result.asc and "asc_sync_pipe(PIPE_MTE2)" in result.asc
+    if pitch > 65535:
+        assert f"npu_row * {pitch * 4}" in result.asc
+    else:
+        assert f", {pitch}, 16, 1, 0);" in result.asc
 
 
 def test_dynamic_row_capacity_is_an_input_contract_checked_by_the_independent_model():

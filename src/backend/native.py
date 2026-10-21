@@ -382,11 +382,12 @@ def native_line(task, *, pointer_renderer, generation):
         maximum, cols, _, resident_cols = task.spec.params
         resident_rows = refs[1].leading_rows
         rows = task.operands[0]
+        itemsize = ITEMSIZE[refs[0].dtype]
         copy = (
             f"asc_copy_gm2l1_nd2nz({p[1]}, {p[0]}, 1, uint16_t({rows}), {cols}, 0, "
-            f"{refs[0].row_stride // 2}, {resident_rows}, 1, 0);"
+            f"{refs[0].row_stride // itemsize}, {resident_rows}, 1, 0);"
         )
-        if refs[0].row_stride // 2 > 65535:
+        if refs[0].row_stride // itemsize > 65535:
             source = ptr(0, extra=f"npu_row * {refs[0].row_stride}")
             destination = ptr(1, extra="npu_row * 32")
             copy = (

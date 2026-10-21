@@ -838,20 +838,21 @@ def native_contract(
     if native == "nd2nz_rows":
         require(len(params) == 4, "runtime ND2NZ needs capacity and resident dimensions")
         m, n, pm, pn = params
+        itemsize = ITEMSIZE[dtypes[0]] if dtypes else 0
         require(
             1 <= m <= pm <= 256
             and 1 <= n <= pn <= 256
             and pm % 16 == pn % 16 == 0
             and banks == ("GM", "L1")
             and layouts == ("linear", "NZ")
-            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and dtypes[0] == dtypes[1] in {"f16", "bf16", "f32"}
             and refs[0].rows == m
-            and refs[0].nbytes == n * 2
-            and refs[0].row_stride % 2 == 0
-            and refs[0].row_stride >= n * 2
+            and refs[0].nbytes == n * itemsize
+            and refs[0].row_stride % itemsize == 0
+            and refs[0].row_stride >= n * itemsize
             and refs[1].contiguous
             and (refs[1].matrix_shape is None or refs[1].leading_rows == pm)
-            and lengths == (m * n * 2, pm * pn * 2),
+            and lengths == (m * n * itemsize, pm * pn * itemsize),
             "runtime ND2NZ requires bounded GM rows and a fully zero-defined NZ destination",
         )
         return "MTE2", ("R", "W")
@@ -884,21 +885,22 @@ def native_contract(
     if native == "nd2nz_pad":
         require(len(params) == 4, "padded ND2NZ requires valid and resident dimensions")
         m, n, pm, pn = params
+        itemsize = ITEMSIZE[dtypes[0]] if dtypes else 0
         require(
             1 <= m <= pm <= 256
             and 1 <= n <= pn <= 256
             and pm % 16 == pn % 16 == 0
             and banks == ("GM", "L1")
-            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and dtypes[0] == dtypes[1] in {"f16", "bf16", "f32"}
             and layouts == ("linear", "NZ")
-            and refs[0].nbytes == n * 2
+            and refs[0].nbytes == n * itemsize
             and refs[0].rows == m
-            and refs[0].row_stride % 2 == 0
-            and n <= refs[0].row_stride // 2
+            and refs[0].row_stride % itemsize == 0
+            and n <= refs[0].row_stride // itemsize
             and refs[1].contiguous
             and (refs[1].matrix_shape is None or refs[1].leading_rows == pm)
-            and lengths == (m * n * 2, pm * pn * 2),
-            "padded ND2NZ needs exact GM rows and a complete b16 NZ destination",
+            and lengths == (m * n * itemsize, pm * pn * itemsize),
+            "padded ND2NZ needs exact GM rows and a complete NZ destination",
         )
         return "MTE2", ("R", "W")
     if native in {"nd2nz", "load2d_a", "load2d_a_t", "load2d_b_nt", "load2d_b_nn"}:

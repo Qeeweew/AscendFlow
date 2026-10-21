@@ -3,7 +3,7 @@
 from ascendflow import language as N
 
 
-def matrix_import():
+def matrix_import(dtype="f16"):
     return N.from_source(
         """
 def rows_import(A:N.Tensor((n,16),N.f16), B:N.Tensor((16,16),N.f16),
@@ -20,7 +20,7 @@ def rows_import(A:N.Tensor((n,16),N.f16), B:N.Tensor((16,16),N.f16),
         bb=N.copy(b1,b0)
         N.matmul(aa,bb,accum=c0,initialize=True)
         N.copy(c0,O)
-""",
+""".replace("N.f16", f"N.{dtype}"),
         disjoint_external=True,
     )
 
@@ -36,6 +36,18 @@ def rows_output(O:N.Tensor((n,16),N.f32,access="write",write_disjoint=True),n:N.
 """,
         disjoint_external=True,
     )
+
+
+def fp32_padding(*, runtime=False, pitch=19):
+    prefix = ",valid_rows=N.min(n,3)" if runtime else ""
+    return N.from_source(f"""
+def fp32_padding(A:N.Tensor((3,{pitch}),N.f32),n:N.int64):
+    with N.Kernel(kind="cube"):
+        x=N.alloc_l1((16,16),N.f32)
+        y=N.alloc_l0a((16,16),N.f32)
+        N.copy(A[:,:5],x,pad_value=0{prefix})
+        N.copy(x,y)
+""")
 
 
 def matrix_overlay():
