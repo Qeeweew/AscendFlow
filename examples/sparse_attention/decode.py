@@ -1,4 +1,4 @@
-"""Sparse decode with one softmax over the window and selected compressed KV.
+"""TND sparse decode, including multiple verification tokens per request.
 
 Sparse rows are gathered once for all heads; window pages go directly to L1.
 QK and PV keep explicit L1/L0 rings, with one persistent query pipeline.
@@ -7,7 +7,7 @@ QK and PV keep explicit L1/L0 rings, with one persistent query pipeline.
 from __future__ import annotations
 
 from ascendflow import language as N
-from examples.sparse_attention.gather import copy_window_pages, gather_compressed
+from examples.sparse_attention.gather import copy_window_pages, gather_compressed, query_metadata
 
 # ruff: noqa: F821 - captured constexpr annotation names.
 NEG_INF = float("-inf")
@@ -15,8 +15,8 @@ NEG_INF = float("-inf")
 
 @N.inline
 def load_cache(
-    Ori,
-    OriTable,
+    ori_kv,
+    ori_block_table,
     length,
     visible,
     KV,
@@ -34,8 +34,8 @@ def load_cache(
 ):
     if IS_WINDOW:
         copy_window_pages(
-            Ori,
-            OriTable,
+            ori_kv,
+            ori_block_table,
             destination,
             batch=batch,
             length=length,
@@ -52,10 +52,10 @@ def load_cache(
 
 @N.inline
 def qk_tile(
-    Ori,
-    OriTable,
-    Lengths,
-    WindowLengths,
+    ori_kv,
+    ori_block_table,
+    length,
+    visible,
     KV,
     Score,
     q1,
@@ -77,18 +77,14 @@ def qk_tile(
     MAX_SEQ,
     ORI_BLOCKS,
 ):
-    length = N.load_index(Lengths[batch : batch + 1], minimum=0, maximum=MAX_SEQ)
-    visible = N.load_index(
-        WindowLengths[batch : batch + 1], minimum=0, maximum=N.min(WINDOW, length)
-    )
     for n in N.serial(WIDTH // 128):
         for chunk in N.Pipelined(D // C, issue_order=("qk_load", "qk_dot", "qk_operand")):
             d = chunk * C
             bank = chunk % 2
             with N.Stage(0, name="qk_load"):
                 load_cache(
-                    Ori=Ori,
-                    OriTable=OriTable,
+                    ori_kv=ori_kv,
+                    ori_block_table=ori_block_table,
                     length=length,
                     visible=visible,
                     KV=KV,
@@ -122,10 +118,10 @@ def qk_tile(
 
 @N.inline
 def pv_tile(
-    Ori,
-    OriTable,
-    Lengths,
-    WindowLengths,
+    ori_kv,
+    ori_block_table,
+    length,
+    visible,
     KV,
     P,
     PV,
@@ -146,10 +142,6 @@ def pv_tile(
     MAX_SEQ,
     ORI_BLOCKS,
 ):
-    length = N.load_index(Lengths[batch : batch + 1], minimum=0, maximum=MAX_SEQ)
-    visible = N.load_index(
-        WindowLengths[batch : batch + 1], minimum=0, maximum=N.min(WINDOW, length)
-    )
     NC = 2 if D % (2 * C) == 0 else 1
     for column in N.serial(D // (NC * C)):
         d = column * (NC * C)
@@ -159,8 +151,8 @@ def pv_tile(
             with N.Stage(0, name="pv_load"):
                 N.copy(P[group, slot, :, j : j + 128], p1[bank, :, :])
                 load_cache(
-                    Ori=Ori,
-                    OriTable=OriTable,
+                    ori_kv=ori_kv,
+                    ori_block_table=ori_block_table,
                     length=length,
                     visible=visible,
                     KV=KV,
@@ -199,23 +191,26 @@ def pv_tile(
 
 @N.prim_func(disjoint_external=True)
 def sparse_mla_decode(
-    Q: N.Tensor((B, H, D), DTYPE),
-    Ori: N.Tensor((ORI_BLOCKS, PAGE, D), DTYPE),
-    Cmp: N.Tensor((CMP_BLOCKS, PAGE // RATIO, D), DTYPE),
-    OriTable: N.Tensor((B, MAX_SEQ // PAGE), N.i32),
-    CmpTable: N.Tensor((B, MAX_SEQ // PAGE), N.i32),
-    Lengths: N.Tensor((B,), N.i32),
-    WindowLengths: N.Tensor((B,), N.i32),
-    Counts: N.Tensor((B,), N.i32),
-    Indices: N.Tensor((B, TOPK), N.i32),
-    Sinks: N.Tensor((H,), N.f32),
-    O: N.Tensor((B, H, D), DTYPE, access="write", write_disjoint=True),
-    KV: N.Tensor((B * (H // BM), 3, S - WINDOW, D), DTYPE, access="write"),
-    Bias: N.Tensor((B * (H // BM), 3, S - WINDOW), N.f32, access="write"),
-    Score: N.Tensor((B * (H // BM), 2, BM, S), N.f32, access="write"),
-    P: N.Tensor((B * (H // BM), 2, BM, S), DTYPE, access="write"),
-    PV: N.Tensor((B * (H // BM), 2, BM, D), N.f32, access="write"),
+    q: N.Tensor((T, H, D), DTYPE),
+    ori_kv: N.Tensor((ORI_BLOCKS, PAGE, 1, D), DTYPE),
+    cmp_kv: N.Tensor((CMP_BLOCKS, PAGE // RATIO, 1, D), DTYPE),
+    cmp_sparse_indices: N.Tensor((T, 1, TOPK), N.i32),
+    ori_block_table: N.Tensor((B, MAX_SEQ // PAGE), N.i32),
+    cmp_block_table: N.Tensor((B, MAX_SEQ // PAGE), N.i32),
+    cu_seqlens_q: N.Tensor((B + 1,), N.i32),
+    seqused_ori_kv: N.Tensor((B,), N.i32),
+    seqused_cmp_kv: N.Tensor((B,), N.i32),
+    cmp_residual_kv: N.Tensor((B,), N.i32),
+    ori_topk_length: N.Tensor((T, 1), N.i32),
+    sinks: N.Tensor((H,), N.f32),
+    attention_out: N.Tensor((T, H, D), DTYPE, access="write", write_disjoint=True),
+    KV: N.Tensor((N.min(GROUPS, T * (H // BM)), 3, S - WINDOW, D), DTYPE, access="write"),
+    Bias: N.Tensor((N.min(GROUPS, T * (H // BM)), 3, S - WINDOW), N.f32, access="write"),
+    Score: N.Tensor((N.min(GROUPS, T * (H // BM)), 2, BM, S), N.f32, access="write"),
+    P: N.Tensor((N.min(GROUPS, T * (H // BM)), 2, BM, S), DTYPE, access="write"),
+    PV: N.Tensor((N.min(GROUPS, T * (H // BM)), 2, BM, D), N.f32, access="write"),
     B: N.constexpr = 4,
+    T: N.constexpr = 16,
     H: N.constexpr = 64,
     D: N.constexpr = 512,
     PAGE: N.constexpr = 128,
@@ -236,7 +231,8 @@ def sparse_mla_decode(
     DTYPE: N.constexpr = N.bf16,
     SCALE: N.constexpr = 0.04419417382415922,
 ):
-    with N.Kernel(N.min(GROUPS, B * (H // BM)), kind="mixed") as group:
+    with N.Kernel(N.min(GROUPS, T * (H // BM)), kind="mixed") as group:
+        assert B > 0 and B < 2147483648 and T > 0 and T < 2147483648, "nonempty INT32 TND prefix"
         assert H % BM == 0 and (BM == 32 or BM == 64), "complete head tiles"
         assert WINDOW == 128 and PAGE == 128 and BK == 512 and C == 128, "cache/tile geometry"
         assert D % C == 0 and S == WINDOW + N.ceildiv(TOPK, BK) * BK, "complete selected capacities"
@@ -273,26 +269,36 @@ def sparse_mla_decode(
         inverse = N.alloc_ub((UR,), N.f32)
         ones = N.alloc_ub((UR,), N.f32)
         update_broadcast = N.alloc_ub((UR, 8), N.f32)
+        with N.Cube():
+            for bank in N.unroll(2):
+                N.fill(kv1[bank, :, :], 0.0)
         with N.Vector():
             N.fill(gather_zeros, 0.0)
             N.fill(ones, 1.0)
-        WORKERS = N.min(GROUPS, B * (H // BM))
+        WORKERS = N.min(GROUPS, T * (H // BM))
         for query in N.Dataflow(
-            N.ceildiv(B * (H // BM) - group, WORKERS),
+            N.ceildiv(T * (H // BM) - group, WORKERS),
             issue_order={"cube": ("pv", "qk"), "vector": ("gather", "softmax", "finish")},
         ):
             owner = group + query * WORKERS
-            batch = owner // (H // BM)
+            token = owner // (H // BM)
             head = (owner % (H // BM)) * BM
             slot = query % 2
             cache_slot = query % 3
             with N.Vector() as sid, N.Stage(0, name="gather"):
+                batch, qlen, offset, length, visible = query_metadata(
+                    cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, MAX_SEQ, WINDOW
+                )
+                available = N.load_index(seqused_cmp_kv[batch : batch + 1])
+                residual = N.load_index(cmp_residual_kv[batch : batch + 1])
+                cutoff = N.max(0, available * RATIO + residual - qlen + offset + 1) // RATIO
                 gather_compressed(
-                    Cmp=Cmp,
-                    CmpTable=CmpTable,
-                    Lengths=Lengths,
-                    Counts=Counts,
-                    Indices=Indices,
+                    Cmp=cmp_kv,
+                    CmpTable=cmp_block_table,
+                    Indices=cmp_sparse_indices,
+                    token=token,
+                    available=available,
+                    cutoff=cutoff,
                     KV=KV,
                     Bias=Bias,
                     zeros=gather_zeros,
@@ -312,41 +318,18 @@ def sparse_mla_decode(
                     TOPK=TOPK,
                 )
             with N.Cube(), N.Stage(0, name="qk"):
-                N.copy(Q[batch, head : head + BM, :], q1)
-                # Publish the window score last. Its M/FIX prefix follows
-                # every compressed QK read, joining both gather publishers
-                # before either AIV consumes the complete Bias and Score.
-                qk_tile(
-                    Ori=Ori,
-                    OriTable=OriTable,
-                    Lengths=Lengths,
-                    WindowLengths=WindowLengths,
-                    KV=KV,
-                    Score=Score,
-                    q1=q1,
-                    k1=kv1,
-                    q0=a0,
-                    b0=b0,
-                    c0=c0,
-                    batch=batch,
-                    group=group,
-                    cache_slot=cache_slot,
-                    slot=slot,
-                    IS_WINDOW=False,
-                    WIDTH=S - WINDOW,
-                    OFFSET=WINDOW,
-                    PAGE=PAGE,
-                    D=D,
-                    C=C,
-                    WINDOW=WINDOW,
-                    MAX_SEQ=MAX_SEQ,
-                    ORI_BLOCKS=ORI_BLOCKS,
+                batch, qlen, offset, length, visible = query_metadata(
+                    cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, MAX_SEQ, WINDOW
                 )
+                N.copy(q[token, head : head + BM, :], q1)
+                # Compute the direct window while the two AIVs gather sparse
+                # rows. The final compressed Score prefix joins both gather
+                # publishers before the full Score acquire and Bias read.
                 qk_tile(
-                    Ori=Ori,
-                    OriTable=OriTable,
-                    Lengths=Lengths,
-                    WindowLengths=WindowLengths,
+                    ori_kv=ori_kv,
+                    ori_block_table=ori_block_table,
+                    length=length,
+                    visible=visible,
                     KV=KV,
                     Score=Score,
                     q1=q1,
@@ -368,10 +351,35 @@ def sparse_mla_decode(
                     MAX_SEQ=MAX_SEQ,
                     ORI_BLOCKS=ORI_BLOCKS,
                 )
+                qk_tile(
+                    ori_kv=ori_kv,
+                    ori_block_table=ori_block_table,
+                    length=length,
+                    visible=visible,
+                    KV=KV,
+                    Score=Score,
+                    q1=q1,
+                    k1=kv1,
+                    q0=a0,
+                    b0=b0,
+                    c0=c0,
+                    batch=batch,
+                    group=group,
+                    cache_slot=cache_slot,
+                    slot=slot,
+                    IS_WINDOW=False,
+                    WIDTH=S - WINDOW,
+                    OFFSET=WINDOW,
+                    PAGE=PAGE,
+                    D=D,
+                    C=C,
+                    WINDOW=WINDOW,
+                    MAX_SEQ=MAX_SEQ,
+                    ORI_BLOCKS=ORI_BLOCKS,
+                )
             with N.Vector() as sid, N.Stage(1, name="softmax"):
-                length = N.load_index(Lengths[batch : batch + 1], minimum=0, maximum=MAX_SEQ)
-                visible = N.load_index(
-                    WindowLengths[batch : batch + 1], minimum=0, maximum=N.min(WINDOW, length)
+                batch, qlen, offset, length, visible = query_metadata(
+                    cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, MAX_SEQ, WINDOW
                 )
                 # Acquire the complete Cube score before reading the mask
                 # published by both AIVs in that Cube input prefix.
@@ -387,7 +395,7 @@ def sparse_mla_decode(
                     if block > 0:
                         N.fill(score, NEG_INF)
                         N.copy(Score[group, slot, r : r + VR, :], score[:, 0:S])
-                    N.copy(Sinks[head + r : head + r + VR], sink)
+                    N.copy(sinks[head + r : head + r + VR], sink)
                     N.mul(score, SCALE, out=score)
                     for row in N.serial(VR):
                         N.add(score[row, :], bias, out=score[row, :])
@@ -429,11 +437,14 @@ def sparse_mla_decode(
                     N.copy(row_sum, final_l[slot, local : local + VR])
                     N.copy(probabilities[:, 0:S], P[group, slot, r : r + VR, :])
             with N.Cube(), N.Stage(1, name="pv"):
+                batch, qlen, offset, length, visible = query_metadata(
+                    cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, T, MAX_SEQ, WINDOW
+                )
                 pv_tile(
-                    Ori=Ori,
-                    OriTable=OriTable,
-                    Lengths=Lengths,
-                    WindowLengths=WindowLengths,
+                    ori_kv=ori_kv,
+                    ori_block_table=ori_block_table,
+                    length=length,
+                    visible=visible,
                     KV=KV,
                     P=P,
                     PV=PV,
@@ -462,4 +473,4 @@ def sparse_mla_decode(
                     N.div(ones, final_l[slot, local : local + UR], out=inverse)
                     N.mul(pv, inverse[:, None], out=pv, scratch=update_broadcast)
                     N.cast(pv, out=output)
-                    N.copy(output, O[batch, head + r : head + r + UR, :])
+                    N.copy(output, attention_out[token, head + r : head + r + UR, :])

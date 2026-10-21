@@ -4,6 +4,7 @@ import argparse
 import ctypes as ct
 import hashlib
 import json
+import os
 import re
 import subprocess
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from ascendflow.diagnostics import require
 from ascendflow.performance import hardware_snapshot
 from benchmarks.artifacts import read_artifact
 from benchmarks.attention.sparse_reference import CASES, gather_oracle, inputs, oracle
+from benchmarks.references.sparse_mla_aclnn import SparseMlaReference
 from benchmarks.validation.dtypes import decode, encode
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,8 +58,19 @@ def policy_for(args):
     require(parts == 1, "CSA baseline has one request owner")
     selected = args.window + ((args.topk + bk - 1) // bk) * bk
     require(selected <= 4096, "resident sparse softmax requires at most 4096 padded columns")
+    query_lens = getattr(args, "query_lens", None)
+    if query_lens is None:
+        query_lens = [getattr(args, "query_tokens", 4)] * args.batch
+    require(
+        len(query_lens) == args.batch and all(0 <= n <= args.max_seq for n in query_lens),
+        "query lengths must have B entries, each within [0,MAX_SEQ]",
+    )
+    require(getattr(args, "groups", 20) > 0, "worker count must be positive")
+    require(sum(query_lens) > 0, "TND must contain at least one query token")
     return {
         "B": args.batch,
+        "T": sum(query_lens),
+        "GROUPS": getattr(args, "groups", 20),
         "H": args.heads,
         "D": args.features,
         "PAGE": page,
@@ -83,11 +96,11 @@ def sources_for(policy):
 
 
 def workspace_shapes(policy):
-    groups = policy["B"] * (policy["H"] // policy["BM"])
+    groups = min(policy["GROUPS"], policy["T"] * (policy["H"] // policy["BM"]))
     return {
         "KV": (groups, 3, policy["S"] - policy["WINDOW"], policy["D"]),
         "Bias": (groups, 3, policy["S"] - policy["WINDOW"]),
-        "O": (policy["B"], policy["H"], policy["D"]),
+        "attention_out": (policy["T"], policy["H"], policy["D"]),
         "Score": (groups, 2, policy["BM"], policy["S"]),
         "P": (groups, 2, policy["BM"], policy["S"]),
         "PV": (groups, 2, policy["BM"], policy["D"]),
@@ -95,7 +108,7 @@ def workspace_shapes(policy):
 
 
 def check_gathered(gathered, bias, expected_kv, expected_bias, policy, workers):
-    owners = policy["B"] * (policy["H"] // policy["BM"])
+    owners = policy["T"] * (policy["H"] // policy["BM"])
     require(0 < workers <= owners, "invalid artifact worker count")
     for group in range(workers):
         retained = {}
@@ -164,6 +177,7 @@ def run_device(args, policy):
     record = {"status": "running", "policy": policy, "rtol": RTOL, "atol": ATOL, "cases": []}
     record_path = output / "device.json"
     runtime = None
+    reference = None
     try:
         record["health"] = health_snapshot(args.physical, output)
         record["hardware"] = hardware_snapshot(args.physical)
@@ -173,28 +187,30 @@ def run_device(args, policy):
             for entry, filename in sources_for(policy).items()
         }
         record["artifacts"] = {entry: value[3] for entry, value in kernels.items()}
+        if args.reference_artifacts is not None:
+            os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(args.reference_artifacts.resolve())
         runtime = ACL()
         dtype = policy["DTYPE"]
         shapes = workspace_shapes(policy)
         capacities = {
-            name: int(np.prod(shape)) * (2 if name in {"KV", "O", "P"} else 4)
+            name: int(np.prod(shape)) * (2 if name in {"KV", "attention_out", "P"} else 4)
             for name, shape in shapes.items()
         }
         workspace = {
             name: runtime.allocate(b"\xcd" * size + GUARD) for name, size in capacities.items()
         }
         for case in args.cases:
-            data = inputs(policy, case)
+            data = inputs(policy, case, args.query_lens)
             directory = output / "validation" / case
             directory.mkdir(parents=True, exist_ok=True)
             if case == args.cases[0]:
-                np.savez(output / "cache-inputs.npz", Ori=data["Ori"], Cmp=data["Cmp"])
+                np.savez(output / "cache-inputs.npz", ori_kv=data["ori_kv"], cmp_kv=data["cmp_kv"])
             np.savez(
                 directory / "inputs.npz",
-                **{key: value for key, value in data.items() if key not in {"Ori", "Cmp"}},
+                **{key: value for key, value in data.items() if key not in {"ori_kv", "cmp_kv"}},
             )
             raw = {
-                key: encode(value, dtype) if key in {"Q", "Ori", "Cmp"} else value.tobytes()
+                key: encode(value, dtype) if key in {"q", "ori_kv", "cmp_kv"} else value.tobytes()
                 for key, value in data.items()
             }
             pointers = {
@@ -248,24 +264,53 @@ def run_device(args, policy):
                 policy,
                 kernels["sparse_mla_decode"][3]["blocks"],
             )
-            actual = decode(results["O"], dtype, shapes["O"])
+            actual = decode(results["attention_out"], dtype, shapes["attention_out"])
             expected = oracle(data, policy)
             np.savez(directory / "outputs.npz", actual=actual, expected=expected)
             require(
                 np.allclose(actual, expected, rtol=RTOL, atol=ATOL),
                 f"{case}: sparse attention differs; max_abs={np.max(np.abs(actual - expected))}",
             )
+            official = None
+            if args.reference_artifacts is not None:
+                size = capacities["attention_out"]
+                pointer = runtime.allocate(b"\xcd" * size + GUARD)
+                reference = SparseMlaReference(
+                    runtime,
+                    pointers | {"attention_out": pointer},
+                    policy,
+                    max(1, int(data["seqused_ori_kv"].max())),
+                    args.reference_artifacts,
+                    query_lens=np.diff(data["cu_seqlens_q"]),
+                )
+                reference()
+                runtime.synchronize()
+                blob = runtime.read(pointer, size + len(GUARD))
+                require(blob[size:] == GUARD, "official output guard changed")
+                official = decode(blob[:size], dtype, shapes["attention_out"])
+                require(
+                    np.allclose(official, expected, rtol=RTOL, atol=ATOL),
+                    f"{case}: official differs from independent oracle",
+                )
+                np.savez(directory / "official.npz", actual=official, expected=expected)
+                reference_record = reference.identity()
+                reference.close()
+                reference = None
             row = {
                 "case": case,
                 "max_abs_error": float(np.max(np.abs(actual - expected))),
                 "input_sha256": {key: digest(value) for key, value in raw.items()},
-                "output_sha256": digest(results["O"]),
+                "output_sha256": digest(results["attention_out"]),
                 "stream_interval_us": elapsed.value * 1000 / args.repeats,
                 "timing_scope": "fused kernel plus host submission gaps; single probe, no performance qualification",
                 "input_and_guards": "unchanged",
                 "gather": "exact",
                 "launch_pairs": args.repeats + args.warmup,
             }
+            if official is not None:
+                row["official"] = reference_record
+                row["official_max_abs_error"] = float(np.max(np.abs(official - expected)))
+                row["max_abs_difference_from_official"] = float(np.max(np.abs(actual - official)))
             record["cases"].append(row)
             record_path.write_text(json.dumps(record, indent=2) + "\n")
             print(
@@ -286,6 +331,8 @@ def run_device(args, policy):
     finally:
         record_path.write_text(json.dumps(record, indent=2) + "\n")
         if runtime is not None:
+            if reference is not None:
+                reference.close()
             runtime.close()
 
 
@@ -295,7 +342,25 @@ def main(argv=None):
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--ir-only", action="store_true")
     parser.add_argument("--physical", type=int)
+    parser.add_argument(
+        "--reference-artifacts",
+        type=Path,
+        help="also check the official operator on identical inputs",
+    )
     parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument(
+        "--query-tokens",
+        type=int,
+        default=4,
+        help="query tokens per request; B remains the request count",
+    )
+    parser.add_argument(
+        "--query-lens",
+        nargs="+",
+        type=int,
+        help="runtime query lengths, B entries; overrides --query-tokens",
+    )
+    parser.add_argument("--groups", type=int, default=20)
     parser.add_argument("--head-tile", type=int, choices=(32, 64))
     parser.add_argument("--kv-parts", type=int)
     parser.add_argument("--heads", type=int, default=64)

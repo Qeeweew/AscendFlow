@@ -1,120 +1,146 @@
-"""Independent paged-cache semantics for the V4.1 decode example.
+"""Independent TND/PA_BBND semantics, including speculative verification.
 
-The oracle selects logical rows directly from the input pages, concatenates
-both cache planes, and evaluates one FP64 softmax including the head sink.
-It does not consume the generated gather output or follow its tile recurrence.
+The oracle selects logical rows directly from the pages and evaluates one
+FP64 softmax per token/head. It does not follow the DSL's request search,
+gather slots, physical pipeline or low precision probability intermediates.
 """
 
 import numpy as np
 
 from benchmarks.validation.dtypes import decode, encode
 
-CASES = ("empty", "window", "mixed", "compressed", "duplicates", "replay", "sink")
+CASES = ("empty", "window", "mixed", "ragged", "padding", "duplicates", "replay", "sink")
 
 
 def rounded(values, dtype):
     return decode(encode(values, dtype), dtype, values.shape)
 
 
-def inputs(policy, case):
+def query_counts(policy, ragged=False):
+    b, t = policy["B"], policy["T"]
+    counts = np.full(b, t // b, dtype=np.int32)
+    counts[: t % b] += 1
+    if ragged and b >= 3 and t >= 3:
+        size = int(counts[:3].sum())
+        counts[:3] = (0, size // 3, size - size // 3)
+    return counts
+
+
+def query_geometry(data, policy, token):
+    cu = data["cu_seqlens_q"]
+    batch = int(np.searchsorted(cu, token, side="right")) - 1
+    count = int(cu[batch + 1] - cu[batch])
+    offset = token - int(cu[batch])
+    right = max(0, int(data["seqused_ori_kv"][batch]) - count + offset + 1)
+    visible = min(policy["WINDOW"], right)
+    requested = int(data["ori_topk_length"][token, 0])
+    if requested > 0:
+        visible = min(visible, requested)
+    available = int(data["seqused_cmp_kv"][batch])
+    compressed_end = available * policy["RATIO"] + int(data["cmp_residual_kv"][batch])
+    cutoff = max(0, compressed_end - count + offset + 1) // policy["RATIO"]
+    return batch, right, visible, available, cutoff
+
+
+def inputs(policy, case, query_lens=None):
     if case not in CASES:
         raise ValueError(f"unknown sparse attention case: {case}")
-    b, h, d, page, ratio, max_seq, window, topk = (
-        policy[key] for key in ("B", "H", "D", "PAGE", "RATIO", "MAX_SEQ", "WINDOW", "TOPK")
+    b, t, h, d, page, ratio, max_seq, topk = (
+        policy[key] for key in ("B", "T", "H", "D", "PAGE", "RATIO", "MAX_SEQ", "TOPK")
     )
     dtype = policy["DTYPE"]
     rng = np.random.default_rng(4102026)
-    q = rounded(rng.normal(0, 0.5, (b, h, d)).astype(np.float32), dtype)
-    ori = rounded(rng.normal(0, 0.5, (policy["ORI_BLOCKS"], page, d)).astype(np.float32), dtype)
-    cmp = rounded(
-        rng.normal(0, 0.5, (policy["CMP_BLOCKS"], page // ratio, d)).astype(np.float32), dtype
+    counts = (
+        query_counts(policy, case == "ragged")
+        if query_lens is None
+        else np.array(query_lens, dtype=np.int32)
     )
-    tables = {}
-    for name, blocks in (("OriTable", policy["ORI_BLOCKS"]), ("CmpTable", policy["CMP_BLOCKS"])):
-        tables[name] = rng.integers(0, blocks, (b, max_seq // page), dtype=np.int32)
-    lengths = np.array(
-        [min(max_seq, x) for x in (0, page - 1, page + 1, max_seq - 1)], dtype=np.int32
-    )
-    lengths = np.array([max_seq - 1], dtype=np.int32) if b == 1 else np.resize(lengths, b)
-    visible = np.minimum(lengths, window)
-    counts = np.zeros(b, dtype=np.int32)
-    indices = np.full((b, topk), -1, dtype=np.int32)
-    sinks = np.linspace(-2, 2, h, dtype=np.float32)
+    lengths = np.resize(np.array([page - 1, page + 1, 2 * page + 1, max_seq - 1]), b)
+    lengths = np.minimum(max_seq, np.maximum(counts, lengths)).astype(np.int32)
     if case == "empty":
         lengths[:] = 0
-        visible[:] = 0
-    elif case != "window":
-        for batch in range(b):
-            available = int(lengths[batch]) // ratio
-            count = min(topk, available)
-            counts[batch] = count
-            # A permutation spans pages, need not be sorted, and ends with
-            # -1 padding. Different requests deliberately share physical pages.
-            if count:
-                indices[batch, :count] = rng.permutation(available)[:count]
-                if case == "duplicates":
-                    indices[batch, :count] = indices[batch, 0]
-                elif case == "mixed":
-                    # Valid storage indices beyond the causal cutoff must not
-                    # be read or acquire a softmax weight.
-                    indices[batch, 0] = max_seq // ratio - 1
-        if case == "compressed":
-            visible[:] = 0
-        if case == "replay":
-            visible = np.minimum(visible, np.arange(b, dtype=np.int32) * 3)
-        if case == "sink":
-            sinks[:] = np.resize(np.array([-80, 80, 0, 5], dtype=np.float32), h)
-    return {
-        "Q": q,
-        "Ori": ori,
-        "Cmp": cmp,
-        **tables,
-        "Lengths": lengths,
-        "WindowLengths": visible,
-        "Counts": counts,
-        "Indices": indices,
-        "Sinks": sinks,
+    data = {
+        "q": rounded(rng.normal(0, 0.5, (t, h, d)).astype(np.float32), dtype),
+        "ori_kv": rounded(
+            rng.normal(0, 0.5, (policy["ORI_BLOCKS"], page, 1, d)).astype(np.float32), dtype
+        ),
+        "cmp_kv": rounded(
+            rng.normal(0, 0.5, (policy["CMP_BLOCKS"], page // ratio, 1, d)).astype(np.float32),
+            dtype,
+        ),
+        "cu_seqlens_q": np.r_[0, counts.cumsum()].astype(np.int32),
+        "seqused_ori_kv": lengths,
+        "seqused_cmp_kv": lengths // ratio,
+        "cmp_residual_kv": lengths % ratio,
+        "ori_topk_length": np.zeros((t, 1), dtype=np.int32),
+        "cmp_sparse_indices": np.full((t, 1, topk), -1, dtype=np.int32),
+        "sinks": np.linspace(-2, 2, h, dtype=np.float32),
     }
+    for name, blocks in (
+        ("ori_block_table", policy["ORI_BLOCKS"]),
+        ("cmp_block_table", policy["CMP_BLOCKS"]),
+    ):
+        # Read-only cache pages may be shared across requests.
+        data[name] = rng.integers(0, blocks, (b, max_seq // page), dtype=np.int32)
+    for token in range(t):
+        _batch, _right, _visible, available, cutoff = query_geometry(data, policy, token)
+        count = min(topk, available, cutoff)
+        if case not in {"empty", "window"} and count > 0:
+            if case == "padding":
+                count = token % (count + 1)
+            prefix = rng.permutation(available)[:count]
+            if case == "duplicates":
+                prefix[:] = 0
+            elif case == "mixed":
+                # Early queries must filter entries created by later tokens.
+                prefix[0] = available - 1
+            data["cmp_sparse_indices"][token, 0, :count] = prefix
+        if case == "replay":
+            data["ori_topk_length"][token, 0] = 1 + token % 7
+    if case == "sink":
+        data["sinks"][:] = np.resize(np.array([-80, 80, 0, 5], dtype=np.float32), h)
+    return data
 
 
-def selected_rows(data, policy, batch):
+def selected_rows(data, policy, token):
     page, ratio = policy["PAGE"], policy["RATIO"]
-    length, visible = int(data["Lengths"][batch]), int(data["WindowLengths"][batch])
+    batch, right, visible, available, cutoff = query_geometry(data, policy, token)
     rows, slots = [], []
-    for slot, position in enumerate(range(length - visible, length)):
-        physical = data["OriTable"][batch, position // page]
-        rows.append(data["Ori"][physical, position % page])
+    for slot, position in enumerate(range(right - visible, right)):
+        physical = data["ori_block_table"][batch, position // page]
+        rows.append(data["ori_kv"][physical, position % page, 0])
         slots.append(slot)
-    for rank, index in enumerate(data["Indices"][batch, : data["Counts"][batch]]):
+    bound = min(policy["TOPK"], available, cutoff)
+    for rank, index in enumerate(data["cmp_sparse_indices"][token, 0, :bound]):
         if index < 0:
-            raise ValueError("the selected prefix must contain valid nonnegative indices")
-        if index >= length // ratio:
+            break
+        if index >= cutoff:
             continue
-        physical = data["CmpTable"][batch, index // (page // ratio)]
-        rows.append(data["Cmp"][physical, index % (page // ratio)])
+        physical = data["cmp_block_table"][batch, index // (page // ratio)]
+        rows.append(data["cmp_kv"][physical, index % (page // ratio), 0])
         slots.append(policy["WINDOW"] + rank)
     return np.asarray(rows, dtype=np.float32).reshape(-1, policy["D"]), slots
 
 
 def oracle(data, policy):
-    output = np.zeros_like(data["Q"])
-    for batch in range(policy["B"]):
-        kv, _ = selected_rows(data, policy, batch)
+    output = np.zeros_like(data["q"])
+    for token in range(policy["T"]):
+        kv, _ = selected_rows(data, policy, token)
         if not len(kv):
             continue
-        scores = (data["Q"][batch].astype(np.float64) @ kv.astype(np.float64).T) * policy["SCALE"]
-        maximum = np.maximum(scores.max(axis=1), data["Sinks"])
+        scores = (data["q"][token].astype(np.float64) @ kv.astype(np.float64).T) * policy["SCALE"]
+        maximum = np.maximum(scores.max(axis=1), data["sinks"])
         weights = np.exp(scores - maximum[:, None])
-        denominator = weights.sum(axis=1) + np.exp(data["Sinks"] - maximum)
-        output[batch] = (weights @ kv.astype(np.float64)) / denominator[:, None]
+        denominator = weights.sum(axis=1) + np.exp(data["sinks"] - maximum)
+        output[token] = (weights @ kv.astype(np.float64)) / denominator[:, None]
     return rounded(output, policy["DTYPE"])
 
 
 def gather_oracle(data, policy):
-    kv = np.zeros((policy["B"], policy["S"], policy["D"]), dtype=np.float32)
-    bias = np.full((policy["B"], policy["S"]), -np.inf, dtype=np.float32)
-    for batch in range(policy["B"]):
-        rows, slots = selected_rows(data, policy, batch)
-        kv[batch, slots] = rows
-        bias[batch, slots] = 0
+    kv = np.zeros((policy["T"], policy["S"], policy["D"]), dtype=np.float32)
+    bias = np.full((policy["T"], policy["S"]), -np.inf, dtype=np.float32)
+    for token in range(policy["T"]):
+        rows, slots = selected_rows(data, policy, token)
+        kv[token, slots] = rows
+        bias[token, slots] = 0
     return kv, bias

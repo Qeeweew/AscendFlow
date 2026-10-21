@@ -14,7 +14,7 @@ from benchmarks.references.aclnn import OperatorReference
 class SparseMlaReference(OperatorReference):
     interface = "aclnnSparseFlashMla TND/PA_BBND, shared BF16 KV, band4/causal3, topk1, sink"
 
-    def __init__(self, runtime, pointers, policy, context, artifacts):
+    def __init__(self, runtime, pointers, policy, context, artifacts, *, query_lens):
         self.runtime = runtime
         self.vendor = Path(artifacts).resolve()
         require(
@@ -34,12 +34,16 @@ class SparseMlaReference(OperatorReference):
         b, h, d, page, ratio, maximum, topk = (
             policy[key] for key in ("B", "H", "D", "PAGE", "RATIO", "MAX_SEQ", "TOPK")
         )
+        t = policy["T"]
+        require(len(query_lens) == b and sum(query_lens) == t, "reference query lengths differ")
+        dtype = 27 if policy["DTYPE"] == "bf16" else 1
         self.metadata_pointer = runtime.allocate(bytes(1024 * 4))
         metadata = self.tensor(self.metadata_pointer, (1024,), dtype=3)
-        cu = self.tensor(pointers["Cu"], (b + 1,), dtype=3)
-        lengths = self.tensor(pointers["Lengths"], (b,), dtype=3)
-        cmp_lengths = self.tensor(pointers["CmpLengths"], (b,), dtype=3)
-        residual = self.tensor(pointers["Residual"], (b,), dtype=3)
+        cu = self.tensor(pointers["cu_seqlens_q"], (b + 1,), dtype=3)
+        lengths = self.tensor(pointers["seqused_ori_kv"], (b,), dtype=3)
+        cmp_lengths = self.tensor(pointers["seqused_cmp_kv"], (b,), dtype=3)
+        residual = self.tensor(pointers["cmp_residual_kv"], (b,), dtype=3)
+        ori_topk = self.tensor(pointers["ori_topk_length"], (t, 1), dtype=3)
         # Metadata generation belongs to scheduler preparation and is outside
         # the measured main operator, matching vLLM's separate metadata stage.
         self.prepare(
@@ -52,13 +56,13 @@ class SparseMlaReference(OperatorReference):
                 lengths,
                 cmp_lengths,
                 residual,
-                None,
+                ori_topk,
                 None,
                 h,
                 1,
                 d,
                 b,
-                1,
+                int(max(query_lens)),
                 context,
                 context // ratio,
                 0,
@@ -91,13 +95,15 @@ class SparseMlaReference(OperatorReference):
         self.prepare(
             "aclnnSparseFlashMla",
             [
-                self.tensor(pointers["Q"], (b, h, d), dtype=27),
-                self.tensor(pointers["Ori"], (policy["ORI_BLOCKS"], page, 1, d), dtype=27),
-                self.tensor(pointers["Cmp"], (policy["CMP_BLOCKS"], page // ratio, 1, d), dtype=27),
+                self.tensor(pointers["q"], (t, h, d), dtype=dtype),
+                self.tensor(pointers["ori_kv"], (policy["ORI_BLOCKS"], page, 1, d), dtype=dtype),
+                self.tensor(
+                    pointers["cmp_kv"], (policy["CMP_BLOCKS"], page // ratio, 1, d), dtype=dtype
+                ),
                 None,
-                self.tensor(pointers["Indices"], (b, 1, topk), dtype=3),
-                self.tensor(pointers["OriTable"], (b, maximum // page), dtype=3),
-                self.tensor(pointers["CmpTable"], (b, maximum // page), dtype=3),
+                self.tensor(pointers["cmp_sparse_indices"], (t, 1, topk), dtype=3),
+                self.tensor(pointers["ori_block_table"], (b, maximum // page), dtype=3),
+                self.tensor(pointers["cmp_block_table"], (b, maximum // page), dtype=3),
                 cu,
                 None,
                 None,
@@ -105,9 +111,9 @@ class SparseMlaReference(OperatorReference):
                 lengths,
                 cmp_lengths,
                 residual,
+                ori_topk,
                 None,
-                None,
-                self.tensor(pointers["Sinks"], (h,)),
+                self.tensor(pointers["sinks"], (h,)),
                 metadata,
                 policy["SCALE"],
                 ratio,
@@ -119,7 +125,7 @@ class SparseMlaReference(OperatorReference):
                 b"PA_BBND",
                 1,
                 False,
-                self.tensor(pointers["O"], (b, h, d), dtype=27),
+                self.tensor(pointers["attention_out"], (t, h, d), dtype=dtype),
                 None,
             ],
             [ct.c_void_p] * 18
