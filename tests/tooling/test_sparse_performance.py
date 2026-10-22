@@ -30,7 +30,7 @@ def test_full_prefill_measurement_inputs_match_paged_oracle(ratio):
         "DTYPE": "bf16",
         "SCALE": 0.5,
     }
-    arrays, patches, selected, valid = make_inputs(policy, 8, 41)
+    arrays, patches, valid = make_inputs(policy, 8, 41)
     data = dict(arrays)
     for name, page in (("ori_kv", 4), ("cmp_kv", 4 // ratio)):
         shape = (4, page, 1, 4)
@@ -39,11 +39,8 @@ def test_full_prefill_measurement_inputs_match_paged_oracle(ratio):
             raw[offset : offset + len(value)] = value
         data[name] = decode(bytes(raw), "bf16", shape)
     rows, bias = gather_oracle(data, policy)
-    for token in range(policy["T"]):
-        selected_rows, selected_bias = selected.gathered(token)
-        np.testing.assert_array_equal(selected_rows, rows[token])
-        np.testing.assert_array_equal(selected_bias, bias[token])
-        np.testing.assert_array_equal(selected.rows(token), rows[token, np.isfinite(bias[token])])
+    np.testing.assert_array_equal(np.isfinite(bias), valid)
+    assert np.isfinite(rows).all()
     assert np.count_nonzero(valid[0]) == 1 + (ratio == 1)
 
 
@@ -72,7 +69,7 @@ def test_prefill_cache_patch_staging_preserves_zero_holes_and_guard():
 
 
 @pytest.mark.parametrize("reference_start", (150, 500))
-def test_profiling_excludes_npu_reference_only_after_measured_calls(tmp_path, reference_start):
+def test_profiling_rejects_reference_tasks_after_timing_starts(tmp_path, reference_start):
     from ascendflow.diagnostics import CompileError
     from benchmarks.attention.profile_sparse import summarize
 
@@ -87,10 +84,5 @@ def test_profiling_excludes_npu_reference_only_after_measured_calls(tmp_path, re
                 ("reference", "BatchMatMul", "AI_CORE", reference_start, 30, 20),
             ]
         )
-    if reference_start < 200:
-        with pytest.raises(CompileError, match="unexpected task during measured calls"):
-            summarize(tmp_path, 1, 1, "ascendflow")
-    else:
-        result = summarize(tmp_path, 1, 1, "ascendflow")
-        assert result["median_us"] == 12
-        assert result["validation_tasks_excluded"] == 1
+    with pytest.raises(CompileError, match="unexpected task during measured calls"):
+        summarize(tmp_path, 1, 1, "ascendflow")

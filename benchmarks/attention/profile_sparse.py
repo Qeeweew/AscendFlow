@@ -28,20 +28,11 @@ def summarize(directory, warmup, repeats, backend, *, cache_eviction=False):
     first_main = min(
         float(row["Task Start Time(us)"].strip()) for row in rows if row["OP Type"] in expected
     )
-    last_main_end = max(
-        float(row["Task Start Time(us)"].strip()) + float(row["Task Duration(us)"].strip())
-        for row in rows
-        if row["OP Type"] in expected
-    )
-    validation_tasks = 0
     for row in rows:
         name = row["OP Type"]
         if name not in expected:
             if cache_eviction and name == "state_sum":
                 evictions.append(row)
-                continue
-            if float(row["Task Start Time(us)"].strip()) >= last_main_end:
-                validation_tasks += 1
                 continue
             require(
                 float(row["Task Start Time(us)"].strip()) < first_main,
@@ -96,7 +87,6 @@ def summarize(directory, warmup, repeats, backend, *, cache_eviction=False):
     return {
         "scope": "sum of device task durations per call; excludes setup and host gaps",
         "setup_tasks_excluded": setup,
-        "validation_tasks_excluded": validation_tasks,
         "eviction_tasks_excluded": len(evictions),
         "summary_csv": str(paths[0].resolve()),
         "summary_sha256": hashlib.sha256(paths[0].read_bytes()).hexdigest(),
@@ -190,7 +180,7 @@ def profile(args, backend, batch, context, trial):
             kill_process_group(proc.pid)
         require(code == 0, f"msprof failed: {output / 'msprof.log'}")
     device = json.loads((output / "device/device.json").read_text())
-    require(device["status"] == "passed", "device validation failed")
+    require(device["status"] == "measured", "device measurement did not complete")
     result = summarize(
         output / "profile",
         args.warmup,
@@ -207,8 +197,7 @@ def profile(args, backend, batch, context, trial):
         backend=backend,
         device_record=str(output / "device/device.json"),
         input_identity=device["input_identity"],
-        max_abs_error=device["max_abs_error"],
-        numerical_reference=device.get("numerical_reference"),
+        numerical_validation=device["numerical_validation"],
         cache_scope=device["cache_scope"],
         cache_eviction=device.get("cache_eviction"),
     )

@@ -212,14 +212,15 @@ device task duration。官方参照必须是从 vllm-ascend 原始 host/kernel �
 应结合 `--metrics MemoryAccess` 和 `--metrics L2Cache` 的原始记录分析。
 `profile_sparse --batches 1` 由产物读取 query 数：context 等于 query 数时为完整
 prefill，更长 context 表示带历史前缀的 chunk。早期 token 的不足窗口和不足 TopK
-均按真实有效行参与参考计算。性能输入保存 query/元数据及零背景 cache 的 BF16
-offset/patch，避免把每个 query 重复引用的 KV 逐份写入记录。数值参考只保留
-共享 cache，按输入元数据独立选行，每128个 query 在 NPU 上执行 FP32 QK、
+均按真实有效行计数。`profile_sparse` 只采集性能：记录种子、
+输入/缓存 hash、源码与产物身份，不转储大规模输入/输出，也不运行数值参考、
+gather 检查或算子输入/输出/workspace 回读检查。完成状态为 `measured`，
+不代表新的正确性资格；正确性由独立的 `run_sparse` 入口检查。
+
+`run_sparse` 按输入元数据独立选行，每128个 query 在 NPU 上执行 FP32 QK、
 包含一个 sink 的 softmax 和 FP32 PV，禁用 HF32，不使用算子自身的 gather workspace。
-性能 runner 只保存 BF16 实际输出和 FP32 参考 hash，不保存完整参考矩阵。
-缓存初始化在采集前，数值参考在所有被测调用后执行；两者均不计入 kernel 时间。
 设备数值校验需要工作区的 `torch` 和 `torch_npu`，编译和 CPU/IR 回归不依赖它们。
-大 query 的完整输入、输出和 guard 检查可用 `--application-timeout` 设置测量进程
+大 query 的输入准备及采集可用 `--application-timeout` 设置测量进程
 期限；它不改变每个算子构建的300秒硬上限，也不改变 kernel 计时范围。
 
 prefill 当前优化限于 B1 的常驻窗口复用，不合并不同 query 的 TopK。
