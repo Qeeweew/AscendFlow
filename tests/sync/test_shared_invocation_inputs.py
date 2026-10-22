@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from ascendflow.passes.structured_sync import synchronize_structure
-from examples.state.shared_inputs import shared_state_sum
+from tests.fixtures.state import shared_state_sum
 from tests.models.structured_events import check_compiled_events
 
 

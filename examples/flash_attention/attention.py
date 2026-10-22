@@ -366,12 +366,11 @@ def attention_target(
                 N.fill(m, NEG_INF)
                 N.fill(l, 0.0)
                 N.fill(o, 0.0)
+            kv_order = {"cube": ("qk", "pv"), "vector": ("softmax", "update")}
             if CAUSAL:
                 active_kv_tiles = N.min(kv_tiles, N.ceildiv(query_row + BQ, BK))
-                kv_order = {"cube": ("qk", "pv"), "vector": ("softmax", "update")}
             else:
                 active_kv_tiles = kv_tiles
-                kv_order = {"cube": ("qk", "pv"), "vector": ("softmax", "update")}
             for kv in N.Dataflow(
                 active_kv_tiles,
                 issue_order=kv_order,

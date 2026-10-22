@@ -79,7 +79,9 @@ def test_next_invocation_keeps_an_independent_loaded_value(inputs):
     value = domains.control.environment.expression(loads[0].operation.value)
     parent = domains.control.loops[current.coordinates[0][0]].ordinal
     left = substitute(value, {domains.control.sid: literal(0)})
-    right = substitute(value, {parent: expression("add", parent, literal(1)), domains.control.sid: literal(0)})
+    right = substitute(
+        value, {parent: expression("add", parent, literal(1)), domains.control.sid: literal(0)}
+    )
     # Both loads obey [1,8], but two generations need not read equal data.
     assert domains.arithmetic.queries.satisfies(
         (Comparison(left, "==", literal(1)), Comparison(right, "==", literal(8))), known
@@ -104,8 +106,9 @@ def participant_inputs(First:N.Tensor((2,),N.i64)):
     domains = EventDomains(selection, ResourceWork())
     load = next(t for t in memory.templates if t.spec.native == "index_load")
     fill = next(t for t in memory.templates if t.spec.native == "fill")
-    points = [point(domains, fill, Placement.BEFORE, actor=actor)
-              for actor in (Actor.AIV0, Actor.AIV1)]
+    points = [
+        point(domains, fill, Placement.BEFORE, actor=actor) for actor in (Actor.AIV0, Actor.AIV1)
+    ]
     value = domains.control.environment.expression(load.operation.value)
     left, right = [substitute(value, {domains.control.sid: literal(sid)}) for sid in (0, 1)]
     known = tuple(test for p in points for test in domains._input_ranges(p))
@@ -115,10 +118,10 @@ def participant_inputs(First:N.Tensor((2,),N.i64)):
 
 
 def test_b128_prepare_keeps_positive_tail_length_through_event_handback():
-    from examples.kda.prefill import prefill_prepare
+    from examples.kda.prefill_prepare import prefill_prepare
 
-    plan = synchronize_structure(prefill_prepare.specialize(
-        SEQUENCES=128, NC=2, CHUNKS=256, H=32, DTYPE="f16"
-    ))
+    plan = synchronize_structure(
+        prefill_prepare.specialize(SEQUENCES=128, NC=2, CHUNKS=256, H=32, DTYPE="f16")
+    )
     assert any(record.discharged for record in plan.generation.domains._activations.values())
     assert all(not name.captures for name in plan.generation.domains.facts)

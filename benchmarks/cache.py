@@ -19,7 +19,7 @@ class CacheEviction:
         self.policy = json.loads((directory / "eviction-policy.json").read_text())
         require(
             self.policy["parameters"] == {"B": 8192, "GROUPS": 40},
-            "eviction artifact must specialize the declared state_sum sweep",
+            "eviction artifact must specialize the declared cache_sweep sweep",
         )
         self.tiles = self.policy["tiles"]
         self.output_size = 40 * 8192 * 4
@@ -29,9 +29,9 @@ class CacheEviction:
             "eviction sweep needs complete tiles and at least four L2 capacities",
         )
         frozen = read_artifact(directory)
-        manifest = json.loads((directory / "state_sum.compile.json").read_text())
-        library = directory / "state_sum.so"
-        require(frozen.name == "state_sum", "unexpected eviction kernel")
+        manifest = json.loads((directory / "cache_sweep.compile.json").read_text())
+        library = directory / "cache_sweep.so"
+        require(frozen.name == "cache_sweep", "unexpected eviction kernel")
         require(
             hashlib.sha256(frozen.asc.encode()).hexdigest() == manifest["source_sha256"],
             "eviction source identity changed",
@@ -41,15 +41,13 @@ class CacheEviction:
             "eviction library identity changed",
         )
         self.module = ct.CDLL(str(library))
-        self.launch = self.module.launch_state_sum
-        self.launch.argtypes = [ct.c_void_p] * 4 + [ct.c_int64]
+        self.launch = self.module.launch_cache_sweep
+        self.launch.argtypes = [ct.c_void_p] * 3 + [ct.c_int64]
         self.launch.restype = ct.c_int
         self.x = runtime.allocate_uninitialized(self.size + 512)
-        self.initial = runtime.allocate_uninitialized(self.output_size + 512)
         self.y = runtime.allocate_uninitialized(self.output_size + 512)
         for pointer, size, value in (
             (self.x, self.size, 0x3F),
-            (self.initial, self.output_size, 0),
             (self.y, self.output_size, 0xCD),
         ):
             runtime.call(
@@ -88,7 +86,7 @@ class CacheEviction:
 
     def __call__(self):
         require(
-            self.launch(self.runtime.stream, self.initial, self.x, self.y, self.tiles) == 0,
+            self.launch(self.runtime.stream, self.x, self.y, self.tiles) == 0,
             "cache eviction kernel launch failed",
         )
         self.calls += 1

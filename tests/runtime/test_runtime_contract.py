@@ -16,9 +16,9 @@ from ascendflow.dialects.io import parse
 from ascendflow.dialects.physical import RuntimeSizeOp
 from ascendflow.dialects.source import SizeOp
 from ascendflow.frontend import FrontendError
-from examples.state.grouped import grouped_state_sum
 from examples.vector.scale import scale
 from tests.fixtures.source_programs import cv_source
+from tests.fixtures.state import grouped_state_sum
 from tests.support.host_launcher import contracts, host_launcher
 
 

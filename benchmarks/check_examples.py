@@ -149,28 +149,6 @@ def examples():
         ("--m", "129", "--n", "257", "--k", "259"),
         ("--scope", "full", "--warmup", "1", "--repeats", "1"),
     )
-    add("nested-cv", "cv/nested", "nested_cv", "cv.run")
-    add(
-        "state",
-        "state/recurrence",
-        "state_sum",
-        "state.run",
-        ("--variant", "generated"),
-        ("--counts", "0", "1", "7", "--repeats", "1"),
-    )
-    for name, filename, entry, mode in (
-        ("grouped-state", "grouped", "grouped_state_sum", ()),
-        ("shared-state", "shared_inputs", "shared_state_sum", ("--shared-inputs",)),
-        ("frame-state", "frame_snapshot", "frame_state_sum", ("--frame-snapshot",)),
-    ):
-        add(
-            name,
-            f"state/{filename}",
-            entry,
-            "state.run_grouped",
-            ("--variant", "generated", *mode),
-            ("--cases", "0:0", "1:0", "1:1", "3:7", "--repeats", "1"),
-        )
     add(
         "flash-attention",
         "flash_attention/attention",

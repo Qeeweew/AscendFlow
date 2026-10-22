@@ -15,7 +15,7 @@ from ascendflow.passes.lower_execution import lower_execution
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.simplify_scalars import ScalarFacts, simplify_scalars
 from ascendflow.target.ascend910b import Actor
-from examples.cv.nested import nested_cv
+from tests.fixtures.nested import nested_cv
 from tests.models.structured_events import _Interpret, check_structured_events
 from tests.models.terminal_trace import trace
 

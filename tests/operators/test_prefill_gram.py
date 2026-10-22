@@ -1,8 +1,8 @@
 """Check buffered Gram lifetimes against the independent pre-sync native trace."""
 
 from ascendflow.passes.structured_sync import synchronize_structure
-from examples.kda.prefill import prefill_gram
-from examples.kda.prefill_gram import prefill_gram_cross
+from examples.kda.prefill_gram import prefill_gram
+from examples.kda.prefill_gram_cross import prefill_gram_cross
 from tests.models.structured_events import _Interpret, check_compiled_events
 
 

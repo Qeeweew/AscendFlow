@@ -33,22 +33,23 @@ def test_actual_launcher_accepts_one_binary_for_different_lengths(grouped, tmp_p
         assert library.dispatches() == index
 
 
-def test_cyclic_count_cannot_cancel_an_invalid_unsigned_dividend():
+def test_dynamic_cyclic_dividend_uses_the_caller_input_contract():
     source = grouped_scale.source.replace("total - group", "((total - group) * 3) // 3")
-    with pytest.raises(CompileError, match="source unsigned division"):
-        compile(replace(grouped_scale, source=source))
+    # Dynamic source arithmetic no longer needs uniform host extrema. Callers
+    # must supply lengths making the original division legal on every owner.
+    compile(replace(grouped_scale, source=source))
 
 
 @pytest.mark.parametrize("cancel", ["bad - bad", "bad * 0"])
-def test_source_division_contract_survives_frontend_constant_cancellation(cancel):
+def test_static_invalid_division_survives_frontend_constant_cancellation(cancel):
     definition = T.from_source(f"""
         def bad_index():
             with T.Kernel():
                 x = T.alloc_ub((64,))
                 for t in T.Pipelined(2):
-                    bad = (t - 1) // 2
+                    bad = (-1) // (t + 1)
                     offset = {cancel}
                     T.fill(x[offset:offset+64], 0.0)
 """)
-    with pytest.raises(CompileError, match="source unsigned division"):
+    with pytest.raises(CompileError, match="nonnegative dividend|nonnegative numerator"):
         compile(definition)

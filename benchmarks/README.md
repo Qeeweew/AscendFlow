@@ -22,7 +22,7 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 |---|---|
 | `check_examples.py` | 统一示例清单，CANN 构建、设备数值检查、失败即停 |
 | `profile_defaults.py` | FA/GEMM 多 shape 的 ACLNN 对照、kernel time、加速比与 TFLOPS |
-| `vector/`、`normalization/`、`gemm/`、`cv/`、`state/`、`attention/` | 单个示例 runner；参数用 `python -m <模块> --help` 查看 |
+| `vector/`、`normalization/`、`gemm/`、`kda/`、`attention/` | 单个算子 runner；参数用 `python -m <模块> --help` 查看 |
 | `vector/run_masks.py` | 通用mask示例：`--build`离线共享构建；`--artifact/--library`只校验已发布ASC/共享库/manifest，不重新编译；`--physical`按独立逻辑oracle运行 |
 | `vector/run_mask_rows.py` | 小行/列mask示例：单UB tile、`cols<hi`/`cols!=lo`/`rows>=cols-q` 三输出；同样`--build`或只校验复用`--library`，记录逐输出位精确证据 |
 | `profile.sh`、`profile_summary.py`、`artifacts.py` | msprof 应用包装、设备 task 汇总和产物身份检查 |
@@ -35,21 +35,11 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 | `references/` | 日常 ACLNN 适配器与独立 AscendC 参考 |
 
-Sparse 冷缓存测量通过 `--cache-evict-artifacts <目录>` 启用。驱逐产物复用已有 FP32 递推
-DSL 样例，可在产品仓库内构建：
+Sparse 冷缓存测量通过 `--cache-evict-artifacts <目录>` 启用。驱逐使用测量工具自己的
+[cache_sweep](cache_sweep.py) DSL kernel，可在产品仓库内构建：
 
 ```bash
-python - <<'PY'
-import json
-from pathlib import Path
-from ascendflow.build import build_file
-output = Path("build/l2-evict")
-parameters = {"B": 8192, "GROUPS": 40}
-build_file("examples/state/recurrence.py", output, entry="state_sum",
-           parameters=parameters, shared=True, timeout_s=300)
-(output / "eviction-policy.json").write_text(
-    json.dumps({"parameters": parameters, "tiles": 819}) + "\n")
-PY
+python -m benchmarks.cache_sweep --output build/l2-evict
 ```
 
 每次 attention launch 前在同一 stream 读取独立的 1023.75 MiB 输入，将 checksum 保留在 UB，

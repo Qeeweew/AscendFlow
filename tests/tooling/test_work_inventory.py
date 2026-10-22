@@ -79,7 +79,7 @@ def test_unknown_algorithm_count_requires_an_explicit_status_instead_of_none():
 
 @pytest.mark.parametrize(
     "module_name",
-    ("benchmarks.gemm.analyze", "benchmarks.state.analyze", "benchmarks.normalization.analyze"),
+    ("benchmarks.gemm.analyze", "benchmarks.normalization.analyze"),
 )
 def test_analyzers_diagnose_missing_work_before_using_profile_counts(
     module_name, tmp_path, monkeypatch

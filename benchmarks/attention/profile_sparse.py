@@ -31,7 +31,7 @@ def summarize(directory, warmup, repeats, backend, *, cache_eviction=False):
     for row in rows:
         name = row["OP Type"]
         if name not in expected:
-            if cache_eviction and name == "state_sum":
+            if cache_eviction and name == "cache_sweep":
                 evictions.append(row)
                 continue
             require(
@@ -54,7 +54,7 @@ def summarize(directory, warmup, repeats, backend, *, cache_eviction=False):
         for i, row in enumerate(sequence):
             if row["OP Type"] in expected:
                 require(
-                    i > 0 and sequence[i - 1]["OP Type"] == "state_sum",
+                    i > 0 and sequence[i - 1]["OP Type"] == "cache_sweep",
                     "attention launch was not immediately preceded by eviction",
                 )
                 previous = sequence[i - 1]
@@ -166,7 +166,11 @@ def profile(args, backend, batch, context, trial):
     }
     (output / "command.json").write_text(
         json.dumps(
-            {"command": command, "worker": worker, "application_timeout_s": args.application_timeout},
+            {
+                "command": command,
+                "worker": worker,
+                "application_timeout_s": args.application_timeout,
+            },
             indent=2,
         )
     )

@@ -35,7 +35,7 @@ export ASCEND_RT_VISIBLE_DEVICES=2 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1
 python -m benchmarks.check_examples --output build/examples-device --physical 2
 ```
 
-清单包含 **30 个公开 kernel 入口，按 22 组检查**。每组构建 CANN 共享库，再运行
+清单包含 **26 个公开 kernel 入口，按 18 组检查**。每组构建 CANN 共享库，再运行
 小规模全输出 oracle；KDA prefill 一组包含十个 phase specialization（九个入口），
 检查整个 pipeline 的输出和最终状态，不把这一结果称为每个中间矩阵的独立数值验证。
 检查输入与 guard，包含各自适用的空、单次、多次和跨槽复用情况。GEMM 使用
@@ -49,7 +49,7 @@ KDA recurrent 使用长度 0/1/3/0，decode 使用四个单 token 序列，prefi
 每次构建覆盖 Python→IR→ASC→CANN 的总硬期限为 300 秒。失败或超时立即停止，
 清理该构建进程组，保存日志和失败记录。设备检查也有独立的 300 秒上限。
 `results.json` 汇总命令、状态、源码 hash 和设备记录路径；原始文件留在各示例目录。
-输出目录必须不存在，以免旧记录混入新结果。定位后可用 `--only nested-cv` 等名称
+输出目录必须不存在，以免旧记录混入新结果。定位后可用 `--only kda-recurrent` 等名称
 在新目录重跑相关项；该记录只代表选中的项。
 
 未支持的动态 `valid=` prefix 地址仅保留在[拒绝测试](../../tests/frontend/test_prefix.py)，

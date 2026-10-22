@@ -14,12 +14,37 @@ output/state relative RMSE 门槛均为 `<0.005`。
 
 `TOKENS: N.int64` 是运行时维度。Cu/Indices 是只读 GM int64 tensor；
 Cu 单调，区间满足 `0 <= bos <= eos <= TOKENS` 且 `eos-bos <= 1`。
-`N.load_index` 的 inclusive 范围是调用方输入合同，不是 clamp。
-元数据在 S pipe 有序读取；没有引入新的同步协议。
+Cu 的 `N.load_index` 范围限定实际 token 时钟，用于生成通知的整数算术；
+Indices 使用完整 int64 范围，不为间接地址额外填写范围提示。范围声明是调用方
+输入合同，不生成 clamp；正状态槽及访问合法性仍由调用方保证。元数据在 S pipe
+有序读取。recurrent 与 decode 共用 `delta_step`，保持相同的 FP32 递推和归约次序；
+recurrent 的外积复用 product scratch，不再另存一份广播后的 K 矩阵。
 
 其他 constexpr/dtype 组合需要重新满足 UB 容量及 native 几何合同，并获得自己的设备资格。
 prefill 的算法与精度见 [KDA prefill](kda-prefill.md)。[recurrent.py](../../examples/kda/recurrent.py)
 保留 token 顺序、FP32 carry 与独立快照的实现；不能由 decode 的检查推导其 speculative 等选项的资格。
+
+## 多 token recurrent
+
+每个 Vector block 拥有一个 sequence/head，完整 FP32 carry 在 UB 中跨 token 保留。
+默认 BV=64，只对 state update 做 V 轴分块；Q/K 归一化、gate exp 和 beta 每个
+token/head 只计算一次。不同 V 分块不再各自重复加载和归一化 Q/K。
+
+流水时钟为该序列内的 token ordinal，三阶段依次为双槽输入预取、FP32 更新与
+快照生成、整 head 输出及快照写回。独立的单份快照缓冲允许 MTE3 写回与下一
+token 的 carry 更新重叠；编译器根据快照的最后 reader 约束其复用。
+默认 H=HV=32、K=V=128、BV=64、两输入槽、FP16 输入/输出与 FP32 状态合计
+使用 177216 B UB，不扩大硬件容量。其他 shape/dtype 组合仍须通过真实容量检查。
+
+每个 token 更新后的状态按 `INPLACE` 写入 `Indices` 指定的正槽或 `Snapshots[token]`；
+快照转换为 `STATE_DTYPE`，下一 token 继续使用未经该转换的 FP32 carry。
+`SPECULATIVE` 从 `Accepted[seq]-1` 选择初始状态，正初始槽才激活 indexed 序列。
+空序列和 inactive 序列不写输出或快照，非正快照目的槽不写状态；其他活跃
+token 仍按原顺序更新 carry。Cu 必须满足单调及实际 tensor/索引宽度合同。
+
+`benchmarks.kda.profile --lengths ...` 可以采集编译后的 recurrent 产物，长度总和、
+序列数和索引宽度须与产物一致。例如 4 条各 32 tokens 的配置使用
+`--lengths 32 32 32 32`，kernel 时间以 profiler 的 `Task Duration` 为准。
 
 ## 计算与流水
 

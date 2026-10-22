@@ -36,17 +36,9 @@ PHASES = (
 KERNELS = {p: "prefill_" + ("solve_merge" if p.startswith("solve_merge") else p) for p in PHASES}
 SOURCES = {
     phase: "examples/kda/"
-    + (
-        "prefill_output.py"
-        if phase == "output"
-        else "prefill_prepare.py"
-        if phase == "prepare_full"
-        else "prefill_gram.py"
-        if phase == "gram_cross"
-        else "prefill_solve.py"
-        if phase.startswith("solve")
-        else "prefill.py"
-    )
+    + "prefill_"
+    + ("prepare" if phase == "prepare_full" else "solve" if phase.startswith("solve") else phase)
+    + ".py"
     for phase in PHASES
 }
 RUNTIME_PHASES = {"prepare_full", "prepare", "output"}

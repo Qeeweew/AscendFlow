@@ -302,20 +302,20 @@ def summarize(output):
     # Epoch timestamps exceed float's sub-microsecond precision. Keep exact decimal
     # arithmetic until after subtracting them, including for the eviction boundary.
     rows.sort(key=lambda row: Decimal(row["Task Start Time(us)"]))
-    sequence = [row for row in rows if row["OP Type"] in NAMES or row["OP Type"] == "state_sum"]
+    sequence = [row for row in rows if row["OP Type"] in NAMES or row["OP Type"] == "cache_sweep"]
     calls = [row for row in sequence if row["OP Type"] in NAMES]
     require(
         [row["OP Type"] for row in calls] == [r["kernel"] for r in d["launch_sequence"]],
         "recorded launch order differs from device execution",
     )
     require(
-        sum(row["OP Type"] == "state_sum" for row in sequence) == len(calls) + 1,
+        sum(row["OP Type"] == "cache_sweep" for row in sequence) == len(calls) + 1,
         "eviction launch count differs",
     )
     for i, row in enumerate(sequence):
         if row["OP Type"] in NAMES:
             require(
-                i > 0 and sequence[i - 1]["OP Type"] == "state_sum",
+                i > 0 and sequence[i - 1]["OP Type"] == "cache_sweep",
                 "gather was not immediately preceded by eviction",
             )
             previous = sequence[i - 1]
@@ -329,7 +329,7 @@ def summarize(output):
     require(
         all(
             row["OP Type"] in NAMES
-            or row["OP Type"] == "state_sum"
+            or row["OP Type"] == "cache_sweep"
             or Decimal(row["Task Start Time(us)"]) < first
             for row in rows
         ),

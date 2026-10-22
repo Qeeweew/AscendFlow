@@ -1,10 +1,7 @@
 # KDA prefill
 
-实现位于 [prefill.py](../../examples/kda/prefill.py)、
-[prefill_prepare.py](../../examples/kda/prefill_prepare.py)、
-[prefill_gram.py](../../examples/kda/prefill_gram.py)、
-[prefill_solve.py](../../examples/kda/prefill_solve.py) 和
-[prefill_output.py](../../examples/kda/prefill_output.py)。全部 kernel 使用普通 DSL、
+实现按计算阶段放在 [KDA 示例目录](../../examples/kda/README.md)，每个模块维护该阶段的
+入口和 inline helper。全部 kernel 使用普通 DSL、
 xDSL 自动同步和 ASC/CANN；算法与流水政策在 examples，编译器没有 KDA 特判。
 
 ## 数值与输入合同

@@ -185,7 +185,7 @@ def test_metadata_selected_last_is_not_built_for_an_absent_parent_carry():
     from ascendflow.analysis.structured_memory import collect_native_memory
     from ascendflow.passes.lower_native import lower_native_structure
     from ascendflow.passes.notification_binding import bind_notifications
-    from examples.kda.prefill import prefill_prepare
+    from examples.kda.prefill_prepare import prefill_prepare
 
     # The absent carry is removed before touching an old invocation's load;
     # active endpoints then consume only their real dominating load ranges.

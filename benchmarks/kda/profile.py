@@ -97,6 +97,7 @@ def main():
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--physical", required=True, type=int)
+    parser.add_argument("--lengths", nargs="+", type=int)
     parser.add_argument("--backend", choices=("ascendflow", "triton"), default="ascendflow")
     parser.add_argument("--metrics", choices=("BasicInfo", "Default"), default="BasicInfo")
     parser.add_argument("--summarize-only", action="store_true")
@@ -126,6 +127,8 @@ def main():
             "1",
             "--worker",
         ]
+        if args.lengths is not None:
+            application.extend(("--lengths", *(str(length) for length in args.lengths)))
         os.environ["ASCENDFLOW_PYTHON"] = sys.executable
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
         os.environ.setdefault("OMP_NUM_THREADS", "1")

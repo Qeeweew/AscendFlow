@@ -8,8 +8,8 @@ from ascendflow import language as N
 
 
 @N.inline
-def prepare_gate_load(Starts, chunk, TOKENS, BT, Gate, gates1, head, ring):
-    start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT)
+def prepare_gate_load(Starts, chunk, BT, Gate, gates1, head, ring):
+    start = N.load_index(Starts[chunk : chunk + 1])
     N.copy(Gate[start : start + BT, head, :], gates1[ring, :, :])
 
 
@@ -18,8 +18,8 @@ def prepare_input_load(inputs, buffers, geometry, coordinates):
     Starts, Q, Key, Value, Beta = inputs
     q16, k16, v16, beta8 = buffers
     (BT,) = geometry
-    chunk, TOKENS, lane, head, ring = coordinates
-    start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT)
+    (chunk, lane, head, ring) = coordinates
+    start = N.load_index(Starts[chunk : chunk + 1])
     row = lane * (BT // 2)
     N.copy(Q[start + row : start + row + BT // 2, head, :], q16[ring, :, :])
     N.copy(Key[start + row : start + row + BT // 2, head, :], k16[ring, :, :])
@@ -170,13 +170,13 @@ def prefill_prepare_full(
                 chunk = (full // (NC - 1)) * NC + full % (NC - 1)
                 ring = task % 2
                 with N.Cube(), N.Stage(0, name="gate_load"):
-                    prepare_gate_load(Starts, chunk, TOKENS, BT, Gate, gates1, head, ring)
+                    prepare_gate_load(Starts, chunk, BT, Gate, gates1, head, ring)
                 with N.Vector() as lane, N.Stage(0, name="input_load"):
                     prepare_input_load(
                         (Starts, Q, Key, Value, Beta),
                         (q16, k16, v16, beta8),
                         (BT,),
-                        (chunk, TOKENS, lane, head, ring),
+                        (chunk, lane, head, ring),
                     )
                 with N.Cube(), N.Stage(1, name="gate_prefix"):
                     prepare_gate_prefix(gates0, gates1, ring, lower0, prefixes0, Gp, chunk, head)
@@ -203,3 +203,91 @@ def prefill_prepare_full(
                     prepare_store(
                         (Qp, Kp, Vp, Bp), (q16, k16, v16, betas), (BT,), (lane, ring, chunk, head)
                     )
+
+
+@N.prim_func(disjoint_external=True)
+def prefill_prepare(
+    Q: N.Tensor((TOKENS, H, K), DTYPE),
+    Key: N.Tensor((TOKENS, H, K), DTYPE),
+    Value: N.Tensor((TOKENS, H, K), DTYPE),
+    Gate: N.Tensor((TOKENS, H, K), N.f32),
+    Beta: N.Tensor((TOKENS, H), N.f32),
+    Qp: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
+    Kp: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
+    Vp: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
+    # Full-plane clearing precedes overlapping stores of the valid prefix rows.
+    Gp: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write"),
+    Bp: N.Tensor((CHUNKS, H, BT), N.f32, access="write", write_disjoint=True),
+    Starts: N.Tensor((CHUNKS,), N.i64),
+    Lengths: N.Tensor((CHUNKS,), N.i64),
+    TOKENS: N.int64(minimum=1),
+    SEQUENCES: N.constexpr = 1,
+    NC: N.constexpr = 2,
+    CHUNKS: N.constexpr = 2,
+    H: N.constexpr = 32,
+    K: N.constexpr = 128,
+    BT: N.constexpr = 64,
+    GROUPS: N.constexpr = 40,
+    DTYPE: N.constexpr = N.f16,
+):
+    with N.Kernel(GROUPS, kind="vector") as owner:
+        assert CHUNKS == SEQUENCES * NC and NC > 0, "equal nonempty chunk domains"
+        q16 = N.alloc_ub((BT, K), DTYPE)
+        k16 = N.alloc_ub((BT, K), DTYPE)
+        v16 = N.alloc_ub((BT, K), DTYPE)
+        q = N.alloc_ub((BT, K), N.f32)
+        k = N.alloc_ub((BT, K), N.f32)
+        work = N.alloc_ub((BT, K), N.f32)
+        gates = N.alloc_ub((2, K), N.f32)
+        prefixes = N.alloc_ub((2, K), N.f32)
+        cumulative = N.alloc_ub((K,), N.f32)
+        betas = N.alloc_ub((BT,), N.f32)
+        partial = N.alloc_ub((BT * (K // 8),), N.f32)
+        stat = N.alloc_ub((BT,), N.f32)
+        rows = N.alloc_ub((BT, 8), N.f32)
+        for task in N.serial(N.ceildiv(N.max(0, SEQUENCES * H - owner), GROUPS)):
+            flat = owner + task * GROUPS
+            chunk, head = (flat // H) * NC + NC - 1, flat % H
+            start = N.load_index(Starts[chunk : chunk + 1])
+            # The tail chunk is nonempty; this bounds its pipeline clock.
+            valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
+            N.fill(q, 0.0)
+            N.cast(q, out=q16)
+            N.cast(q, out=k16)
+            N.cast(q, out=v16)
+            N.copy(q, Gp[chunk, head, :, :])
+            N.fill(cumulative, 0.0)
+            N.fill(betas, 0.0)
+            for row in N.Pipelined(valid):
+                token = start + row
+                ring = row % 2
+                with N.Stage(0, name="load"):
+                    N.copy(Q[token, head, :], q16[row, :])
+                    N.copy(Key[token, head, :], k16[row, :])
+                    N.copy(Value[token, head, :], v16[row, :])
+                    N.copy(Gate[token, head, :], gates[ring, :])
+                    coefficient = N.load_scalar(Beta[token, head : head + 1])
+                    N.store_scalar(coefficient, out=betas[row : row + 1])
+                with N.Stage(1, name="prefix"):
+                    N.add(cumulative, gates[ring, :], out=cumulative)
+                    N.copy(cumulative, prefixes[ring, :])
+                with N.Stage(2, name="store"):
+                    N.copy(prefixes[ring, :], Gp[chunk, head, row, :])
+            N.cast(q16, out=q)
+            N.cast(k16, out=k)
+            N.mul(q, q, out=work)
+            N.reduce_sum(work, axis=1, out=stat, scratch=partial, order="block8_then_packed_merge")
+            N.add(stat, 1e-6, out=stat)
+            N.rsqrt(stat, out=stat)
+            N.mul(q, stat[:, None], out=q, scratch=rows)
+            N.cast(q, out=q16)
+            N.mul(k, k, out=work)
+            N.reduce_sum(work, axis=1, out=stat, scratch=partial, order="block8_then_packed_merge")
+            N.add(stat, 1e-6, out=stat)
+            N.rsqrt(stat, out=stat)
+            N.mul(k, stat[:, None], out=k, scratch=rows)
+            N.cast(k, out=k16)
+            N.copy(q16, Qp[chunk, head, :, :])
+            N.copy(k16, Kp[chunk, head, :, :])
+            N.copy(v16, Vp[chunk, head, :, :])
+            N.copy(betas, Bp[chunk, head, :])

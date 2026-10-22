@@ -76,9 +76,10 @@ def decode_kda(
         if GATE_DTYPE != N.f32:
             gate_input = N.alloc_ub((PIPE_SLOTS, K), GATE_DTYPE, name="gate_input")
         seq = owner // HEAD_GROUPS
+        # This clock covers at most one token; slot addresses need no range hints.
         bos = N.load_index(Cu[seq : seq + 1], minimum=0, maximum=TOKENS)
         eos = N.load_index(Cu[seq + 1 : seq + 2], minimum=bos, maximum=N.min(TOKENS, bos + 1))
-        slot = N.load_index(Indices[seq, :], minimum=0, maximum=SLOTS - 1)
+        slot = N.load_index(Indices[seq, :])
         if slot > 0:
             for token in N.serial(bos, eos):
                 for item in N.Pipelined(

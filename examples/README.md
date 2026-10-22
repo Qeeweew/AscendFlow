@@ -23,11 +23,6 @@ python -m benchmarks.check_examples --output build/examples-cann
 | `hierarchical-gemm` | [gemm/hierarchical.py](gemm/hierarchical.py) · `hierarchical_gemm` | 输出块循环嵌套 K 流水 |
 | `dense-gemm` | [gemm/dense.py](gemm/dense.py) · `dense_gemm` | 连续 NT、FP16 输入/FP32 输出 |
 | `gemm` | [gemm/matmul.py](gemm/matmul.py) · `gemm` | 连续 NN、FP16/BF16、静态尾块 |
-| `nested-cv` | [cv/nested.py](cv/nested.py) · `nested_cv` | 嵌套混合流水、共享 GM、双 AIV 共用 body |
-| `state` | [state/recurrence.py](state/recurrence.py) · `state_sum` | 初始化、FP32 递推、导出 |
-| `grouped-state` | [state/grouped.py](state/grouped.py) · `grouped_state_sum` | 两个 runtime 轴、跨调用复用 |
-| `shared-state` | [state/shared_inputs.py](state/shared_inputs.py) · `shared_state_sum` | 多调用共享只读输入 |
-| `frame-state` | [state/frame_snapshot.py](state/frame_snapshot.py) · `frame_state_sum` | snapshot、WAR、最后读取 |
 | `flash-attention` | [flash_attention/attention.py](flash_attention/attention.py) · `attention_target` | QK/softmax/PV/update 多级 CV 流水 |
 | `sparse-mla` | [sparse_attention/gather.py](sparse_attention/gather.py) / [attention.py](sparse_attention/attention.py) | V4.1 decode/prefill、分页 shared-KV、稀疏 TopK、sink 与双 AIV 流水 |
 | `scalar-store` | [vector/scalar_store.py](vector/scalar_store.py) · `scalar_store` | Scalar capture/store 与精确 FP32 检查 |
@@ -41,7 +36,7 @@ python -m benchmarks.check_examples --output build/examples-cann
 单个示例可用 CLI 构建，例如：
 
 ```bash
-python -m ascendflow --input examples/cv/nested.py --entry nested_cv --shared --timeout 300 --output build/nested-cv
+python -m ascendflow --input examples/vector/scale.py --entry scale --shared --timeout 300 --output build/scale
 ```
 
 设备运行器可按[工具目录](../benchmarks/README.md)查找。普通 GEMM 的尺寸、dtype、
@@ -59,3 +54,13 @@ V4.1 的计算入口、缓存与索引条件、数值和接入边界见
 GEMM normal 的多 shape ACLNN 对照及 TFLOPS 采集见[测试指南](../docs/guide/testing.md)。
 动态 `valid=` prefix 地址等未支持形式保留在拒绝测试中，不作为 runnable example；
 runner 接受某个参数不代表该变体已经设备验证。
+
+示例遵守当前[动态访问与标量合同](../docs/guide/dsl.md)：`load_index` 默认保留源
+整数 dtype 的完整有符号范围，普通间接地址不需要逐个填写 `minimum/maximum`。
+实际访问合法、metadata 单调及状态槽互斥等仍由调用方保证；决定通知时钟的循环
+metadata 可以声明必要的有限范围。静态非法原式、物理容量和同步资源仍由编译器检查。
+
+整数元数据也可用普通 `copy` 批量预取到 UB，再用 `load_index` 读取；DMA 的对齐、
+初始化、ready 和最后 reader 退休合同保持不变。具体索引、页表缓存与双槽 gather 流水见
+[sparse attention](sparse_attention/attention.py) 和 [gather](sparse_attention/gather.py)。
+其他算子按实际复用选择缓存，KDA 的 GM int64 ABI 保持原有合同。

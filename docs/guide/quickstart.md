@@ -121,4 +121,4 @@ print(artifact.asc)
 stream、设备指针和标量，不检查这些输入；不要提交负尺寸、越界指针或重叠 buffer
 来测试 host 拒绝。自建 launcher 集成按生成 `.asc` 中的 `launch_<entry>` 命名参数绑定
 ABI，使用设备地址并保持 allocation 存活直到 stream 完成；设备示例见
-[vector runner](../../benchmarks/vector/run.py)和[CV runner](../../benchmarks/cv/run.py)。
+[vector runner](../../benchmarks/vector/run.py)和[FA runner](../../benchmarks/attention/run.py)。

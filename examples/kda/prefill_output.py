@@ -57,21 +57,17 @@ def output_merge(buffers, task, geometry):
 def output_store(buffers, task, geometry):
     output, Output, Starts, Lengths = buffers
     chunk, head, ring, lane = task
-    BT, NC, TOKENS = geometry
+    (BT, NC) = geometry
     row = lane * (BT // 2)
     if chunk % NC < NC - 1:
-        full_start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - BT)
+        full_start = N.load_index(Starts[chunk : chunk + 1])
         N.copy(
             output[ring, :, :],
             Output[full_start + row : full_start + row + BT // 2, head, :],
         )
     else:
-        tail_start = N.load_index(Starts[chunk : chunk + 1], minimum=0, maximum=TOKENS - 1)
-        valid = N.load_index(
-            Lengths[chunk : chunk + 1],
-            minimum=1,
-            maximum=N.min(BT, TOKENS - tail_start),
-        )
+        tail_start = N.load_index(Starts[chunk : chunk + 1])
+        valid = N.load_index(Lengths[chunk : chunk + 1])
         for token in N.serial(N.min(BT // 2, N.max(0, valid - row))):
             N.copy(
                 output[ring, token, :],
@@ -133,6 +129,4 @@ def prefill_output(
             with N.Vector(), N.Stage(1, name="merge"):
                 output_merge((products, total, output), (ring,), (K,))
             with N.Vector() as lane, N.Stage(2, name="store"):
-                output_store(
-                    (output, Output, Starts, Lengths), (chunk, head, ring, lane), (BT, NC, TOKENS)
-                )
+                output_store((output, Output, Starts, Lengths), (chunk, head, ring, lane), (BT, NC))

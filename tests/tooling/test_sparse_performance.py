@@ -121,12 +121,12 @@ def test_gather_eviction_boundary_preserves_precision_at_epoch_timestamps(tmp_pa
         )
     )
     epoch = Decimal("1792645861338118.182")
-    rows = [("state_sum", "AI_VECTOR_CORE", epoch - 1000, 10)]
+    rows = [("cache_sweep", "AI_VECTOR_CORE", epoch - 1000, 10)]
     for i, name in enumerate(NAMES):
         start = epoch + i * 1000
         rows.extend(
             [
-                ("state_sum", "AI_VECTOR_CORE", start, "764.376"),
+                ("cache_sweep", "AI_VECTOR_CORE", start, "764.376"),
                 (name, "AI_VECTOR_CORE", start + Decimal("764.376") + Decimal(gap_us), 1),
             ]
         )
