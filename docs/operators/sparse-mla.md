@@ -13,6 +13,24 @@ prefill、chunked prefill 和推测译码验证阶段。滑窗 KV 与稀疏压�
 `topk_value_mode=1`。这是该调用的 C1/C2 计算子集，有自己的 workspace 和 launcher，
 不提供 vLLM 插件注册或 ACLNN ABI 替换。
 
+## DeepSeek V4.1 Flash 的 DSpark query 数
+
+[DeepSeek-V4.1-Flash-1017 配置](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4.1-Flash-1017/resolve/master/config.json)
+给出 H=64、KV-head=1、D=512、window=128、index TopK=512，
+`dspark_block_size=5`、`num_nextn_predict_layers=3`。
+[配套 vllm-ascend 部署示例](https://github.com/vllm-project/vllm-ascend/blob/2581a69bcc16ee6af56e72985a15799bb5f61808/docs/source/tutorials/models/DeepSeek-V4.1-Flash.md)
+使用 `{"method":"dspark","num_speculative_tokens":5}`。
+
+该部署的主模型满宽验证包含 **5 个 draft token + 1 个普通 decode token**，
+每请求 6 个 query，因此 benchmark 使用 `--query-tokens 6`；B64 对应 T384，
+B128 对应 T768。3 是 draft 层数，不是每请求 query 数；draft 在
+`sample_from_anchor=True` 时自身使用 5 个 query，与 target 验证的 6 个不同。
+动态调度可缩短实际验证长度，调用方应以真实 `cu_seqlens_q` 为准。
+
+这里覆盖主模型的因果 C1/C2 验证 attention；DSpark draft 的非因果 SWA 不在
+当前合同内。配置中的 `max_position_embeddings=1048576` 是模型上下文上限，
+不是每次 decode 的上下文长度；测量必须另外标明实际上下文。
+
 ## 计算与输入
 
 Q/O 使用 `[T,H,D]`，B 是请求数，T 是本次所有请求的 query token 总数。
@@ -196,6 +214,10 @@ python -m benchmarks.check_examples --only sparse-mla --output build/sparse-smok
 # B1 prefill 使用同一个入口，query 数由 T 指定。
 python -m benchmarks.attention.run_sparse --build --batch 1 --query-tokens 8192 \
   --max-seq 131072 --output build/sparse-prefill
+
+# DSpark 主模型满宽验证：每请求 6 query，B64/T384，缓存容量 128K。
+python -m benchmarks.attention.run_sparse --build --batch 64 --query-tokens 6 \
+  --max-seq 131072 --output build/sparse-dspark-b64
 ```
 
 只做 Python/IR 检查时加 `--ir-only`。每个构建共享 300 秒硬期限，失败即停。

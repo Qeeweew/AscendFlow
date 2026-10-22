@@ -41,8 +41,8 @@ AscendFlow 是基于 **xDSL**、面向 **Ascend 910B / dav-2201** 的算子编�
 
 实现 DeepSeek V4.1 的分页 shared-KV attention 核心：因果滑窗、稀疏压缩 KV 与 sink
 共同归一化，支持多 query 的 prefill 和推测译码验证。
-表中为 C2 prefill，**B=1、H=64、D=512、BF16、window=128、TopK=512、压缩倍率=2**。
-上下文长度包含本次 query chunk，1K=1024 tokens。
+以下均为 **C2、H=64、KV-head=1、D=512、BF16、window=128、TopK=512、压缩倍率=2**。
+上下文长度包含本次 query chunk，1K=1024 tokens。Prefill 使用 B=1：
 
 | Query / 上下文 | AscendFlow | vllm-ascend 官方 AscendC | 加速比 |
 | --- | ---: | ---: | ---: |
@@ -54,10 +54,23 @@ AscendFlow 是基于 **xDSL**、面向 **Ascend 910B / dav-2201** 的算子编�
 FP32 数值参考检查。所选有效行对应的 QK+PV 有效吞吐约 **100 TFLOPS**，
 按 BF16 矩阵乘、FP32 累加计数，FMA=2；softmax、gather 等耗时仍包含在分母中。
 
+Decode 按 **DeepSeek-V4.1-Flash-1017** 配套 vllm-ascend 的 DSpark 部署配置，
+`num_speculative_tokens=5`。主模型满宽验证每请求包含 **5 个 draft token + 1 个普通
+decode token，共 6 个 query**。这里选择 **128K 上下文**，模型配置中的上限为 1M。
+
+| 请求数 B / Query 总数 T | AscendFlow | vllm-ascend 官方 AscendC | 加速比 |
+| --- | ---: | ---: | ---: |
+| 64 / 384 | 0.410 ms | 0.440 ms | **1.07×** |
+| 128 / 768 | 0.810 ms | 0.830 ms | **1.02×** |
+
+Decode 采集 3 轮并交替双方顺序，每轮预热 3 次、测量 30 次，报告各轮中位数的中位数。
+调用前的 L2 驱逐与计时范围同上；两组配置的双方输出均通过独立 FP32 参考，
+数值验证与性能采集的输入 hash 一致。这是 target 的因果验证 attention。
+
 实现通过私有 UB 缓存索引与页表、跨 Cube/Vector 流水、Q/P/KV 存储复用和
 prefill 常驻环形窗口减少搬运。计算、缓存与复用政策都在 DSL 中表达。
 范围与精度见 [Sparse MLA 合同](docs/operators/sparse-mla.md)；核心不包含索引器、
-压缩器或完整模型服务。
+压缩器或完整模型服务，也不覆盖 DSpark draft 的非因果 SWA。
 
 ### KDA
 
