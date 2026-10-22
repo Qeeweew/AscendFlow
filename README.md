@@ -9,7 +9,7 @@ AscendFlow 是基于 **xDSL**、面向 **Ascend 910B / dav-2201** 的算子编�
 [快速上手](docs/guide/quickstart.md) · [DSL](docs/guide/dsl.md) ·
 [算子示例](examples/README.md) · [编译器设计](docs/development/README.md)
 
-![AscendFlow：从 Python DSL、真实访问与生命周期分析，到自动同步和 Ascend 910B 执行；下方展示双槽流水的 ready 与 release](docs/assets/ascendflow-design.svg)
+![AscendFlow：从 Python DSL、真实访问与生命周期分析，到自动同步和 Ascend 910B 执行；下方展示 attention 的 Cube/Vector 流水与双槽复用](docs/assets/ascendflow-design.svg)
 
 ## 设计理念
 
@@ -103,38 +103,60 @@ Sparse 与 KDA 的缓存和采样条件不同，各自与其参照比较；其�
 
 ## 一段 DSL，一条流水
 
-下面的完整 kernel 使用两槽 UB，对运行时数量的 tile 逐元素乘 2：
+用一个整块 **non-causal attention** 展示 Cube 与 Vector 的协作：
+`O = softmax(Q @ K.T / sqrt(128)) @ V`。
+固定 **head dimension=128、K/V 长度=128、query tile=64**，query 长度为 64 的正整数倍。
+Q/K/V 与输出为 FP16，分数与 softmax 统计为 FP32，归一化的 P 转为 FP16 后参与 PV。
+
+每个 head 对应一组 1 AIC + 2 AIV，两个 AIV 各处理 32 行。
+K/V 预载后常驻 L0；`Score`、`P`、`PV` 各用两个 GM 槽在 Cube/Vector 间传递。
+下面是[完整示例](examples/flash_attention/simple.py)的流水主体，缓冲区声明与 K/V 预载见源码：
 
 ```python
-from __future__ import annotations
-
-from ascendflow import language as N
-
-
-@N.prim_func(disjoint_external=True)
-def scale(
-    X: N.Tensor((tiles, B), N.f32),
-    Y: N.Tensor((tiles, B), N.f32, access="write"),
-    tiles: N.int64,
-    B: N.constexpr = 64,
-):
-    with N.Kernel(1, kind="vector"):
-        x = N.alloc_ub((2, B), N.f32)
-        y = N.alloc_ub((2, B), N.f32)
-        for t in N.Pipelined(tiles):
-            slot = t % 2
-            with N.Stage(0, name="load"):
-                N.copy(X[t, :], x[slot, :])
-            with N.Vector(), N.Stage(1, name="compute"):
-                N.mul(x[slot, :], 2.0, out=y[slot, :])
-            with N.Stage(2, name="store"):
-                N.copy(y[slot, :], Y[t, :])
+for tile in N.Dataflow(S // 64):
+    q = tile * 64
+    slot = tile % 2
+    with N.Cube(), N.Stage(0, name="qk"):
+        N.copy(Q[head, q : q + 64, :], q1)
+        N.copy(q1, q0)
+        N.matmul(q0, k0, accum=score0, initialize=True)
+        N.copy(score0, Score[head, slot, :, :])
+    with N.Vector() as lane, N.Stage(0, name="softmax"):
+        r = lane * 32
+        N.copy(Score[head, slot, r : r + 32, :], score)
+        N.mul(score, 0.08838834764831845, out=score)
+        N.reduce_max(
+            score,
+            axis=1,
+            out=maximum,
+            scratch=partial[:, :2],
+            order="r64_then_packed_merge",
+        )
+        N.sub(score, maximum[:, None], out=score, scratch=broadcast)
+        N.exp(score, out=score)
+        N.reduce_sum(
+            score, axis=1, out=total, scratch=partial[:, :2], order="r64_then_packed_merge"
+        )
+        N.div(score, total[:, None], out=score, scratch=broadcast)
+        N.cast(score, out=probability)
+        N.copy(probability, P[head, slot, r : r + 32, :])
+    with N.Cube(), N.Stage(1, name="pv"):
+        N.copy(P[head, slot, :, :], p1)
+        N.copy(p1, p0)
+        N.matmul(p0, v0, accum=output0, initialize=True)
+        N.copy(output0, PV[head, slot, :, :])
+    with N.Vector() as lane, N.Stage(1, name="store"):
+        r = lane * 32
+        N.copy(PV[head, slot, r : r + 32, :], output)
+        N.cast(output, out=result)
+        N.copy(result, O[head, q + r : q + r + 32, :])
 ```
 
-作者选择 buffer 和三个阶段，编译器生成跨 pipe 的 Set/Wait 与复用约束。
-`tiles` 保持运行时参数，同一二进制处理空、短和长循环。完整示例及入口见
-[scale.py](examples/vector/scale.py)，混合 Cube/Vector 流水见
-[Sparse MLA](examples/sparse_attention/attention.py)。
+作者指定 QK、softmax、PV、写回四个阶段，编译器从实际读写生成 ready 与 release。
+例如 `Score[slot]` 在两个 AIV 都完成 GM→UB 读取后即可复用，后续 softmax 仍可继续；
+同槽下一代的写入等待这些真实 reader 退休。代码不填写 Set/Wait 或 event ID。
+此示例已通过独立 FP32 数值检查；长上下文的 KV 分块与在线 softmax 见
+[Flash Attention](examples/flash_attention/attention.py)。
 
 ## 开始使用
 
@@ -144,14 +166,14 @@ def scale(
 python3 -m venv ../.venv  # 已有工作区环境可跳过
 source ../.venv/bin/activate
 python -m pip install -e '.[dev,validation]'
-python -m ascendflow --input examples/vector/scale.py --entry scale --output build/quickstart/scale
+python -m ascendflow --input examples/flash_attention/simple.py --entry simple_attention --output build/quickstart/attention
 ```
 
 这会生成 source IR、同步前后 IR 与 ASC。生成共享库时加载 CANN 环境并增加 `--shared`：
 
 ```bash
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
-python -m ascendflow --input examples/vector/scale.py --entry scale --shared --output build/quickstart/scale-shared
+python -m ascendflow --input examples/flash_attention/simple.py --entry simple_attention --shared --output build/quickstart/attention-shared
 ```
 
 构建命令不运行设备，每个算子构建的 Python→IR→ASC→CANN 共用 300 秒硬期限。

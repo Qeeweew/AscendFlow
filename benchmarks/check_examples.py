@@ -157,6 +157,22 @@ def examples():
         (),
         ("--cases", "256:1024", "768:3072", "--repeats", "1"),
     )
+    result.append(
+        Example(
+            "simple-attention",
+            (("examples/flash_attention/simple.py", "simple_attention"),),
+            (
+                "ascendflow",
+                "--input",
+                "examples/flash_attention/simple.py",
+                "--entry",
+                "simple_attention",
+                "--shared",
+            ),
+            ("benchmarks.attention.run_simple", "--artifact", "{output}"),
+            "validation",
+        )
+    )
     source, entry = "examples/vector/scalar_store.py", "scalar_store"
     result.append(
         Example(

@@ -24,6 +24,7 @@ python -m benchmarks.check_examples --output build/examples-cann
 | `dense-gemm` | [gemm/dense.py](gemm/dense.py) · `dense_gemm` | 连续 NT、FP16 输入/FP32 输出 |
 | `gemm` | [gemm/matmul.py](gemm/matmul.py) · `gemm` | 连续 NN、FP16/BF16、静态尾块 |
 | `flash-attention` | [flash_attention/attention.py](flash_attention/attention.py) · `attention_target` | QK/softmax/PV/update 多级 CV 流水 |
+| `simple-attention` | [flash_attention/simple.py](flash_attention/simple.py) · `simple_attention` | 整块 non-causal attention 教学示例，D128、四阶段与两槽 workspace |
 | `sparse-mla` | [sparse_attention/gather.py](sparse_attention/gather.py) / [attention.py](sparse_attention/attention.py) | V4.1 decode/prefill、分页 shared-KV、稀疏 TopK、sink 与双 AIV 流水 |
 | `scalar-store` | [vector/scalar_store.py](vector/scalar_store.py) · `scalar_store` | Scalar capture/store 与精确 FP32 检查 |
 | `kda-recurrent` | [kda/recurrent.py](kda/recurrent.py) · `recurrent_kda` | token 顺序递推、FP32 carry 与独立快照 |

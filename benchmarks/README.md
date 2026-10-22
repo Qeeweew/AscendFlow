@@ -35,6 +35,12 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 | `references/` | 日常 ACLNN 适配器与独立 AscendC 参考 |
 
+README 的整块 non-causal attention 教学示例使用 `attention/run_simple.py` 验证：
+默认 H4/Sq256/Sk128/D128，检查随机输入和均匀 softmax，每组复用 workspace 调用三次，
+对比独立 FP32 NumPy 参考并检查输入和尾哨兵。统一入口为
+`python -m benchmarks.check_examples --only simple-attention --output build/simple-attention`，
+完成全卡检查和显式映射后增加 `--physical <物理卡号>` 进行设备检查。
+
 Sparse 冷缓存测量通过 `--cache-evict-artifacts <目录>` 启用。驱逐使用测量工具自己的
 [cache_sweep](cache_sweep.py) DSL kernel，可在产品仓库内构建：
 
