@@ -13,8 +13,8 @@ from ascendflow import language as N
 def scale_prefix(
     X: N.Tensor((n,), N.f32),  # noqa: F821 - DSL signature scope
     Y: N.Tensor((m,), N.f32, access="write"),  # noqa: F821
-    n: N.int64,
-    m: N.int64,
+    n: N.i64,
+    m: N.i64,
     B: N.constexpr = 64,
 ):
     with N.Kernel(1, kind="vector"):

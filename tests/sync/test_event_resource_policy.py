@@ -149,7 +149,7 @@ def test_joint_exclusive_recoloring_precedes_an_available_sharing_permission():
 def test_absent_carry_is_proved_before_selecting_an_unavailable_old_metadata_value(monkeypatch):
     source = """
 def bounded(X:N.Tensor((n,64),N.f32),Meta:N.Tensor((n,),N.i64),
-            Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+            Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="vector"):
         row=N.alloc_ub((2,64),N.f32)
         for i in N.Pipelined(N.min(n,1)):

@@ -83,7 +83,6 @@ _SYNTAX = {
     "ceildiv",
     "min",
     "max",
-    "int64",
     "constexpr",
 }
 _CONSTANTS = {"f32", "f16", "bf16", "i32", "i64"}
@@ -329,19 +328,20 @@ class _Parser:
             if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
                 annotation = ast.parse(annotation.value, mode="eval").body
             if annotation is None:
-                self.fail(arg, "expected Tensor, int64, or constexpr annotation")
+                self.fail(arg, "expected Tensor, i64, or constexpr annotation")
             annotations[arg.arg] = annotation
             target = annotation.func if isinstance(annotation, ast.Call) else annotation
-            if isinstance(target, ast.Attribute) and target.attr in {"int64", "constexpr"}:
-                kind = self.expr(target)
-                if kind == _Symbol("int64"):
-                    if arg.arg in defaults:
-                        self.fail(arg, "runtime scalars cannot have specialization defaults")
-                    runtime[arg.arg] = annotation
-                else:
-                    if isinstance(annotation, ast.Call):
-                        self.fail(annotation, "constexpr annotation does not accept arguments")
-                    constexpr[arg.arg] = arg
+            kind = self.expr(target)
+            if kind is syntax.i64:
+                if arg.arg in defaults:
+                    self.fail(arg, "runtime scalars cannot have specialization defaults")
+                runtime[arg.arg] = annotation
+            elif kind == _Symbol("constexpr"):
+                if isinstance(annotation, ast.Call):
+                    self.fail(annotation, "constexpr annotation does not accept arguments")
+                constexpr[arg.arg] = arg
+            elif isinstance(kind, syntax.DType):
+                self.fail(arg, "runtime scalar parameters require i64")
         bound = dict(self.definition.specializations)
         unknown = set(bound) - constexpr.keys()
         if unknown:
@@ -360,9 +360,9 @@ class _Parser:
             if isinstance(annotation, ast.Call):
                 values, options = self.arguments(annotation)
                 if values or set(options) - {"minimum", "multiple_of"}:
-                    self.fail(annotation, "int64 accepts only minimum and multiple_of keywords")
+                    self.fail(annotation, "i64 accepts only minimum and multiple_of keywords")
                 if len(options) != len(annotation.keywords):
-                    self.fail(annotation, "int64 contract keywords cannot repeat")
+                    self.fail(annotation, "i64 contract keywords cannot repeat")
             try:
                 self.env[name] = contracts.dynamic(name, **options)
             except CompileError as error:

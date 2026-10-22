@@ -15,7 +15,7 @@ def conditional_loads(*, reuse):
 def repeated(X:N.Tensor((n,m,9,64),N.f32),
              Out:N.Tensor((n,m,9,64),N.f32,access="write",write_disjoint=True),
              Meta:N.Tensor((n,m,9),N.i64),
-             n:N.int64,m:N.int64):
+             n:N.i64,m:N.i64):
     with N.Kernel(1,kind="vector"):
         x=N.alloc_ub(({buffers},64),N.f32)
         with N.Vector():
@@ -86,7 +86,7 @@ def disjoint_loop_episodes(*, scalar):
         )
     return N.from_source(
         'def episodes(Out:N.Tensor((9,n,64),N.f32,access="write",write_disjoint=True),'
-        "n:N.int64,m:N.int64):\n"
+        "n:N.i64,m:N.i64):\n"
         '    with N.Kernel(1,kind="vector"):\n'
         + declarations
         + "\n        with N.Vector():\n"
@@ -113,7 +113,7 @@ def test_two_required_handoffs_may_join_at_later_work_in_the_same_queue():
         """
 def patches(X:N.Tensor((n,16,64),N.f32),
             O:N.Tensor((n,16,64),N.f32,access="write",write_disjoint=True),
-            Masks:N.Tensor((n,16),N.f32,access="write",write_disjoint=True),n:N.int64):
+            Masks:N.Tensor((n,16),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="vector"):
         x=N.alloc_ub((2,16,64),N.f32)
         masks=N.alloc_ub((2,16),N.f32)
@@ -148,7 +148,7 @@ def test_nested_bursts_check_last_consumption_and_next_outer_invocation():
         for i in range(9)
     )
     source = (
-        'def bursts(n:N.int64):\n    with N.Kernel(1,kind="vector"):\n'
+        'def bursts(n:N.i64):\n    with N.Kernel(1,kind="vector"):\n'
         + declarations
         + "\n        for outer in N.Pipelined(n):\n"
         + bursts
@@ -170,7 +170,7 @@ def test_contained_windows_reuse_only_under_pressure_and_keep_real_consumption(p
         for i in range(panels)
     )
     source = (
-        'def prefixes(n:N.int64):\n    with N.Kernel(1,kind="vector"):\n'
+        'def prefixes(n:N.i64):\n    with N.Kernel(1,kind="vector"):\n'
         + declarations
         + "\n        for outer in N.Pipelined(n):\n"
         + bursts
@@ -188,7 +188,7 @@ def test_alternating_child_bursts_preserve_consumptions_across_empty_and_short_i
     read_odd = "N.load_scalar(b[:1])" if scalar else "N.copy(b,Out[i,k,:])"
     definition = N.from_source(
         f"""
-def phases(Out:N.Tensor((n,3,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+def phases(Out:N.Tensor((n,3,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="vector"):
         a=N.alloc_ub((64,),N.f32)
         b=N.alloc_ub((64,),N.f32)

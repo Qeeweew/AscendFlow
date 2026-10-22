@@ -17,8 +17,8 @@ from tests.models.structured_events import check_structured_events
 def window_import(
     ori_kv: N.Tensor((2, 128, 1, 128), N.f16),
     Table: N.Tensor((1, 2), N.i32),
-    length: N.int64,
-    requested: N.int64,
+    length: N.i64,
+    requested: N.i64,
 ):
     with N.Kernel(kind="cube"):
         x = N.alloc_l1((128, 128), N.f16)

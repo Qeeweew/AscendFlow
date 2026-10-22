@@ -165,7 +165,7 @@ def test_exact_integer_limits_reject_unsafe_forms_and_emit_floor_division():
         return N.from_source(
             f"""
             def kernel(X:N.Tensor((8,128),N.f32), Y:N.Tensor((8,128),N.f32,access="write"),
-                       q:N.int64):
+                       q:N.i64):
                 with N.Kernel(1, kind="vector"):
                     work=N.alloc_ub((8,128),N.f32)
                     N.copy(X,work)

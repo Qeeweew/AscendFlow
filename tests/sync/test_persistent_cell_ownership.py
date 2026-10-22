@@ -25,8 +25,8 @@ from tests.support.structured import native_memory
 
 def two_readers():
     source = LOCAL_SOURCE.replace(
-        "n:N.int64):",
-        'Mirror:N.Tensor((n,4,64),N.f32,access="write",write_disjoint=True),n:N.int64):',
+        "n:N.i64):",
+        'Mirror:N.Tensor((n,4,64),N.f32,access="write",write_disjoint=True),n:N.i64):',
     )
     source = source.replace(
         "N.copy(scratch[child%2,:],Out[parent,child,:])",
@@ -91,7 +91,7 @@ def test_persistent_cells_use_the_real_eight_id_local_bank():
 def test_a_shared_conditional_activation_preserves_credit_when_the_call_is_skipped():
     source = """
 def conditional(X:N.Tensor((n,4,64),N.f32),
-                Out:N.Tensor((n,4,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+                Out:N.Tensor((n,4,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="vector"):
         scratch=N.alloc_ub((2,64),N.f32)
         with N.Vector():
@@ -115,7 +115,7 @@ def test_slot_visits_use_parent_entry_relations_without_assuming_a_child_exists(
     # absent. The loop's own body domain must not prove its slot populated.
     source = f"""
 def prefix(X:N.Tensor((n,2,4,64),N.f32),
-           Out:N.Tensor((n,2,4,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+           Out:N.Tensor((n,2,4,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="vector"):
         scratch=N.alloc_ub((2,64),N.f32)
         with N.Vector():

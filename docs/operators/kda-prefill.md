@@ -10,7 +10,7 @@ xDSL 自动同步和 ASC/CANN；算法与流水政策在 examples，编译器没
 H=HV、H 为 8 的正整数倍、BT=64，启用 Q/K L2 归一化，Gate 为非正的 log 衰减值。
 state 布局为 `[sequence, head, V, K]`。
 每条序列的 chunk 数相同且非零；最后一个 chunk 可以不足 64 tokens，长度可以不同。
-`TOKENS: N.int64(minimum=1)` 是运行时值，Starts/Lengths 为不可变 GM i64 元数据。
+`TOKENS: N.i64(minimum=1)` 是运行时值，Starts/Lengths 为不可变 GM i64 元数据。
 调用方保证每个 chunk 在对应序列内且 `1 <= valid <= min(64, TOKENS-start)`，
 各序列只有最后一个 chunk 可以不满 64 tokens。
 当前 runner 拒绝零长度和不同 chunk 数的序列；不由此推导 grouped heads、speculative

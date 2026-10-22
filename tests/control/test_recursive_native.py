@@ -75,7 +75,7 @@ def test_large_count_retains_identical_native_and_control_work():
 @pytest.mark.parametrize("n", [0, 1, 3, 8])
 def test_serial_carry_and_if_results_keep_zero_iteration_initial_value(n):
     source = N.from_source("""
-        def carry(n:N.int64):
+        def carry(n:N.i64):
             with N.Kernel():
                 total=7
                 for i in N.serial(1,n,2):
@@ -144,7 +144,7 @@ def test_empty_pipeline_exports_last_selection_without_inventing_completion():
 
 def test_stale_tile_remains_an_explicit_unresolved_writer_requirement():
     source = N.from_source("""
-        def stale(X:N.Tensor((n,64),N.f32),n:N.int64):
+        def stale(X:N.Tensor((n,64),N.f32),n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 y=N.alloc_ub((64,))
@@ -162,7 +162,7 @@ def test_stale_tile_remains_an_explicit_unresolved_writer_requirement():
 
 def test_cross_stage_scalar_capture_is_not_silently_cloned_or_treated_as_complete():
     source = N.from_source("""
-        def scalar(n:N.int64):
+        def scalar(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 y=N.alloc_ub((64,))

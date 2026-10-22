@@ -10,9 +10,9 @@
 |---|---|
 | `@T.prim_func` | 捕获源码、参数及位置 |
 | `@T.inline` | 词法作用域的透明 AST 内联；不执行 Python helper |
-| `T.Tensor` / `T.int64` | 外部tensor与runtime标量；长度不是constexpr |
-| `T.int64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
-| `T.i64` | GM/UB tensor 的 int64 元素类型；与 runtime 参数声明 `T.int64` 职责不同 |
+| `T.Tensor` | 外部 tensor 的 shape、元素类型与访问权限 |
+| `T.i32` / `T.i64` | 统一整数类型；均可作 GM/UB tensor 元素类型，runtime 参数目前只支持 `T.i64` |
+| `T.i64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
 | `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 或已初始化 UB 单个 int32/int64 的 S 读取，捕获有符号 index SSA；inclusive 值合同不生成 clamp |
 | `T.load_scalar(view)` | f32 UB 或浮点 GM 单元素的 S 读取，返回 f32 SSA |
 | `T.store_scalar(value, out=view)` | 将已读取的 f32 SSA 写入单个 f32 UB 元素，保留真实 4 B S 写入效果 |
@@ -39,6 +39,12 @@
 | `fill/mul/add/sub/div/maximum/exp/sqrt/rsqrt(..., mask=p)` | 显式谓词更新；mask=False lane保留目标旧值 |
 
 本地 stage 偏移、buffer slot 数、event width 互不等同。没有 `stages=` 声明。`cube.task/vector.task`已经移除且不恢复兼容。内部physical Task IR不属于旧公开语法。
+
+类型由使用位置决定用途：`Meta: T.Tensor((n,), T.i64)` 声明 8 字节有符号
+整数存储，`n: T.i64` 声明 runtime 长度参数，两处使用同一个类型描述符。
+参数的默认输入合同为 `minimum=0, multiple_of=1`；带合同的
+`T.i64(minimum=..., multiple_of=...)` 只用于参数注解，不能作为 tensor 元素类型。
+runtime 参数仍是非负 int64 长度；tensor 元素及 `load_index` 保留完整有符号范围。
 
 调整算子时按下面的边界选择修改位置：
 

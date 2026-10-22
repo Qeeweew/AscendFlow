@@ -29,7 +29,7 @@ def _source(offsets, reverse):
         f"                N.copy(x,O[g,{index},:])"
         for index, (label, offset) in enumerate(zip(labels, offsets, strict=True))
     )
-    return f"""def scratch(O:N.Tensor((n,{len(offsets)},64),N.f32,access="write"),n:N.int64):
+    return f"""def scratch(O:N.Tensor((n,{len(offsets)},64),N.f32,access="write"),n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((64,),name="scratch")
         for g in N.Pipelined(n,issue_order={order!r}):

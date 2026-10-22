@@ -3,7 +3,7 @@
 
 def nested_slot_source(slots):
     return f"""
-    def slots(X:N.Tensor((n,m,64),N.f32),n:N.int64,m:N.int64):
+    def slots(X:N.Tensor((n,m,64),N.f32),n:N.i64,m:N.i64):
         with N.Kernel():
             x,y=N.alloc_ub(({slots},64)),N.alloc_ub(({slots},64))
             for p in N.serial(n):

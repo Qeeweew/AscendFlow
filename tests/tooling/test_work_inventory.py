@@ -15,7 +15,7 @@ from benchmarks.work import read_work, structure_inventory, work_record
 
 def inventory(count):
     source = N.from_source(f"""
-def work(tiles:N.int64):
+def work(tiles:N.i64):
     with N.Kernel(3,kind="vector"):
         x=N.alloc_ub((64,),name="x")
         for i in N.Pipelined({count}):

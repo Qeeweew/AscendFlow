@@ -15,8 +15,8 @@ def scoped_query_recurrence(
     K: N.Tensor((kv_tiles, 2, 16, 16), N.f16),
     Score: N.Tensor((GROUPS, 2, 16, 32), N.f32, access="write"),
     O: N.Tensor((total_queries, 16, 32), N.f32, access="write"),
-    total_queries: N.int64(minimum=0),
-    kv_tiles: N.int64(minimum=1),
+    total_queries: N.i64(minimum=0),
+    kv_tiles: N.i64(minimum=1),
 ):
     with N.Kernel(GROUPS, kind="mixed") as group:
         q_l1 = N.alloc_l1((2, 16, 16), N.f16, name="q_l1")

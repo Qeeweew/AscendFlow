@@ -56,7 +56,7 @@ def interpret(block, values, arguments):
 @pytest.mark.parametrize("n", [0, 1, 2, 3, 9, 32])
 def test_serial_loop_carries_ssa_through_if_and_preserves_zero_iteration_value(n):
     definition = from_source("""
-        def accumulate(n: N.int64):
+        def accumulate(n: N.i64):
             with N.Kernel():
                 total = 7
                 for i in N.serial(n):
@@ -79,7 +79,7 @@ def test_serial_loop_carries_ssa_through_if_and_preserves_zero_iteration_value(n
 
 def test_serial_bound_is_captured_at_entry_even_when_carried_value_changes():
     source = from_source("""
-        def countdown(n: N.int64):
+        def countdown(n: N.i64):
             with N.Kernel():
                 remaining = n
                 for i in N.serial(remaining):
@@ -93,7 +93,7 @@ def test_serial_bound_is_captured_at_entry_even_when_carried_value_changes():
 
 def test_if_can_define_a_new_scalar_on_both_paths_and_merge_it():
     source = from_source("""
-        def select(n: N.int64):
+        def select(n: N.i64):
             with N.Kernel():
                 if n < 4:
                     count = 2
@@ -108,7 +108,7 @@ def test_if_can_define_a_new_scalar_on_both_paths_and_merge_it():
 
 def test_one_sided_definition_is_not_exported_as_an_initialized_scalar():
     definition = from_source("""
-        def invalid(n: N.int64):
+        def invalid(n: N.i64):
             with N.Kernel():
                 if n < 4:
                     count = 2
@@ -138,7 +138,7 @@ def test_explicit_unroll_preserves_constant_updates(count):
 
 def test_boolean_merge_is_not_a_host_boolean():
     source = from_source("""
-        def choose(n: N.int64):
+        def choose(n: N.i64):
             with N.Kernel():
                 chosen = False
                 if n < 4:

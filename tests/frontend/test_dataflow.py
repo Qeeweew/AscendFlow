@@ -21,7 +21,7 @@ def import_and_cast(X, x, y, g):
 def test_labels_are_local_to_actual_actor_and_domain_after_inline():
     source = N.from_source(
         """
-def scopes(X:N.Tensor((n,16,16),N.f16),n:N.int64):
+def scopes(X:N.Tensor((n,16,16),N.f16),n:N.i64):
     with N.Kernel(kind="mixed"):
         a=N.alloc_l1((16,16))
         b=N.alloc_l0a((16,16))
@@ -61,7 +61,7 @@ def scopes(X:N.Tensor((n,16,16),N.f16),n:N.int64):
 )
 def test_mixed_domain_rejects_ambiguous_actor_or_removed_stage_declaration(loop, scopes, message):
     source = N.from_source(f"""
-def invalid(n:N.int64):
+def invalid(n:N.i64):
     with N.Kernel(kind="mixed"):
         x=N.alloc_ub((64,))
         for g in {loop}:
@@ -77,7 +77,7 @@ def invalid(n:N.int64):
 )
 def test_local_pipeline_accepts_only_local_policy(policy):
     source = N.from_source(f"""
-def invalid(n:N.int64):
+def invalid(n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((64,))
         for g in N.Pipelined(n,{policy}):

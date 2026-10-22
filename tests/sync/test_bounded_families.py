@@ -20,7 +20,7 @@ def test_reader_prefix_releases_after_actual_last_member_before_overwrite():
     memory = check(
         """
     def prefix(Work:N.Tensor((4,64),N.f32,access="write"),
-               Out:N.Tensor((4,64),N.f32,access="write"),n:N.int64(minimum=2)):
+               Out:N.Tensor((4,64),N.f32,access="write"),n:N.i64(minimum=2)):
         with N.Kernel():
             init=N.alloc_ub((4,64))
             x=N.alloc_ub((2,64))
@@ -49,7 +49,7 @@ def test_child_last_uses_the_selected_parent_header_not_an_unbound_parent():
     check(
         """
     def selected(X:N.Tensor((4,64),N.f32),Y:N.Tensor((2,64),N.f32,access="write"),
-                 n:N.int64(minimum=1)):
+                 n:N.i64(minimum=1)):
         with N.Kernel():
             x=N.alloc_ub((2,64))
             for parent in N.serial(n):
@@ -69,7 +69,7 @@ def test_entry_publication_resolves_computed_last_after_a_selected_parent():
     check(
         """
     def selected(X:N.Tensor((4,64),N.f32),Y:N.Tensor((n,64),N.f32,access="write"),
-                 n:N.int64(minimum=1)):
+                 n:N.i64(minimum=1)):
         with N.Kernel():
             x=N.alloc_ub((64,))
             one=N.alloc_ub((64,))

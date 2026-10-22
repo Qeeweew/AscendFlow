@@ -20,7 +20,7 @@ from tests.models.structured_events import EventModelError, check_structured_eve
 PREFIX_STATE = """
 def prefix_state(X:N.Tensor((2,64),N.f32),
                  Before:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),
-                 After:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+                 After:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel():
         state=N.alloc_ub((64,))
         N.copy(X[0,:],state)
@@ -224,7 +224,7 @@ def test_two_aiv_use_one_body_with_different_child_activity_and_full_quorum():
     source = """
     def lanes(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
               Work:N.Tensor((16,16),N.f32,access="write"),
-              Out:N.Tensor((3,n,16,16),N.f32,access="write",write_disjoint=True),n:N.int64):
+              Out:N.Tensor((3,n,16,16),N.f32,access="write",write_disjoint=True),n:N.i64):
         with N.Kernel(1,kind="mixed"):
             a1=N.alloc_l1((16,16),N.f16)
             b1=N.alloc_l1((16,16),N.f16)

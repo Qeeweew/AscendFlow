@@ -18,7 +18,7 @@ from ascendflow.target.ascend910b import Engine
 @pytest.fixture(scope="module")
 def control():
     source = N.from_source("""
-    def clocks(n:N.int64,m:N.int64):
+    def clocks(n:N.i64,m:N.i64):
         with N.Kernel():
             for p in N.Pipelined(n):
                 for g in N.Pipelined(m):
@@ -116,7 +116,7 @@ def test_runtime_true_count_empty_short_and_nonzero_first(control):
 
 def test_clamped_owner_count_keeps_empty_and_nonempty_invocations():
     source = N.from_source("""
-    def owners(n:N.int64(minimum=8, multiple_of=8)):
+    def owners(n:N.i64(minimum=8, multiple_of=8)):
         with N.Kernel(20) as group:
             for query in N.serial(N.ceildiv(N.max(n // 8 - group, 0), 20)):
                 pass
@@ -317,7 +317,7 @@ def test_parameter_dependent_parent_activation_is_not_assumed_to_be_one_window(c
 
 def test_unknown_scalar_carry_cannot_be_a_window_parameter():
     source = N.from_source("""
-    def carry(n:N.int64):
+    def carry(n:N.i64):
         with N.Kernel():
             count=0
             for i in N.serial(n):

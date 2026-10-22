@@ -211,7 +211,7 @@ def test_rotated_runtime_grid_composes_axes_with_real_capacity(monkeypatch):
 
     source = N.from_source("""
 def rotated(X:N.Tensor((3,n,64),N.f32),Out:N.Tensor((3,n,64),N.f32,access="write"),
-            n:N.int64(minimum=64,multiple_of=64)):
+            n:N.i64(minimum=64,multiple_of=64)):
     with N.Kernel(7) as owner:
         tile=N.alloc_ub((64,64),N.f32)
         blocks=n//64

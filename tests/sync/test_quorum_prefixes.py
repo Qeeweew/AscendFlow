@@ -30,7 +30,7 @@ def test_counter_packing_requires_fifo_receivers_and_bounds_the_whole_backlog(me
 def messages(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
              Work:N.Tensor(({slots},{messages},16,16),N.f32,access="write"),
              Out:N.Tensor((n,{messages},16,16),N.f32,access="write",write_disjoint=True),
-             n:N.int64):
+             n:N.i64):
     with N.Kernel(1,kind="mixed"):
         a1=N.alloc_l1((16,16),N.f16)
         b1=N.alloc_l1((16,16),N.f16)
@@ -126,7 +126,7 @@ def test_two_publishers_share_only_with_matching_fifo_and_complete_quorums(messa
 def messages(A:N.Tensor((n,{messages},32,16),N.f16),B:N.Tensor((16,16),N.f16),
              Work:N.Tensor((2,{messages},32,16),N.f16,access="write"),
              Out:N.Tensor((n,{messages},32,16),N.f32,access="write",write_disjoint=True),
-             n:N.int64):
+             n:N.i64):
     with N.Kernel(1,kind="mixed"):
         x=N.alloc_ub((16,16),N.f16)
         a1=N.alloc_l1(({messages},32,16),N.f16)
@@ -319,7 +319,7 @@ def test_bulk_load_waits_for_every_old_reader_before_reusing_its_ring():
     program = N.from_source(
         """
 def local_prefix(X:N.Tensor((n,8,64),N.f32),
-                 Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+                 Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="vector"):
         inputs=N.alloc_ub((2,8,64),N.f32)
         total=N.alloc_ub((2,64),N.f32)
@@ -359,7 +359,7 @@ def test_independent_gm_handoffs_keep_complete_quorums_and_fit_real_capacity():
         """
 def paired(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
            Work:N.Tensor((2,2,16,16),N.f32,access="write"),
-           Out:N.Tensor((n,16,16),N.f32,access="write",write_disjoint=True),n:N.int64):
+           Out:N.Tensor((n,16,16),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="mixed"):
         a1=N.alloc_l1((16,16),N.f16)
         b1=N.alloc_l1((16,16),N.f16)

@@ -15,7 +15,7 @@ from tests.support.structured import selected
 @pytest.fixture(scope="module")
 def base():
     return selected("""
-    def clocks(X:N.Tensor((n,64),N.f32),n:N.int64,m:N.int64):
+    def clocks(X:N.Tensor((n,64),N.f32),n:N.i64,m:N.i64):
         with N.Kernel():
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
             for p in N.Pipelined(n):

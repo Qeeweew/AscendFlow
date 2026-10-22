@@ -13,7 +13,7 @@ def nested_cv(
     X: N.Tensor((2, n, 2, 16, 16), N.f16),
     Score: N.Tensor((2, 2, 16, 32), N.f32, access="write"),
     O: N.Tensor((2, n, 16, 32), N.f32, access="write"),
-    n: N.int64,
+    n: N.i64,
 ):
     with N.Kernel(2, kind="mixed") as group:
         x1 = N.alloc_l1((2, 16, 16))
@@ -49,7 +49,7 @@ def partitioned_cv(
     X: N.Tensor((n, 2, 16, 16), N.f16),
     Exchange: N.Tensor((2, 32, 16), N.f32, access="write"),
     Back: N.Tensor((2, 32, 16), N.f16, access="write"),
-    n: N.int64,
+    n: N.i64,
 ):
     """Two Cube operations address the separate halves of one AIV quorum."""
     with N.Kernel(1, kind="mixed"):
@@ -82,7 +82,7 @@ def nested_copy(
     X: N.Tensor((n, 4, 8), N.f32),
     Y: N.Tensor((n, 4, 8), N.f32, access="write"),
     O: N.Tensor((n, 4, 8), N.f32, access="write"),
-    n: N.int64,
+    n: N.i64,
 ):
     with N.Kernel():
         x = N.alloc_ub((2, 2, 8))
@@ -106,7 +106,7 @@ def shared_l0c_qk_pv(
     X: N.Tensor((1, n, 8, 16, 16), N.f16),
     Score: N.Tensor((1, 2, 16, 128), N.f32, access="write"),
     Y: N.Tensor((1, n, 16, 16), N.f32, access="write"),
-    n: N.int64,
+    n: N.i64,
 ):
     with N.Kernel(1, kind="cube") as group:
         qk_l1 = N.alloc_l1((2, 16, 16), name="qk_l1")

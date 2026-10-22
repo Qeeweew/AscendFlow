@@ -19,7 +19,7 @@ from tests.models.structured_events import check_compiled_events
 def test_equivalent_affine_residues_keep_their_real_storage_identity(step, bias, modulus):
     plan = synchronize_structure(
         N.from_source(f"""
-    def residues(Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+    def residues(Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.i64):
         with N.Kernel():
             x=N.alloc_ub(({modulus},64),N.f32)
             for i in N.Pipelined(n,issue_order=("store","fill")):
@@ -48,7 +48,7 @@ def scratch():
         N.from_source(
             """
     def scratch(X:N.Tensor((n,64),N.f32),A:N.Tensor((n,64),N.f32,access="write"),
-                B:N.Tensor((n,64),N.f32,access="write"),n:N.int64):
+                B:N.Tensor((n,64),N.f32,access="write"),n:N.i64):
         with N.Kernel():
             x=N.alloc_ub((64,))
             for g in N.Pipelined(n):
@@ -94,7 +94,7 @@ def recurrence():
         N.from_source(
             """
     def reduction(A:N.Tensor((n,16,16),N.f16),B:N.Tensor((n,16,16),N.f16),
-                  O:N.Tensor((n,16,16),N.f32,access="write",write_disjoint=True),n:N.int64):
+                  O:N.Tensor((n,16,16),N.f32,access="write",write_disjoint=True),n:N.i64):
         with N.Kernel(kind="cube"):
             a1=N.alloc_l1((16,16),N.f16)
             b1=N.alloc_l1((16,16),N.f16)

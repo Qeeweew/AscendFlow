@@ -7,7 +7,7 @@ def matrix_import(dtype="f16"):
     return N.from_source(
         """
 def rows_import(A:N.Tensor((n,16),N.f16), B:N.Tensor((16,16),N.f16),
-                O:N.Tensor((16,16),N.f32,access="write",write_disjoint=True),n:N.int64):
+                O:N.Tensor((16,16),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(kind="cube"):
         a1=N.alloc_l1((16,16),N.f16)
         b1=N.alloc_l1((16,16),N.f16)
@@ -28,7 +28,7 @@ def rows_import(A:N.Tensor((n,16),N.f16), B:N.Tensor((16,16),N.f16),
 def row_output():
     return N.from_source(
         """
-def rows_output(O:N.Tensor((n,16),N.f32,access="write",write_disjoint=True),n:N.int64):
+def rows_output(O:N.Tensor((n,16),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((4,16),N.f32)
         N.fill(x,3.0)
@@ -41,7 +41,7 @@ def rows_output(O:N.Tensor((n,16),N.f32,access="write",write_disjoint=True),n:N.
 def fp32_padding(*, runtime=False, pitch=19):
     prefix = ",valid_rows=N.min(n,3)" if runtime else ""
     return N.from_source(f"""
-def fp32_padding(A:N.Tensor((3,{pitch}),N.f32),n:N.int64):
+def fp32_padding(A:N.Tensor((3,{pitch}),N.f32),n:N.i64):
     with N.Kernel(kind="cube"):
         x=N.alloc_l1((16,16),N.f32)
         y=N.alloc_l0a((16,16),N.f32)
@@ -56,7 +56,7 @@ def matrix_overlay():
         '''
 def overlay(A:N.Tensor((32,64),N.f16), B:N.Tensor((32,64),N.f16),
             Identity:N.Tensor((64,64),N.f16),
-            O:N.Tensor((32,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+            O:N.Tensor((32,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(kind="cube"):
         a1=N.alloc_l1((32,64),N.f16)
         b1=N.alloc_l1((64,64),N.f16)

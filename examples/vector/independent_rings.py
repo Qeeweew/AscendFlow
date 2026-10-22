@@ -14,7 +14,7 @@ from ascendflow import language as N
 def independent_rings(
     X: N.Tensor((tiles, 64), N.f32),  # noqa: F821
     Y: N.Tensor((tiles, 64), N.f32, access="write"),  # noqa: F821
-    tiles: N.int64,
+    tiles: N.i64,
     P: N.constexpr = 5,
     Q: N.constexpr = 7,
 ):

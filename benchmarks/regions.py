@@ -14,7 +14,7 @@ def source(streams=32, unused=128):
     result = """from __future__ import annotations
 from ascendflow import language as N
 @N.prim_func(disjoint_external=True)
-def chain(A:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write"),n:N.int64):
+def chain(A:N.Tensor((64,),N.f32),O:N.Tensor((64,),N.f32,access="write"),n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((64,))
 """

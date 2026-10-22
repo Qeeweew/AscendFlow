@@ -11,7 +11,7 @@ from ascendflow import language as N
 def native_guarded_recurrence(
     X: N.Tensor((n, 2, 8, 64), N.f32),
     O: N.Tensor((2, 8, 64), N.f16, access="write"),
-    n: N.int64,
+    n: N.i64,
 ):
     with N.Kernel():
         state = N.alloc_ub((2, 8, 64), N.f32, name="state")

@@ -47,7 +47,7 @@ from tests.fixtures.conditional_mad import _retarget, _structure
 @pytest.fixture(scope="module")
 def selected_context():
     source = N.from_source("""
-    def selected_clocks(X:N.Tensor((64,),N.f32),n:N.int64,m:N.int64):
+    def selected_clocks(X:N.Tensor((64,),N.f32),n:N.i64,m:N.i64):
         with N.Kernel():
             x=N.alloc_ub((64,))
             for p in N.Pipelined(n):

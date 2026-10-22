@@ -19,7 +19,7 @@ def _structure(body=None, *, ring=False):
         body = f"N.matmul(aa,bb,accum={destination},initialize=(k==0))"
     shape = "(2,16,16)" if ring else "(16,16)"
     source = f"""
-def reduction(A:N.Tensor((n,16,16),N.f16),B:N.Tensor((n,16,16),N.f16),n:N.int64):
+def reduction(A:N.Tensor((n,16,16),N.f16),B:N.Tensor((n,16,16),N.f16),n:N.i64):
     with N.Kernel(kind="cube"):
         a1=N.alloc_l1((16,16),N.f16)
         b1=N.alloc_l1((16,16),N.f16)

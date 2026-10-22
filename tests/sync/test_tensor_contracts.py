@@ -19,7 +19,7 @@ from tests.models.structured_events import EventModelError, check_structured_eve
 PERMUTED = """
 def permuted(X:N.Tensor((8,64),N.f32),
              Y:N.Tensor((8,64),N.f32,access="write",write_disjoint=True),
-             p:N.int64):
+             p:N.i64):
     with N.Kernel(3) as group:
         x=N.alloc_ub((64,))
         for i in N.Pipelined(N.ceildiv(N.max(0,8-group),3)):
@@ -76,7 +76,7 @@ def test_disjoint_writes_do_not_remove_raw_or_war_on_a_read_write_tensor():
     source = N.from_source(
         """
     def state(Y:N.Tensor((4,64),N.f32,access="read_write",write_disjoint=True),
-              a:N.int64,b:N.int64,c:N.int64):
+              a:N.i64,b:N.i64,c:N.i64):
         with N.Kernel():
             x=N.alloc_ub((64,))
             z=N.alloc_ub((64,))

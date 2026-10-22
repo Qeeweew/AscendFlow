@@ -13,7 +13,7 @@ def counter_epochs(
     B: N.Tensor((16, 16), N.f16),
     Work: N.Tensor((PHASES, 16, 16), N.f16, access="write"),
     Feedback: N.Tensor((PHASES, 16, 16), N.f16, access="write"),
-    n: N.int64,
+    n: N.i64,
     PHASES: N.constexpr = 17,
 ):
     with N.Kernel(1, kind="mixed"):

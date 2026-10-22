@@ -38,7 +38,7 @@ def test_captured_namespace_never_executes_rebound_host_operations(monkeypatch):
         raise AssertionError("public syntax invoked as a host builder")
 
     @syntax.prim_func
-    def captured(n: "syntax.int64(minimum=4, multiple_of=2)"):
+    def captured(n: "syntax.i64(minimum=4, multiple_of=2)"):
         with syntax.Kernel():
             x = syntax.alloc_ub((64,))
             for i in syntax.Pipelined(n):
@@ -74,6 +74,31 @@ def test_runtime_parameter_cannot_be_silently_specialized():
     )
 
 
+@pytest.mark.parametrize("annotation", ["N.i64", "Index", "Index(minimum=2)", '"N.i64"'])
+def test_runtime_annotations_resolve_the_shared_dtype_descriptor(annotation):
+    source = N.from_source(
+        f"""
+        def shared(Meta:N.Tensor((n,),Index), n:{annotation}):
+            with N.Kernel():
+                pass
+""",
+        constants={"Index": N.i64},
+    ).to_ir()
+    size = next(op for op in source.walk() if isinstance(op, SizeOp))
+    assert (size.minimum.data, size.multiple.data) == (2 if "minimum" in annotation else 0, 1)
+    allocation = next(op for op in source.walk() if isinstance(op, AllocationOp))
+    assert allocation.ref.type.dtype.data == "i64"
+
+
+def test_runtime_annotation_requires_a_dtype_instead_of_an_equal_string():
+    definition = N.from_source(
+        "def invalid(n:Index):\n    with N.Kernel():\n        pass",
+        constants={"Index": "i64"},
+    )
+    with pytest.raises(FrontendError, match="expected Tensor"):
+        definition.to_ir()
+
+
 def test_ast_constant_loop_keeps_one_body_even_for_millions_of_iterations():
     sizes = []
     for count in (0, 4, 1 << 26):
@@ -94,7 +119,7 @@ def test_ast_constant_loop_keeps_one_body_even_for_millions_of_iterations():
 
 def test_device_if_is_a_real_scf_region_and_both_sides_are_present():
     definition = N.from_source("""
-        def branch(n: N.int64):
+        def branch(n: N.i64):
             with N.Kernel():
                 x = N.alloc_ub((2, 64))
                 for i in N.Pipelined(n):
@@ -110,7 +135,7 @@ def test_device_if_is_a_real_scf_region_and_both_sides_are_present():
 
 def test_dynamic_serial_and_ceildiv_are_retained_in_source_ir():
     definition = N.from_source("""
-        def nested(n: N.int64, m: N.int64):
+        def nested(n: N.i64, m: N.i64):
             with N.Kernel():
                 x = N.alloc_ub((2, 64))
                 for i in N.Pipelined(n):
@@ -158,7 +183,7 @@ def test_unroll_is_explicit_and_does_not_add_a_device_loop():
 
 def test_branch_rebinding_cannot_silently_select_the_host_value():
     definition = N.from_source("""
-        def invalid(n: N.int64):
+        def invalid(n: N.i64):
             with N.Kernel():
                 value = 0
                 for i in N.Pipelined(n):

@@ -31,7 +31,7 @@ from tests.support.asc_trace import TRACE_SHIM, compile_cpp, memory
 
 @pytest.mark.parametrize("depth", [1, 2, 4])
 def test_nested_pipelines_have_one_clock_loop_and_no_phase_controllers(depth):
-    source = ["def nested(n:N.int64):", "    with N.Kernel():", "        x=N.alloc_ub((64,))"]
+    source = ["def nested(n:N.i64):", "    with N.Kernel():", "        x=N.alloc_ub((64,))"]
     for level in range(depth):
         indent = " " * (8 + 8 * level)
         source += [

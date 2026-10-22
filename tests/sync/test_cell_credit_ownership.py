@@ -12,7 +12,7 @@ def test_eight_release_cells_reuse_their_inner_credit_at_outer_reentry():
         """
 def parts(X:N.Tensor((n,8,4,64),N.f32),
           Out:N.Tensor((n,8,4,64),N.f32,access="write",write_disjoint=True),
-          n:N.int64):
+          n:N.i64):
     with N.Kernel(1,kind="vector"):
         scratch=N.alloc_ub((2,4,64),N.f32)
         with N.Vector():

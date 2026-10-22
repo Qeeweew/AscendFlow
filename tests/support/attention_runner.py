@@ -121,7 +121,7 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
     # executable kernel or synchronization oracle for this fake artifact.
     probe = N.from_source(
         """
-def metadata(Sk:N.int64):
+def metadata(Sk:N.i64):
     with N.Kernel():
         work=N.alloc_ub((8,1024))
         N.fill(work,NEG_INF,mask=N.arange(1024)[None,:] >= Sk)

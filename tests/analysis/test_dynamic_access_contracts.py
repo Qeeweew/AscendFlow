@@ -138,7 +138,7 @@ def test_scalar_carry_and_conditional_result_retain_actual_addresses(monkeypatch
         monkeypatch,
         """
 def carry(X:N.Tensor((32,64),N.f32), I:N.Tensor((1,),N.i32),
-          O:N.Tensor((64,),N.f32,access="write"), n:N.int64):
+          O:N.Tensor((64,),N.f32,access="write"), n:N.i64):
     with N.Kernel():
         row=N.alloc_ub((64,),N.f32)
         N.fill(row,0.0)
@@ -203,7 +203,7 @@ def lazy(X:N.Tensor((32,64),N.f32), I:N.Tensor((1,),N.i32),
 def test_static_illegal_original_arithmetic_is_still_rejected(expression):
     source = N.from_source(
         """
-def invalid(n:N.int64):
+def invalid(n:N.i64):
     with N.Kernel():
         bad=EXPRESSION
         gone=bad-bad

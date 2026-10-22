@@ -13,7 +13,7 @@ def vector_event_borrow(
     Z: N.Tensor((n, 4, 16), N.f32),
     Y: N.Tensor((n, 4, 16), N.f16, access="write"),
     O: N.Tensor((4, 16), N.f16, access="write"),
-    n: N.int64,
+    n: N.i64,
 ):
     with N.Kernel():
         x = N.alloc_ub((2, 16), N.f32, name="x")

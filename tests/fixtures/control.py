@@ -1,7 +1,7 @@
 """Source inputs for recursive control and shared AIV participant tests."""
 
 NESTED = """
-def nested(X: N.Tensor((n,k,PARTS,64),N.f32), n: N.int64, k: N.int64,
+def nested(X: N.Tensor((n,k,PARTS,64),N.f32), n: N.i64, k: N.i64,
            PARTS: N.constexpr=3):
     with N.Kernel():
         x=N.alloc_ub((2,64),name="x")
@@ -25,7 +25,7 @@ def shared(A:N.Tensor((GROUPS,n,32,16),N.f16),
            B:N.Tensor((GROUPS,n,16,16),N.f16),
            Scratch:N.Tensor((GROUPS,2,32,16),N.f32,access="write"),
            Y:N.Tensor((GROUPS,n,32,16),N.f32,access="write"),
-           n:N.int64,GROUPS:N.constexpr=3):
+           n:N.i64,GROUPS:N.constexpr=3):
     with N.Kernel(GROUPS,kind="mixed") as group:
         a1=N.alloc_l1((32,16),N.f16)
         b1=N.alloc_l1((16,16),N.f16)
@@ -51,7 +51,7 @@ def shared(A:N.Tensor((GROUPS,n,32,16),N.f16),
 
 
 CARRY = """
-def carry(n:N.int64):
+def carry(n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((64,),name="x")
         total=7

@@ -8,7 +8,7 @@ from ascendflow import language as N
 
 
 @N.prim_func(disjoint_external=True)
-def ub_copy(X: N.Tensor((n, 8), N.f32), O: N.Tensor((n, 8), N.f32, access="write"), n: N.int64):
+def ub_copy(X: N.Tensor((n, 8), N.f32), O: N.Tensor((n, 8), N.f32, access="write"), n: N.i64):
     with N.Kernel():
         source = N.alloc_ub((2, 8), N.f32)
         destination = N.alloc_ub((2, 8), N.f32)

@@ -240,7 +240,7 @@ def test_dense_multi_residue_first_last_and_reuse_remain_defined_near_i64_limit(
 @pytest.fixture(scope="module")
 def selected_last_identity():
     source = N.from_source("""
-    def clocks(extent:N.int64(multiple_of=8)):
+    def clocks(extent:N.i64(multiple_of=8)):
         with N.Kernel():
             for p in N.Pipelined(extent//8):
                 pass

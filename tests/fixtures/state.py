@@ -12,7 +12,7 @@ def state_sum(
     Initial: T.Tensor((GROUPS, B), T.f32),
     X: T.Tensor((GROUPS, tiles, B), T.f32),
     Output: T.Tensor((GROUPS, B), T.f32, access="write"),
-    tiles: T.int64,
+    tiles: T.i64,
     B: T.constexpr = 4096,
     GROUPS: T.constexpr = 32,
 ):
@@ -33,8 +33,8 @@ def grouped_state_sum(
     Initial: T.Tensor((GROUPS, outputs, B), T.f32),
     X: T.Tensor((GROUPS, outputs, tiles, B), T.f32),
     Output: T.Tensor((GROUPS, outputs, B), T.f32, access="write"),
-    outputs: T.int64,
-    tiles: T.int64,
+    outputs: T.i64,
+    tiles: T.i64,
     B: T.constexpr = 4096,
     GROUPS: T.constexpr = 32,
 ):
@@ -56,8 +56,8 @@ def shared_state_sum(
     Initial: T.Tensor((GROUPS, B), T.f32),
     X: T.Tensor((GROUPS, tiles, B), T.f32),
     Output: T.Tensor((GROUPS, outputs, B), T.f32, access="write"),
-    outputs: T.int64,
-    tiles: T.int64,
+    outputs: T.i64,
+    tiles: T.i64,
     B: T.constexpr = 4096,
     GROUPS: T.constexpr = 32,
 ):
@@ -79,8 +79,8 @@ def frame_state_sum(
     Initial: T.Tensor((GROUPS, outputs, B), T.f32),
     X: T.Tensor((GROUPS, outputs, tiles, B), T.f32),
     Output: T.Tensor((GROUPS, outputs, B), T.f32, access="write"),
-    outputs: T.int64,
-    tiles: T.int64,
+    outputs: T.i64,
+    tiles: T.i64,
     B: T.constexpr = 4096,
     GROUPS: T.constexpr = 32,
 ):

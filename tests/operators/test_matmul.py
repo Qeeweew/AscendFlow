@@ -126,7 +126,7 @@ def test_distinct_loop_names_do_not_hide_overlapping_output_rectangles(tmp_path)
 from __future__ import annotations
 from ascendflow import language as T
 @T.prim_func(disjoint_external=True)
-def overlap(A:T.Tensor((16,16),T.f16),B:T.Tensor((16,16),T.f16),C:T.Tensor((R,32),T.f16,access="write"),R:T.int64(minimum=32,multiple_of=16)):
+def overlap(A:T.Tensor((16,16),T.f16),B:T.Tensor((16,16),T.f16),C:T.Tensor((R,32),T.f16,access="write"),R:T.i64(minimum=32,multiple_of=16)):
     with T.Kernel(1,kind="cube"):
         a1=T.alloc_l1((16,16),T.f16)
         b1=T.alloc_l1((16,16),T.f16)

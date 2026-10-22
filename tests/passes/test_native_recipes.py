@@ -197,7 +197,7 @@ def test_scalar_result_is_the_actual_ssa_operand_of_its_consumer():
 
 def test_scale_value_segment_keeps_scalar_load_as_an_atom_not_an_address():
     source = N.from_source("""
-        def scalar_scale(n: N.int64):
+        def scalar_scale(n: N.i64):
             with N.Kernel():
                 statistic=N.alloc_ub((8,))
                 x=N.alloc_ub((64,))

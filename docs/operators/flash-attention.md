@@ -6,7 +6,7 @@
 
 - dense、无mask forward，BNSD，f16输入输出，B1/Hq8/Hkv8/D128。
 - BQ256/BM128/BK1024/CK128/VR8，20组AIC/双AIV。
-- Sq/Sk为任意正整数runtime参数，声明均为 `N.int64(minimum=1)`，没有倍数限制；空owner不发任务。
+- Sq/Sk为任意正整数runtime参数，声明均为 `N.i64(minimum=1)`，没有倍数限制；空owner不发任务。
 - 每组串行处理分配到的Q块，每个Q块遍历KV块，内部Cube/Vector再分块。这里的Q块不是编译器应特殊识别的控制类型。
 
 | 显式workspace | shape | dtype |

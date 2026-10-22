@@ -87,7 +87,7 @@ def test_row_count_cannot_be_negative_or_exceed_its_static_capacity(count):
 @pytest.mark.parametrize("count", (0, 2))
 def test_constant_row_counts_share_the_same_address_and_instruction_operand(count):
     source = row_output().source.replace("N.min(4,n)", str(count))
-    source = source.replace("n:N.int64", "n:N.int64(minimum=2)")
+    source = source.replace("n:N.i64", "n:N.i64(minimum=2)")
     checked = check_compiled_events(
         synchronize_structure(N.from_source(source, disjoint_external=True)), {"n": 2}
     )
@@ -101,7 +101,7 @@ def test_constant_row_counts_share_the_same_address_and_instruction_operand(coun
 
 
 def test_empty_rows_do_not_legalize_undefined_original_scalar_arithmetic():
-    source = row_output().source.replace("n:N.int64", "n:N.int64,d:N.int64")
+    source = row_output().source.replace("n:N.i64", "n:N.i64,d:N.i64")
     source = source.replace("N.min(4,n)", "(n//0)*0")
     with pytest.raises(CompileError, match="divisor|division"):
         synchronize_structure(N.from_source(source, disjoint_external=True))
@@ -121,7 +121,7 @@ def test_row_count_in_the_address_must_match_the_actual_native_operand():
 def test_a_partial_output_write_does_not_initialize_its_static_upper_envelope():
     source = N.from_source(
         """
-def partial(O:N.Tensor((4,16),N.f32,access="write"),n:N.int64):
+def partial(O:N.Tensor((4,16),N.f32,access="write"),n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((4,16),N.f32)
         y=N.alloc_ub((4,16),N.f32)
@@ -194,7 +194,7 @@ def rows(A:N.Tensor((16,128),N.f32)):
 def test_branch_merge_initialization_requires_both_complete_physical_writes(other_rows, accepted):
     other = f"N.copy(A[0:{other_rows},:],x[0:{other_rows},:])" if other_rows else "pass"
     source = N.from_source(f"""
-def branches(A:N.Tensor((16,16),N.f32),choice:N.int64):
+def branches(A:N.Tensor((16,16),N.f32),choice:N.i64):
     with N.Kernel():
         x=N.alloc_ub((16,16),N.f32)
         y=N.alloc_ub((16,16),N.f32)

@@ -34,7 +34,7 @@ def softmax_compute(x, statistic, slot, partial, D, broadcast, y):
 def softmax(
     X: T.Tensor((GROUPS, tiles, R, D), T.f32),  # noqa: F821
     Y: T.Tensor((GROUPS, tiles, R, D), T.f32, access="write"),  # noqa: F821
-    tiles: T.int64,
+    tiles: T.i64,
     R: T.constexpr = 8,
     D: T.constexpr = 1024,
     GROUPS: T.constexpr = 32,

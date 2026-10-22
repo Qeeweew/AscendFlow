@@ -140,7 +140,7 @@ def _leaves(value):
 
 def test_multiple_ancestor_coordinates_and_runtime_extent_stay_in_one_ssa_address(monkeypatch):
     source = N.from_source("""
-        def nested(X: N.Tensor((n,m,64),N.f32), n:N.int64(minimum=1), m:N.int64(minimum=1)):
+        def nested(X: N.Tensor((n,m,64),N.f32), n:N.i64(minimum=1), m:N.i64(minimum=1)):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for outer in N.serial(n):
@@ -177,7 +177,7 @@ def test_multiple_ancestor_coordinates_and_runtime_extent_stay_in_one_ssa_addres
 
 def test_whole_source_expression_and_per_call_lexical_bindings_are_preserved():
     source = N.from_source("""
-        def indexed(n:N.int64(minimum=1),m:N.int64(minimum=1)):
+        def indexed(n:N.i64(minimum=1),m:N.i64(minimum=1)):
             with N.Kernel():
                 x=N.alloc_ub((2,64))
                 for outer in N.serial(n):

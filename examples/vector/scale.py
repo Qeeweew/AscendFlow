@@ -16,7 +16,7 @@ from ascendflow.build import build_file
 def scale(
     X: N.Tensor((tiles, B), N.f32),  # noqa: F821 - resolved by the DSL signature pass
     Y: N.Tensor((tiles, B), N.f32, access="write"),  # noqa: F821
-    tiles: N.int64,
+    tiles: N.i64,
     B: N.constexpr = 64,
 ):
     with N.Kernel(1, kind="vector"):

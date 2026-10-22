@@ -94,7 +94,7 @@ def test_complete_branches_do_not_make_an_optional_writer_loop_execute(minimum):
     source = SOURCE.replace(
         '    Y:N.Tensor((4,64),N.f32,access="write"),',
         '    Y:N.Tensor((4,64),N.f32,access="write"),\n'
-        f'    n:N.int64(minimum={minimum}),',
+        f'    n:N.i64(minimum={minimum}),',
     ).replace('N.serial(4)', 'N.serial(N.min(n,4))')
     if minimum == 4:
         admit(source)

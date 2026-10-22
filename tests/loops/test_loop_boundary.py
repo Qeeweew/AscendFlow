@@ -61,7 +61,7 @@ def test_singleton_reader_does_not_synchronize_its_idle_engine_each_iteration(
         )
         if reader_engine is Engine.FIX
         else N.from_source(f"""
-        def last_store(Y: N.Tensor((64,), N.f32, access="write"), panels: N.int64):
+        def last_store(Y: N.Tensor((64,), N.f32, access="write"), panels: N.i64):
             with N.Kernel():
                 x = N.alloc_ub((64,))
                 for i in N.Pipelined(panels):
@@ -91,7 +91,7 @@ def test_singleton_reader_does_not_synchronize_its_idle_engine_each_iteration(
 
 def test_terminal_writer_cannot_initialize_a_steady_first_read():
     definition = N.from_source("""
-        def uninitialized(n: N.int64):
+        def uninitialized(n: N.i64):
             with N.Kernel():
                 x = N.alloc_ub((64,))
                 y = N.alloc_ub((64,))

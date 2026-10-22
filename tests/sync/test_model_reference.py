@@ -107,7 +107,7 @@ def independent(X:N.Tensor((2,64),N.f32)):
 def local_pipeline():
     memory, reference = snapshots("""
         def stream(X:N.Tensor((n,64),N.f32),
-                   Y:N.Tensor((n,2,64),N.f32,access="write"),n:N.int64):
+                   Y:N.Tensor((n,2,64),N.f32,access="write"),n:N.i64):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
                 for t in N.Pipelined(n):

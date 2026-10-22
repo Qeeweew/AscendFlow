@@ -9,7 +9,7 @@ def vector_source(count=4):
     return T.from_source(
         f"""
         def scale(X:T.Tensor((2,EXTENT,64),T.f32),
-                  Y:T.Tensor((2,EXTENT,64),T.f32,access="write"){", " + name + ":T.int64" if runtime else ""}):
+                  Y:T.Tensor((2,EXTENT,64),T.f32,access="write"){", " + name + ":T.i64" if runtime else ""}):
             with T.Kernel(2) as group:
                 inputs=T.alloc_ub((2,64),name="inputs")
                 outputs=T.alloc_ub((2,64),name="outputs")
@@ -36,7 +36,7 @@ def cv_source(count=4):
                O:T.Tensor((1,EXTENT,16,16),T.f32,access="write"),
                scores:T.Tensor((1,2,16,16),T.f32,access="write"),
                probabilities:T.Tensor((1,2,16,16),T.f16,access="write"),
-               pv:T.Tensor((1,2,16,16),T.f32,access="write"){", " + name + ":T.int64" if runtime else ""}):
+               pv:T.Tensor((1,2,16,16),T.f32,access="write"){", " + name + ":T.i64" if runtime else ""}):
             with T.Kernel(1,kind="mixed") as group:
                 q=T.alloc_l1((16,16))
                 k=T.alloc_l1((2,16,16))

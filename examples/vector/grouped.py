@@ -14,7 +14,7 @@ from ascendflow import language as T
 def grouped_scale(
     X: T.Tensor((B, H, S, D), T.f32),  # noqa: F821
     Y: T.Tensor((B, H, S, D), T.f32, access="write"),  # noqa: F821
-    S: T.int64(minimum=1, multiple_of=ROWS),  # noqa: F821
+    S: T.i64(minimum=1, multiple_of=ROWS),  # noqa: F821
     B: T.constexpr = 2,
     H: T.constexpr = 3,
     D: T.constexpr = 64,

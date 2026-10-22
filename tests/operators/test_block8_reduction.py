@@ -14,7 +14,7 @@ from tests.models.structured_events import check_structured_events
 def definition(kind="sum", rows=8, columns=1024, workspace=1152):
     return N.from_source(
         f"""
-        def block8(n: N.int64):
+        def block8(n: N.i64):
             with N.Kernel(kind="vector"):
                 x = N.alloc_ub(({rows}, {columns}), N.f32)
                 workspace = N.alloc_ub((2, {workspace}), N.f32)

@@ -10,7 +10,7 @@ from ascendflow.passes.lower_pipeline import normalize_loop_controls
 
 def program(lower, upper, expression, *, step=1):
     module = N.from_source(f"""
-        def domain(n: N.int64):
+        def domain(n: N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for i in N.serial({lower},{upper},{step}):
@@ -47,7 +47,7 @@ def test_uniform_runtime_lower_is_preserved_in_the_range_proof():
 @pytest.mark.parametrize("origin", ["i-3", "i-8"])
 def test_unrelated_scalar_carry_does_not_hide_or_require_division_premises(origin):
     module = N.from_source(f"""
-        def carried(n: N.int64):
+        def carried(n: N.i64):
             with N.Kernel():
                 total=7
                 for k in N.serial(n):

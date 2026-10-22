@@ -65,7 +65,7 @@ def test_row_new_axis_does_not_create_a_dense_broadcast_buffer():
 def test_maximum_is_a_vector_primitive_with_ordinary_physical_effects():
     definition = T.from_source(
         """
-    def maximum(X:T.Tensor((n,64),T.f32), Y:T.Tensor((n,64),T.f32,access="write"), n:T.int64):
+    def maximum(X:T.Tensor((n,64),T.f32), Y:T.Tensor((n,64),T.f32,access="write"), n:T.i64):
         with T.Kernel():
             x=T.alloc_ub((64,),T.f32)
             y=T.alloc_ub((64,),T.f32)

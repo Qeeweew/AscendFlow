@@ -12,7 +12,7 @@ def cohort(X:N.Tensor((n,{pack},16,16),N.f16),B:N.Tensor((16,16),N.f16),
            Work:N.Tensor((2,{pack},16,16),N.f16,access="write"),
            Score:N.Tensor((2,{pack},16,16),N.f32,access="write"),
            Out:N.Tensor((n,{pack},16,16),N.f32,access="write",write_disjoint=True),
-           n:N.int64):
+           n:N.i64):
     with N.Kernel(1,kind="mixed"):
         x=N.alloc_ub((8,16),N.f16)
         y=N.alloc_ub((8,16),N.f32)

@@ -10,7 +10,7 @@ from ascendflow.diagnostics import CompileError
 @pytest.mark.parametrize("destination", ("0:16", "8:24"))
 def test_exact_and_shifted_overlaps_are_refused_without_memmove_assumptions(destination):
     text = f"""
-def overlap(n:N.int64):
+def overlap(n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((32,),N.f32)
         for tile in N.Pipelined(n):
@@ -23,7 +23,7 @@ def overlap(n:N.int64):
 
 def test_generation_dependent_aliases_are_not_assumed_disjoint():
     text = """
-def changing(n:N.int64):
+def changing(n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((3,8),N.f32)
         for tile in N.Pipelined(n):

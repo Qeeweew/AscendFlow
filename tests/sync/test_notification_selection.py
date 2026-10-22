@@ -218,7 +218,7 @@ def test_incomplete_mode2_quorum_stays_explicitly_unresolved(source):
 def test_unordered_same_engine_dependency_cannot_be_repaired_by_a_fence():
     with pytest.raises(CompileError, match="same-engine source"):
         selected("""
-        def bad(n:N.int64):
+        def bad(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((2,64))
                 for t in N.Pipelined(n):

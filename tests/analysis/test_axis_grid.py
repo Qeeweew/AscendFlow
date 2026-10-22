@@ -10,7 +10,7 @@ from tests.models.structured_events import EventModelError, check_structured_eve
 
 SOURCE = """
 def permuted(X:N.Tensor((4,n,64),N.f32),Y:N.Tensor((4,n,64),N.f32,access="write"),
-             n:N.int64(minimum=1)):
+             n:N.i64(minimum=1)):
     with N.Kernel(3) as group:
         x=N.alloc_ub((64,))
         for t in N.serial(N.ceildiv(N.max(0,4*n-group),3)):
@@ -63,7 +63,7 @@ def test_cyclic_prefix_translation_is_bijective_only_with_a_unique_source_coordi
 def test_contracted_child_digits_keep_their_actual_bounded_range():
     source = """
     def nested(X:N.Tensor((4,n,64),N.f32),
-               Y:N.Tensor((4,n,64),N.f32,access="write"),n:N.int64(minimum=16,multiple_of=16)):
+               Y:N.Tensor((4,n,64),N.f32,access="write"),n:N.i64(minimum=16,multiple_of=16)):
         with N.Kernel(3) as group:
             x=N.alloc_ub((64,))
             for t in N.serial(n//4):

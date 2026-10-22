@@ -16,7 +16,7 @@ from ascendflow.build import build_file
 def cache_sweep(
     X: T.Tensor((GROUPS, tiles, B), T.f32),
     Output: T.Tensor((GROUPS, B), T.f32, access="write"),
-    tiles: T.int64,
+    tiles: T.i64,
     B: T.constexpr = 8192,
     GROUPS: T.constexpr = 40,
 ):

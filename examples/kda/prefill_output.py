@@ -85,7 +85,7 @@ def prefill_output(
     OutputProducts: N.Tensor((GROUPS, 2, BT, 2 * K), N.f32, access="write"),
     Starts: N.Tensor((CHUNKS,), N.i64),
     Lengths: N.Tensor((CHUNKS,), N.i64),
-    TOKENS: N.int64(minimum=1),
+    TOKENS: N.i64(minimum=1),
     SEQUENCES: N.constexpr = 1,
     NC: N.constexpr = 2,
     CHUNKS: N.constexpr = 2,

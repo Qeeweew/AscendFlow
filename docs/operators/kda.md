@@ -12,7 +12,7 @@ Q/Key/Value/Output 为 FP16，Gate/Beta/State 为 FP32，开启 Q/K L2 归一化
 槽 0 为 inactive sentinel，禁止覆盖。数值验收检查完整输出、完整状态和槽 0，
 output/state relative RMSE 门槛均为 `<0.005`。
 
-`TOKENS: N.int64` 是运行时维度。Cu/Indices 是只读 GM int64 tensor；
+`TOKENS: N.i64` 是运行时维度。Cu/Indices 是只读 GM int64 tensor；
 Cu 单调，区间满足 `0 <= bos <= eos <= TOKENS` 且 `eos-bos <= 1`。
 Cu 的 `N.load_index` 范围限定实际 token 时钟，用于生成通知的整数算术；
 Indices 使用完整 int64 范围，不为间接地址额外填写范围提示。范围声明是调用方

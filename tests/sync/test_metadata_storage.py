@@ -140,7 +140,7 @@ def test_unrelated_metadata_read_preserves_an_ordinary_two_buffer_pipeline(metad
         """
     def buffered(X:N.Tensor((n,64),N.f32),Y:N.Tensor((n,64),N.f32),
                  Meta:N.Tensor((n,),N.i64),
-                 Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+                 Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.i64):
         with N.Kernel():
             a=N.alloc_ub((2,64))
             b=N.alloc_ub((64,))
@@ -165,7 +165,7 @@ def test_a_loaded_index_still_retains_real_aliases_and_repeated_slot_values(meta
     source = N.from_source(
         """
     def indexed(X:N.Tensor((n,64),N.f32),Meta:N.Tensor((n,),N.i64),
-                Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+                Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.i64):
         with N.Kernel():
             a=N.alloc_ub((2,64))
             for i in N.Pipelined(n):
@@ -187,7 +187,7 @@ def test_scalar_store_exit_still_publishes_before_vector_reads(metadata_values):
     source = N.from_source(
         """
 def store_exit(Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),
-               Meta:N.Tensor((n,),N.i64),n:N.int64):
+               Meta:N.Tensor((n,),N.i64),n:N.i64):
     with N.Kernel(1,kind="vector"):
         scalar=N.alloc_ub((8,),N.f32)
         row=N.alloc_ub((64,),N.f32)

@@ -209,7 +209,7 @@ def test_event_binding_must_preserve_the_same_generation_at_both_ends():
 
 def finite_ports(*, at_most_one=False):
     selection = selected("""
-    def anchors(X:N.Tensor((n,64),N.f32),n:N.int64):
+    def anchors(X:N.Tensor((n,64),N.f32),n:N.i64):
         with N.Kernel():
             a,b=N.alloc_ub((2,64)),N.alloc_ub((2,64))
             for j in N.Pipelined(n):

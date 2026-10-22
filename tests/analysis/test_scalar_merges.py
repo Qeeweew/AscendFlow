@@ -22,7 +22,7 @@ def choose(body):
     return N.from_source(
         """
 def choose(X:N.Tensor((128,64),N.f32), I:N.Tensor((1,),N.i32),
-           O:N.Tensor((64,),N.f32,access="write"), n:N.int64):
+           O:N.Tensor((64,),N.f32,access="write"), n:N.i64):
     with N.Kernel():
         row=N.alloc_ub((64,),N.f32)
         n=N.min(n,64)

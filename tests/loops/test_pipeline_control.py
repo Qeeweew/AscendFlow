@@ -21,7 +21,7 @@ from examples.vector.scale import scale
 @pytest.mark.parametrize("depth", (0, 1, 2, 4, 32))
 def test_shifted_domains_preserve_each_stage_instance_and_physical_issue_order(depth):
     lines = [
-        "def stages(n:N.int64):",
+        "def stages(n:N.i64):",
         "    with N.Kernel():",
         "        x=N.alloc_ub((64,))",
         "        for g in N.Pipelined(n):",
@@ -53,7 +53,7 @@ def test_shifted_domains_preserve_each_stage_instance_and_physical_issue_order(d
 
 def test_stage_depth_does_not_remove_release_distance_boundary_guards():
     module = N.from_source("""
-        def reuse(n:N.int64):
+        def reuse(n:N.i64):
             with N.Kernel():
                 for g in N.Pipelined(n):
                     pass
@@ -87,7 +87,7 @@ def test_control_collection_round_trips_without_mutating_or_cloning_source():
 
 
 NESTED = """
-def nested(n: N.int64, k: N.int64, PARTS: N.constexpr=3):
+def nested(n: N.i64, k: N.i64, PARTS: N.constexpr=3):
     with N.Kernel():
         x=N.alloc_ub((64,))
         N.fill(x,0.0)
@@ -145,7 +145,7 @@ def test_large_constant_loop_uses_identical_control_work():
 
 @pytest.mark.parametrize("depth", (1, 2, 4))
 def test_nested_bodies_have_additive_phase_size_not_three_to_the_depth(depth):
-    source = ["def nested(n: N.int64):", "    with N.Kernel():", "        x=N.alloc_ub((64,))"]
+    source = ["def nested(n: N.i64):", "    with N.Kernel():", "        x=N.alloc_ub((64,))"]
     for level in range(depth):
         indent = " " * (8 + 8 * level)
         source.append(indent + f"for i{level} in N.Pipelined(n):")
@@ -168,7 +168,7 @@ def test_nested_bodies_have_additive_phase_size_not_three_to_the_depth(depth):
 
 def test_scalar_carry_is_retained_as_control_not_silently_accepted_as_sync():
     module = N.from_source("""
-        def carry(n: N.int64):
+        def carry(n: N.i64):
             with N.Kernel():
                 total=0
                 for i in N.serial(n):

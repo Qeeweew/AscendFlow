@@ -9,7 +9,7 @@ from ascendflow.passes.structured_sync import synchronize_structure
 from tests.models.structured_events import EventModelError, check_compiled_events
 
 SOURCE = """
-def overlay(A:N.Tensor((32,64),N.bf16), B:N.Tensor((32,64),N.bf16), n:N.int64):
+def overlay(A:N.Tensor((32,64),N.bf16), B:N.Tensor((32,64),N.bf16), n:N.i64):
     with N.Kernel(kind="cube"):
         x=N.alloc_l1((32,64),N.bf16)
         y=N.alloc_l0a((32,64),N.bf16)
@@ -20,7 +20,7 @@ def overlay(A:N.Tensor((32,64),N.bf16), B:N.Tensor((32,64),N.bf16), n:N.int64):
 """
 
 INITIALIZE_SUBVIEW = """
-def initialize(A:N.Tensor((16,64),N.bf16), B:N.Tensor((16,64),N.bf16), n:N.int64):
+def initialize(A:N.Tensor((16,64),N.bf16), B:N.Tensor((16,64),N.bf16), n:N.i64):
     with N.Kernel(kind="cube"):
         x=N.alloc_l1((32,64),N.bf16)
         y=N.alloc_l0a((16,64),N.bf16)
@@ -146,7 +146,7 @@ def test_runtime_prefix_alone_still_cannot_initialize_the_pitched_subview():
 
 
 JOINED = """
-def joined(A:N.Tensor((128,128),N.bf16), B:N.Tensor((128,128),N.bf16), n:N.int64):
+def joined(A:N.Tensor((128,128),N.bf16), B:N.Tensor((128,128),N.bf16), n:N.i64):
     with N.Kernel(kind="cube"):
         x=N.alloc_l1((128,128),N.bf16)
         y=N.alloc_l0a((128,128),N.bf16)

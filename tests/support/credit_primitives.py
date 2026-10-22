@@ -24,7 +24,7 @@ from tests.support.structured import allocated
 
 LOCAL_SOURCE = """
 def local_free(X:N.Tensor((n,4,64),N.f32),
-               Out:N.Tensor((n,4,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+               Out:N.Tensor((n,4,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="vector"):
         scratch=N.alloc_ub((2,64),N.f32)
         with N.Vector():
@@ -40,7 +40,7 @@ def local_free(X:N.Tensor((n,4,64),N.f32),
 CROSS_SOURCE = """
 def cross_free(X:N.Tensor((16,16),N.f16),
                Work:N.Tensor((2,16,16),N.f32,access="write"),
-               Out:N.Tensor((n,4,16,16),N.f32,access="write",write_disjoint=True),n:N.int64):
+               Out:N.Tensor((n,4,16,16),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel(1,kind="mixed"):
         a1=N.alloc_l1((16,16),N.f16)
         b1=N.alloc_l1((16,16),N.f16)

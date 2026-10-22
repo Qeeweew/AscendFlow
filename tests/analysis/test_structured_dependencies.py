@@ -101,7 +101,7 @@ def test_zero_loop_is_identity_between_actual_parent_writer_and_reader():
 
 def test_read_only_child_captures_every_reader_before_parent_overwrite():
     source = """
-        def readers(n:N.int64):
+        def readers(n:N.i64):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
                 N.fill(x,0.0)
@@ -119,7 +119,7 @@ def test_read_only_child_captures_every_reader_before_parent_overwrite():
 
 def test_rmw_same_task_next_generation_is_a_real_dependency():
     result = dependencies("""
-        def rmw(n:N.int64):
+        def rmw(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 N.fill(x,1.0)
@@ -138,7 +138,7 @@ def test_rmw_same_task_next_generation_is_a_real_dependency():
 
 def test_first_and_last_branches_preserve_values_without_phase_case_products():
     source = """
-        def phases(n:N.int64):
+        def phases(n:N.i64):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
                 for j in N.Pipelined(n):
@@ -156,7 +156,7 @@ def test_first_and_last_branches_preserve_values_without_phase_case_products():
 @pytest.mark.parametrize("width", [2, 3])
 def test_compound_slot_short_and_long_children_preserve_actual_byte_values(width):
     source = f"""
-        def slots(q:N.int64,k:N.int64):
+        def slots(q:N.i64,k:N.i64):
             with N.Kernel():
                 x,y=N.alloc_ub(({width},64)),N.alloc_ub(({width},64))
                 for parent in N.serial(q):
@@ -265,7 +265,7 @@ def test_nonzero_serial_start_and_step_accept_both_last_and_absent_branch(last):
 
 def test_parent_dependent_possibly_empty_child_does_not_invent_last_writer():
     result = dependencies("""
-        def holes(n:N.int64):
+        def holes(n:N.i64):
             with N.Kernel():
                 x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
                 N.fill(x,1.0)
@@ -301,7 +301,7 @@ def test_contracted_family_preserves_order_for_shifted_or_invariant_aliases(read
 
 def test_unknown_symbolic_alias_keeps_waw_without_inventing_a_complete_definition():
     result = dependencies("""
-        def aliases(a:N.int64(minimum=1),b:N.int64(minimum=1)):
+        def aliases(a:N.i64(minimum=1),b:N.i64(minimum=1)):
             with N.Kernel():
                 x=N.alloc_ub((256,))
                 N.fill(x[a*32:a*32+32],1.0)
@@ -314,7 +314,7 @@ def test_unknown_symbolic_alias_keeps_waw_without_inventing_a_complete_definitio
 
 def test_unknown_scalar_carry_is_not_a_loop_invariant_branch():
     result = dependencies("""
-        def alternating(X:N.Tensor((64,),N.f32),n:N.int64):
+        def alternating(X:N.Tensor((64,),N.f32),n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 flag=0

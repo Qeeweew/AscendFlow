@@ -537,7 +537,7 @@ def test_public_compile_simplifies_final_ssa_once_after_notification_materializa
     from ascendflow.passes import structured_sync
 
     source = N.from_source("""
-        def wired(n: N.int64):
+        def wired(n: N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for i in N.Pipelined(n):

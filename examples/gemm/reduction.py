@@ -15,7 +15,7 @@ def reduction_gemm(
     A: T.Tensor((GROUPS, panels, M, BK), DTYPE),  # noqa: F821
     B: T.Tensor((GROUPS, panels, N if TRANSPOSE_B else BK, BK if TRANSPOSE_B else N), DTYPE),  # noqa: F821
     C: T.Tensor((GROUPS, M, N), T.f32, access="write"),  # noqa: F821
-    panels: T.int64,
+    panels: T.i64,
     M: T.constexpr = 32,
     N: T.constexpr = 64,
     BK: T.constexpr = 64,

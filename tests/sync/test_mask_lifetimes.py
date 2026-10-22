@@ -34,7 +34,7 @@ def test_partial_update_preserves_initialized_lanes_and_rejects_uninitialized():
     assert "PIPE_ALL" not in asc
     uninitialized = N.from_source(
         """
-        def kernel(Y:N.Tensor((16,256),N.f32,access="write"), q:N.int64):
+        def kernel(Y:N.Tensor((16,256),N.f32,access="write"), q:N.i64):
             with N.Kernel(1, kind="vector"):
                 work=N.alloc_ub((16,256),N.f32)
                 rows=N.arange(16)[:, None]
@@ -168,7 +168,7 @@ def test_materialized_coordinate_predicate_combines_coherently():
 def test_mask_alternates_with_count_packets_without_incoming_state():
     program = N.from_source(
         """
-        def kernel(X:N.Tensor((8,128),N.f32), Y:N.Tensor((8,128),N.f32,access="write"), q:N.int64):
+        def kernel(X:N.Tensor((8,128),N.f32), Y:N.Tensor((8,128),N.f32,access="write"), q:N.i64):
             with N.Kernel(1, kind="vector"):
                 work=N.alloc_ub((8,128),N.f32)
                 N.copy(X,work)

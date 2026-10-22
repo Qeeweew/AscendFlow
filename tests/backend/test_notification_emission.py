@@ -206,7 +206,7 @@ def test_guarded_event_and_first_last_arithmetic_stay_inside_short_circuit(tmp_p
 
     _, facts = memory(
         N.from_source("""
-        def guarded(n:N.int64):
+        def guarded(n:N.i64):
             with N.Kernel():
                 pass
     """)
@@ -337,7 +337,7 @@ int main(){
 
 def test_notification_ssa_binds_actual_nested_serial_and_pipeline_coordinates(tmp_path):
     source = N.from_source("""
-        def coordinates(n:N.int64,k:N.int64):
+        def coordinates(n:N.i64,k:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for i in N.serial(1,n,2):

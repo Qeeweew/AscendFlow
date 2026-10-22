@@ -76,7 +76,7 @@ def test_static_ranges_skip_empty_work_and_retain_large_device_loops(extent):
 )
 def test_edge_specialization_rejects_invalid_or_dynamic_geometry(extent, width, target, diagnostic):
     program = T.from_source(f"""
-        def invalid(n:T.int64):
+        def invalid(n:T.i64):
             with T.Kernel():
                 for {target} in T.tile_ranges({extent},{width}):
                     pass
@@ -207,7 +207,7 @@ def test_inline_early_returns_cannot_select_a_runtime_branch_on_the_host():
         return 0
 
     program = T.from_source(
-        "def invalid(n:T.int64):\n    with T.Kernel():\n        result=helper(n)",
+        "def invalid(n:T.i64):\n    with T.Kernel():\n        result=helper(n)",
         functions={"helper": helper},
     )
     with pytest.raises(FrontendError, match="only one final return"):

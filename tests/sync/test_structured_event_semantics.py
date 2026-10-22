@@ -249,7 +249,7 @@ def test_binary_event_consumption_must_precede_reuse_across_actual_body_invocati
 def test_finite_zero_single_and_short_actual_pipeline_instances(count):
     facts = native_memory(
         N.from_source("""
-        def short(n:N.int64):
+        def short(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((8,))
                 for t in N.Pipelined(n):

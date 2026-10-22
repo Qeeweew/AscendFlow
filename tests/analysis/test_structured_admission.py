@@ -31,7 +31,7 @@ def _admit(text):
     return admit_structured_memory(*_inputs(N.from_source(text, disjoint_external=True)))
 
 
-def _vector(body, signature="n:N.int64(minimum=1)"):
+def _vector(body, signature="n:N.i64(minimum=1)"):
     return f"""
         def vector({signature}):
             with N.Kernel():
@@ -48,7 +48,7 @@ def _last_source(minimum, *, overwritten=False):
             "                for i in N.Pipelined(n):\n                    N.fill(x[0:64],1.0)\n"
             + tail
             + "                N.mul(x[0:64],2.0,out=y)",
-            f"n:N.int64(minimum={minimum})",
+            f"n:N.i64(minimum={minimum})",
         ),
         disjoint_external=True,
     ).to_ir()
@@ -134,7 +134,7 @@ def test_first_logical_iteration_initialization_is_an_inductive_value_fact():
                     if i == 0:
                         N.fill(x,1.0)
                     N.mul(x[0:64],2.0,out=y)""",
-            "n:N.int64",
+            "n:N.i64",
         )
     )
     assert admission.work["read_proofs"] == 1
@@ -150,7 +150,7 @@ def test_maybe_empty_sibling_loops_keep_their_own_initializing_writers(initializ
         "                for j in N.serial(m):\n"
         + second
         + "                    N.mul(x[0:64],4.0,out=y)",
-        "n:N.int64, m:N.int64",
+        "n:N.i64, m:N.i64",
     )
     if initialize_second:
         assert _admit(text).work["read_proofs"] == 2
@@ -165,7 +165,7 @@ def test_closed_runtime_loop_needs_a_proven_first_writer_before_an_outside_read(
         """                for i in N.Pipelined(n):
                     N.fill(x,1.0)
                 N.mul(x[0:64],2.0,out=y)""",
-        f"n:N.int64(minimum={minimum})",
+        f"n:N.i64(minimum={minimum})",
     )
     if accepted:
         assert _admit(text).work["read_proofs"] == 1
@@ -181,7 +181,7 @@ def test_child_initialization_uses_parent_domain_without_erasing_empty_children(
                     for child in N.Pipelined({count}):
                         N.fill(x,1.0)
                     N.mul(x[0:64],2.0,out=y)""",
-        "n:N.int64",
+        "n:N.i64",
     )
     if accepted:
         assert _admit(text).work["read_proofs"] == 1
@@ -198,7 +198,7 @@ def test_child_nonempty_in_an_active_parent_does_not_initialize_after_an_empty_p
                     for child in N.Pipelined(N.min(2,parent+1)):
                         N.fill(x,1.0)
                 N.mul(x[0:64],2.0,out=y)""",
-                "n:N.int64",
+                "n:N.i64",
             )
         )
 
@@ -386,7 +386,7 @@ def test_register_configuration_has_one_actual_invariant_writer():
 
 def test_dynamic_scalar_ranges_do_not_create_a_host_admission_contract():
     admission = _admit("""
-        def dynamic(n:N.int64(minimum=1)):
+        def dynamic(n:N.i64(minimum=1)):
             with N.Kernel(20) as group:
                 x=N.alloc_ub((64,))
                 for i in N.serial(N.ceildiv(N.max(0,n*n-group),20)):

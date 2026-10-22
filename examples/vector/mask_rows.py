@@ -28,9 +28,9 @@ def mask_rows(
     Y0: N.Tensor((ROWS, COLUMNS), N.f32, access="write", write_disjoint=True),
     Y1: N.Tensor((ROWS, COLUMNS), N.f32, access="write", write_disjoint=True),
     Y2: N.Tensor((ROWS, COLUMNS), N.f32, access="write", write_disjoint=True),
-    q: N.int64,
-    lo: N.int64,
-    hi: N.int64,
+    q: N.i64,
+    lo: N.i64,
+    hi: N.i64,
     ROWS: N.constexpr = 4,
     COLUMNS: N.constexpr = 256,
 ):

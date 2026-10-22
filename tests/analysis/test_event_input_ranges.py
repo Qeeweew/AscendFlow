@@ -23,7 +23,7 @@ from ascendflow.target.ascend910b import Actor
 @pytest.fixture(scope="module")
 def inputs():
     source = N.from_source("""
-def input_scopes(First:N.Tensor((n,),N.i64),Second:N.Tensor((n,8),N.i64),n:N.int64):
+def input_scopes(First:N.Tensor((n,),N.i64),Second:N.Tensor((n,8),N.i64),n:N.i64):
     with N.Kernel(1,kind="vector"):
         x=N.alloc_ub((64,),N.f32)
         for i in N.serial(n):

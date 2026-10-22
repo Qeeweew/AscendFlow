@@ -24,7 +24,7 @@ from tests.models.structured_events import (
 from tests.models.terminal_trace import trace
 
 NESTED = """
-def packets(q:N.int64,n:N.int64):
+def packets(q:N.i64,n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((64,))
         for query in N.serial(q):
@@ -269,7 +269,7 @@ def test_same_prefix_fences_union_guards_and_keep_all_origins(guards):
 @pytest.mark.parametrize("boundary", ["native", "loop", "opaque"])
 def test_fences_do_not_cross_new_work_loops_or_unmodeled_effects(boundary):
     source = N.from_source("""
-        def work(n:N.int64):
+        def work(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 N.fill(x,1.0)
@@ -315,7 +315,7 @@ def test_fence_merge_keeps_other_pipe_and_event_instruction_boundaries(middle):
 
 def test_fence_coalescing_preserves_finite_byte_dependencies_and_required_fences():
     source = N.from_source("""
-        def work(n:N.int64):
+        def work(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for i in N.serial(n):
@@ -364,7 +364,7 @@ def test_fence_coalescing_preserves_finite_byte_dependencies_and_required_fences
 
 def test_fence_union_preserves_each_aiv_existence_domain_in_the_shared_body():
     source = N.from_source("""
-        def shared(n:N.int64):
+        def shared(n:N.i64):
             with N.Kernel(kind="mixed"):
                 x=N.alloc_ub((64,))
                 with N.Vector():
@@ -508,7 +508,7 @@ def test_packet_entry_cannot_reuse_a_range_established_only_under_its_old_guard(
 
 def test_contiguous_native_blocks_share_the_condition_without_crossing_an_effect():
     source = N.from_source("""
-        def blocks(n:N.int64):
+        def blocks(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for i in N.serial(n):
@@ -537,7 +537,7 @@ def test_contiguous_native_blocks_share_the_condition_without_crossing_an_effect
 @pytest.mark.parametrize("period", [2, 3, 4, 8])
 def test_untaken_prefix_and_total_bitmask_extension_preserve_unsigned_evaluation(period):
     source = N.from_source("""
-        def protected(n:N.int64):
+        def protected(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 N.fill(x,1.0)

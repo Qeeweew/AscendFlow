@@ -14,7 +14,7 @@ def batched_matmul(
     A: T.Tensor((GROUPS, tiles, M, K), DTYPE),  # noqa: F821
     B: T.Tensor((GROUPS, tiles, N if TRANSPOSE_B else K, K if TRANSPOSE_B else N), DTYPE),  # noqa: F821
     C: T.Tensor((GROUPS, tiles, M, N), T.f32, access="write"),  # noqa: F821
-    tiles: T.int64,
+    tiles: T.i64,
     M: T.constexpr = 32,
     N: T.constexpr = 64,
     K: T.constexpr = 64,

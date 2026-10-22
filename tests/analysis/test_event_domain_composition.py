@@ -7,7 +7,7 @@ import pytest
 from tests.support.structured import prepared, selected
 
 NESTED = """
-def nested(X:N.Tensor((n,2,64),N.f32),n:N.int64):
+def nested(X:N.Tensor((n,2,64),N.f32),n:N.i64):
     with N.Kernel():
         x=N.alloc_ub((2,64))
         for outer in N.serial(n):

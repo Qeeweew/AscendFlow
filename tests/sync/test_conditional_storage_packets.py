@@ -28,7 +28,7 @@ from tests.support.structured import allocated, native_memory
 SCRATCH_CALLS = """
 def scratch_calls(X:N.Tensor((n,2,4,64),N.f32),
                   Out:N.Tensor((n,2,4,64),N.f32,access="write",write_disjoint=True),
-                  n:N.int64):
+                  n:N.i64):
     with N.Kernel(1,kind="vector"):
         scratch=N.alloc_ub((2,64),N.f32)
         with N.Vector():
@@ -65,7 +65,7 @@ def test_closed_calls_keep_real_prefixes_across_empty_and_short_children(compile
 
 def test_scratch_value_escaping_a_skipped_child_prevents_packet_reordering():
     source = SCRATCH_CALLS.replace(
-        "n:N.int64):", 'Tail:N.Tensor((64,),N.f32,access="write"), n:N.int64):'
+        "n:N.i64):", 'Tail:N.Tensor((64,),N.f32,access="write"), n:N.i64):'
     )
     source += "\n            N.copy(scratch[1,:],Tail[:])\n"
     memory = collect_native_memory(lower_native_structure(N.from_source(source)).module)

@@ -55,7 +55,7 @@ def test_same_loop_stages_share_logical_ordinal_without_claiming_same_dispatch_s
 
 def test_distinct_loop_operations_never_share_a_clock_by_label_or_bound():
     source = N.from_source("""
-        def sibling(n:N.int64):
+        def sibling(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for a in N.Pipelined(n):
@@ -114,7 +114,7 @@ def test_shared_vector_domain_has_two_participants_but_one_symbolic_sid():
 
 def test_scalar_carry_retains_unknown_range_instead_of_an_assumed_nonnegative_value():
     source = N.from_source("""
-        def carry(n:N.int64):
+        def carry(n:N.i64):
             with N.Kernel():
                 count=0
                 for i in N.serial(n):
@@ -191,7 +191,7 @@ def test_complete_tiles_use_floor_bound_without_requiring_length_multiple():
     from ascendflow.analysis.structured_memory import collect_native_memory
 
     source = N.from_source("""
-        def full_tiles(X:N.Tensor((n,),N.f32),n:N.int64):
+        def full_tiles(X:N.Tensor((n,),N.f32),n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for i in N.Pipelined(n//64):

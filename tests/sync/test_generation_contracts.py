@@ -279,7 +279,7 @@ def test_finite_fragment_sharing_also_checks_its_later_loop():
     source = finite_independent_cells(scalar=True).source
     source = source.replace(
         'def finite(O:N.Tensor((9,64),N.f32,access="write")):',
-        'def finite(O:N.Tensor((9,64),N.f32,access="write"),n:N.int64):',
+        'def finite(O:N.Tensor((9,64),N.f32,access="write"),n:N.i64):',
     )
     source += "        for j in N.Pipelined(n):\n            N.fill(x0,2.0)\n            N.load_scalar(x0[:1])\n"
     plan = synchronize_structure(N.from_source(source, disjoint_external=True))
@@ -305,7 +305,7 @@ def test_a_proved_absent_domain_does_not_consume_finite_event_capacity():
     source = finite_independent_cells(scalar=False).source
     source = source.replace(
         'def finite(O:N.Tensor((9,64),N.f32,access="write")):',
-        'def finite(O:N.Tensor((9,64),N.f32,access="write"),n:N.int64):',
+        'def finite(O:N.Tensor((9,64),N.f32,access="write"),n:N.i64):',
     )
     lines = source.splitlines()
     start = next(i for i, line in enumerate(lines) if "N.fill" in line)

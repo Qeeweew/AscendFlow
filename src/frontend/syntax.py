@@ -12,11 +12,18 @@ from .contracts import IntegerContract
 
 
 class DType(StrEnum):
+    """Element types shared by tensor storage and supported scalar parameters."""
+
     F32 = "f32"
     F16 = "f16"
     BF16 = "bf16"
     I32 = "i32"
     I64 = "i64"
+
+    def __call__(self, *, minimum=0, multiple_of=1):
+        """Attach a caller input contract to an i64 parameter annotation."""
+        require(self is DType.I64, "runtime input contracts require i64")
+        return IntegerContract(minimum, multiple_of)
 
 
 f32, f16, bf16 = DType.F32, DType.F16, DType.BF16
@@ -24,15 +31,10 @@ i32, i64 = DType.I32, DType.I64
 
 
 class _ParameterType(StrEnum):
-    INT64 = "int64"
     CONSTEXPR = "constexpr"
 
-    def __call__(self, *, minimum=0, multiple_of=1):
-        require(self is _ParameterType.INT64, "only int64 accepts runtime input contracts")
-        return IntegerContract(minimum, multiple_of)
 
-
-int64, constexpr = _ParameterType.INT64, _ParameterType.CONSTEXPR
+constexpr = _ParameterType.CONSTEXPR
 
 
 @dataclass(frozen=True)

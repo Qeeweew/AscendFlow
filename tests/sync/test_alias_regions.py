@@ -16,7 +16,7 @@ from tests.models.structured_events import EventModelError, check_structured_eve
 
 ALIASES = """
 def aliases(X:N.Tensor((2,64),N.f32),Y:N.Tensor((n,64),N.f32,access="write"),
-            n:N.int64,a:N.int64,b:N.int64,c:N.int64):
+            n:N.i64,a:N.i64,b:N.i64,c:N.i64):
     with N.Kernel():
         x=N.alloc_ub((4,64))
         y=N.alloc_ub((64,))
@@ -47,7 +47,7 @@ def test_uncertain_aliases_keep_both_reader_engines_and_empty_short_loop_version
 
 def test_uncertain_waw_without_a_reader_still_needs_completion():
     final, original = _memory("""
-    def writes(X:N.Tensor((64,),N.f32),a:N.int64,b:N.int64):
+    def writes(X:N.Tensor((64,),N.f32),a:N.i64,b:N.i64):
         with N.Kernel():
             x=N.alloc_ub((4,64))
             N.fill(x[a%4,:],1.0)
@@ -83,7 +83,7 @@ def test_alias_regions_are_ordering_facts_not_exact_kills_or_private_packet_cred
 
 def test_shifted_ring_reads_preserve_the_previous_iteration_value():
     final, original = _memory("""
-    def shifted(X:N.Tensor((n,64),N.f32),Y:N.Tensor((n,64),N.f32,access="write"),n:N.int64):
+    def shifted(X:N.Tensor((n,64),N.f32),Y:N.Tensor((n,64),N.f32,access="write"),n:N.i64):
         with N.Kernel():
             x=N.alloc_ub((2,64))
             N.fill(x,1.0)
@@ -104,7 +104,7 @@ def test_uncertain_shared_gm_retains_both_aiv_readers_and_actual_quorum():
     def mixed(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
               Work:N.Tensor((2,16,16),N.f32,access="write"),
               Y:N.Tensor((n,16,16),N.f32,access="write",write_disjoint=True),
-              n:N.int64,a:N.int64):
+              n:N.i64,a:N.i64):
         with N.Kernel(1,kind="mixed"):
             a1=N.alloc_l1((16,16),N.f16)
             b1=N.alloc_l1((16,16),N.f16)
@@ -159,7 +159,7 @@ def test_shared_enclosures_keep_group_slots_and_both_aiv_publications():
     from ascendflow.target.ascend910b import Actor
 
     final, original = _memory("""
-def shared(Work:N.Tensor((2,3,16,16),N.f16,access="write"),n:N.int64):
+def shared(Work:N.Tensor((2,3,16,16),N.f16,access="write"),n:N.i64):
     with N.Kernel(2,kind="mixed") as group:
         x=N.alloc_ub((8,16),N.f16)
         values=N.alloc_ub((8,16),N.f32)
@@ -202,7 +202,7 @@ def _fragment_ring(slots, *, complete=True, surrounding=False):
     final = "        N.copy(A,x[0,:,:])" if surrounding else ""
     fill = "N.copy(A,x[slot,:,:])" if complete else "pass"
     return f"""
-def fragments(A:N.Tensor((16,32),N.f16),Rows:N.Tensor((4,),N.i32),n:N.int64):
+def fragments(A:N.Tensor((16,32),N.f16),Rows:N.Tensor((4,),N.i32),n:N.i64):
     with N.Kernel(kind="cube"):
         x=N.alloc_l1(({slots},16,32),N.f16)
         a0=N.alloc_l0a((2,16,32),N.f16)
@@ -276,7 +276,7 @@ def test_linear_enclosures_preserve_both_vector_and_dma_last_readers(slots, monk
     _metadata_rows(monkeypatch, (0, 7, 3, 6))
     final, original = _memory(f"""
 def fragments(A:N.Tensor((4,64),N.f32),Rows:N.Tensor((4,),N.i32),
-              O:N.Tensor((n,8,64),N.f32,access="write",write_disjoint=True),n:N.int64):
+              O:N.Tensor((n,8,64),N.f32,access="write",write_disjoint=True),n:N.i64):
     with N.Kernel():
         x=N.alloc_ub(({slots},8,64),N.f32)
         y=N.alloc_ub((8,64),N.f32)

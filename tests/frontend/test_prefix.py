@@ -10,7 +10,7 @@ from tests.fixtures.prefix import scale_prefix
 
 def test_incorrect_valid_expression_is_not_treated_as_padding():
     definition = from_source("""
-        def invalid(X: N.Tensor((n,), N.f32), n: N.int64):
+        def invalid(X: N.Tensor((n,), N.f32), n: N.i64):
             with N.Kernel():
                 x = N.alloc_ub((2, 64))
                 for t in N.Pipelined(N.ceildiv(n, 64)):

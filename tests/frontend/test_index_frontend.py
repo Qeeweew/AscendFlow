@@ -27,7 +27,7 @@ from tests.models.source_index import evaluate
 BNSD_COPY = """
     def tiled(X: N.Tensor((B,H,S,D),N.f32),
               Y: N.Tensor((B,H,S,D),N.f32,access="write"),
-              S: N.int64(minimum=1,multiple_of=R),
+              S: N.i64(minimum=1,multiple_of=R),
               B: N.constexpr=2,H: N.constexpr=3,R: N.constexpr=16,
               D: N.constexpr=64,GROUPS: N.constexpr=20):
         with N.Kernel(GROUPS) as group:
@@ -118,7 +118,7 @@ def test_serial_coordinate_times_uniform_factor_and_shifted_division_use_whole_e
     module = parse(
         dump(
             N.from_source("""
-                def linearized(n: N.int64(minimum=1),m: N.int64(minimum=1)):
+                def linearized(n: N.i64(minimum=1),m: N.i64(minimum=1)):
                     with N.Kernel():
                         x=N.alloc_ub((2,64))
                         for outer in N.serial(n):
@@ -225,7 +225,7 @@ def test_valid_prefix_is_an_explicit_index_operand_with_verified_provenance():
     module = parse(
         dump(
             N.from_source("""
-                def masked(n: N.int64):
+                def masked(n: N.i64):
                     with N.Kernel():
                         x=N.alloc_ub((64,))
                         y=N.alloc_ub((64,))

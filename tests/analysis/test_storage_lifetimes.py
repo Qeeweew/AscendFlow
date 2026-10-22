@@ -19,7 +19,7 @@ from tests.support.structured import selected
 def scratch(order=("b_fill", "b_read", "a_fill", "a_read")):
     return N.from_source(
         f"""
-        def scratch(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.int64):
+        def scratch(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.i64):
             with N.Kernel():
                 s = N.alloc_ub((64,))
                 for g in N.Pipelined(n, issue_order={order!r}):
@@ -56,7 +56,7 @@ def test_shifted_private_packets_keep_values_through_fill_and_drain():
     result = synchronize_structure(
         N.from_source(
             """
-        def shifted(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.int64):
+        def shifted(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.i64):
             with N.Kernel():
                 s=N.alloc_ub((64,))
                 for g in N.Pipelined(n,issue_order=("a","b")):
@@ -89,7 +89,7 @@ def test_shifted_private_packets_keep_values_through_fill_and_drain():
 def test_same_vector_overwrite_before_the_old_value_read_is_rejected():
     source = N.from_source(
         """
-        def clobber(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.int64):
+        def clobber(O:N.Tensor((n,2,64),N.f32,access="write"), n:N.i64):
             with N.Kernel():
                 s,x,y=N.alloc_ub((64,)),N.alloc_ub((64,)),N.alloc_ub((64,))
                 for g in N.Pipelined(n,

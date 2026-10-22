@@ -111,7 +111,7 @@ def assert_actual_order(domains, uniform, actor):
 @pytest.fixture(scope="module")
 def flat():
     return domains_for("""
-    def flat(X:N.Tensor((64,),N.f32),n:N.int64):
+    def flat(X:N.Tensor((64,),N.f32),n:N.i64):
         with N.Kernel(kind="mixed"):
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
             with N.Vector():
@@ -178,7 +178,7 @@ def test_last_selected_member_keeps_its_residue_order_condition(flat):
 @pytest.mark.parametrize("count", (0, 1, 2))
 def test_nested_sibling_and_direct_parent_order_matches_retained_ir(actor, count):
     domains = domains_for("""
-    def nested(X:N.Tensor((64,),N.f32),n:N.int64):
+    def nested(X:N.Tensor((64,),N.f32),n:N.i64):
         with N.Kernel(kind="mixed"):
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
             with N.Vector():

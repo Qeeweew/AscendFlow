@@ -20,7 +20,7 @@ from tests.models.structured_events import _Interpret, check_structured_events
 from tests.models.terminal_trace import trace
 
 NESTED = """
-def clocks(n:N.int64,m:N.int64):
+def clocks(n:N.i64,m:N.i64):
     with N.Kernel():
         x=N.alloc_ub((64,))
         for i in N.Pipelined(n,issue_order=("late","early")):
@@ -81,7 +81,7 @@ def test_unbounded_count_clock_has_defined_arithmetic_at_int64_edges():
     memory = collect_native_memory(
         lower_native_structure(
             N.from_source("""
-        def edges(n:N.int64):
+        def edges(n:N.i64):
             with N.Kernel():
                 x=N.alloc_ub((64,))
                 for g in N.Pipelined(n):
@@ -163,7 +163,7 @@ def test_public_static_int64_count_does_not_require_an_overflowing_count_plus_ho
 def test_cyclic_owner_range_simplifies_a_constant_quotient_on_the_public_path():
     source = N.from_source(
         """
-        def grouped(X:N.Tensor((n,64),N.f32),n:N.int64(minimum=1)):
+        def grouped(X:N.Tensor((n,64),N.f32),n:N.i64(minimum=1)):
             with N.Kernel(7) as group:
                 x=N.alloc_ub((64,))
                 for local in N.serial(N.ceildiv(N.max(0,n-group),7)):
@@ -186,7 +186,7 @@ def test_joint_quotient_bound_retains_a_uniform_divisor_with_rational_coefficien
     source = N.from_source(
         """
         def grouped_radix(X:N.Tensor((n,64),N.f32),
-                          n:N.int64(minimum=1,multiple_of=64)):
+                          n:N.i64(minimum=1,multiple_of=64)):
             with N.Kernel(7) as group:
                 x=N.alloc_ub((64,))
                 tiles=n//64

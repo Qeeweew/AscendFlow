@@ -15,8 +15,8 @@ def hierarchical_gemm(
     A: T.Tensor((GROUPS, outputs, panels, M, BK), DTYPE),  # noqa: F821
     B: T.Tensor((GROUPS, outputs, panels, N, BK), DTYPE),  # noqa: F821
     C: T.Tensor((GROUPS, outputs, M, N), T.f32, access="write"),  # noqa: F821
-    outputs: T.int64,
-    panels: T.int64,
+    outputs: T.i64,
+    panels: T.i64,
     M: T.constexpr = 32,
     N: T.constexpr = 64,
     BK: T.constexpr = 64,

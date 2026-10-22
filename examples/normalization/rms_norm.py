@@ -32,7 +32,7 @@ def rms_compute(x, slot, y, partial, statistics, D, EPS, constant):
 def rms_normalize(
     X: N.Tensor((GROUPS, rows, D), N.f32),  # noqa: F821 - DSL signature scope
     Y: N.Tensor((GROUPS, rows, D), N.f32, access="write"),  # noqa: F821
-    rows: N.int64,
+    rows: N.i64,
     D: N.constexpr = 4096,
     GROUPS: N.constexpr = 32,
     EPS: N.constexpr = 1e-6,

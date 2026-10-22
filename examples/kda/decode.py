@@ -27,7 +27,7 @@ def decode_kda(
     Cu: N.Tensor((SEQUENCES + 1,), N.i64),
     Indices: N.Tensor((SEQUENCES, 1), N.i64),
     Accepted: N.Tensor((SEQUENCES,), N.i64),
-    TOKENS: N.int64,
+    TOKENS: N.i64,
     SEQUENCES: N.constexpr = 128,
     SLOTS: N.constexpr = 129,
     HEAD_GROUPS: N.constexpr = 8,

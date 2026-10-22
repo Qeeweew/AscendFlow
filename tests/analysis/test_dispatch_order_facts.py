@@ -29,7 +29,7 @@ from tests.support.structured import selected
 @pytest.mark.parametrize("minimum", (0, 1))
 def test_real_compound_two_slot_source_reaches_notification_selection(minimum):
     selection = selected(f"""
-    def slots(X:N.Tensor((n,m,64),N.f32),n:N.int64,m:N.int64(minimum={minimum})):
+    def slots(X:N.Tensor((n,m,64),N.f32),n:N.i64,m:N.i64(minimum={minimum})):
         with N.Kernel():
             x,y=N.alloc_ub((2,64)),N.alloc_ub((2,64))
             for p in N.serial(n):
@@ -84,7 +84,7 @@ def test_real_compound_two_slot_source_reaches_notification_selection(minimum):
 @pytest.fixture(scope="module")
 def clocks():
     selection = selected("""
-    def clocks(n:N.int64):
+    def clocks(n:N.i64):
         with N.Kernel(kind="mixed"):
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
             for i in N.Dataflow(n):
@@ -214,7 +214,7 @@ def test_count_and_residue_premises_are_owned_by_the_complete_need(clocks):
 
 def test_real_branch_premise_is_not_reused_after_its_removal():
     selection = selected("""
-    def branch(n:N.int64):
+    def branch(n:N.i64):
         with N.Kernel():
             x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
             for i in N.Pipelined(n):

@@ -33,7 +33,7 @@ def _masked_fill(mask_expression):
     return N.from_source(
         f"""
         def kernel(X:N.Tensor((16,256),N.f32), Y:N.Tensor((16,256),N.f32,access="write"),
-                   q:N.int64, lo:N.int64, hi:N.int64):
+                   q:N.i64, lo:N.i64, hi:N.i64):
             with N.Kernel(1, kind="vector"):
                 work=N.alloc_ub((16,256),N.f32)
                 N.copy(X,work)
@@ -57,7 +57,7 @@ def _mask_spec(expression, shape=(16, 256)):
         coords.append(f"i{axis}=N.arange({extent})[{', '.join(parts)}]")
     body = [
         f'def kernel(X:N.Tensor({shape},N.f32), Y:N.Tensor({shape},N.f32,access="write"),',
-        "           q:N.int64, lo:N.int64, hi:N.int64):",
+        "           q:N.i64, lo:N.i64, hi:N.i64):",
         '    with N.Kernel(1, kind="vector"):',
         f"        work=N.alloc_ub({shape},N.f32)",
         "        N.copy(X,work)",
@@ -102,7 +102,7 @@ def _row_fill_asc(shape, expression):
         "\n".join(
             [
                 f'def kernel(X:N.Tensor({shape},N.f32), Y:N.Tensor({shape},N.f32,access="write"),',
-                "           q:N.int64, lo:N.int64, hi:N.int64):",
+                "           q:N.i64, lo:N.i64, hi:N.i64):",
                 '    with N.Kernel(1, kind="vector"):',
                 f"        work=N.alloc_ub({shape},N.f32)",
                 "        N.copy(X,work)",

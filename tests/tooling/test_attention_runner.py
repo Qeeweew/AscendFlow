@@ -43,7 +43,7 @@ def test_runner_uses_the_actual_compiler_launcher_parameter_names():
 
     parameters = ",".join(f"{name}:N.Tensor((64,),N.f32)" for name in GENERATED_ORDER)
     source = N.from_source(f"""
-def attention_target({parameters},Sq:N.int64,Sk:N.int64):
+def attention_target({parameters},Sq:N.i64,Sk:N.i64):
     with N.Kernel():
         x=N.alloc_ub((64,))
         N.fill(x,1.0)
