@@ -13,93 +13,46 @@ AscendFlow 是基于 **xDSL**、面向 **Ascend 910B / dav-2201** 的算子编�
 
 ## 设计理念
 
-**算法和排步由算子作者掌握。** 分块、缓存、buffer 槽数以及 Cube/Vector 的阶段顺序
-直接写在 DSL 中。GEMM、attention 和递推状态更新共用同一编译链；算子专属政策留在
-`examples/`，编译器提供带有访问与生命周期合同的通用能力。
-
-**同步来自数据的真实使用。** 编译器区分“写完，可以读”的 ready 和“最后一个 reader
-已退休，可以覆盖”的 release。L1 在 MTE1 读完后即可复用，后续矩阵计算仍可继续，
-让搬运与计算按真实的数据使用关系重叠。
-
-**逻辑代次与物理复用分开。** 同一个环形 buffer 会承载多个逻辑值。编译器保留各代的
-读写来源、ownership 和最后读取，处理循环边界、跨阶段交接与有限事件资源。
-混合 kernel 中两个 AIV 共用一份 Vector 代码，按 runtime SID 区分地址与角色。
-各阶段维护已建立的访问与生命周期事实，后端消费已确定的同步计划。
-
-**以硬件合同约束优化。** UB/L1/L0 容量、DMA 几何和事件资源进入编译约束；算法精度与
-舍入边界在 DSL 中明确表达。显式排步也经过同一同步与验证流程，无法满足的合同给出诊断。
-生成的 IR、ASC、CANN 命令和产物身份可检查，CPU/IR 回归、独立有限执行模型与
-设备数值验证各自覆盖对应层次。
+- **作者掌握算法与排步**：用 Python DSL 表达分块、搬运、buffer 和 Cube/Vector 阶段。
+- **编译器推导同步**：从真实读写、逻辑代次和最后 reader 推导 ready/release，管理有限事件资源。
+- **优化遵守硬件与精度合同**：检查 UB/L1/L0 容量与数据生命周期，生成可检查的 IR、ASC 和设备 kernel。
 
 ## LLM 算子性能
 
-以下为 **2026-10-22、Ascend 910B3（20 AIC / 40 AIV）、CANN 9.1.0** 的设备 kernel 测量。
-每组比较使用同一张卡和相同输入；加速比为“参照耗时 / AscendFlow 耗时”。
-算子实现对应提交 `cdcc24d`。这些是所列配置的算子结果，计时不包含 host 提交间隙。
+**Ascend 910B3（20 AIC / 40 AIV）· CANN 9.1.0 · 2026-10-22**。
+参照为 vllm-ascend `2581a69`；加速比 = 参照耗时 / AscendFlow 耗时。
 
 ### DSv4.1 Sparse Attention
 
-实现 DeepSeek V4.1 的分页 shared-KV attention 核心：因果滑窗、稀疏压缩 KV 与 sink
-共同归一化，支持多 query 的 prefill 和推测译码验证。
-以下均为 **C2、H=64、KV-head=1、D=512、BF16、window=128、TopK=512、压缩倍率=2**。
-上下文长度包含本次 query chunk，1K=1024 tokens。Prefill 使用 B=1：
+C2（压缩倍率2）、H64、KV-head1、D512、BF16、window128、TopK512。参照为官方 AscendC。
+Prefill 使用 B1；decode 为 **DSpark target 因果验证，每请求 6 query（5 draft + 1 decode）**，
+上下文128K。1K=1024 tokens。
 
-| Query / 上下文 | AscendFlow | vllm-ascend 官方 AscendC | 加速比 |
-| --- | ---: | ---: | ---: |
-| 8K / 32K | 6.847 ms | 7.853 ms | **1.15×** |
-| 32K / 32K | 27.225 ms | 31.399 ms | **1.15×** |
+| 配置 | AscendFlow (ms) | TFLOPS | 官方 AscendC (ms) | TFLOPS | 加速比 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prefill · Q8K / 上下文32K | 6.847 | 100.4 | 7.853 | 87.5 | **1.15×** |
+| Prefill · Q32K / 上下文32K | 27.225 | 99.7 | 31.399 | 86.4 | **1.15×** |
+| Decode · B64 / Q384 | 0.410 | 78.5 | 0.440 | 73.3 | **1.07×** |
+| Decode · B128 / Q768 | 0.810 | 79.5 | 0.830 | 77.6 | **1.02×** |
 
-每组预热 3 次、测量 30 次，报告单次采集内的中位数；每次调用前独立驱逐 L2。
-耗时包含 gather、QK、softmax、PV 与写回，排除驱逐和输入准备。两组都通过独立
-FP32 数值参考检查。所选有效行对应的 QK+PV 有效吞吐约 **100 TFLOPS**，
-按 BF16 矩阵乘、FP32 累加计数，FMA=2；softmax、gather 等耗时仍包含在分母中。
-
-Decode 按 **DeepSeek-V4.1-Flash-1017** 配套 vllm-ascend 的 DSpark 部署配置，
-`num_speculative_tokens=5`。主模型满宽验证每请求包含 **5 个 draft token + 1 个普通
-decode token，共 6 个 query**。这里选择 **128K 上下文**，模型配置中的上限为 1M。
-
-| 请求数 B / Query 总数 T | AscendFlow | vllm-ascend 官方 AscendC | 加速比 |
-| --- | ---: | ---: | ---: |
-| 64 / 384 | 0.410 ms | 0.440 ms | **1.07×** |
-| 128 / 768 | 0.810 ms | 0.830 ms | **1.02×** |
-
-Decode 采集 3 轮并交替双方顺序，每轮预热 3 次、测量 30 次，报告各轮中位数的中位数。
-调用前的 L2 驱逐与计时范围同上；两组配置的双方输出均通过独立 FP32 参考，
-数值验证与性能采集的输入 hash 一致。这是 target 的因果验证 attention。
-
-实现通过私有 UB 缓存索引与页表、跨 Cube/Vector 流水、Q/P/KV 存储复用和
-prefill 常驻环形窗口减少搬运。计算、缓存与复用政策都在 DSL 中表达。
-范围与精度见 [Sparse MLA 合同](docs/operators/sparse-mla.md)；核心不包含索引器、
-压缩器或完整模型服务，也不覆盖 DSpark draft 的非因果 SWA。
+TFLOPS 按有效 QK+PV FLOPs / 完整 kernel 耗时计算，FMA=2；耗时包含 gather、softmax 和写回。
+计算范围与精度见 [Sparse MLA](docs/operators/sparse-mla.md)。
 
 ### KDA
 
-覆盖单 token decode、多 token recurrent 和 chunked prefill。
-以下均为 **H=HV=32、K=V=128、FP16 Q/K/V 与输出、FP32 carry**。
-参照为原版 vllm-ascend Triton KDA。
+H=HV=32、K=V=128，FP16 Q/K/V 与输出、FP32 carry。参照为 vllm-ascend Triton。
 
-| 配置 | AscendFlow | vllm-ascend Triton | 加速比 |
+| 配置 | AscendFlow (ms) | Triton (ms) | 加速比 |
 | --- | ---: | ---: | ---: |
-| Decode：128 条序列 × 1 token | 0.427 ms | 2.093 ms | **4.90×** |
-| Recurrent：4 条序列 × 32 tokens | 0.484 ms | 1.269 ms | **2.62×** |
-| Prefill：1 条序列 × 4096 tokens，chunk=64 | 3.734 ms | 10.540 ms | **2.82×** |
+| Decode · 128 条序列 × 1 token | 0.427 | 2.093 | **4.90×** |
+| Recurrent · 4 条序列 × 32 tokens | 0.484 | 1.269 | **2.62×** |
+| Prefill · 1 条序列 × 4096 tokens，chunk64 | 3.734 | 10.540 | **2.82×** |
 
-每个实现采集 3 次 `msprof op BasicInfo`，报告三次结果的中位数；使用 kernel replay。
-Prefill 计完整算法各 kernel 的设备耗时之和。输出与状态均通过独立 CPU oracle，
-relative RMSE 门槛保持 `<0.005`。
+实现与使用说明见 [KDA 示例](examples/kda/README.md)。
 
-Decode 使用 head 流水；recurrent 将完整 head 的 FP32 carry 留在 UB，通过输入预取
-和独立快照缓冲重叠计算与写回。Prefill 将块逆、变换、scan 与输出组织为多个阶段，
-分别保持 FP32 carry、低精度快照和矩阵乘输入精度合同。
-源码与使用说明见 [KDA 示例](examples/kda/README.md)、
-[decode / recurrent](docs/operators/kda.md) 和 [prefill](docs/operators/kda-prefill.md)。
-
-两类参照均来自 vllm-ascend `2581a69bcc16ee6af56e72985a15799bb5f61808`：
-sparse 使用原版 host/kernel 构建的 custom OPP，KDA 使用官方 Triton-Ascend 3.6.0。
-Sparse 与 KDA 的缓存和采样条件不同，各自与其参照比较；其他 shape 和端到端推理
-需要单独测量。复测入口见 [测试与 profiling](docs/guide/testing.md)、
-[sparse profiler](benchmarks/attention/profile_sparse.py) 和
-[KDA profiler](benchmarks/kda/profile.py)。
+**测量方法**：双方同卡同输入，用 msprof 统计完整算子的设备 kernel 耗时，重复采样取中位数。
+Sparse 每次调用前驱逐 L2，KDA 使用 kernel replay；不计 host 提交和输入准备，均通过独立数值验证。
+复测入口见 [测试与 profiling](docs/guide/testing.md)。
 
 ## 一段 DSL，一条流水
 
