@@ -1,4 +1,4 @@
-"""Build and validate the paged V4.1 sparse MLA decode example on 910B."""
+"""Build and validate paged V4.1 sparse MLA attention on 910B."""
 
 import argparse
 import ctypes as ct
@@ -17,12 +17,18 @@ from ascendflow.device import ACL, health_snapshot
 from ascendflow.diagnostics import require
 from ascendflow.performance import hardware_snapshot
 from benchmarks.artifacts import read_artifact
-from benchmarks.attention.sparse_reference import CASES, gather_oracle, inputs, oracle
+from benchmarks.attention.sparse_reference import (
+    CASES,
+    gather_oracle,
+    inputs,
+    npu_reference_batches,
+    selected_rows,
+)
 from benchmarks.references.sparse_mla_aclnn import SparseMlaReference
 from benchmarks.validation.dtypes import decode, encode
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCES = {"sparse_mla_decode": "decode"}
+SOURCES = {"sparse_mla": "attention"}
 GUARD = b"\x5a" * 512
 RTOL, ATOL = 0.02, 0.005
 
@@ -91,10 +97,6 @@ def policy_for(args):
     }
 
 
-def sources_for(policy):
-    return SOURCES
-
-
 def workspace_shapes(policy):
     groups = min(policy["GROUPS"], policy["T"] * (policy["H"] // policy["BM"]))
     return {
@@ -107,7 +109,7 @@ def workspace_shapes(policy):
     }
 
 
-def check_gathered(gathered, bias, expected_kv, expected_bias, policy, workers):
+def check_gathered(gathered, bias, expected, policy, workers):
     owners = policy["T"] * (policy["H"] // policy["BM"])
     require(0 < workers <= owners, "invalid artifact worker count")
     for group in range(workers):
@@ -115,28 +117,28 @@ def check_gathered(gathered, bias, expected_kv, expected_bias, policy, workers):
         for request, owner in enumerate(range(group, owners, workers)):
             retained[request % 3] = owner // (policy["H"] // policy["BM"])
         for slot, batch in retained.items():
+            expected_kv, expected_bias = expected(batch)
             selection = slice(policy["WINDOW"], policy["S"])
-            active = np.isfinite(expected_bias[batch, selection])
+            active = np.isfinite(expected_bias[selection])
             require(
-                np.array_equal(gathered[group, slot, active], expected_kv[batch, selection][active]),
+                np.array_equal(gathered[group, slot, active], expected_kv[selection][active]),
                 "gathered KV differs",
             )
             require(np.isfinite(gathered[group, slot]).all(), "gathered KV must remain finite")
             require(
-                np.array_equal(bias[group, slot], expected_bias[batch, selection]),
+                np.array_equal(bias[group, slot], expected_bias[selection]),
                 "gathered mask differs",
             )
 
 
 def build(output, policy, shared):
     identity = source_identity()
-    for entry, filename in sources_for(policy).items():
-        keys = tuple(policy) if filename == "decode" else ("B", "H", "D", "BM", "PARTS", "DTYPE")
+    for entry, filename in SOURCES.items():
         build_file(
             ROOT / f"examples/sparse_attention/{filename}.py",
             output / filename,
             entry=entry,
-            parameters={key: policy[key] for key in keys},
+            parameters=policy,
             shared=shared,
             timeout_s=300,
         )
@@ -184,10 +186,7 @@ def run_device(args, policy):
         record["health"] = health_snapshot(args.physical, output)
         record["hardware"] = hardware_snapshot(args.physical)
         record["source_identity"] = json.loads((output / "source-identity.json").read_text())
-        kernels = {
-            entry: artifact(output, entry, filename)
-            for entry, filename in sources_for(policy).items()
-        }
+        kernels = {entry: artifact(output, entry, filename) for entry, filename in SOURCES.items()}
         record["artifacts"] = {entry: value[3] for entry, value in kernels.items()}
         if args.reference_artifacts is not None:
             os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(args.reference_artifacts.resolve())
@@ -220,8 +219,8 @@ def run_device(args, policy):
                 **{key: runtime.allocate(value + GUARD) for key, value in raw.items()},
             }
 
-            def launch_pair(pointers=pointers):
-                for entry in sources_for(policy):
+            def launch_attention(pointers=pointers):
+                for entry in SOURCES:
                     _module, launch, names, _identity = kernels[entry]
                     require(
                         launch(runtime.stream, *(pointers[key] for key in names)) == 0,
@@ -229,12 +228,12 @@ def run_device(args, policy):
                     )
 
             for _ in range(args.warmup):
-                launch_pair()
+                launch_attention()
             runtime.synchronize()
             start, end = runtime.event(), runtime.event()
             runtime.record(start)
             for _ in range(args.repeats):
-                launch_pair()
+                launch_attention()
             runtime.record(end)
             runtime.synchronize()
             elapsed = ct.c_float()
@@ -261,13 +260,19 @@ def run_device(args, policy):
             check_gathered(
                 gathered,
                 gathered_bias,
-                expected_kv,
-                expected_bias,
+                lambda token, kv=expected_kv, mask=expected_bias: (kv[token], mask[token]),
                 policy,
-                kernels["sparse_mla_decode"][3]["blocks"],
+                kernels["sparse_mla"][3]["blocks"],
             )
             actual = decode(results["attention_out"], dtype, shapes["attention_out"])
-            expected = oracle(data, policy)
+            expected = np.empty_like(actual)
+            for first, chunk in npu_reference_batches(
+                data["q"],
+                data["sinks"],
+                lambda token, data=data: selected_rows(data, policy, token)[0],
+                policy,
+            ):
+                expected[first : first + len(chunk)] = chunk
             np.savez(directory / "outputs.npz", actual=actual, expected=expected)
             require(
                 np.allclose(actual, expected, rtol=RTOL, atol=ATOL),
@@ -307,7 +312,8 @@ def run_device(args, policy):
                 "timing_scope": "fused kernel plus host submission gaps; single probe, no performance qualification",
                 "input_and_guards": "unchanged",
                 "gather": "exact",
-                "launch_pairs": args.repeats + args.warmup,
+                "launches": args.repeats + args.warmup,
+                "numerical_reference": "NPU FP32 QK/softmax/PV; HF32 disabled",
             }
             if official is not None:
                 row["official"] = reference_record

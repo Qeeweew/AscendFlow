@@ -10,7 +10,7 @@ from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import parse
 from benchmarks.attention.sparse_reference import query_geometry
-from examples.sparse_attention.decode import sparse_mla_decode
+from examples.sparse_attention.attention import sparse_mla
 from tests.models.structured_events import EventModelError, check_structured_events
 
 
@@ -20,7 +20,7 @@ def specialize(definition):
 
 @pytest.fixture(scope="module")
 def resident_artifact():
-    return compile(specialize(sparse_mla_decode), timeout_s=300)
+    return compile(specialize(sparse_mla), timeout_s=300)
 
 
 def metadata_inputs(batch=5, tokens=7, topk=512, valid=512):
@@ -128,15 +128,15 @@ def test_resident_worker_retires_old_token_across_ragged_and_empty_requests(
 
 
 def test_new_softmax_cannot_overwrite_previous_token_denominator():
-    source = sparse_mla_decode.source.replace("final_l[slot, local : local + UR]", "row_sum[0:UR]")
-    assert source != sparse_mla_decode.source
+    source = sparse_mla.source.replace("final_l[slot, local : local + UR]", "row_sum[0:UR]")
+    assert source != sparse_mla.source
     with pytest.raises(CompileError, match="issued|ownership|same-engine|queue"):
-        compile(specialize(replace(sparse_mla_decode, source=source)), timeout_s=300)
+        compile(specialize(replace(sparse_mla, source=source)), timeout_s=300)
 
 
 @pytest.mark.parametrize("gather_first", (False, True))
 def test_two_cache_slots_require_prior_score_acquire_before_gather(monkeypatch, gather_first):
-    source = sparse_mla_decode.source.replace("3, S - WINDOW", "2, S - WINDOW").replace(
+    source = sparse_mla.source.replace("3, S - WINDOW", "2, S - WINDOW").replace(
         "cache_slot = query % 3", "cache_slot = query % 2"
     )
     if not gather_first:
@@ -144,7 +144,7 @@ def test_two_cache_slots_require_prior_score_acquire_before_gather(monkeypatch, 
             '"vector": ("gather", "softmax", "finish")',
             '"vector": ("softmax", "gather", "finish")',
         )
-    result = compile(specialize(replace(sparse_mla_decode, source=source)), timeout_s=300)
+    result = compile(specialize(replace(sparse_mla, source=source)), timeout_s=300)
     bind_metadata(monkeypatch, metadata_inputs())
     if gather_first:
         with pytest.raises(EventModelError, match="unordered physical WAR: Bias"):
@@ -154,12 +154,12 @@ def test_two_cache_slots_require_prior_score_acquire_before_gather(monkeypatch, 
 
 
 def test_mask_read_before_cube_score_acquire_has_no_peer_publication(monkeypatch):
-    source = sparse_mla_decode.source
+    source = sparse_mla.source
     start = source.index("                # Acquire the complete compressed score")
     middle = source.index("                N.fill(window_bias, 0.0)", start)
     end = source.index("                for block in N.serial", middle)
     source = source[:start] + source[middle:end] + source[start:middle] + source[end:]
-    result = compile(specialize(replace(sparse_mla_decode, source=source)), timeout_s=300)
+    result = compile(specialize(replace(sparse_mla, source=source)), timeout_s=300)
     bind_metadata(monkeypatch, metadata_inputs())
     with pytest.raises(EventModelError, match="unordered physical RAW: Bias"):
         check_trace(result)

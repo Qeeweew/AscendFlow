@@ -1,4 +1,4 @@
-"""CSA cache movement: direct window pages and streamed sparse compressed rows."""
+"""CSA cache movement: paged or circular windows and streamed sparse rows."""
 
 from ascendflow import language as N
 
@@ -57,6 +57,29 @@ def copy_window_pages(
         Ori[page2, :128, 0, feature : feature + C],
         destination[first_rows : first_rows + 128, :],
         valid_rows=second_rows,
+    )
+
+
+@N.inline
+def copy_window_ring(Ori, OriTable, destination, length, rows, feature, PAGE, C, MAX_SEQ):
+    # B1 prefill stores each logical window position at position % 128.
+    # Page and ring boundaries coincide; at most two real page fragments.
+    position = N.max(0, length - rows)
+    offset = position % 128
+    first = N.min(rows, PAGE - offset)
+    column = N.min(position // PAGE, MAX_SEQ // PAGE - 1)
+    page = N.load_index(OriTable[0, column : column + 1])
+    N.copy(
+        Ori[page, offset : offset + 128, 0, feature : feature + C],
+        destination[offset : offset + 128, :],
+        valid_rows=first,
+    )
+    column2 = N.min((position + first) // PAGE, MAX_SEQ // PAGE - 1)
+    page2 = N.load_index(OriTable[0, column2 : column2 + 1])
+    N.copy(
+        Ori[page2, :128, 0, feature : feature + C],
+        destination,
+        valid_rows=rows - first,
     )
 
 

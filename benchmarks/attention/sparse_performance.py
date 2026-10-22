@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from time import monotonic
 
 import numpy as np
 
@@ -17,14 +18,50 @@ from benchmarks.attention.run_sparse import (
     GUARD,
     ROOT,
     RTOL,
+    SOURCES,
     artifact,
     check_gathered,
     policy_for,
-    sources_for,
     workspace_shapes,
 )
+from benchmarks.attention.sparse_reference import npu_reference_batches
 from benchmarks.references.sparse_mla_aclnn import SparseMlaReference
 from benchmarks.validation.dtypes import decode, encode
+
+
+class ReferenceRows:
+    """Retain shared cache rows once; select a single query on demand."""
+
+    def __init__(self, arrays, planes, policy):
+        self.arrays, self.planes, self.policy = arrays, planes, policy
+
+    def split(self, token):
+        cu = self.arrays["cu_seqlens_q"]
+        batch = int(np.searchsorted(cu, token, side="right")) - 1
+        right = int(self.arrays["seqused_ori_kv"][batch]) - int(cu[batch + 1]) + token + 1
+        positions = np.arange(max(0, right - self.policy["WINDOW"]), right)
+        indices = self.arrays["cmp_sparse_indices"][token, 0]
+        indices = indices[indices >= 0]
+        w_positions, w_values = self.planes[batch]["ori_kv"]
+        c_positions, c_values = self.planes[batch]["cmp_kv"]
+        return (
+            w_values[np.searchsorted(w_positions, positions)],
+            c_values[np.searchsorted(c_positions, indices)],
+        )
+
+    def rows(self, token):
+        return np.concatenate(self.split(token))
+
+    def gathered(self, token):
+        window, compressed = self.split(token)
+        rows = np.zeros((self.policy["S"], self.policy["D"]), np.float32)
+        bias = np.full(self.policy["S"], -np.inf, np.float32)
+        first = self.policy["WINDOW"]
+        rows[: len(window)] = window
+        rows[first : first + len(compressed)] = compressed
+        bias[: len(window)] = 0
+        bias[first : first + len(compressed)] = 0
+        return rows, bias
 
 
 def make_inputs(policy, context, seed, query_lens=None):
@@ -35,25 +72,21 @@ def make_inputs(policy, context, seed, query_lens=None):
     )
     counts = query_counts(policy) if query_lens is None else np.array(query_lens, np.int32)
     require(len(counts) == b and counts.sum() == t, "query lengths differ")
-    require(
-        window + int(counts.max()) - 1 <= context <= maximum,
-        "context must contain all query windows",
-    )
-    require(
-        topk <= (context - int(counts.max()) + 1) // ratio,
-        "every query must have enough completed compressed rows",
-    )
+    require(int(counts.max()) <= context <= maximum, "context must contain the query tokens")
     rng = np.random.default_rng(seed)
     tables = np.stack(
         [rng.permutation(maximum // page) + batch * (maximum // page) for batch in range(b)]
     ).astype(np.int32)
     cu = np.r_[0, counts.cumsum()].astype(np.int32)
-    indices = np.empty((t, 1, topk), dtype=np.int32)
+    indices = np.full((t, 1, topk), -1, dtype=np.int32)
+    valid = np.zeros((t, window + topk), dtype=bool)
     for batch in range(b):
         for offset, token in enumerate(range(cu[batch], cu[batch + 1])):
             right = context - int(counts[batch]) + offset + 1
-            indices[token, 0] = np.sort(rng.choice(right // ratio, topk, replace=False))
-    selected = np.empty((t, window + topk, d), dtype=np.float32)
+            count = min(topk, right // ratio)
+            indices[token, 0, :count] = np.sort(rng.choice(right // ratio, count, replace=False))
+            valid[token, : min(window, right)] = True
+            valid[token, window : window + count] = True
     q = rng.normal(0, 0.5, (t, h, d)).astype(np.float32)
     q = decode(encode(q, "bf16"), "bf16", q.shape)
     arrays = {
@@ -69,32 +102,26 @@ def make_inputs(policy, context, seed, query_lens=None):
         "cmp_residual_kv": np.full(b, context % ratio, dtype=np.int32),
     }
     patches = {"ori_kv": [], "cmp_kv": []}
+    planes = [{} for _ in range(b)]
     for batch in range(b):
-        tokens = range(int(cu[batch]), int(cu[batch + 1]))
         if not counts[batch]:
             continue
-        window_union = np.arange(context - int(counts[batch]) + 1 - window, context)
+        window_union = np.arange(max(0, context - int(counts[batch]) + 1 - window), context)
         compressed_union = np.unique(indices[cu[batch] : cu[batch + 1]])
-        for key, positions, block, column in (
-            ("ori_kv", window_union, page, 0),
-            ("cmp_kv", compressed_union, page // ratio, window),
+        compressed_union = compressed_union[compressed_union >= 0]
+        for key, positions, block in (
+            ("ori_kv", window_union, page),
+            ("cmp_kv", compressed_union, page // ratio),
         ):
             values = rng.normal(0, 0.5, (len(positions), d)).astype(np.float32)
             values = decode(encode(values, "bf16"), "bf16", values.shape)
+            planes[batch][key] = positions, values
             # Overlapping windows/indices within a request refer to one cache
             # value. No per-query patch may overwrite a peer query's KV.
             for position, value in zip(positions, values, strict=True):
                 physical = int(tables[batch, position // block]) * block + int(position % block)
                 patches[key].append((physical * d * 2, encode(value, "bf16")))
-            for token in tokens:
-                right = context - int(counts[batch]) + token - int(cu[batch]) + 1
-                selection = (
-                    np.arange(right - window, right) if key == "ori_kv" else indices[token, 0]
-                )
-                selected[token, column : column + len(selection)] = values[
-                    np.searchsorted(positions, selection)
-                ]
-    return arrays, patches, selected
+    return arrays, patches, ReferenceRows(arrays, planes, policy), valid
 
 
 def zero_cache(runtime, nbytes, patches):
@@ -110,19 +137,33 @@ def zero_cache(runtime, nbytes, patches):
     # This canonical sparse-patch identity describes every initialized byte,
     # including the zero background, without saving multi-GB cache replicas.
     identity = hashlib.sha256(str(nbytes).encode() + b"/zero-background/bf16/patches-v1")
-    for offset, blob in sorted(patches):
-        source = ct.create_string_buffer(blob)
+    # Prefill can touch millions of rows. Stage nearby patches together;
+    # holes keep the same zero background, outside the measured kernel.
+    transfer_start, transfer = 0, bytearray()
+
+    def publish():
+        source = ct.create_string_buffer(bytes(transfer))
         runtime.call(
             "aclrtMemcpy",
             [ct.c_void_p, ct.c_size_t, ct.c_void_p, ct.c_size_t, ct.c_int],
-            ct.c_void_p(pointer.value + offset),
-            len(blob),
+            ct.c_void_p(pointer.value + transfer_start),
+            len(transfer),
             source,
-            len(blob),
+            len(transfer),
             1,
         )
+
+    for offset, blob in sorted(patches):
+        if not transfer or offset + len(blob) > transfer_start + len(transfer):
+            if transfer:
+                publish()
+            transfer_start = offset
+            transfer = bytearray(min(max(1024 * 1024, len(blob)), nbytes - offset))
+        transfer[offset - transfer_start : offset - transfer_start + len(blob)] = blob
         identity.update(offset.to_bytes(8, "little"))
         identity.update(blob)
+    if transfer:
+        publish()
     guard = ct.create_string_buffer(GUARD)
     runtime.call(
         "aclrtMemcpy",
@@ -134,17 +175,6 @@ def zero_cache(runtime, nbytes, patches):
         1,
     )
     return pointer, identity.hexdigest()
-
-
-def expected_output(arrays, selected, policy):
-    result = np.empty_like(arrays["q"])
-    for batch, (q, kv) in enumerate(zip(arrays["q"], selected, strict=True)):
-        scores = (q.astype(np.float64) @ kv.astype(np.float64).T) * policy["SCALE"]
-        maximum = np.maximum(scores.max(axis=1), arrays["sinks"])
-        weight = np.exp(scores - maximum[:, None])
-        denominator = weight.sum(axis=1) + np.exp(arrays["sinks"] - maximum)
-        result[batch] = (weight @ kv.astype(np.float64)) / denominator[:, None]
-    return decode(encode(result, "bf16"), "bf16", result.shape)
 
 
 def main(argv=None):
@@ -174,6 +204,7 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=4102026)
     parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     args = parser.parse_args(argv)
+    started = monotonic()
     require(0 < args.rotations <= args.warmup + args.repeats, "every input rotation must run")
     args.output.mkdir(parents=True, exist_ok=True)
     policy = policy_for(args)
@@ -187,11 +218,13 @@ def main(argv=None):
         "seed": args.seed,
         "rotations": args.rotations,
         "cache_scope": "cyclic independent cache allocations; no cache flush or cold-HBM claim",
+        "input_encoding": "rounded query/metadata plus BF16 byte-offset patches over zero caches",
         "benchmark_sources_sha256": {
             str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (
                 Path(__file__).resolve(),
                 ROOT / "benchmarks/attention/run_sparse.py",
+                ROOT / "benchmarks/attention/sparse_reference.py",
                 ROOT / "benchmarks/references/sparse_mla_aclnn.py",
             )
         },
@@ -207,8 +240,7 @@ def main(argv=None):
                 "artifact policy differs",
             )
             kernels = {
-                entry: artifact(args.artifacts, entry, name)
-                for entry, name in sources_for(policy).items()
+                entry: artifact(args.artifacts, entry, name) for entry, name in SOURCES.items()
             }
             record["artifacts"] = {entry: kernel[3] for entry, kernel in kernels.items()}
             record["source_identity"] = json.loads(
@@ -237,10 +269,19 @@ def main(argv=None):
         }
         output_bytes = policy["T"] * policy["H"] * policy["D"] * 2
         for rotation in range(args.rotations):
-            arrays, patches, selected = make_inputs(
+            arrays, patches, selected, valid = make_inputs(
                 policy, args.context, args.seed + rotation, args.query_lens
             )
-            np.savez(args.output / f"inputs-{rotation}.npz", **arrays, selected=selected)
+            # Capture real cache bytes once, instead of duplicating the same
+            # KV row in every prefill query's selected matrix on disk.
+            snapshot = dict(arrays)
+            snapshot["selected_valid"] = valid
+            for name, values in patches.items():
+                snapshot[name + "_patch_offsets"] = np.array([p for p, _ in values], np.uint64)
+                snapshot[name + "_patch_bf16"] = np.frombuffer(
+                    b"".join(blob for _, blob in values), dtype="<u2"
+                ).reshape(-1, policy["D"])
+            np.savez(args.output / f"inputs-{rotation}.npz", **snapshot)
             raw = {
                 key: encode(value, "bf16") if key == "q" else value.tobytes()
                 for key, value in arrays.items()
@@ -280,6 +321,7 @@ def main(argv=None):
                     "arrays": arrays,
                     "raw": raw,
                     "selected": selected,
+                    "valid": valid,
                     "identity": identity,
                     "selected_bytes": sum(
                         sum(len(blob) for _offset, blob in values) for values in patches.values()
@@ -289,11 +331,15 @@ def main(argv=None):
             )
         record["input_identity"] = [case["identity"] for case in cases]
         record["selected_kv_logical_bytes"] = (
-            args.rotations * policy["T"] * (policy["WINDOW"] + policy["TOPK"]) * policy["D"] * 2
+            sum(int(case["valid"].sum()) for case in cases) * policy["D"] * 2
         )
         record["selected_kv_working_bytes"] = sum(case["selected_bytes"] for case in cases)
         record["allocated_cache_bytes"] = args.rotations * sum(sizes.values())
         record["launch_rotation"] = "invocation % rotations; includes warmup"
+        record["preparation_seconds"] = monotonic() - started
+        print(
+            json.dumps({"phase": "prepared", "seconds": record["preparation_seconds"]}), flush=True
+        )
         if references:
             record["reference"] = [reference.identity() for reference in references]
         eviction = None
@@ -319,14 +365,37 @@ def main(argv=None):
             )
             blob = runtime.read(pointers["attention_out"], output_bytes + len(GUARD))
             require(blob[output_bytes:] == GUARD, "output guard changed")
-            actual = decode(blob[:output_bytes], "bf16", (policy["T"], policy["H"], policy["D"]))
-            expected = expected_output(arrays, selected, policy)
-            np.savez(args.output / f"outputs-{rotation}.npz", actual=actual, expected=expected)
-            require(
-                np.allclose(actual, expected, rtol=RTOL, atol=ATOL),
-                f"numerical mismatch: {np.max(np.abs(actual - expected))}",
+            actual_bf16 = np.frombuffer(blob, "<u2", count=output_bytes // 2).reshape(
+                policy["T"], policy["H"], policy["D"]
             )
-            errors.append(float(np.max(np.abs(actual - expected))))
+            reference_started = monotonic()
+            maximum_error = 0.0
+            expected_sha = hashlib.sha256()
+            for first, expected in npu_reference_batches(
+                arrays["q"], arrays["sinks"], selected.rows, policy
+            ):
+                actual_chunk = actual_bf16[first : first + len(expected)]
+                actual = decode(actual_chunk.tobytes(), "bf16", actual_chunk.shape)
+                error = float(np.max(np.abs(actual - expected)))
+                require(
+                    np.allclose(actual, expected, rtol=RTOL, atol=ATOL),
+                    f"numerical mismatch at query {first}: {error}",
+                )
+                maximum_error = max(maximum_error, error)
+                expected_sha.update(expected.tobytes())
+            print(
+                json.dumps(
+                    {
+                        "phase": "reference",
+                        "rotation": rotation,
+                        "seconds": monotonic() - reference_started,
+                    }
+                ),
+                flush=True,
+            )
+            np.savez(args.output / f"outputs-{rotation}.npz", actual_bf16=actual_bf16)
+            case["reference_fp32_sha256"] = expected_sha.hexdigest()
+            errors.append(maximum_error)
             outputs.append(hashlib.sha256(blob[:output_bytes]).hexdigest())
             for name, data in raw.items():
                 require(
@@ -351,17 +420,12 @@ def main(argv=None):
             bias = np.frombuffer(
                 runtime.read(scratch["Bias"], capacities["Bias"]), np.float32
             ).reshape(shapes["Bias"])
-            expected_rows = np.zeros((policy["T"], policy["S"], policy["D"]), np.float32)
-            expected_rows[:, : last["selected"].shape[1]] = last["selected"]
-            expected_bias = np.full((policy["T"], policy["S"]), -np.inf, np.float32)
-            expected_bias[:, : last["selected"].shape[1]] = 0
             check_gathered(
                 packed,
                 bias,
-                expected_rows,
-                expected_bias,
+                last["selected"].gathered,
                 policy,
-                kernels["sparse_mla_decode"][3]["blocks"],
+                kernels["sparse_mla"][3]["blocks"],
             )
         record.update(
             status="passed",
@@ -371,6 +435,14 @@ def main(argv=None):
             atol=ATOL,
             checked_metadata_and_guards="unchanged",
             output_sha256=outputs,
+            numerical_reference={
+                "device": "npu:0",
+                "dtype": "fp32",
+                "allow_hf32": False,
+                "chunk_queries": 128,
+                "formula": "logical KV selection; FP32 QK, softmax with one sink, FP32 PV",
+                "fp32_sha256": [case["reference_fp32_sha256"] for case in cases],
+            },
         )
     except BaseException as error:
         record.update(status="failed", error=f"{type(error).__name__}: {error}")

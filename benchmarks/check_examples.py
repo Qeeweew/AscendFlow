@@ -271,8 +271,8 @@ def examples():
     )
     result.append(
         Example(
-            "sparse-mla-decode",
-            (("examples/sparse_attention/decode.py", "sparse_mla_decode"),),
+            "sparse-mla",
+            (("examples/sparse_attention/attention.py", "sparse_mla"),),
             ("benchmarks.attention.run_sparse", "--build"),
             ("benchmarks.attention.run_sparse",),
             result_glob="device.json",

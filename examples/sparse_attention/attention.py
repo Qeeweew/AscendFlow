@@ -1,4 +1,4 @@
-"""TND sparse decode, including multiple verification tokens per request.
+"""TND sparse shared-KV attention for prefill and speculative verification.
 
 Sparse rows are gathered once per token/head tile; window pages go directly to L1.
 QK and PV keep explicit L1/L0 rings, with one persistent query pipeline.
@@ -7,7 +7,12 @@ QK and PV keep explicit L1/L0 rings, with one persistent query pipeline.
 from __future__ import annotations
 
 from ascendflow import language as N
-from examples.sparse_attention.gather import copy_window_pages, gather_compressed, query_metadata
+from examples.sparse_attention.gather import (
+    copy_window_pages,
+    copy_window_ring,
+    gather_compressed,
+    query_metadata,
+)
 
 # ruff: noqa: F821 - captured constexpr annotation names.
 NEG_INF = float("-inf")
@@ -36,7 +41,23 @@ def load_cache(cache, geometry, position, destination, first, feature, IS_WINDOW
 
 
 @N.inline
-def qk_tiles(cache, geometry, position, Score, l1, l0, S, PAGE, D, C, MAX_SEQ, KEEP, CACHE_Q):
+def qk_tiles(
+    cache,
+    geometry,
+    position,
+    Score,
+    l1,
+    l0,
+    S,
+    PAGE,
+    D,
+    C,
+    MAX_SEQ,
+    KEEP,
+    CACHE_Q,
+    WINDOW_RING,
+    WINDOW_ROWS,
+):
     q1, k1, resident = l1
     q0, b0, c0 = l0
     group, _cache_slot, slot = position
@@ -54,18 +75,33 @@ def qk_tiles(cache, geometry, position, Score, l1, l0, S, PAGE, D, C, MAX_SEQ, K
                 d = panel * LC
                 with N.Stage(0, name="qk_load"):
                     if n + OFFSET // 128 < KEEP:
-                        load_cache(
-                            cache,
-                            geometry,
-                            position,
-                            resident[n + OFFSET // 128, :, d : d + LC],
-                            first=n * 128,
-                            feature=d,
-                            IS_WINDOW=plane == 0,
-                            PAGE=PAGE,
-                            C=LC,
-                            MAX_SEQ=MAX_SEQ,
-                        )
+                        if plane == 0 and WINDOW_RING:
+                            ori_kv, ori_block_table, _KV = cache
+                            _batch, length, _visible = geometry
+                            copy_window_ring(
+                                ori_kv,
+                                ori_block_table,
+                                resident[0, :, d : d + LC],
+                                length=length,
+                                rows=WINDOW_ROWS,
+                                feature=d,
+                                PAGE=PAGE,
+                                C=LC,
+                                MAX_SEQ=MAX_SEQ,
+                            )
+                        else:
+                            load_cache(
+                                cache,
+                                geometry,
+                                position,
+                                resident[n + OFFSET // 128, :, d : d + LC],
+                                first=n * 128,
+                                feature=d,
+                                IS_WINDOW=plane == 0,
+                                PAGE=PAGE,
+                                C=LC,
+                                MAX_SEQ=MAX_SEQ,
+                            )
                     else:
                         load_cache(
                             cache,
@@ -179,7 +215,7 @@ def pv_tile(cache, geometry, position, P, PV, l1, p1, l0, S, PAGE, D, C, MAX_SEQ
 
 
 @N.prim_func(disjoint_external=True)
-def sparse_mla_decode(
+def sparse_mla(
     q: N.Tensor((T, H, D), DTYPE),
     ori_kv: N.Tensor((ORI_BLOCKS, PAGE, 1, D), DTYPE),
     cmp_kv: N.Tensor((CMP_BLOCKS, PAGE // RATIO, 1, D), DTYPE),
@@ -235,6 +271,7 @@ def sparse_mla_decode(
         NC = 2 if D % (2 * C) == 0 else 1
         BASE_L1 = 2 * (BM * D + 2 * 128 * NC * C + 2 * BM * 128)
         KEEP = N.min(S // 128, N.min(2, (512 * 1024 - BASE_L1) // (128 * D * 2)))
+        WINDOW_RING = B == 1 and H == BM and T >= 32 and KEEP > 0
         q1 = N.alloc_l1((BM, D), DTYPE)
         kv1 = N.alloc_l1((2, 128, NC * C), DTYPE)
         if KEEP > 0:
@@ -334,6 +371,17 @@ def sparse_mla_decode(
                 batch, qlen, offset, length, visible = query_metadata(
                     cu_seqlens_q, seqused_ori_kv, ori_topk_length, token, B, WINDOW
                 )
+                window_rows = visible
+                if WINDOW_RING and query > 0:
+                    previous = N.load_index(ori_topk_length[token - WORKERS, :])
+                    previous_right = N.max(0, length - WORKERS)
+                    previous_visible = N.min(WINDOW, previous_right)
+                    if previous > 0:
+                        previous_visible = N.min(previous_visible, previous)
+                    if visible == N.min(WINDOW, length) and previous_visible == N.min(
+                        WINDOW, previous_right
+                    ):
+                        window_rows = N.min(visible, WORKERS)
                 N.copy(q[token, head : head + BM, :], q1)
                 # Compute the direct window while the two AIVs gather sparse
                 # rows. The final compressed Score prefix joins both gather
@@ -352,6 +400,8 @@ def sparse_mla_decode(
                     MAX_SEQ=MAX_SEQ,
                     KEEP=KEEP,
                     CACHE_Q=CACHE_Q,
+                    WINDOW_RING=WINDOW_RING,
+                    WINDOW_ROWS=window_rows,
                 )
             with N.Vector() as sid, N.Stage(1, name="softmax"):
                 batch, qlen, offset, length, visible = query_metadata(
@@ -365,7 +415,14 @@ def sparse_mla_decode(
                     window_score,
                 )
                 N.fill(window_bias, 0.0)
-                N.fill(window_bias, NEG_INF, mask=N.arange(WINDOW) >= visible)
+                if WINDOW_RING:
+                    first = (length - visible) % WINDOW
+                    wrap = first + visible - WINDOW
+                    cols = N.arange(WINDOW)
+                    valid = ((cols >= first) & (cols < first + visible)) | (cols < wrap)
+                    N.fill(window_bias, NEG_INF, mask=~valid)
+                else:
+                    N.fill(window_bias, NEG_INF, mask=N.arange(WINDOW) >= visible)
                 N.copy(Bias[group, cache_slot, :], bias)
                 for block in N.serial(BM // 2 // VR):
                     local = block * VR

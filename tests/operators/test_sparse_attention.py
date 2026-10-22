@@ -7,7 +7,7 @@ from ascendflow import compile
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.dialects.io import parse
 from benchmarks.attention.sparse_reference import gather_oracle, oracle, selected_rows
-from examples.sparse_attention.decode import sparse_mla_decode
+from examples.sparse_attention.attention import sparse_mla
 from tests.models.structured_events import check_structured_events
 
 
@@ -146,7 +146,7 @@ def test_native_mixed_pipeline_has_complete_quorums_and_retirement(
 
     bind_metadata(monkeypatch, metadata_inputs(batch, batch, topk))
     result = compile(
-        sparse_mla_decode.specialize(
+        sparse_mla.specialize(
             B=batch,
             T=batch,
             GROUPS=1,

@@ -29,7 +29,7 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `kda/run.py`、`kda/profile.py`、`kda/compare.py`、`kda/matrix.py` | KDA decode 全量数值验收、BasicInfo、batch 1–64 同输入/设备/官方 Triton wheel 比较；见[decode](../docs/operators/kda.md) |
 | `kda/prefill.py`、`kda/profile_prefill.py`、`kda/compare_prefill.py` | KDA prefill 多 kernel 完整构建、独立 CPU 递推数值验收、BasicInfo 总时间及原始 Triton 对照；见[prefill](../docs/operators/kda-prefill.md) |
 | `kda/audit_prefill.py`、`gemm/run_fp32.py` | 原始 dot 两侧输入精度离线审计、FP32 Cube 随机输入设备检查 |
-| `attention/run_sparse.py` | V4.1 CSA 单 kernel decode、INT32 页表/索引、独立 FP64 数值参考与输入/哨兵检查；见[合同](../docs/operators/sparse-mla-decode.md) |
+| `attention/run_sparse.py` | V4.1 CSA 单 kernel decode/prefill、INT32 页表/索引、NPU FP32 数值参考与输入/哨兵检查；见[合同](../docs/operators/sparse-mla.md) |
 | `attention/profile_sparse.py` | 普通 msprof 采集 CSA 与官方 vllm-ascend kernel；支持独立缓存轮换、显式 L2 驱逐、batch 和上下文矩阵 |
 | `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 | `references/` | 日常 ACLNN 适配器与独立 AscendC 参考 |

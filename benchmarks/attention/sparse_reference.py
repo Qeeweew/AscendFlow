@@ -1,7 +1,7 @@
 """Independent TND/PA_BBND semantics, including speculative verification.
 
 The oracle selects logical rows directly from the pages and evaluates one
-FP64 softmax per token/head. It does not follow the DSL's request search,
+FP32 softmax per token/head. It does not follow the DSL's request search,
 gather slots, physical pipeline or low precision probability intermediates.
 """
 
@@ -95,7 +95,9 @@ def inputs(policy, case, query_lens=None):
                 # Early queries must filter entries created by later tokens.
                 prefix[0] = available - 1
             data["cmp_sparse_indices"][token, 0, :count] = prefix
-        if case == "replay":
+        if case == "replay" and token % 3 != 2:
+            # Interleave narrowed and full windows, including transitions
+            # along the default worker stride, rather than narrowing all rows.
             data["ori_topk_length"][token, 0] = 1 + token % 7
     if case == "sink":
         data["sinks"][:] = np.resize(np.array([-80, 80, 0, 5], dtype=np.float32), h)
@@ -128,12 +130,45 @@ def oracle(data, policy):
         kv, _ = selected_rows(data, policy, token)
         if not len(kv):
             continue
-        scores = (data["q"][token].astype(np.float64) @ kv.astype(np.float64).T) * policy["SCALE"]
+        scores = (data["q"][token] @ kv.T) * policy["SCALE"]
         maximum = np.maximum(scores.max(axis=1), data["sinks"])
         weights = np.exp(scores - maximum[:, None])
         denominator = weights.sum(axis=1) + np.exp(data["sinks"] - maximum)
-        output[token] = (weights @ kv.astype(np.float64)) / denominator[:, None]
+        output[token] = (weights @ kv) / denominator[:, None]
     return rounded(output, policy["DTYPE"])
+
+
+def npu_reference_batches(q, sinks, rows, policy, chunk=128):
+    """Independent FP32 QK/softmax/PV, bounded to one query chunk on NPU.
+
+    Row selection comes from logical input metadata, never the kernel's
+    gathered workspace. The probability matrix stays FP32 through PV.
+    """
+    import torch
+    import torch_npu  # noqa: F401
+
+    torch.npu.set_device(0)
+    torch.npu.matmul.allow_hf32 = False
+    sink = torch.from_numpy(sinks).to(device="npu", dtype=torch.float32)[None, :]
+    with torch.inference_mode():
+        for first in range(0, len(q), chunk):
+            count = min(chunk, len(q) - first)
+            kv = np.zeros((count, policy["S"], policy["D"]), np.float32)
+            valid = np.zeros((count, policy["S"]), bool)
+            for local in range(count):
+                selected = rows(first + local)
+                kv[local, : len(selected)] = selected
+                valid[local, : len(selected)] = True
+            query = torch.from_numpy(q[first : first + count]).to("npu")
+            cache = torch.from_numpy(kv).to("npu")
+            mask = torch.from_numpy(valid).to("npu")
+            scores = torch.bmm(query, cache.transpose(1, 2)) * policy["SCALE"]
+            scores.masked_fill_(~mask[:, None, :], -torch.inf)
+            maximum = torch.maximum(scores.amax(dim=-1), sink)
+            weight = torch.exp(scores - maximum[:, :, None])
+            denominator = weight.sum(dim=-1) + torch.exp(sink - maximum)
+            output = torch.bmm(weight, cache) / denominator[:, :, None]
+            yield first, output.cpu().numpy()
 
 
 def gather_oracle(data, policy):

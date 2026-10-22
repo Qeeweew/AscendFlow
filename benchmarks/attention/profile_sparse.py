@@ -1,4 +1,4 @@
-"""Collect same-input sparse MLA decode measurements with msprof."""
+"""Collect same-input sparse MLA attention measurements with msprof."""
 
 import argparse
 import csv
@@ -21,18 +21,27 @@ def summarize(directory, warmup, repeats, backend, *, cache_eviction=False):
     paths = list(directory.rglob("op_summary*.csv"))
     require(len(paths) == 1, "expected exactly one msprof operator summary")
     rows = list(csv.DictReader(paths[0].open()))
-    expected = {"sparse_mla_decode"} if backend == "ascendflow" else {"SparseFlashMla"}
+    expected = {"sparse_mla"} if backend == "ascendflow" else {"SparseFlashMla"}
     groups = {}
     setup = []
     evictions = []
     first_main = min(
         float(row["Task Start Time(us)"].strip()) for row in rows if row["OP Type"] in expected
     )
+    last_main_end = max(
+        float(row["Task Start Time(us)"].strip()) + float(row["Task Duration(us)"].strip())
+        for row in rows
+        if row["OP Type"] in expected
+    )
+    validation_tasks = 0
     for row in rows:
         name = row["OP Type"]
         if name not in expected:
             if cache_eviction and name == "state_sum":
                 evictions.append(row)
+                continue
+            if float(row["Task Start Time(us)"].strip()) >= last_main_end:
+                validation_tasks += 1
                 continue
             require(
                 float(row["Task Start Time(us)"].strip()) < first_main,
@@ -87,6 +96,7 @@ def summarize(directory, warmup, repeats, backend, *, cache_eviction=False):
     return {
         "scope": "sum of device task durations per call; excludes setup and host gaps",
         "setup_tasks_excluded": setup,
+        "validation_tasks_excluded": validation_tasks,
         "eviction_tasks_excluded": len(evictions),
         "summary_csv": str(paths[0].resolve()),
         "summary_sha256": hashlib.sha256(paths[0].read_bytes()).hexdigest(),
@@ -165,14 +175,17 @@ def profile(args, backend, batch, context, trial):
         "OPENBLAS_NUM_THREADS": "1",
     }
     (output / "command.json").write_text(
-        json.dumps({"command": command, "worker": worker}, indent=2)
+        json.dumps(
+            {"command": command, "worker": worker, "application_timeout_s": args.application_timeout},
+            indent=2,
+        )
     )
     with (output / "msprof.log").open("w") as log:
         proc = subprocess.Popen(
             command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
         try:
-            code = proc.wait(timeout=240)
+            code = proc.wait(timeout=args.application_timeout)
         finally:
             kill_process_group(proc.pid)
         require(code == 0, f"msprof failed: {output / 'msprof.log'}")
@@ -195,6 +208,7 @@ def profile(args, backend, batch, context, trial):
         device_record=str(output / "device/device.json"),
         input_identity=device["input_identity"],
         max_abs_error=device["max_abs_error"],
+        numerical_reference=device.get("numerical_reference"),
         cache_scope=device["cache_scope"],
         cache_eviction=device.get("cache_eviction"),
     )
@@ -222,8 +236,10 @@ def main(argv=None):
     parser.add_argument("--metrics", default="PipeUtilization")
     parser.add_argument("--rotations", type=int, default=1)
     parser.add_argument("--cache-evict-artifacts", type=Path)
+    parser.add_argument("--application-timeout", type=float, default=240)
     args = parser.parse_args(argv)
     require(args.trials > 0 and args.repeats > 0 and args.warmup >= 0, "invalid repetition counts")
+    require(args.application_timeout > 0, "profiling application timeout must be positive")
     require(
         "vllm-ascend" not in args.backends or args.reference_artifacts is not None,
         "source reference artifacts required",
