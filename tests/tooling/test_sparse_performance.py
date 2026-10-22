@@ -2,6 +2,8 @@
 
 import csv
 import ctypes as ct
+import json
+from decimal import Decimal
 
 import numpy as np
 import pytest
@@ -73,7 +75,14 @@ def test_profiling_rejects_reference_tasks_after_timing_starts(tmp_path, referen
     from ascendflow.diagnostics import CompileError
     from benchmarks.attention.profile_sparse import summarize
 
-    keys = ("Op Name", "OP Type", "Task Type", "Task Start Time(us)", "Task Duration(us)", "Block Num")
+    keys = (
+        "Op Name",
+        "OP Type",
+        "Task Type",
+        "Task Start Time(us)",
+        "Task Duration(us)",
+        "Block Num",
+    )
     with (tmp_path / "op_summary_0.csv").open("w") as stream:
         writer = csv.writer(stream)
         writer.writerow(keys)
@@ -86,3 +95,51 @@ def test_profiling_rejects_reference_tasks_after_timing_starts(tmp_path, referen
         )
     with pytest.raises(CompileError, match="unexpected task during measured calls"):
         summarize(tmp_path, 1, 1, "ascendflow")
+
+
+@pytest.mark.parametrize("gap_us", ("0.020", "-0.020"))
+def test_gather_eviction_boundary_preserves_precision_at_epoch_timestamps(tmp_path, gap_us):
+    from ascendflow.diagnostics import CompileError
+    from benchmarks.attention.gather_dma import NAMES, summarize
+
+    measure = tmp_path / "measure"
+    profile = tmp_path / "profile"
+    measure.mkdir()
+    profile.mkdir()
+    (measure / "device.json").write_text(
+        json.dumps(
+            {
+                "status": "measured",
+                "batches": [64],
+                "warmup": 0,
+                "repeats": 1,
+                "query_tokens": 4,
+                "topk": 512,
+                "row_bytes": 1024,
+                "launch_sequence": [{"kernel": name} for name in NAMES],
+            }
+        )
+    )
+    epoch = Decimal("1792645861338118.182")
+    rows = [("state_sum", "AI_VECTOR_CORE", epoch - 1000, 10)]
+    for i, name in enumerate(NAMES):
+        start = epoch + i * 1000
+        rows.extend(
+            [
+                ("state_sum", "AI_VECTOR_CORE", start, "764.376"),
+                (name, "AI_VECTOR_CORE", start + Decimal("764.376") + Decimal(gap_us), 1),
+            ]
+        )
+    with (profile / "op_summary_0.csv").open("w") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("OP Type", "Task Type", "Task Start Time(us)", "Task Duration(us)"))
+        writer.writerows(rows)
+    if gap_us.startswith("-"):
+        with pytest.raises(CompileError, match="eviction overlapped gather"):
+            summarize(tmp_path)
+        assert not (tmp_path / "results.json").exists()
+    else:
+        summarize(tmp_path)
+        results = json.loads((tmp_path / "results.json").read_text())["results"]
+        assert len(results) == 6
+        assert all(result["median_us"] == 1 for result in results)

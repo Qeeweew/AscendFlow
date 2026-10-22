@@ -1,0 +1,133 @@
+// Independent dav-2201 DMA experiment. No AscendFlow generated kernel code.
+#include "kernel_operator.h"
+#include <cstdint>
+using namespace AscendC;
+constexpr int GROUPS=20, CORES=40, QT=4, TOPK=512, D=512, ROWS=32;
+constexpr int PAGE_ROWS=64, TABLE=1024, ROW_BYTES=D*2, CHUNK=8192;
+
+extern "C" __global__ __vector__ void gather_init(__gm__ int32_t* source, int64_t words) {
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> index_buf, data_buf;
+    pipe.InitBuffer(index_buf, CHUNK*4);
+    pipe.InitBuffer(data_buf, 2*CHUNK*4);
+    auto index=index_buf.Get<int32_t>(), data=data_buf.Get<int32_t>();
+    GlobalTensor<int32_t> output; output.SetGlobalBuffer(source);
+    CreateVecIndex(index, int32_t(0), CHUNK);
+    PipeBarrier<PIPE_V>();
+    const int64_t chunks=words/CHUNK;
+    int64_t generation=0;
+    for (int64_t chunk=GetBlockIdx(); chunk<chunks; chunk+=CORES, ++generation) {
+        const auto bank=event_t(generation%2);
+        if (generation>=2) WaitFlag<HardEvent::MTE3_V>(bank);
+        Adds(data[(generation%2)*CHUNK], index, int32_t(chunk*CHUNK), CHUNK);
+        SetFlag<HardEvent::V_MTE3>(bank);
+        WaitFlag<HardEvent::V_MTE3>(bank);
+        DataCopy(output[chunk*CHUNK], data[(generation%2)*CHUNK], CHUNK);
+        if (chunk+2*CORES<chunks) SetFlag<HardEvent::MTE3_V>(bank);
+    }
+    PipeBarrier<PIPE_ALL>();
+}
+
+// MODE 0: original order, single-row instructions.
+// MODE 1: pair/address order identical to gather2, but two single-row instructions.
+// MODE 2: two-row dynamic-stride instruction, falling back for duplicates/invalids.
+template<int MODE, bool PHYSICAL>
+__aicore__ inline void gather_body(__gm__ uint16_t* source, __gm__ int32_t* indices,
+    __gm__ int32_t* pages, __gm__ uint16_t* output, int64_t batch) {
+    const int group=GetBlockIdx()/2, sid=GetBlockIdx()%2;
+    const int tokens=batch*QT;
+    if (group>=tokens) return;
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> index_buf, page_buf, data_buf;
+    pipe.InitBuffer(index_buf, TOPK*4);
+    pipe.InitBuffer(page_buf, TABLE*4);
+    pipe.InitBuffer(data_buf, 2*ROWS*ROW_BYTES);
+    auto index=index_buf.Get<int32_t>(), table=page_buf.Get<int32_t>();
+    auto data=data_buf.Get<uint16_t>();
+    GlobalTensor<uint16_t> input, out;
+    GlobalTensor<int32_t> gi, gp;
+    input.SetGlobalBuffer(source); out.SetGlobalBuffer(output);
+    gi.SetGlobalBuffer(indices); gp.SetGlobalBuffer(pages);
+    const int jobs=(tokens-1-group)/GROUPS+1;
+    const int blocks=TOPK/2/ROWS, total_blocks=jobs*blocks;
+    const DataCopyPadExtParams<uint16_t> pad{false, 0, 0, 0};
+    const DataCopyExtParams one{1, ROW_BYTES, 0, 0, 0};
+    for (int job=0; job<jobs; ++job) {
+        const int token=group+job*GROUPS;
+        DataCopy(index, gi[int64_t(token)*TOPK], TOPK);
+        if constexpr (!PHYSICAL) DataCopy(table, gp[int64_t(token/QT)*TABLE], TABLE);
+        SetFlag<HardEvent::MTE2_S>(event_t(2));
+        WaitFlag<HardEvent::MTE2_S>(event_t(2));
+        auto row_id=[&](int slot) __aicore__ -> int64_t {
+            int32_t value=index.GetValue(slot);
+            if (value<0) return -1;
+            if constexpr (PHYSICAL) return int64_t(value);
+            else return int64_t(table.GetValue(value/PAGE_ROWS))*PAGE_ROWS+value%PAGE_ROWS;
+        };
+        for (int step=0; step<blocks+1; ++step) {
+            if (step<blocks) {
+                const int generation=job*blocks+step, bank=generation%2;
+                if (generation>=2) WaitFlag<HardEvent::MTE3_MTE2>(event_t(bank));
+                const int start=sid*(TOPK/2)+step*ROWS;
+                if constexpr (MODE==0) {
+                    #pragma unroll 1
+                    for (int row=0; row<ROWS; ++row) {
+                        int64_t id=row_id(start+row);
+                        if (id>=0) DataCopyPad(data[bank*ROWS*D+row*D], input[id*D], one, pad);
+                    }
+                } else {
+                    #pragma unroll 1
+                    for (int row=0; row<ROWS; row+=2) {
+                        int64_t a=row_id(start+row), b=row_id(start+row+1);
+                        if (a>=0 && b>=0 && a>b) { const int64_t t=a; a=b; b=t; }
+                        const int64_t gap=(b-a-1)*ROW_BYTES;
+                        if constexpr (MODE==2) {
+                            if (a>=0 && b>=0 && gap>=0 && gap<INT32_MAX) {
+                                // GM source stride is a gap in BYTES after each row.
+                                // UB destination gap is zero, so rows are contiguous.
+                                DataCopyExtParams two{2, ROW_BYTES, uint32_t(gap), 0, 0};
+                                DataCopyPad(data[bank*ROWS*D+row*D], input[a*D], two, pad);
+                                continue;
+                            }
+                        }
+                        if (a>=0) DataCopyPad(data[bank*ROWS*D+row*D], input[a*D], one, pad);
+                        if (b>=0) DataCopyPad(data[bank*ROWS*D+(row+1)*D], input[b*D], one, pad);
+                    }
+                }
+                SetFlag<HardEvent::MTE2_MTE3>(event_t(bank));
+            }
+            if (step>0) {
+                const int prev=step-1, generation=job*blocks+prev, bank=generation%2;
+                WaitFlag<HardEvent::MTE2_MTE3>(event_t(bank));
+                const int start=sid*(TOPK/2)+prev*ROWS;
+                const int64_t offset=(int64_t(group)*3+job%3)*TOPK*D+int64_t(start)*D;
+                DataCopy(out[offset], data[bank*ROWS*D], ROWS*D);
+                if (generation+2<total_blocks) SetFlag<HardEvent::MTE3_MTE2>(event_t(bank));
+            }
+        }
+    }
+    PipeBarrier<PIPE_ALL>();
+}
+
+#define DEFINE_GATHER(NAME, MODE, PHYSICAL) \
+extern "C" __global__ __vector__ void NAME(__gm__ uint16_t* source, __gm__ int32_t* indices, \
+    __gm__ int32_t* pages, __gm__ uint16_t* output, int64_t batch) { \
+    gather_body<MODE, PHYSICAL>(source, indices, pages, output, batch); \
+} \
+extern "C" int launch_##NAME(void* stream, void* source, void* indices, void* pages, \
+    void* output, int64_t batch) { \
+    if (batch<=0 || batch>128) return -1; \
+    NAME<<<CORES, nullptr, stream>>>((uint16_t*)source, (int32_t*)indices, \
+        (int32_t*)pages, (uint16_t*)output, batch); return 0; \
+}
+DEFINE_GATHER(gather_single_lookup, 0, false)
+DEFINE_GATHER(gather_pair_single_lookup, 1, false)
+DEFINE_GATHER(gather_pair_dma_lookup, 2, false)
+DEFINE_GATHER(gather_single_physical, 0, true)
+DEFINE_GATHER(gather_pair_single_physical, 1, true)
+DEFINE_GATHER(gather_pair_dma_physical, 2, true)
+
+extern "C" int launch_gather_init(void* stream, void* source, int64_t words) {
+    if (words<=0 || words%CHUNK || words>int64_t(INT32_MAX)+1) return -1;
+    gather_init<<<CORES, nullptr, stream>>>((int32_t*)source, words); return 0;
+}

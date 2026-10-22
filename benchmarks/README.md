@@ -31,6 +31,7 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `kda/audit_prefill.py`、`gemm/run_fp32.py` | 原始 dot 两侧输入精度离线审计、FP32 Cube 随机输入设备检查 |
 | `attention/run_sparse.py` | V4.1 CSA 单 kernel decode/prefill、INT32 页表/索引、NPU FP32 数值参考与输入/哨兵检查；见[合同](../docs/operators/sparse-mla.md) |
 | `attention/profile_sparse.py` | 仅做 msprof 性能采集，不运行数值参考或回读算子输出；支持独立缓存轮换、显式 L2 驱逐、batch 和上下文矩阵 |
+| `attention/gather_dma.py` | 独立 AscendC 单行/双行 DMA 对照，包含逐行查页表和预给物理行号两种路径；不是 AscendFlow DSL 或完整 attention |
 | `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 | `references/` | 日常 ACLNN 适配器与独立 AscendC 参考 |
 
@@ -57,6 +58,27 @@ PY
 任务交替且不重叠，仅报告 attention 的 device task duration，排除驱逐、metadata 和 host gaps。
 使用普通 `msprof`，不使用 `msprof op`；可选 `--metrics L2Cache` 核对缓存计数。
 这表示 kernel 入口前的缓存驱逐，kernel 内部正常的 KV/L2 复用仍会发生；轮换输入本身不代表冷缓存。
+
+独立 gather DMA 实验固定每请求 4 token、每 token 512 行、每行 1024 字节，使用 8 GiB
+源缓存和 GM ring 发布结果。三种模式分别是原顺序单行、按地址配对后两次单行、同样配对的
+一次双行 DMA；后两者用于隔离 DMA 合并本身的收益。双行 source stride 是行间的字节 gap，
+重复、无效或 gap 超范围的 pair 回退单行。配对会调整 KV 行序；此工具只检查搬运，不计算 attention。
+
+```bash
+python -m benchmarks.attention.gather_dma --mode build --output build/gather-dma
+# 先检查所有卡，选择健康空闲卡；这里以物理卡 3 为例，进程映射到逻辑 0。
+ASCEND_RT_VISIBLE_DEVICES=3 ASCEND_DEVICE_ID=0 python -m benchmarks.attention.gather_dma \
+  --mode check --physical 3 --batches 1 64 128 --output build/gather-dma
+python -m benchmarks.attention.gather_dma --mode profile --physical 3 --batches 64 128 \
+  --cache-evict-artifacts build/l2-evict --output build/gather-dma
+# 仅从已有 CSV 和 measurement manifest 重汇总，不启动设备或重新采集。
+python -m benchmarks.attention.gather_dma --mode summarize --output build/gather-dma
+```
+
+`check` 独立执行逐 bit 地址/行序检查；`profile` 每个 gather 前驱逐缓存，只统计 device task
+duration，不做数值校验或输出回读。`results.json` 的逻辑 KV GB/s 是请求字节量除以时间，
+不是硬件计数器测得的 HBM 带宽。`summarize` 从已记录的 batch、warmup 和 repeats 恢复样本，
+用十进制时间戳检查驱逐边界，避免 epoch 时间戳的浮点舍入误报。
 
 ## 专项诊断
 
