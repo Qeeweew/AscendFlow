@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="686" viewBox="0 0 1200 686" role="img" aria-labelledby="title desc">
+  <title id="title">AscendFlow: explicit kernels, automatic synchronization</title>
+  <desc id="desc">The kernel author specifies computation, memory and stage order in Python DSL. The xDSL compiler derives synchronization from physical accesses, buffer ownership, logical generations and last readers, then emits ASC for CANN and Ascend 910B. A two-slot vector pipeline illustrates ready and release across load, compute and store.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#64748b"/>
+    </marker>
+    <marker id="ready-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="release-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#b45309"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "DejaVu Sans", sans-serif; fill: #152840; }
+      .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: 1.2px; }
+      .heading { font-size: 23px; font-weight: 700; }
+      .body { font-size: 15px; }
+      .small { font-size: 13px; }
+      .muted { fill: #52647a; }
+      .lane { font-size: 14px; font-weight: 700; }
+      .tile { font-size: 15px; font-weight: 700; }
+      .tile-sub { font-size: 12px; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="686" rx="20" fill="#f7fafc"/>
+  <text x="32" y="48" font-size="30" font-weight="700">AscendFlow</text>
+  <text x="32" y="77" font-size="17" class="muted">Explicit computation and scheduling. Synchronization from real memory use.</text>
+
+  <rect x="32" y="108" width="264" height="186" rx="14" fill="#ffffff" stroke="#cdddeb"/>
+  <text x="52" y="136" class="eyebrow" style="fill:#2563eb">KERNEL AUTHOR</text>
+  <text x="52" y="169" class="heading">Python DSL</text>
+  <text x="52" y="199" class="body">Compute + data movement</text>
+  <text x="52" y="224" class="body">Tiles, buffers, stage order</text>
+  <rect x="52" y="247" width="224" height="28" rx="7" fill="#eff6ff"/>
+  <text x="164" y="266" text-anchor="middle" class="small" style="fill:#1d4ed8">GM / UB / L1 / L0</text>
+
+  <path d="M 302 201 H 322" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="334" y="108" width="384" height="186" rx="14" fill="#ffffff" stroke="#9ac8bf"/>
+  <text x="354" y="136" class="eyebrow" style="fill:#0f766e">ACCESS + LIFETIME</text>
+  <text x="354" y="169" class="heading">xDSL compiler</text>
+  <text x="354" y="199" class="body">Physical reads / writes + logical generations</text>
+  <text x="354" y="224" class="body">Ownership + every last reader</text>
+  <rect x="354" y="247" width="344" height="28" rx="7" fill="#e8f5f0"/>
+  <text x="526" y="266" text-anchor="middle" class="small" style="fill:#0f766e">ready / release + finite event resources</text>
+
+  <path d="M 724 201 H 744" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="756" y="108" width="180" height="186" rx="14" fill="#ffffff" stroke="#cdddeb"/>
+  <text x="776" y="136" class="eyebrow" style="fill:#6d28d9">CODE GENERATION</text>
+  <text x="776" y="169" class="heading">ASC</text>
+  <text x="776" y="199" class="body">CANN 9.1</text>
+  <text x="776" y="224" class="small muted">Device kernel</text>
+  <text x="776" y="246" class="small muted">+ runtime launcher</text>
+
+  <path d="M 942 201 H 962" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="974" y="108" width="194" height="186" rx="14" fill="#ffffff" stroke="#cdddeb"/>
+  <text x="994" y="136" class="eyebrow" style="fill:#2563eb">EXECUTION</text>
+  <text x="994" y="169" font-size="21" font-weight="700">Ascend 910B</text>
+  <rect x="994" y="188" width="154" height="27" rx="6" fill="#eff6ff"/>
+  <text x="1071" y="207" text-anchor="middle" class="small">AIC: Cube</text>
+  <rect x="994" y="222" width="154" height="27" rx="6" fill="#e8f5f0"/>
+  <text x="1071" y="241" text-anchor="middle" class="small">AIV: Vector</text>
+  <text x="994" y="275" font-size="12" class="muted">Mixed: 1 AIC + 2 AIV</text>
+
+  <rect x="32" y="318" width="1136" height="336" rx="14" fill="#ffffff" stroke="#d6e2ec"/>
+  <text x="52" y="350" font-size="21" font-weight="700">Overlap work. Reuse storage after its last reader.</text>
+  <text x="52" y="376" class="body muted">Example: two input slots, two output slots. Logical generations stay distinct.</text>
+
+  <g stroke="#e7edf3" stroke-width="1">
+    <path d="M 346 411 V 590 M 538 411 V 590 M 730 411 V 590 M 922 411 V 590 M 1114 411 V 590"/>
+  </g>
+  <g class="small muted" text-anchor="middle">
+    <text x="248" y="404">step 0</text>
+    <text x="440" y="404">step 1</text>
+    <text x="632" y="404">step 2</text>
+    <text x="824" y="404">step 3</text>
+    <text x="1016" y="404">step 4</text>
+  </g>
+  <text x="52" y="450" class="lane">MTE2</text>
+  <text x="52" y="468" class="small muted">load</text>
+  <text x="52" y="509" class="lane">Vector</text>
+  <text x="52" y="527" class="small muted">compute</text>
+  <text x="52" y="568" class="lane">MTE3</text>
+  <text x="52" y="586" class="small muted">store</text>
+
+  <g fill="#eff6ff" stroke="#b7d1fb">
+    <rect x="166" y="426" width="164" height="47" rx="8"/>
+    <rect x="358" y="426" width="164" height="47" rx="8"/>
+    <rect x="550" y="426" width="164" height="47" rx="8"/>
+    <rect x="742" y="426" width="164" height="47" rx="8"/>
+  </g>
+  <g text-anchor="middle" class="tile" style="fill:#1d4ed8">
+    <text x="248" y="455">load 0 · x[0]</text>
+    <text x="440" y="455">load 1 · x[1]</text>
+    <text x="632" y="455">load 2 · x[0]</text>
+    <text x="824" y="455">load 3 · x[1]</text>
+  </g>
+  <g fill="#e8f5f0" stroke="#a9d5c7">
+    <rect x="358" y="485" width="164" height="47" rx="8"/>
+    <rect x="550" y="485" width="164" height="47" rx="8"/>
+    <rect x="742" y="485" width="164" height="47" rx="8"/>
+    <rect x="934" y="485" width="164" height="47" rx="8"/>
+  </g>
+  <g text-anchor="middle">
+    <text x="440" y="505" class="tile" style="fill:#0f766e">compute 0</text>
+    <text x="440" y="522" class="tile-sub muted">x[0] → y[0]</text>
+    <text x="632" y="505" class="tile" style="fill:#0f766e">compute 1</text>
+    <text x="632" y="522" class="tile-sub muted">x[1] → y[1]</text>
+    <text x="824" y="505" class="tile" style="fill:#0f766e">compute 2</text>
+    <text x="824" y="522" class="tile-sub muted">x[0] → y[0]</text>
+    <text x="1016" y="505" class="tile" style="fill:#0f766e">compute 3</text>
+    <text x="1016" y="522" class="tile-sub muted">x[1] → y[1]</text>
+  </g>
+  <g fill="#f2edff" stroke="#d3c1f4">
+    <rect x="550" y="544" width="164" height="47" rx="8"/>
+    <rect x="742" y="544" width="164" height="47" rx="8"/>
+    <rect x="934" y="544" width="164" height="47" rx="8"/>
+  </g>
+  <g text-anchor="middle" class="tile" style="fill:#6d28d9">
+    <text x="632" y="573">store 0 · y[0]</text>
+    <text x="824" y="573">store 1 · y[1]</text>
+    <text x="1016" y="573">store 2 · y[0]</text>
+  </g>
+  <text x="1128" y="573" font-size="22" class="muted">…</text>
+
+  <path d="M 330 451 C 346 451 342 508 356 508" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#ready-arrow)"/>
+  <path d="M 522 509 C 542 509 531 451 548 451" fill="none" stroke="#b45309" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#release-arrow)"/>
+  <circle cx="522" cy="509" r="3" fill="#b45309"/>
+
+  <circle cx="59" cy="623" r="4" fill="#2563eb"/>
+  <text x="72" y="628" class="small"><tspan font-weight="700">ready</tspan><tspan class="muted">: producer finished → reader may start</tspan></text>
+  <circle cx="539" cy="623" r="4" fill="#b45309"/>
+  <text x="552" y="628" class="small"><tspan font-weight="700">release</tspan><tspan class="muted">: last reader finished → slot may be overwritten</tspan></text>
+  <text x="1168" y="675" text-anchor="end" font-size="11" class="muted">Conceptual schedule · not a profiling trace</text>
+</svg>
