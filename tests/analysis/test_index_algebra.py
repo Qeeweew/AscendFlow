@@ -184,6 +184,38 @@ def test_active_range_dags_keep_actual_lexical_domains_and_failed_unsigned_evalu
     assert tuple(bound.constant for bound in ranges.interval(quotient, active)) == (0, 3)
 
 
+def test_algebra_scope_keeps_input_snapshots_keyword_calls_and_argument_diagnostics():
+    n = argument("n")
+    rounded = expression("mul", expression("floordiv", n, literal(4)), literal(4))
+    facts = {"n": Fact(minimum=4, multiple=4)}
+    with memo_scope():
+        assert equivalent(rounded, n, facts)
+        assert equivalent(a=rounded, b=n, facts=facts)
+        facts["n"] = Fact(minimum=4)
+        assert not equivalent(rounded, n, facts=facts)
+        with pytest.raises(TypeError):
+            equivalent(rounded, n, facts, a=rounded)
+        with pytest.raises(TypeError):
+            equivalent(rounded, n, facts, unexpected=True)
+    assert memo_table(indexing.normalize) is None
+
+
+def test_algebra_scope_retries_failed_queries_and_releases_them_on_exit(monkeypatch):
+    original = indexing._PolynomialQuery.visit
+    n = argument("n")
+
+    def fail(*args):
+        raise RuntimeError("interrupted normalization")
+
+    with memo_scope():
+        monkeypatch.setattr(indexing._PolynomialQuery, "visit", fail)
+        with pytest.raises(RuntimeError, match="interrupted normalization"):
+            indexing.normalize(n, {})
+        monkeypatch.setattr(indexing._PolynomialQuery, "visit", original)
+        assert indexing.normalize(n, {}) == n
+    assert memo_table(indexing.normalize) is None
+
+
 def test_active_range_dags_retain_joint_owner_iteration_bounds():
     owner, generation = argument("$core"), argument("$g")
     flat = expression("add", owner, expression("mul", literal(3), generation))
@@ -484,3 +516,6 @@ def test_axis_checks_raw_unsigned_atoms_before_their_mathematical_zero(wrapper):
     with pytest.raises(CompileError, match="nonnegative numerator"):
         origin.evaluate({"$g": 0, "size": 4})
     assert defined_under(origin, [(task, literal(1), literal(3))], facts)
+
+
+from ascendflow.memo import memo_scope, memo_table

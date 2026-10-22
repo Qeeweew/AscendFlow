@@ -7,7 +7,8 @@ import pytest
 from ascendflow import scalar
 from ascendflow.diagnostics import CompileError
 from ascendflow.indexing import arguments, normalize
-from ascendflow.scalar import Expr, Fact, expression, expression_scope, literal, substitute
+from ascendflow.memo import memo_scope
+from ascendflow.scalar import Expr, Fact, expression, literal, substitute, substitution
 
 
 def _argument(name):
@@ -96,6 +97,19 @@ def test_empty_and_unrelated_substitutions_preserve_original_node_identities():
     assert root.args == (left, right)
 
 
+def test_bulk_substitution_keeps_its_snapshot_and_simultaneous_replacements():
+    source, replacement = _argument("source"), _argument("replacement")
+    root = Expr("add", (source, source))
+    bindings = {source: replacement, replacement: literal(99)}
+    with memo_scope(fresh=True):
+        translate = substitution(bindings)
+        bindings[source] = literal(4)
+        result = translate(root)
+        assert result.evaluate({"replacement": 3}) == 6
+        assert translate(root) is result
+        assert substitute(root, bindings).evaluate({}) == 8
+
+
 def test_free_variables_are_immutable_compositional_facts():
     first, second = _argument("first"), _argument("second")
     root = _doubled(Expr("mul", (first, second)), 8)
@@ -144,26 +158,26 @@ def test_shared_graphs_still_obey_expanded_weight_and_depth_budgets():
 
 
 def test_expression_scope_shares_only_identical_raw_syntax_and_restores_outer_scope():
-    with expression_scope():
+    with memo_scope(fresh=True):
         first = expression("add", _argument("n"), literal(3))
         assert expression("add", _argument("n"), literal(3)) is first
         assert expression("mul", _argument("n"), literal(3)) is not first
         raw_division = Expr("floordiv", (_argument("n"), literal(1)))
         assert raw_division.kind == "floordiv" and raw_division is not _argument("n")
-        with pytest.raises(RuntimeError, match="inner"), expression_scope():
+        with pytest.raises(RuntimeError, match="inner"), memo_scope(fresh=True):
             inner = expression("add", _argument("n"), literal(3))
             assert inner == first and inner is not first
             raise RuntimeError("inner")
         assert expression("add", _argument("n"), literal(3)) is first
     outside = expression("add", _argument("n"), literal(3))
     assert outside == first and outside is not first
-    with expression_scope():
+    with memo_scope(fresh=True):
         assert expression("add", _argument("n"), literal(3)) is not first
 
 
 @pytest.mark.parametrize("invalid", (True, 1.0))
 def test_expression_arena_does_not_mask_invalid_constants_equal_to_cached_integers(invalid):
-    with expression_scope():
+    with memo_scope(fresh=True):
         valid = Expr("constant", (1,))
         for _ in range(2):
             with pytest.raises(CompileError, match="invalid scalar constant"):
@@ -177,7 +191,7 @@ def test_expression_arena_never_shares_definedness_between_fact_environments():
     from ascendflow.analysis.integer_facts import IntegerFacts
     from ascendflow.analysis.structured_schedule import Comparison
 
-    with expression_scope():
+    with memo_scope(fresh=True):
         quotient = expression("floordiv", literal(1), _argument("n"))
         assert expression("floordiv", literal(1), _argument("n")) is quotient
         test = Comparison(quotient, ">=", literal(0))

@@ -6,38 +6,25 @@ new machine evaluations are checked separately. Unknown facts keep the SSA.
 """
 
 from collections.abc import Mapping
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from math import gcd
 
 from xdsl.dialects import arith
 
 from .diagnostics import CompileError, ErrorKind, require
 from .dialects.physical import RuntimeSizeOp
+from .memo import memo_table, memoized, memoized_method
 from .symbols import Symbol, SymbolKind, symbol_name, symbol_order
 
 INT64_MAX = (1 << 63) - 1
 DIVISION = {"floordiv", "rem", "ceildiv"}
 BINARY = {"add", "mul", "min", "max", *DIVISION}
-_expression_nodes = ContextVar("ascendflow_expression_nodes", default=None)
-
-
-@contextmanager
-def expression_scope():
-    """Own raw syntax nodes for one compilation, never range or proof facts."""
-    nodes = {}
-    token = _expression_nodes.set(nodes)
-    try:
-        yield
-    finally:
-        _expression_nodes.reset(token)
-        nodes.clear()
+_UNCHANGED = object()
 
 
 class _ExprType(type):
     def __call__(cls, kind, args):
-        nodes = _expression_nodes.get()
+        nodes = memo_table(Expr)
         if nodes is None or cls is not Expr:
             return super().__call__(kind, args)
         # Validate the key's shape before lookup: Python otherwise conflates
@@ -268,6 +255,45 @@ def literal(value):
     return Expr("constant", (value,))
 
 
+class _Substitution:
+    """One immutable simultaneous binding snapshot and its shared DAG query."""
+
+    def __init__(self, bindings):
+        self.bindings = dict(bindings)
+        self.variables = (
+            frozenset(key.args[0] for key in bindings)
+            if all(key.kind == "argument" for key in bindings)
+            else None
+        )
+
+    def apply(self, value):
+        if self.variables is not None and value.variables.isdisjoint(self.variables):
+            return value
+        result = self._rewrite(value)
+        return value if result is _UNCHANGED else result
+
+    @memoized_method
+    def _rewrite(self, current):
+        if current in self.bindings:
+            return self.bindings[current]
+        if current.kind == "argument" and isinstance(current.args[0], Symbol):
+            symbol = current.args[0]
+            captures = tuple(self.apply(capture) for capture in symbol.captures)
+            if captures != symbol.captures:
+                return Expr("argument", (symbol.with_captures(captures),))
+        elif current.kind not in {"constant", "argument"}:
+            children = tuple(self.apply(child) for child in current.args)
+            if any(old is not new for old, new in zip(current.args, children, strict=True)):
+                return expression(current.kind, *children)
+        return _UNCHANGED
+
+
+@memoized(key=lambda bindings: frozenset(bindings.items()))
+def substitution(bindings):
+    """Bind one immutable coordinate snapshot for bulk DAG translation."""
+    return _Substitution(bindings).apply
+
+
 def substitute(value: Expr, bindings: Mapping[Expr, Expr]) -> Expr:
     """Simultaneous coordinate substitution, without assumptions about its domain.
 
@@ -275,37 +301,7 @@ def substitute(value: Expr, bindings: Mapping[Expr, Expr]) -> Expr:
     loop/guard scope that makes any division or selected occurrence valid.
     This shared operation supplies no alias or completion proof.
     """
-    if not bindings:
-        return value
-    memo = {}
-
-    def visit(current):
-        identity = id(current)
-        if identity in memo:
-            return memo[identity]
-        if current in bindings:
-            result = bindings[current]
-        elif current.kind == "argument" and isinstance(current.args[0], Symbol):
-            symbol = current.args[0]
-            captures = tuple(visit(capture) for capture in symbol.captures)
-            result = (
-                current
-                if captures == symbol.captures
-                else Expr("argument", (replace(symbol, captures=captures),))
-            )
-        elif current.kind in {"constant", "argument"}:
-            result = current
-        else:
-            children = tuple(visit(child) for child in current.args)
-            result = (
-                current
-                if all(old is new for old, new in zip(current.args, children, strict=True))
-                else expression(current.kind, *children)
-            )
-        memo[identity] = result
-        return result
-
-    return visit(value)
+    return substitution(bindings)(value) if bindings else value
 
 
 def expression(kind, a, b):

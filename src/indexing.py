@@ -14,11 +14,16 @@ from itertools import product
 from types import MappingProxyType
 
 from .diagnostics import CompileError, ErrorKind, require
+from .memo import memoized, memoized_method
 from .scalar import DIVISION, Expr, Fact, expression, infer, literal
 from .symbols import is_coordinate
 
 MAX_TERMS = 256
 MAX_WORK = 16384
+
+
+def _expression_key(expr, facts, *, identity=None):
+    return expr, frozenset(facts.items()), identity
 
 
 def _charge(work, amount):
@@ -348,6 +353,7 @@ def multiple_of(value: Expr, alignment: int, facts: Mapping[str, Fact]) -> bool:
     return True
 
 
+@memoized(key=lambda a, b, facts: (a, b, frozenset(facts.items())))
 def equivalent(a, b, facts):
     query = _PolynomialQuery(facts)
     return query.visit(a) == query.visit(b)
@@ -357,6 +363,7 @@ def _exact_integers(polynomial):
     return all(coefficient.denominator == 1 for coefficient in polynomial.values())
 
 
+@memoized(key=_expression_key)
 def normalize(expr, facts, *, identity=None):
     """Ring-normalize one expression that stays integral over the integers.
 
@@ -368,6 +375,7 @@ def normalize(expr, facts, *, identity=None):
     return _to_expr(_PolynomialQuery(facts, identity=identity).visit(expr))
 
 
+@memoized(key=_expression_key)
 def normalize_integral(expr, facts, *, identity=None):
     """Rebuild a normalized expression, or ``None`` when it is not integral.
 
@@ -376,10 +384,9 @@ def normalize_integral(expr, facts, *, identity=None):
     fractional proof coefficient into an exception, and must never receive a
     fabricated integer.
     """
+
     polynomial = _PolynomialQuery(facts, identity=identity).visit(expr)
-    if not _exact_integers(polynomial):
-        return None
-    return _to_expr(polynomial)
+    return _to_expr(polynomial) if _exact_integers(polynomial) else None
 
 
 def normalize_or_identity(expr, facts, *, identity=None):
@@ -395,6 +402,7 @@ def normalize_or_identity(expr, facts, *, identity=None):
     return expr if integral is None else integral
 
 
+@memoized(key=_expression_key)
 def exact_constant(expr, facts, *, identity=None):
     """The exact integer value of a normalized expression, or ``None``.
 
@@ -402,6 +410,7 @@ def exact_constant(expr, facts, *, identity=None):
     force a full executable reconstruction: a term whose coefficient is only
     integral under an input multiple is still not a constant.
     """
+
     polynomial = _PolynomialQuery(facts, identity=identity).visit(expr)
     if any(term for term in polynomial):
         return None
@@ -529,6 +538,15 @@ class IndexRanges:
         self.facts = MappingProxyType(dict(facts))
         self.queries = queries
         self._domains = {}
+        # These terms only answer mathematical equality. They are never
+        # reconstructed into a bound or exported as another raw expression's
+        # evaluation domain; actual bounds stay keyed by the full lexical DAG.
+        self._equality_terms = _PolynomialQuery(self.facts)
+
+    @memoized_method
+    def _equivalent(self, lhs, rhs):
+        self._equality_terms.work[0] = 0
+        return lhs == rhs or self._equality_terms.visit(lhs) == self._equality_terms.visit(rhs)
 
     def interval(self, expr, domains):
         domains = tuple(domains)
@@ -541,7 +559,7 @@ class IndexRanges:
         facts = self.facts
         matched = None
         for coordinate, lower, upper in domains:
-            if equivalent(expr, coordinate, facts):
+            if self._equivalent(expr, coordinate):
                 matched = (
                     (lower, upper)
                     if matched is None

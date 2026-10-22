@@ -12,31 +12,16 @@ environment; they never replace the query service nor act as a proof.
 """
 
 from dataclasses import dataclass
-from functools import cache, wraps
+from functools import cache
 from types import MappingProxyType
 
 from ..indexing import AtomIdentity, exact_constant, normalize_integral
+from ..memo import memoized_method
 from ..scalar import DIVISION, Expr, expression, infer, literal
 from .smt import IntegerQueryService, query_service
 from .structured_schedule import Comparison
 
 _OPPOSITE = {"==": "!=", "!=": "==", ">": "<=", ">=": "<", "<": ">=", "<=": ">"}
-_NO_ANSWER = object()
-
-
-def _query(method):
-    """Reuse a fact in this instance's immutable environment, including False."""
-
-    @wraps(method)
-    def query(self, *args):
-        key = (method.__name__, *args)
-        answer = self._answers.get(key, _NO_ANSWER)
-        if answer is _NO_ANSWER:
-            answer = method(self, *args)
-            self._answers[key] = answer
-        return answer
-
-    return query
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -56,10 +41,8 @@ class IntegerFacts:
 
     def __init__(self, facts):
         self._facts = MappingProxyType(dict(facts))
-        self._answers = {}
         self._atom_identity = AtomIdentity()
         self._premise_owner = object()
-        self._contexts: dict[tuple[Comparison, ...], _PremiseContext] = {}
         self._queries: IntegerQueryService | None = None
 
     @property
@@ -76,22 +59,22 @@ class IntegerFacts:
     def _context(self, assumptions: tuple[Comparison, ...]) -> _PremiseContext:
         if not isinstance(assumptions, tuple):
             raise TypeError("integer premises must be an immutable tuple")
-        context = self._contexts.get(assumptions)
-        if context is None:
-            context = _PremiseContext(self._premise_owner, assumptions)
-            self._contexts[assumptions] = context
-        return context
+        return self._premise_context(assumptions)
+
+    @memoized_method
+    def _premise_context(self, assumptions):
+        return _PremiseContext(self._premise_owner, assumptions)
 
     def _check_context(self, context: _PremiseContext):
         if not isinstance(context, _PremiseContext) or context.owner is not self._premise_owner:
             raise ValueError("integer premise context belongs to another owner")
 
-    @_query
+    @memoized_method
     def _difference(self, lhs, rhs):
         """Construct and bound one operand difference in this facts owner."""
         return self.bounded(expression("sub", lhs, rhs))
 
-    @_query
+    @memoized_method
     def normalize(self, value):
         """Best-effort ring-normal form; a non-integral form keeps ``value``.
 
@@ -102,16 +85,16 @@ class IntegerFacts:
         """
         return normalize_integral(value, self.facts, identity=self._atom_identity) or value
 
-    @_query
+    @memoized_method
     def exact_constant(self, value):
         """The exact integer value of one normalized expression, or ``None``."""
         return exact_constant(value, self.facts, identity=self._atom_identity)
 
-    @_query
+    @memoized_method
     def infer(self, value):
         return infer(value, self.facts)
 
-    @_query
+    @memoized_method
     def ordered_definedness(
         self, tests: tuple[Comparison, ...], evaluated: frozenset[Expr] = frozenset()
     ) -> tuple[Comparison, tuple[Comparison, ...]] | None:
@@ -152,6 +135,25 @@ class IntegerFacts:
             completed.add(identity)
             return None
 
+        divisions, visited = set(), set()
+
+        def discover(value):
+            identity = id(value)
+            if identity in visited or value in evaluated:
+                return
+            visited.add(identity)
+            if value.kind in DIVISION:
+                divisions.add(identity)
+            for child in value.args:
+                if isinstance(child, Expr):
+                    discover(child)
+
+        for test in tests:
+            discover(test.lhs)
+            discover(test.rhs)
+        if not divisions:
+            return None
+
         # Within this one ordered conjunction, later evaluation prefixes
         # only add established predicates. A raw node already admitted under
         # an earlier prefix stays defined under every extension. Keep this
@@ -162,11 +164,13 @@ class IntegerFacts:
             for value in (test.lhs, test.rhs):
                 if (missing := check(value, prefix, completed)) is not None:
                     return missing, prefix
+            if divisions <= completed:
+                return None
             if proved(Comparison(test.lhs, _OPPOSITE[test.predicate], test.rhs), prefix):
                 return None
         return None
 
-    @_query
+    @memoized_method
     def bounded(self, value):
         """Normalize integer ring arithmetic while retaining division atoms.
 
@@ -217,13 +221,13 @@ class IntegerFacts:
     def bounds(self, value, assumptions: tuple[Comparison, ...] = ()):
         return self._bounds(value, self._context(assumptions))
 
-    @_query
+    @memoized_method
     def _contains_unsigned(self, value):
         return value.kind in DIVISION or any(
             self._contains_unsigned(child) for child in value.args if isinstance(child, Expr)
         )
 
-    @_query
+    @memoized_method
     def _unsigned_defined(self, value, context):
         if not self._contains_unsigned(value):
             return True
@@ -240,7 +244,7 @@ class IntegerFacts:
             return lower is not None and lower >= 0 and positive is not None and positive > 0
         return True
 
-    @_query
+    @memoized_method
     def _bounds(self, value, context: _PremiseContext):
         self._check_context(context)
         assumptions = context.tests
@@ -340,10 +344,14 @@ class IntegerFacts:
     def prove(self, test, assumptions: tuple[Comparison, ...]):
         return self._prove(test, self._context(assumptions))
 
-    @_query
+    @memoized_method
     def _prove(self, test, context: _PremiseContext):
         """Answered by the shared query service under this exact premise tuple."""
         self._check_context(context)
+        if test.lhs == test.rhs:
+            return test.predicate in {"==", ">=", "<="}
+        if test.lhs.constant is not None and test.rhs.constant is not None:
+            return test.evaluate({})
         if test in context.tests:
             return True
         return self.queries.implies(test, context.tests).proved

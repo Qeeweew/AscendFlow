@@ -137,7 +137,7 @@ def test_arithmetic_alias_cannot_replace_a_literal_id_or_guard_bound(number):
     # Rebuild real control facts after the IR edit; the old analysis is unused.
     memory = collect_native_memory(module)
     assert memory.control.environment.expression(alias.result) == literal(number)
-    guard = ActionGuard((Comparison(memory.control.group, ">=", literal(number)),))
+    guard = ActionGuard((Comparison(memory.control.group, "==", literal(number)),))
     notifications = word(memory, literal(number), guard)
     assert [literal_value(op.event) for op in notifications] == [number, number]
     condition = notifications[0].parent_op().cond.owner

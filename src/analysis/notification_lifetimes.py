@@ -10,6 +10,7 @@ including outer reentry. A finite upper bound can instead give one ID per use.
 from dataclasses import dataclass
 
 from ..diagnostics import CompileError, ErrorKind, require
+from ..memo import memoized_method
 from ..scalar import expression, literal, substitute
 from .event_contracts import CROSS_BACKLOG, LOCAL_CAPACITY, CaseLease, StructuredEventLease
 from .guard_cover import opposite, prove_guard_cover
@@ -99,6 +100,7 @@ class HandbackRule:
             return self.boundary_cases[peer]
         return cases
 
+    @memoized_method
     def _step(self, bound, loop):
         d = self.domains
         task = d.dispatch.site(bound)
@@ -501,8 +503,7 @@ class HandbackRule:
             "queue handback rule cannot establish consumption before reuse within event capacity",
             phase="notification-generation-lifetime",
             witness=tuple(
-                f"optional relay {n.name}: {e.phase}"
-                for n, e in self.declined_boundaries.items()
+                f"optional relay {n.name}: {e.phase}" for n, e in self.declined_boundaries.items()
             ),
         )
 

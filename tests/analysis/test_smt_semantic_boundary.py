@@ -63,6 +63,56 @@ def test_integer_ring_identity_does_not_hide_an_overflowing_intermediate():
     assert dict(overflow.instance.values)["x"] == INT64_MAX
 
 
+@pytest.mark.parametrize("divisor", (1, 2, 7, 256, 1024))
+def test_ceil_encoding_keeps_mathematical_values_and_original_evaluation_domain(divisor):
+    from z3 import If, Solver, unsat
+
+    queries = IntegerQueryService({})
+    ceiling = Expr("ceildiv", (X, literal(divisor)))
+    x = queries._integer(X)
+    reference = x / divisor + If(x % divisor == 0, 0, 1)
+    solver = Solver()
+    solver.add(queries._integer(ceiling) != reference)
+    assert solver.check() == unsat
+    # The mathematical encoding handles negative integers without silently
+    # licensing unsigned source evaluation in that same input domain.
+    assert queries.defined(
+        (Comparison(ceiling, "==", ceiling),), (Comparison(X, "<", ZERO),)
+    ).refuted
+
+    largest = IntegerQueryService({"x": Fact(minimum=INT64_MAX, maximum=INT64_MAX)})
+    assert largest.machine_representable(ceiling).proved
+
+
+def test_redundant_modulo_encoding_keeps_raw_unsigned_and_product_overflow_checks():
+    from z3 import Solver, unsat
+
+    d, m = (Expr("argument", (name,)) for name in ("d", "m"))
+    product = Expr("mul", (d, m))
+    inner = Expr("rem", (X, product))
+    quotient = Expr("floordiv", (inner, d))
+    outer = Expr("rem", (quotient, m))
+    queries = IntegerQueryService(
+        {"d": Fact(minimum=1, maximum=3), "m": Fact(minimum=1, maximum=7)}
+    )
+    x, divisor, modulus = (queries._integer(value) for value in (X, d, m))
+    reference = ((x % (divisor * modulus)) / divisor) % modulus
+    solver = Solver()
+    solver.add(divisor > 0, divisor <= 3, modulus > 0, modulus <= 7)
+    solver.add(queries._integer(outer) != reference)
+    assert solver.check() == unsat
+    assert queries.defined((Comparison(outer, "==", outer),), (Comparison(X, "<", ZERO),)).refuted
+
+    overflow = IntegerQueryService(
+        {
+            "x": Fact(maximum=0),
+            "d": Fact(minimum=2, maximum=2),
+            "m": Fact(minimum=INT64_MAX, maximum=INT64_MAX),
+        }
+    )
+    assert overflow.machine_representable(outer).refuted
+
+
 def test_existence_witness_and_impossibility_have_distinct_meanings():
     queries = IntegerQueryService({"x": Fact(maximum=2)})
     witness = queries.satisfies((Comparison(X, ">", ZERO),))
@@ -84,6 +134,24 @@ def test_a_query_cannot_borrow_a_different_premise_or_input_environment():
     inputs["x"] = Fact(minimum=1, maximum=4)
     assert queries.implies(positive).refuted
     assert IntegerQueryService(inputs).implies(positive).proved
+
+
+def test_fixed_model_predicates_keep_complete_changed_and_contradictory_contexts():
+    y, z = (Expr("argument", (name,)) for name in ("y", "z"))
+    queries = IntegerQueryService({"x": Fact(maximum=2), "y": Fact(maximum=2)})
+    left = (Comparison(X, "==", ZERO), Comparison(y, "==", literal(1)))
+    right = (Comparison(X, "==", literal(1)), Comparison(y, "==", ZERO))
+    assert queries.satisfies(left).satisfied
+    assert queries.implies(Comparison(X, ">", ZERO), left).refuted
+    assert queries.statistics.model_reuses > 0
+    changed = queries.implies(Comparison(X, "==", ZERO), right)
+    assert changed.refuted
+    assert dict(changed.instance.values)["x"] == 1
+    assert queries.implies(False, (left[0], right[0])).proved
+    # Earlier models have no assignment for z. They cannot supply a witness
+    # by dropping that new predicate from the question.
+    answer = queries.satisfies((Comparison(z, ">", ZERO),), left)
+    assert answer.satisfied and dict(answer.instance.values)["z"] > 0
 
 
 def test_correlated_boolean_union_retains_its_complete_context():

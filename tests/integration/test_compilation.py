@@ -1,15 +1,17 @@
 """One public source path, immutable artifacts, and no imported proof markers."""
 
 from dataclasses import FrozenInstanceError
+from io import StringIO
 
 import pytest
-from xdsl.dialects.builtin import ModuleOp
+from xdsl.dialects.builtin import ModuleOp, StringAttr
+from xdsl.printer import Printer
 
 from ascendflow import compile
 from ascendflow import language as N
 from ascendflow.compilation import Compilation
 from ascendflow.diagnostics import CompileError, ErrorKind
-from ascendflow.dialects.io import dump
+from ascendflow.dialects.io import dump, parse
 from ascendflow.dialects.structured import NotificationOp
 
 SOURCE = """
@@ -20,6 +22,18 @@ def point(X:N.Tensor((64,),N.f32),Y:N.Tensor((64,),N.f32,access="write")):
         value=N.mul(value,2.0,out=y)
         N.copy(value,Y)
 """
+
+
+@pytest.mark.parametrize(
+    "text",
+    ("", "plain_identifier", 'quote" and slash\\', "中文😀\n", "".join(map(chr, range(256)))),
+)
+def test_snapshot_string_escaping_matches_xdsl_and_round_trips(text):
+    module = ModuleOp([], attributes={"probe": StringAttr(text)})
+    reference = StringIO()
+    Printer(stream=reference).print_op(module)
+    assert dump(module) == reference.getvalue() + "\n"
+    assert parse(dump(module)).is_structurally_equivalent(parse(reference.getvalue()))
 
 
 @pytest.fixture(scope="module")

@@ -2,16 +2,16 @@
 
 from dataclasses import replace
 
-from ascendflow.analysis.smt import IntegerQueryService, query_scope, query_service
+from ascendflow.analysis.smt import IntegerQueryService, query_service
 from ascendflow.analysis.structured_schedule import Comparison
-from ascendflow.scalar import Expr, Fact, expression, expression_scope, literal, substitute
+from ascendflow.scalar import Expr, Fact, expression, literal, substitute
 from ascendflow.symbols import Symbol, SymbolKind, is_coordinate
 
 
 def test_same_printed_name_does_not_merge_two_actual_scalar_bindings():
     left = Symbol("same", SymbolKind.METADATA, object())
     right = Symbol("same", SymbolKind.METADATA, object())
-    with expression_scope():
+    with memo_scope(fresh=True):
         a, b = (Expr("argument", (symbol,)) for symbol in (left, right))
         assert a is not b
         query = IntegerQueryService({left: Fact(maximum=0), right: Fact(minimum=1)})
@@ -69,7 +69,7 @@ def test_complete_fact_snapshots_reuse_queries_only_inside_one_compilation():
     x = Expr("argument", (Symbol("input", SymbolKind.PARAMETER, object()),))
     positive = Comparison(x, ">", literal(0))
     facts = {x.args[0]: Fact(minimum=1)}
-    with query_scope():
+    with memo_scope():
         first = query_service(facts)
         assert first.implies(positive).proved
         assert query_service(dict(facts)) is first
@@ -78,7 +78,7 @@ def test_complete_fact_snapshots_reuse_queries_only_inside_one_compilation():
         assert changed is not first
         assert changed.implies(positive).refuted
         assert first.implies(positive).proved
-    with query_scope():
+    with memo_scope():
         fresh = query_service(facts)
         assert fresh is not changed
         assert fresh.statistics.calls == 0
@@ -124,3 +124,6 @@ def test_metadata_invariance_retains_definition_and_every_specialized_capture():
     assert not control.invariant_over(Expr("argument", (variant,)), inner.operation)
     carry = replace(first.args[0], kind=SymbolKind.CARRY)
     assert not control.invariant_over(Expr("argument", (carry,)), inner.operation)
+
+
+from ascendflow.memo import memo_scope

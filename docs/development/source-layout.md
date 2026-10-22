@@ -73,6 +73,8 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `target/layout.py`、`analysis/structured_addresses.py` | L1 NZ allocation 形状、C0、偏移与条带几何；解码一次并将物理 M 交给 native 和终端消费 |
 | `analysis/matrix_regions.py` | L1 全 rank 逻辑矩形、实际部分定义及 writer 来源、精确相邻拼接与固定连续遍历摘要；不含 ready、退休或事件事实 |
 | `analysis/smt.py`、`integer_facts.py`、`guard_cover.py` | 原式数学关系与条件覆盖共用 Z3 查询；定义性和机器范围独立，输入环境与完整前提限定缓存 |
+| `memo.py` | 编译作用域和分析对象拥有的自动 memoization；统一释放表，语义键由查询声明，可变事实仍按原职责失效 |
+| `indexing.py`、`IndexRanges` | 编译内原式代数查询与固定输入环境下的范围 DAG；保留每个范围的完整调用域，不导出其他原式的求值资格 |
 | `analysis/structured_bounds.py`、`structured_admission.py` | 静态非法、物理容量、源/native 对应、别名、存储实例、初始化和借用 Tile；动态源 bounds 与 group/peer 独立性属于输入合同 |
 | `analysis/structured_access.py`、`structured_regions.py` | 按真实地址周期建立可选精确 cell 与可能别名的 AliasRegion；保留实际 native 访问，不将 may-write 当完整定义 |
 | `analysis/access_order.py`、`storage_packets.py`、`storage_word.py`、`structured_dependencies.py` | 可能冲突的 RAW/WAR/WAW、条件访问的并集及完整入口可用域、单次激活证明、共同队列端口、局部完整 packet 的实际复用 |
@@ -204,6 +206,16 @@ if (g == 7) {
 阻止跨边界合并。连续指令共用相同 SSA guard，协议来源全部保留。
 结构边界先判断一次，局部域内的区间、余数、条件规范形和并集查询按不可变
 输入复用；这些表仅属于本次 packet，不跨编译保存事实。
+
+条件 packet 在确认所有移动标量都能在共同入口完整求值后，先按真实 SSA
+操作数共享纯整数表达式，再构造 guard 和 event selector；相等的 event SSA
+无需重新投影有限 ID 来识别。别名仅随整个 packet 成功一起提交。
+单个输入 guard 只做区间规范化，不逐项搜索其非空性或可删谓词。
+相关条件的消去在实际多分支 union 提案上进行；只有一个剩余 guard 时保留它。
+通知共享仍证明完整域的互斥，event selector 仍保留 modulo 关系与有限 ID 对应，
+未知不授权改变 Set/Wait 的次数或参与者贡献。
+仿射 ID 选择直接检查保守范围上的完整映射；不能由这些范围确定时使用
+精确的剩余条件选择，不通过逐 residue 可达性查询搜索该映射。
 
 条件变换新建或移动的标量加入受影响集合。最终清理只对这些定义重新检查
 合法外提，并传播域内常量、CSE 和 DCE；正常链路只调用一次全模块 arithmetic

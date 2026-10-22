@@ -6,6 +6,7 @@ guards and observable notifications are inserted. No optimizer sees async work.
 """
 
 from collections.abc import Iterable
+from functools import cache
 
 from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import ArrayAttr, IndexType, ModuleOp, StringAttr, i1
@@ -19,6 +20,7 @@ from ..dialects.physical import BufferOp, CoreIdOp, EndOp, KernelOp, MixedOp, Ru
 from ..dialects.structured import ActorDomainOp, NotificationOp, PipelineLoopOp
 from ..scalar import DIVISION, INT64_MAX, expression, literal
 from ..target.ascend910b import Actor
+from .simplify_scalars import _bounded_interval, _Scope
 
 _BINARY = {
     "add": arith.AddiOp,
@@ -79,7 +81,31 @@ def _bindings(memory, block, before, container):
     return memo, ordinals
 
 
-def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncAction]) -> ModuleOp:
+def _ring_interval(value, bindings, scope):
+    """Bound generated ring arithmetic using the actual dominating SSA."""
+
+    @cache
+    def bounds(current):
+        if current in bindings:
+            return scope.interval(bindings[current])
+        if current.constant is not None:
+            return current.constant, current.constant
+        if current.kind not in {"add", "mul"}:
+            return None
+        left, right = (bounds(child) for child in current.args)
+        if left is None or right is None:
+            return None
+        if current.kind == "add":
+            return left[0] + right[0], left[1] + right[1]
+        products = tuple(a * b for a in left for b in right)
+        return min(products), max(products)
+
+    return bounds(value)
+
+
+def materialize_notifications(
+    memory: NativeMemoryFacts, actions: Iterable[SyncAction], *, scalar_facts=None
+) -> ModuleOp:
     """Materialize once, in place, without cloning or changing owned facts."""
     require(
         isinstance(memory, NativeMemoryFacts), "notification materialization needs owned memory"
@@ -165,6 +191,22 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
             + frame.predicates()
         )
         arithmetic = IntegerFacts(memory.control.environment.facts)
+        known_tests = dict.fromkeys(premises)
+        evaluated = frozenset(memo)
+        for test in dict.fromkeys(test for action in group for test in action.guard.comparisons):
+            if (
+                test not in known_tests
+                and all(
+                    value in memo
+                    or value.constant is not None
+                    and -INT64_MAX - 1 <= value.constant <= INT64_MAX
+                    for value in (test.lhs, test.rhs)
+                )
+                and arithmetic.prove(test, premises)
+                and arithmetic.ordered_definedness((*premises, test), evaluated) is None
+            ):
+                known_tests[test] = None
+        premises += tuple(test for test in known_tests if test not in premises)
 
         def residue(value, modulus, memo, assumptions, arithmetic=arithmetic):
             """Bound a newly generated nonnegative ring calculation before %.
@@ -194,6 +236,7 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
             current,
             memo,
             prefix,
+            scope,
             *,
             arithmetic=arithmetic,
             ordinals=ordinals,
@@ -202,7 +245,7 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
             if expr in memo:
                 return memo[expr]
             if expr in ordinals:
-                memo[expr] = scalar(ordinals[expr], current, memo, prefix)
+                memo[expr] = scalar(ordinals[expr], current, memo, prefix, scope)
                 return memo[expr]
             if expr.constant is not None:
                 require(
@@ -210,39 +253,61 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
                 )
                 operation = arith.ConstantOp.from_int_and_width(expr.constant, IndexType())
             else:
-                require(
-                    expr.kind != "argument",
-                    f"sync materialization has unbound symbol {expr.text()}",
-                )
-                assumptions = (
-                    *premises,
-                    *prefix,
-                    # Only bindings in this actual scope supply machine
-                    # ranges. Sibling guarded definitions cannot escape.
-                    *(
-                        Comparison(value, predicate, literal(bound))
-                        for value, ssa in memo.items()
-                        for predicate, bound in (
-                            (">=", 0 if ssa.type == i1 else -INT64_MAX - 1),
-                            ("<=", 1 if ssa.type == i1 else INT64_MAX),
-                        )
-                    ),
-                )
+                if expr.kind == "argument":
+                    require(False, f"sync materialization has unbound symbol {expr.text()}")
+                assumptions = None
+
+                def context():
+                    nonlocal assumptions
+                    if assumptions is not None:
+                        return assumptions
+                    assumptions = (
+                        *premises,
+                        *prefix,
+                        # Only bindings in this actual scope supply machine
+                        # ranges. Sibling guarded definitions cannot escape.
+                        *(
+                            Comparison(value, predicate, literal(bound))
+                            for value, ssa in memo.items()
+                            for predicate, bound in (
+                                (">=", 0 if ssa.type == i1 else -INT64_MAX - 1),
+                                ("<=", 1 if ssa.type == i1 else INT64_MAX),
+                            )
+                        ),
+                    )
+                    return assumptions
+
                 if expr.kind == "rem" and (modulus := expr.args[1].constant) is not None:
                     numerator = expr.args[0]
                     if (
                         0 < modulus <= 1 << 31
                         and numerator not in memo
+                        and (
+                            (ring_bounds := _ring_interval(numerator, memo, scope)) is None
+                            or ring_bounds[1] > INT64_MAX
+                        )
                         and not arithmetic.prove(
-                            Comparison(numerator, "<=", literal(INT64_MAX)), assumptions
+                            Comparison(numerator, "<=", literal(INT64_MAX)), context()
                         )
                     ):
-                        reduced = residue(numerator, modulus, memo, assumptions)
+                        reduced = residue(numerator, modulus, memo, context())
                         if reduced is not None and reduced != expr:
-                            memo[expr] = scalar(reduced, current, memo, prefix)
+                            memo[expr] = scalar(reduced, current, memo, prefix, scope)
                             return memo[expr]
-                operands = tuple(scalar(child, current, memo, prefix) for child in expr.args)
-                assumptions += tuple(
+                operands = tuple(scalar(child, current, memo, prefix, scope) for child in expr.args)
+                operation = _BINARY[expr.kind](*operands)
+                bounds = _bounded_interval(operation, scope)
+                defined = expr.kind not in DIVISION or (
+                    scope.interval(operands[0])[0] >= 0 and scope.interval(operands[1])[0] > 0
+                )
+                if defined and (expr.kind not in {"add", "mul", "ceildiv"} or bounds is not None):
+                    current.add_op(operation)
+                    if bounds is not None:
+                        scope.bind_range(operation.results[0], bounds)
+                    memo[expr] = operation.results[0]
+                    return operation.results[0]
+                operation.erase()
+                assumptions = context() + tuple(
                     Comparison(child, predicate, literal(bound))
                     for child in expr.args
                     for predicate, bound in ((">=", -INT64_MAX - 1), ("<=", INT64_MAX))
@@ -269,10 +334,14 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
             memo[expr] = operation.results[0]
             return operation.results[0]
 
-        prefixes, scopes = [], [(current, memo)]
+        prefixes, scopes = [], [(current, memo, _Scope(facts=scalar_facts))]
         for action in group:
             active_prefix = []
-            tests = action.guard.comparisons
+            # These premises belong to this actual lexical insertion domain;
+            # generation already checked the original ordered guard. Keep
+            # its residual tests instead of materializing known conjuncts and
+            # asking the final SSA passes to rediscover the same fact.
+            tests = tuple(test for test in action.guard.comparisons if test not in known_tests)
             if (
                 isinstance(root, MixedOp)
                 and len(action.participants) == 1
@@ -290,11 +359,11 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
                 scopes.pop()[0].add_op(scf.YieldOp())
                 prefixes.pop()
             for test in tests[common:]:
-                current, memo = scopes[-1]
+                current, memo, scope = scopes[-1]
                 active_prefix = prefixes[:]
                 left, right = (
-                    scalar(test.lhs, current, memo, active_prefix),
-                    scalar(test.rhs, current, memo, active_prefix),
+                    scalar(test.lhs, current, memo, active_prefix, scope),
+                    scalar(test.rhs, current, memo, active_prefix, scope),
                 )
                 if left.type != right.type and left.type == i1 and test.rhs.constant in {0, 1}:
                     boolean = arith.ConstantOp.from_int_and_width(test.rhs.constant, i1)
@@ -310,11 +379,15 @@ def materialize_notifications(memory: NativeMemoryFacts, actions: Iterable[SyncA
                     (comparison, scf.IfOp(comparison.result, [], Region(nested), Region()))
                 )
                 prefixes.append(test)
-                scopes.append((nested, dict(memo)))
-            current, memo = scopes[-1]
+                child_scope = scope.child()
+                child_scope.assume(comparison.result, True)
+                scopes.append((nested, dict(memo), child_scope))
+            current, memo, scope = scopes[-1]
             active_prefix = prefixes[:]
             event = (
-                None if action.event is None else scalar(action.event, current, memo, active_prefix)
+                None
+                if action.event is None
+                else scalar(action.event, current, memo, active_prefix, scope)
             )
             current.add_op(
                 NotificationOp.build(

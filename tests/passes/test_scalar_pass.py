@@ -674,3 +674,24 @@ def test_deep_scope_reuse_does_not_rewalk_unchanged_ancestor_inputs(monkeypatch)
     # Broaden the real ancestor input after all descendants cached its range.
     parent.bind_range(value, (0, 7))
     assert child.interval(value) == (0, 7)
+
+
+def test_inherited_range_observes_a_later_binding_inside_a_skipped_scalar_dag():
+    from ascendflow.passes import simplify_scalars as integers
+
+    block = Block(arg_types=[IndexType(), IndexType()])
+    value, unrelated = block.args
+    zero = _constant(block, 0)
+    doubled = arith.AddiOp(value, value)
+    block.add_op(doubled)
+    _function(block, doubled.result).verify()
+    parent = integers._Scope(ranges={value: (0, 3), unrelated: (0, 1)})
+    assert parent.interval(doubled.result) == (0, 6)
+    child = parent.child()
+    child.relation(unrelated, 5, zero.result)
+    assert child.interval(doubled.result) == (0, 6)
+    child.bind_range(value, (1, 2))
+    assert child.interval(doubled.result) == (2, 4)
+    child.bind_range(value, (0, 3))
+    assert child.interval(doubled.result) == (0, 6)
+    assert parent.child().interval(doubled.result) == (0, 6)

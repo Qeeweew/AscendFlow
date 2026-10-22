@@ -8,9 +8,11 @@ or perform notification/lifetime analysis.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 
 from ..diagnostics import require
-from ..indexing import arguments, equivalent, normalize_or_identity
+from ..indexing import equivalent, normalize_or_identity
+from ..memo import memoized_method
 from ..scalar import Expr, expression, infer, literal, substitute
 from ..symbols import Symbol
 from .access_frontier import LoopResidueSelection, ResiduePosition
@@ -25,7 +27,7 @@ from .structured_regions import (
 from .structured_schedule import Comparison
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ScalarScope:
     """Actual dominating values available after an occurrence coordinate map.
 
@@ -39,28 +41,38 @@ class ScalarScope:
 
     values: tuple[Expr, ...]
     facts: object = field(compare=False, hash=False, repr=False)
+    _targets: dict = field(default_factory=dict, init=False, compare=False, hash=False, repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "facts", MappingProxyType(dict(self.facts)))
+        for value in self.values:
+            symbol = value.args[0]
+            self._targets.setdefault(
+                (symbol.kind, symbol._identity, len(symbol.captures)), []
+            ).append(value)
 
     def resolve(self, value):
         if not self.values:
             return value
         bindings = {}
-        for symbol in arguments(value):
+        for symbol in value.variables:
             if not isinstance(symbol, Symbol) or not symbol.captures:
                 continue
-            for available in self.values:
-                target = available.args[0]
-                if (
-                    symbol.kind is target.kind
-                    and symbol._identity == target._identity
-                    and len(symbol.captures) == len(target.captures)
-                    and all(
-                        equivalent(a, b, self.facts)
-                        for a, b in zip(symbol.captures, target.captures, strict=True)
-                    )
-                ):
-                    bindings[Expr("argument", (symbol,))] = available
-                    break
+            if (available := self._resolve_symbol(symbol)) is not None:
+                bindings[Expr("argument", (symbol,))] = available
         return substitute(value, bindings)
+
+    @memoized_method
+    def _resolve_symbol(self, symbol):
+        for available in self._targets.get(
+            (symbol.kind, symbol._identity, len(symbol.captures)), ()
+        ):
+            if all(
+                equivalent(a, b, self.facts)
+                for a, b in zip(symbol.captures, available.args[0].captures, strict=True)
+            ):
+                return available
+        return None
 
 
 class RegionCoordinates:

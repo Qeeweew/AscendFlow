@@ -38,9 +38,9 @@ class Compilation:
         debug_verify=False,
     ):
         from .frontend import PrimFunction
-        from .scalar import expression_scope
+        from .memo import memo_scope
 
-        with limit(timeout_s, cancel), expression_scope():
+        with limit(timeout_s, cancel), memo_scope(fresh=True):
             require(
                 isinstance(module, PrimFunction)
                 or isinstance(module, ModuleOp)

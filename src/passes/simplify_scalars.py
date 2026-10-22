@@ -198,8 +198,15 @@ _SIGNS = ({0}, {-1, 1}, {-1}, {-1, 0}, {1}, {0, 1})
 
 @cache
 def _arithmetic_type(operation_type):
-    """Static IRDL membership only; no instance trait or program fact."""
-    return issubclass(operation_type, _ARITH_OPERATIONS)
+    """Static dialect membership and class traits, never program facts."""
+    return issubclass(operation_type, _ARITH_OPERATIONS) and (
+        operation_type.has_trait(Pure) or issubclass(operation_type, _UNSIGNED)
+    )
+
+
+@cache
+def _integer_type(attribute_type):
+    return issubclass(attribute_type, (IntegerType, IndexType))
 
 
 def _constant(value):
@@ -230,12 +237,8 @@ def _limits(value):
 def _scalar_arithmetic(op):
     return (
         _arithmetic_type(type(op))
-        and (op.has_trait(Pure) or isinstance(op, _UNSIGNED))
         and len(op.results) == 1
-        and all(
-            isinstance(value.type, (IntegerType, IndexType))
-            for value in (*op.operands, *op.results)
-        )
+        and all(_integer_type(type(value.type)) for value in (*op.operands, *op.results))
     )
 
 
@@ -267,19 +270,23 @@ class _Scope:
     multiples: dict = field(default_factory=dict)
     _range_data: dict = field(init=False, repr=False)
     _intervals: dict = field(default_factory=dict, init=False, repr=False)
+    _refinements: dict = field(default_factory=dict, init=False, repr=False)
     _revision: int = field(default=0, init=False, repr=False)
     _clock: list[int] = field(default_factory=lambda: [0], init=False, repr=False)
     _observed: tuple = field(default=(), init=False, repr=False)
     _inputs: tuple = field(default=(), init=False, repr=False)
+    premises: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
         self._range_data = dict(self.ranges)
         self.ranges = MappingProxyType(self._range_data)
+        self.premises.update(self.relations)
         if self.parent is not None:
             self._clock = self.parent._clock
 
     def _invalidate(self):
         self._intervals.clear()
+        self._refinements.clear()
         self.affines.clear()
         self._revision += 1
 
@@ -306,7 +313,12 @@ class _Scope:
     def bind_range(self, value, bounds):
         if self.ranges.get(value) != bounds:
             self._range_data[value] = bounds
-            if value in self._intervals:
+            if (
+                value in self._intervals
+                and self._intervals[value] != bounds
+                or value not in self._intervals
+                and value in self._refinements
+            ):
                 self._changed()
 
     def child(self):
@@ -343,10 +355,9 @@ class _Scope:
             # A dominating expression can become tighter under a child guard
             # without being recomputed there (for example t-s under t>=s).
             if (
-                self.parent is not None
-                and self.relations
-                and isinstance(value.owner, Operation)
+                isinstance(value.owner, Operation)
                 and _scalar_arithmetic(value.owner)
+                and (self.parent is None or self._refines(value))
             ):
                 refined = _bounded_interval(value.owner, self)
                 if refined is not None:
@@ -356,6 +367,20 @@ class _Scope:
             result = max(result[0], low), min(result[1], high)
         self._intervals[value] = result
         return result
+
+    def _refines(self, value):
+        """Only changed scalar inputs require rebuilding an inherited range."""
+        if value not in self._refinements:
+            if value in self.ranges:
+                self._refinements[value] = self.ranges[value] != self.parent.interval(value)
+            else:
+                owner = value.owner
+                self._refinements[value] = (
+                    isinstance(owner, Operation)
+                    and _scalar_arithmetic(owner)
+                    and any(self._refines(operand) for operand in owner.operands)
+                )
+        return self._refinements[value]
 
     def affine_definition(self, key):
         return self.canonical.get(key) or (
@@ -371,6 +396,7 @@ class _Scope:
         return self.parent.multiple(value) if self.parent else 1
 
     def relation(self, lhs, predicate, rhs, truth=True):
+        self.premises[lhs, predicate, rhs] = truth
         if not self.relations:
             self._changed()
         if predicate >= 6:
@@ -924,7 +950,19 @@ def simplify_scalars(module: ModuleOp, *, control=None, facts=None, finalize=Tru
     runtime_limits = facts.limits
     for block in module.body.blocks:
         _simplify_block(block, _Scope(facts=facts), runtime_limits)
-    cleanup_scalar_syntax(module, canonicalize=finalize, facts=facts)
+    if finalize:
+        cleanup_scalar_syntax(module, facts=facts)
+    else:
+        # The condition pass follows immediately and owns final syntax CSE.
+        # Scoped simplification has already folded/shared the current tree;
+        # only dead definitions must be removed before packet collection.
+        _erase_dead_scalars(module)
+
+
+def _erase_dead_scalars(module):
+    for op in reversed(tuple(module.walk())):
+        if _scalar_arithmetic(op) and not op.results[0].uses:
+            op.parent.erase_op(op)
 
 
 def cleanup_scalar_syntax(module, *, canonicalize=True, facts=None, changed=()):
@@ -938,11 +976,7 @@ def cleanup_scalar_syntax(module, *, canonicalize=True, facts=None, changed=()):
             for op in module.walk()
             if _scalar_arithmetic(op) and (op not in previous or _key(op) != previous[op])
         )
-    for op in reversed(tuple(module.walk())):
-        if _scalar_arithmetic(op) and not op.results[0].uses:
-            op.parent.erase_op(op)
+    _erase_dead_scalars(module)
     for block in module.body.blocks:
         _cse_block(block, _Scope(facts=facts), changed)
-    for op in reversed(tuple(module.walk())):
-        if _scalar_arithmetic(op) and not op.results[0].uses:
-            op.parent.erase_op(op)
+    _erase_dead_scalars(module)

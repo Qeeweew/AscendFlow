@@ -16,7 +16,7 @@ from types import MappingProxyType
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import TaskOp
 from ..indexing import arguments
-from ..scalar import Expr, Fact, expression, literal
+from ..scalar import Expr, Fact, expression, literal, substitution
 from ..symbols import Symbol, SymbolKind
 from ..target.ascend910b import Actor, Engine
 from .access_frontier import QueueEndpoint
@@ -146,6 +146,8 @@ class EventDomains:
             object.__setattr__(self, name, MappingProxyType(getattr(self, name)))
 
     def _validate(self):
+        admitted_endpoints = set()
+        evaluated_at = {}
         self.selection.require_closed()
         require(self.dispatch.memory is self.memory, "event resources belong to another dispatch")
         require(
@@ -217,6 +219,8 @@ class EventDomains:
                     "mode-2 notification needs the actual complete 1 AIC : 2 AIV quorum",
                 )
             for bound in notification.sources + notification.consumers:
+                if bound in admitted_endpoints:
+                    continue
                 tests = self._ambient(bound)
                 before = (
                     bound.operation
@@ -227,10 +231,14 @@ class EventDomains:
                     self.control.loops[loop].ordinal: value for loop, value in bound.coordinates
                 }
                 bindings[self.control.sid] = literal(1 if bound.actor is Actor.AIV1 else 0)
-                evaluated = frozenset(
-                    substitute(self.control.environment.expression(value), bindings)
-                    for value in self.control.dominating_scalars(bound.operation.parent, before)
-                )
+                site = bound.operation, bound.placement, bound.actor, bound.coordinates
+                if site not in evaluated_at:
+                    translate = substitution(bindings)
+                    evaluated_at[site] = frozenset(
+                        translate(self.control.environment.expression(value))
+                        for value in self.control.dominating_scalars(bound.operation.parent, before)
+                    )
+                evaluated = evaluated_at[site]
                 missing = self.arithmetic.ordered_definedness(tests, evaluated)
                 if missing is not None:
                     self.fail(
@@ -238,6 +246,7 @@ class EventDomains:
                         "new notification arithmetic lacks an ordered activation prefix proof",
                         phase="structured-event-pairing",
                     )
+                admitted_endpoints.add(bound)
             self.tests[notification] = tuple(
                 dict.fromkeys(
                     test
@@ -381,6 +390,7 @@ class EventDomains:
             self.control.loops[loop].ordinal: value for loop, value in placement.coordinates
         }
         bindings[self.control.sid] = literal(1 if placement.actor is Actor.AIV1 else 0)
+        translate = substitution(bindings)
         tests = []
         for frame in placement.occurrence.frame.ancestors():
             operation = frame.operation
@@ -390,7 +400,7 @@ class EventDomains:
                 continue
             for value, lower, upper in frame.ranges:
                 tests.extend(
-                    Comparison(substitute(value, bindings), predicate, substitute(bound, bindings))
+                    Comparison(translate(value), predicate, translate(bound))
                     for predicate, bound in ((">=", lower), ("<=", upper))
                 )
         result = tuple(dict.fromkeys(tests))
@@ -406,6 +416,7 @@ class EventDomains:
             self.control.loops[loop].ordinal: value for loop, value in placement.coordinates
         }
         bindings[self.control.sid] = literal(1 if placement.actor is Actor.AIV1 else 0)
+        translate = substitution(bindings)
         coordinate_guards = dict(placement.coordinate_guards)
         for loop, guard in extra_coordinate_guards:
             prior = coordinate_guards.get(loop, ActionGuard())
@@ -418,28 +429,22 @@ class EventDomains:
                 # prefix to erase its earlier activation obligation.
                 tests.setdefault(test, tuple(contracts))
 
-        def bind(test, substitutions):
-            return Comparison(
-                substitute(test.lhs, substitutions),
-                test.predicate,
-                substitute(test.rhs, substitutions),
-            )
+        def bind(test, translate):
+            return Comparison(translate(test.lhs), test.predicate, translate(test.rhs))
 
         # Retain lexical activation order, including empty enclosing loops.
         # A selected ordinal is evaluated only after its own nonempty fiber
         # prerequisite, and cannot borrow a later action-guard conjunct.
         # Coordinate prerequisites are already canonical; applying the actual
         # coordinate map again would translate a previous invocation twice.
-        canonical = {self.control.sid: bindings[self.control.sid]}
+        canonical = substitution({self.control.sid: bindings[self.control.sid]})
         for frame in placement.occurrence.frame.ancestors():
             if isinstance(frame.operation, TaskOp) and frame.operation.native.data == "index_load":
                 contracts.append(
                     (
                         frame.operation,
                         tuple(
-                            Comparison(
-                                substitute(value, bindings), predicate, substitute(bound, bindings)
-                            )
+                            Comparison(translate(value), predicate, translate(bound))
                             for value, lower, upper in frame.ranges
                             for predicate, bound in ((">=", lower), ("<=", upper))
                         ),
@@ -469,7 +474,7 @@ class EventDomains:
                 ):
                     continue
                 append(
-                    bind(test, bindings)
+                    bind(test, translate)
                     for test in (
                         Comparison(frame.loop.ordinal, ">=", literal(0)),
                         Comparison(frame.loop.count, ">", frame.loop.ordinal),
@@ -482,8 +487,8 @@ class EventDomains:
                     kind=ErrorKind.UNSUPPORTED,
                     phase="structured-event-pairing",
                 )
-                append(bind(test, bindings) for test in frame.comparisons)
-        append(bind(test, bindings) for test in placement.guard.comparisons)
+                append(bind(test, translate) for test in frame.comparisons)
+        append(bind(test, translate) for test in placement.guard.comparisons)
         result = tuple(tests.items())
         self._guard_inputs[key] = result
         return result
@@ -533,13 +538,14 @@ class EventDomains:
             return self._shift_instance(known, bindings) if bindings else known
         # Parameter specialization is separate from a coordinate translation:
         # a replacement coordinate must not itself be shifted a second time.
+        translate = substitution(bindings)
         tests = list(case.condition.comparisons)
         inactive = False
         for test in self._activation(placement, extra_coordinate_guards=extra_coordinate_guards):
             specialized = Comparison(
-                substitute(case.specialize(test.lhs), bindings),
+                translate(case.specialize(test.lhs)),
                 test.predicate,
-                substitute(case.specialize(test.rhs), bindings),
+                translate(case.specialize(test.rhs)),
             )
             tests.append(specialized)
             if (
@@ -555,25 +561,23 @@ class EventDomains:
             coordinates=()
             if inactive
             else tuple(
-                (loop, substitute(case.specialize(value), bindings))
-                for loop, value in placement.coordinates
+                (loop, translate(case.specialize(value))) for loop, value in placement.coordinates
             ),
             guard=ActionGuard(tuple(dict.fromkeys(tests))),
             substitutions=(),
         )
 
     def _shift_instance(self, placement, bindings):
+        translate = substitution(bindings)
         return replace(
             placement,
-            coordinates=tuple(
-                (loop, substitute(value, bindings)) for loop, value in placement.coordinates
-            ),
+            coordinates=tuple((loop, translate(value)) for loop, value in placement.coordinates),
             guard=ActionGuard(
                 tuple(
                     Comparison(
-                        substitute(test.lhs, bindings),
+                        translate(test.lhs),
                         test.predicate,
-                        substitute(test.rhs, bindings),
+                        translate(test.rhs),
                     )
                     for test in placement.guard.comparisons
                 )

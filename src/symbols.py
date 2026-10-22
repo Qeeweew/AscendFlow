@@ -58,6 +58,7 @@ class Symbol:
     captures: tuple = ()
     _identity: tuple = field(init=False, repr=False)
     _order: tuple = field(init=False, compare=False, repr=False)
+    _hash: int = field(init=False, compare=False, repr=False)
 
     def __post_init__(self):
         require(type(self.name) is str and bool(self.name), "scalar symbol needs a diagnostic name")
@@ -68,9 +69,30 @@ class Symbol:
         object.__setattr__(self, "_identity", identity)
         order = (0, self.name) if self.origin is None else (1, _binding_order(self.origin))
         object.__setattr__(self, "_order", order)
+        object.__setattr__(self, "_hash", hash((self.kind, self.captures, identity)))
+
+    def __hash__(self):
+        return self._hash
 
     def __str__(self):
         return self.name
+
+    def with_captures(self, captures):
+        """Substitute coordinates while retaining the original SSA binding order.
+
+        The binding and its lexical position do not change when a notification
+        selects another iteration. Rewalking the IR here is both redundant and
+        would observe a different order after terminal mutation.
+        """
+        require(isinstance(captures, tuple), "scalar capture coordinates must be immutable")
+        if captures == self.captures:
+            return self
+        result = object.__new__(Symbol)
+        for name in ("name", "kind", "origin", "_identity", "_order"):
+            object.__setattr__(result, name, getattr(self, name))
+        object.__setattr__(result, "captures", captures)
+        object.__setattr__(result, "_hash", hash((self.kind, captures, self._identity)))
+        return result
 
 
 def symbol_name(symbol: str | Symbol) -> str:

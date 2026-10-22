@@ -5,6 +5,7 @@ and emitted actions. Structural operation numbers come from the original
 control facts, not object addresses or the notification-mutated IR walk.
 """
 
+from functools import cache
 from itertools import pairwise
 
 from .event_contracts import LOCAL_CAPACITY, SUPPORTED_CROSS_IDS
@@ -21,8 +22,12 @@ def event_resource_report(plan):
     leases = {item.notification: item for item in plan.leases}
     channels = {member: number for number, c in enumerate(plan.channels) for member in c.members}
 
+    @cache
+    def text(value):
+        return value.text()
+
     def guard(value):
-        return [(c.lhs.text(), c.predicate, c.rhs.text()) for c in value.comparisons]
+        return [(text(c.lhs), c.predicate, text(c.rhs)) for c in value.comparisons]
 
     def bank(value):
         return [item.value for item in value]
@@ -33,7 +38,7 @@ def event_resource_report(plan):
             "actor": value.actor.value,
             "placement": value.placement.value,
             "guard": guard(value.guard),
-            "coordinates": [(operations[loop], e.text()) for loop, e in value.coordinates],
+            "coordinates": [(operations[loop], text(e)) for loop, e in value.coordinates],
         }
 
     def counter_group(event, certificate, members):
@@ -93,7 +98,7 @@ def event_resource_report(plan):
                 {
                     "phase": phase,
                     "actor": actor.value,
-                    "shifts": [(operations[loop], shift.text()) for loop, shift in shifts],
+                    "shifts": [(operations[loop], text(shift)) for loop, shift in shifts],
                 }
                 for phase, actor, shifts in certificate.clock_shifts
             ],
@@ -160,7 +165,7 @@ def event_resource_report(plan):
                     {
                         "condition": guard(c.case.condition),
                         "width": c.width,
-                        "phase": c.ordinal.text(),
+                        "phase": text(c.ordinal),
                         "backlog": c.backlog,
                         "policy": c.policy,
                         "rings": [(operations[w.loop], width) for w, width in c.rings],
@@ -213,7 +218,7 @@ def event_resource_report(plan):
                         {
                             "condition": guard(c.case.condition),
                             "width": c.width,
-                            "phase": c.ordinal.text(),
+                            "phase": text(c.ordinal),
                             "backlog": c.backlog,
                             "rings": [(operations[w.loop], width) for w, width in c.rings],
                             "policy": c.policy,
@@ -254,7 +259,7 @@ def event_resource_report(plan):
                 "actors": [p.value for p in a.participants],
                 "kind": a.kind.value,
                 "route": [a.source.value, a.destination.value],
-                "event": None if a.event is None else a.event.text(),
+                "event": None if a.event is None else text(a.event),
                 "guard": guard(a.guard),
                 "origins": list(a.protocols),
             }

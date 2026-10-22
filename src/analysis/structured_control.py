@@ -31,6 +31,7 @@ from ..indexing import (
     merge_scalar_bounds,
     nonnegative,
 )
+from ..memo import memoized_method
 from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
 from ..symbols import Symbol, SymbolKind, is_coordinate
 from ..target.ascend910b import Actor
@@ -180,6 +181,7 @@ class ControlFacts:
     sid: Expr
     operations_visited: int
 
+    @memoized_method
     def dominating_scalars(self, block, before):
         """Actual scalar definitions available at this lexical insertion point.
 
@@ -202,6 +204,7 @@ class ControlFacts:
         visit(block, before)
         return tuple(v for v in values if isinstance(v.type, IndexType) or v.type == i1)
 
+    @memoized_method
     def invariant_over(self, value: Expr, operation: Operation) -> bool:
         """Whether an expression is fixed throughout this actual invocation.
 
@@ -209,6 +212,17 @@ class ControlFacts:
         Unknown scalar carry/results have no invariance contract merely
         because their expression lacks this loop's ordinal symbol.
         """
+        names, metadata = self._invariant_input(operation)
+        return all(
+            name in names
+            or isinstance(name, Symbol)
+            and name.kind is SymbolKind.METADATA
+            and name._identity in metadata
+            for name in value.variables
+        )
+
+    @memoized_method
+    def _invariant_input(self, operation):
         names = set(self.environment.facts)
         frame = self.frames.get(operation)
         if frame is not None and frame.parent is not None:
@@ -237,13 +251,7 @@ class ControlFacts:
         # dependency recursively: all must still be fixed in this invocation.
         # A load defined inside the queried loop has no visible origin here,
         # even if someone substitutes a constant for its captured ordinal.
-        return all(
-            name in names
-            or isinstance(name, Symbol)
-            and name.kind is SymbolKind.METADATA
-            and name._identity in metadata
-            for name in arguments(value)
-        )
+        return frozenset(names), frozenset(metadata)
 
 
 def build_control_facts(module: ModuleOp) -> ControlFacts:

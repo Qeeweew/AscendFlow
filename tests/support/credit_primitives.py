@@ -8,13 +8,13 @@ rule. Neither protocol names nor the old resource plan qualify the mutation.
 from dataclasses import replace
 
 from ascendflow import language as N
-from ascendflow.analysis.smt import query_scope
 from ascendflow.analysis.structured_admission import admit_structured_memory
 from ascendflow.analysis.structured_bounds import admit_memory_bounds
 from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement, SyncAction
+from ascendflow.memo import memo_scope
 from ascendflow.passes.generate_notifications import generate_notifications
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.passes.structured_sync import _materialize_owned
@@ -64,7 +64,7 @@ def cross_free(X:N.Tensor((16,16),N.f16),
 """
 
 
-@query_scope()
+@memo_scope()
 def seeded_credit_probe(*, cross=False, remove=None, missing_lane=False, late_reclaim=False):
     """Return actual seeded instructions and an independent native snapshot."""
     structure = lower_native_structure(

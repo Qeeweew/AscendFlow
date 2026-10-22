@@ -137,3 +137,19 @@ def test_shared_nested_divisions_preserve_the_first_missing_operand_and_exact_pr
         (positive_inner,),
     )
     assert queries.ordered_definedness((positive_inner, positive_outer, use)) is None
+
+
+def test_total_or_dominating_guard_values_need_no_guard_truth_search(monkeypatch):
+    queries = IntegerFacts({})
+    total = expression("add", X, literal(-1))
+    partial = Expr("rem", (X, D))
+
+    def no_search(*args):
+        raise AssertionError("no new unsigned evaluation needs a proof")
+
+    monkeypatch.setattr(queries, "prove", no_search)
+    assert queries.ordered_definedness((Comparison(total, ">", literal(0)),)) is None
+    assert (
+        queries.ordered_definedness((Comparison(partial, ">", literal(0)),), frozenset((partial,)))
+        is None
+    )

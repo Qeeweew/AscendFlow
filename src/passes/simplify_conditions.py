@@ -115,9 +115,10 @@ class _Domains:
     residue products. This view never authorizes a new runtime evaluation.
     """
 
-    def __init__(self, scope, ranks):
+    def __init__(self, scope, ranks, aliases=None):
         self.scope = scope
         self.ranks = ranks
+        self.aliases = {} if aliases is None else aliases
         self.affines, self.quantities, self.tests = {}, {}, {}
         self.bounds_cache = {}
         self.intervals = {}
@@ -130,18 +131,20 @@ class _Domains:
         self.fixed_constraints = None
         current = scope
         while current is not None:
-            for (a, predicate, b), truth in current.relations.items():
+            for (a, predicate, b), truth in current.premises.items():
                 if predicate < 6:
                     q, allowed = self.comparison(a, predicate, b, truth)
                     self.base[q] = self.base.get(q, _FULL).intersect(allowed)
             current = current.parent
 
     def interval(self, value):
+        value = self.value(value)
         if value not in self.intervals:
             self.intervals[value] = self.scope.interval(value)
         return self.intervals[value]
 
     def modulo(self, value):
+        value = self.value(value)
         if value not in self.modulos:
             self.modulos[value] = _modulo(value)
         return self.modulos[value]
@@ -152,7 +155,15 @@ class _Domains:
         return self.ranks[value]
 
     def affine(self, value):
-        return _affine(value, self.scope)
+        terms, bias = _affine(self.value(value), self.scope)
+        canonical = {}
+        for atom, coefficient in terms.items():
+            atom = self.value(atom)
+            canonical[atom] = canonical.get(atom, 0) + coefficient
+        return {v: c for v, c in canonical.items() if c}, bias
+
+    def value(self, value):
+        return self.aliases.get(value, value)
 
     def comparison(self, lhs, predicate, rhs, truth=True):
         left, a = self.affine(lhs)
@@ -190,6 +201,7 @@ class _Domains:
         return q, _Ranges(intervals)
 
     def literal(self, value, truth):
+        value = self.value(value)
         constant = _constant(value)
         if constant is not None:
             return {} if bool(constant) == truth else None
@@ -288,19 +300,10 @@ class _Domains:
         key = q, frozenset(cube.items())
         if key not in self.bounds_cache:
             result = self._bounds(q, cube)
-            # Only event-selector output needs individual finite ID values.
-            # This projects at most 16 values, not pairs of residues or loops.
-            if sum(high - low + 1 for low, high in result.intervals) <= 16:
-                value = self._quantity(q)
-                premises = self._premises(cube)
-                result = _EMPTY
-                for low, high in self._bounds(q, cube).intervals:
-                    for point in range(low, high + 1):
-                        possible = self.queries.satisfies(
-                            (Comparison(value, "==", literal(point)),), premises
-                        )
-                        if not possible.impossible:
-                            result = result.union(_Ranges(((point, point),)))
+            self._quantity(q)  # Register bounds/modulo links even for a singleton.
+            # Conservative ranges suffice to establish a complete affine ID
+            # mapping. If they overlap incompatibly, keep the exact guarded
+            # selector instead of solving for every guessed residue value.
             self.bounds_cache[key] = result
         return self.bounds_cache[key]
 
@@ -311,11 +314,11 @@ class _Domains:
         if key in self.normalized:
             result = self.normalized[key]
             return None if result is None else dict(result)
-        formula = self._formula(cube)
-        if self.queries.satisfies((formula,), self._premises({})).impossible:
-            self.normalized[key] = None
-            return None
         result = dict(cube)
+        # Interval inclusion and empty intersections are already exact for a
+        # quantity. Reduce them before encoding correlated SMT questions. A
+        # singleton event range likewise needs no feasibility projection: it
+        # conservatively contains every possible value, even on a dead path.
         for q, allowed in tuple(result.items()):
             other = result.copy()
             del other[q]
@@ -324,13 +327,14 @@ class _Domains:
             if not narrowed.intervals:
                 self.normalized[key] = None
                 return None
-            if (
-                allowed.contains(valid)
-                or self.queries.implies(self._predicate(q, allowed), self._premises(other)).proved
-            ):
+            if allowed.contains(valid):
                 del result[q]
             else:
                 result[q] = narrowed
+        # This is local interval normalization. Correlated predicate removal
+        # belongs to the actual union proposal below, once per merged group;
+        # do not search independently for every input/relative guard literal.
+        # Keeping a redundant conjunct preserves the complete original domain.
         self.normalized[key] = tuple(result.items())
         return result
 
@@ -368,6 +372,11 @@ class _Domains:
             cube = self.normalize(cube)
             if cube is not None and not any(self._contains(prior, cube) for prior in result):
                 result = [prior for prior in result if not self._contains(cube, prior)] + [cube]
+        if len(result) <= 1:
+            # There is no union proposal. Preserve the locally normalized
+            # guard instead of speculating about every removable predicate.
+            self.unions[key] = tuple(tuple(cube.items()) for cube in result)
+            return result
         # Aligned rectangles merge by syntax. Do not ask the solver about
         # every pair and every guessed dimension: the complete union below
         # decides correlated coverage once for each actual simplification.
@@ -485,7 +494,7 @@ class _Build:
         return result
 
     def test(self, q, allowed):
-        domain = self.domains.bounds(q, {})
+        domain = self.domains._bounds(q, {})
         if allowed.contains(domain):
             return self.constant(1, i1)
         if (known := self.domains.tests.get((q, allowed))) is not None:
@@ -575,7 +584,7 @@ class _Build:
         return condition, (left, right)
 
     def event(self, cases):
-        events = [op.event for _, op in cases]
+        events = [self.domains.value(op.event) for _, op in cases]
         if (
             all(v is events[0] for v in events)
             or all(_constant(v) == _constant(events[0]) for v in events if v is not None)
@@ -636,7 +645,7 @@ class _Build:
                         )
         by_event = {}
         for cube, instruction in cases:
-            event = instruction.event
+            event = self.domains.value(instruction.event)
             key = event if _constant(event) is None else (event.type, _constant(event))
             by_event.setdefault(key, (event, []))[1].append(cube)
         alternatives = [(event, self.domains.union(cubes)) for event, cubes in by_event.values()]
@@ -702,7 +711,21 @@ def _packet(operations, scope, work, ranks, changed):
 
     for op in operations:
         collect(op, ())
-    domains = _Domains(local, ranks)
+    # Every moved scalar is already total at the common packet entry. Share
+    # exact SSA expressions there before reconstructing guards/selectors, so
+    # equal event expressions do not require a finite-value projection to
+    # rediscover their identity. Commit aliases only with the entire packet.
+    aliases, available, duplicates = {}, {}, set()
+    for op in movable:
+        key = _key(op)
+        kind, operands, *properties = key
+        key = kind, tuple(aliases.get(v, v) for v in operands), *properties
+        if key in available:
+            aliases[op.results[0]] = available[key]
+            duplicates.add(op)
+        else:
+            available[key] = op.results[0]
+    domains = _Domains(local, ranks, aliases)
     normalized = []
     for guard, op in cases:
         cube = {}
@@ -768,11 +791,11 @@ def _packet(operations, scope, work, ranks, changed):
                 prefixes.append(condition)
                 blocks.append(child)
             original = group[0][1]
-            event = original.event
+            event = domains.value(original.event)
             event_builder = None
             static_event = None
             if event is not None and len(group) > 1:
-                nested = _Domains(contexts[-1], ranks)
+                nested = _Domains(contexts[-1], ranks, aliases)
                 nested.tests.update(domains.tests)
                 nested.quantities.update(domains.quantities)
                 for q, allowed in assumptions.items():
@@ -828,11 +851,16 @@ def _packet(operations, scope, work, ranks, changed):
         block = placeholder.parent
         block.insert_op_before(original, placeholder)
         block.erase_op(placeholder)
+    for original, representative in aliases.items():
+        original.replace_all_uses_with(representative)
     for op in movable:
+        if op in duplicates:
+            op.parent.erase_op(op)
+            continue
         op.parent.detach_op(op)
         if scope.facts is not None and op.results[0] in local.facts.ranges:
             scope.facts.bind_range(op.results[0], local.facts.ranges[op.results[0]])
-    prefix = list(movable)
+    prefix = [op for op in movable if op not in duplicates]
     for scalar in tuple(builder.ops):
         if _scalar_arithmetic(scalar):
             _place_invariant(scalar, build.scope, _key(scalar))

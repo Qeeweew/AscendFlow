@@ -23,9 +23,24 @@ def create_context() -> Context:
     return ctx
 
 
+class _StringPrinter(Printer):
+    def print_string_literal(self, string: str):
+        if string.isascii() and string.isprintable() and '"' not in string and "\\" not in string:
+            self.print_string('"' + string + '"')
+        else:
+            super().print_string_literal(string)
+
+    def print_string(self, text: str, *, indent: int | None = None) -> None:
+        if "\n" not in text:
+            self._current_column += len(text)
+            self.stream.write(text)
+        else:
+            super().print_string(text, indent=indent)
+
+
 def dump(module: ModuleOp) -> str:
     output = StringIO()
-    Printer(stream=output).print_op(module)
+    _StringPrinter(stream=output).print_op(module)
     return output.getvalue() + "\n"
 
 

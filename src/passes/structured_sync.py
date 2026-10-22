@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from xdsl.dialects.builtin import ModuleOp
 
-from ..analysis.smt import query_scope, query_statistics
+from ..analysis.smt import query_statistics
 from ..analysis.structured_admission import StructuredAdmission, admit_structured_memory
 from ..analysis.structured_bounds import admit_memory_bounds
 from ..analysis.structured_dependencies import StructuredDependencies, build_structured_dependencies
@@ -23,6 +23,7 @@ from ..analysis.structured_memory import collect_native_memory
 from ..analysis.structured_protocols import SynchronizationSelection
 from ..diagnostics import require
 from ..dialects.io import dump
+from ..memo import memo_scope
 from .executable import ExecutablePlan, NativeExecution
 from .lower_execution import lower_execution
 from .lower_native import NativeStructure, lower_native_structure
@@ -83,10 +84,11 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
     started = perf_counter()
     before_ir = dump(structure.module)
     frozen = perf_counter()
-    logical = materialize_notifications(admission.memory, resources.actions)
+    admitted = ScalarFacts.from_control(admission.memory.control)
+    ranged = perf_counter()
+    logical = materialize_notifications(admission.memory, resources.actions, scalar_facts=admitted)
     require(logical is structure.module, "notification insertion changed its owned physical module")
     materialized = perf_counter()
-    admitted = ScalarFacts.from_control(admission.memory.control)
     values = {}
     module = logical.clone(value_mapper=values)
     operations = dict(zip(logical.walk(), module.walk(), strict=True))
@@ -111,7 +113,8 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
     merged = perf_counter()
     timings += (
         ("before_snapshot", frozen - started),
-        ("materialize", materialized - frozen),
+        ("scalar_ranges", ranged - frozen),
+        ("materialize", materialized - ranged),
         ("execution_projection", projected - materialized),
         ("execution_lowering", lowered - projected),
         ("scalar_simplification", simplified - lowered),
@@ -135,7 +138,7 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
     return result
 
 
-@query_scope()
+@memo_scope()
 def synchronize_structure(source) -> StructuredSynchronization:
     """Run the current analysis stages, then materialize the selected program.
 

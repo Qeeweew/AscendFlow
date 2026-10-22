@@ -158,7 +158,9 @@ class ScalarEnvironment:
         Source dynamic definedness is an input contract, not a decoder query.
         Newly generated evaluations retain their separate lowering obligations.
         """
-        return from_ssa(value, memo=self._memo)
+        if value not in self._memo:
+            self._memo[value] = from_ssa(value, memo=self._memo)
+        return self._memo[value]
 
 
 class StructuredAddresses:

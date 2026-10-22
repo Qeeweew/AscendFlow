@@ -40,8 +40,6 @@ group watchdog enforces the build's hard time limit.
 from __future__ import annotations
 
 from collections import deque
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cached_property
 from operator import eq, ge, gt, le, lt, ne
@@ -74,7 +72,8 @@ from z3.z3core import Z3_mk_and, Z3_mk_or
 
 from ..budget import poll, remaining
 from ..diagnostics import require
-from ..scalar import DIVISION, INT64_MAX, Expr, Fact
+from ..memo import memo_table, memoized, memoized_method
+from ..scalar import DIVISION, INT64_MAX, Expr, Fact, infer
 from ..symbols import Symbol, SymbolKind
 from .structured_schedule import Comparison
 
@@ -86,7 +85,6 @@ NONE = "none"
 WITNESS = "witness"
 _LOCAL_TIMEOUT_MS = 2000
 _PREDICATES = {"==": eq, "!=": ne, "<": lt, "<=": le, ">": gt, ">=": ge}
-_active_services = ContextVar("ascendflow_integer_queries", default=None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +93,14 @@ class Boolean:
 
     kind: str
     operands: tuple
+    _hash: int | None = field(default=None, init=False, compare=False, repr=False)
+
+    def __hash__(self):
+        value = self._hash
+        if value is None:
+            value = hash((self.kind, self.operands))
+            object.__setattr__(self, "_hash", value)
+        return value
 
     def __post_init__(self):
         require(self.kind in {"and", "or"}, "unknown boolean query operation")
@@ -119,39 +125,19 @@ def any_of(*conditions):
     return False if not values else values[0] if len(values) == 1 else Boolean("or", values)
 
 
-@contextmanager
-def query_scope():
-    """Own query reuse within one complete compilation, never between builds."""
-    if _active_services.get() is not None:
-        yield
-        return
-    services = {}
-    token = _active_services.set(services)
-    try:
-        yield
-    finally:
-        _active_services.reset(token)
-        services.clear()
-
-
+@memoized(key=lambda facts: frozenset(facts.items()))
 def query_service(facts):
     """Reuse precisely the same immutable input environment in this build."""
-    services = _active_services.get()
-    if services is None:
-        return IntegerQueryService(facts)
-    key = frozenset(facts.items())
-    if key not in services:
-        services[key] = IntegerQueryService(facts)
-    return services[key]
+    return IntegerQueryService(facts)
 
 
 def query_statistics():
-    services = _active_services.get()
+    services = memo_table(query_service)
     return tuple(
         {
             "input_symbols": len(service._facts),
-            "expressions": len(service._expressions),
-            "contexts": len(service._contexts),
+            "expressions": service._integer.cache_info().currsize,
+            "contexts": service._encode_context.cache_info().currsize,
             **service.statistics.report(),
         }
         for service in (() if services is None else services.values())
@@ -275,6 +261,7 @@ class Statistics:
     maximum: float = 0.0
     solver_checks: int = 0
     model_reuses: int = 0
+    elementary_proofs: int = 0
 
     def record(self, kind, elapsed, *, cached):
         self.calls += 1
@@ -300,6 +287,7 @@ class Statistics:
             "maximum_seconds": round(self.maximum, 6),
             "solver_checks": self.solver_checks,
             "model_reuses": self.model_reuses,
+            "elementary_proofs": self.elementary_proofs,
         }
 
 
@@ -349,17 +337,14 @@ class IntegerQueryService:
         self._symbols = {}
         self._functions = {}
         self._captures = {}
-        self._expressions = {}
-        self._comparisons = {}
-        self._defined = {}
-        self._contexts = {}
         self._answers = {}
-        self._witnesses = deque(maxlen=4)
+        self._witnesses = deque(maxlen=32)
         self.statistics = Statistics()
         self._solver = Solver()
+        self._solver_timeout = None
         self._solver.set(random_seed=0)
         # Input facts are immutable for the lifetime of this service. Establish
-        # them once; query push/pop adds only the actual lexical premises.
+        # them once; each query assumes only its actual lexical premises.
         for name, fact in self._facts.items():
             integer = self._integer(Expr("argument", (name,)))
             self._solver.add(integer >= fact.minimum)
@@ -378,10 +363,8 @@ class IntegerQueryService:
                 self._solver.add(integer % fact.multiple == 0)
 
     # -- encoding ---------------------------------------------------------
+    @memoized_method
     def _integer(self, value: Expr):
-        cached = self._expressions.get(value)
-        if cached is not None:
-            return cached
         if value.kind == "constant":
             result = IntVal(value.constant)
         elif value.kind == "argument":
@@ -421,17 +404,42 @@ class IntegerQueryService:
             elif value.kind == "floordiv":
                 result = a / b
             elif value.kind == "rem":
-                result = a % b
+                numerator, modulus = value.args
+                quotient = numerator.args[0] if numerator.kind == "floordiv" else None
+                product = (
+                    quotient.args[1] if quotient is not None and quotient.kind == "rem" else None
+                )
+                divisor = numerator.args[1] if numerator.kind == "floordiv" else None
+                # 0 <= floor((x mod (d*m))/d) < m for positive d,m.
+                # Removing the outer modulo avoids a redundant nonlinear
+                # division. This is only a mathematical encoding identity:
+                # Def and machine checks still traverse every original node.
+                if (
+                    product is not None
+                    and product.kind == "mul"
+                    and product.args in ((divisor, modulus), (modulus, divisor))
+                    and (dl := self._range(divisor)[0]) is not None
+                    and dl > 0
+                    and (ml := self._range(modulus)[0]) is not None
+                    and ml > 0
+                ):
+                    result = a
+                else:
+                    result = a % b
+            elif value.args[1].constant is not None and value.args[1].constant > 0:
+                # For a positive divisor, ceil(a/b) = floor((a+b-1)/b)
+                # for every mathematical integer a. Avoid a second remainder
+                # and conditional per ceildiv in the solver's value encoding.
+                # The original unsigned DAG and machine-range checks remain
+                # separate; this is never emitted as machine arithmetic.
+                result = (a + (value.args[1].constant - 1)) / b
             else:
                 result = a / b + If(a % b == 0, IntVal(0), IntVal(1))
-        self._expressions[value] = result
         return result
 
+    @memoized_method
     def _def(self, value: Expr):
         """Ordered definedness of one original DAG node, layer by layer."""
-        cached = self._defined.get(value)
-        if cached is not None:
-            return cached
         if value.kind in {"constant", "argument"}:
             result = BoolVal(True)
         else:
@@ -441,21 +449,16 @@ class IntegerQueryService:
                 # Source unsigned division: nonnegative numerator, positive
                 # divisor. Z3's total division is not source legality.
                 result = _and(result, self._integer(a) >= 0, self._integer(b) > 0)
-        self._defined[value] = result
         return result
 
+    @memoized_method
     def _comparison(self, test: Comparison | Boolean | bool):
-        result = self._comparisons.get(test)
-        if result is None:
-            if type(test) is bool:
-                result = BoolVal(test)
-            elif isinstance(test, Boolean):
-                operation = _and if test.kind == "and" else _or
-                result = operation(*(self._comparison(value) for value in test.operands))
-            else:
-                result = _cmp(self._integer(test.lhs), test.predicate, self._integer(test.rhs))
-            self._comparisons[test] = result
-        return result
+        if type(test) is bool:
+            return BoolVal(test)
+        if isinstance(test, Boolean):
+            operation = _and if test.kind == "and" else _or
+            return operation(*(self._comparison(value) for value in test.operands))
+        return _cmp(self._integer(test.lhs), test.predicate, self._integer(test.rhs))
 
     def _context(self, assumptions):
         """Input facts plus one complete ordered premise tuple, as relations.
@@ -470,14 +473,59 @@ class IntegerQueryService:
             and all(isinstance(item, (Comparison, Boolean, bool)) for item in assumptions),
             "integer query premises must be an immutable predicate tuple",
         )
-        cached = self._contexts.get(assumptions)
-        if cached is not None:
-            return cached
-        encoded = (_and(*(self._comparison(test) for test in assumptions)),)
-        self._contexts[assumptions] = encoded
-        return encoded
+        return self._encode_context(assumptions)
+
+    @memoized_method
+    def _encode_context(self, assumptions):
+        return (_and(*(self._comparison(test) for test in assumptions)),)
 
     # -- query core -------------------------------------------------------
+    @memoized_method
+    def _range(self, value):
+        if value.constant is not None:
+            return value.constant, value.constant
+        bound = infer(value, self._facts)
+        return (None, None) if bound is None else (bound.minimum, bound.maximum)
+
+    def _elementary(self, test):
+        """Sufficient mathematical facts, independent of lexical premises.
+
+        Exact constants/identity and disjoint enclosing intervals need no
+        search. This never authorizes evaluation of an original partial DAG.
+        All correlated or unresolved relations still use the complete SMT
+        context, including contradictory premises.
+        """
+        if type(test) is bool:
+            return test
+        if isinstance(test, Boolean):
+            values = (self._elementary(value) for value in test.operands)
+            return all(values) if test.kind == "and" else any(values)
+        if test.lhs == test.rhs:
+            return test.predicate in {"==", "<=", ">="}
+        low, high = self._range(test.lhs)
+        other_low, other_high = self._range(test.rhs)
+        if test.predicate in {">", ">="}:
+            low, high, other_low, other_high = other_low, other_high, low, high
+            predicate = "<" if test.predicate == ">" else "<="
+        else:
+            predicate = test.predicate
+        if predicate in {"<", "<="}:
+            return (
+                high is not None
+                and other_low is not None
+                and (high < other_low if predicate == "<" else high <= other_low)
+            )
+        if predicate == "==":
+            return low is not None and low == high == other_low == other_high
+        return (
+            high is not None
+            and other_low is not None
+            and high < other_low
+            or other_high is not None
+            and low is not None
+            and other_high < low
+        )
+
     def _local_timeout(self):
         """The local cap, further bounded by the remaining build deadline."""
         left = remaining("integer query")
@@ -493,16 +541,40 @@ class IntegerQueryService:
             self.statistics.record(cached.kind, cached.elapsed, cached=True)
             return cached
         poll("integer query", distinct=self.statistics.distinct, calls=self.statistics.calls)
-        solver = self._solver
-        solver.set(timeout=self._local_timeout(), random_seed=0)
         started = perf_counter()
-        question = _and(*self._context(assumptions), goal())
+        if kind == "implies" and self._elementary(key[1]):
+            require(
+                isinstance(assumptions, tuple)
+                and all(isinstance(item, (Comparison, Boolean, bool)) for item in assumptions),
+                "integer query premises must be an immutable predicate tuple",
+            )
+            elapsed = perf_counter() - started
+            answer = Answer(PROVED, kind, elapsed)
+            self.statistics.elementary_proofs += 1
+            self.statistics.record(PROVED, elapsed, cached=False)
+            self._answers[cache_key] = answer
+            return answer
+        solver = self._solver
+        context, objective = self._context(assumptions), goal()
+        question = _and(*context, objective)
         # An already obtained SMT model can witness another question only if
         # that exact model satisfies its COMPLETE context and counterexample
         # formula. This never proves a universal claim, never samples inputs,
         # and never uses model completion to invent a missing value.
-        for model in self._witnesses:
-            if is_true(model.eval(question, model_completion=False)):
+        for model, values in self._witnesses:
+            # A fixed model gives the same value to each original predicate
+            # across lexical contexts. Reuse those evaluations, but require
+            # every actual premise and this objective to hold in that model.
+            valid = True
+            for test in assumptions:
+                if test not in values:
+                    values[test] = is_true(
+                        model.eval(self._comparison(test), model_completion=False)
+                    )
+                if not values[test]:
+                    valid = False
+                    break
+            if valid and is_true(model.eval(objective, model_completion=False)):
                 elapsed = perf_counter() - started
                 outcome = COUNTEREXAMPLE if universal else WITNESS
                 answer = (Answer if universal else Exists)(
@@ -512,17 +584,24 @@ class IntegerQueryService:
                 self.statistics.record(outcome, elapsed, cached=False)
                 self._answers[cache_key] = answer
                 return answer
+        # Keep each query in its own assertion scope. Assertion preprocessing
+        # is important for nonlinear arithmetic; passing the entire formula as
+        # a Boolean assumption can leave even simple bounded queries unresolved.
+        timeout = self._local_timeout()
+        if timeout != self._solver_timeout:
+            solver.set(timeout=timeout)
+            self._solver_timeout = timeout
+        self.statistics.solver_checks += 1
         solver.push()
         try:
             solver.add(question)
-            self.statistics.solver_checks += 1
             outcome = solver.check()
             elapsed = perf_counter() - started
             if outcome == unsat:
                 result = (PROVED if universal else NONE, elapsed, None, "")
             elif outcome == sat:
                 model = solver.model()
-                self._witnesses.appendleft(model)
+                self._witnesses.appendleft((model, dict.fromkeys(assumptions, True)))
                 result = (
                     COUNTEREXAMPLE if universal else WITNESS,
                     elapsed,

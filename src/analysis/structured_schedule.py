@@ -10,7 +10,7 @@ only inside the guard. Participant identities never clone a Vector body.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from xdsl.ir import Operation
@@ -32,6 +32,14 @@ class Comparison:
     lhs: Expr
     predicate: str
     rhs: Expr
+    _hash: int | None = field(default=None, init=False, compare=False, repr=False)
+
+    def __hash__(self):
+        value = self._hash
+        if value is None:
+            value = hash((self.lhs, self.predicate, self.rhs))
+            object.__setattr__(self, "_hash", value)
+        return value
 
     def __post_init__(self):
         require(
