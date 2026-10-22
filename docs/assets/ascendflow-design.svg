@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="686" viewBox="0 0 1200 686" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1280" viewBox="0 0 1200 1280" role="img" aria-labelledby="title desc">
   <title id="title">AscendFlow: explicit kernels, automatic synchronization</title>
-  <desc id="desc">The kernel author specifies computation, memory and stage order in Python DSL. The xDSL compiler derives synchronization from physical accesses, buffer ownership, logical generations and last readers, then emits ASC for CANN and Ascend 910B. An aligned non-causal attention with head dimension 128 illustrates Cube QK/PV, two AIVs for softmax/output, and two-slot Score/P/PV workspace reuse.</desc>
+  <desc id="desc">The author chooses stage offsets and physical buffers. For aligned D128 attention, QK and softmax have offset 0; PV and store have offset 1. Score, P and PV each have two independent GM slots indexed by tile modulo two. The compiler derives producer readiness and last-reader release. Each actor expands tile equals its own local step minus stage, yielding fill, steady issue and drain. Cube and Vector local counters are independent and the table is not a wall-clock trace.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 Z" fill="#64748b"/>
@@ -24,7 +24,7 @@
     </style>
   </defs>
 
-  <rect x="0" y="0" width="1200" height="686" rx="20" fill="#f7fafc"/>
+  <rect x="0" y="0" width="1200" height="1280" rx="20" fill="#f7fafc"/>
   <text x="32" y="48" font-size="30" font-weight="700">AscendFlow</text>
   <text x="32" y="77" font-size="17" class="muted">Explicit computation and scheduling. Synchronization from real memory use.</text>
 
@@ -63,58 +63,148 @@
   <text x="1071" y="241" text-anchor="middle" class="small">AIV: Vector</text>
   <text x="994" y="275" font-size="12" class="muted">Mixed: 1 AIC + 2 AIV</text>
 
-  <rect x="32" y="318" width="1136" height="336" rx="14" fill="#ffffff" stroke="#d6e2ec"/>
-  <text x="52" y="350" font-size="21" font-weight="700">Attention: QK → softmax → PV → output</text>
-  <text x="52" y="376" class="body muted">D=128 · 64 query rows/tile · 128 K/V rows · two-slot Score / P / PV in GM</text>
-  <text x="1128" y="405" text-anchor="end" class="small muted">issue sequence →</text>
-  <text x="52" y="452" class="lane">Cube</text>
-  <text x="52" y="474" class="small muted">1 AIC</text>
-  <text x="52" y="548" class="lane">Vector</text>
-  <text x="52" y="570" class="small muted">2 AIV · 32 rows each</text>
-  <rect x="212" y="426" width="112" height="58" rx="8" fill="#eff6ff" stroke="#b7d1fb"/>
-  <text x="268" y="450" text-anchor="middle" class="tile" style="fill:#1d4ed8">QK 0</text>
-  <text x="268" y="470" text-anchor="middle" class="tile-sub muted">→ Score[0]</text>
-  <rect x="340" y="426" width="112" height="58" rx="8" fill="#eff6ff" stroke="#b7d1fb"/>
-  <text x="396" y="450" text-anchor="middle" class="tile" style="fill:#1d4ed8">QK 1</text>
-  <text x="396" y="470" text-anchor="middle" class="tile-sub muted">→ Score[1]</text>
-  <rect x="468" y="426" width="112" height="58" rx="8" fill="#eff6ff" stroke="#b7d1fb"/>
-  <text x="524" y="450" text-anchor="middle" class="tile" style="fill:#1d4ed8">PV 0</text>
-  <text x="524" y="470" text-anchor="middle" class="tile-sub muted">P[0] × V</text>
-  <rect x="596" y="426" width="112" height="58" rx="8" fill="#eff6ff" stroke="#b7d1fb"/>
-  <text x="652" y="450" text-anchor="middle" class="tile" style="fill:#1d4ed8">QK 2</text>
-  <text x="652" y="470" text-anchor="middle" class="tile-sub muted">→ Score[0]</text>
-  <rect x="724" y="426" width="112" height="58" rx="8" fill="#eff6ff" stroke="#b7d1fb"/>
-  <text x="780" y="450" text-anchor="middle" class="tile" style="fill:#1d4ed8">PV 1</text>
-  <text x="780" y="470" text-anchor="middle" class="tile-sub muted">P[1] × V</text>
-  <rect x="852" y="426" width="112" height="58" rx="8" fill="#eff6ff" stroke="#b7d1fb"/>
-  <text x="908" y="450" text-anchor="middle" class="tile" style="fill:#1d4ed8">PV 2</text>
-  <text x="908" y="470" text-anchor="middle" class="tile-sub muted">P[0] × V</text>
-  <rect x="340" y="524" width="112" height="58" rx="8" fill="#e8f5f0" stroke="#a9d5c7"/>
-  <text x="396" y="548" text-anchor="middle" class="tile" style="fill:#0f766e">softmax 0</text>
-  <text x="396" y="568" text-anchor="middle" class="tile-sub muted">Score[0] → P[0]</text>
-  <rect x="468" y="524" width="112" height="58" rx="8" fill="#e8f5f0" stroke="#a9d5c7"/>
-  <text x="524" y="548" text-anchor="middle" class="tile" style="fill:#0f766e">softmax 1</text>
-  <text x="524" y="568" text-anchor="middle" class="tile-sub muted">Score[1] → P[1]</text>
-  <rect x="596" y="524" width="112" height="58" rx="8" fill="#e8f5f0" stroke="#a9d5c7"/>
-  <text x="652" y="548" text-anchor="middle" class="tile" style="fill:#0f766e">store 0</text>
-  <text x="652" y="568" text-anchor="middle" class="tile-sub muted">PV[0] → O₀</text>
-  <rect x="724" y="524" width="112" height="58" rx="8" fill="#e8f5f0" stroke="#a9d5c7"/>
-  <text x="780" y="548" text-anchor="middle" class="tile" style="fill:#0f766e">softmax 2</text>
-  <text x="780" y="568" text-anchor="middle" class="tile-sub muted">Score[0] → P[0]</text>
-  <rect x="852" y="524" width="112" height="58" rx="8" fill="#e8f5f0" stroke="#a9d5c7"/>
-  <text x="908" y="548" text-anchor="middle" class="tile" style="fill:#0f766e">store 1</text>
-  <text x="908" y="568" text-anchor="middle" class="tile-sub muted">PV[1] → O₁</text>
-  <rect x="980" y="524" width="112" height="58" rx="8" fill="#e8f5f0" stroke="#a9d5c7"/>
-  <text x="1036" y="548" text-anchor="middle" class="tile" style="fill:#0f766e">store 2</text>
-  <text x="1036" y="568" text-anchor="middle" class="tile-sub muted">PV[0] → O₂</text>
-  <path d="M 324 455 C 337 455 325 553 338 553" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#ready-arrow)"/>
-  <path d="M 580 455 C 593 455 581 553 594 553" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#ready-arrow)"/>
-  <path d="M 396 522 V 503 H 652 V 486" fill="none" stroke="#b45309" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#release-arrow)"/>
-  <circle cx="396" cy="522" r="3" fill="#b45309"/>
-  <text x="440" y="498" class="small" style="fill:#b45309">Score[0] release</text>
-  <circle cx="59" cy="623" r="4" fill="#2563eb"/>
-  <text x="72" y="628" class="small"><tspan font-weight="700">ready</tspan><tspan class="muted">: producer finished → reader may start</tspan></text>
-  <circle cx="539" cy="623" r="4" fill="#b45309"/>
-  <text x="552" y="628" class="small"><tspan font-weight="700">release</tspan><tspan class="muted">: both AIV GM reads finished → Score slot may be reused</tspan></text>
-  <text x="1168" y="675" text-anchor="end" font-size="11" class="muted">Conceptual schedule · columns are not clock cycles · not a profiling trace</text>
+  <rect x="32" y="318" width="1136" height="244" rx="10" fill="#ffffff" stroke="#d6e2ec" />
+  <text x="52" y="350" font-size="21" font-weight="700" style="fill:#152840" text-anchor="start">1  Choose stage offsets and physical buffers</text>
+  <text x="52" y="382" font-size="15" font-weight="700" style="fill:#152840" text-anchor="start">Stage = offset in an actor’s own issue loop</text>
+  <text x="190" y="410" font-size="13" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">stage 0</text>
+  <text x="377" y="410" font-size="13" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">stage 1</text>
+  <text x="52" y="452" font-size="14" font-weight="700" style="fill:#152840" text-anchor="start">Cube</text>
+  <rect x="120" y="426" width="140" height="40" rx="7" fill="#eff6ff" stroke="#b7d1fb" />
+  <text x="190" y="451" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">QK(tile)</text>
+  <rect x="307" y="426" width="140" height="40" rx="7" fill="#eff6ff" stroke="#b7d1fb" />
+  <text x="377" y="451" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">PV(tile)</text>
+  <text x="52" y="504" font-size="14" font-weight="700" style="fill:#152840" text-anchor="start">Vector</text>
+  <rect x="120" y="478" width="140" height="40" rx="7" fill="#eff6ff" stroke="#b7d1fb" />
+  <text x="190" y="503" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">softmax(tile)</text>
+  <rect x="307" y="478" width="140" height="40" rx="7" fill="#eff6ff" stroke="#b7d1fb" />
+  <text x="377" y="503" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">store(tile)</text>
+  <text x="52" y="544" font-size="13" font-weight="400" style="fill:#52647a" text-anchor="start">Per actor: visit stage 0, then stage 1.</text>
+  <path d="M 565 374 V 542" stroke="#e7edf3" fill="none"/>
+  <text x="594" y="382" font-size="15" font-weight="700" style="fill:#152840" text-anchor="start">Buffer = physical ring; slot = tile % 2</text>
+  <text x="854" y="409" font-size="13" font-weight="700" style="fill:#0f766e" text-anchor="middle">slot 0</text>
+  <text x="1038" y="409" font-size="13" font-weight="700" style="fill:#0f766e" text-anchor="middle">slot 1</text>
+  <text x="594" y="443" font-size="14" font-weight="700" style="fill:#152840" text-anchor="start">Score · f32</text>
+  <rect x="778" y="422" width="152" height="28" rx="6" fill="#e8f5f0" stroke="#a9d5c7" />
+  <rect x="962" y="422" width="152" height="28" rx="6" fill="#e8f5f0" stroke="#a9d5c7" />
+  <text x="854" y="441" font-size="13" font-weight="400" style="fill:#0f766e" text-anchor="middle">tile 0, 2, …</text>
+  <text x="1038" y="441" font-size="13" font-weight="400" style="fill:#0f766e" text-anchor="middle">tile 1, 3, …</text>
+  <text x="594" y="480" font-size="14" font-weight="700" style="fill:#152840" text-anchor="start">P · f16</text>
+  <rect x="778" y="459" width="152" height="28" rx="6" fill="#e8f5f0" stroke="#a9d5c7" />
+  <rect x="962" y="459" width="152" height="28" rx="6" fill="#e8f5f0" stroke="#a9d5c7" />
+  <text x="854" y="478" font-size="13" font-weight="400" style="fill:#0f766e" text-anchor="middle">tile 0, 2, …</text>
+  <text x="1038" y="478" font-size="13" font-weight="400" style="fill:#0f766e" text-anchor="middle">tile 1, 3, …</text>
+  <text x="594" y="517" font-size="14" font-weight="700" style="fill:#152840" text-anchor="start">PV · f32</text>
+  <rect x="778" y="496" width="152" height="28" rx="6" fill="#e8f5f0" stroke="#a9d5c7" />
+  <rect x="962" y="496" width="152" height="28" rx="6" fill="#e8f5f0" stroke="#a9d5c7" />
+  <text x="854" y="515" font-size="13" font-weight="400" style="fill:#0f766e" text-anchor="middle">tile 0, 2, …</text>
+  <text x="1038" y="515" font-size="13" font-weight="400" style="fill:#0f766e" text-anchor="middle">tile 1, 3, …</text>
+  <text x="594" y="544" font-size="13" font-weight="400" style="fill:#52647a" text-anchor="start">Three independent rings · K/V resident in L0</text>
+  <rect x="32" y="578" width="1136" height="190" rx="10" fill="#ffffff" stroke="#d6e2ec" />
+  <text x="52" y="610" font-size="21" font-weight="700" style="fill:#152840" text-anchor="start">2  Derive ready and release from the real accesses</text>
+  <rect x="52" y="632" width="168" height="54" rx="8" fill="#f7fafc" stroke="#cdddeb" />
+  <text x="136" y="654" font-size="16" font-weight="700" style="fill:#152840" text-anchor="middle">QK(t)</text>
+  <text x="136" y="675" font-size="12" font-weight="400" style="fill:#52647a" text-anchor="middle">Cube</text>
+  <rect x="344" y="632" width="168" height="54" rx="8" fill="#f7fafc" stroke="#cdddeb" />
+  <text x="428" y="654" font-size="16" font-weight="700" style="fill:#152840" text-anchor="middle">softmax(t)</text>
+  <text x="428" y="675" font-size="12" font-weight="400" style="fill:#52647a" text-anchor="middle">Vector × 2</text>
+  <rect x="636" y="632" width="168" height="54" rx="8" fill="#f7fafc" stroke="#cdddeb" />
+  <text x="720" y="654" font-size="16" font-weight="700" style="fill:#152840" text-anchor="middle">PV(t)</text>
+  <text x="720" y="675" font-size="12" font-weight="400" style="fill:#52647a" text-anchor="middle">Cube</text>
+  <rect x="928" y="632" width="168" height="54" rx="8" fill="#f7fafc" stroke="#cdddeb" />
+  <text x="1012" y="654" font-size="16" font-weight="700" style="fill:#152840" text-anchor="middle">store(t)</text>
+  <text x="1012" y="675" font-size="12" font-weight="400" style="fill:#52647a" text-anchor="middle">Vector × 2</text>
+  <text x="282" y="646" font-size="13" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">Score[s]</text>
+  <path d="M 230 661 H 332" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#ready-arrow)"/>
+  <text x="574" y="646" font-size="13" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">P[s]</text>
+  <path d="M 522 661 H 624" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#ready-arrow)"/>
+  <text x="866" y="646" font-size="13" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">PV[s]</text>
+  <path d="M 814 661 H 916" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#ready-arrow)"/>
+  <text x="1140" y="625" font-size="12" font-weight="400" style="fill:#52647a" text-anchor="end">s = t % 2</text>
+  <text x="52" y="716" font-size="13" font-weight="600" style="fill:#b45309" text-anchor="start">Score[s]: retire both AIV GM reads</text>
+  <text x="430" y="716" font-size="13" font-weight="600" style="fill:#b45309" text-anchor="start">P[s]: retire AIC GM read</text>
+  <text x="810" y="716" font-size="13" font-weight="600" style="fill:#b45309" text-anchor="start">PV[s]: retire both AIV GM reads</text>
+  <text x="52" y="744" font-size="13" font-weight="400" style="fill:#1d4ed8" text-anchor="start">ready: finish writing t → allow its readers</text>
+  <text x="580" y="744" font-size="13" font-weight="400" style="fill:#b45309" text-anchor="start">release: last reader of t retires → allow writer of t+2</text>
+  <rect x="32" y="784" width="1136" height="464" rx="10" fill="#ffffff" stroke="#d6e2ec" />
+  <text x="52" y="816" font-size="21" font-weight="700" style="fill:#152840" text-anchor="start">3  Expand tile = local_step − stage; activate only 0 ≤ tile &lt; 4</text>
+  <text x="52" y="843" font-size="14" font-weight="400" style="fill:#52647a" text-anchor="start">Cube uses j_C; Vector uses j_V. Each counter advances independently, subject to ready / release.</text>
+  <rect x="322" y="862" width="156" height="27" rx="6" fill="#edf2f7" stroke="#edf2f7" />
+  <rect x="486" y="862" width="484" height="27" rx="6" fill="#e8f5f0" stroke="#e8f5f0" />
+  <rect x="978" y="862" width="156" height="27" rx="6" fill="#edf2f7" stroke="#edf2f7" />
+  <text x="400" y="881" font-size="13" font-weight="700" style="fill:#52647a" text-anchor="middle">fill</text>
+  <text x="728" y="881" font-size="13" font-weight="700" style="fill:#0f766e" text-anchor="middle">steady issue pattern</text>
+  <text x="1056" y="881" font-size="13" font-weight="700" style="fill:#52647a" text-anchor="middle">drain</text>
+  <text x="400" y="913" font-size="13" font-weight="600" style="fill:#52647a" text-anchor="middle">local step 0</text>
+  <text x="564" y="913" font-size="13" font-weight="600" style="fill:#52647a" text-anchor="middle">local step 1</text>
+  <text x="728" y="913" font-size="13" font-weight="600" style="fill:#52647a" text-anchor="middle">local step 2</text>
+  <text x="892" y="913" font-size="13" font-weight="600" style="fill:#52647a" text-anchor="middle">local step 3</text>
+  <text x="1056" y="913" font-size="13" font-weight="600" style="fill:#52647a" text-anchor="middle">local step 4</text>
+  <rect x="52" y="926" width="246" height="96" rx="8" fill="#eff6ff" stroke="#eff6ff" />
+  <rect x="52" y="1042" width="246" height="96" rx="8" fill="#e8f5f0" stroke="#e8f5f0" />
+  <text x="68" y="969" font-size="16" font-weight="700" style="fill:#1d4ed8" text-anchor="start">Cube</text>
+  <text x="68" y="1085" font-size="16" font-weight="700" style="fill:#0f766e" text-anchor="start">Vector</text>
+  <text x="181" y="953" font-size="14" font-weight="600" style="fill:#1d4ed8" text-anchor="start">QK @0</text>
+  <rect x="322" y="926" width="156" height="44" rx="6" fill="#eff6ff" stroke="#d6e2ec" data-actor="cube" data-stage="0" data-local-step="0" data-active="true" data-tile="0" data-slot="0"/>
+  <text x="400" y="944" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">QK(0)</text>
+  <text x="400" y="962" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">→ Score[0]</text>
+  <rect x="486" y="926" width="156" height="44" rx="6" fill="#eff6ff" stroke="#d6e2ec" data-actor="cube" data-stage="0" data-local-step="1" data-active="true" data-tile="1" data-slot="1"/>
+  <text x="564" y="944" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">QK(1)</text>
+  <text x="564" y="962" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">→ Score[1]</text>
+  <rect x="650" y="926" width="156" height="44" rx="6" fill="#eff6ff" stroke="#d6e2ec" data-actor="cube" data-stage="0" data-local-step="2" data-active="true" data-tile="2" data-slot="0"/>
+  <text x="728" y="944" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">QK(2)</text>
+  <text x="728" y="962" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">→ Score[0]</text>
+  <rect x="814" y="926" width="156" height="44" rx="6" fill="#eff6ff" stroke="#d6e2ec" data-actor="cube" data-stage="0" data-local-step="3" data-active="true" data-tile="3" data-slot="1"/>
+  <text x="892" y="944" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">QK(3)</text>
+  <text x="892" y="962" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">→ Score[1]</text>
+  <rect x="978" y="926" width="156" height="44" rx="6" fill="#f7fafc" stroke="#d6e2ec" data-actor="cube" data-stage="0" data-local-step="4" data-active="false"/>
+  <text x="1056" y="953" font-size="16" font-weight="400" style="fill:#52647a" text-anchor="middle">—</text>
+  <text x="181" y="1005" font-size="14" font-weight="600" style="fill:#1d4ed8" text-anchor="start">PV @1</text>
+  <rect x="322" y="978" width="156" height="44" rx="6" fill="#f7fafc" stroke="#d6e2ec" data-actor="cube" data-stage="1" data-local-step="0" data-active="false"/>
+  <text x="400" y="1005" font-size="16" font-weight="400" style="fill:#52647a" text-anchor="middle">—</text>
+  <rect x="486" y="978" width="156" height="44" rx="6" fill="#eff6ff" stroke="#d6e2ec" data-actor="cube" data-stage="1" data-local-step="1" data-active="true" data-tile="0" data-slot="0"/>
+  <text x="564" y="996" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">PV(0)</text>
+  <text x="564" y="1014" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">P[0] → PV[0]</text>
+  <rect x="650" y="978" width="156" height="44" rx="6" fill="#eff6ff" stroke="#d6e2ec" data-actor="cube" data-stage="1" data-local-step="2" data-active="true" data-tile="1" data-slot="1"/>
+  <text x="728" y="996" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">PV(1)</text>
+  <text x="728" y="1014" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">P[1] → PV[1]</text>
+  <rect x="814" y="978" width="156" height="44" rx="6" fill="#eff6ff" stroke="#d6e2ec" data-actor="cube" data-stage="1" data-local-step="3" data-active="true" data-tile="2" data-slot="0"/>
+  <text x="892" y="996" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">PV(2)</text>
+  <text x="892" y="1014" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">P[0] → PV[0]</text>
+  <rect x="978" y="978" width="156" height="44" rx="6" fill="#eff6ff" stroke="#d6e2ec" data-actor="cube" data-stage="1" data-local-step="4" data-active="true" data-tile="3" data-slot="1"/>
+  <text x="1056" y="996" font-size="14" font-weight="700" style="fill:#1d4ed8" text-anchor="middle">PV(3)</text>
+  <text x="1056" y="1014" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">P[1] → PV[1]</text>
+  <text x="181" y="1069" font-size="14" font-weight="600" style="fill:#0f766e" text-anchor="start">softmax @0</text>
+  <rect x="322" y="1042" width="156" height="44" rx="6" fill="#e8f5f0" stroke="#d6e2ec" data-actor="vector" data-stage="0" data-local-step="0" data-active="true" data-tile="0" data-slot="0"/>
+  <text x="400" y="1060" font-size="14" font-weight="700" style="fill:#0f766e" text-anchor="middle">softmax(0)</text>
+  <text x="400" y="1078" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">Score[0] → P[0]</text>
+  <rect x="486" y="1042" width="156" height="44" rx="6" fill="#e8f5f0" stroke="#d6e2ec" data-actor="vector" data-stage="0" data-local-step="1" data-active="true" data-tile="1" data-slot="1"/>
+  <text x="564" y="1060" font-size="14" font-weight="700" style="fill:#0f766e" text-anchor="middle">softmax(1)</text>
+  <text x="564" y="1078" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">Score[1] → P[1]</text>
+  <rect x="650" y="1042" width="156" height="44" rx="6" fill="#e8f5f0" stroke="#d6e2ec" data-actor="vector" data-stage="0" data-local-step="2" data-active="true" data-tile="2" data-slot="0"/>
+  <text x="728" y="1060" font-size="14" font-weight="700" style="fill:#0f766e" text-anchor="middle">softmax(2)</text>
+  <text x="728" y="1078" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">Score[0] → P[0]</text>
+  <rect x="814" y="1042" width="156" height="44" rx="6" fill="#e8f5f0" stroke="#d6e2ec" data-actor="vector" data-stage="0" data-local-step="3" data-active="true" data-tile="3" data-slot="1"/>
+  <text x="892" y="1060" font-size="14" font-weight="700" style="fill:#0f766e" text-anchor="middle">softmax(3)</text>
+  <text x="892" y="1078" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">Score[1] → P[1]</text>
+  <rect x="978" y="1042" width="156" height="44" rx="6" fill="#f7fafc" stroke="#d6e2ec" data-actor="vector" data-stage="0" data-local-step="4" data-active="false"/>
+  <text x="1056" y="1069" font-size="16" font-weight="400" style="fill:#52647a" text-anchor="middle">—</text>
+  <text x="181" y="1121" font-size="14" font-weight="600" style="fill:#0f766e" text-anchor="start">store @1</text>
+  <rect x="322" y="1094" width="156" height="44" rx="6" fill="#f7fafc" stroke="#d6e2ec" data-actor="vector" data-stage="1" data-local-step="0" data-active="false"/>
+  <text x="400" y="1121" font-size="16" font-weight="400" style="fill:#52647a" text-anchor="middle">—</text>
+  <rect x="486" y="1094" width="156" height="44" rx="6" fill="#e8f5f0" stroke="#d6e2ec" data-actor="vector" data-stage="1" data-local-step="1" data-active="true" data-tile="0" data-slot="0"/>
+  <text x="564" y="1112" font-size="14" font-weight="700" style="fill:#0f766e" text-anchor="middle">store(0)</text>
+  <text x="564" y="1130" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">PV[0] → O(0)</text>
+  <rect x="650" y="1094" width="156" height="44" rx="6" fill="#e8f5f0" stroke="#d6e2ec" data-actor="vector" data-stage="1" data-local-step="2" data-active="true" data-tile="1" data-slot="1"/>
+  <text x="728" y="1112" font-size="14" font-weight="700" style="fill:#0f766e" text-anchor="middle">store(1)</text>
+  <text x="728" y="1130" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">PV[1] → O(1)</text>
+  <rect x="814" y="1094" width="156" height="44" rx="6" fill="#e8f5f0" stroke="#d6e2ec" data-actor="vector" data-stage="1" data-local-step="3" data-active="true" data-tile="2" data-slot="0"/>
+  <text x="892" y="1112" font-size="14" font-weight="700" style="fill:#0f766e" text-anchor="middle">store(2)</text>
+  <text x="892" y="1130" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">PV[0] → O(2)</text>
+  <rect x="978" y="1094" width="156" height="44" rx="6" fill="#e8f5f0" stroke="#d6e2ec" data-actor="vector" data-stage="1" data-local-step="4" data-active="true" data-tile="3" data-slot="1"/>
+  <text x="1056" y="1112" font-size="14" font-weight="700" style="fill:#0f766e" text-anchor="middle">store(3)</text>
+  <text x="1056" y="1130" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="middle">PV[1] → O(3)</text>
+  <text x="52" y="1171" font-size="14" font-weight="700" style="fill:#152840" text-anchor="start">Steady state:  Cube QK(j_C) → PV(j_C−1)     |     Vector softmax(j_V) → store(j_V−1)</text>
+  <text x="52" y="1201" font-size="13" font-weight="400" style="fill:#52647a" text-anchor="start">Within each actor, → means issue order. Across actors, matching columns do not mean simultaneous execution.</text>
+  <text x="52" y="1228" font-size="13" font-weight="400" style="fill:#52647a" text-anchor="start">Stage offsets select logical generations. Buffer slots select physical storage. Waits preserve both contracts.</text>
+  <text x="1168" y="1270" font-size="11" font-weight="400" style="fill:#52647a" text-anchor="end">Aligned non-causal attention · D128 / Q tile64 / KV128 · conceptual issue expansion, not a latency trace</text>
 </svg>

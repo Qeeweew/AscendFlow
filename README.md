@@ -9,7 +9,7 @@ AscendFlow 是基于 **xDSL**、面向 **Ascend 910B / dav-2201** 的算子编�
 [快速上手](docs/guide/quickstart.md) · [DSL](docs/guide/dsl.md) ·
 [算子示例](examples/README.md) · [编译器设计](docs/development/README.md)
 
-![AscendFlow：从 Python DSL、真实访问与生命周期分析，到自动同步和 Ascend 910B 执行；下方展示 attention 的 Cube/Vector 流水与双槽复用](docs/assets/ascendflow-design.svg)
+![AscendFlow：从 Python DSL、真实访问与生命周期分析，到自动同步和 Ascend 910B 执行；下方从 attention 的 stage 偏移、buffer 双槽与访问依赖推导填充、稳态发射和排空](docs/assets/ascendflow-design.svg)
 
 ## 设计理念
 
@@ -103,59 +103,67 @@ Sparse 与 KDA 的缓存和采样条件不同，各自与其参照比较；其�
 
 ## 一段 DSL，一条流水
 
-用一个整块 **non-causal attention** 展示 Cube 与 Vector 的协作：
+用整块 **non-causal attention** 说明 stage、buffer 与稳态排步：
 `O = softmax(Q @ K.T / sqrt(128)) @ V`。
 固定 **head dimension=128、K/V 长度=128、query tile=64**，query 长度为 64 的正整数倍。
-Q/K/V 与输出为 FP16，分数与 softmax 统计为 FP32，归一化的 P 转为 FP16 后参与 PV。
+Q/K/V、P 与输出为 FP16，分数和 softmax 统计为 FP32。
 
-每个 head 对应一组 1 AIC + 2 AIV，两个 AIV 各处理 32 行。
-K/V 预载后常驻 L0；`Score`、`P`、`PV` 各用两个 GM 槽在 Cube/Vector 间传递。
-下面是[完整示例](examples/flash_attention/simple.py)的流水主体，缓冲区声明与 K/V 预载见源码：
+数学阶段分别写成 `@N.inline` helper，例如 QK 的搬运、矩阵乘和发布：
+
+```python
+@N.inline
+def qk(query, key, scores, buffers):
+    q1, q0, score0 = buffers
+    N.copy(query, q1)
+    N.copy(q1, q0)
+    N.matmul(q0, key, accum=score0, initialize=True)
+    N.copy(score0, scores)
+```
+
+`softmax`、`pv`、`store` 同样封装各自的计算。它们在编译时展开，实际读写保持可见。
+每个 head 使用 1 AIC + 2 AIV，两个 AIV 各处理 32 行；K/V 预载后常驻 L0。
+`Score`、`P`、`PV` 各有两个 GM 槽，`*_buffers` 是各 helper 的 L1/L0/UB 缓冲区。
+完整声明见[示例源码](examples/flash_attention/simple.py)，主体只表达四个阶段的排步：
 
 ```python
 for tile in N.Dataflow(S // 64):
     q = tile * 64
     slot = tile % 2
+
     with N.Cube(), N.Stage(0, name="qk"):
-        N.copy(Q[head, q : q + 64, :], q1)
-        N.copy(q1, q0)
-        N.matmul(q0, k0, accum=score0, initialize=True)
-        N.copy(score0, Score[head, slot, :, :])
+        qk(Q[head, q : q + 64, :], k0, Score[head, slot, :, :], qk_buffers)
+
     with N.Vector() as lane, N.Stage(0, name="softmax"):
         r = lane * 32
-        N.copy(Score[head, slot, r : r + 32, :], score)
-        N.mul(score, 0.08838834764831845, out=score)
-        N.reduce_max(
-            score,
-            axis=1,
-            out=maximum,
-            scratch=partial[:, :2],
-            order="r64_then_packed_merge",
+        softmax(
+            Score[head, slot, r : r + 32, :],
+            P[head, slot, r : r + 32, :],
+            softmax_buffers,
         )
-        N.sub(score, maximum[:, None], out=score, scratch=broadcast)
-        N.exp(score, out=score)
-        N.reduce_sum(
-            score, axis=1, out=total, scratch=partial[:, :2], order="r64_then_packed_merge"
-        )
-        N.div(score, total[:, None], out=score, scratch=broadcast)
-        N.cast(score, out=probability)
-        N.copy(probability, P[head, slot, r : r + 32, :])
+
     with N.Cube(), N.Stage(1, name="pv"):
-        N.copy(P[head, slot, :, :], p1)
-        N.copy(p1, p0)
-        N.matmul(p0, v0, accum=output0, initialize=True)
-        N.copy(output0, PV[head, slot, :, :])
+        pv(P[head, slot, :, :], v0, PV[head, slot, :, :], pv_buffers)
+
     with N.Vector() as lane, N.Stage(1, name="store"):
         r = lane * 32
-        N.copy(PV[head, slot, r : r + 32, :], output)
-        N.cast(output, out=result)
-        N.copy(result, O[head, q + r : q + r + 32, :])
+        store(PV[head, slot, r : r + 32, :], O[head, q + r : q + r + 32, :], store_buffers)
 ```
 
-作者指定 QK、softmax、PV、写回四个阶段，编译器从实际读写生成 ready 与 release。
-例如 `Score[slot]` 在两个 AIV 都完成 GM→UB 读取后即可复用，后续 softmax 仍可继续；
-同槽下一代的写入等待这些真实 reader 退休。代码不填写 Set/Wait 或 event ID。
-此示例已通过独立 FP32 数值检查；长上下文的 KV 分块与在线 softmax 见
+**Stage 决定发射哪一代，buffer 决定复用哪一块存储。** 对每个 actor 自己的本地步 `j`，
+偏移为 `s` 的阶段执行逻辑 tile `t=j-s`，仅在 `0<=t<tiles` 时激活。
+因此填充后，Cube 每步按顺序发射 `QK(j)`、`PV(j-1)`，Vector 发射
+`softmax(j)`、`store(j-1)`；末尾再排空剩余的 PV 和写回。两侧本地步独立推进，
+相同列号不表示同一物理时刻。
+
+**同步决定这些发射何时能安全前进。** 每个 tile 使用 `slot=t%2`：生产者写完后，
+消费者才可读取；同槽的 `t+2` 必须等待 `t` 的最后 reader 退休。
+例如 Score 的两个 AIV 都完成 GM→UB 读取后，该槽即可交给下一代 QK，softmax 仍可继续。
+Stage 偏移与两槽声明由作者选择，编译器从真实访问生成 ready/release 和首尾处理，
+在实际交接和存储复用处生成等待；stage 数字不声明完成，也不分配 buffer。
+
+上图依次展示这些声明、访问依赖，以及四个 tile 的填充、稳态发射和排空。
+这是发射关系示意；实际重叠与吞吐取决于指令耗时和等待。
+示例通过独立 FP32 数值检查；长上下文的 KV 分块与在线 softmax 见
 [Flash Attention](examples/flash_attention/attention.py)。
 
 ## 开始使用
