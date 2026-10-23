@@ -195,6 +195,17 @@ class UnresolvedSynchronization:
     reason: str
 
 
+@dataclass
+class BindingWork:
+    """Diagnostic counts only; no coverage or lifetime permission."""
+
+    acquisition_words: int = 0
+    retained_acquires: int = 0
+    word_queries: int = 0
+    order_bands: int = 0
+    range_vertices: int = 0
+
+
 @dataclass(frozen=True)
 class SynchronizationSelection:
     dependencies: StructuredDependencies
@@ -202,6 +213,7 @@ class SynchronizationSelection:
     notifications: tuple[LogicalNotification, ...]
     coverage: tuple[NotificationCoverage, ...]
     unresolved: tuple[UnresolvedSynchronization, ...] = ()
+    binding_work: BindingWork = field(default_factory=BindingWork, compare=False)
 
     @property
     def closed(self):

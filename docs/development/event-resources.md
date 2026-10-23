@@ -74,6 +74,27 @@ local 的两份完整 credit 只有全部成员及实际 occurrence 的占用区
 真实 FIRST/LAST/family 端点，并检查坐标往返及完整激活。未来放宽坐标映射时，
 必须重审实际首末顺序，不能只保留可逆性就继续复用整段 invocation 证明。
 
+本地事件规划按受压 bank 建立完整 credit 的分层消费前沿。同一激活类保留
+最早的真实 publisher 和最晚的真实 consumer；合并必须具有相同的完整 guard、
+坐标、case、输入范围及参与者合同，并证明真实端点间的无条件发射包围关系。
+同一 native 锚点上的两条不同通知没有由此确定的相对顺序，不能据 rank 相等合并。
+包围只提供 issue/queue 前缀覆盖，不建立新的完成、消费或 quorum 贡献。
+
+两份前沿的分离仍检查真实尾 Wait 到新头 Set 的 handback，包括同代正向和
+每层下一次 invocation 的反向回传。无法证明的粗接口继续细分到实际消息端点，
+不另建全历史 pair 表或第二条求解路径。A→B、B→C 的两份许可本身不能推出
+A→C：链尾到下一次链首的消费义务仍须独立成立。不同激活类或任意交错结构
+仍可能需要稠密的接口检查；本规则不承诺所有程序都具有线性分析成本。
+
+已建立的完整 credit 分离冻结为 `CreditSeparation` 和有限 bitmask 矩形。
+编号器只查这份不可变数字关系。最终 local 同号组逐行检查成员 mask 的完整覆盖，
+任一成员缺少对其他 credit 的许可即拒绝；检查和报告保留所选子矩形，不再展开
+每对消息。报告以 `LocalEventReuse` 记录 bank、ID、完整 credit 成员与所选矩形，
+共享的 `local_event_certificates` / `local_event_frontiers` 表保存证书和真实端点树。
+这些操作不重新调用域或 handback 分析；逐消息对展开仅用于开发对照测试。
+缩环选项只改变 width/phase 时，共用同一输入 owner 的
+激活、真实端点、包围和消费事实；完整成员集合或输入 owner 改变即不能沿用。
+
 ## AIV 共用代码
 
 规划阶段比较两个 AIV 的完整虚拟动作序列，保留位置、顺序、重复数、phase、
@@ -117,7 +138,7 @@ quorum 回传：旧消费先于它的发布，它的接收又先于新 Set。逐
 ## mode-2 整组 FIFO
 
 并发 packing 使用规划阶段建立的 `CounterGroup`，不同于 local 二值着色。
-当前充分规则要求每个 publisher 和 receiver 上的消息属于相同实际 clock、
+叶子 word 的充分规则要求每个 publisher 和 receiver 上的消息属于相同实际 clock、
 scope、stage 及坐标映射；所有参与者的完整消息 word 相同。逐 credit 的成员
 兼容仍先检查，但两两兼容不能代替整组 word 检查。
 
@@ -135,15 +156,33 @@ scope、stage 及坐标映射；所有参与者的完整消息 word 相同。逐
 超过 15。两个 AIV 各自贡献，快 AIV 不能替代慢 AIV。删除候选组中的消息保持
 word、quorum、FIFO 和积压证据，故分配可选择其子集；最终检查实际同号成员
 确为某份完整证据的子集。此规则没有增加 Wait 或新的 controller 排步。
-同一 ID 的集合必须整体满足时间不干涉，或属于一份完整 FIFO 证书。不同 ID 可
-分别使用这两种合同；同一 ID 上任意混合时间 epoch 与并发子组、更一般的多时钟
-交错 packing 尚未支持。
+候选规划保留通用贪心候选，并按完整激活/clock 形状建立额外整组候选；候选允许
+重叠，不把第一份分区当作唯一可能映射。结构分桶只选择候选，不代替完整证书。
+候选集合有限且不保证全局最优，不枚举所有成员子集。
+
+不同 clock 的 word 可以保留为 `CounterGroup.episodes`，用每个实际 publisher 和
+receiver 上的 LAST→FIRST 发射位置证明整个调用内的顺序拼接。各片段继续使用自身
+clock，不比较不同 actor 的裸 epoch。ownership 和编号身份保留；此规则仍对完整
+credit 的积压求和，包含跨片段尚未消费的贡献，不把循环退出当成 counter 清空。
+不能建立整次调用 word 边界的更一般嵌套/交错结构，不取得此拼接资格。
+
+## FIFO 子组的时间复用
+
+`CounterTimeGroups` 保存多个不相交的完整 credit 子组，各子组有自己的 FIFO
+证书或是一份独立 credit。任意两个子组之间，每一对 credit 都须已有完整
+`CounterReuse` 证据；没有这些证据的两两兼容图不能授权组合。
+
+于是任一时刻只有一个子组有未消费贡献：子组内部积压按完整 credit 求和，
+子组之间取最大值，仍逐 publisher 检查不超过 15。两个 AIV 的贡献保持独立。
+冻结后的组合只向分配器交付有限数字选择；最终同号组检查共同消费原组合，
+删除未选成员保留资格。不会为获得时间复用添加 Wait、移动 native 或改变 buffer。
 
 ## 证据口径
 
 `Compilation.report.event_resources` 记录实际通知、完整 credit、环宽/phase、
 预留、编号、sharing 与物化动作；`protocol_selection` 区分首选环、选中协议及
 受影响消息流；`counter_time_reuse` 保存旧消费、新发布、回传及最大积压，
-`counter_groups` 则保存并发 word 与求和积压。报告是诊断输出，不能作为外部输入的 verified
+`counter_groups` 保存并发 word、顺序片段及求和积压，`counter_compositions` 保存
+FIFO 子组、时间回传和最大积压。报告是诊断输出，不能作为外部输入的 verified
 标记。独立有限模型读取真实指令、字节版本、二值消费和逐发送者贡献。
 CPU 检查、ASC 对照、CANN、设备数值、编译耗时与 msprof 性能分别给出资格。

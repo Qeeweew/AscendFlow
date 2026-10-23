@@ -1,7 +1,8 @@
 """Actual stage/serial/participant bindings used by structured address facts."""
 
 import pytest
-from xdsl.dialects import scf
+from xdsl.dialects import arith, scf
+from xdsl.dialects.builtin import IndexType
 
 from ascendflow import language as N
 from ascendflow.analysis.structured_addresses import StructuredAddresses, check_static_axes
@@ -68,6 +69,41 @@ def test_distinct_loop_operations_never_share_a_clock_by_label_or_bound():
     assert first.operation is not second.operation
     assert first.ordinal != second.ordinal
     assert first.count == second.count
+
+
+def test_scalar_prefix_keeps_load_and_branch_results_after_their_real_definitions():
+    source = N.from_source(
+        """
+        def prefixes(Meta:N.Tensor((1,),N.i64),n:N.i64):
+            with N.Kernel(kind="vector"):
+                x=N.alloc_ub((64,),N.f32)
+                value=N.load_index(Meta[:1],minimum=0,maximum=1)
+                if value==0 or n==0:
+                    N.fill(x,1.0)
+    """,
+        disjoint_external=True,
+    )
+    structure = lower_native_structure(source)
+    control = build_control_facts(structure.module)
+    loaded = next(
+        op
+        for op in structure.module.walk()
+        if isinstance(op, TaskOp) and op.native.data == "index_load"
+    )
+    branch = next(op for op in structure.module.walk() if isinstance(op, scf.IfOp) and op.results)
+    for operation, result in ((loaded, loaded.value), (branch, branch.results[0])):
+        assert result not in control.dominating_scalars(operation.parent, operation)
+        after = control.dominating_scalars(operation.parent, operation.next_op)
+        assert result in after
+        assert control.dominating_arguments(operation.parent, operation.next_op) == frozenset(
+            name for value in after for name in control.environment.expression(value).variables
+        )
+    anchor = loaded.next_op
+    before = control.dominating_scalars(loaded.parent, anchor)
+    inserted = arith.ConstantOp.from_int_and_width(123, IndexType())
+    loaded.parent.insert_op_before(inserted, anchor)
+    assert control.dominating_scalars(loaded.parent, inserted) == before
+    assert inserted.result not in control.dominating_scalars(loaded.parent, anchor)
 
 
 @pytest.mark.parametrize("lower,upper,step", [(3, 10, 2), (-2, 4, 3), (3, 0, 2)])

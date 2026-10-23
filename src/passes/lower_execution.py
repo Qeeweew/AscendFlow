@@ -12,7 +12,7 @@ from xdsl.ir import Block, Region
 
 from ..analysis.scalar_uses import ScalarUses
 from ..diagnostics import require
-from ..dialects.physical import EndOp, FixConfigOp, Load3DConfigOp, MixedOp, TaskOp
+from ..dialects.physical import EndOp, FixConfigOp, MixedOp, TaskOp
 from ..dialects.structured import (
     ActorDomainOp,
     AddressOp,
@@ -65,7 +65,7 @@ def lower_execution(module, natives, facts, schedules):
                 if isinstance(op, TaskOp):
                     op.stage = IntAttr(0)
                 target.add_op(op)
-            elif isinstance(op, (FixConfigOp, Load3DConfigOp)):
+            elif isinstance(op, FixConfigOp):
                 if family == "cube":
                     op.parent.detach_op(op)
                     target.add_op(op)

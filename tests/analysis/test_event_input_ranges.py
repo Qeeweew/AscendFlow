@@ -117,11 +117,22 @@ def participant_inputs(First:N.Tensor((2,),N.i64)):
     ).satisfied
 
 
-def test_b128_prepare_keeps_positive_tail_length_through_event_handback():
-    from examples.kda.prefill_prepare import prefill_prepare
-
-    plan = synchronize_structure(
-        prefill_prepare.specialize(SEQUENCES=128, NC=2, CHUNKS=256, H=32, DTYPE="f16")
+def test_positive_loaded_length_survives_selected_child_handback():
+    source = N.from_source(
+        """
+def positive(Lengths:N.Tensor((n,),N.i64),X:N.Tensor((n,64),N.f32),
+             Out:N.Tensor((n,64),N.f32,access="write",write_disjoint=True),n:N.i64):
+    with N.Kernel(1,kind="vector"):
+        x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
+        for i in N.serial(n):
+            valid=N.load_index(Lengths[i:i+1],minimum=1,maximum=64)
+            for row in N.serial(N.ceildiv(valid,64)):
+                N.copy(X[i,:],x)
+                N.mul(x,2.0,out=y)
+            N.copy(y,Out[i,:])
+""",
+        disjoint_external=True,
     )
+    plan = synchronize_structure(source)
     assert any(record.discharged for record in plan.generation.domains._activations.values())
     assert all(not name.captures for name in plan.generation.domains.facts)

@@ -103,17 +103,6 @@ class TaskOp(IRDLOperation):
 
 
 @irdl_op_definition
-class Load3DConfigOp(IRDLOperation):
-    """Invariant FMATRIX_A/B and Load3D state plus an entry S->MTE1 handshake."""
-
-    name = "npu.init_load3d"
-    a_width = attr_def(IntAttr)
-    b_width = attr_def(IntAttr)
-    fp32 = opt_attr_def(IntAttr)
-    traits = traits_def(AsyncEffects())
-
-
-@irdl_op_definition
 class FixConfigOp(IRDLOperation):
     """One real invariant S initialization + one S->FIX ready handshake.
 
@@ -141,7 +130,6 @@ NPU = Dialect(
         RuntimeSizeOp,
         TaskOp,
         FixConfigOp,
-        Load3DConfigOp,
         EndOp,
         ActorDomainOp,
         AddressOp,

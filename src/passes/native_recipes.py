@@ -86,8 +86,7 @@ class RecipeContext:
     subview: PhysicalSubview
     emit: NativeEmitter
     operand: "ScalarOperand | None" = None
-    load3d_b_width: int | None = None
-    load3d_a_width: int | None = None
+    load3d_a: bool = False
     aligned: Callable[[SSAValue, int], bool] | None = None
 
 
@@ -230,13 +229,9 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
             if transpose
             else "load2d_b_nn"
         )
-        if context.load3d_b_width is not None and strided_b_width(op) == context.load3d_b_width:
+        if strided_b_width(op) is not None:
             native = "load3d_b_nn"
-        if (
-            not transpose
-            and context.load3d_a_width is not None
-            and compact_a_width(op) == context.load3d_a_width
-        ):
+        if not transpose and context.load3d_a and compact_a_width(op) is not None:
             native = "load3d_a"
         task = context.emit(
             "_copy",

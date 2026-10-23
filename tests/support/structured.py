@@ -46,3 +46,29 @@ def allocated(program):
     from ascendflow.analysis.structured_resources import allocate_structured_events
 
     return allocate_structured_events(plan_event_resources(program))
+
+
+def shared_message_pairs(plan):
+    """Test-only expansion of frozen local rectangles to real message pairs."""
+    from ascendflow.analysis.event_frontier_contracts import LocalEventReuse
+
+    for witness in plan.resources.sharing:
+        if not isinstance(witness, LocalEventReuse):
+            yield frozenset((witness.earlier, witness.later))
+            continue
+        credits = dict(witness.credits)
+        for rectangle in witness.rectangles:
+            left = [r for r in credits if rectangle.left & (1 << r)]
+            right = [r for r in credits if rectangle.right & (1 << r)]
+            for a in left:
+                for b in right:
+                    for x in credits[a]:
+                        for y in credits[b]:
+                            assert any(
+                                x in p.left.members
+                                and y in p.right.members
+                                or y in p.left.members
+                                and x in p.right.members
+                                for p in rectangle.certificate.interfaces
+                            ), "compressed credit certificate omitted an actual message pair"
+                            yield frozenset((x, y))

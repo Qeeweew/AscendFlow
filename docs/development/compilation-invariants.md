@@ -52,6 +52,15 @@ L1 NZ allocation 的物理 shape 和 C0 经统一布局传递，子视图不改�
 初始化按真实矩形联合及 writer 来源建立；相邻部分写可以拼满，矩形包围盒不能
 填补孔洞。完整定义不提供 ready、ownership KILL、reader 退休或事件消费事实。
 
+线性存储的初始化按真实 allocation/participant、读取 loop nest 和完整 guard
+建立增量上下文，每个新 writer 在该上下文内只转移一次。已定义常量字节区间
+维护精确并集，相邻或重叠区间可合并；跨行孔洞和符号坐标继续保留原 span。
+完整分支树仍先按实际参与者及逐代 footprint 闭合，再作循环摘要。数值并集
+保留原 writer 身份，不替代逻辑值版本检查、ready 或最后 reader 退休。
+读取的 writer 来源以不可变前缀节点共享；读取保留当时的快照，后续 writer 不能
+修改旧快照。无条件写与完整分支树的 writer 均按首次建立覆盖的次序去重追加，
+正常准入不复制整个历史 tuple；显式诊断迭代仍可取得全部 writer 身份。
+
 公共编译在独立 expression scope 内驻留完全相同的原始 `(kind, args)` 节点，
 退出、异常或取消时释放节点表，嵌套 scope 恢复外层。它不保存 range、guard、
 alias 或完成证据；数学等价的不同原式不会在此合并。原始 SSA 的求值域继续保留，
@@ -81,19 +90,41 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 Comparison、Boolean 和 Symbol 同样只保存自身完整比较字段的 hash；它们不保存
 范围、定义性或完成证明。
 
+Handback 的实际 publication port 按旧消费点、peer、真实循环及 horizon 建立，
+保留全部 source/receiver 激活、坐标对应和首段发射条件。不同目标可以共用这些
+未变接口，但各自仍检查 receiver→新 Set 和完整消费覆盖。先按路由选择，再按需
+打开 child FIRST/LAST；未用的可选边界不成为新的准入要求。两段交接只连接实际
+中间 queue 已有的通知，不存任意路径闭包。覆盖 union 没有新增证据时不重复求解，
+输入前提变化的其他 reuse 请求不能借用该结论。
+
+单段 handback 的返回前沿可以省去被已有返回点覆盖的较晚候选：完整有序 guard、
+全部参与者的实际坐标/选择前提必须相同，两个 Wait 均已具备阻塞目标 queue/controller
+的路由资格，且已有返回点到较晚返回点的实际发射顺序无条件成立。由发射顺序传递，
+任何可由较晚返回点到达的新 Set 也能由已有返回点到达；不新增完成边，不将两个
+通知合成一个贡献。两段 handback 的中间 native/queue 匹配仍保留全部原端口。
+
+本地事件共享使用分层的真实 publication/consumption 前沿。包围依据完整激活和
+坐标合同下的无条件发射顺序，实际消费仍由 handback 建立，包括各层重入。
+冻结的完整 credit 分离矩形只提供有限编号许可，不以相邻 pair 传递代替 wrap
+义务。未变输入 owner 上的缩环选项可保留端点事实；成员、guard、坐标或输入
+事实变化时重建对应接口。详见 [事件资源](event-resources.md)。
+最终 local 同号组检查逐行消费冻结的 bitmask 覆盖，保留选中的证书子矩形；
+报告共享端点树和证书，不把矩形重新物化为全部历史消息对。
+
 ## 2. 保证的目标归属与当前缺口
 
 | 不变量 | 目标建立职责 | 当前应核对的代码/缺口 |
 |---|---|---|
 | 类型与runtime输入合同 | frontend/admission；输入条件由调用方满足 | 编译器检查合同声明；生成的kernel和launcher不验证调用方输入 |
 | 完整effects | native lowering/目标原语合同 | 包括scratch、padding、SPR、读写及真实退休 |
+| 配置状态 | NativeSpec/registers 的值事实，access_order 的真实读取与覆盖顺序 | RegisterCell 不冒充 tensor；定义、ready、旧 reader 退休分开；入口 setter 的 guard 依赖实际支配 SSA |
 | 存储实例与alias | 物理访问、pointer合同与可选分区分析 | group/peer独立性属于源语义；保留root/view/slot/generation及AIV私有性，未知区域保留源码内存顺序 |
 | 源值语义 | frontend/Tile 与 admission、局部 packet 合同 | 不要求全程序精确 writer 闭合；dispatch 不能改变原读取值；may-write 不宣称完整定义 |
 | 物理复用 | access_order 与局部 packet 的实际 dispatch word | 保留全部 pending reader；控制端口只提供插入位置，真实 Set/Wait 才捕获/获取前缀 |
 | ready/release覆盖 | notification binding | 真实 capture/acquire、独立覆盖及原始 ownership edges |
 | 配对与事件消费/复用 | 生成器的域、cell credit 与 handback 规则 | 域只检查一次；物理 lifetime 归纳或明确消费回传，rank 不提供消费证据 |
-| 可进展 | queue_order 的分层生成准入 | 零 step phase DAG、正 step 前进；父层只组合 child may-block 边界 |
-| bank/ID/width/quorum | 资源规划建立协议及复用约束；编号分配器检查冻结的有限映射 | 不默认ID共享只是改名；counter 时间复用覆盖每个旧receiver至每个新publisher的消费回传并取最大积压；FIFO需逐端同序、完整quorum及求和积压≤15；编号候选不触发域或handback求解 |
+| 可进展 | queue_order 的分层生成准入 | 按路由/有限时间类分解阻塞区间，保留零 step phase DAG 与正 step 前进；索引内部顶点不提供完成/消费，父层只组合 child may-block 边界 |
+| bank/ID/width/quorum | 资源规划建立协议及复用约束；编号分配器检查冻结的有限映射 | 时间复用覆盖每个旧receiver至每个新publisher的消费回传；FIFO完整word逐端同序；有完整跨子组不干涉证据时取FIFO子组求和上界的最大值，各publisher≤15；编号选择不触发域或handback求解 |
 | 输出对应 | 物化与后端 | 不重选同步，不改native/控制/guard语义 |
 
 上表不表示所有已存在的前置分析都应重写。先对源码确认真实职责，只删除被替代的机制。

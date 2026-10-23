@@ -25,6 +25,7 @@ from .event_contracts import (
     StructuredEventAssignment,
     StructuredEventPlan,
 )
+from .event_frontier_contracts import LocalEventReuse
 from .structured_protocols import NotificationKind
 from .structured_schedule import SyncAction
 
@@ -63,13 +64,39 @@ def allocate_event_ids(problem):
             for flag in ids[number]:
                 occupied.setdefault(b, {}).setdefault(flag, set()).add(number)
     seen = set()
-    counter_groups, counter_reuses = [], []
+    counter_groups, counter_reuses, compositions = [], [], []
     packs = tuple(frozenset(c.resources) for c in problem.counter_groups)
+    time_packs = tuple(c.groups for c in problem.counter_compositions)
+    problem.work.local_reuse_groups = 0
+    problem.work.local_reuse_rectangles = 0
+    problem.work.local_reuse_row_checks = 0
     for b, pool in occupied.items():
         for event, members in pool.items():
+            if b is not None:
+                if len(members) > 1:
+                    rectangles = problem.relations.cover_group(members)
+                    require(
+                        rectangles is not None, "same ID lacks a complete-credit reuse constraint"
+                    )
+                    sharing.append(
+                        LocalEventReuse(
+                            b,
+                            event,
+                            tuple((r, problem.demands[r].members) for r in sorted(members)),
+                            rectangles,
+                        )
+                    )
+                    problem.work.local_reuse_groups += 1
+                    problem.work.local_reuse_rectangles += len(rectangles)
+                    problem.work.local_reuse_row_checks += len(members)
+                continue
             usage = None
+            certificate = None
+            composition = None
             if b is None and members:
-                usage = counter_group_usage(problem.demands, members, problem.counter_reuses, packs)
+                usage = counter_group_usage(
+                    problem.demands, members, problem.counter_reuses, packs, time_packs=time_packs
+                )
                 require(usage is not None, "mode-2 group has no complete temporal or FIFO premise")
                 _, backlog = usage
                 require(
@@ -78,6 +105,25 @@ def allocate_event_ids(problem):
                 problem.work.maximum_counter_backlog = max(
                     problem.work.maximum_counter_backlog, backlog
                 )
+                if usage[0] == "fifo":
+                    certificate = next(
+                        (c for c in problem.counter_groups if members <= set(c.resources)), None
+                    )
+                    require(
+                        certificate is not None, "mode-2 packing lacks a whole-word certificate"
+                    )
+                    require(
+                        certificate.order is problem.order,
+                        "mode-2 FIFO belongs to another issue order",
+                    )
+                elif usage[0] == "time_fifo":
+                    composition = next(
+                        c for c in problem.counter_compositions if members <= set(c.resources)
+                    )
+                    require(
+                        composition.order is problem.order,
+                        "counter composition belongs to another issue order",
+                    )
             witnesses = []
             for a, c in combinations(sorted(members), 2):
                 key = (a, c)
@@ -86,13 +132,29 @@ def allocate_event_ids(problem):
                     if usage is not None and usage[0] == "time"
                     else problem.relations
                 )
-                permission = source.get(key)
+                if composition is not None:
+                    same = any({a, c} <= group for group in composition.groups)
+                    if same:
+                        certificate = next(
+                            f for f in composition.fifo if {a, c} <= set(f.resources)
+                        )
+                    else:
+                        certificate = None
+                        source = problem.counter_reuses
+                permission = (
+                    tuple(w for x, y, w in certificate.sharing if (x, y) == key)
+                    if certificate is not None and certificate.episodes
+                    else source.get(key)
+                )
                 require(permission is not None, "same ID lacks a complete-credit reuse constraint")
                 witnesses.extend(permission)
                 if key not in seen:
                     sharing.extend(permission)
                     seen.add(key)
             if usage is not None and len(members) > 1:
+                if composition is not None:
+                    compositions.append((event, composition, tuple(sorted(members)), usage[1]))
+                    continue
                 if usage[0] == "time":
                     counter_reuses.append(
                         CounterReuseGroup(
@@ -106,13 +168,6 @@ def allocate_event_ids(problem):
                         )
                     )
                     continue
-                certificate = next(
-                    (c for c in problem.counter_groups if members <= set(c.resources)), None
-                )
-                require(certificate is not None, "mode-2 packing lacks a whole-word certificate")
-                require(
-                    certificate.order is problem.order, "mode-2 FIFO belongs to another issue order"
-                )
                 counter_groups.append((event, certificate, tuple(sorted(members))))
     problem.work.allocated_local_ids = sum(
         len(pool) for b, pool in occupied.items() if b is not None
@@ -124,7 +179,12 @@ def allocate_event_ids(problem):
     problem.work.peer_equalities = len(problem.peers)
     problem.work.counter_groups = len(problem.counter_groups)
     return EventAllocation(
-        ids, tuple(sharing), tuple(counter_groups), option, tuple(counter_reuses)
+        ids,
+        tuple(sharing),
+        tuple(counter_groups),
+        option,
+        tuple(counter_reuses),
+        tuple(compositions),
     )
 
 
@@ -224,4 +284,5 @@ def allocate_structured_events(problem):
         counter_groups=allocation.counter_groups,
         preferred_leases=preferred.leases,
         counter_reuse_groups=allocation.counter_reuse_groups,
+        counter_compositions=allocation.counter_compositions,
     )

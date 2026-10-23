@@ -16,8 +16,9 @@ from .structured_schedule import ActionGuard, Placement, SyncAction
 if TYPE_CHECKING:
     from .cell_channels import CellChannel
     from .cell_ownership import PersistentCellCredit
-    from .event_counter_groups import CounterGroup
+    from .event_counter_groups import CounterGroup, CounterTimeGroups
     from .event_domains import EventCase
+    from .event_frontier_contracts import FrozenEventRelations, LocalEventReuse
     from .event_sharing import CounterReuse, CounterSharing, EventSharing
     from .event_windows import EventWindow
     from .notification_lifetimes import Reuse
@@ -126,9 +127,10 @@ class EventResourceProblem:
     actions: tuple[VirtualEventAction, ...]
     peers: tuple[tuple[int, int], ...]
     counter_groups: tuple[CounterGroup, ...]
+    counter_compositions: tuple[CounterTimeGroups, ...]
     counter_reuses: Mapping[tuple[int, int], tuple[CounterReuse, ...]]
     reservations: tuple[EventReservation, ...]
-    relations: Mapping[tuple[int, int], tuple[EventSharing | CounterSharing, ...] | None]
+    relations: FrozenEventRelations
     work: ResourceWork
     # Frozen smaller protocols, in cumulative structural order. They carry
     # their own phases and constraints; allocation never asks for more facts.
@@ -143,10 +145,11 @@ class EventAllocation:
     """A checked finite mapping of every demand's virtual lanes to real IDs."""
 
     ids: tuple[tuple[int, ...], ...]
-    sharing: tuple[EventSharing | CounterSharing | CounterReuse, ...]
+    sharing: tuple[EventSharing | LocalEventReuse | CounterSharing | CounterReuse, ...]
     counter_groups: tuple = ()
     option: int = 0
     counter_reuse_groups: tuple[CounterReuseGroup, ...] = ()
+    counter_compositions: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,13 +173,26 @@ class ResourceWork:
     parameter_splits: int = 0
     window_constructions: int = 0
     lifetime_interfaces: int = 0
+    issue_order_words: int = 0
     handback_candidates: int = 0
+    handback_port_candidates: int = 0
+    handback_ports: int = 0
+    handback_return_candidates: int = 0
+    dominated_handback_returns: int = 0
+    handback_cover_queries: int = 0
     handback_compositions: int = 0
     ring_cases: int = 0
     cell_channels: int = 0
     cell_members: int = 0
     sharing_pairs: int = 0
     sharing_reuses: int = 0
+    frontier_enclosures: int = 0
+    frontier_queries: int = 0
+    frontier_blocks: int = 0
+    frontier_rectangles: int = 0
+    local_reuse_groups: int = 0
+    local_reuse_rectangles: int = 0
+    local_reuse_row_checks: int = 0
     allocated_local_ids: int = 0
     allocated_cross_ids: int = 0
     maximum_counter_backlog: int = 0
@@ -184,6 +200,7 @@ class ResourceWork:
     coloring_nodes: int = 0
     peer_equalities: int = 0
     counter_groups: int = 0
+    counter_compositions: int = 0
     protocol_candidates: int = 0
     selected_protocol_option: int = 0
     counter_time_pairs: int = 0
@@ -203,8 +220,9 @@ class StructuredEventPlan:
     work: ResourceWork
     channels: tuple[CellChannel, ...]
     banks: tuple[EventBankUsage, ...]
-    sharing: tuple[EventSharing | CounterSharing | CounterReuse, ...] = ()
+    sharing: tuple[EventSharing | LocalEventReuse | CounterSharing | CounterReuse, ...] = ()
     persistent: tuple[PersistentEventAssignment, ...] = ()
     counter_groups: tuple = ()
     preferred_leases: tuple[StructuredEventLease, ...] = ()
     counter_reuse_groups: tuple[CounterReuseGroup, ...] = ()
+    counter_compositions: tuple = ()

@@ -38,6 +38,7 @@ class _ColoringProblem:
     relations: dict
     counter_packs: tuple[frozenset[int], ...] = ()
     counter_reuses: frozenset[tuple[int, int]] = frozenset()
+    counter_time_packs: tuple[tuple[frozenset[int], ...], ...] = ()
 
 
 def _peer_demands(demands, peers):
@@ -77,6 +78,10 @@ def _equal_numbers(problem):
     demands, groups = _peer_demands(problem.demands, problem.peers)
     owners = {n: i for i, group in enumerate(groups) for n in group}
     packs = tuple(frozenset(owners[n] for n in c.resources) for c in problem.counter_groups)
+    time_packs = tuple(
+        tuple(frozenset(owners[n] for n in group) for group in c.groups)
+        for c in getattr(problem, "counter_compositions", ())
+    )
     relations = {}
     time = set()
     for a, b in combinations(range(len(groups)), 2):
@@ -92,29 +97,47 @@ def _equal_numbers(problem):
         temporal = demands[a].backlog is not None and all(
             (min(x, y), max(x, y)) in problem.counter_reuses for x in groups[a] for y in groups[b]
         )
-        packing = demands[a].backlog is None or any({a, b} <= pack for pack in packs)
+        packing = (
+            demands[a].backlog is None
+            or any({a, b} <= pack for pack in packs)
+            or any({a, b} <= frozenset().union(*groups) for groups in time_packs)
+        )
         if temporal:
             time.add((a, b))
-        if temporal or packing and all(permission is not None for permission in permissions):
+        if (
+            temporal
+            or packing
+            and (
+                demands[a].backlog is not None
+                or all(permission is not None for permission in permissions)
+            )
+        ):
             relations[a, b] = ()
     return _ColoringProblem(
-        demands, problem.reservations, relations, packs, frozenset(time)
+        demands, problem.reservations, relations, packs, frozenset(time), time_packs
     ), groups
 
 
-def counter_group_usage(demands, members, reuses, packs, *, packing=True):
+def counter_group_usage(demands, members, reuses, packs, *, packing=True, time_packs=()):
     """Check a whole counter set using frozen numeric permissions only.
 
     Pairwise noninterference composes for time reuse: at most one complete
     credit has outstanding contributions. FIFO packing instead needs one
-    whole-word certificate and the sum of credit bounds. Mixed sets without
-    either complete premise are unsupported.
+    whole-word certificate and the sum of credit bounds. Frozen temporal
+    compositions take the maximum of certified FIFO-child sums; pairwise
+    permissions alone do not authorize an arbitrary mixed set.
     """
     members = tuple(sorted(members))
     if all((a, b) in reuses for a, b in combinations(members, 2)):
         return "time", max(demands[n].backlog for n in members)
     if packing and any(set(members) <= group for group in packs):
         return "fifo", sum(demands[n].backlog for n in members)
+    if packing:
+        for groups in time_packs:
+            if set(members) <= frozenset().union(*groups):
+                return "time_fifo", max(
+                    sum(demands[n].backlog for n in members if n in g) for g in groups
+                )
     return None
 
 
@@ -258,6 +281,7 @@ def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_pac
                     problem.counter_reuses,
                     problem.counter_packs,
                     packing=counter_packing,
+                    time_packs=problem.counter_time_packs,
                 )
                 if usage is None or usage[1] > CROSS_BACKLOG:
                     continue

@@ -647,6 +647,31 @@ def test_range_reuse_observes_parent_changes_and_broadened_source_facts():
     assert sibling.interval(doubled.result) == (0, 10)
 
 
+def test_proposal_ranges_isolate_overrides_and_observe_changed_inherited_inputs():
+    from ascendflow.passes import simplify_scalars as integers
+
+    value, other = Block(arg_types=[IndexType(), IndexType()]).args
+    facts = integers.ScalarFacts(ranges={value: (0, 4), other: (0, 7)})
+    proposal = facts.fork()
+    scope = integers._Scope(facts=proposal)
+    assert scope.interval(value) == (0, 4)
+    assert scope.interval(other) == (0, 7)
+    proposal.bind_range(value, (-3, 9))
+    assert scope.interval(value) == (-3, 9)
+    assert facts.bound(value) == (0, 4)
+    # A retained proposal cannot use a stale inherited bound after the source
+    # definition moves. Its own re-established range remains independent.
+    facts.bind_range(other, (-2, 12))
+    facts.bind_range(value, (-5, 11))
+    assert scope.interval(other) == (-2, 12)
+    assert scope.interval(value) == (-3, 9)
+    assert facts.fork().bound(value) == (-5, 11)
+    unchanged = facts.fork()
+    unchanged.bind_range(other, (-2, 12))
+    facts.bind_range(other, (-7, 20))
+    assert unchanged.bound(other) == (-2, 12)
+
+
 def test_deep_scope_reuse_does_not_rewalk_unchanged_ancestor_inputs(monkeypatch):
     from ascendflow.passes import simplify_scalars as integers
 

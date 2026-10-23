@@ -16,6 +16,7 @@ from types import MappingProxyType
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import TaskOp
 from ..indexing import arguments
+from ..memo import memoized_method
 from ..scalar import Expr, Fact, expression, literal, substitution
 from ..symbols import Symbol, SymbolKind
 from ..target.ascend910b import Actor, Engine
@@ -596,12 +597,25 @@ class EventDomains:
             common = free if common is None else common & free
         return tuple(loop for loop in self.control.loops if loop in (common or ()))
 
-    def _path(self, task):
-        result, scope = [], task.scope
-        while scope is not None:
-            result.append(scope)
-            scope = scope.parent
-        return tuple(reversed(result))
+    @memoized_method
+    def _inactive(self, guard):
+        return any(
+            test.lhs.constant is not None
+            and test.rhs.constant is not None
+            and not test.evaluate({})
+            for test in guard.comparisons
+        )
+
+    @memoized_method
+    def _positions(self, site, coordinates):
+        path = self.dispatch._position_path(site, coordinates)
+        present = dict(coordinates)
+        if any(
+            scope.operation in self.control.loops and scope.operation not in present
+            for scope, _, _ in path
+        ):
+            return None
+        return path
 
     def _order_conditions(self, before, after):
         """Exact queue order under both endpoints' established activation.
@@ -613,13 +627,7 @@ class EventDomains:
         """
         if before.actor is not after.actor:
             return ()
-        if any(
-            test.lhs.constant is not None
-            and test.rhs.constant is not None
-            and not test.evaluate({})
-            for bound in (before, after)
-            for test in bound.guard.comparisons
-        ):
+        if self._inactive(before.guard) or self._inactive(after.guard):
             return ()
         key = (
             before.operation,
@@ -633,30 +641,27 @@ class EventDomains:
         )
         if key in self._order_facts:
             return self._order_facts[key]
-        a, b = self.dispatch.site(before), self.dispatch.site(after)
-        ap, bp = self._path(a), self._path(b)
-        ac, bc = dict(before.coordinates), dict(after.coordinates)
-        if any(
-            scope.operation in self.control.loops and scope.operation not in coordinates
-            for path, coordinates in ((ap, ac), (bp, bc))
-            for scope in path
-        ):
+        ap = self._positions(self.dispatch.site(before), before.coordinates)
+        bp = self._positions(self.dispatch.site(after), after.coordinates)
+        if ap is None or bp is None:
             return ()
         common = 0
-        while common < min(len(ap), len(bp)) and ap[common] is bp[common]:
+        while common < min(len(ap), len(bp)) and ap[common][0] is bp[common][0]:
             common += 1
+        # Native identities choose the real common invocation and lexical
+        # tie. The order formula then depends only on these actual clock
+        # expressions and the final tie direction, not every native pair.
+        word = tuple(
+            (ap[index][1], bp[index][1], index + 1 == common and bp[index][2] >= ap[index][2])
+            for index in range(common)
+        )
+        result = self._order_word(word)
+        self._order_facts[key] = result
+        return result
 
-        def position(task, path, coordinates, native, index):
-            owner = path[index]
-            coordinate = coordinates.get(owner.operation, literal(0))
-            if task.scope is owner:
-                stage, lexical = task.stage, task.lexical
-                phase = 0
-            else:
-                child = path[index + 1]
-                stage, lexical, phase = child.parent_stage, child.parent_lexical * 3 + 1, 0
-            return expression("add", coordinate, literal(stage)), (lexical, phase)
-
+    @memoized_method
+    def _order_word(self, word):
+        self.work.issue_order_words += 1
         conditions, prefix = [], ()
 
         def append(tests, test):
@@ -667,14 +672,14 @@ class EventDomains:
         # Earlier clocks dominate every descendant. At equal outer clocks
         # both endpoints enter the same child, so compare the next clock.
         # Only the final common scope can have distinct lexical/phase ranks.
-        for index in range(common):
-            ag, ar = position(a, ap, ac, False, index)
-            bg, br = position(b, bp, bc, True, index)
-            difference = self.arithmetic.bounded(expression("sub", bg, ag))
-            final = index + 1 == common
+        for index, (ag, bg, inclusive) in enumerate(word):
+            difference = (
+                literal(0) if ag == bg else self.arithmetic.bounded(expression("sub", bg, ag))
+            )
+            final = index + 1 == len(word)
             clause = append(
                 prefix,
-                Comparison(difference, ">=" if final and br >= ar else ">", literal(0)),
+                Comparison(difference, ">=" if inclusive else ">", literal(0)),
             )
             if clause is not None:
                 conditions.append(ActionGuard(clause))
@@ -683,9 +688,7 @@ class EventDomains:
             prefix = append(prefix, Comparison(difference, "==", literal(0)))
             if prefix is None:
                 break
-        result = tuple(conditions)
-        self._order_facts[key] = result
-        return result
+        return tuple(conditions)
 
     def _gate(self, notification):
         return (

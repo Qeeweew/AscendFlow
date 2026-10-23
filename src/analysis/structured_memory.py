@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from types import MappingProxyType
 
 from xdsl.dialects import scf
@@ -69,6 +70,10 @@ class NativeMemoryFacts:
     templates: tuple[MemoryTemplate, ...]
     addresses: Mapping[SSAValue, AddressFacts]
     native_contract_calls: int
+
+    @cached_property
+    def by_operation(self):
+        return MappingProxyType({template.operation: template for template in self.templates})
 
 
 def _operand_count(operation):
@@ -337,6 +342,12 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
         _check_mask_program(operation, refs, params)
         _check_mask_layout(operation)
         spec = native.NativeSpec(operation.native.data, engine, modes, params, geometries)
+        require(
+            not spec.registers or frame.participants == (Actor.AIC,),
+            "Load3D and FP32 register state belongs to the AIC",
+            phase="structured-memory",
+            location=str(operation.location),
+        )
         require(
             spec.packet is not None
             and spec.packet is audited_packet(spec.native)

@@ -288,7 +288,9 @@ def test_finite_fragment_sharing_also_checks_its_later_loop():
         i for a in plan.resources.assignments if a.notification in channel.members for i in a.ids
     }
     assert len(ids) == 1
-    shared = {frozenset((w.earlier, w.later)) for w in plan.resources.sharing}
+    from tests.support.structured import shared_message_pairs
+
+    shared = set(shared_message_pairs(plan))
     for assignment in plan.resources.assignments:
         if assignment.notification not in channel.members and ids.intersection(assignment.ids):
             # A proof for the startup member cannot license the later loop.

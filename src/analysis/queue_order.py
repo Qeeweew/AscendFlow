@@ -16,6 +16,7 @@ another whole-program progress search.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass
 
@@ -74,6 +75,9 @@ class QueueOrderWork:
     boundary_transfers: int
     origin_constraints: int
     origin_relaxations: int
+    gate_classes: int
+    gate_queries: int
+    routing_points: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +92,67 @@ class _Position:
     stage: int
     lexical: int
     child: Operation | None
+
+
+class _IssueIndex:
+    """A directed range tree, from a route query to actual publications only.
+
+    Internal vertices factor a union of possible blockers. They are neither
+    instructions nor completion/consumption milestones. Every leaf is an
+    original Set/input, and no tree edge returns to a Wait. Thus replacing a
+    Wait-to-range by paths through this tree preserves endpoint reachability
+    and the zero/positive weight of every blocking transfer.
+    """
+
+    def __init__(self, sources, positions, node, edge):
+        child_numbers = {positions[p].child: i for i, p in enumerate(sources)}
+        self.sources = sorted(
+            sources, key=lambda p: (positions[p].lexical, child_numbers[positions[p].child])
+        )
+        self.lexical = [positions[p].lexical for p in self.sources]
+        self.children = {}
+        for i, point in enumerate(self.sources):
+            child = positions[point].child
+            if child is not None:
+                start, _ = self.children.get(child, (i, i))
+                self.children[child] = start, i + 1
+        self.size = 1 << (len(self.sources) - 1).bit_length()
+        self.tree = [None] * (2 * self.size)
+        self.tree[self.size : self.size + len(self.sources)] = self.sources
+        for i in range(self.size - 1, 0, -1):
+            left, right = self.tree[2 * i : 2 * i + 2]
+            if left is None or right is None:
+                self.tree[i] = left if right is None else right
+            else:
+                self.tree[i] = node(self.sources[0])
+                edge(self.tree[i], left, 0)
+                edge(self.tree[i], right, 0)
+
+    def interval(self, start, end):
+        start, end = start + self.size, end + self.size
+        while start < end:
+            if start & 1:
+                yield self.tree[start]
+                start += 1
+            if end & 1:
+                end -= 1
+                yield self.tree[end]
+            start, end = start // 2, end // 2
+
+    def halves(self, position):
+        """Lexically earlier/later ranges, excluding this opaque child call."""
+        split = bisect_left(self.lexical, position.lexical)
+        omitted = self.children.get(position.child, (0, 0))
+        for lexical, start, end in ((False, 0, split), (True, split, len(self.sources))):
+            a, b = omitted
+            if a < end and b > start:
+                yield (
+                    lexical,
+                    tuple(self.interval(start, max(start, a)))
+                    + tuple(self.interval(min(end, b), end)),
+                )
+            else:
+                yield lexical, tuple(self.interval(start, end))
 
 
 class _OrderConstruction:
@@ -376,6 +441,9 @@ class _OrderConstruction:
         weights fail to telescope and could hide an actual blocking cycle.
         """
         actors = tuple(dict.fromkeys(p.actor for a, b, _ in relations for p in (a, b)))
+        # Same-actor nonnegative transfers impose no origin constraint. Keep
+        # negative self edges: they are incompatible, even without another actor.
+        relations = tuple((a, b, d) for a, b, d in relations if a.actor is not b.actor or d < 0)
         origins = dict.fromkeys(actors, 0)
         predecessor = {}
         last = None
@@ -413,14 +481,7 @@ class _OrderConstruction:
             )
         return origins
 
-    def _gate(self, region, wait, source):
-        wp, sp = self._position(wait, region), self._position(source, region)
-        # The child's exported transfer is authoritative for one invocation.
-        # Reentry into that same call belongs to the next parent step.
-        same_child = wp.child is not None and wp.child is sp.child
-        if same_child:
-            return 1 if region is not self.root else None
-        lexical = sp.lexical >= wp.lexical
+    def _gate_distance(self, region, wait, source, lexical):
         if region is not self.root and wait.bound is not None and source.bound is not None:
             a, _ = self._time(wait, region)
             b, _ = self._time(source, region)
@@ -455,6 +516,99 @@ class _OrderConstruction:
         if lexical:
             return 0
         return 1 if region is not self.root else None
+
+    def _gates(self, region, points, node, edge):
+        """Factor route-local gate relations without enumerating endpoint pairs.
+
+        Repeated channels share one lexical index, regardless of their stage
+        or coordinate expression. Only singleton/selected boundaries need time
+        classes: equal expressions and range hulls have the same finite gate
+        rule. A finite Wait also opens the repeated sources' time classes.
+        Work follows route indices and distinct boundary classes, not all
+        historical Wait x Set pairs. Arbitrary distinct finite selections may
+        still have distinct blocking relations; they are not merged by order.
+        """
+        positions = {p: self._position(p, region) for p in points}
+        sources = tuple(p for p in points if p.phase in {"set", "input"})
+        routes = {}
+        for wait in points:
+            if wait.phase in {"wait", "output"}:
+                key = wait.actor, None if self._controller(wait) else wait.engine
+                routes.setdefault(key, []).append(wait)
+
+        def finite(point):
+            return (
+                region is not self.root
+                and point.bound is not None
+                and self.control.invariant_over(self._time(point, region)[0], region)
+            )
+
+        def classes(group):
+            result = {}
+            for source in group:
+                # All members are bound endpoints. Guard hulls matter even
+                # when two selected coordinates have the same expression.
+                key = self._time(source, region)[0], self._boundary_time(source, region)
+                result.setdefault(key, []).append(source)
+            return tuple(tuple(group) for group in result.values())
+
+        for (actor, engine), waits in routes.items():
+            actual = tuple(
+                p for p in sources if p.actor is actor and (engine is None or p.engine is engine)
+            )
+            if not actual:
+                continue
+            indices = {}
+
+            def lookup(group, indices=indices):
+                if group not in indices:
+                    indices[group] = _IssueIndex(group, positions, node, edge)
+                    self.work["gate_classes"] += 1
+                return indices[group]
+
+            opaque = tuple(p for p in actual if p.bound is None)
+            repeated = tuple(p for p in actual if p.bound is not None and not finite(p))
+            selected = tuple(p for p in actual if finite(p))
+            selected_classes = classes(selected)
+            finite_waits = {p for p in waits if finite(p)}
+            repeated_classes = classes(repeated) if finite_waits else ()
+            all_sources = lookup(actual) if any(positions[p].child for p in waits) else None
+            regular_groups = tuple(
+                (group[0], lookup(group))
+                for group in (opaque + repeated,) + selected_classes
+                if group
+            )
+            finite_groups = (
+                tuple(
+                    (group[0], lookup(group))
+                    for group in (opaque,) + repeated_classes + selected_classes
+                    if group
+                )
+                if finite_waits
+                else ()
+            )
+            for wait in waits:
+                poll(
+                    "notification generation queue order",
+                    regions=len(self.regions),
+                    points=len(points),
+                )
+                position = positions[wait]
+                # Within one invocation the child's exported transfer is
+                # authoritative. Only reentry adds same-child gate edges.
+                if region is not self.root and all_sources is not None:
+                    start, end = all_sources.children.get(position.child, (0, 0))
+                    for target in all_sources.interval(start, end):
+                        edge(wait, target, 1)
+                groups = finite_groups if wait in finite_waits else regular_groups
+                for representative, issue in groups:
+                    for lexical, targets in issue.halves(position):
+                        if not targets:
+                            continue
+                        self.work["gate_queries"] += 1
+                        distance = self._gate_distance(region, wait, representative, lexical)
+                        for target in targets:
+                            edge(wait, target, distance)
 
     def _rank(self, region, points, edges):
         outgoing = [[] for _ in points]
@@ -502,45 +656,41 @@ class _OrderConstruction:
             if step is not None:
                 edges.add((index[source], index[destination], step))
 
+        def node(source):
+            point = QueuePoint(source.operation, source.actor, source.engine, "route")
+            index[point] = len(points)
+            points.append(point)
+            self.work["routing_points"] += 1
+            return point
+
+        endpoints = {}
+        for point in original:
+            endpoints.setdefault((point.notification, point.phase, point.case), []).append(point)
         for notification in own:
-            publications = tuple(
-                p for p in original if p.notification is notification and p.phase == "set"
-            )
-            waits = tuple(
-                p for p in original if p.notification is notification and p.phase == "wait"
-            )
-            for source in publications:
-                for wait in waits:
-                    if source.case is wait.case:
+            for case in self.domains.cases[notification]:
+                for source in endpoints.get((notification, "set", case), ()):
+                    for wait in endpoints.get((notification, "wait", case), ()):
                         distance = self._publication(region, source, wait)
                         if distance is not None:
                             relations.append((source, wait, distance))
         for child in children:
             for source, destination in child.transfers:
                 relations.append((source, destination, 0))
-        for wait in tuple(points):
-            if wait.phase not in {"wait", "output"}:
-                continue
-            for source in tuple(points):
-                poll(
-                    "notification generation queue order",
-                    regions=len(self.regions),
-                    points=len(points),
-                )
-                if source.phase in {"set", "input"} and self._route(wait, source):
-                    distance = self._gate(region, wait, source)
-                    if distance is not None:
-                        relations.append((wait, source, distance))
-
         origins = self._origins(region, relations)
+        for point in points:
+            origins.setdefault(point.actor, 0)
         for source, destination, distance in relations:
             shifted = distance + origins[destination.actor] - origins[source.actor]
             assert shifted >= 0, "clock-origin solution violated an established lower bound"
             edge(source, destination, int(shifted > 0))
 
+        self._gates(region, tuple(points), node, edge)
+
         # New cuts summarize only closed publications/gates and child cuts.
         # Open endpoints keep their actual identity and ancestor coordinates.
-        closed = tuple(p for p in points if p.bound is None or p.notification in own)
+        closed = tuple(
+            p for p in points if p.phase != "route" and (p.bound is None or p.notification in own)
+        )
         routes = tuple(
             dict.fromkeys(
                 (

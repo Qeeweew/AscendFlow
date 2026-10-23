@@ -7,6 +7,7 @@ source facts and actual control supply local ranges. Native, address,
 notification and control operations keep their identities.
 """
 
+from collections import ChainMap
 from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import cache
@@ -41,6 +42,7 @@ class ScalarFacts:
     ranges: dict = field(default_factory=dict)
     _range_data: dict = field(init=False, repr=False, compare=False)
     _observed: set = field(default_factory=set, init=False, repr=False, compare=False)
+    _parent: Self | None = field(default=None, init=False, repr=False, compare=False)
     revision: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -49,13 +51,35 @@ class ScalarFacts:
 
     def bound(self, value):
         self._observed.add(value)
+        if self._parent is not None and value not in self._range_data:
+            return self._parent.bound(value)
         return self.ranges.get(value)
+
+    @property
+    def version(self):
+        return self.revision if self._parent is None else (self.revision, self._parent.version)
+
+    def fork(self):
+        """Isolate a rewrite proposal's changed ranges without copying all SSA.
+
+        Inherited queries still observe their actual owner's revisions. Local
+        overrides cannot alter that owner, including when a proposal fails.
+        """
+        result = ScalarFacts(self.limits)
+        result._parent = self
+        result.ranges = MappingProxyType(ChainMap(result._range_data, self.ranges))
+        return result
 
     def bind_range(self, value, bounds):
         if self.ranges.get(value) != bounds:
             self._range_data[value] = bounds
             if value in self._observed:
                 self.revision += 1
+        elif self._parent is not None:
+            # An explicitly re-established result owns its range even if it
+            # currently equals the inherited one; later parent changes must
+            # not replace the proposal's new evaluation-domain fact.
+            self._range_data[value] = bounds
 
     @classmethod
     def from_control(cls, control=None):
@@ -294,7 +318,7 @@ class _Scope:
         # The clock only reports a possible input change. It never invalidates
         # sibling scopes: the actual parent/facts revisions below decide that.
         # Unchanged queries avoid recursively polling the same ancestor chain.
-        facts_revision = () if self.facts is None else (id(self.facts), self.facts.revision)
+        facts_revision = () if self.facts is None else (id(self.facts), self.facts.version)
         observed = self._clock[0], facts_revision
         if observed == self._observed:
             return

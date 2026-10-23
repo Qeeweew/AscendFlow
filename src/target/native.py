@@ -145,7 +145,7 @@ def native_read_resets(native: str, params: tuple[int, ...]) -> tuple[NativeRead
 
 
 def _implicit_completion(native, engine, params):
-    if native == "scalar_store":
+    if native in {"scalar_store", "set_fmatrix_a", "set_fmatrix_b", "set_load3d", "set_fp32"}:
         # Ordered Scalar issue does not publish the UB write to Vector.
         return False
     if engine is Engine.S:
@@ -156,6 +156,37 @@ def _implicit_completion(native, engine, params):
     # AtlasA2 CATLASS TileMmad fences short instructions: <10 output
     # fractals cannot supply the prior blanket M completion guarantee.
     return (m // 16) * (n // 16) >= 10
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterEffect:
+    """An actor-private hardware state access, distinct from tensor bytes."""
+
+    register: str
+    mode: str
+    value: int
+
+
+def register_effects(native, operands, params):
+    if native in {"set_fmatrix_a", "set_fmatrix_b"}:
+        return (
+            RegisterEffect("FMATRIX_A" if native.endswith("_a") else "FMATRIX_B", "W", params[0]),
+        )
+    common = (("L3D_RPT", 1 << 16), ("L3D_PADDING", 0), ("L3D_SIZE", 0))
+    if native == "set_load3d":
+        return tuple(RegisterEffect(name, "W", value) for name, value in common)
+    if native == "set_fp32":
+        return (RegisterEffect("FP32_MODE", "W", 1),)
+    if native in {"load3d_a", "load3d_b_nn"}:
+        return (
+            RegisterEffect(
+                "FMATRIX_A" if native == "load3d_a" else "FMATRIX_B", "R", operands[0].leading_rows
+            ),
+            *(RegisterEffect(name, "R", value) for name, value in common),
+        )
+    if native in {"mad", "mad_first", "mad_cycle"} and operands[0].dtype == "f32":
+        return (RegisterEffect("FP32_MODE", "R", 1),)
+    return ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +206,7 @@ class NativeSpec:
     packet: NativePacket | None = field(init=False)
     read_resets: tuple[NativeReadReset, ...] = field(init=False)
     implicit_completion: bool = field(init=False)
+    registers: tuple[RegisterEffect, ...] = field(init=False)
 
     def __post_init__(self):
         require(len(self.operands) == len(self.modes), "native operand/effect counts differ")
@@ -188,6 +220,9 @@ class NativeSpec:
             "conditional native reset needs a complete read/write operand",
         )
         object.__setattr__(self, "read_resets", resets)
+        object.__setattr__(
+            self, "registers", register_effects(self.native, self.operands, self.params)
+        )
         object.__setattr__(
             self, "implicit_completion", _implicit_completion(self.native, self.engine, self.params)
         )
@@ -210,13 +245,23 @@ def native_contract(
         all(isinstance(ref, NativeGeometry) for ref in refs),
         "native contract needs static NativeGeometry operands",
     )
+    if native in {"set_fmatrix_a", "set_fmatrix_b", "set_load3d", "set_fp32"}:
+        require(not refs, "register setters have no tensor operands")
+        if native in {"set_fmatrix_a", "set_fmatrix_b"}:
+            require(
+                len(params) == 1 and 1 <= params[0] <= 65535,
+                "FMATRIX needs a positive uint16 width",
+            )
+        else:
+            require(not params, "fixed register setup has no parameters")
+        return "S", ()
     if native in {"load3d_a", "load3d_b_nn"}:
         if refs and refs[0].dtype == "f32":
             require(len(params) == 2, "FP32 Load3D requires matrix dimensions")
             rows, cols = params
             source = refs[0]
             source_matches = source.contiguous or (
-                native == "load3d_a"
+                native in {"load3d_a", "load3d_b_nn"}
                 and source.nbytes == rows * 8 * 4
                 and source.rows == cols // 8
                 and source.row_stride % (16 * 8 * 4) == 0

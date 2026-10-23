@@ -8,8 +8,9 @@ logical writer establish numerical definedness, not asynchronous readiness.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from bisect import bisect_left
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -17,7 +18,7 @@ from xdsl.dialects import arith
 from xdsl.ir import SSAValue
 
 from ..diagnostics import ErrorKind, require
-from ..dialects.physical import FixConfigOp, Load3DConfigOp, TaskOp
+from ..dialects.physical import FixConfigOp, TaskOp
 from ..indexing import (
     arguments,
     domain_nonnegative,
@@ -59,9 +60,51 @@ class ReadAdmission:
     template: MemoryTemplate
     access: MemoryAccess
     participant: Actor
-    writers: tuple[TaskOp, ...]
+    writers: tuple[TaskOp, ...] | DefinitionSources
     external: bool = False
     initialization: ConditionalRead | None = None
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class DefinitionSources(Sequence):
+    """Immutable writer prefix; reads retain a snapshot without copying it.
+
+    Iteration is an explicit diagnostic query, not an admission operation.
+    A later extension cannot change a previously admitted read's sources.
+    """
+
+    previous: DefinitionSources | None = field(default=None, repr=False)
+    members: tuple[TaskOp, ...] = ()
+    count: int = 0
+
+    def extend(self, members):
+        members = tuple(members)
+        return DefinitionSources(self, members, self.count + len(members)) if members else self
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        nodes, node = [], self
+        while node is not None:
+            if node.members:
+                nodes.append(node.members)
+            node = node.previous
+        for members in reversed(nodes):
+            yield from members
+
+    def __getitem__(self, index):
+        return tuple(self)[index]
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if not isinstance(other, Sequence):
+            return NotImplemented
+        return len(self) == len(other) and all(a == b for a, b in zip(self, other, strict=True))
+
+    def __hash__(self):
+        return hash(tuple(self))
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +122,7 @@ class StructuredAdmission:
     instances: Mapping[tuple[TaskOp, int, Actor], StorageInstance]
     reads: tuple[ReadAdmission, ...]
     values: tuple[TileAdmission, ...]
-    configurations: tuple[FixConfigOp | Load3DConfigOp, ...]
+    configurations: tuple[FixConfigOp | TaskOp, ...]
     work: Mapping[str, int]
 
 
@@ -433,6 +476,92 @@ class _MatrixDefinitions:
         return definitions
 
 
+class _DefinitionSpans:
+    """Exact monotone byte union; constant adjacent intervals are one fact.
+
+    Pitched holes and symbolic coordinates retain their original spans. This
+    union provides numerical definedness only, never ownership or retirement.
+    """
+
+    def __init__(self):
+        self.intervals = []
+        self.symbolic = {}
+
+    def add(self, span, facts):
+        base, width = exact_constant(span.base, facts), exact_constant(span.width, facts)
+        if span.rows != 1 or base is None or width is None:
+            self.symbolic.setdefault(span, None)
+            return
+        if width <= 0:
+            return
+        end = base + width
+        intervals = self.intervals
+        first = bisect_left(intervals, (base,))
+        if first and intervals[first - 1][1] >= base:
+            first -= 1
+            base, end = intervals[first][0], max(end, intervals[first][1])
+        stop = first
+        while stop < len(intervals) and intervals[stop][0] <= end:
+            end = max(end, intervals[stop][1])
+            stop += 1
+        intervals[first:stop] = [(base, end)]
+
+    def spans(self):
+        return tuple(_Span(literal(a), literal(b - a)) for a, b in self.intervals) + tuple(
+            self.symbolic
+        )
+
+
+class _SpanDefinitions:
+    """Transfer each new real writer once per reader loop/activation context."""
+
+    def __init__(self, memory, work):
+        self.memory, self.work = memory, work
+        self.writes, self.contexts = {}, {}
+
+    def write(self, instance, template, access, actor):
+        self.writes.setdefault(instance, []).append((template, access, actor))
+
+    def before(self, instance, reader):
+        memory, facts = self.memory, self.memory.control.environment.facts
+        guards = _guards(reader.frame, memory.control.environment)
+        key = instance, reader.frame.loops(), guards
+        cursor, definitions, guarded, writers, known = self.contexts.setdefault(
+            key, (0, _DefinitionSpans(), [], DefinitionSources(), set())
+        )
+        writes = self.writes.get(instance, ())
+        for writer, output, actor in writes[cursor:]:
+            self.work["span_region_transfers"] += 1
+            span = _writer_span(writer, output, actor, reader, memory)
+            if span is not None:
+                definitions.add(span, facts)
+                if writer.operation not in known:
+                    known.add(writer.operation)
+                    writers = writers.extend((writer.operation,))
+                    self.work["definition_source_nodes"] += 1
+                    self.work["definition_source_members"] += 1
+            missing = tuple(
+                guard
+                for guard in _guards(writer.frame, memory.control.environment)
+                if not any(_same_guard(guard, other, facts) for other in guards)
+            )
+            if missing:
+                guarded.append((writer, output, actor, missing))
+        if cursor != len(writes):
+            conditional = []
+            for span, members in _conditional_spans(guarded, reader, memory):
+                definitions.add(span, facts)
+                for member in members:
+                    if member not in known:
+                        known.add(member)
+                        conditional.append(member)
+            writers = writers.extend(conditional)
+            self.work["definition_source_nodes"] += bool(conditional)
+            self.work["definition_source_members"] += len(conditional)
+        self.contexts[key] = len(writes), definitions, guarded, writers, known
+        return definitions.spans(), writers
+
+
 def _complete_branch_paths(paths, facts):
     """Cover a full ordered branch tree without assuming any input values.
 
@@ -692,64 +821,29 @@ def _covers(spans, read, frame, facts, work):
     return False
 
 
-def _configurations(memory):
+def _configurations(memory, work):
+    from .registers import admit_register_definitions
+
     root = memory.module.body.block.first_op
     positions = {operation: index for index, operation in enumerate(memory.control.frames)}
-    configs = tuple(op for op in positions if isinstance(op, (FixConfigOp, Load3DConfigOp)))
-    for kind in (FixConfigOp, Load3DConfigOp):
-        matching = tuple(op for op in configs if isinstance(op, kind))
+    configs = tuple(op for op in positions if isinstance(op, FixConfigOp))
+    _require(
+        len(configs) <= 1, "native register configuration must have one invariant writer", root
+    )
+    for operation in configs:
         _require(
-            len(matching) <= 1, "native register configuration must have one invariant writer", root
+            operation.parent is root.body.block,
+            "native register configuration must execute at kernel entry",
+            operation,
         )
-        for operation in matching:
+    for template in memory.templates:
+        if template.spec.native in {"fix", "fix16"}:
             _require(
-                operation.parent is root.body.block,
-                "native register configuration must execute at kernel entry",
-                operation,
-            )
-            if isinstance(operation, Load3DConfigOp):
-                _require(
-                    operation.fp32 is None or operation.fp32.data == 1,
-                    "only IEEE FP32 Cube mode is supported",
-                    operation,
-                )
-        for template in memory.templates:
-            float_mad = (
-                kind is Load3DConfigOp
-                and template.spec.native in {"mad", "mad_first", "mad_cycle"}
-                and template.accesses[0].address.geometry.dtype == "f32"
-            )
-            if float_mad:
-                _require(
-                    bool(matching)
-                    and matching[0].fp32 is not None
-                    and positions[matching[0]] < positions[template.operation],
-                    "FP32 MAD requires a preceding IEEE mode configuration",
-                    template.operation,
-                )
-            if template.spec.native not in (
-                {"fix", "fix16"} if kind is FixConfigOp else {"load3d_a", "load3d_b_nn"}
-            ):
-                continue
-            _require(
-                bool(matching) and positions[matching[0]] < positions[template.operation],
+                bool(configs) and positions[configs[0]] < positions[template.operation],
                 "native requires a preceding invariant register configuration",
                 template.operation,
             )
-            if kind is Load3DConfigOp:
-                width = (
-                    matching[0].a_width
-                    if template.spec.native == "load3d_a"
-                    else matching[0].b_width
-                )
-                source = template.accesses[0].address.geometry
-                actual_width = source.leading_rows
-                _require(
-                    width.data == actual_width,
-                    "Load3D invariant FMATRIX width does not match the actual native",
-                    template.operation,
-                )
-    return configs
+    return configs + admit_register_definitions(memory, work=work)
 
 
 def _selected_values(structure, memory, templates, facts):
@@ -835,6 +929,9 @@ def admit_structured_memory(
         "row_intervals": 0,
         "expanded_iterations": 0,
         "l1_region_transfers": 0,
+        "span_region_transfers": 0,
+        "definition_source_nodes": 0,
+        "definition_source_members": 0,
     }
     for root in bounds.allocations:
         initialized = root.owner.initialized.data
@@ -864,10 +961,11 @@ def admit_structured_memory(
         "distinct external roots need the launch's disjoint pointer contract",
         memory.module.body.block.first_op,
     )
-    configurations = _configurations(memory)
+    configurations = _configurations(memory, work)
     _native_aliases(memory)
-    instances, reads, prior = {}, [], {}
+    instances, reads = {}, []
     matrices = _MatrixDefinitions(memory, work)
+    spans = _SpanDefinitions(memory, work)
     defined_writes = set()
     templates = {item.operation: item for item in memory.templates}
     positions = {item.operation: index for index, item in enumerate(memory.templates)}
@@ -917,25 +1015,7 @@ def admit_structured_memory(
                     )
                     reads.append(ReadAdmission(template, access, actor, writers))
                     continue
-                candidates = []
-                writers = []
-                guarded = []
-                reader_guards = _guards(template.frame, environment)
-                for writer, output, participant in prior.get(instance, ()):
-                    span = _writer_span(writer, output, participant, template, memory)
-                    if span is not None:
-                        candidates.append(span)
-                        writers.append(writer.operation)
-                    missing = tuple(
-                        guard
-                        for guard in _guards(writer.frame, environment)
-                        if not any(_same_guard(guard, other, facts) for other in reader_guards)
-                    )
-                    if missing:
-                        guarded.append((writer, output, participant, missing))
-                for span, members in _conditional_spans(guarded, template, memory):
-                    candidates.append(span)
-                    writers.extend(members)
+                candidates, writers = spans.before(instance, template)
                 needed = _span(access, _participant(actor, memory.control.sid))
                 # The checked source/native mapping keeps every legal read
                 # inside the logical allocation. Once real writers define all
@@ -958,7 +1038,7 @@ def admit_structured_memory(
                         actor.value,
                     ),
                 )
-                reads.append(ReadAdmission(template, access, actor, tuple(dict.fromkeys(writers))))
+                reads.append(ReadAdmission(template, access, actor, writers))
             # Reads of all participants precede this instruction's writes below.
         for actor in template.participants:
             for access in template.accesses:
@@ -986,7 +1066,7 @@ def admit_structured_memory(
                         access.address.geometry,
                     )
                     if signature not in defined_writes:
-                        prior.setdefault(key, []).append((template, access, actor))
+                        spans.write(key, template, access, actor)
                         defined_writes.add(signature)
     values = []
     for use, reader, selected, binding, substitutions in selected_values:
@@ -1108,6 +1188,7 @@ def admit_structured_memory(
     work["configuration_writers"] = len(configurations)
     work["defined_write_frontier"] = len(defined_writes)
     work["l1_definition_contexts"] = len(matrices.contexts)
+    work["span_definition_contexts"] = len(spans.contexts)
     return StructuredAdmission(
         structure,
         memory,

@@ -4,7 +4,7 @@ from collections import defaultdict
 
 from xdsl.dialects import arith, scf
 
-from ..dialects.physical import FixConfigOp, Load3DConfigOp, MixedOp, TaskOp
+from ..dialects.physical import FixConfigOp, MixedOp, TaskOp
 from ..dialects.structured import ActorDomainOp, AddressOp, NotificationOp, PipelineLoopOp
 from ..target.ascend910b import Actor
 
@@ -25,7 +25,7 @@ class ScalarUses:
             for actor in template.participants:
                 mark(template.operation, "cube" if actor is Actor.AIC else "vector")
         for op in module.walk():
-            if isinstance(op, (FixConfigOp, Load3DConfigOp)):
+            if isinstance(op, FixConfigOp):
                 mark(op, "cube")
             elif isinstance(op, NotificationOp):
                 for actor in op.participants:

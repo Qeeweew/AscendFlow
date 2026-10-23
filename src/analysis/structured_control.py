@@ -169,6 +169,21 @@ class ControlFrame:
         return False
 
 
+class _ScalarPrefix:
+    """One lexical SSA prefix index and its incrementally decoded atoms."""
+
+    def __init__(self, values, positions):
+        self.values, self.positions = tuple(values), positions
+        self.symbols = [frozenset()]
+
+    def arguments(self, count, environment):
+        while len(self.symbols) <= count:
+            names = arguments(environment.expression(self.values[len(self.symbols) - 1]))
+            previous = self.symbols[-1]
+            self.symbols.append(previous if names <= previous else previous | names)
+        return self.symbols[count]
+
+
 @dataclass(frozen=True)
 class ControlFacts:
     module: ModuleOp
@@ -182,27 +197,47 @@ class ControlFacts:
     operations_visited: int
 
     @memoized_method
-    def dominating_scalars(self, block, before):
-        """Actual scalar definitions available at this lexical insertion point.
+    def _scalar_prefix(self, block):
+        def scalar(value):
+            return isinstance(value.type, IndexType) or value.type == i1
 
-        Newly inserted notifications are absent from this owned input snapshot.
-        No range query or claim of cross-invocation equality is involved.
-        """
         values = []
+        owner = block.parent_op()
+        if owner is not None and owner.parent is not None:
+            values.extend(self.dominating_scalars(owner.parent, owner))
+        values.extend(v for v in block.args if scalar(v))
+        positions = {}
+        for operation in block.ops:
+            if operation in self.frames:
+                positions[operation] = len(values)
+                values.extend(v for v in operation.results if scalar(v))
+        positions[None] = len(values)
+        return _ScalarPrefix(values, positions)
 
-        def visit(block, stop):
-            owner = block.parent_op()
-            if owner is not None and owner.parent is not None:
-                visit(owner.parent, owner)
-            values.extend(block.args)
-            for operation in block.ops:
-                if operation is stop:
-                    break
-                if operation in self.frames:
-                    values.extend(operation.results)
+    def _scalar_position(self, block, before):
+        prefix = self._scalar_prefix(block)
+        # Inserted notifications/scalars have no source definitions in this
+        # snapshot. Their position is the next retained original operation.
+        while before not in prefix.positions:
+            before = before.next_op
+        return prefix, prefix.positions[before]
 
-        visit(block, before)
-        return tuple(v for v in values if isinstance(v.type, IndexType) or v.type == i1)
+    @memoized_method
+    def dominating_scalars(self, block, before):
+        """Actual scalar definitions at this owned lexical insertion point.
+
+        Each block's prefix is indexed once, including its true ancestor
+        prefix. Newly inserted operations do not grant source availability.
+        No range query or cross-invocation equality claim is involved.
+        """
+        prefix, count = self._scalar_position(block, before)
+        return prefix.values[:count]
+
+    @memoized_method
+    def dominating_arguments(self, block, before):
+        """Analysis atoms of the same actual dominating SSA definitions."""
+        prefix, count = self._scalar_position(block, before)
+        return prefix.arguments(count, self.environment)
 
     @memoized_method
     def invariant_over(self, value: Expr, operation: Operation) -> bool:

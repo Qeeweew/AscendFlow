@@ -9,7 +9,7 @@ from types import MappingProxyType
 
 from ..budget import poll
 from ..diagnostics import require
-from ..dialects.physical import FixConfigOp, Load3DConfigOp
+from ..dialects.physical import FixConfigOp
 from ..scalar import expression, literal
 from ..target.ascend910b import Actor, Engine, SyncKind
 from .event_coloring import exclusive_pressure_banks
@@ -19,7 +19,9 @@ from .event_contracts import (
     EventResourceProblem,
     VirtualEventAction,
 )
-from .event_counter_groups import plan_counter_groups
+from .event_counter_groups import plan_counter_groups, plan_counter_time_groups
+from .event_frontier_contracts import FrozenEventRelations
+from .event_frontiers import LocalEventFrontiers
 from .event_peers import bind_event_peers
 from .event_sharing import share_counter_time, share_counters, share_events
 from .notification_lifetimes import HandbackRule
@@ -95,6 +97,7 @@ class _Planning:
         )
         self.paired = set() if established is None else established.paired
         self.pressured = set()
+        self.frontiers = None if established is None else established.frontiers
 
     def action(
         self,
@@ -131,13 +134,7 @@ class _Planning:
     def reservations_and_credits(self):
         root = self.domains.memory.module.body.block.first_op
         for operation in self.domains.control.frames:
-            engine = (
-                Engine.FIX
-                if isinstance(operation, FixConfigOp)
-                else Engine.MTE1
-                if isinstance(operation, Load3DConfigOp)
-                else None
-            )
+            engine = Engine.FIX if isinstance(operation, FixConfigOp) else None
             if engine is None:
                 continue
             self.reservations.append(
@@ -148,12 +145,6 @@ class _Planning:
                     operation,
                 )
             )
-            if isinstance(operation, Load3DConfigOp) and operation.fp32 is not None:
-                self.reservations.append(
-                    EventReservation(
-                        (Actor.AIC, Engine.S, Engine.M), 0, "IEEE FP32 Cube mode", operation
-                    )
-                )
         drained = set()
         for task in self.domains.dispatch.tasks.values():
             bank = task.actor, task.engine, Engine.S
@@ -317,18 +308,12 @@ class _Planning:
         # a bank that can hold every preferred credit exclusively.
         pressured = exclusive_pressure_banks(self.demands, self.reservations, peers)
         self.pressured = pressured
-        for a, b in combinations(range(len(self.demands)), 2):
+        counters = [i for i, demand in enumerate(self.demands) if demand.backlog is not None]
+        for a, b in combinations(counters, 2):
             left, right = self.demands[a], self.demands[b]
             if left.persistent is not None or right.persistent is not None:
                 continue
-            if (left.backlog is None) != (right.backlog is None):
-                continue
-            if left.backlog is None and not set(left.banks).intersection(right.banks):
-                continue
-            common = (
-                {None} if left.backlog is not None else set(left.banks).intersection(right.banks)
-            )
-            if not common.intersection(pressured):
+            if None not in pressured:
                 continue
             poll("virtual event reuse constraints", pairs=len(result))
             witnesses = []
@@ -344,7 +329,10 @@ class _Planning:
                 break
             else:
                 result[a, b] = tuple(witnesses)
-        return MappingProxyType(result)
+        self.frontiers = LocalEventFrontiers(
+            self.domains, self.handbacks, self.demands, self.compatible, established=self.frontiers
+        )
+        return FrozenEventRelations(result, self.frontiers.build(pressured))
 
     def time_relations(self):
         result = {}
@@ -397,8 +385,18 @@ class _Planning:
         relations = self.relations(peers)
         time_relations = self.time_relations()
         self.domains.work.peer_equalities = len(peers)
-        counter_groups = plan_counter_groups(self.program, self.demands, relations)
+        counter_groups = plan_counter_groups(
+            self.program,
+            self.demands,
+            relations,
+            compatible=self.compatible,
+            handbacks=self.handbacks,
+        )
         self.domains.work.counter_groups = len(counter_groups)
+        compositions = plan_counter_time_groups(
+            self.program, self.demands, counter_groups, time_relations
+        )
+        self.domains.work.counter_compositions = len(compositions)
         result = object.__new__(EventResourceProblem)
         for name, value in (
             ("selection", self.program.selection),
@@ -410,6 +408,7 @@ class _Planning:
             ("actions", actions),
             ("peers", peers),
             ("counter_groups", counter_groups),
+            ("counter_compositions", compositions),
             ("counter_reuses", time_relations),
             ("reservations", tuple(self.reservations)),
             ("relations", relations),

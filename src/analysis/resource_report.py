@@ -9,6 +9,7 @@ from functools import cache
 from itertools import pairwise
 
 from .event_contracts import LOCAL_CAPACITY, SUPPORTED_CROSS_IDS
+from .event_frontier_contracts import LocalEventReuse
 from .structured_protocols import NotificationKind
 
 
@@ -31,6 +32,70 @@ def event_resource_report(plan):
 
     def bank(value):
         return [item.value for item in value]
+
+    frontiers, frontier_numbers = [], {}
+    certificates, certificate_numbers = [], {}
+
+    def frontier(value):
+        if value not in frontier_numbers:
+            number = frontier_numbers[value] = len(frontiers)
+            record = {"head": numbers[value.head], "tail": numbers[value.tail]}
+            frontiers.append(record)
+            record["children"] = [frontier(child) for child in value.children]
+            return number
+        return frontier_numbers[value]
+
+    def certificate(value):
+        if value not in certificate_numbers:
+            certificate_numbers[value] = len(certificates)
+            certificates.append(
+                {
+                    "interfaces": [
+                        {
+                            "left": frontier(p.left),
+                            "right": frontier(p.right),
+                            "forward": p.forward,
+                            "original": None
+                            if p.original is None
+                            else [type(w).__name__ for w in p.original],
+                        }
+                        for p in value.interfaces
+                    ],
+                }
+            )
+        return certificate_numbers[value]
+
+    def resource_numbers(mask):
+        result = []
+        while mask:
+            low = mask & -mask
+            result.append(low.bit_length() - 1)
+            mask ^= low
+        return result
+
+    def sharing(value):
+        if isinstance(value, LocalEventReuse):
+            return {
+                "kind": "LocalEventReuse",
+                "bank": bank(value.bank),
+                "id": value.event,
+                "credits": [
+                    {"resource": r, "members": [numbers[n] for n in members]}
+                    for r, members in value.credits
+                ],
+                "rectangles": [
+                    {
+                        "left": resource_numbers(s.left),
+                        "right": resource_numbers(s.right),
+                        "certificate": certificate(s.certificate),
+                    }
+                    for s in value.rectangles
+                ],
+            }
+        return {
+            "kind": type(value).__name__,
+            "members": [numbers[value.earlier], numbers[value.later]],
+        }
 
     def point(value):
         return {
@@ -104,6 +169,25 @@ def event_resource_report(plan):
             ],
             "fifo_reentry": "matching filtered words in lexicographic clock order",
             "additional_controller_orders": [],
+            "episodes": [
+                {
+                    "resources": list(e.resources),
+                    "words": [
+                        {
+                            "phase": phase,
+                            "actor": actor.value,
+                            "messages": [key for key in word if key[0] in members],
+                        }
+                        for phase, actor, word in e.words
+                    ],
+                }
+                for e in certificate.episodes
+            ],
+            "episode_order": [
+                {"phase": phase, "actor": actor.value, "earlier": point(old), "later": point(new)}
+                for phase, actor, old, new, _ in certificate.boundaries
+            ],
+            "backlog_rule": "sum of complete-credit bounds across all episodes",
         }
 
     def counter_reuse(group):
@@ -243,15 +327,49 @@ def event_resource_report(plan):
         "reservations": [
             {"bank": bank(r.bank), "id": r.event, "reason": r.reason} for r in plan.reservations
         ],
-        "sharing": [
-            {"kind": type(w).__name__, "members": [numbers[w.earlier], numbers[w.later]]}
-            for w in plan.sharing
-        ],
+        "sharing": [sharing(w) for w in plan.sharing],
+        "local_event_certificates": certificates,
+        "local_event_frontiers": frontiers,
         "counter_groups": [
             counter_group(event, certificate, members)
             for event, certificate, members in plan.counter_groups
         ],
         "counter_time_reuse": [counter_reuse(group) for group in plan.counter_reuse_groups],
+        "counter_compositions": [
+            {
+                "id": event,
+                "resources": list(members),
+                "groups": [
+                    sorted(group.intersection(members))
+                    for group in certificate.groups
+                    if group.intersection(members)
+                ],
+                "maximum_backlog": backlog,
+                "backlog_rule": "maximum of FIFO-child sums, after complete consumption handbacks",
+                "fifo": [
+                    counter_group(
+                        event, leaf, tuple(sorted(set(leaf.resources).intersection(members)))
+                    )
+                    for leaf in certificate.fifo
+                    if len(set(leaf.resources).intersection(members)) > 1
+                ],
+                "time_reuses": [
+                    {
+                        "resources": [a, b],
+                        "earlier": numbers[w.earlier],
+                        "later": numbers[w.later],
+                        "rule": w.rule,
+                        "handbacks": [
+                            {"consume": point(h.consume), "next_set": point(h.next_set)}
+                            for h in w.handbacks
+                        ],
+                    }
+                    for a, b, w in certificate.witnesses
+                    if a in members and b in members
+                ],
+            }
+            for event, certificate, members, backlog in plan.counter_compositions
+        ],
         "actions": [
             {
                 "operation": operations[a.anchor],

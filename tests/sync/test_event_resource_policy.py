@@ -200,5 +200,7 @@ def test_metadata_selected_last_is_not_built_for_an_absent_parent_carry():
     absences = [c.absence for c in selection.coverage if c.absence is not None]
     assert absences and all(a.answer.impossible and a.premises for a in absences)
     domains = EventDomains(selection, ResourceWork())
-    assert any(f.discharged for f in domains._activations.values())
+    # Fused Prepare no longer needs a metadata-only predicate discharge.
+    # The actual regression is absence before selected LAST construction,
+    # followed by admission of every surviving endpoint above.
     assert all(not name.captures for name in domains.facts)

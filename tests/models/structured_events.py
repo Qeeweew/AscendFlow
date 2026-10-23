@@ -30,7 +30,6 @@ from ascendflow.dialects.physical import (
     EndOp,
     FixConfigOp,
     KernelOp,
-    Load3DConfigOp,
     MixedOp,
     RuntimeSizeOp,
     TaskOp,
@@ -95,6 +94,7 @@ class Command:
     event: int | None = None
     spans: tuple[Span, ...] = ()
     implicit: bool = False
+    registers: tuple = ()
     issue: int = -1
     begin: int = -1
     end: int = -1
@@ -125,6 +125,7 @@ class FiniteExecution:
     reachable: tuple[int, ...]
     bytes_read: int
     bytes_written: int
+    register_hazards: tuple = ()
 
     @property
     def natives(self):
@@ -223,6 +224,10 @@ class _Interpret:
                 template.spec.engine,
                 spans=tuple(spans),
                 implicit=template.spec.implicit_completion,
+                registers=tuple(
+                    (effect.register, effect.mode, effect.value)
+                    for effect in template.spec.registers
+                ),
             )
         )
         _check(len(self.commands) <= self.maximum, "finite model command budget exceeded")
@@ -388,7 +393,7 @@ class _Interpret:
                                 actor,
                                 (*coordinates, (operation, ordinal)),
                             )
-            elif isinstance(operation, (FixConfigOp, Load3DConfigOp)):
+            elif isinstance(operation, FixConfigOp):
                 pass  # Admitted invariant register packets; no tensor access.
             else:
                 self.arithmetic(operation, values)
@@ -648,6 +653,47 @@ def _accesses(logical, physical, reach, order):
     return tuple(hazards), bytes_read, bytes_written
 
 
+def _register_accesses(logical, physical, reach, order):
+    """Check SPR values and old-reader retirement independently of byte aliases."""
+    actual = {c.occurrence: c for c in physical if c.kind == "native"}
+    current, writers, reads = {}, defaultdict(list), []
+    for command in logical:
+        key = command.occurrence
+        _check(command.registers == actual[key].registers, "native register effects changed")
+        for name, mode, value in command.registers:
+            cell = key.group, key.actor, name
+            if mode == "R":
+                _check(
+                    cell in current and current[cell][1] == value,
+                    f"undefined or incorrect source register value: {name}",
+                )
+                reads.append((cell, key, current[cell][0]))
+            else:
+                current[cell] = key, value
+                writers[cell].append(key)
+    hazards, following = [], {}
+
+    def require_order(kind, cell, source, consumer):
+        if source == consumer:
+            return
+        _check(
+            bool(reach[actual[source].end] & (1 << actual[consumer].begin)),
+            f"unordered register {kind}: {cell[2]} {source.label} -> {consumer.label}",
+        )
+        hazards.append((kind, cell, source, consumer))
+
+    for cell, versions in writers.items():
+        versions.sort(key=lambda key: order[actual[key].begin])
+        for old, new in pairwise(versions):
+            require_order("WAW", cell, old, new)
+            following[cell, old] = new
+    for cell, reader, writer in reads:
+        require_order("RAW", cell, writer, reader)
+        if (next_writer := following.get((cell, writer))) is not None:
+            require_order("WAR", cell, reader, next_writer)
+    return tuple(hazards)
+
+
 def _reference_correspondence(memory, reference):
     """Map independent snapshots; synchronization may only add scalar/sync IR.
 
@@ -825,4 +871,7 @@ def check_structured_events(
     )
     reach, consumptions, order = _causality(physical.commands)
     hazards, reads, writes = _accesses(expected, physical.commands, reach, order)
-    return FiniteExecution(tuple(physical.commands), consumptions, hazards, reach, reads, writes)
+    registers = _register_accesses(expected, physical.commands, reach, order)
+    return FiniteExecution(
+        tuple(physical.commands), consumptions, hazards, reach, reads, writes, registers
+    )

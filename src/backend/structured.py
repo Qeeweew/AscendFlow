@@ -22,7 +22,6 @@ from ..dialects.physical import (
     EndOp,
     FixConfigOp,
     KernelOp,
-    Load3DConfigOp,
     MixedOp,
     RuntimeSizeOp,
     TaskOp,
@@ -34,7 +33,7 @@ from ..dialects.structured import (
 )
 from ..passes.executable import ExecutablePlan, NativeExecution
 from ..target.ascend910b import Actor
-from .native import QUALIFIER, load3d_init
+from .native import QUALIFIER
 from .structured_native import format_native
 
 _BINARY = {
@@ -385,18 +384,6 @@ class _Emitter:
                         "asc_sync_notify(PIPE_S, PIPE_FIX, 0);",
                         "asc_sync_wait(PIPE_S, PIPE_FIX, 0);",
                     ]
-            elif isinstance(operation, Load3DConfigOp):
-                if context.family == "cube":
-                    if operation.fp32 is not None:
-                        lines += [
-                            "asc_set_fp32_mode();",
-                            "asc_sync_notify(PIPE_S, PIPE_M, event_t(0));",
-                            "asc_sync_wait(PIPE_S, PIPE_M, event_t(0));",
-                        ]
-                    lines.extend(
-                        line.strip()
-                        for line in load3d_init((operation.a_width.data, operation.b_width.data))
-                    )
             elif isinstance(operation, RuntimeSizeOp):
                 self.bind(operation.value, f"npu_size_{operation.sym_name.data}", context)
             elif isinstance(operation, CoreIdOp):

@@ -160,8 +160,16 @@ class AliasRegion:
 
 
 @dataclass(frozen=True, slots=True)
+class RegisterCell:
+    """An actor-private SPR ordering domain, with no tensor address or alias."""
+
+    register: str
+    private: Actor
+
+
+@dataclass(frozen=True, slots=True)
 class StructuredNeed:
-    cell: StorageCell | AliasRegion
+    cell: StorageCell | AliasRegion | RegisterCell
     kind: HazardKind
     source: AccessOccurrence
     consumer: AccessOccurrence

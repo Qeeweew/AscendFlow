@@ -18,6 +18,8 @@ from xdsl.ir import Operation
 from ..diagnostics import require
 from ..dialects.physical import KernelOp, MixedOp, TaskOp
 from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
+from ..memo import memoized_method
+from ..scalar import expression, literal
 from ..target.ascend910b import Actor, Engine
 from .access_frontier import QueueEndpoint
 from .local_schedule import LocalSchedule, bind_local_schedules
@@ -25,8 +27,10 @@ from .structured_memory import MemoryTemplate, NativeMemoryFacts
 from .structured_schedule import Placement
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class DispatchScope:
+    """One actual actor invocation scope, compared by identity."""
+
     operation: Operation
     actor: Actor
     name: str
@@ -90,7 +94,10 @@ class StructuredDispatch:
 
     def site(self, point):
         occurrence = getattr(point, "occurrence", point)
-        endpoint = occurrence.endpoint
+        return self._site(occurrence.endpoint, getattr(point, "placement", Placement.BEFORE))
+
+    @memoized_method
+    def _site(self, endpoint, placement):
         if isinstance(endpoint, QueueEndpoint):
             scope, stage, entry, exit = self.boundaries[endpoint.operation, endpoint.participant]
             lexical = entry * 3 if endpoint.placement is Placement.ENTRY else exit * 3 + 2
@@ -101,8 +108,7 @@ class StructuredDispatch:
                     "queue prefix retirement lost its admitted Scalar source contract",
                 )
             return IssueSite(scope, stage, lexical, endpoint.engine, bool(endpoint.retirements))
-        task = self.tasks[occurrence.operation, occurrence.participant]
-        placement = getattr(point, "placement", Placement.BEFORE)
+        task = self.tasks[endpoint.operation, endpoint.participant]
         return IssueSite(
             task.scope,
             task.stage,
@@ -110,6 +116,42 @@ class StructuredDispatch:
             task.engine,
             task.implicit_completion,
         )
+
+    def position_path(self, point):
+        """Hierarchical issue coordinates; no activation or completion claim."""
+        return self._position_path(self.site(point), point.coordinates)
+
+    @memoized_method
+    def _position_path(self, site, coordinates):
+        coordinates = dict(coordinates)
+        children, scope = [], site.scope
+        while scope.parent is not None:
+            children.append(scope)
+            scope = scope.parent
+        result = []
+        for child in reversed(children):
+            parent = child.parent
+            result.append(
+                (
+                    parent,
+                    expression(
+                        "add",
+                        coordinates.get(parent.operation, literal(0)),
+                        literal(child.parent_stage),
+                    ),
+                    child.parent_lexical * 3 + 1,
+                )
+            )
+        result.append(
+            (
+                site.scope,
+                expression(
+                    "add", coordinates.get(site.scope.operation, literal(0)), literal(site.stage)
+                ),
+                site.lexical,
+            )
+        )
+        return tuple(result)
 
 
 def bind_structured_dispatch(memory: NativeMemoryFacts) -> StructuredDispatch:

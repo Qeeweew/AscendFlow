@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from ..diagnostics import CompileError, ErrorKind, require
 from ..memo import memoized_method
 from ..scalar import expression, literal, substitute
+from ..target.ascend910b import Engine
 from .event_contracts import CROSS_BACKLOG, LOCAL_CAPACITY, CaseLease, StructuredEventLease
 from .guard_cover import opposite, prove_guard_cover
 from .structured_protocols import NotificationKind
@@ -39,6 +40,41 @@ class Reuse:
     handbacks: tuple[Handback, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _ReturnPort:
+    relay: object
+    publication: object
+    acquisition: object
+    condition: ActionGuard
+
+
+class _Ports:
+    """Demand-built actual handoff interfaces, replayed without reopening them.
+
+    Stop at the first covering interface as before. In particular, an unused
+    optional child boundary is never forced just to populate an index.
+    """
+
+    def __init__(self, ports):
+        self.ports = iter(ports)
+        self.established = []
+        self.complete = False
+
+    def __iter__(self):
+        index = 0
+        while True:
+            if index == len(self.established):
+                if self.complete:
+                    return
+                try:
+                    self.established.append(next(self.ports))
+                except StopIteration:
+                    self.complete = True
+                    return
+            yield self.established[index]
+            index += 1
+
+
 class HandbackRule:
     def __init__(self, domains, *, boundaries=()):
         self.domains = domains
@@ -47,10 +83,22 @@ class HandbackRule:
         )
         self.at_native = {}
         self.at_queue = {}
+        self.from_queue = {}
+        self.routes = {}
         self.boundary_cases = dict(boundaries)
         self.declined_boundaries = {}
         for peer in self.peers:
             for source in peer.sources:
+                for engine in (None, peer.source_engine):
+                    self.from_queue.setdefault((source.actor, engine), []).append(peer)
+                    for consumer in peer.consumers:
+                        destinations = (
+                            tuple(Engine) if domains._gate(peer) else (peer.destination_engine,)
+                        )
+                        for destination in destinations:
+                            self.routes.setdefault(
+                                (source.actor, engine, consumer.actor, destination), []
+                            ).append(peer)
                 self.at_native.setdefault((source.operation, source.actor), []).append(
                     (peer, source)
                 )
@@ -59,18 +107,56 @@ class HandbackRule:
                     (site.scope, site.stage, source.actor, peer.source_engine), []
                 ).append((peer, source))
 
-    def _eligible(self, old_channel, old, target_channel, target, peer):
-        return (
-            any(old.actor is p.actor for p in peer.sources)
-            and (
-                self.domains._gate(old_channel)
-                or old_channel.destination_engine is peer.source_engine
-            )
-            and any(target.actor is p.actor for p in peer.consumers)
-            and (
-                self.domains._gate(peer) or peer.destination_engine is target_channel.source_engine
-            )
-        )
+    @memoized_method
+    def single_case(self, notification):
+        domains = self.domains
+        cases = domains.cases[notification]
+        if len(cases) != 1 or cases[0].empty or cases[0].windows:
+            return None
+        case = cases[0]
+        root = domains.memory.module.body.block.first_op
+        for point in notification.sources + notification.consumers:
+            if any(not domains.control.invariant_over(v, root) for _, v in point.coordinates):
+                return None
+            instance = domains._instance(point, {}, case=case)
+            if any(
+                not domains.control.invariant_over(t.lhs, root)
+                or not domains.control.invariant_over(t.rhs, root)
+                for t in instance.guard.comparisons
+            ):
+                return None
+        return case
+
+    @memoized_method
+    def ordered_stream(self, notification, case):
+        """Canonical clocks advance the real sites by unit translations.
+
+        Selected child FIRST/LAST coordinates are allowed only when independent
+        of that child clock. Reversed or mixed coordinate maps are not episodes.
+        """
+        domains = self.domains
+        clocks = domains.clocks[notification]
+        if not clocks or tuple(w.loop for w in case.windows) != clocks:
+            return False
+        for point in notification.sources + notification.consumers:
+            if point.families:
+                return False
+            actual = dict(point.coordinates)
+            for loop in clocks:
+                if loop not in actual:
+                    return False
+                shift = domains.arithmetic.normalize(
+                    expression("sub", actual[loop], domains.control.loops[loop].ordinal)
+                )
+                if not domains.control.invariant_over(shift, loop):
+                    return False
+            if any(
+                not domains.control.invariant_over(value, loop)
+                for loop, value in point.coordinates
+                if loop not in clocks
+            ):
+                return False
+        return True
 
     def _cases(self, peer):
         cases = self.domains.cases[peer]
@@ -118,17 +204,17 @@ class HandbackRule:
             )
         ).constant
 
-    def candidates(self, peers, loop, delta, *, reentry, old, target):
+    def candidates(self, peer, loop, *, old, end, native):
         d = self.domains
         # Pairing already maps both ends of a channel. At an actual native
         # admission, bind a returning publication directly to that same
         # occurrence. No FIRST/LAST member or child-existence projection is
         # needed to identify a native we already have in hand.
         actual = {d.control.loops[l].ordinal: value for l, value in old.coordinates}
-        for peer in peers:
-            for source in peer.sources:
-                if source.operation is not old.operation or source.actor is not old.actor:
-                    continue
+        for candidate, source in (
+            self.at_native.get((old.operation, old.actor), ()) if native else ()
+        ):
+            if candidate is peer:
                 bindings = {
                     ordinal: substitute(source.expression(ordinal), actual) for ordinal in actual
                 }
@@ -153,36 +239,185 @@ class HandbackRule:
                         for p in sources
                     )
                     yield peer, sources, consumers
-        if loop is None:
-            for peer in peers:
-                for case in self._cases(peer):
-                    if not case.empty:
-                        for sources, consumers in d._instances(peer, case, None, 0):
-                            yield peer, sources, consumers
+        if native:
             return
-        begin, end = self._step(old, loop), self._step(target, loop)
-        for peer in peers:
-            starts = [self._step(p, loop) for p in peer.sources]
-            stops = [self._step(p, loop) for p in peer.consumers]
-            repeated = loop in d.clocks[peer]
-            if repeated and any(s is None for s in starts + stops):
-                continue
-            if repeated and begin is not None and end is not None:
-                offsets = range(begin - max(starts), end - min(stops) + 1)
-            elif repeated:
-                # Non-unit selected/reentry coordinates cannot supply a
-                # constant finite handback horizon under this rule.
-                continue
-            else:
-                offsets = (0,)
+        if loop is None:
             for case in self._cases(peer):
-                if case.empty:
+                if not case.empty:
+                    for sources, consumers in d._instances(peer, case, None, 0):
+                        yield peer, sources, consumers
+            return
+        begin = self._step(old, loop)
+        starts = [self._step(p, loop) for p in peer.sources]
+        stops = [self._step(p, loop) for p in peer.consumers]
+        repeated = loop in d.clocks[peer]
+        if repeated and any(s is None for s in starts + stops):
+            return
+        if repeated and begin is not None and end is not None:
+            offsets = range(begin - max(starts), end - min(stops) + 1)
+        elif repeated:
+            # Non-unit selected/reentry coordinates cannot supply a
+            # constant finite handback horizon under this rule.
+            return
+        else:
+            offsets = (0,)
+        for case in self._cases(peer):
+            if case.empty:
+                continue
+            for offset in offsets:
+                yield from (
+                    (peer, sources, consumers)
+                    for sources, consumers in d._instances(peer, case, loop, offset)
+                )
+
+    @memoized_method
+    def _peers(self, operation, actor, engine, target_actor=None, target_engine=None):
+        peers = (
+            self.from_queue.get((actor, engine), ())
+            if target_actor is None
+            else self.routes.get((actor, engine, target_actor, target_engine), ())
+        )
+        return tuple(
+            sorted(
+                peers,
+                key=lambda p: (
+                    not any(s.operation is operation and s.actor is actor for s in p.sources)
+                ),
+            )
+        )
+
+    @memoized_method
+    def _publication_ports(self, old, peer, loop, end, native):
+        """Consumption-to-publication interfaces independent of the next user.
+
+        The route index establishes the engine/controller premise. Keep every
+        actual source order and activation; a caller still has to establish
+        receiver-to-next-publication order under its own reuse assumptions.
+        """
+        d = self.domains
+
+        def build():
+            for _, sources, consumers in self.candidates(
+                peer, loop, old=old, end=end, native=native
+            ):
+                d.work.handback_port_candidates += 1
+                first = []
+                for source in sources:
+                    d.work.lifetime_interfaces += 1
+                    if order := d._order_conditions(old, source):
+                        first.append((source, order))
+                if first:
+                    d.work.handback_ports += 1
+                    yield peer, sources, consumers, tuple(first)
+
+        return _Ports(build())
+
+    def _outgoing(self, old, peers, loop, end, exclude):
+        # Filter the destination route before opening child boundaries, while
+        # sharing each publication interface with both one/two-relay users.
+        allowed = frozenset(peers)
+        for peer, _ in self.at_native.get((old.operation, old.actor), ()):
+            if peer is not exclude and peer in allowed:
+                yield from self._publication_ports(old, peer, loop, end, True)
+        for peer in peers:
+            if peer is not exclude:
+                yield from self._publication_ports(old, peer, loop, end, False)
+
+    @memoized_method
+    def _returns(self, channel, old, loop, end, actor, engine):
+        """Guarded earliest return ports for one destination queue.
+
+        Under identical guards and complete coordinate/selection contexts,
+        a later acquisition adds no target Set that the earlier acquisition
+        cannot precede. Both ports
+        already block this destination engine/controller; only unconditional
+        actual issue order authorizes dropping the later alternative. No
+        completion edge is added. Two-relay matching keeps every original
+        intermediate native/queue port.
+        """
+        d = self.domains
+        source_engine = None if d._gate(channel) else channel.destination_engine
+        peers = self._peers(old.operation, old.actor, source_engine, actor, engine)
+
+        def build():
+            frontier = {}
+            for peer, sources, consumers, first_orders in self._outgoing(
+                old, peers, loop, end, channel
+            ):
+                active = tuple(
+                    dict.fromkeys(t for p in sources + consumers for t in p.guard.comparisons)
+                )
+                context = tuple(
+                    (p.actor, p.coordinates, p.coordinate_guards, p.families, p.selected)
+                    for p in sources + consumers
+                )
+                for source, first in first_orders:
+                    for order in first:
+                        guard = ActionGuard(tuple(dict.fromkeys(active + order.comparisons)))
+                        earlier = frontier.setdefault((guard, context), [])
+                        for wait in consumers:
+                            if wait.actor is not actor:
+                                continue
+                            d.work.handback_return_candidates += 1
+                            if any(
+                                d._order_conditions(prior, wait) == (ActionGuard(),)
+                                for prior in earlier
+                            ):
+                                d.work.dominated_handback_returns += 1
+                                continue
+                            earlier.append(wait)
+                            yield _ReturnPort(peer, source, wait, guard)
+
+        return _Ports(build())
+
+    @memoized_method
+    def _seconds(self, peer, middle, queue_composition, actor, engine):
+        """Actual next handoffs at this one acquired native/queue occurrence."""
+        d = self.domains
+
+        def build():
+            site = d.dispatch.site(middle)
+            seconds = dict.fromkeys(
+                (
+                    *self.at_native.get((middle.operation, middle.actor), ()),
+                    *(
+                        self.at_queue.get(
+                            (site.scope, site.stage, middle.actor, peer.destination_engine), ()
+                        )
+                        if queue_composition
+                        else ()
+                    ),
+                )
+            )
+            actual = {d.control.loops[l].ordinal: v for l, v in middle.coordinates}
+            for second, second_source in seconds:
+                if (
+                    second is peer
+                    or not any(actor is w.actor for w in second.consumers)
+                    or not (d._gate(second) or second.destination_engine is engine)
+                ):
                     continue
-                for offset in offsets:
-                    yield from (
-                        (peer, sources, consumers)
-                        for sources, consumers in d._instances(peer, case, loop, offset)
+                bindings = {
+                    ordinal: substitute(second_source.expression(ordinal), actual)
+                    for ordinal in actual
+                }
+                for case in d.cases[second]:
+                    if case.empty:
+                        continue
+                    d.work.handback_compositions += 1
+                    ss = d._instance(second_source, bindings, case=case)
+                    via = d._following_conditions(peer, middle, second, ss)
+                    if not via:
+                        continue
+                    match = tuple(
+                        Comparison(v, "==", dict(ss.coordinates)[l])
+                        for l, v in middle.coordinates
+                        if l in dict(ss.coordinates)
                     )
+                    waits = tuple(d._instance(p, bindings, case=case) for p in second.consumers)
+                    yield second, ss, waits, via, match
+
+        return _Ports(build())
 
     def establish(
         self,
@@ -208,6 +443,7 @@ class HandbackRule:
             dict.fromkeys(assumptions + d._input_ranges(old) + d._input_ranges(target))
         )
         conditions, handbacks = [], []
+        checked = -1
 
         def add(guard, relay=None, source=None, wait=None):
             remaining = []
@@ -225,50 +461,31 @@ class HandbackRule:
             handbacks.append(Handback(old, target, relay, source, wait, guard))
 
         def covered():
+            nonlocal checked
+            # A rejected union cannot start covering merely because another
+            # candidate supplied no new evidence. Its premises are unchanged.
+            if checked == len(conditions):
+                return False
+            checked = len(conditions)
+            d.work.handback_cover_queries += 1
             return prove_guard_cover(d.arithmetic, assumptions, tuple(conditions)) is not None
 
         for condition in d._following_conditions(channel, old, target_channel, target):
             add(condition)
         if covered():
             return tuple(handbacks)
-        peers = tuple(
-            p
-            for p in self.peers
-            if p is not channel and self._eligible(channel, old, target_channel, target, p)
-        )
-        # A consume before native admission can return on that native's
-        # already-required publication. Try this local rule first: it has
-        # the exact issue-site correspondence, without accumulating guards
-        # from unrelated queue handoffs in the containing kernel.
-        peers = tuple(
-            sorted(
-                peers,
-                key=lambda p: (
-                    not any(
-                        s.operation is old.operation and s.actor is old.actor for s in p.sources
-                    )
-                ),
-            )
-        )
-        for peer, sources, consumers in self.candidates(
-            peers, loop, delta, reentry=reentry, old=old, target=target
+        source_engine = None if d._gate(channel) else channel.destination_engine
+        end = None if loop is None else self._step(target, loop)
+        for port in self._returns(
+            channel, old, loop, end, target.actor, target_channel.source_engine
         ):
             d.work.handback_candidates += 1
-            active = tuple(
-                dict.fromkeys(t for p in sources + consumers for t in p.guard.comparisons)
-            )
-            for source in sources:
-                first = d._following_conditions(channel, old, peer, source)
-                if not first:
-                    continue
-                for wait in consumers:
-                    last = d._following_conditions(peer, wait, target_channel, target)
-                    for a in first:
-                        for b in last:
-                            guard = ActionGuard(
-                                tuple(dict.fromkeys(active + a.comparisons + b.comparisons))
-                            )
-                            add(guard, peer, source, wait)
+            last = d._following_conditions(port.relay, port.acquisition, target_channel, target)
+            for order in last:
+                guard = ActionGuard(
+                    tuple(dict.fromkeys(port.condition.comparisons + order.comparisons))
+                )
+                add(guard, port.relay, port.publication, port.acquisition)
             if covered():
                 return tuple(handbacks)
         if max_relays == 1:
@@ -278,87 +495,43 @@ class HandbackRule:
         # publication in the same stage/queue can also carry the consumption,
         # but only with its own checked queue order and occurrence binding.
         # This is a bounded two-handoff rule, not arbitrary path search.
-        first_peers = tuple(
-            p
-            for p in self.peers
-            if p is not channel
-            and any(old.actor is s.actor for s in p.sources)
-            and (d._gate(channel) or channel.destination_engine is p.source_engine)
-        )
-        for peer, sources, consumers in self.candidates(
-            first_peers, loop, delta, reentry=reentry, old=old, target=target
+        peers = self._peers(old.operation, old.actor, source_engine)
+        for peer, sources, consumers, first_orders in self._outgoing(
+            old, peers, loop, end, channel
         ):
             for middle in consumers:
-                site = d.dispatch.site(middle)
-                seconds = dict.fromkeys(
-                    (
-                        *self.at_native.get((middle.operation, middle.actor), ()),
-                        *(
-                            self.at_queue.get(
-                                (site.scope, site.stage, middle.actor, peer.destination_engine), ()
-                            )
-                            if queue_composition
-                            else ()
-                        ),
-                    )
-                )
-                for second, second_source in seconds:
-                    if (
-                        second in (channel, peer)
-                        or not any(target.actor is w.actor for w in second.consumers)
-                        or not (
-                            d._gate(second)
-                            or second.destination_engine is target_channel.source_engine
-                        )
-                    ):
+                for second, ss, waits, via, match in self._seconds(
+                    peer, middle, queue_composition, target.actor, target_channel.source_engine
+                ):
+                    if second is channel:
                         continue
-                    actual = {d.control.loops[l].ordinal: v for l, v in middle.coordinates}
-                    bindings = {
-                        ordinal: substitute(second_source.expression(ordinal), actual)
-                        for ordinal in actual
-                    }
-                    for case in d.cases[second]:
-                        if case.empty:
-                            continue
-                        d.work.handback_compositions += 1
-                        ss = d._instance(second_source, bindings, case=case)
-                        via = d._following_conditions(peer, middle, second, ss)
-                        if not via:
-                            continue
-                        match = tuple(
-                            Comparison(v, "==", dict(ss.coordinates)[l])
-                            for l, v in middle.coordinates
-                            if l in dict(ss.coordinates)
-                        )
-                        active = (
-                            tuple(
-                                t for p in sources + consumers + (ss,) for t in p.guard.comparisons
-                            )
-                            + match
-                        )
-                        for source in sources:
-                            first = d._following_conditions(channel, old, peer, source)
-                            for wait in (
-                                d._instance(p, bindings, case=case) for p in second.consumers
-                            ):
-                                last = d._following_conditions(second, wait, target_channel, target)
-                                for a in first:
-                                    for middle_order in via:
-                                        for b in last:
-                                            guard = ActionGuard(
-                                                tuple(
-                                                    dict.fromkeys(
-                                                        active
-                                                        + wait.guard.comparisons
-                                                        + a.comparisons
-                                                        + middle_order.comparisons
-                                                        + b.comparisons
-                                                    )
+                    active = (
+                        tuple(t for p in sources + consumers + (ss,) for t in p.guard.comparisons)
+                        + match
+                    )
+                    last_orders = tuple(
+                        (wait, d._following_conditions(second, wait, target_channel, target))
+                        for wait in waits
+                    )
+                    for source, first in first_orders:
+                        for wait, last in last_orders:
+                            for a in first:
+                                for middle_order in via:
+                                    for b in last:
+                                        guard = ActionGuard(
+                                            tuple(
+                                                dict.fromkeys(
+                                                    active
+                                                    + wait.guard.comparisons
+                                                    + a.comparisons
+                                                    + middle_order.comparisons
+                                                    + b.comparisons
                                                 )
                                             )
-                                            add(guard, (peer, second), (source, ss), (middle, wait))
-                        if covered():
-                            return tuple(handbacks)
+                                        )
+                                        add(guard, (peer, second), (source, ss), (middle, wait))
+                    if covered():
+                        return tuple(handbacks)
         return None
 
     def reuse(self, channel, case, window, width, *, reentry, queue_composition=True):

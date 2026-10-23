@@ -12,12 +12,14 @@ from dataclasses import replace
 from math import gcd, lcm
 
 from ..analysis.access_frontier import LoopResidueSelection, QueueEndpoint, ResiduePosition
+from ..analysis.acquired_prefixes import AcquiredPrefixes
 from ..analysis.integer_facts import IntegerFacts
 from ..analysis.region_coordinates import ScalarScope
 from ..analysis.smt import all_of, any_of
 from ..analysis.structured_dependencies import StructuredDependencies
 from ..analysis.structured_dispatch import StructuredDispatch
 from ..analysis.structured_protocols import (
+    BindingWork,
     BoundPlacement,
     EmptyOrdinalDomain,
     FamilyCapture,
@@ -35,10 +37,10 @@ from ..analysis.structured_regions import (
     BranchGuard,
     LoopCountGuard,
     LoopOrdinalGuard,
+    RegisterCell,
 )
 from ..analysis.structured_schedule import ActionGuard, Comparison, Placement
 from ..diagnostics import CompileError, ErrorKind, require
-from ..dialects.physical import TaskOp
 from ..indexing import arguments, equivalent, nonnegative, normalize
 from ..scalar import Expr, expression, literal
 from ..symbols import Symbol, is_coordinate, symbol_order
@@ -182,9 +184,7 @@ def _bind_endpoint(
     engine = (
         endpoint.engine
         if isinstance(endpoint, QueueEndpoint)
-        else next(
-            item.spec.engine for item in memory.templates if item.operation is occurrence.operation
-        )
+        else memory.by_operation[occurrence.operation].spec.engine
     )
     substitutions, coordinate_guards, tests, families, selector_tests, coordinates = (
         {},
@@ -199,14 +199,22 @@ def _bind_endpoint(
     family_map = {domain.loop: domain for domain in occurrence.families}
     available = {control.group.args[0], control.sid.args[0]}
     available.update(name for name in environment.facts if not is_coordinate(name))
-    for frame in occurrence.frame.ancestors():
-        operation = frame.operation
-        if isinstance(operation, TaskOp) and operation.native.data == "index_load":
-            if operation is occurrence.operation and not source:
-                continue
-            # This load dominates the actual insertion scope. Its SSA result
-            # may be consumed here; no reload or different iteration is used.
-            available.update(arguments(environment.expression(operation.value)))
+    placement = (
+        endpoint.placement
+        if isinstance(endpoint, QueueEndpoint)
+        else Placement.AFTER
+        if source
+        else Placement.BEFORE
+    )
+    before = (
+        occurrence.operation
+        if placement in {Placement.BEFORE, Placement.ENTRY}
+        else occurrence.operation.next_op
+    )
+    # Consume the same actual SSA availability as domain admission and
+    # materialization, including short-circuit condition results. Repeated
+    # needs at this position share its atoms, never another invocation's SSA.
+    available.update(control.dominating_arguments(occurrence.operation.parent, before))
     scalar_scope = ScalarScope(
         tuple(
             Expr("argument", (symbol,))
@@ -387,11 +395,7 @@ def _bind_endpoint(
     )
     return BoundPlacement(
         occurrence,
-        endpoint.placement
-        if isinstance(endpoint, QueueEndpoint)
-        else Placement.AFTER
-        if source
-        else Placement.BEFORE,
+        placement,
         guard,
         tuple(substitutions.items()),
         tuple(coordinate_guards),
@@ -404,28 +408,10 @@ def _bind_endpoint(
 
 def _dispatch_path(placement, dispatch):
     """Actual hierarchical controller issue positions, in canonical coordinates."""
-    task = dispatch.site(placement)
-    coordinates = dict(placement.coordinates)
-    scopes, scope = [], task.scope
-    while scope.parent is not None:
-        scopes.append(scope)
-        scope = scope.parent
-    result = []
-    for child in reversed(scopes):
-        parent = child.parent
-        ordinal = coordinates.get(parent.operation, literal(0))
-        result.append(
-            (
-                parent.operation,
-                expression("add", ordinal, literal(child.parent_stage)),
-                child.parent_lexical * 3 + 1,
-            )
-        )
-    ordinal = coordinates.get(task.scope.operation, literal(0))
-    result.append(
-        (task.scope.operation, expression("add", ordinal, literal(task.stage)), task.lexical)
+    return tuple(
+        (scope.operation, coordinate, rank)
+        for scope, coordinate, rank in dispatch.position_path(placement)
     )
-    return tuple(result)
 
 
 class _IssueOrder:
@@ -439,6 +425,7 @@ class _IssueOrder:
 
     def __init__(self, dispatch):
         self.dispatch = dispatch
+        self.binding_work = BindingWork()
         self.arithmetic = IntegerFacts(dispatch.memory.control.environment.facts)
         self._loop_order = {loop: index for index, loop in enumerate(dispatch.memory.control.loops)}
         self._premises = {}
@@ -789,32 +776,24 @@ def _reuse_acquisitions(notifications, order):
             scope = scope.parent
         return task.actor.value, tuple(reversed(steps)), item.source_engine.value
 
-    selected, candidates = [], {}
+    def activation(item):
+        return (
+            _domain_key(item),
+            tuple(order.guards(item.requirements[0])),
+            tuple(point.families for point in item.consumers),
+        )
+
+    frontier = AcquiredPrefixes(notifications, order, _route_key, activation, order.binding_work)
+    selected = []
     for item in sorted(notifications, key=key):
-        route = _route_key(item)
-        for index in candidates.get(route, ()):
+        index = frontier.find(item, _contains_activation)
+        if index is not None:
             previous = selected[index]
-            if not _contains_activation(previous, item, order):
-                continue
-            acquire = _capture_order(previous.consumers, item.consumers, item.requirements, order)
-            if not acquire <= {-1, 0}:
-                continue
-            capture = _capture_order(
-                item.sources,
-                previous.consumers
-                if previous.mechanism is NotificationKind.PIPE_FENCE
-                else previous.sources,
-                item.requirements,
-                order,
-            )
-            if not capture <= {-1, 0}:
-                continue
             selected[index] = replace(
                 previous, requirements=previous.requirements + item.requirements
             )
-            break
         else:
-            candidates.setdefault(route, []).append(len(selected))
+            frontier.add(item, len(selected))
             selected.append(item)
     return tuple(selected)
 
@@ -950,7 +929,7 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
             need.period,
             need.domains,
             order.guards(need),
-            need.cell.root.type.bank,
+            RegisterCell if isinstance(need.cell, RegisterCell) else need.cell.root.type.bank,
         )
         bundles.setdefault(key, []).append(need)
     for bundle in bundles.values():
@@ -1031,5 +1010,5 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
                 )
             )
     return SynchronizationSelection(
-        dependencies, dispatch, selected, tuple(coverage), tuple(unresolved)
+        dependencies, dispatch, selected, tuple(coverage), tuple(unresolved), order.binding_work
     )

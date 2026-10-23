@@ -669,7 +669,7 @@ def _packet(operations, scope, work, ranks, changed):
     if scope.facts is not None:
         # Proposal-only domains must not borrow a result's old guarded bound
         # after moving its evaluation into the common packet entry.
-        local.facts = ScalarFacts(scope.facts.limits, dict(scope.facts.ranges))
+        local.facts = scope.facts.fork()
 
     def collect(op, guard):
         if _scalar_arithmetic(op):

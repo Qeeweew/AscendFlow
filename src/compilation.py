@@ -89,6 +89,7 @@ class Compilation:
                 },
                 "admission": dict(plan.admission.work),
                 "dependencies": asdict(plan.dependencies.work),
+                "binding": asdict(plan.selection.binding_work),
                 "resources": asdict(plan.resources.work),
                 "generation": {
                     **asdict(plan.generation.order.work),

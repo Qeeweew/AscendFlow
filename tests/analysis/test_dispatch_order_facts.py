@@ -10,6 +10,8 @@ from dataclasses import replace
 import pytest
 
 from ascendflow.analysis.access_frontier import AccessEndpoint
+from ascendflow.analysis.event_contracts import ResourceWork
+from ascendflow.analysis.event_domains import EventDomains
 from ascendflow.analysis.structured_protocols import BoundPlacement
 from ascendflow.analysis.structured_regions import (
     AccessOccurrence,
@@ -180,6 +182,35 @@ def test_varying_clock_order_stays_unknown_in_both_directions(clocks):
     assert any(observations) and not all(observations)
     assert order.compare(varying, fixed, active) is None
     assert order.compare(fixed, varying, active) is None
+
+
+def test_event_order_words_match_actual_issue_trace_and_keep_endpoint_admission(clocks):
+    selection, loop, _ = clocks
+    domains = EventDomains(selection, ResourceWork())
+    points = [
+        point(selection, loop, native, expression("add", loop.ordinal, literal(shift)), phase)
+        for native in (0, 1)
+        for shift in (0, 1)
+        for phase in (Placement.BEFORE, Placement.AFTER)
+    ]
+    for iteration in range(3):
+        context = {"n": 4, loop.ordinal.args[0]: iteration}
+        positions = {
+            p: (finite_position(selection, p, context), p.placement is Placement.AFTER)
+            for p in points
+        }
+        for before in points:
+            for after in points:
+                conditions = domains._order_conditions(before, after)
+                assert any(g.evaluate(context) for g in conditions) == (
+                    positions[before] <= positions[after]
+                )
+    before, after = points[0], points[-1]
+    inactive = replace(before, guard=ActionGuard((Comparison(literal(0), "==", literal(1)),)))
+    assert not domains._order_conditions(inactive, after)
+    assert not domains._order_conditions(replace(before, coordinates=()), after)
+    other = point(selection, loop, 1, loop.ordinal, Placement.BEFORE, Actor.AIV1)
+    assert not domains._order_conditions(before, other)
 
 
 def test_count_and_residue_premises_are_owned_by_the_complete_need(clocks):

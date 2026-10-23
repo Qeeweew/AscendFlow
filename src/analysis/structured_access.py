@@ -37,6 +37,7 @@ from .structured_regions import (
     Guard,
     LoopCountGuard,
     LoopDomain,
+    RegisterCell,
     StorageCell,
 )
 
@@ -51,7 +52,7 @@ class CellEffect:
 
     template: MemoryTemplate
     participant: Actor
-    accesses: tuple[MemoryAccess, ...]
+    accesses: tuple[MemoryAccess | StateAccess, ...]
 
     @property
     def mode(self):
@@ -67,9 +68,19 @@ class CellEffect:
 
 
 @dataclass(frozen=True)
+class StateAccess:
+    """Register order uses the same sequence/loop transfers, without fake bytes."""
+
+    mode: AccessMode
+    read_condition: None = None
+
+
+@dataclass(frozen=True)
 class PartitionedAccesses:
     memory: NativeMemoryFacts
-    effects: Mapping[TaskOp, Mapping[StorageCell | AliasRegion, tuple[CellEffect, ...]]]
+    effects: Mapping[
+        TaskOp, Mapping[StorageCell | AliasRegion | RegisterCell, tuple[CellEffect, ...]]
+    ]
     patterns: Mapping[tuple[StorageCell | AliasRegion, Operation], tuple[int, int | Expr]]
     work: DependencyWork
 
@@ -831,6 +842,13 @@ class _Partitioner:
 
     def build(self):
         self._project()
+        for template in self.memory.templates:
+            for actor in template.participants:
+                for access in template.spec.registers:
+                    cell = RegisterCell(access.register, actor)
+                    self.effects.setdefault(template.operation, {}).setdefault(cell, []).append(
+                        CellEffect(template, actor, (StateAccess(AccessMode(access.mode)),))
+                    )
         # Unresolved/multiple-residue partitions were already retained as
         # AliasRegion above. Consumers receive one optional precision fact,
         # never a new frontier-closure obligation.

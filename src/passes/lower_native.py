@@ -29,7 +29,6 @@ from ..dialects.physical import (
     EndOp,
     FixConfigOp,
     KernelOp,
-    Load3DConfigOp,
     MixedOp,
     RuntimeSizeOp,
     TaskOp,
@@ -59,7 +58,7 @@ from ..dialects.source import (
     WhereOp,
     YieldOp,
 )
-from ..dialects.structured import ActorDomainOp, PipelineLoopOp, PipelineStageOp
+from ..dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
 from ..dialects.types import TaskType, TileType, ref_type
 from ..indexing import multiple_of, validate_static_arithmetic
 from ..scalar import facts_from_sizes, from_ssa
@@ -152,27 +151,15 @@ class _Lowerer:
         self.needs_fp32 = any(
             isinstance(op, MatmulOp) and op.a.type.dtype.data == "f32" for op in source.walk()
         )
-        widths = {
-            width for op in source.walk() if (width := recipes.strided_b_width(op)) is not None
-        }
-        self.load3d_b_width = next(iter(widths)) if len(widths) == 1 else None
-        a_copies = [
-            (op, width)
-            for op in source.walk()
-            if (width := recipes.compact_a_width(op)) is not None
-        ]
-        a_widths = {width for _, width in a_copies}
-        self.load3d_a_width = (
-            next(iter(a_widths))
-            if len(a_widths) == 1
-            and (
-                self.load3d_b_width is not None
-                or self.needs_fp32
-                or any(op.source.type.dtype.data == "f32" for op, _ in a_copies)
+        self.load3d_a = (
+            self.needs_fp32
+            or any(recipes.strided_b_width(op) is not None for op in source.walk())
+            or any(
+                recipes.compact_a_width(op) is not None and op.source.type.dtype.data == "f32"
+                for op in source.walk()
             )
-            else None
         )
-        self.needs_load3d = False
+        self.register_uses = []
         self.work = Counter(source_operations=0, native_templates=0, expanded_iterations=0)
 
     def scalar(self, value, scope):
@@ -292,7 +279,6 @@ class _Lowerer:
             mask_layout=None,
         ):
             self.needs_fix |= native in {"fix", "fix16"}
-            self.needs_load3d |= native in {"load3d_a", "load3d_b_nn"}
             scalar_operands = tuple(operands)
             if native in {"mad_first", "mad_cycle"}:
                 require(scope.pipeline is not None, "native reset needs its logical ordinal")
@@ -326,6 +312,14 @@ class _Lowerer:
             task.location = op.location
             scope.block.add_op(task)
             self.task_scopes[task] = scope.execution
+            if native in {"load3d_a", "load3d_b_nn"}:
+                address = refs[0].owner
+                while isinstance(address, AddressOp):
+                    address = address.source.owner
+                matrix = address.matrix_shape
+                self.register_uses.append(
+                    (task, scope, "a" if native == "load3d_a" else "b", matrix.data[-2].data)
+                )
             self.work["native_templates"] += 1
             self.family_work[scope.family] += 1
             return task
@@ -355,8 +349,7 @@ class _Lowerer:
             aligned=lambda address, alignment: multiple_of(
                 from_ssa(address.owner.offset), alignment, self.index_facts
             ),
-            load3d_b_width=self.load3d_b_width,
-            load3d_a_width=self.load3d_a_width,
+            load3d_a=self.load3d_a,
         )
         if isinstance(op, CopyOp):
             result = recipes.lower_copy(op, context)
@@ -723,17 +716,60 @@ def lower_native_structure(source) -> NativeStructure:
         # reader, even when a containing runtime loop has zero iterations.
         # Its native packet includes the target S -> FIX readiness handshake.
         body.insert_op_before(FixConfigOp(), core)
-    if lowerer.needs_load3d:
-        body.insert_op_before(
-            Load3DConfigOp.build(
-                attributes={
-                    "a_width": IntAttr(lowerer.load3d_a_width or 1),
-                    "b_width": IntAttr(lowerer.load3d_b_width or 1),
-                    **({"fp32": IntAttr(1)} if lowerer.needs_fp32 else {}),
-                }
-            ),
-            core,
+    setup = []
+
+    def register_task(native, params, task_scope, stage=0):
+        task = TaskOp.build(
+            operands=[()],
+            attributes={
+                **task_attrs(f"register_{len(lowerer.task_scopes)}", native, stage, params),
+                "address_count": IntAttr(0),
+            },
+            result_types=[TaskType(), None],
         )
+        lowerer.task_scopes[task] = task_scope
+        lowerer.work["native_templates"] += 1
+        return task
+
+    if lowerer.needs_fp32:
+        setup.append(register_task("set_fp32", (), scope.execution))
+    if lowerer.register_uses:
+        setup.append(register_task("set_load3d", (), scope.execution))
+        widths = {}
+        for _, _, side, width in lowerer.register_uses:
+            widths.setdefault(side, set()).add(width)
+        for side, values in widths.items():
+            if len(values) == 1:
+                setup.append(
+                    register_task(f"set_fmatrix_{side}", (next(iter(values)),), scope.execution)
+                )
+        for task, use_scope, side, width in lowerer.register_uses:
+            if len(widths[side]) > 1:
+                setter = register_task(
+                    f"set_fmatrix_{side}", (width,), use_scope.execution, use_scope.stage
+                )
+                task.parent.insert_op_before(setter, task)
+    if setup:
+        # Generated ready guards can depend on runtime sizes and the group
+        # coordinate. Keep their real SSA definitions before the setters;
+        # the invariant Fixpipe packet itself has no such dependency.
+        setup_before = next(
+            operation
+            for operation in body.ops
+            if not isinstance(
+                operation,
+                (BufferOp, CoreIdOp, RuntimeSizeOp, FixConfigOp, *tuple(arith.Arith.operations)),
+            )
+        )
+        if mixed:
+            config_body = Block(arg_types=[IndexType()])
+            config_body.add_ops((*setup, EndOp()))
+            domain = ActorDomainOp.build(
+                attributes={"kind": StringAttr("cube")}, regions=[Region(config_body)]
+            )
+            body.insert_op_before(domain, setup_before)
+        else:
+            body.insert_ops_before(setup, setup_before)
     body.add_op(EndOp())
     values, uses = bind_values(source, lowerer.results, lowerer.loops)
     # The constructors preserve structure from the admitted source. Developer

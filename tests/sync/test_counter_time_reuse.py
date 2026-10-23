@@ -101,3 +101,13 @@ def test_counter_set_requires_one_complete_temporal_or_fifo_premise():
     partial = {(0, 1): (), (1, 2): ()}
     assert counter_group_usage(demands, {0, 1, 2}, partial, (frozenset({0, 2}),)) is None
     assert counter_group_usage(demands, {0, 1, 2}, partial, (frozenset({0, 1, 2}),)) == ("fifo", 15)
+
+
+def test_frozen_fifo_children_compose_with_a_maximum_only_after_time_proof():
+    demands = tuple(EventDemand((), 1, (), backlog=7) for _ in range(4))
+    assert counter_group_usage(demands, {0, 1, 2, 3}, {}, ()) is None
+    groups = ((frozenset({0, 1}), frozenset({2, 3})),)
+    assert counter_group_usage(demands, {0, 1, 2, 3}, {}, (), time_packs=groups) == (
+        "time_fifo",
+        14,
+    )

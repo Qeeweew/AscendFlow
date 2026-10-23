@@ -59,7 +59,10 @@ AscendFlow 在 example 表达裁剪、对角 mask 和任务顺序，通用编译
   同一 actor 的 S store→S load 使用已证明的有序发射，跨循环端口也不发 S barrier；
   S 写 UB 向 Vector/MTE3 发布仍有真实跨管线通知，不能借 Scalar load 的返回完成语义省略。
 - FP32 Cube 使用 CANN 2201 的 `asc_set_fp32_mode()` 和 float MAD/Load3D 接口，
-  IEEE 配置有 S→M ready 与 ID 预留。L1 FP32 NZ 的 C0=8，L0C FP32 为 16 列；
+  IEEE 配置的 S→M ready 使用共同事件分配。Load3D 的 FMATRIX_A/B 与
+  RPT/padding/size 分别保留状态 effects，更新前取得旧 MTE1 reader 的退休；
+  setter 接口来自 CANN 2201 的 `asc_set_l13d_fmatrix(_b)` 等实现。
+  具体合同见[寄存器状态](register-state.md)。L1 FP32 NZ 的 C0=8，L0C FP32 为 16 列；
   设备随机 FP32 输入证据与 KDA dot 输入精度见[审计](../operators/kda-prefill-precision.md)。
 
 模型和测试共用这些硬件前提，不能反过来把图验证当成它们的独立证明。新原语或新设备行为仍需源码、CANN和必要设备证据。

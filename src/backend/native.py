@@ -51,6 +51,21 @@ def native_line(task, *, pointer_renderer, generation):
     ptr = pointer_renderer
     refs = task.spec.operands
     p = [ptr(index) for index in range(len(refs))]
+    if task.spec.native in {"set_fmatrix_a", "set_fmatrix_b"}:
+        function = "asc_set_l13d_fmatrix" + ("_b" if task.spec.native.endswith("_b") else "")
+        return (
+            "{ asc_l13d_fmatrix_config config = { .config = "
+            f"uint64_t({task.spec.params[0]}) | (uint64_t(1) << 16) "
+            "}; " + function + "(config); }"
+        )
+    if task.spec.native == "set_load3d":
+        return (
+            "{ asc_load3d_v2_config config = { .config = uint64_t(1) << 16 }; "
+            "asc_set_l13d_rpt(config); asc_set_l13d_padding(uint64_t(0)); "
+            "asc_set_l13d_size(uint64_t(0)); }"
+        )
+    if task.spec.native == "set_fp32":
+        return "asc_set_fp32_mode();"
     if task.spec.native in _MASKED_ELEMENTS:
         from . import vector_mask
 
@@ -501,19 +516,3 @@ def native_line(task, *, pointer_renderer, generation):
     if task.spec.native == "fix16":
         return f"asc_copy_l0c2gm({p[1]}, {p[0]}, 16, 16, 16, 16, 0, 0, 0, false, true);"
     raise AssertionError("unvalidated native recipe")
-
-
-def load3d_init(config):
-    if config is None:
-        return []
-    a, b = config
-    return [
-        "  // Invariant dav-2201 Load3D SPRs; width low, height high (raw contract).",
-        f"  asc_l13d_fmatrix_config npu_fa = {{ .config = uint64_t({a}) | (uint64_t(1) << 16) }};",
-        f"  asc_l13d_fmatrix_config npu_fb = {{ .config = uint64_t({b}) | (uint64_t(1) << 16) }};",
-        "  asc_set_l13d_fmatrix(npu_fa); asc_set_l13d_fmatrix_b(npu_fb);",
-        "  asc_load3d_v2_config npu_rpt = { .config = uint64_t(1) << 16 };",
-        "  asc_set_l13d_rpt(npu_rpt); asc_set_l13d_padding(uint64_t(0)); asc_set_l13d_size(uint64_t(0));",
-        "  asc_sync_notify(PIPE_S, PIPE_MTE1, event_t(0));",
-        "  asc_sync_wait(PIPE_S, PIPE_MTE1, event_t(0));",
-    ]

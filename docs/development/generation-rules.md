@@ -68,6 +68,16 @@ head reader、异步 reader 和未知来源仍保留。ENTRY、Scalar store 及 
 queue acquire。被选通知保留它自身的原始 ownership edge，不把新增 coverage
 反过来当作捕获者自己的存储归属。
 
+已取得的完成前缀按实际 route、完整激活类、capture/acquire 的层级发射坐标
+建立查询索引。同一个发射 word 只允许最后 lexical 位置变化，其余 scope、
+坐标、stage、参与者相对位置及控制边界身份均保留。查询在目标实际 lexical
+位置处分段，每段检查相同的完整有序关系；unknown 不作为已排序。
+二维区间索引只返回一个已经存在的真实 capture/acquire pair，并保持原来的
+最早匹配选择。动态条目按本 word 的实际 acquire 顺序加入；查询不扫描该 word
+的全部历史，不把两个 pair 的捕获最大值和获取最小值拼成一条新通知。
+各 word 分别判断激活包含关系，任意多种条件/调用域一般仍可形成真实稠密关系。
+这些完成覆盖事实不提供 event 消费或 ID 共享资格。
+
 以上规则也适用于已经完整的跨核 quorum：每个 producer 的捕获都覆盖所需
 source，每个 receiver 的已有 acquire 都先于所需 consumer，才能复用。
 相同 Stage、ActorDomain 或共同写入某个 cell 都不授权合并独立完成边界；
@@ -101,6 +111,16 @@ k 是实际配对 publication 的 epoch 差下界。常数差直接使用；有�
 端口的时间范围在本层建立一次，用来排除不存在的短循环回返。相同 native、
 actor、phase、实际坐标和 owner/case 的内存分片合成一个 may-block 位置，
 域取保守并集、时间范围取凸包；publication 仍逐原始端口检查，不丢配对或坐标。
+
+Wait→Set 的可能阻塞关系按实际 actor/engine 路由建立共享区间索引，不枚举
+全体端点对。重复端口共用 lexical 索引；有限选择按实际时间表达式和域范围凸包
+分组，保留短循环中不存在的回返及正 step 判断。普通 Wait 只查询目标 engine，
+Scalar/cross Wait 查询本 actor 的全部发布队列。同一 child 的内部关系由 child
+接口提供，父层仅为再次进入该 child 保留正 step 关系。
+区间树的内部顶点只分解可能阻塞关系，不代表发射、完成、消费或存储里程碑，
+不成为 child 对外 cuts。原点求解只保留跨 actor 和负的同 actor 约束；非负的
+同 actor gate 不约束原点，负的同 actor publication 仍须拒绝。区间索引的
+工作量取决于路由端点及不同有限时间类；不同有限选择一般不能合并为线性序列。
 
 child 只导出 actor/queue/controller 输入到输出的 **可能阻塞**关系。父层不导入
 其内部图，也不在父查询中读取隐藏路径。正 step 内部关系在 whole invocation
@@ -305,6 +325,12 @@ AIV 间的轮次 barrier，也不丢掉任一 AIV 的原始发布或完成前缀
 同号新增的是 counter 效果 FIFO，不能宣称不同 ID 的 Set 效果原本已按发射顺序
 完成。当前整组规则核对实际 clock 单位平移和各参与者完整 word，借同 source
 pipe 的单调 native 前缀及有限积压建立新增 FIFO 的局部进展；见[事件资源](event-resources.md)。
+
+候选不固定成一份 first-fit 分区。额外结构候选仍经过相同整组检查；不同 clock 的
+叶子 word 仅在每个 publisher/receiver 的真实首末端口均证明整次调用顺序时拼接。
+积压继续对完整 credit 求和，不用循环控制退出证明通知已消费。
+不同 FIFO 子组只有全部跨子组 credit 对取得完整消费回传/整次调用互斥，才可按
+子组内部求和、子组之间取最大值组合。分配和最终组检查消费同一份冻结组合。
 
 分配候选 ID 时，对全部已占用与将占用的完整 credit 求积压上界之和；同一个
 物理 credit 只计一次，总和不得超过 15。未知积压不是 0。容量检查覆盖之后

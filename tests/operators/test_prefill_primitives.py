@@ -101,3 +101,29 @@ def test_vector_row_copy_rejects_unrepresentable_native_geometry(width, rows, pi
     ref = NativeGeometry("UB", "f32", "linear", width, rows=rows, row_stride=pitch)
     with pytest.raises(CompileError, match="Vector row copy"):
         native_contract("vector_copy_rows", (ref, ref), (), disjoint=lambda: True)
+
+
+@pytest.mark.parametrize("rows,columns", [(16, 16), (32, 32)])
+def test_fp32_load3d_b_keeps_parent_pitch_and_reads_only_its_matrix(rows, columns):
+    source = NativeGeometry(
+        "L1",
+        "f32",
+        "NZ",
+        rows * 32,
+        rows=columns // 8,
+        row_stride=64 * 32,
+        matrix_shape=(64, columns),
+    )
+    destination = NativeGeometry("L0B", "f32", "ZN", rows * columns * 4)
+    assert native_contract("load3d_b_nn", (source, destination), (rows, columns)) == (
+        "MTE1",
+        ("R", "W"),
+    )
+    touched = {plane * 64 * 32 + byte for plane in range(columns // 8) for byte in range(rows * 32)}
+    assert len(touched) == rows * columns * 4
+    assert rows * 32 not in touched
+    invalid = NativeGeometry(
+        "L1", "f32", "NZ", rows * 32, rows=columns // 8, row_stride=64 * 32 + 32
+    )
+    with pytest.raises(CompileError, match="FP32 Load3D"):
+        native_contract("load3d_b_nn", (invalid, destination), (rows, columns))
