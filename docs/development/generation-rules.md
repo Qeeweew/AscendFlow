@@ -82,6 +82,10 @@ queue acquire。被选通知保留它自身的原始 ownership edge，不把新�
 已阻塞本 queue/controller 的 Wait 所取得的来源；后来才执行的 Wait 不能回填。
 native issue 本身不产生完成事实。同锚点不同动作不因位置相等取得先后关系。
 条件前缀的合取/并集保持共享 DAG，由原始需求的完整激活前提证明覆盖。
+层级位置索引将不同 sibling region 的内部获取合为共享出口范围；查询只进入
+与目标位置重合的 child，开放分支的激活仍保留在每个真实获取上。range 节点
+不成为新 gate，空 child 不提供完成事实。SCC 的可能来源上界仅用于查询剪枝，
+同一不可变上界在当前原始需求的查询中复用，不作为完成证据。
 
 每条合并前需求保留独立的 source/consumer binding，包含 CopyGroup 明确授权的
 共同 ready。删除一个合并通知前逐 binding、逐参数 case 检查；只为相同真实端点

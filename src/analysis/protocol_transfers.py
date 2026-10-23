@@ -10,7 +10,7 @@ have distinct origins and queries.
 
 from __future__ import annotations
 
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -19,7 +19,6 @@ from ..budget import poll
 from ..scalar import literal, substitute
 from .event_domains import EventCase
 from .guard_cover import opposite
-from .position_words import PositionWord, position_word
 from .smt import all_of, any_of
 from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard
@@ -155,21 +154,48 @@ class _Positions:
 
 
 class _QueueWord:
-    def __init__(self, graph, entries):
-        self.graph = graph
-        order = graph.positions
-        self.positions = PositionWord(
-            ((position_word((point,), order)[1], (point,)) for point, _ in entries), order
-        )
-        self.size = 1 << (len(self.positions.keys) - 1).bit_length()
-        leaves = {}
+    """A region's lexical sequence with shared closed-child exits.
+
+    A query enters only the child tied with its actual position. Earlier and
+    later siblings are whole ranges whose condition uses the common parent
+    clock. Guards stay on each acquire, so an empty child supplies no facts.
+    """
+
+    def __init__(self, graph, entries, depth=0):
+        self.graph, self.depth = graph, depth
+        self.scope = graph.positions.position(entries[0][0])[depth][0]
+        graph.work.transfer_words += 1
+        ranks = {}
         for point, node in entries:
-            rank = position_word((point,), order)[1]
-            leaves.setdefault(rank, []).append(node)
+            path = graph.positions.position(point)
+            ranks.setdefault(path[depth][2], []).append((point, node))
+        self.keys = sorted(ranks)
+        self.examples = {rank: group[0][0] for rank, group in ranks.items()}
+        self.children, self.leaves = {}, {}
+        for rank, group in ranks.items():
+            children, leaves = {}, {}
+            for point, node in group:
+                path = graph.positions.position(point)
+                if len(path) > depth + 1:
+                    children.setdefault(path[depth + 1][:2], []).append((point, node))
+                else:
+                    leaves.setdefault((point.operation, point.placement), []).append((point, node))
+            self.children[rank] = tuple(
+                _QueueWord(graph, values, depth + 1) for values in children.values()
+            )
+            self.leaves[rank] = tuple(
+                (values[0][0], graph.merge(node for _, node in values))
+                for values in leaves.values()
+            )
+        self.size = 1 << (len(self.keys) - 1).bit_length()
         self.tree = [0] * (2 * self.size)
-        for rank, nodes in leaves.items():
-            index = bisect_left(self.positions.keys, rank)
-            self.tree[self.size + index] = graph.merge(nodes)
+        for index, rank in enumerate(self.keys):
+            self.tree[self.size + index] = graph.merge(
+                (
+                    *[word.tree[1] for word in self.children[rank]],
+                    *[node for _, node in self.leaves[rank]],
+                )
+            )
         for index in range(self.size - 1, 0, -1):
             self.tree[index] = graph.merge(self.tree[2 * index : 2 * index + 2])
 
@@ -186,14 +212,37 @@ class _QueueWord:
 
     def before(self, point, *, strict):
         graph = self.graph
-        for start, end, (representative,) in self.positions.bands((point,)):
+        path = graph.positions.position(point)
+        if len(path) <= self.depth or path[self.depth][0] is not self.scope:
+            # The target and this child have only their parent in common.
+            # Every interior endpoint has that same complete order formula.
             graph.work.transfer_order_bands += 1
-            condition = graph.order(representative, point, strict=strict)
+            condition = graph.order(self.examples[self.keys[0]], point, strict=strict)
+            if condition is not False:
+                graph.work.transfer_range_vertices += 1
+                yield graph.merge((self.tree[1],), condition=condition)
+            return
+        rank = path[self.depth][2]
+        first, last = bisect_left(self.keys, rank), bisect_right(self.keys, rank)
+        for start, end in ((0, first), (last, len(self.keys))):
+            if start == end:
+                continue
+            graph.work.transfer_order_bands += 1
+            condition = graph.order(self.examples[self.keys[start]], point, strict=strict)
             if condition is False:
                 continue
             for node in self.interval(start, end):
                 graph.work.transfer_range_vertices += 1
                 yield graph.merge((node,), condition=condition)
+        if first != last:
+            for word in self.children[rank]:
+                yield from word.before(point, strict=strict)
+            for representative, node in self.leaves[rank]:
+                graph.work.transfer_order_bands += 1
+                condition = graph.order(representative, point, strict=strict)
+                if condition is not False:
+                    graph.work.transfer_range_vertices += 1
+                    yield graph.merge((node,), condition=condition)
 
 
 class ProtocolTransfers:
@@ -235,12 +284,11 @@ class ProtocolTransfers:
             for point, node in zip(consumers, acquisitions, strict=True):
                 self.nodes[node] = TransferNode("acquire", notification, point, publications, guard)
                 engine = None if domains._gate(notification) else notification.destination_engine
-                key = point.actor, engine, position_word((point,), self.positions)[0]
+                key = point.actor, engine, self.positions.position(point)[0][:2]
                 words.setdefault(key, []).append((point, node))
         self.words = {}
         for (actor, engine, _), entries in words.items():
             self.words.setdefault((actor, engine), []).append(_QueueWord(self, entries))
-        self.work.transfer_words += len(words)
         for group in self.episodes.values():
             for episode in group:
                 for point, node in zip(episode.captures, episode.publications, strict=True):
@@ -380,7 +428,7 @@ class ProtocolTransfers:
                     ready.append(parent)
         self.work.transfer_components += len(members)
 
-    def _may_complete(self, number, source, engine):
+    def _may_complete(self, number, source, engine, cache):
         if self._may[number] is None:
             # New query unions only point at already frozen capture snapshots.
             pending = [(number, False)]
@@ -402,10 +450,14 @@ class ProtocolTransfers:
                         for child in self.nodes[current].inputs
                         if self._may[child] is None
                     )
-        return any(
-            self.order(source, capture, strict=False) is not False
-            for capture in self._may[number].get((source.actor, engine), ())
-        )
+        summary = self._may[number]
+        key = id(summary)
+        if key not in cache:
+            cache[key] = any(
+                self.order(source, capture, strict=False) is not False
+                for capture in summary.get((source.actor, engine), ())
+            )
+        return cache[key]
 
     def order(self, before, after, *, strict):
         key = before, after, strict
@@ -466,7 +518,7 @@ class ProtocolTransfers:
         if self.positions.position(source) is None or self.positions.position(target) is None:
             return None
         root = self.snapshot(target, destination, strict=False)
-        results, visiting, stack = {}, set(), [(root, 0)]
+        results, possible, visiting, stack = {}, {}, set(), [(root, 0)]
         while stack:
             poll("completion frontier transfer")
             number, next_input = stack[-1]
@@ -477,7 +529,7 @@ class ProtocolTransfers:
                 continue
             if next_input == 0 and number not in visiting:
                 if facts.truth(node.condition) is False or not self._may_complete(
-                    number, source, engine
+                    number, source, engine, possible
                 ):
                     results[number] = None
                     self.work.completion_pruned += 1
@@ -495,6 +547,21 @@ class ProtocolTransfers:
                         stack.pop()
                         continue
             visiting.add(number)
+            if next_input:
+                previous = results.get(node.inputs[next_input - 1])
+                if previous is not None and facts.truth(previous.condition) is True:
+                    # One acquired frontier already covers this query's whole
+                    # domain. Preserve its actual proof and the parent's guard;
+                    # inspecting the rest of the union cannot enlarge that
+                    # guarded fact under these same assumptions.
+                    results[number] = CausalProof(
+                        node, (previous,), all_of(node.condition, previous.condition)
+                    )
+                    self.work.completion_nodes += 1
+                    self.work.completion_shortcuts += 1
+                    visiting.remove(number)
+                    stack.pop()
+                    continue
             if next_input < len(node.inputs):
                 child = node.inputs[next_input]
                 stack[-1] = number, next_input + 1

@@ -219,6 +219,7 @@ class ResourceWork:
     transfer_components: int = 0
     transfer_may_points: int = 0
     completion_pruned: int = 0
+    completion_shortcuts: int = 0
 
 
 @dataclass(frozen=True)

@@ -174,3 +174,23 @@ def test_regular_controller_stream_grows_by_real_frontiers_instead_of_all_pairs(
     assert work.completion_nodes <= 2 * blocks
     assert work.transfer_order_bands <= 6 * blocks
     check_compiled_events(plan, invocations=2)
+
+
+@pytest.mark.parametrize("blocks", [8, 32, 64])
+def test_closed_sibling_regions_share_exits_without_rescanning_each_interior(blocks):
+    declarations = "\n".join(f"        x{i}=N.alloc_ub((64,))" for i in range(blocks))
+    regions = "\n".join(
+        f"        for child{i} in N.serial(n):\n"
+        f"            N.fill(x{i},1.0)\n"
+        f"            N.load_scalar(x{i}[:1])"
+        for i in range(blocks)
+    )
+    source = "def siblings(n:N.i64):\n    with N.Kernel():\n" + declarations + "\n" + regions + "\n"
+    plan = synchronize_structure(N.from_source(source))
+    work = plan.generation.domains.work
+    assert work.transfer_order_bands <= 24 * blocks
+    # Each query stores logarithmically many shared prefix ranges, never all
+    # previous sibling interiors. The finite tree height is part of the bound.
+    assert work.transfer_edges <= 4 * blocks * (blocks.bit_length() + 1)
+    for count in (0, 1, 3):
+        check_compiled_events(plan, {"n": count}, invocations=2)
