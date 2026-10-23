@@ -12,10 +12,10 @@ from ..diagnostics import require
 from ..dialects.physical import FixConfigOp
 from ..scalar import expression, literal
 from ..target.ascend910b import Actor, Engine, SyncKind
-from . import event_coloring
 from .event_coloring import counter_fifo_partition, exclusive_pressure_banks
 from .event_contracts import (
     EventDemand,
+    EventIdPools,
     EventReservation,
     EventResourceProblem,
     VirtualEventAction,
@@ -30,14 +30,16 @@ from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard, Placement
 
 
-def plan_event_resources(program):
+def plan_event_resources(program, *, id_pools=None):
     from ..passes.generate_notifications import NotificationProgram
 
     require(
         isinstance(program, NotificationProgram),
         "resource planning requires generated notification lifetimes",
     )
-    planner = _Planning(program)
+    id_pools = EventIdPools() if id_pools is None else id_pools
+    require(isinstance(id_pools, EventIdPools), "event pools must be frozen target numbers")
+    planner = _Planning(program, id_pools=id_pools)
     preferred = planner.build()
     alternatives = []
     leases = dict(planner.leases)
@@ -69,7 +71,9 @@ def plan_event_resources(program):
                     changed = True
         if not changed:
             continue
-        candidate = _Planning(program, leases=proposed, established=planner).build()
+        candidate = _Planning(
+            program, id_pools=id_pools, leases=proposed, established=planner
+        ).build()
         if not set(preferred.peers) <= set(candidate.peers):
             # Do not trade a mirrored protocol for new SID-specific code.
             continue
@@ -81,8 +85,9 @@ def plan_event_resources(program):
 
 
 class _Planning:
-    def __init__(self, program, *, leases=None, established=None):
+    def __init__(self, program, *, id_pools, leases=None, established=None):
         self.program = program
+        self.id_pools = id_pools
         self.domains = program.domains
         self.leases = {v.notification: v for v in program.leases} if leases is None else leases
         self.channels = {m: c for c in program.channels for m in c.members}
@@ -307,7 +312,7 @@ class _Planning:
         result = {}
         # Facts about optional reuse must not choose a different mapping for
         # a bank that can hold every preferred credit exclusively.
-        pressured = exclusive_pressure_banks(self.demands, self.reservations, peers)
+        pressured = exclusive_pressure_banks(self.demands, self.reservations, peers, self.id_pools)
         self.pressured = pressured
         counters = [i for i, demand in enumerate(self.demands) if demand.backlog is not None]
         for a, b in combinations(counters, 2):
@@ -342,7 +347,7 @@ class _Planning:
         partition = counter_fifo_partition(
             self.demands, tuple(frozenset(group.resources) for group in counter_groups)
         )
-        if partition is not None and len(partition) <= len(event_coloring.SUPPORTED_CROSS_IDS):
+        if partition is not None and len(partition) <= len(self.id_pools.cross):
             # A concrete certified FIFO partition already fits. Each group
             # has its own whole word, progress, quorum and backlog certificate;
             # no new consumption question is needed for candidate integers.
@@ -420,6 +425,7 @@ class _Planning:
             ("counter_groups", counter_groups),
             ("counter_compositions", compositions),
             ("counter_reuses", time_relations),
+            ("id_pools", self.id_pools),
             ("reservations", tuple(self.reservations)),
             ("relations", relations),
             ("work", self.domains.work),

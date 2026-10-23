@@ -10,6 +10,10 @@
 `event_planning.plan_event_resources` 消费它，冻结 `EventResourceProblem`：
 虚拟 lane/phase、固定动作位置、全部成员的复用关系、AIV peer 相等约束、
 counter 候选组及预留。域和 handback 查询只在规划阶段发生。
+`EventIdPools` 在进入规划时保存实际可分配的整数集合及私有 bank 覆盖；所有
+缩环选项引用同一份不可变池。local 只允许 0..7、cross 只允许 0..15 的子集，
+检查整数类型、重复及 bank 身份；固定预留仍占据原硬件编号，即使它不属于
+该可分配子池。编号器保持这些实际数字，不用子池长度重新构造 0 起始的编号。
 
 `event_coloring` 和 `structured_resources` 只消费有限数字约束，不取得
 `EventDomains`、SMT callback 或补造 handback 的入口。分配不能移动 native、
@@ -29,6 +33,10 @@ mode-2 规划先用已有整组 FIFO 证书构造一个具体分区；该分区�
 quorum、进展和 backlog 证据。分配器直接消费这个有限分区，不查询 source 域。
 分区不能证明可放入时继续建立时间复用约束；已有时间证据先于一般 FIFO 残余
 着色使用。结构分区是可行映射的上界，不声称全局最少 ID。
+资源分量按 bank 的连通关系建立，AIV 取商后的许可仅在残余冲突确实查询时
+投影全部原私有 bank 的约束。专属单 bank 计数已超出实际可用池时无需构造
+稠密 clique；能直接专属摆放或按已证 FIFO 分区分配的输入也不枚举所有资源对。
+一般残余 `_color` 目前仍构造顶点冲突图，不把上述快路径称为全面稀疏编号。
 尚未使用且对全部顶点具有相同可用性的 ID，只尝试一个代表；它们在冻结约束中
 可互换。不同 bank 的预留通过完整可用性列区分，已使用的 ID 不按此规则合并。
 连续环仍只是摆放偏好，不因对称剪枝改变 lane 异号或整组 counter 检查。

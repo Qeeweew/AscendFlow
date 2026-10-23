@@ -6,9 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from ascendflow.analysis import event_coloring
 from ascendflow.analysis.event_coloring import color_event_resources, counter_group_usage
-from ascendflow.analysis.event_contracts import EventDemand
+from ascendflow.analysis.event_contracts import EventDemand, EventIdPools
 from ascendflow.analysis.event_sharing import CounterReuse, share_counter_time
 from ascendflow.analysis.notification_lifetimes import HandbackRule
 from ascendflow.analysis.structured_protocols import NotificationKind
@@ -22,10 +21,10 @@ from tests.models.structured_events import check_compiled_events
 def plan(request):
     # The large case must need temporal reuse after certified FIFO words have
     # been packed. A legal subset makes that need explicit as policy changes.
-    with pytest.MonkeyPatch.context() as patch:
-        if request.param == 17:
-            patch.setattr(event_coloring, "SUPPORTED_CROSS_IDS", tuple(range(5)))
-        return request.param, synchronize_structure(counter_epochs.specialize(PHASES=request.param))
+    pools = EventIdPools(cross=tuple(range(5 if request.param == 17 else 16)))
+    return request.param, synchronize_structure(
+        counter_epochs.specialize(PHASES=request.param), id_pools=pools
+    )
 
 
 def test_complete_epochs_keep_empty_calls_reentry_and_two_vector_receivers(plan):
@@ -94,6 +93,7 @@ def test_temporal_complete_credits_use_maximum_instead_of_adding_full_counters()
         counter_groups=(),
         relations={},
         counter_reuses=reuses,
+        id_pools=EventIdPools(),
     )
     ids, _ = color_event_resources(problem)
     assert len({group[0] for group in ids}) <= 16

@@ -139,7 +139,7 @@ def _materialize_owned(structure, admission, dependencies, generation, resources
 
 
 @memo_scope()
-def synchronize_structure(source) -> StructuredSynchronization:
+def synchronize_structure(source, *, id_pools=None) -> StructuredSynchronization:
     """Run the current analysis stages, then materialize the selected program.
 
     Imported physical snapshots are not accepted by this source entry. It
@@ -171,7 +171,7 @@ def synchronize_structure(source) -> StructuredSynchronization:
     )
     program = generate_notifications(dependencies, dispatch)
     timings.extend(program.timings)
-    problem = stage("event_constraints", plan_event_resources, program)
+    problem = stage("event_constraints", plan_event_resources, program, id_pools=id_pools)
     resources = stage("event_banks", allocate_structured_events, problem)
     return _materialize_owned(
         structure, admission, dependencies, program, resources, tuple(timings)

@@ -33,6 +33,48 @@ CROSS_BACKLOG = 15
 
 
 @dataclass(frozen=True, slots=True)
+class EventIdPools:
+    """Assignable target numbers, snapshotted before resource planning.
+
+    A restricted pool is a subset of the real hardware namespace. Fixed
+    reservations remain occupied even when outside that assignable subset.
+    Private bank overrides do not merge AIV storage or numbering obligations.
+    """
+
+    local: tuple[int, ...] = tuple(range(8))
+    cross: tuple[int, ...] = tuple(range(16))
+    banks: tuple[tuple[LocalBank, tuple[int, ...]], ...] = ()
+
+    def __post_init__(self):
+        def snapshot(values, limit):
+            values = tuple(values)
+            if any(type(n) is not int or not 0 <= n < limit for n in values):
+                raise ValueError("event pool must contain actual target integer IDs")
+            if len(set(values)) != len(values):
+                raise ValueError("event pool repeats a target ID")
+            return tuple(sorted(values))
+
+        object.__setattr__(self, "local", snapshot(self.local, 8))
+        object.__setattr__(self, "cross", snapshot(self.cross, 16))
+        banks = tuple((tuple(bank), snapshot(values, 8)) for bank, values in self.banks)
+        if len({bank for bank, _ in banks}) != len(banks):
+            raise ValueError("event pool repeats a private bank")
+        if any(
+            len(bank) != 3
+            or not isinstance(bank[0], Actor)
+            or any(not isinstance(pipe, Engine) for pipe in bank[1:])
+            for bank, _ in banks
+        ):
+            raise ValueError("event pool requires an actual actor/pipe bank")
+        object.__setattr__(self, "banks", banks)
+
+    def ids(self, bank):
+        if bank is None:
+            return self.cross
+        return next((values for own, values in self.banks if own == bank), self.local)
+
+
+@dataclass(frozen=True, slots=True)
 class CaseLease:
     case: EventCase
     width: int
@@ -129,6 +171,7 @@ class EventResourceProblem:
     counter_groups: tuple[CounterGroup, ...]
     counter_compositions: tuple[CounterTimeGroups, ...]
     counter_reuses: Mapping[tuple[int, int], tuple[CounterReuse, ...]]
+    id_pools: EventIdPools
     reservations: tuple[EventReservation, ...]
     relations: FrozenEventRelations
     work: ResourceWork
@@ -244,6 +287,7 @@ class StructuredEventPlan:
     work: ResourceWork
     channels: tuple[CellChannel, ...]
     banks: tuple[EventBankUsage, ...]
+    id_pools: EventIdPools
     sharing: tuple[EventSharing | LocalEventReuse | CounterSharing | CounterReuse, ...] = ()
     persistent: tuple[PersistentEventAssignment, ...] = ()
     counter_groups: tuple = ()

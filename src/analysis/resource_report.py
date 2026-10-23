@@ -383,12 +383,18 @@ def event_resource_report(plan):
             ],
         },
         "streams": streams,
+        "id_pools": {
+            "local": plan.id_pools.local,
+            "cross": plan.id_pools.cross,
+            "banks": [{"bank": bank(b), "ids": ids} for b, ids in plan.id_pools.banks],
+        },
         "exclusive_demand": [
             {
                 "bank": None if b is None else bank(b),
                 "lanes": demand,
                 "reserved": len(reserved.get(b, ())),
                 "capacity": len(SUPPORTED_CROSS_IDS) if b is None else LOCAL_CAPACITY,
+                "assignable_ids": plan.id_pools.ids(b),
             }
             for b, demand in demands.items()
         ],
