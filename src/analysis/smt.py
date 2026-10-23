@@ -111,18 +111,30 @@ class Boolean:
         )
 
 
+@memoized(key=lambda kind, operands: (kind, tuple((type(value), value) for value in operands)))
+def _boolean(kind, operands):
+    """Intern exact mathematical syntax inside the current compilation only.
+
+    Children created by these factories already have canonical identity, so
+    equality of shared Boolean DAGs never unfolds their full path trees.
+    Operand types are part of the key: Python's 0 == False cannot bypass the
+    ordinary predicate validation. This stores no facts or query answers.
+    """
+    return Boolean(kind, operands)
+
+
 def all_of(*conditions):
     if any(condition is False for condition in conditions):
         return False
     values = tuple(dict.fromkeys(condition for condition in conditions if condition is not True))
-    return True if not values else values[0] if len(values) == 1 else Boolean("and", values)
+    return True if not values else values[0] if len(values) == 1 else _boolean("and", values)
 
 
 def any_of(*conditions):
     if any(condition is True for condition in conditions):
         return True
     values = tuple(dict.fromkeys(condition for condition in conditions if condition is not False))
-    return False if not values else values[0] if len(values) == 1 else Boolean("or", values)
+    return False if not values else values[0] if len(values) == 1 else _boolean("or", values)
 
 
 @memoized(key=lambda facts: frozenset(facts.items()))

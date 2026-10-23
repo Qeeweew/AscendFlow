@@ -78,6 +78,17 @@ queue acquire。被选通知保留它自身的原始 ownership edge，不把新�
 各 word 分别判断激活包含关系，任意多种条件/调用域一般仍可形成真实稠密关系。
 这些完成覆盖事实不提供 event 消费或 ID 共享资格。
 
+配对域建立后，完成前缀还通过实际 capture/acquire 组合。capture 冻结其之前
+已阻塞本 queue/controller 的 Wait 所取得的来源；后来才执行的 Wait 不能回填。
+native issue 本身不产生完成事实。同锚点不同动作不因位置相等取得先后关系。
+条件前缀的合取/并集保持共享 DAG，由原始需求的完整激活前提证明覆盖。
+
+每条合并前需求保留独立的 source/consumer binding，包含 CopyGroup 明确授权的
+共同 ready。删除一个合并通知前逐 binding、逐参数 case 检查；只为相同真实端点
+共享查询，不能用代表 source 替代其他 writer，也不能合取互斥 writer 的激活条件
+制造空域。证明排除自身及此前已删除的协议，成功证明引用的实际支持协议保持
+保留。cell credit、消费、进展和资源许可随后在保留集合上建立。
+
 以上规则也适用于已经完整的跨核 quorum：每个 producer 的捕获都覆盖所需
 source，每个 receiver 的已有 acquire 都先于所需 consumer，才能复用。
 相同 Stage、ActorDomain 或共同写入某个 cell 都不授权合并独立完成边界；

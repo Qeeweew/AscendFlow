@@ -207,6 +207,18 @@ class ResourceWork:
     counter_time_cache_hits: int = 0
     boundary_instances: int = 0
     boundary_instance_reuses: int = 0
+    transfer_words: int = 0
+    transfer_nodes: int = 0
+    transfer_edges: int = 0
+    transfer_order_bands: int = 0
+    transfer_range_vertices: int = 0
+    completion_queries: int = 0
+    completion_nodes: int = 0
+    completion_cycles: int = 0
+    completion_eliminated: int = 0
+    transfer_components: int = 0
+    transfer_may_points: int = 0
+    completion_pruned: int = 0
 
 
 @dataclass(frozen=True)

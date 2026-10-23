@@ -45,6 +45,7 @@ compile / Compilation
     generate_notifications
       bind_notifications                 # 覆盖、真实位置及原始 ownership edges
       EventDomains                       # 新 guard 定义性、复用实际 SSA、坐标往返、配对
+      reduce_completion_prefixes         # 冻结实际 capture，逐原始义务证明多段完成覆盖
       bind_cell_credits                  # 稀疏私有轮次的端点与本地发射前提
       establish_queue_order              # 逐层 physical-step / phase 准入
       construct_cell_channels            # 物理 lifetime credit 归纳
@@ -83,6 +84,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/local_schedule.py`、`structured_dispatch.py` | 按迭代域和 actor family 建立本地 stage 顺序与 horizon；派发消费该顺序并绑定 native、控制入口/出口的位置 |
 | `passes/notification_binding.py`、`analysis/structured_protocols.py` | 复用已经必要的 capture/acquire、建立完整 quorum；保留自身 origin，不将新增 coverage 当作 ownership，不按 Stage 合并独立完成边界 |
 | `analysis/acquired_prefixes.py` | 按真实激活类与层级发射 word 查询已有 capture/acquire pair；保留每个 participant 的 lexical 分段与原最早匹配，不扫描同 word 的全部获取历史，不提供事件消费资格 |
+| `analysis/position_words.py`、`protocol_transfers.py`、`completion_prefixes.py` | 共用真实位置分段；实际 Set 快照与 queue/controller Wait 组成不可变证明 DAG，逐合并前需求验证完成覆盖；排除自身及已删协议，固定保留支持动作，不提供事件消费资格 |
 | `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期 |
 | `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |
 | `analysis/queue_order.py` | 每层 actor clock-origin 差约束、按实际路由/有限时间类建立的稀疏阻塞区间索引、零距离 DAG 与正距离前进；child 仅导出 open ports 和 may-block cuts |

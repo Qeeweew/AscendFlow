@@ -12,9 +12,11 @@ from time import perf_counter
 
 from ..analysis.cell_channels import CellChannel, construct_cell_channels
 from ..analysis.cell_ownership import LocalCreditOrder, PersistentCellCredit, bind_cell_credits
+from ..analysis.completion_prefixes import reduce_completion_prefixes
 from ..analysis.event_contracts import ResourceWork, StructuredEventLease
 from ..analysis.event_domains import EventCase, EventDomains
 from ..analysis.notification_lifetimes import HandbackRule
+from ..analysis.protocol_transfers import ProtocolTransfers
 from ..analysis.queue_order import QueueOrder, establish_queue_order
 from ..analysis.structured_protocols import LogicalNotification, SynchronizationSelection
 from .notification_binding import bind_notifications
@@ -31,6 +33,7 @@ class NotificationProgram:
     timings: tuple[tuple[str, float], ...]
     credits: tuple[PersistentCellCredit, ...]
     credit_order: LocalCreditOrder
+    transfers: ProtocolTransfers
 
     def __init__(self, *args, **kwargs):
         raise TypeError("construct notifications with generate_notifications")
@@ -46,6 +49,10 @@ def _complete_bindings(selection, *, binding_s=0.0):
     """Internal rule entry, also used by adversarial generation tests."""
     started = perf_counter()
     domains = EventDomains(selection, ResourceWork())
+    domained = perf_counter()
+    domains, transfers = reduce_completion_prefixes(domains)
+    selection = domains.selection
+    prefixed = perf_counter()
     credits, credit_order = bind_cell_credits(domains)
     paired = perf_counter()
     order = establish_queue_order(domains)
@@ -57,7 +64,9 @@ def _complete_bindings(selection, *, binding_s=0.0):
     result = object.__new__(NotificationProgram)
     timings = (
         ("notification_binding", binding_s),
-        ("endpoint_domains", paired - started),
+        ("endpoint_domains", domained - started),
+        ("completion_prefixes", prefixed - domained),
+        ("cell_credits", paired - prefixed),
         ("queue_order", ordered - paired),
         ("credit_lifetimes", completed - ordered),
     )
@@ -71,6 +80,7 @@ def _complete_bindings(selection, *, binding_s=0.0):
         ("timings", timings),
         ("credits", credits),
         ("credit_order", credit_order),
+        ("transfers", transfers),
     ):
         object.__setattr__(result, name, value)
     return result

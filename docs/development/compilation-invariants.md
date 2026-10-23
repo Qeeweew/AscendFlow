@@ -203,6 +203,11 @@ mode-2 Wait 阻塞接收端 controller。已有完整 quorum 的 capture/acquire
 参与者、激活和真实端点顺序。该覆盖不新增完成关系或改变原通知的 ownership。
 local Wait 只阻塞目标 queue，不能以相同理由覆盖另一 pipe 的 consumer。
 
+组合完成覆盖逐条保存合并前需求的端点和证明对应；证明只落到实际保留的
+capture/acquire。已删除动作不能支持后续删除，保留支持动作也不能再被删除。
+同一通知的多个 writer、分支和调用分别检查完整激活，不能只证明代表端点。
+完成证明不授权旧 Wait 已消费；消费和资源许可在最终通知集合上另行建立。
+
 release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继续；MTE2读完共享GM可以释放GM而Vector继续。不能以整个计算完成替代最后读取，不能因不同tensor名称忽略别名。
 
 条件首clear和后续RMW保持各自读写合同。private packet的独立性须由精确cell、已定义读、跨代RAW及外部可见状态等前提建立；private或admission成功本身不够。只允许已经论证独立的生命周期按给定dispatch组织。

@@ -33,6 +33,7 @@ from ..analysis.structured_protocols import (
     NotificationCoverage,
     NotificationKind,
     OrderingWitness,
+    RequirementBinding,
     SelectedOrdinal,
     SynchronizationSelection,
     UnresolvedSynchronization,
@@ -925,6 +926,7 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     )
     order = _IssueOrder(dispatch)
     notifications, coverage, unresolved = [], [], []
+    bindings = {}
     owned = {
         need: lifetime
         for lifetime in dependencies.order.cell_lifetimes
@@ -993,6 +995,10 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
                 _bind_notification(need, dispatch, order.guards(need), ready_source=ready_source),
                 requirements=tuple(bundle),
             )
+            for original in bundle:
+                bindings[original] = RequirementBinding(
+                    original, item.sources[0], item.consumers[0]
+                )
             if rule := _implicit(item, order):
                 coverage.extend(
                     NotificationCoverage(
@@ -1041,6 +1047,7 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
                     if item.mechanism is NotificationKind.CROSS_EVENT
                     else "actual cumulative source capture and consumer-queue acquire",
                     item,
+                    binding=bindings[need],
                 )
             )
     return SynchronizationSelection(

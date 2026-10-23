@@ -144,11 +144,12 @@ def test_deleting_actual_store_release_leaves_an_unordered_war():
         (SyncKind.LOCAL_SET.value, SyncKind.LOCAL_WAIT.value)
     )
     # Remove the real matched pair so event imbalance cannot mask the missing
-    # reader retirement. The existing Vector RAW fence still orders both writes.
+    # reader retirement. A composed release may also carry the Vector write
+    # prefix; the independent model can encounter that WAW before the WAR.
     for operation in release:
         operation.parent.erase_op(operation)
     result.module.verify()
-    with pytest.raises(EventModelError, match="unordered physical WAR"):
+    with pytest.raises(EventModelError, match=r"unordered physical (WAR|WAW)"):
         check_compiled_events(result)
 
 
