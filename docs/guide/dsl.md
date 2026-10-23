@@ -94,6 +94,10 @@ x.storage[i, :]  # 同一 allocation 的普通完整物理 view
 授权复写。`copy`、算术结果的普通 slice 保留原 writer；该区域被覆盖后读取旧
 Tile 仍会拒绝。`alloc_mask(..., slots=S).at(t)` 同样选择 packed predicate 存储。
 
+部分 `copy(..., valid_rows=r)` 返回的 Tile 保留更新时目标未写区域的既有值。
+要读取整个返回区域，其余部分须在该更新点已有定义；更新后才进行的初始化
+不能补到这个旧 Tile。读取 raw view 仍按其实际读取时的存储状态检查。
+
 `CopyGroup` 只接受一个 actor/Stage/实际迭代及激活域内的直线 copy、纯标量、
 view 和透明 inline；constexpr unroll 展开后适用相同规则。runtime 分支或循环
 可包围整组，不能放在组内；不接受嵌套组或其他计算 effects。

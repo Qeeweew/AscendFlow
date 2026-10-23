@@ -21,6 +21,13 @@ physical 方式。lowering 产生该 selector 对应的真实 modulo 或直接�
 与结构化 view 进入相同地址/effects/alias 链。Tile slice 沿共享值 DAG 转发原
 writer，读取的真实区域仍由 admission 检查，切片不定义新值。
 
+返回部分 row-prefix copy 的 Tile 表示该更新点的目标区域。其保留部分必须在
+更新发生时已有定义：admission 在真实 native 更新后、下一个 writer 前，从既有
+region/字节 transfer 冻结来源快照，并分别保存实际 participant。完整 payload
+只作为值的区域 enclosure；真实 prefix effects 不扩大。后来写入不能回填早先
+快照，raw alias 的后续覆盖仍由原 stale-value 检查拒绝。定义快照不提供 ready、
+ownership 或 reader 退休，后续同步仍使用真实物理访问。
+
 CopyGroup 的 typed region 对应 physical ReadyGroupOp 的实际 native 成员。
 内存事实检查相同 queue、参与者与 activation；RAW 共同捕获最后成员的真实
 源前缀，原存储 ownership 和 WAR/WAW 分别保持。内部联系不通过共同 ready
