@@ -6,12 +6,22 @@ from ascendflow import language as N
 
 # ruff: noqa: F821 - captured constexpr annotation names.
 VALUES = (
-    0.0, -0.0, 1.0, -2.0,
-    1.0 + 2.0**-8, 1.0 + 3.0 * 2.0**-8,
-    1.0 + 2.0**-11, 1.0 + 3.0 * 2.0**-11,
-    2.0**-133, 2.0**-24, 2.0**-25,
-    65520.0, -65520.0,
-    float.fromhex("0x1.fffffep+127"), float("inf"), float("-inf"),
+    0.0,
+    -0.0,
+    1.0,
+    -2.0,
+    1.0 + 2.0**-8,
+    1.0 + 3.0 * 2.0**-8,
+    1.0 + 2.0**-11,
+    1.0 + 3.0 * 2.0**-11,
+    2.0**-133,
+    2.0**-24,
+    2.0**-25,
+    65520.0,
+    -65520.0,
+    float.fromhex("0x1.fffffep+127"),
+    float("inf"),
+    float("-inf"),
 )
 
 

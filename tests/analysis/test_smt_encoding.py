@@ -22,9 +22,7 @@ def test_boolean_packets_keep_empty_singleton_order_duplicates_and_nested_asts(
 def test_nested_math_encoding_keeps_the_entire_context_formula():
     service = IntegerQueryService({})
     x, y = (Expr("argument", (name,)) for name in ("x", "y"))
-    left = Boolean(
-        "or", (Comparison(x, "<", literal(0)), Comparison(y, "==", literal(1)))
-    )
+    left = Boolean("or", (Comparison(x, "<", literal(0)), Comparison(y, "==", literal(1))))
     right = Boolean("and", (True, Comparison(x, ">=", y), left))
     query = Boolean("and", (left, right, False))
     a, b = service._integer(x), service._integer(y)

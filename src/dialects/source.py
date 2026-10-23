@@ -91,8 +91,29 @@ def _mask_storage(value):
     return allocation
 
 
+def source_yield_origin(value):
+    """Follow source handle identity, without admitting its selected occurrence.
+
+    A loop result still needs the ordinary nonempty/last-writer checks at its
+    actual read. This query only identifies the descriptor behind its yields.
+    """
+    seen = set()
+    while isinstance(value.owner, (DomainOp, StageOp, IterationOp)):
+        terminator = value.owner.body.block.last_op
+        if (
+            value in seen
+            or not isinstance(terminator, YieldOp)
+            or value.index >= len(terminator.values)
+        ):
+            raise VerifyException("predicate has invalid writer forwarding")
+        seen.add(value)
+        value = terminator.values[value.index]
+    return value
+
+
 def _verify_materialized_mask(mask, storage, dependency, *, message="predicate"):
-    if isinstance(mask.owner, MaskOp):
+    mask_writer = source_yield_origin(mask).owner
+    if isinstance(mask_writer, MaskOp):
         raise VerifyException(f"{message} requires materialized predicate storage")
     chunks = mask_chunks(tuple(size.data for size in mask.type.shape))
     typ = storage.type
@@ -102,11 +123,13 @@ def _verify_materialized_mask(mask, storage, dependency, *, message="predicate")
         or prod(size.data for size in typ.shape) != chunks * 32
     ):
         raise VerifyException(f"{message} needs exact packed 32-byte predicate blocks")
-    producer = dependency.owner
+    producer = source_yield_origin(dependency).owner
     if not isinstance(producer, (CompareOp, MaterializeMaskOp, MaskCombineOp)):
         raise VerifyException(f"{message} dependency must name the predicate writer")
     if _mask_storage(storage) is not _mask_storage(producer.out):
         raise VerifyException(f"{message} storage view does not belong to its writer")
+    if mask_writer is not producer:
+        raise VerifyException(f"{message} descriptor and storage dependence need the same writer")
     return chunks
 
 
@@ -155,7 +178,7 @@ def copy_compatible(source, destination, *, transpose=False, zero_pad=False):
 @irdl_op_definition
 class YieldOp(IRDLOperation):
     name = "npu_source.yield"
-    values = var_operand_def(TileType)
+    values = var_operand_def(TileType | MaskType)
     traits = traits_def(IsTerminator())
 
 
@@ -280,7 +303,7 @@ class IterationOp(IRDLOperation):
     limit = opt_operand_def(IndexType)
     issue_order = opt_attr_def(DictionaryAttr)
     body = region_def("single_block")
-    values = var_result_def(TileType)
+    values = var_result_def(TileType | MaskType)
     traits = traits_def(RecursiveMemoryEffect())
 
     def verify_(self):
@@ -322,7 +345,7 @@ class StageOp(IRDLOperation):
     label = attr_def(StringAttr)
     family = attr_def(StringAttr)
     body = region_def("single_block")
-    values = var_result_def(TileType)
+    values = var_result_def(TileType | MaskType)
     traits = traits_def(RecursiveMemoryEffect())
 
     def verify_(self):
@@ -357,7 +380,7 @@ class DomainOp(IRDLOperation):
     name = "npu_source.domain"
     kind = attr_def(StringAttr)
     body = region_def("single_block")
-    values = var_result_def(TileType)
+    values = var_result_def(TileType | MaskType)
     traits = traits_def(RecursiveMemoryEffect())
 
     def verify_(self):
@@ -1108,9 +1131,7 @@ class IndexReadOp(IRDLOperation):
             or self.source.type.dtype.data not in {"i32", "i64"}
             or any(n.data != 1 for n in self.source.type.shape)
         ):
-            raise VerifyException(
-                "index read requires exactly one GM/UB int32/int64 element"
-            )
+            raise VerifyException("index read requires exactly one GM/UB int32/int64 element")
 
 
 @irdl_op_definition

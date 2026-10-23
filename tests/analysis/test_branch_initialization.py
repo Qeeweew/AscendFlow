@@ -75,7 +75,9 @@ def whole_children(X:N.Tensor((4,64),N.f32), Count:N.Tensor((1,),N.i32),
     admit(source)
 
 
-@pytest.mark.parametrize("change", ("missing_inner", "missing_outer", "wrong_row", "half_row", "rmw"))
+@pytest.mark.parametrize(
+    "change", ("missing_inner", "missing_outer", "wrong_row", "half_row", "rmw")
+)
 def test_incomplete_or_reading_writers_cannot_initialize_the_whole_tile(change):
     before, after = {
         "missing_inner": ("                    N.fill(x[row,:],2.0)", "                    pass"),
@@ -93,9 +95,8 @@ def test_incomplete_or_reading_writers_cannot_initialize_the_whole_tile(change):
 def test_complete_branches_do_not_make_an_optional_writer_loop_execute(minimum):
     source = SOURCE.replace(
         '    Y:N.Tensor((4,64),N.f32,access="write"),',
-        '    Y:N.Tensor((4,64),N.f32,access="write"),\n'
-        f'    n:N.i64(minimum={minimum}),',
-    ).replace('N.serial(4)', 'N.serial(N.min(n,4))')
+        f'    Y:N.Tensor((4,64),N.f32,access="write"),\n    n:N.i64(minimum={minimum}),',
+    ).replace("N.serial(4)", "N.serial(N.min(n,4))")
     if minimum == 4:
         admit(source)
     else:
@@ -159,8 +160,7 @@ def test_actual_nested_pipeline_keeps_all_conditional_writer_completions(monkeyp
         if operation.native.data == "index_load":
             root, offset, _ = values[operation.refs[0]]
             values[operation.value] = (
-                inputs["count"] if root.sym_name.data == "Count"
-                else inputs["flags"][offset // 4]
+                inputs["count"] if root.sym_name.data == "Count" else inputs["flags"][offset // 4]
             )
 
     monkeypatch.setattr(_Interpret, "native", metadata)

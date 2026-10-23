@@ -164,5 +164,6 @@ def bind_values(
     for operation in source.walk():
         if isinstance(operation, (StageOp, DomainOp, IterationOp)):
             for value in operation.results:
-                resolve(value)
+                if isinstance(value.type, TileType):
+                    resolve(value)
     return values, tuple(uses)

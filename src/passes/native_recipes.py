@@ -33,6 +33,7 @@ from ..dialects.source import (
     block8_reduction_widths,
     copy_compatible,
     mask_chunks,
+    source_yield_origin,
 )
 from ..mask import (
     MASK_REPEAT_POLICY,
@@ -394,7 +395,7 @@ class MaskInfo:
 
 def resolve_mask(value, context):
     require(context.operand is not None, "predicate lowering needs actual scalar bindings")
-    producer = value.owner
+    producer = source_yield_origin(value).owner
     if isinstance(producer, MaskOp):
         program = producer.program()
         count = scalar_operand_count(program.nodes)

@@ -53,7 +53,7 @@ def fp32_padding(A:N.Tensor((3,{pitch}),N.f32),n:N.i64):
 def matrix_overlay():
     """Identity GEMM exposes every preserved/overlaid NZ row and column."""
     return N.from_source(
-        '''
+        """
 def overlay(A:N.Tensor((32,64),N.f16), B:N.Tensor((32,64),N.f16),
             Identity:N.Tensor((64,64),N.f16),
             O:N.Tensor((32,64),N.f32,access="write",write_disjoint=True),n:N.i64):
@@ -70,5 +70,6 @@ def overlay(A:N.Tensor((32,64),N.f16), B:N.Tensor((32,64),N.f16),
         bb=N.copy(b1,b0)
         N.matmul(aa,bb,accum=c0,initialize=True)
         N.copy(c0,O)
-''', disjoint_external=True,
+""",
+        disjoint_external=True,
     )

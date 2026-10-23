@@ -83,8 +83,10 @@ def test_binary_cross_ids_keep_constant_operands_and_the_actual_notification_wor
     slot = expression("rem", g, literal(2))
     materialize_notifications(
         memory,
-        tuple(action(task, event, (Comparison(slot, "==", literal(i)),), kind=kind)
-              for i, event in enumerate(events)),
+        tuple(
+            action(task, event, (Comparison(slot, "==", literal(i)),), kind=kind)
+            for i, event in enumerate(events)
+        ),
     )
     original = dump(module)
     simplify_scalars(module)
@@ -104,8 +106,10 @@ def test_binary_cross_selection_preserves_holes_and_multiple_cases_of_one_id(kin
     slot = expression("rem", g, literal(4))
     materialize_notifications(
         memory,
-        tuple(action(task, event, (Comparison(slot, "==", literal(i)),), kind=kind)
-              for i, event in ((0, 3), (1, 11), (3, 3))),
+        tuple(
+            action(task, event, (Comparison(slot, "==", literal(i)),), kind=kind)
+            for i, event in ((0, 3), (1, 11), (3, 3))
+        ),
     )
     original = dump(module)
     simplify_scalars(module)
@@ -164,11 +168,10 @@ def test_a_constant_id_covering_both_phases_keeps_its_word_and_guard_hole():
         assert trace(module, parameters) == trace(parse(original), parameters)
 
 
-@pytest.mark.parametrize(
-    "steady,boundary", [((0, 1), (2, 3)), ((4, 5), (0, 1)), ((3, 4), (6, 7))]
-)
+@pytest.mark.parametrize("steady,boundary", [((0, 1), (2, 3)), ((4, 5), (0, 1)), ((3, 4), (6, 7))])
 def test_four_ids_with_a_shared_phase_preserve_boundaries_holes_and_every_notification(
-    steady, boundary,
+    steady,
+    boundary,
 ):
     module, memory, task, q, _, g = packet_program()
     slot = expression("rem", g, literal(2))

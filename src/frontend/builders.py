@@ -633,12 +633,16 @@ class _Mask:
     """A logical predicate value with exactly one actual producer."""
 
     shape: tuple[int, ...]
-    value: SSAValue
+    _value: SSAValue
     storage: _MaskStorage | None = None
 
     @property
     def materialized(self):
         return self.storage is not None
+
+    @property
+    def value(self):
+        return _trace().logical(self._value) if self.materialized else self._value
 
     def __and__(self, other):
         return _mask_binary(self, other, "and")
@@ -1483,6 +1487,7 @@ def compare(source, threshold, *, kind="gt", out):
     _trace().add(op)
     _trace().record(op.value)
     storage = _MaskStorage(out.view, chunks, _Value(out.view, op.value))
+    _trace().record(op.mask)
     return _Mask(tuple(src.shape), op.mask, storage)
 
 
@@ -1508,6 +1513,7 @@ def materialize(mask, *, out):
     _trace().add(op)
     _trace().record(op.value)
     storage = _MaskStorage(out.view, out.chunks, _Value(out.view, op.value))
+    _trace().record(op.result)
     return _Mask(mask.shape, op.result, storage)
 
 
@@ -1593,6 +1599,7 @@ def _mask_combine(lhs, rhs, kind, out):
     _trace().add(op)
     _trace().record(op.value)
     storage = _MaskStorage(out.view, out.chunks, _Value(out.view, op.value))
+    _trace().record(op.result)
     return _Mask(out.shape, op.result, storage)
 
 

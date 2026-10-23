@@ -212,6 +212,10 @@ def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_pac
     for number, _ in vertices:
         blocked = set().union(*(reserved.get(b, set()) for b in namespaces(demands[number])))
         allowed.append(tuple(flag for flag in range(capacity) if flag not in blocked))
+    # Unused IDs with the same admissible vertices are interchangeable.
+    # Reservations can distinguish numbers across joint banks, so retain the
+    # whole allowed-column signature rather than just a count of used IDs.
+    signatures = tuple(tuple(flag in choices for choices in allowed) for flag in range(capacity))
     for i, j in combinations(range(len(vertices)), 2):
         a, b = vertices[i][0], vertices[j][0]
         common = set(namespaces(demands[a])).intersection(namespaces(demands[b]))
@@ -272,7 +276,14 @@ def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_pac
             None,
         )
         choices.sort(key=lambda c: (c != previous if previous is not None else False, c in used, c))
+        occupied = set(colors.values())
+        tried_unused = set()
         for color in choices:
+            if color not in occupied:
+                signature = signatures[color]
+                if signature in tried_unused:
+                    continue
+                tried_unused.add(signature)
             if cross:
                 members = {vertices[n][0] for n, c in colors.items() if c == color} | {number}
                 usage = counter_group_usage(

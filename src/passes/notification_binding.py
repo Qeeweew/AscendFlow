@@ -685,6 +685,16 @@ def _route_key(notification):
     )
 
 
+def _acquire_route_key(notification):
+    route = _route_key(notification)
+    # A mode-2 Wait blocks this receiver's controller, so its acquired source
+    # prefix also precedes later instructions on other receiver pipes. Local
+    # Waits only gate their destination queue and retain the exact route.
+    return (
+        route[:2] + route[3:] if notification.mechanism is NotificationKind.CROSS_EVENT else route
+    )
+
+
 def _capture_order(left, right, requirements, order):
     """Compare every participant's actual prefix, without moving an endpoint."""
     return {
@@ -783,7 +793,9 @@ def _reuse_acquisitions(notifications, order):
             tuple(point.families for point in item.consumers),
         )
 
-    frontier = AcquiredPrefixes(notifications, order, _route_key, activation, order.binding_work)
+    frontier = AcquiredPrefixes(
+        notifications, order, _acquire_route_key, activation, order.binding_work
+    )
     selected = []
     for item in sorted(notifications, key=key):
         index = frontier.find(item, _contains_activation)

@@ -30,7 +30,10 @@ def exhaustive(items, order):
     kept = []
     for item in sorted(items, key=key):
         for i, previous in enumerate(kept):
-            if binding._route_key(previous) != binding._route_key(item):
+            a, b = binding._route_key(previous), binding._route_key(item)
+            if previous.mechanism is item.mechanism is NotificationKind.CROSS_EVENT:
+                a, b = a[:2] + a[3:], b[:2] + b[3:]
+            if a != b:
                 continue
             if not binding._contains_activation(previous, item, order):
                 continue

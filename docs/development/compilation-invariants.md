@@ -163,6 +163,12 @@ lane word，R表示保留旧padding并依赖真实initializer的ordinary read ad
 单次compare单独授权未初始化packed读取。packed NOT是真实count-mode Vector `vnot`，
 engine/effects/packet与实际调用一致。不能把scalar清零或其它引擎的工作藏进声明为
 Vector的task。
+材料化谓词跨 Domain、Stage 或 Iteration 时，描述符与 packed Tile 依赖一起通过
+实际 yield 导出。描述符只标识形状和 writer；Tile 依赖仍由普通值绑定、初始化和
+同步准入检查真实读取。两者必须指向同一实际 writer 及其精确 allocation。
+沿 yield 查询 writer 不证明循环非空、LAST 存在、ready 或 ownership；空循环
+不能通过转发描述符制造可读的谓词值。
+
 谓词按有界128位精确整数求值，极端signed起点
 不溢出、不shift-by-64；`mask=False` lane保留旧值，不构成完整定义。
 
@@ -172,6 +178,11 @@ physical IR；bypass launcher 用目标 runtime 查询的地址别名绑定原�
 同一 allocation，不能用不同虚地址规避真实重叠。
 
 Set只能捕获合法source里程碑，不能把后续发射也当已完成；Wait只取得真实配对贡献。普通queue Wait和Scalar/cross controller阻塞分别建模。数据顺序、flag空闲和无死锁是不同保证。
+
+mode-2 Wait 阻塞接收端 controller。已有完整 quorum 的 capture/acquire 可以覆盖
+同一接收端 controller 上随后其他 pipe 的访问，但须保持 producer pipe、全部
+参与者、激活和真实端点顺序。该覆盖不新增完成关系或改变原通知的 ownership。
+local Wait 只阻塞目标 queue，不能以相同理由覆盖另一 pipe 的 consumer。
 
 release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继续；MTE2读完共享GM可以释放GM而Vector继续。不能以整个计算完成替代最后读取，不能因不同tensor名称忽略别名。
 
