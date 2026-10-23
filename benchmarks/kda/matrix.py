@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--physical", required=True, type=int)
-    parser.add_argument("--official-release", required=True, type=Path)
+    parser.add_argument("--reference-artifacts", required=True, type=Path)
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64])
     args = parser.parse_args()
     require(not args.output.exists(), "matrix requires a new output directory")
@@ -38,7 +38,7 @@ def main():
             shared=True,
             timeout_s=300,
         )
-        for backend in ("ascendflow", "triton"):
+        for backend in ("ascendflow", "ascendc"):
             print(f"batch={batch}: {backend} BasicInfo", flush=True)
             with (point / f"{backend}.log").open("w") as log:
                 subprocess.run(
@@ -54,6 +54,8 @@ def main():
                         str(args.physical),
                         "--backend",
                         backend,
+                        "--reference-artifacts",
+                        str(args.reference_artifacts.resolve()),
                         "--metrics",
                         "BasicInfo",
                     ],
@@ -61,13 +63,13 @@ def main():
                     stdout=log,
                     stderr=subprocess.STDOUT,
                 )
-        report = compare(point / "ascendflow", point / "triton", args.official_release)
+        report = compare(point / "ascendflow", point / "ascendc", None)
         report_path = point / "comparison.json"
         report_path.write_text(json.dumps(report, indent=2) + "\n")
         row = {
             "batch": batch,
             "ascendflow_us": report["ascendflow"]["kernel_us"],
-            "triton_us": report["triton"]["kernel_us"],
+            "ascendc_us": report["ascendc"]["kernel_us"],
             "speedup": report["speedup"],
             "comparison": str(report_path),
             "comparison_sha256": digest(report_path),
@@ -86,11 +88,11 @@ def main():
         }
         (directory / "matrix.json").write_text(json.dumps(matrix, indent=2) + "\n")
         lines = [
-            "| Batch | AscendFlow (μs) | Triton (μs) | Triton / AscendFlow |",
+            "| Batch | AscendFlow (μs) | AscendC (μs) | AscendC / AscendFlow |",
             "| ---: | ---: | ---: | ---: |",
         ]
         lines += [
-            f"| {r['batch']} | {r['ascendflow_us']:.3f} | {r['triton_us']:.3f} | {r['speedup']:.2f}× |"
+            f"| {r['batch']} | {r['ascendflow_us']:.3f} | {r['ascendc_us']:.3f} | {r['speedup']:.2f}× |"
             for r in rows
         ]
         (directory / "matrix.md").write_text("\n".join(lines) + "\n")

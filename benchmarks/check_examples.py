@@ -263,6 +263,19 @@ def examples():
             "validation/results.json",
         )
     )
+    from benchmarks.kda.fragments import CASES, source
+
+    for fragment in CASES:
+        result.append(
+            Example(
+                f"kda-{fragment}",
+                (source(fragment),),
+                ("benchmarks.kda.fragments", "--case", fragment, "--build"),
+                ("benchmarks.kda.fragments", "--case", fragment, "--artifacts", "{output}"),
+                "validation",
+                "validation/results.json",
+            )
+        )
     result.append(
         Example(
             "sparse-mla",

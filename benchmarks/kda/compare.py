@@ -7,6 +7,7 @@ from pathlib import Path
 from ascendflow.diagnostics import require
 from benchmarks.kda.reference import verify_provenance
 from benchmarks.kda.run import digest
+from benchmarks.references.kda_aclnn import verify_reference
 
 
 def read_profile(directory, backend):
@@ -42,16 +43,21 @@ def read_profile(directory, backend):
     }
 
 
-def compare(ascendflow, triton, official_release):
+def compare(ascendflow, reference_directory, official_release=None, backend="ascendc"):
     generated, ours = read_profile(ascendflow, "ascendflow")
-    original, theirs = read_profile(triton, "triton")
+    original, theirs = read_profile(reference_directory, backend)
     modes = [
         json.loads((directory / "metrics.json").read_text())["provenance"].get(
             "aic_metrics", "Default"
         )
-        for directory in (ascendflow, triton)
+        for directory in (ascendflow, reference_directory)
     ]
     require(modes[0] == modes[1], "profiling configurations differ")
+    clocks = [
+        json.loads((directory / "metrics.json").read_text())["OpBasicInfo"]["Current Freq"]["mean"]
+        for directory in (ascendflow, reference_directory)
+    ]
+    require(clocks[0] == clocks[1] and clocks[0] > 0, "measured kernel frequencies differ")
     keys = (
         "shapes",
         "lengths",
@@ -71,8 +77,8 @@ def compare(ascendflow, triton, official_release):
         "device or platform differs",
     )
     require(
-        len(generated["lengths"]) > 0 and set(generated["lengths"]) == {1},
-        "comparison requires a positive batch of single-token decode",
+        len(generated["lengths"]) > 0 and max(generated["lengths"]) > 0,
+        "comparison requires a nonempty batch",
     )
     artifact = generated["generated"]
     root = Path(artifact["directory"])
@@ -83,19 +89,23 @@ def compare(ascendflow, triton, official_release):
         "compiled artifact changed",
     )
     reference = original["reference"]
-    verify_provenance(reference, official_release)
+    if backend == "ascendc":
+        verify_reference(reference)
+    else:
+        require(official_release is not None, "Triton comparison requires --official-release")
+        verify_provenance(reference, official_release)
     report = {
         "status": "passed",
-        "scope": f"single-token decode; one msprof op {modes[0]} collection per backend",
+        "scope": f"decode/recurrent; one msprof op {modes[0]} collection per backend",
         "aic_metrics": modes[0],
         "ascendflow": ours,
-        "triton": theirs,
+        backend: theirs,
         "speedup": theirs["kernel_us"] / ours["kernel_us"],
         "configuration": {key: generated[key] for key in keys},
         "physical_device": generated["health"]["physical_device"],
         "reference": reference,
-        "official_release": str(official_release.resolve()),
-        "official_release_sha256": digest(official_release),
+        "official_release": str(official_release.resolve()) if official_release else None,
+        "official_release_sha256": digest(official_release) if official_release else None,
     }
     return report
 
@@ -103,16 +113,19 @@ def compare(ascendflow, triton, official_release):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ascendflow", required=True, type=Path)
-    parser.add_argument("--triton", required=True, type=Path)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--ascendc", type=Path)
+    group.add_argument("--triton", type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--official-release", required=True, type=Path)
+    parser.add_argument("--official-release", type=Path)
     args = parser.parse_args()
-    report = compare(args.ascendflow, args.triton, args.official_release)
+    backend = "ascendc" if args.ascendc else "triton"
+    report = compare(args.ascendflow, args.ascendc or args.triton, args.official_release, backend)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(
         json.dumps(
-            {key: report[key] for key in ("status", "ascendflow", "triton", "speedup")}, indent=2
+            {key: report[key] for key in ("status", "ascendflow", backend, "speedup")}, indent=2
         )
     )
 

@@ -1,7 +1,8 @@
 # KDA prefill 的矩阵乘输入精度
 
 参考为 vllm-ascend `2581a69bcc16ee6af56e72985a15799bb5f61808`，
-Triton-Ascend 官方 3.6.0，目标 Ascend910B3。下表的两列是 **dot 两侧输入**，
+Triton-Ascend 官方 3.6.0，目标 Ascend910B3。这是算术来源审计；当前性能主基线为
+flash-linear-attention-npu AscendC，默认 Q/K/V/Output 已统一为 BF16。下表的两列是 **dot 两侧输入**，
 以 Q/K/V 为 FP16、gate/beta/initial state 为 FP32 为例。
 
 | 阶段 | 左输入 | 右输入 | 源码原因 |

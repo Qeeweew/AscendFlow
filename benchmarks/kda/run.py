@@ -1,4 +1,4 @@
-"""Validate a published KDA library and compare the original Triton operator."""
+"""Validate a published KDA library and compare upstream AscendC KDA."""
 
 import argparse
 import ctypes as ct
@@ -41,6 +41,12 @@ def worker(args):
     # Check all physical cards before anything initializes the NPU runtime.
     health = health_snapshot(args.physical, args.output)
     hardware = hardware_snapshot(args.physical)
+    if args.backend in {"ascendc", "both"}:
+        from benchmarks.references.kda_aclnn import configure_reference
+
+        reference = configure_reference(args.reference_artifacts)
+    else:
+        reference = None
     import torch
     import torch_npu
 
@@ -77,7 +83,7 @@ def worker(args):
     tokens, heads, dimension = shapes["Q"]
     require(
         heads == shapes["Value"][1] and dimension == shapes["Value"][2],
-        "the original Triton wrapper comparison requires H=HV and K=V",
+        "the KDA benchmark currently requires H=HV and K=V",
     )
     require(
         sum(lengths) == tokens
@@ -150,8 +156,14 @@ def worker(args):
         return device["Output"], device["State"]
 
     functions = {"ascendflow": generated}
-    reference = None
-    if args.backend in {"both", "triton"}:
+    reference_call = None
+    if args.backend in {"both", "ascendc"}:
+        from benchmarks.references.kda_aclnn import KdaReference
+
+        reference_call = KdaReference.recurrent(args.reference_artifacts, device)
+        reference["interface"] = reference_call.operator
+        functions["ascendc"] = reference_call
+    if args.backend == "triton":
         original, reference = load_reference(args.reference)
 
         def triton_call():
@@ -171,7 +183,10 @@ def worker(args):
     results = {}
     for backend in selected:
         device["State"].copy_(initial)
-        output, state = functions[backend]()
+        from benchmarks.kda.profiling import invocation
+
+        with invocation(args.profile_invocation):
+            output, state = functions[backend]()
         torch.npu.synchronize()
         metrics = {
             "output": error_metrics(output, oracle),
@@ -198,6 +213,9 @@ def worker(args):
             end.synchronize()
             times.append(start.elapsed_time(end) * 1000)
         results[backend] = {"correctness": metrics, "stream_interval_us": times}
+    if reference_call is not None:
+        torch.npu.synchronize()
+        reference_call.close()
     record = {
         "status": "passed",
         "operator": kernel,
@@ -234,14 +252,19 @@ def main():
     parser.add_argument(
         "--reference", type=Path, default=Path("/workspace/xdsl-910b/reference/vllm-ascend")
     )
+    parser.add_argument("--reference-artifacts", type=Path)
+    parser.add_argument("--profile-invocation", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--physical", type=int, required=True)
-    parser.add_argument("--backend", choices=("both", "ascendflow", "triton"), default="both")
+    parser.add_argument(
+        "--backend", choices=("both", "ascendflow", "ascendc", "triton"), default="ascendflow"
+    )
     parser.add_argument("--lengths", nargs="+", type=int)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    require(args.warmup >= 0 and args.repeats > 0, "invalid KDA timing counts")
+    require(args.warmup >= 0 and args.repeats >= 0, "invalid KDA timing counts")
+    os.environ.update(ASCEND_RT_VISIBLE_DEVICES=str(args.physical), ASCEND_DEVICE_ID="0")
     os.environ.setdefault("TRITON_CACHE_DIR", str(args.output.resolve() / "triton-cache"))
     if args.worker:
         worker(args)

@@ -82,8 +82,7 @@ def diagonal_gram(buffers, geometry, coordinates):
 
 
 @N.inline
-def diagonal_inverse(inputs, buffers, geometry, coordinates):
-    Ai32, Diagonal = inputs
+def invert_diagonal(buffers, geometry):
     (
         inverse,
         coefficients,
@@ -95,7 +94,6 @@ def diagonal_inverse(inputs, buffers, geometry, coordinates):
         identities,
     ) = buffers
     (BT,) = geometry
-    chunk, head = coordinates
     N.mul(inverse, -1.0, out=inverse)
     for inverse_row in N.serial(2, 16):
         N.copy(inverse[inverse_row, :], coefficients)
@@ -112,6 +110,15 @@ def diagonal_inverse(inputs, buffers, geometry, coordinates):
         N.add(inverse_tree[0, :], inverse_tree[1, :], out=inverse_tree[0, :])
         N.add(coefficients, inverse_tree[0, :], out=inverse[inverse_row, :])
     N.add(inverse, identities, out=inverse)
+
+
+@N.inline
+def diagonal_inverse(inputs, buffers, geometry, coordinates):
+    Ai32, Diagonal = inputs
+    inverse = buffers[0]
+    (BT,) = geometry
+    chunk, head = coordinates
+    invert_diagonal(buffers, geometry)
     for plane in N.unroll(BT // 16):
         block = plane * 16
         N.copy(
@@ -140,7 +147,7 @@ def prefill_gram(
     K: N.constexpr = 128,
     BT: N.constexpr = 64,
     GROUPS: N.constexpr = 40,
-    DTYPE: N.constexpr = N.f16,
+    DTYPE: N.constexpr = N.bf16,
     SCALE: N.constexpr = 0.08838834764831845,
 ):
     with N.Kernel(GROUPS, kind="vector") as owner:

@@ -6,7 +6,7 @@ xDSL 自动同步和 ASC/CANN；算法与流水政策在 examples，编译器没
 
 ## 数值与输入合同
 
-默认合同为 Q/K/V/Output FP16，Gate/Beta/Initial/Final FP32，K=V=128、
+默认合同为 Q/K/V/Output BF16，Gate/Beta/Initial/Final FP32，K=V=128、
 H=HV、H 为 8 的正整数倍、BT=64，启用 Q/K L2 归一化，Gate 为非正的 log 衰减值。
 state 布局为 `[sequence, head, V, K]`。
 每条序列的 chunk 数相同且非零；最后一个 chunk 可以不足 64 tokens，长度可以不同。
@@ -14,50 +14,54 @@ state 布局为 `[sequence, head, V, K]`。
 调用方保证每个 chunk 在对应序列内且 `1 <= valid <= min(64, TOKENS-start)`，
 各序列只有最后一个 chunk 可以不满 64 tokens。
 当前 runner 拒绝零长度和不同 chunk 数的序列；不由此推导 grouped heads、speculative
-state indexing 或 BF16 的设备资格。
+state indexing 或其他 dtype 的设备资格。
 
 原始 Triton 的**矩阵乘两侧输入 dtype** 见[输入精度表](kda-prefill-precision.md)。
 整块 Gate 前缀、跨块 Gram、块逆合并和历史状态投影使用 IEEE FP32×FP32 Cube；
-W/U、状态增量与两个输出乘法使用 FP16×FP16、FP32 累加。
-W 先舍入为 FP16，再转为投影所需的 FP32；不能省去中间舍入。
+W/U、状态增量与两个输出乘法使用 BF16×BF16、FP32 累加。
+W 先舍入为 BF16，再转为投影所需的 FP32；不能省去中间舍入。
 同一 16×16 对角块的 Gram 使用 FP32 元素乘、exp 和归约，不调用 dot。
-FP32 carry 与 FP16 snapshot 是不同的值和存储，snapshot 不反馈到递推状态。
+FP32 carry 与 BF16 snapshot 是不同的值和存储，snapshot 不反馈到递推状态。
 
 ## 计算与流水
 
-当前 runner 顺序发射十个 phase specialization，具体 ABI 与顺序见
-[运行器](../../benchmarks/kda/prefill.py)。同一 stream 保证 kernel 间依赖，
-kernel 内的 ready/release、GM 交接和事件资源由公共同步链建立。
+当前 runner 在同一 stream 上依次发射 `prepare → scan → output` 三个 kernel，
+具体 ABI 与顺序见[运行器](../../benchmarks/kda/prefill.py)。kernel 边界建立全设备阶段顺序；
+Prepare 内的一个 chunk/head 完整归属一个 mixed group，因此不需要 kernel 内全核同步。
+核内 ready/release、GM 交接和有限事件资源由公共同步链建立。
 
-| 阶段 | 计算及流水 |
+| 阶段 | 计算及归属 |
 |---|---|
-| prepare_full | 非末块以 FP32 下三角矩阵乘计算 Gate 前缀；三阶段双槽流水，Cube 前缀与 Vector 归一化、beta 提取重叠 |
-| prepare | 每序列末块使用运行时 valid；三阶段 token 流水与 FP32 Vector 顺序前缀，清零 padding |
-| gram | 四个 16×16 对角块在 UB 计算；四块逆按 `[16,64]` 合批，复用不变 packed mask |
-| gram_cross | chunk/head 任务在核内循环；外层 prepare/compute/store 三阶段复用两槽 GM workspace，Cube 子流水双缓冲导入并做 IEEE FP32 dot |
-| solve_merge16 / solve_merge32 | 同一 kernel 的两个 constexpr 特化，FP32 Cube 将 16×16 对角逆合为 32×32、64×64，三阶段双槽流水 |
-| transform | Vector 构造 beta*K*expG、beta*V、KG、QG 和 A16，保留各自 FP16 舍入边界 |
-| wu | FP16 Ai @ RHS 生成 W/U；三阶段双槽流水，W 经 FP16 GM 槽后转存 FP32 |
+| prepare | Q/K 归一化、Gate 前缀、对角与跨块 Gram、16→32→64 块逆、RHS/KG/QG/A16、W/U；每个 chunk/head 在同一 AIC 与两个 AIV 内完成 |
 | scan | 以 sequence/head 分配任务；chunk 间两阶段预取/递推，历史投影、residual、状态增量和 FP32 carry 更新保持递推顺序 |
 | output | 以 chunk/head 并行，双缓冲导入、Cube 计算两项输出乘法、Vector 合并及有效行写回 |
 
+Prepare 在同一 kernel 内分别循环处理非末块与每序列末块。非末块使用 FP32
+下三角矩阵乘计算 Gate 前缀；末块保留 FP32 Vector 顺序累加并清零 padding，
+随后用单位矩阵乘发布完整前缀。末块即使有 64 个有效 token，也保持该求和次序。
+FP32 carry、BF16 snapshot 和矩阵乘输入精度分别遵守上述数值合同。
+
 块逆使用 `[[D0,0],[-D1*A10*D0,D1]]` 合并 16→32→64，乘法输入保持 FP32。
 对角逆的四个矩阵沿列合并，使乘法及加法树填满 64 个 FP32 lane；行依赖仍在核内顺序执行。
-跨块 Gram 采用 16/32-token 分层矩形，运行器将一个 cohort 的任务数设为
-`PACK=gcd(CHUNKS*H,16)`。每组两个 workspace 槽由实际最后 reader 约束回收，
-不再由 host 按 512-task slab 重复发射 Vector/Cube kernel。
-Cube/Vector 通过 GM workspace 交接；每个 mixed kernel 的两个 AIV 共用 body，
-通过 runtime SID 区分地址和角色，分析保留各自私有 UB 与 quorum 贡献。
+跨块 Gram 采用 16/32-token 分层矩形；四次 FP32 GEMM 的结果占用同一
+`[32,96]` L0C 的不重叠列区间，经一次 FIX 写入 `GramProducts`。
+中间 GM workspace 按 group 分配，并由实际最后 reader 约束回收。
+两个 AIV 共用 body，通过 runtime SID 区分地址与角色；分析保留各自私有 UB
+及完整 quorum 贡献，不把同组不同 AIV 的源码顺序当作完成关系。
 
-gram_cross 每项的四片左操作数在 L1 中保存为一个 `[128,K]` NZ slab，使用
-一次真实 GM→L1 DMA 导入，再由四次行切片 Load3D 读取。slab 下一次覆盖等
-全部旧 reader 退休。右操作数保留紧凑转置平面；每项导入从七次减少为四次，
-L1 容量不变。FP32 Load3D A 的 strided NZ 源保留每个 K/8 平面的实际行距，
-行距按 16×8 个 FP32 对齐且宽度不超过 256；目标仍是完整紧凑 L0A 平面。
-该能力不放宽 FP32 转置 Load2D 的紧凑源合同，也不改变矩阵乘输入精度。
+跨块 Gram 的行分工与 transform 的连续 32 行分工不同。每个 AIV 先发布 Aqk，
+再发布送入 Cube 的 Negative；transform 在获取 Cube 最终块逆结果后读取 Aqk，
+保留完整的双 AIV 可见性链。块逆的 FP32 UB 副本跨 transform 保留，之后才舍入
+并发布 BF16 Inverse，使 W/U 的首个导入同时获取此前 Right 的发布前缀。
 
-scan 中每个 chunk 保存更新前的 FP16 snapshot，同时用 FP32 历史状态做投影；
-residual 舍入为 FP16 后参与状态增量。carry 在 FP32 中完成衰减与加法，
+跨块 Gram 的四片左操作数在 L1 中保存为一个 `[128,K]` NZ slab，使用一次真实
+GM→L1 DMA 导入，再由四次行切片 Load3D 读取；下一次覆盖等待全部旧 reader 退休。
+右操作数保留紧凑转置平面。FP32 Load3D A 与非转置 B 的 strided NZ 源保留
+每个 K/8 平面的实际行距，行距按 16×8 个 FP32 对齐且宽度不超过 256；
+目标仍是完整紧凑 L0A/B 平面。该能力不放宽 FP32 转置 Load2D 的紧凑源合同。
+
+scan 中每个 chunk 保存更新前的 BF16 snapshot，同时用 FP32 历史状态做投影；
+residual 舍入为 BF16 后参与状态增量。carry 在 FP32 中完成衰减与加法，
 每个 sequence/head 必须按 chunk 顺序执行。独立的 output 阶段读取各 chunk 的
 snapshot、residual 等数据，按 chunk 分配负载，不重新计算递推状态。
 
@@ -77,31 +81,50 @@ workspace 读取和 credit 归还。L0C 仍为 128 KiB，GM workspace 字节数�
 也不外推其他 dtype 或未列出的元数据合同。
 性能使用 `msprof op` 的 kernel Task Duration，保持默认 kernel 重放；
 BasicInfo、PipeUtilization 和 L2Cache 分开采集，不能混用各次时间。
+AscendFlow 的采集入口在提交每个 phase 后进行 host stream 同步，避免依赖阶段
+尚在重放时提交下一阶段；该设置记录为 `phase_host_sync`。耗时只累计设备
+kernel，不包含 host 间隔。普通运行仍在同一 stream 连续提交三个 kernel，
+数值验收也覆盖不加逐阶段 host 同步的调用。
 具体数值与性能结果随每次构建和采集保存，旧版本快照不作为当前代码资格。
 
-## 复现
+## AscendC 基线与复现
 
-使用工作区独立 venv，从产品仓库执行：
+主基线为 [flash-linear-attention-npu](https://github.com/flashserve/flash-linear-attention-npu)
+的 `aclnnChunkKdaFwdV2`。它是 upstream Python `chunk_kda_fwd` 在 BF16、
+K=V=128、chunk64 且开启 Q/K 归一化时选择的公开组合入口，按 Prepare、FwdH、
+Finalize 发射；与旧版本的单 L0 融合入口需区分。使用自然 log gate、预处理 beta、
+FP32 初始/最终状态和 V-first state，不启用额外 gate/beta 激活。
+这里的内部 Q/K 归一化开关会强制选择 V2。未启用这些强制开关时，upstream
+按 `heads × total_chunks >= 4096` 选择 V2；H32、4096 tokens、chunk64 只有
+2048 个 work item。所核对的 vllm-ascend 封装先独立归一化 Q/K，再调用默认
+分支，因此该 shape 会选择旧融合入口，并可能包含布局转换。当前 V2 性能
+不能代表该 vllm-ascend 完整默认路径；后者尚未测量。
+该版本 FwdH 使用 BF16 W 与 BF16 history 做投影，FP32 carry 单独保留；
+AscendFlow 仍使用上述 FP32 W×carry 投影。双方共享整算子误差门槛，内部矩阵
+输入精度需分别报告，不能用此基线放宽 AscendFlow 的数值合同。
+
+双方以原始 BF16 Q/K/V 为输入，kernel 内归一化计入耗时，完整 output/state
+relative RMSE 必须各自小于 0.005。MSTX `kda` 标记覆盖完整调用，统计其中所有
+kernel，包括 ACLNN 内部的 transpose、copy 与辅助输出，不按名称删去其成本。
 
 ```bash
 source ../.venv/bin/activate
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
-python -m benchmarks.kda.prefill --build-only --physical 2 \
+python -m benchmarks.kda.prefill --build-only \
   --artifacts build/kda/prefill --output build/kda/prefill-device --lengths 4096
 python -m benchmarks.kda.profile_prefill --physical 2 \
   --artifacts build/kda/prefill --output build/kda/prefill-ours
-python -m benchmarks.kda.profile_prefill --physical 2 --backend triton \
-  --artifacts build/kda/prefill --output build/kda/prefill-triton
+python -m benchmarks.kda.profile_prefill --physical 2 --backend ascendc \
+  --reference-artifacts build/kda/reference/opp/vendors/fla_npu_transformer \
+  --artifacts build/kda/prefill --output build/kda/prefill-ascendc
 python -m benchmarks.kda.compare_prefill \
-  --ascendflow build/kda/prefill-ours --triton build/kda/prefill-triton \
-  --official-release /workspace/xdsl-910b/materials/triton-official/release.json \
+  --ascendflow build/kda/prefill-ours --ascendc build/kda/prefill-ascendc \
   --output build/kda/prefill-comparison.json
 ```
 
 完整 pipeline 构建和每次运行分别有单次 300 秒进程组硬上限。运行前检查所有卡的
 健康、进程、显存和利用率，每进程显式映射物理卡至逻辑 0；设备错误直接停止。
 `--run-lengths` 可复用同一份库改变 tokens 数和尾块，只接受已编译的 sequence/chunk 域。
-数值检查先于报告性能；stream interval 另有标记，不用它代替 kernel 时间。
-batch=4 构建时将 `--lengths` 改为 `512 512 512 512`；该库可用
-`--run-lengths 449 477 505 512` 运行尾块配置，输出目录使用新路径。
+数值检查先于报告性能；batch=4 可构建 `--lengths 512 512 512 512`，该库可运行
+`--run-lengths 449 477 505 512`，输出目录使用新路径。

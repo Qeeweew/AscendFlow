@@ -87,7 +87,7 @@ def prefill_transform(
     K: N.constexpr = 128,
     BT: N.constexpr = 64,
     GROUPS: N.constexpr = 40,
-    DTYPE: N.constexpr = N.f16,
+    DTYPE: N.constexpr = N.bf16,
     SCALE: N.constexpr = 0.08838834764831845,
 ):
     with N.Kernel(GROUPS, kind="vector") as owner:

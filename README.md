@@ -40,13 +40,16 @@ TFLOPS 按有效 QK+PV FLOPs / 完整 kernel 耗时计算，FMA=2；耗时包含
 
 ### KDA
 
-H=HV=32、K=V=128，FP16 Q/K/V 与输出、FP32 carry。参照为 vllm-ascend Triton。
+H=HV=32、K=V=128，BF16 Q/K/V 与输出、FP32 Gate/Beta/carry。参照为
+[flash-linear-attention-npu](https://github.com/flashserve/flash-linear-attention-npu) AscendC，
+与 vllm-ascend 使用的 KDA 算子来自同一上游；prefill 使用带 Q/K 归一化的 V2 入口。
+该 prefill 比值仅对应 V2；此 shape 下 vllm-ascend 默认分支先独立归一化 Q/K，再选择融合入口，尚未测量该完整路径。
 
-| 配置 | AscendFlow (ms) | Triton (ms) | 加速比 |
+| 配置 | AscendFlow (ms) | AscendC (ms) | 加速比 |
 | --- | ---: | ---: | ---: |
-| Decode · 128 条序列 × 1 token | 0.427 | 2.093 | **4.90×** |
-| Recurrent · 4 条序列 × 32 tokens | 0.484 | 1.269 | **2.62×** |
-| Prefill · 1 条序列 × 4096 tokens，chunk64 | 3.734 | 10.540 | **2.82×** |
+| Decode · 128 条序列 × 1 token | 0.426 | 0.512 | **1.20×** |
+| Recurrent · 4 条序列 × 32 tokens | 0.478 | 0.594 | **1.24×** |
+| Prefill · 1 条序列 × 4096 tokens，chunk64 | 3.705 | 4.906 | **1.32×** |
 
 实现与使用说明见 [KDA 示例](examples/kda/README.md)。
 

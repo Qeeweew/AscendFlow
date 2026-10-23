@@ -29,7 +29,7 @@ python -m benchmarks.check_examples --output build/examples-cann
 | `scalar-store` | [vector/scalar_store.py](vector/scalar_store.py) · `scalar_store` | Scalar capture/store 与精确 FP32 检查 |
 | `kda-recurrent` | [kda/recurrent.py](kda/recurrent.py) · `recurrent_kda` | token 顺序递推、FP32 carry 与独立快照 |
 | `kda-decode` | [kda/decode.py](kda/decode.py) · `decode_kda` | 单 token 解码、三阶段 head 流水 |
-| `kda-prefill` | [KDA prefill](../docs/operators/kda-prefill.md) · 九个入口、十个特化 | chunk 预处理、Gram/块逆、递推及输出 |
+| `kda-prefill` | [KDA prefill](../docs/operators/kda-prefill.md) · prepare / scan / output 三个入口 | chunk 预处理、Gram/块逆、递推及输出 |
 
 [gemm/schedule.py](gemm/schedule.py) 是 GEMM 的 inline L2 政策 helper，随 GEMM 验证。
 `independent_rings` 用于测试互质环的组合，不是推荐的性能参数。

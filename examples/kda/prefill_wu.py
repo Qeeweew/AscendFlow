@@ -54,7 +54,7 @@ def prefill_wu(
     K: N.constexpr = 128,
     BT: N.constexpr = 64,
     GROUPS: N.constexpr = 20,
-    DTYPE: N.constexpr = N.f16,
+    DTYPE: N.constexpr = N.bf16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
         a1 = N.alloc_l1((2, BT, BT), DTYPE)

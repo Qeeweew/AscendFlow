@@ -62,8 +62,16 @@ def summarize(directory, metrics="BasicInfo"):
         if argument.startswith("--") and "=" in argument
     )
     require(options.get("replay-mode", "kernel") == "kernel", "expected kernel replay")
+    require(
+        options.get("mstx") == "on" and options.get("mstx-include") == "kda",
+        "profiling must capture one complete invocation",
+    )
     require(options.get("aic-metrics") == metrics, "recorded PMU group differs")
     device_path = directory / "device/results.json"
+    require(
+        device_path.is_file(),
+        "profiling application did not publish a numerical result; see watchdog/build.log",
+    )
     record = json.loads(device_path.read_text())
     require(record["status"] == "passed", "prefill numerical validation failed")
     rows = []
@@ -96,12 +104,14 @@ def summarize(directory, metrics="BasicInfo"):
             == sorted(KERNELS.get(p, "prefill_" + p) for p in config["phases"]),
             "prefill phase launch multiplicities differ",
         )
+    elif set(record["results"]) == {"ascendc"}:
+        require(
+            any("chunkkdafwdfinalize" in row["name"].lower().replace("_", "") for row in rows),
+            "AscendC output kernel was not collected",
+        )
     else:
         require(set(record["results"]) == {"triton"}, "expected one backend")
-        # Inputs and metadata are constructed on the CPU. These two device
-        # helpers belong to input reset and numerical validation, respectively.
-        # Zero initialization and the original gate scaling remain timed.
-        rows = [row for row in rows if not row["name"].startswith(("Cast_", "TensorMove_"))]
+        # The MSTX range includes every kernel in the original invocation.
         require(
             any(row["name"] == "chunk_gla_fwd_kernel_o" for row in rows),
             "original output kernel was not collected",
@@ -125,7 +135,8 @@ def summarize(directory, metrics="BasicInfo"):
         "status": "passed",
         "aic_metrics": metrics,
         "replay_mode": "kernel",
-        "scope": "sum of prefill kernel Task Duration; excludes host gaps and validation kernels",
+        "phase_host_sync": "--phase-sync" in shlex.split(options.get("application", "")),
+        "scope": "sum of all kernels in MSTX kda invocation; includes ACLNN layout/auxiliary kernels; excludes host gaps",
         "counter_scope": "per-block samples; pipe ratios are fractions of each core's active interval, not whole-device utilization",
         "kernel_us": sum(row["kernel_us"] for row in rows),
         "kernels": rows,
@@ -161,7 +172,9 @@ def main():
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--physical", required=True, type=int)
-    parser.add_argument("--backend", choices=("ascendflow", "triton"), default="ascendflow")
+    parser.add_argument(
+        "--backend", choices=("ascendflow", "ascendc", "triton"), default="ascendflow"
+    )
     parser.add_argument(
         "--metrics",
         choices=(
@@ -174,6 +187,7 @@ def main():
         ),
         default="BasicInfo",
     )
+    parser.add_argument("--reference-artifacts", type=Path)
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args()
     directory = args.output.resolve()
@@ -204,7 +218,14 @@ def main():
             "--repeats",
             "0",
             "--worker",
+            "--profile-invocation",
         ]
+        if args.reference_artifacts is not None:
+            application.extend(["--reference-artifacts", str(args.reference_artifacts.resolve())])
+        if args.backend == "ascendflow":
+            # Keep each dependent phase's replay complete before the host
+            # submits the next phase. Only device kernel durations are timed.
+            application.append("--phase-sync")
         command = [
             "msprof",
             "op",
@@ -213,6 +234,8 @@ def main():
             "--aic-metrics=" + args.metrics,
             "--launch-count=100",
             "--warm-up=0",
+            "--mstx=on",
+            "--mstx-include=kda",
         ]
         bounded_process(command, directory / "watchdog", timeout_s=300)
     result = summarize(directory, args.metrics)

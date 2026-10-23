@@ -7,7 +7,7 @@
 ## 输入与数值合同
 
 默认示例为 128 条序列，每条至多 1 token，H=HV=32、K=V=128，
-Q/Key/Value/Output 为 FP16，Gate/Beta/State 为 FP32，开启 Q/K L2 归一化。
+Q/Key/Value/Output 为 BF16，Gate/Beta/State 为 FP32，开启 Q/K L2 归一化。
 状态采用 `[slot, head, V, K]`，原地更新。不同活跃序列拥有互不重叠的正状态槽；
 槽 0 为 inactive sentinel，禁止覆盖。数值验收检查完整输出、完整状态和槽 0，
 output/state relative RMSE 门槛均为 `<0.005`。
@@ -33,7 +33,7 @@ token/head 只计算一次。不同 V 分块不再各自重复加载和归一化
 流水时钟为该序列内的 token ordinal，三阶段依次为双槽输入预取、FP32 更新与
 快照生成、整 head 输出及快照写回。独立的单份快照缓冲允许 MTE3 写回与下一
 token 的 carry 更新重叠；编译器根据快照的最后 reader 约束其复用。
-默认 H=HV=32、K=V=128、BV=64、两输入槽、FP16 输入/输出与 FP32 状态合计
+默认 H=HV=32、K=V=128、BV=64、两输入槽、BF16 输入/输出与 FP32 状态合计
 使用 177216 B UB，不扩大硬件容量。其他 shape/dtype 组合仍须通过真实容量检查。
 
 每个 token 更新后的状态按 `INPLACE` 写入 `Indices` 指定的正槽或 `Snapshots[token]`；
@@ -73,40 +73,43 @@ Q/K 归一化、gate exp 和 beta 每个 head 只做一次。两个状态槽加�
 默认完整 launch 为 473432064 FLOPs。有效 GM 流量约 518.016 MiB，其中 state 读写为 512 MiB；
 PMU 请求流量、UB 流量与 HBM 实流量是不同计数口径。
 
-## Triton 对照方法
+## AscendC 对照方法
 
-参考为 vllm-ascend `2581a69bcc16ee6af56e72985a15799bb5f61808` 的未修改
-`fused_recurrent_kda`，保留 BV=8、num_warps=1、num_stages=3。
-比较工具核对[官方 Triton-Ascend 3.6.0](https://github.com/triton-lang/triton-ascend/releases/tag/v3.6.0)
-wheel、参考源码、输入、平台和产物身份，不能将本地补丁版作为未修改的参考。
-双方采用相同 shape/dtype、输入和原地状态合同，先检查数值，再比较 kernel Task Duration。
+主基线为 [flash-linear-attention-npu](https://github.com/flashserve/flash-linear-attention-npu)
+的未修改 `RecurrentKda`，也是 vllm-ascend 使用的 AscendC recurrent 算子。
+Q/K/V/Output 统一为 BF16，Gate/Beta/State 保持 FP32，开启 kernel 内 Q/K
+归一化，使用相同的间接槽、输入字节和原地更新合同。参考公开接口只支持 BF16
+Q/K/V，不能与历史 FP16 Triton 数字混作同一对比。
 
-batch=1、2、4、8、16、32、64 的 BasicInfo 矩阵使用相同的
-HEAD_GROUPS=8、BV=64、两槽三阶段政策；H=HV=32、K=V=128，每序列一 token。
-结果、输入 hash、数值记录、原始 CSV 和逐点比较写入指定输出目录：
+参考通过 `aclnnRecurrentKda` 调用，输出和完整状态先通过独立 CPU 递推检查。
+OPP 的构建记录包含上游提交、源码、编译命令与 runtime 文件 hash；比较时复核
+产物、输入、平台和 PMU 模式。Triton 入口仅供原始精度审计和历史诊断。
+
+参考源码单独保留，上游源码不做补丁。`benchmarks.kda.build_reference` 使用上游
+`build.sh --jit` 生成 host/源码包，再调用 CANN `asc_opc` 编译本次 dtype 的动态
+shape 签名，生成标准 kernel 配置。单次 300 秒期限覆盖整个参考构建。
+`--dependencies` 指向 CANN 第三方安装材料（json/makeself/pkg）；这些只供参考构建。
 
 ```bash
-python -m benchmarks.kda.matrix --output build/kda/matrix --physical 2 \
-  --official-release /workspace/xdsl-910b/materials/triton-official/release.json
+python -m benchmarks.kda.build_reference --checkout /path/to/flash-linear-attention-npu \
+  --dependencies /path/to/cann-third-party --output build/kda/reference
 ```
 
-单点比较从产品仓库执行，使用独立工作区 venv。安装的 Triton wheel 必须与官方 Release 记录匹配。
-
 ```bash
+source ../.venv/bin/activate
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
-export ASCEND_RT_VISIBLE_DEVICES=2 ASCEND_DEVICE_ID=0
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
-python - <<'PY'
-from ascendflow.build import build_file
-build_file('examples/kda/decode.py', 'build/kda/decode', entry='decode_kda',
-           diagnostics=True, shared=True, timeout_s=300)
-PY
-python -m benchmarks.kda.profile --artifact build/kda/decode --output build/kda/ours --physical 2
-python -m benchmarks.kda.profile --artifact build/kda/decode --output build/kda/theirs --physical 2 --backend triton
-python -m benchmarks.kda.compare --ascendflow build/kda/ours --triton build/kda/theirs \
-  --official-release /workspace/xdsl-910b/materials/triton-official/release.json \
-  --output build/kda/comparison.json
+python -m benchmarks.kda.profile --artifact build/kda/decode \
+  --output build/kda/ours --physical 2
+python -m benchmarks.kda.profile --artifact build/kda/decode \
+  --output build/kda/ascendc --physical 2 --backend ascendc \
+  --reference-artifacts build/kda/reference/opp/vendors/fla_npu_transformer
+python -m benchmarks.kda.compare --ascendflow build/kda/ours \
+  --ascendc build/kda/ascendc --output build/kda/comparison.json
 ```
 
-每个 runner 先检查全卡健康、进程、显存和利用率；每个构建或运行有 300 秒硬上限。
-`run.py` 的 stream interval 含 host 提交间隙，性能比较只读取 profiler 的 kernel 时间。
+recurrent 使用相同工具并传入 `--lengths 32 32 32 32`。batch 矩阵通过
+`benchmarks.kda.matrix --reference-artifacts <vendor>` 使用同一 AscendC 基线。
+所有 runner 都先检查全卡状态、显式映射物理卡到逻辑 0，并使用 300 秒进程组
+硬期限。性能只用 msprof 的 kernel Task Duration；MSTX `kda` 范围包含实际调用，
+不含输入准备与数值检查。stream interval 另行标记，不代替 kernel 时间。

@@ -37,7 +37,7 @@ def decode_kda(
     V: N.constexpr = 128,
     BV: N.constexpr = 64,
     PIPE_SLOTS: N.constexpr = 2,
-    DTYPE: N.constexpr = N.f16,
+    DTYPE: N.constexpr = N.bf16,
     GATE_DTYPE: N.constexpr = N.f32,
     BETA_DTYPE: N.constexpr = N.f32,
     STATE_DTYPE: N.constexpr = N.f32,

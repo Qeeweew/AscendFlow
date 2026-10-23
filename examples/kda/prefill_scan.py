@@ -106,7 +106,7 @@ def prefill_scan(
     BV: N.constexpr = 64,
     CK: N.constexpr = 64,
     GROUPS: N.constexpr = 20,
-    DTYPE: N.constexpr = N.f16,
+    DTYPE: N.constexpr = N.bf16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
         assert K == 128 and BT == 64 and CK == 64 and BV == 64, "scan tile policy"

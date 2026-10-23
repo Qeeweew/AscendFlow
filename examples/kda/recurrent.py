@@ -1,6 +1,6 @@
 """Token-pipelined KDA with a whole-head FP32 carry and per-token snapshots.
 
-State is V-first, like vllm-ascend's Triton kernel. Distinct sequences must
+State is V-first, like the AscendC reference. Distinct sequences must
 own disjoint positive state slots, including initial and snapshot slots.
 Slot zero is the inactive sentinel. Sequence boundaries and slot IDs are
 immutable device metadata, not host-expanded token schedules.
@@ -39,7 +39,7 @@ def recurrent_kda(
     V: N.constexpr = 128,
     BV: N.constexpr = 64,
     PIPE_SLOTS: N.constexpr = 2,
-    DTYPE: N.constexpr = N.f16,
+    DTYPE: N.constexpr = N.bf16,
     GATE_DTYPE: N.constexpr = N.f32,
     BETA_DTYPE: N.constexpr = N.f32,
     STATE_DTYPE: N.constexpr = N.f32,

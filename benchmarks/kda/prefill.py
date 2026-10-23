@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import sys
-from math import gcd
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,28 +19,10 @@ from ascendflow.runtime.process import bounded_process
 from benchmarks.kda.reference import load_reference
 from benchmarks.kda.run import digest, error_metrics
 
-GRAM_PACK = 16
-PHASES = (
-    "prepare_full",
-    "prepare",
-    "gram",
-    "gram_cross",
-    "solve_merge16",
-    "solve_merge32",
-    "transform",
-    "wu",
-    "scan",
-    "output",
-)
-KERNELS = {p: "prefill_" + ("solve_merge" if p.startswith("solve_merge") else p) for p in PHASES}
-SOURCES = {
-    phase: "examples/kda/"
-    + "prefill_"
-    + ("prepare" if phase == "prepare_full" else "solve" if phase.startswith("solve") else phase)
-    + ".py"
-    for phase in PHASES
-}
-RUNTIME_PHASES = {"prepare_full", "prepare", "output"}
+PHASES = ("prepare", "scan", "output")
+KERNELS = {p: "prefill_" + p for p in PHASES}
+SOURCES = {p: "examples/kda/prefill_" + p + ".py" for p in PHASES}
+RUNTIME_PHASES = {"prepare", "output"}
 ORDERS = {
     "prepare": (
         "Q",
@@ -53,28 +34,30 @@ ORDERS = {
         "Kp",
         "Vp",
         "Gp",
+        "LocalGp",
         "Bp",
-        "Starts",
-        "Lengths",
-    ),
-    "gram": ("Qp", "Kp", "Gp", "Bp", "Aqk", "Diagonal", "Ai32", "Lengths"),
-    "gram_cross": (
-        "Qp",
-        "Kp",
-        "Gp",
-        "Bp",
-        "Negative",
         "Aqk",
-        "Lengths",
+        "Diagonal",
+        "Ai32",
+        "Negative",
+        "Inverse",
+        "Right",
+        "KG",
+        "QG",
+        "A16",
+        "U",
+        "W32",
         "GramLeft",
         "GramRight",
-        "GramSmall",
-        "GramLarge",
+        "GramProducts",
+        "Merge16",
+        "Merge32",
+        "Off32",
+        "W16Ring",
+        "Starts",
+        "Lengths",
+        "Lower",
     ),
-    "solve_merge16": ("Negative", "Diagonal", "Merge16", "Ai32", "Inverse"),
-    "solve_merge32": ("Negative", "Ai32", "Merge32", "Off32", "Inverse"),
-    "transform": ("Qp", "Kp", "Vp", "Gp", "Bp", "Right", "KG", "QG", "Aqk", "A16", "Lengths"),
-    "wu": ("Inverse", "Right", "U", "W16Ring", "W32"),
     "scan": (
         "U",
         "KG",
@@ -100,14 +83,36 @@ ORDERS = {
         "Lengths",
     ),
 }
-ORDERS["prepare_full"] = ORDERS["prepare"] + ("Lower", "BetaSelectors")
-MERGE_ABI = ("Negative", "Blocks", "Merge", "Off", "Inverse")
 
 
-def gram_pack_tasks(chunks, heads):
-    pack = gcd(chunks * heads, GRAM_PACK)
-    require(pack > 0, "cross Gram requires nonempty task cohorts")
-    return pack
+def workspace_layout(chunks, heads, sequences, dtype):
+    layouts = {}
+
+    def add(names, shape, storage):
+        for name in names.split():
+            layouts[name] = (shape, storage)
+
+    add("KG QG Residual U", (chunks, heads, 64, 128), dtype)
+    add("Qp Kp Vp", (20, 1, 64, 128), dtype)
+    add("LocalGp", (20, 1, 64, 128), "f32")
+    add("Gp W32 Projection", (chunks, heads, 64, 128), "f32")
+    add("Aqk Ai32 Negative Diagonal", (20, 1, 64, 64), "f32")
+    add("Bp", (20, 1, 64), "f32")
+    add("Merge16", (20, 2, 16, 16), "f32")
+    add("Merge32 Off32", (20, 2, 32, 32), "f32")
+    add("Inverse", (20, 1, 64, 64), dtype)
+    add("A16", (chunks, heads, 64, 64), dtype)
+    add("OutputProducts", (20, 2, 64, 256), "f32")
+    add("Right", (20, 1, 2, 64, 128), dtype)
+    add("W16Ring", (20, 2, 64, 128), dtype)
+    add("Snapshot", (chunks, heads, 128, 128), dtype)
+    add("Delta", (chunks, heads, 128, 128), "f32")
+    add("GramLeft", (20, 2, 1, 128, 128), "f32")
+    add("GramRight", (20, 2, 1, 64, 128), "f32")
+    add("GramProducts", (20, 2, 32, 96), "f32")
+    add("Initial History Final", (sequences, heads, 128, 128), "f32")
+    add("Lower", (2, 64, 64), "f32")
+    return layouts
 
 
 def oracle(host, lengths):
@@ -140,18 +145,13 @@ def build(args):
         "scan currently requires the same nonzero chunk count per sequence",
     )
     parameters = {"CHUNKS": nc * len(args.lengths), "H": args.heads, "DTYPE": args.dtype}
-    pack_tasks = gram_pack_tasks(parameters["CHUNKS"], args.heads)
     for phase in args.phases:
         print(f"build prefill_{phase}", flush=True)
         options = parameters | (
             {"SEQUENCES": len(args.lengths), "NC": nc}
-            if phase in {"prepare_full", "prepare", "scan", "output"}
+            if phase in {"prepare", "scan", "output"}
             else {}
         )
-        if phase.startswith("solve_merge"):
-            options["WIDTH"] = int(phase[-2:])
-        if phase == "gram_cross":
-            options["PACK"] = pack_tasks
         build_file(
             Path(__file__).resolve().parents[2] / SOURCES[phase],
             args.artifacts / phase,
@@ -174,7 +174,7 @@ def build(args):
                 "chunks_per_sequence": nc,
                 "parameters": parameters,
                 "phases": PHASES,
-                "gram_pack_tasks": pack_tasks,
+                "front_end_task_policy": "chunk_head_local",
                 "artifacts": identity,
             },
             indent=2,
@@ -185,7 +185,7 @@ def build(args):
 
 def validate_artifacts(directory, heads, dtype, chunks, sequences):
     identity = {}
-    pack_tasks = gram_pack_tasks(chunks, heads)
+    layouts = workspace_layout(chunks, heads, sequences, dtype)
     for phase in PHASES:
         path = directory / phase
         source = parse((path / "source.xdsl").read_text())
@@ -194,99 +194,22 @@ def validate_artifacts(directory, heads, dtype, chunks, sequences):
             for op in source.walk()
             if isinstance(op, AllocationOp) and op.ref.type.memory.data == "GM"
         }
-        expected_abi = MERGE_ABI if phase.startswith("solve_merge") else ORDERS[phase]
-        require(tuple(buffers) == expected_abi, f"{phase} library ABI differs")
-        primary = (
-            buffers["Qp"]
-            if "Qp" in buffers
-            else buffers["Inverse"]
-            if phase.startswith("solve_merge") or phase == "wu"
-            else buffers["QG"]
-            if phase == "output"
-            else buffers["U"]
-        )
+        require(tuple(buffers) == ORDERS[phase], f"{phase} library ABI differs")
+        for name, tensor in buffers.items():
+            if name in layouts:
+                shape, storage = layouts[name]
+                require(
+                    tuple(d.data for d in tensor.shape.data) == shape
+                    and tensor.dtype.data == storage,
+                    f"{phase} {name} specialization differs",
+                )
+        primary = buffers["KG" if phase == "prepare" else "QG" if phase == "output" else "U"]
         require(
             primary.shape.data[0].data == chunks
             and primary.shape.data[1].data == heads
             and primary.dtype.data == dtype,
             f"{phase} specialization differs",
         )
-        if phase == "prepare_full":
-            require(
-                all(
-                    tuple(d.data for d in buffers[name].shape.data) == shape
-                    and buffers[name].dtype.data == "f32"
-                    for name, shape in {"Lower": (64, 64), "BetaSelectors": (8, 32, 8)}.items()
-                ),
-                "preprocessing constant geometry differs from the runner",
-            )
-        if phase == "gram_cross":
-            shapes = {
-                "GramLeft": (20, 2, pack_tasks, 128, 128),
-                "GramRight": (20, 2, pack_tasks, 64, 128),
-                "GramSmall": (20, 2, pack_tasks, 2, 32, 16),
-                "GramLarge": (20, 2, pack_tasks, 64, 32),
-            }
-            require(
-                all(
-                    tuple(d.data for d in buffers[name].shape.data) == shape
-                    and buffers[name].dtype.data == "f32"
-                    for name, shape in shapes.items()
-                    if name in buffers
-                ),
-                "Gram ring workspace differs from the runner",
-            )
-            operands = [
-                tuple(d.data for d in op.ref.type.shape.data)
-                for op in source.walk()
-                if isinstance(op, AllocationOp) and op.ref.type.memory.data == "L0B"
-            ]
-            require(
-                operands == [(128, width) for width in (16, 32)],
-                "Gram panel specialization differs",
-            )
-        if phase == "wu":
-            require(
-                all(
-                    tuple(d.data for d in buffers[name].shape.data) == shape
-                    and buffers[name].dtype.data == storage
-                    for name, shape, storage in (
-                        ("U", (chunks, heads, 64, 128), dtype),
-                        ("W32", (chunks, heads, 64, 128), "f32"),
-                        ("W16Ring", (20, 2, 64, 128), dtype),
-                    )
-                ),
-                "W/U output or conversion workspace differs from the runner",
-            )
-        if phase == "output":
-            require(
-                tuple(d.data for d in buffers["A16"].shape.data) == (chunks, heads, 64, 64)
-                and buffers["A16"].dtype.data == dtype
-                and tuple(d.data for d in buffers["OutputProducts"].shape.data) == (20, 2, 64, 256)
-                and buffers["OutputProducts"].dtype.data == "f32",
-                "output ring workspace differs from the runner",
-            )
-        if phase == "scan":
-            require(
-                buffers["Initial"].shape.data[0].data == sequences, "scan sequence count differs"
-            )
-        if phase.startswith("solve_merge"):
-            operands = [
-                tuple(d.data for d in op.ref.type.shape.data)
-                for op in source.walk()
-                if isinstance(op, AllocationOp) and op.ref.type.memory.data == "L0A"
-            ]
-            width = int(phase[-2:])
-            require(operands == [(width, width)], "inverse merge width specialization differs")
-            require(
-                tuple(d.data for d in buffers["Merge"].shape.data) == (20, 2, width, width),
-                "inverse merge workspace geometry differs from the runner",
-            )
-            expected_off = (chunks, heads, 64, 64) if width == 16 else (20, 2, width, width)
-            require(
-                tuple(d.data for d in buffers["Off"].shape.data) == expected_off,
-                "inverse output workspace geometry differs from the runner",
-            )
         kernel = KERNELS[phase]
         manifest = json.loads((path / f"{kernel}.compile.json").read_text())
         require(
@@ -305,6 +228,12 @@ def validate_artifacts(directory, heads, dtype, chunks, sequences):
 def worker(args):
     health = health_snapshot(args.physical, args.output)
     hardware = hardware_snapshot(args.physical)
+    if args.backend in {"ascendc", "both"}:
+        from benchmarks.references.kda_aclnn import configure_reference
+
+        reference = configure_reference(args.reference_artifacts)
+    else:
+        reference = None
     import torch
     import torch_npu  # noqa: F401
 
@@ -331,8 +260,7 @@ def worker(args):
     lengths = config["lengths"]
     tokens, batch, heads, dimension = sum(lengths), len(lengths), config["heads"], 128
     chunks, bt = batch * config["chunks_per_sequence"], 64
-    pack_tasks = gram_pack_tasks(chunks, heads)
-    require(config["gram_pack_tasks"] == pack_tasks, "Gram cohort policy differs")
+    require(tuple(config["phases"]) == PHASES, "expected the three-stage pipeline")
     dtype = {"f16": torch.float16, "bf16": torch.bfloat16}[config["dtype"]]
     generator = torch.Generator().manual_seed(42)
     host = {
@@ -361,10 +289,7 @@ def worker(args):
     torch.npu.set_device(0)
     device = {n: t.npu() for n, t in host.items()}
     constants = {
-        "Lower": torch.tril(torch.ones(bt, bt, dtype=torch.float32)),
-        "BetaSelectors": torch.eye(8, dtype=torch.float32)[:, None, :]
-        .expand(8, bt // 2, 8)
-        .contiguous(),
+        "Lower": torch.stack((torch.tril(torch.ones(bt, bt, dtype=torch.float32)), torch.eye(bt))),
     }
     constant_sha = {
         name: hashlib.sha256(t.view(torch.uint8).numpy().tobytes()).hexdigest()
@@ -375,31 +300,10 @@ def worker(args):
     def workspace(name, shape, storage_dtype):
         device[name] = torch.empty(shape, dtype=storage_dtype, device="npu")
 
-    for name in ("Qp", "Kp", "Vp", "KG", "QG", "Residual"):
-        workspace(name, (chunks, heads, bt, dimension), dtype)
-    for name in ("Gp", "W32", "Projection"):
-        workspace(name, (chunks, heads, bt, dimension), torch.float32)
-    workspace("Aqk", (chunks, heads, bt, bt), torch.float32)
-    for name in ("Ai32", "Negative", "Diagonal"):
-        workspace(name, (chunks, heads, bt, bt), torch.float32)
-    workspace("Bp", (chunks, heads, bt), torch.float32)
-    for width in (16, 32):
-        workspace(f"Merge{width}", (20, 2, width, width), torch.float32)
-    workspace("Off32", (20, 2, 32, 32), torch.float32)
-    workspace("Inverse", (chunks, heads, bt, bt), dtype)
-    workspace("A16", (chunks, heads, bt, bt), dtype)
-    workspace("OutputProducts", (20, 2, bt, 2 * dimension), torch.float32)
-    workspace("Right", (chunks, heads, 2, bt, dimension), dtype)
-    workspace("U", (chunks, heads, bt, dimension), dtype)
-    workspace("W16Ring", (20, 2, bt, dimension), dtype)
-    workspace("Snapshot", (chunks, heads, dimension, dimension), dtype)
-    workspace("Delta", (chunks, heads, dimension, dimension), torch.float32)
-    workspace("GramLeft", (20, 2, pack_tasks, 128, dimension), torch.float32)
-    workspace("GramRight", (20, 2, pack_tasks, 64, dimension), torch.float32)
-    workspace("GramSmall", (20, 2, pack_tasks, 2, 32, 16), torch.float32)
-    workspace("GramLarge", (20, 2, pack_tasks, 64, 32), torch.float32)
-    for name in ("History", "Final"):
-        workspace(name, (batch, heads, dimension, dimension), torch.float32)
+    storage_types = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
+    for name, (shape, storage) in workspace_layout(chunks, heads, batch, config["dtype"]).items():
+        if name not in device:
+            workspace(name, shape, storage_types[storage])
     workspace("Output", (tokens, heads, dimension), dtype)
     stream = torch.npu.current_stream()
     libraries, launchers, artifacts = [], {}, {}
@@ -445,9 +349,16 @@ def worker(args):
             launch_phase(phase)
         return device["Output"], device["Final"]
 
-    functions, reference = {"ascendflow": generated}, None
+    functions = {"ascendflow": generated}
+    reference_call = None
+    if args.backend in {"ascendc", "both"}:
+        from benchmarks.references.kda_aclnn import KdaReference
+
+        reference_call = KdaReference.prefill(args.reference_artifacts, device, cu, chunk_indices)
+        reference["interface"] = reference_call.operator
+        functions["ascendc"] = reference_call
     value_initial = device["Value"].clone()
-    if args.backend in {"triton", "both"}:
+    if args.backend == "triton":
         original, reference = load_reference(args.reference)
         cu_device = torch.tensor(cu, dtype=torch.int64, device="npu")
         meta = SimpleNamespace(
@@ -475,7 +386,10 @@ def worker(args):
     for backend in functions if args.backend == "both" else (args.backend,):
         device["Value"].copy_(value_initial)
         torch.npu.synchronize()
-        output, state = functions[backend]()
+        from benchmarks.kda.profiling import invocation
+
+        with invocation(args.profile_invocation):
+            output, state = functions[backend]()
         torch.npu.synchronize()
         correctness = {
             "output": error_metrics(output, expected),
@@ -500,6 +414,9 @@ def worker(args):
             end.synchronize()
             times.append(begin.elapsed_time(end) * 1000)
         results[backend] = {"correctness": correctness, "stream_interval_us": times}
+    if reference_call is not None:
+        torch.npu.synchronize()
+        reference_call.close()
     (args.output / "results.json").write_text(
         json.dumps(
             {
@@ -535,13 +452,17 @@ def main():
         help="reuse libraries with different lengths in the same compiled chunk domain",
     )
     parser.add_argument("--heads", type=int, default=32)
-    parser.add_argument("--dtype", choices=("f16", "bf16"), default="f16")
-    parser.add_argument("--backend", choices=("ascendflow", "triton", "both"), default="ascendflow")
+    parser.add_argument("--dtype", choices=("f16", "bf16"), default="bf16")
+    parser.add_argument(
+        "--backend", choices=("ascendflow", "ascendc", "triton", "both"), default="ascendflow"
+    )
     parser.add_argument(
         "--reference",
         type=Path,
         default=Path(__file__).resolve().parents[3] / "reference/vllm-ascend",
     )
+    parser.add_argument("--reference-artifacts", type=Path)
+    parser.add_argument("--profile-invocation", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--build-worker", action="store_true", help=argparse.SUPPRESS)
@@ -609,6 +530,8 @@ def main():
             str(args.repeats),
             "--worker",
         ]
+        if args.reference_artifacts is not None:
+            command.extend(["--reference-artifacts", str(args.reference_artifacts.resolve())])
         if args.save_intermediates:
             command.append("--save-intermediates")
         if args.phase_sync:

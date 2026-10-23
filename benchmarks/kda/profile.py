@@ -42,11 +42,17 @@ COLUMNS = {
 
 
 def summarize(directory, backend="ascendflow", metrics="Default"):
+    require(
+        (directory / "device/results.json").is_file(),
+        "profiling application did not publish a numerical result; see watchdog/build.log",
+    )
     record = json.loads((directory / "device/results.json").read_text())
     require(record["status"] == "passed", "profiling runner failed numerical validation")
     kernel = (
         record["operator"]
         if backend == "ascendflow"
+        else "recurrent_kda"
+        if backend == "ascendc"
         else "fused_recurrent_gated_delta_rule_fwd_kernel"
     )
     require(set(record["results"]) == {backend}, "profile runner backend differs")
@@ -63,7 +69,11 @@ def summarize(directory, backend="ascendflow", metrics="Default"):
         if name == "OpBasicInfo":
             require(
                 len(rows) == 1
-                and rows[0]["Op Name"] == kernel
+                and (
+                    rows[0]["Op Name"] == kernel
+                    if backend != "ascendc"
+                    else rows[0]["Op Name"].lower().replace("_", "").startswith("recurrentkda")
+                )
                 and int(rows[0]["Device Id"]) == record["health"]["physical_device"],
                 "profile kernel or physical device differs from the validated launch",
             )
@@ -98,8 +108,11 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--physical", required=True, type=int)
     parser.add_argument("--lengths", nargs="+", type=int)
-    parser.add_argument("--backend", choices=("ascendflow", "triton"), default="ascendflow")
+    parser.add_argument(
+        "--backend", choices=("ascendflow", "ascendc", "triton"), default="ascendflow"
+    )
     parser.add_argument("--metrics", choices=("BasicInfo", "Default"), default="BasicInfo")
+    parser.add_argument("--reference-artifacts", type=Path)
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args()
     directory = args.output.resolve()
@@ -107,6 +120,8 @@ def main():
         require(not directory.exists(), "KDA profiling requires a new output directory")
         artifact = args.artifact.resolve()
         kernel = json.loads((artifact / "verification.json").read_text())["kernel"]
+        if args.backend == "ascendc":
+            kernel = "recurrent_kda"
         if args.backend == "triton":
             kernel = "fused_recurrent_gated_delta_rule_fwd_kernel"
         root = Path(__file__).resolve().parents[2]
@@ -124,11 +139,15 @@ def main():
             "--warmup",
             "0",
             "--repeats",
-            "1",
+            "0",
             "--worker",
+            "--profile-invocation",
         ]
         if args.lengths is not None:
             application.extend(("--lengths", *(str(length) for length in args.lengths)))
+        if args.reference_artifacts is not None:
+            application.extend(["--reference-artifacts", str(args.reference_artifacts.resolve())])
+        os.environ.update(ASCEND_RT_VISIBLE_DEVICES=str(args.physical), ASCEND_DEVICE_ID="0")
         os.environ["ASCENDFLOW_PYTHON"] = sys.executable
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
         os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -137,11 +156,14 @@ def main():
             "op",
             "--application=" + shlex.join(application),
             "--output=" + str(directory / "raw"),
-            "--kernel-name=" + kernel,
             "--aic-metrics=" + args.metrics,
             "--launch-count=1",
             "--warm-up=0",
+            "--mstx=on",
+            "--mstx-include=kda",
         ]
+        if args.backend != "ascendc":
+            command.append("--kernel-name=" + kernel)
         bounded_process(command, directory / "watchdog", timeout_s=300)
     result = summarize(directory, args.backend, args.metrics)
     print(json.dumps(result, indent=2))

@@ -8,6 +8,7 @@ from pathlib import Path
 from ascendflow.diagnostics import require
 from benchmarks.kda.reference import verify_provenance
 from benchmarks.kda.run import digest
+from benchmarks.references.kda_aclnn import verify_reference
 
 
 def read_profile(directory, backend):
@@ -51,12 +52,13 @@ def read_profile(directory, backend):
         "metrics": str(metrics_path.resolve()),
         "metrics_sha256": digest(metrics_path),
         "replay_mode": metrics.get("replay_mode", "kernel"),
+        "phase_host_sync": metrics.get("phase_host_sync", False),
     }
 
 
-def compare(ascendflow, triton, official_release):
+def compare(ascendflow, reference_directory, official_release=None, backend="ascendc"):
     ours_record, ours = read_profile(ascendflow, "ascendflow")
-    theirs_record, theirs = read_profile(triton, "triton")
+    theirs_record, theirs = read_profile(reference_directory, backend)
     # Each backend may have a different implementation phase graph. These
     # fields and byte digests specify the shared mathematical invocation.
     keys = ("lengths", "heads", "dimension", "dtype", "chunk_size", "chunks_per_sequence")
@@ -76,7 +78,11 @@ def compare(ascendflow, triton, official_release):
         == theirs_record["hardware"]["platform_sha256"],
         "device platform differs",
     )
-    verify_provenance(theirs_record["reference"], official_release)
+    if backend == "ascendc":
+        verify_reference(theirs_record["reference"])
+    else:
+        require(official_release is not None, "Triton comparison requires --official-release")
+        verify_provenance(theirs_record["reference"], official_release)
     require(
         ours["replay_mode"] == theirs["replay_mode"],
         "profiling replay modes differ",
@@ -94,20 +100,25 @@ def compare(ascendflow, triton, official_release):
         "aic_metrics": "BasicInfo",
         "scope": "sum of device kernel Task Durations; one collection per backend; excludes host gaps",
         "ascendflow": ours,
-        "triton": theirs,
+        backend: theirs,
         "speedup": theirs["kernel_us"] / ours["kernel_us"],
         "reference": theirs_record["reference"],
-        "official_release": str(official_release.resolve()),
-        "official_release_sha256": digest(official_release),
+        "official_release": str(official_release.resolve()) if official_release else None,
+        "official_release_sha256": digest(official_release) if official_release else None,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("ascendflow", "triton", "official-release", "output"):
+    for name in ("ascendflow", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--ascendc", type=Path)
+    group.add_argument("--triton", type=Path)
+    parser.add_argument("--official-release", type=Path)
     args = parser.parse_args()
-    report = compare(args.ascendflow, args.triton, args.official_release)
+    backend = "ascendc" if args.ascendc else "triton"
+    report = compare(args.ascendflow, args.ascendc or args.triton, args.official_release, backend)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({key: report[key] for key in ("configuration", "speedup")}, indent=2))

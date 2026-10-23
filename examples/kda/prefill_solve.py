@@ -45,17 +45,30 @@ def merge_inverse_blocks(inputs, buffers, geometry, coordinates):
 
 
 @N.inline
-def pack_inverse_blocks(inputs, buffers, coordinates):
-    Blocks, Off, Inverse = inputs
-    raw, packed = buffers
+def read_inverse_blocks(inputs, raw, coordinates):
+    Blocks, Off = inputs
     lane, chunk, head, owner, ring = coordinates
     row = lane * 16
     N.copy(Blocks[chunk, head, row : row + 16, :], raw[:16, :])
     N.copy(Blocks[chunk, head, row + 32 : row + 48, 32:64], raw[16:32, 32:64])
     N.copy(Off[owner, ring, row : row + 16, :], raw[16:32, :32])
+
+
+@N.inline
+def publish_inverse_blocks(Inverse, buffers, coordinates):
+    raw, packed = buffers
+    lane, chunk, head, _owner, _ring = coordinates
+    row = lane * 16
     N.cast(raw, out=packed)
     N.copy(packed[:16, :], Inverse[chunk, head, row : row + 16, :])
     N.copy(packed[16:32, :], Inverse[chunk, head, row + 32 : row + 48, :])
+
+
+@N.inline
+def pack_inverse_blocks(inputs, buffers, coordinates):
+    Blocks, Off, Inverse = inputs
+    read_inverse_blocks((Blocks, Off), buffers[0], coordinates)
+    publish_inverse_blocks(Inverse, buffers, coordinates)
 
 
 @N.prim_func(disjoint_external=True)
@@ -75,7 +88,7 @@ def prefill_solve_merge(
     BT: N.constexpr = 64,
     WIDTH: N.constexpr = 16,
     GROUPS: N.constexpr = 20,
-    DTYPE: N.constexpr = N.f16,
+    DTYPE: N.constexpr = N.bf16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
         assert BT == 64 and (WIDTH == 16 or WIDTH == 32), "hierarchical block merge"

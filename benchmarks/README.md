@@ -26,8 +26,10 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `vector/run_masks.py` | 通用mask示例：`--build`离线共享构建；`--artifact/--library`只校验已发布ASC/共享库/manifest，不重新编译；`--physical`按独立逻辑oracle运行 |
 | `vector/run_mask_rows.py` | 小行/列mask示例：单UB tile、`cols<hi`/`cols!=lo`/`rows>=cols-q` 三输出；同样`--build`或只校验复用`--library`，记录逐输出位精确证据 |
 | `profile.sh`、`profile_summary.py`、`artifacts.py` | msprof 应用包装、设备 task 汇总和产物身份检查 |
-| `kda/run.py`、`kda/profile.py`、`kda/compare.py`、`kda/matrix.py` | KDA decode 全量数值验收、BasicInfo、batch 1–64 同输入/设备/官方 Triton wheel 比较；见[decode](../docs/operators/kda.md) |
-| `kda/prefill.py`、`kda/profile_prefill.py`、`kda/compare_prefill.py` | KDA prefill 多 kernel 完整构建、独立 CPU 递推数值验收、BasicInfo 总时间及原始 Triton 对照；见[prefill](../docs/operators/kda-prefill.md) |
+| `kda/run.py`、`kda/profile.py`、`kda/compare.py`、`kda/matrix.py` | KDA decode 全量数值验收、BasicInfo、batch 1–64 同输入/设备/上游 AscendC OPP 比较；见[decode](../docs/operators/kda.md) |
+| `kda/prefill.py`、`kda/profile_prefill.py`、`kda/compare_prefill.py` | KDA prefill 多 kernel 完整构建、独立 CPU 递推数值验收、完整调用 BasicInfo 总时间及上游 AscendC 对照；见[prefill](../docs/operators/kda-prefill.md) |
+| `kda/build_reference.py` | 从未修改的上游源码生成 BF16/FP32 KDA AscendC OPP，记录源码、配置与二进制身份 |
+| `kda/fragments.py` | 五个公开 prefill fragment 的六种实际构建与独立 CPU 方程设备检查，包含 Solve 16/32、部分写哨兵、BF16 舍入和重复调用 |
 | `kda/audit_prefill.py`、`gemm/run_fp32.py` | 原始 dot 两侧输入精度离线审计、FP32 Cube 随机输入设备检查 |
 | `attention/run_sparse.py` | V4.1 CSA 单 kernel decode/prefill、INT32 页表/索引、NPU FP32 数值参考与输入/哨兵检查；见[合同](../docs/operators/sparse-mla.md) |
 | `attention/profile_sparse.py` | 仅做 msprof 性能采集，不运行数值参考或回读算子输出；支持独立缓存轮换、显式 L2 驱逐、batch 和上下文矩阵 |
