@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ascendflow.analysis import event_coloring
 from ascendflow.analysis.event_coloring import color_event_resources, counter_group_usage
 from ascendflow.analysis.event_contracts import EventDemand
 from ascendflow.analysis.event_sharing import CounterReuse, share_counter_time
@@ -19,7 +20,12 @@ from tests.models.structured_events import check_compiled_events
 
 @pytest.fixture(scope="module", params=[2, 17])
 def plan(request):
-    return request.param, synchronize_structure(counter_epochs.specialize(PHASES=request.param))
+    # The large case must need temporal reuse after certified FIFO words have
+    # been packed. A legal subset makes that need explicit as policy changes.
+    with pytest.MonkeyPatch.context() as patch:
+        if request.param == 17:
+            patch.setattr(event_coloring, "SUPPORTED_CROSS_IDS", tuple(range(5)))
+        return request.param, synchronize_structure(counter_epochs.specialize(PHASES=request.param))
 
 
 def test_complete_epochs_keep_empty_calls_reentry_and_two_vector_receivers(plan):

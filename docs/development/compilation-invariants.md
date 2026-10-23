@@ -109,18 +109,18 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 Comparison、Boolean 和 Symbol 同样只保存自身完整比较字段的 hash；它们不保存
 范围、定义性或完成证明。
 
-Handback 的实际 publication port 按旧消费点、peer、真实循环及 horizon 建立，
-保留全部 source/receiver 激活、坐标对应和首段发射条件。不同目标可以共用这些
-未变接口，但各自仍检查 receiver→新 Set 和完整消费覆盖。先按路由选择，再按需
-打开 child FIRST/LAST；未用的可选边界不成为新的准入要求。两段交接只连接实际
-中间 queue 已有的通知，不存任意路径闭包。覆盖 union 没有新增证据时不重复求解，
-输入前提变化的其他 reuse 请求不能借用该结论。
+消费使用独立的 ConsumptionOrigin：真实匹配 Wait 已消费后，它只阻塞指定 queue，
+Scalar/cross Wait 按目标合同阻塞 controller。来源完成和消费共用位置、实际
+capture 快照及匹配 acquire 的 DAG，不能把数据 ready 替代旧 Wait 消费。
+复用窗口通过实际 offset span 和 FIRST/LAST 端口建立，不展开 runtime N。
+同锚点不同动作没有自然先后；消费到新 capture 必须严格推进真实位置。
 
-单段 handback 的返回前沿可以省去被已有返回点覆盖的较晚候选：完整有序 guard、
-全部参与者的实际坐标/选择前提必须相同，两个 Wait 均已具备阻塞目标 queue/controller
-的路由资格，且已有返回点到较晚返回点的实际发射顺序无条件成立。由发射顺序传递，
-任何可由较晚返回点到达的新 Set 也能由已有返回点到达；不新增完成边，不将两个
-通知合成一个贡献。两段 handback 的中间 native/queue 匹配仍保留全部原端口。
+消费前沿保留 origin、实际取得事实的 Wait 或 queue admission cut、完整前提、
+证明及该输入作用域拥有的数学答案。二维位置索引只从同一阻塞路由和实际调用
+取前沿；在实际 Wait 后取得的事实不能借相同锚点回填更早 capture。改变前提的
+查询仍证明全部激活及两个 cut 的顺序，不复用其他作用域的 proved 标记。
+条件证明可以共享；未覆盖开放边界时继续组合该图，缓存阴性结果不作不可达证明。
+报告按 DAG 引用保留证据，不重新展开全部 relay 历史。
 
 本地事件共享使用分层的真实 publication/consumption 前沿。包围依据完整激活和
 坐标合同下的无条件发射顺序，实际消费仍由 handback 建立，包括各层重入。

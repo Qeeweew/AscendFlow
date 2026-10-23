@@ -220,10 +220,8 @@ def _same_iteration_streams(domains, rule, left, right):
 
 def _handback(domains, rule, earlier, old, later, target, assumptions, **reuse):
     # Binary sharing additionally requires forward issue on its controller.
-    # Cross consumption blocks the whole controller, so the supported mode-2
-    # rule uses one opposite-direction, complete-quorum return. Its receiver
-    # must precede the new Set. Do not search compositions across unrelated
-    # queue stages when that direct return cannot be established.
+    # Cross consumption blocks the whole controller. Its transfer still keeps
+    # every publisher/receiver and the complete matched quorum.
     if (
         earlier.mechanism is NotificationKind.LOCAL_EVENT
         and not domains.arithmetic.queries.covers(
@@ -237,7 +235,6 @@ def _handback(domains, rule, earlier, old, later, target, assumptions, **reuse):
         later,
         target,
         assumptions,
-        max_relays=1 if earlier.mechanism is NotificationKind.CROSS_EVENT else 2,
         **reuse,
     )
 

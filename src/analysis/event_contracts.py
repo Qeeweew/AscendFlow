@@ -174,13 +174,7 @@ class ResourceWork:
     window_constructions: int = 0
     lifetime_interfaces: int = 0
     issue_order_words: int = 0
-    handback_candidates: int = 0
-    handback_port_candidates: int = 0
-    handback_ports: int = 0
-    handback_return_candidates: int = 0
-    dominated_handback_returns: int = 0
     handback_cover_queries: int = 0
-    handback_compositions: int = 0
     ring_cases: int = 0
     cell_channels: int = 0
     cell_members: int = 0
@@ -220,6 +214,23 @@ class ResourceWork:
     transfer_may_points: int = 0
     completion_pruned: int = 0
     completion_shortcuts: int = 0
+    consumption_queries: int = 0
+    consumption_nodes: int = 0
+    consumption_cycles: int = 0
+    consumption_pruned: int = 0
+    consumption_shortcuts: int = 0
+    consumption_instances: int = 0
+    consumption_regions: int = 0
+    consumption_frontier_words: int = 0
+    consumption_frontier_queries: int = 0
+    consumption_frontier_hits: int = 0
+    consumption_fact_reuses: int = 0
+    consumption_state_hits: int = 0
+    consumption_state_refreshes: int = 0
+    counter_structure_ids: int = 0
+    consumption_acquired_boundaries: int = 0
+    consumption_bound_queries: int = 0
+    consumption_bound_exclusions: int = 0
 
 
 @dataclass(frozen=True)

@@ -90,3 +90,41 @@ def test_boolean_interning_cannot_admit_integer_zero_as_a_cached_false_operand()
         assert _boolean("and", (False, p)).operands == (False, p)
         with pytest.raises(CompileError, match="mathematical predicates"):
             _boolean("and", (0, p))
+
+
+def test_deep_shared_predicate_encoding_does_not_use_python_recursion_depth():
+    x = Expr("argument", ("long_transfer",))
+    p, q = Comparison(x, "<", literal(0)), Comparison(x, ">", literal(0))
+    with memo_scope(fresh=True):
+        condition = p
+        for _ in range(2048):
+            condition = all_of(any_of(condition, q), p)
+        queries = IntegerQueryService({})
+        assert queries.implies(condition, (p,)).proved
+        assert queries.satisfies((condition, q)).impossible
+        assert len(queries._encoded_predicates) <= 2 * 2048 + 4
+
+
+def test_owned_implication_cannot_be_replaced_by_a_proved_flag_or_another_question():
+    from dataclasses import replace
+
+    x = Expr("argument", ("owned",))
+    p, q = Comparison(x, "<", literal(0)), Comparison(x, ">", literal(0))
+    queries = IntegerQueryService({})
+    answer = queries.implies(p, (p,))
+    assert queries.owns_implication(answer, p, (p,))
+    assert not queries.owns_implication(replace(answer), p, (p,))
+    assert not queries.owns_implication(answer, p, ())
+    assert not queries.owns_implication(answer, q, (p,))
+    assert not IntegerQueryService({}).owns_implication(answer, p, (p,))
+
+
+def test_numeric_booleans_cannot_bypass_predicate_checks_through_query_cache_keys():
+    queries = IntegerQueryService({})
+    answer = queries.implies(True, ())
+    assert not queries.owns_implication(answer, 1, ())
+    with pytest.raises(CompileError, match="mathematical predicates"):
+        queries.implies(1, ())
+    assert queries.implies(True, (False,)).proved
+    with pytest.raises(CompileError, match="mathematical predicates"):
+        queries.implies(True, (0,))

@@ -10,7 +10,10 @@ from itertools import pairwise
 
 from .event_contracts import LOCAL_CAPACITY, SUPPORTED_CROSS_IDS
 from .event_frontier_contracts import LocalEventReuse
+from .event_sharing import EventSharing
+from .smt import Boolean
 from .structured_protocols import NotificationKind
+from .structured_schedule import ActionGuard
 
 
 def event_resource_report(plan):
@@ -58,6 +61,18 @@ def event_resource_report(plan):
                             "original": None
                             if p.original is None
                             else [type(w).__name__ for w in p.original],
+                            "consumption": [
+                                handback(h)
+                                for h in (
+                                    *p.handbacks,
+                                    *(
+                                        h
+                                        for w in p.original or ()
+                                        if isinstance(w, EventSharing)
+                                        for h in w.handbacks
+                                    ),
+                                )
+                            ],
                         }
                         for p in value.interfaces
                     ],
@@ -97,6 +112,7 @@ def event_resource_report(plan):
             "members": [numbers[value.earlier], numbers[value.later]],
         }
 
+    @cache
     def point(value):
         return {
             "operation": operations[value.operation],
@@ -104,6 +120,74 @@ def event_resource_report(plan):
             "placement": value.placement.value,
             "guard": guard(value.guard),
             "coordinates": [(operations[loop], text(e)) for loop, e in value.coordinates],
+        }
+
+    consumption_proofs, proof_numbers = [], {}
+    consumption_predicates, predicate_numbers = [], {}
+
+    def predicate(value):
+        pending = [value]
+        unfinished = []
+        while pending:
+            item = pending.pop()
+            key = type(item), item
+            if key in predicate_numbers:
+                continue
+            predicate_numbers[key] = len(consumption_predicates)
+            record = {}
+            consumption_predicates.append(record)
+            if type(item) is bool:
+                record["constant"] = item
+            elif isinstance(item, Boolean):
+                record.update(kind=item.kind, operands=[])
+                pending.extend(reversed(item.operands))
+                unfinished.append((record, item.operands))
+            else:
+                record["comparison"] = [text(item.lhs), item.predicate, text(item.rhs)]
+        # Finish only the newly seen syntax; no expression path expansion.
+        for record, operands in unfinished:
+            record["operands"] = [predicate_numbers[type(v), v] for v in operands]
+        return predicate_numbers[type(value), value]
+
+    def consumption_proof(root):
+        pending = [root]
+        records = []
+        while pending:
+            proof = pending.pop()
+            if proof in proof_numbers:
+                continue
+            proof_numbers[proof] = len(consumption_proofs)
+            node = proof.node
+            record = {
+                "kind": node.kind,
+                "protocol": None if node.notification is None else numbers[node.notification],
+                "point": None if node.point is None else point(node.point),
+                "condition": predicate(proof.condition),
+            }
+            if node.evidence is not None:
+                fact = node.evidence
+                record["established_consumption"] = {
+                    "protocol": numbers[fact.origin.notification],
+                    "wait": point(fact.origin.point),
+                    "admission": point(fact.target),
+                    "after_actual_wait": fact.after_action,
+                    "premises": guard(ActionGuard(fact.premises)),
+                    "answer": fact.answer.kind,
+                }
+            consumption_proofs.append(record)
+            records.append((record, proof.inputs))
+            pending.extend(reversed(proof.inputs))
+        for record, inputs in records:
+            record["inputs"] = [proof_numbers[child] for child in inputs]
+        return proof_numbers[root]
+
+    def handback(value):
+        return {
+            "origin": numbers[value.proof.origin.notification],
+            "consume": point(value.consume),
+            "next_publication": point(value.next_set),
+            "condition": guard(value.condition),
+            "proof": consumption_proof(value.proof.proof),
         }
 
     def counter_group(event, certificate, members):
@@ -205,24 +289,7 @@ def event_resource_report(plan):
                     "earlier": numbers[w.earlier],
                     "later": numbers[w.later],
                     "rule": w.rule,
-                    "handbacks": [
-                        {
-                            "consume": point(h.consume),
-                            "next_publication": point(h.next_set),
-                            "condition": guard(h.condition),
-                            "relays": [
-                                numbers[n]
-                                for n in (
-                                    ()
-                                    if h.relay is None
-                                    else h.relay
-                                    if isinstance(h.relay, tuple)
-                                    else (h.relay,)
-                                )
-                            ],
-                        }
-                        for h in w.handbacks
-                    ],
+                    "handbacks": [handback(h) for h in w.handbacks],
                 }
                 for w in group.witnesses
             ],
@@ -259,6 +326,7 @@ def event_resource_report(plan):
                                 "distance": r.delta,
                                 "finite_uses": r.upper_uses,
                                 "handbacks": len(r.handbacks),
+                                "proofs": [handback(h) for h in r.handbacks],
                             }
                             for r in (*c.inside, *c.reentries)
                         ],
@@ -328,6 +396,8 @@ def event_resource_report(plan):
             {"bank": bank(r.bank), "id": r.event, "reason": r.reason} for r in plan.reservations
         ],
         "sharing": [sharing(w) for w in plan.sharing],
+        "consumption_proofs": consumption_proofs,
+        "consumption_predicates": consumption_predicates,
         "local_event_certificates": certificates,
         "local_event_frontiers": frontiers,
         "counter_groups": [
@@ -359,10 +429,7 @@ def event_resource_report(plan):
                         "earlier": numbers[w.earlier],
                         "later": numbers[w.later],
                         "rule": w.rule,
-                        "handbacks": [
-                            {"consume": point(h.consume), "next_set": point(h.next_set)}
-                            for h in w.handbacks
-                        ],
+                        "handbacks": [handback(h) for h in w.handbacks],
                     }
                     for a, b, w in certificate.witnesses
                     if a in members and b in members

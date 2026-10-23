@@ -12,7 +12,8 @@ from ..diagnostics import require
 from ..dialects.physical import FixConfigOp
 from ..scalar import expression, literal
 from ..target.ascend910b import Actor, Engine, SyncKind
-from .event_coloring import exclusive_pressure_banks
+from . import event_coloring
+from .event_coloring import counter_fifo_partition, exclusive_pressure_banks
 from .event_contracts import (
     EventDemand,
     EventReservation,
@@ -334,9 +335,18 @@ class _Planning:
         )
         return FrozenEventRelations(result, self.frontiers.build(pressured))
 
-    def time_relations(self):
+    def time_relations(self, counter_groups):
         result = {}
         if None not in self.pressured:
+            return MappingProxyType(result)
+        partition = counter_fifo_partition(
+            self.demands, tuple(frozenset(group.resources) for group in counter_groups)
+        )
+        if partition is not None and len(partition) <= len(event_coloring.SUPPORTED_CROSS_IDS):
+            # A concrete certified FIFO partition already fits. Each group
+            # has its own whole word, progress, quorum and backlog certificate;
+            # no new consumption question is needed for candidate integers.
+            self.domains.work.counter_structure_ids = len(partition)
             return MappingProxyType(result)
         counters = [i for i, d in enumerate(self.demands) if d.backlog is not None]
         for a, b in combinations(counters, 2):
@@ -383,7 +393,6 @@ class _Planning:
                 )
         peers, actions = bind_event_peers(self.demands, self.actions)
         relations = self.relations(peers)
-        time_relations = self.time_relations()
         self.domains.work.peer_equalities = len(peers)
         counter_groups = plan_counter_groups(
             self.program,
@@ -393,6 +402,7 @@ class _Planning:
             handbacks=self.handbacks,
         )
         self.domains.work.counter_groups = len(counter_groups)
+        time_relations = self.time_relations(counter_groups)
         compositions = plan_counter_time_groups(
             self.program, self.demands, counter_groups, time_relations
         )

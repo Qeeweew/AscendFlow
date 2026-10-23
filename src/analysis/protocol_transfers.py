@@ -78,42 +78,51 @@ class _QueryFacts:
         )
 
     def truth(self, condition):
-        if type(condition) is bool:
-            return condition
-        if condition in self.cache:
-            return self.cache[condition]
-        if hasattr(condition, "kind"):
-            parts = tuple(self.truth(part) for part in condition.operands)
-            if condition.kind == "and":
-                answer = (
-                    False if False in parts else True if all(p is True for p in parts) else None
-                )
+        pending = [(condition, False)]
+        while pending:
+            current, done = pending.pop()
+            if current in self.cache:
+                continue
+            if type(current) is bool:
+                self.cache[current] = current
+            elif hasattr(current, "kind"):
+                if not done:
+                    pending.append((current, True))
+                    pending.extend((part, False) for part in reversed(current.operands))
+                    continue
+                parts = tuple(self.cache[part] for part in current.operands)
+                if current.kind == "and":
+                    answer = (
+                        False if False in parts else True if all(p is True for p in parts) else None
+                    )
+                else:
+                    answer = (
+                        True if True in parts else False if all(p is False for p in parts) else None
+                    )
+                self.cache[current] = answer
             else:
-                answer = (
-                    True if True in parts else False if all(p is False for p in parts) else None
-                )
-        else:
-            lhs, rhs = self.normalize(condition.lhs), self.normalize(condition.rhs)
-            test = type(condition)(lhs, condition.predicate, rhs)
-            left = lhs.constant if lhs.constant is not None else self.equalities.get(lhs)
-            right = rhs.constant if rhs.constant is not None else self.equalities.get(rhs)
-            if left is not None and right is not None:
-                answer = {
-                    "==": left == right,
-                    "!=": left != right,
-                    "<": left < right,
-                    "<=": left <= right,
-                    ">": left > right,
-                    ">=": left >= right,
-                }[test.predicate]
-            elif test in self.tests:
-                answer = True
-            elif opposite(test) in self.tests:
-                answer = False
-            else:
-                answer = None
-        self.cache[condition] = answer
-        return answer
+                self.cache[current] = self._atomic_truth(current)
+        return self.cache[condition]
+
+    def _atomic_truth(self, condition):
+        lhs, rhs = self.normalize(condition.lhs), self.normalize(condition.rhs)
+        test = type(condition)(lhs, condition.predicate, rhs)
+        left = lhs.constant if lhs.constant is not None else self.equalities.get(lhs)
+        right = rhs.constant if rhs.constant is not None else self.equalities.get(rhs)
+        if left is not None and right is not None:
+            return {
+                "==": left == right,
+                "!=": left != right,
+                "<": left < right,
+                "<=": left <= right,
+                ">": left > right,
+                ">=": left >= right,
+            }[test.predicate]
+        if test in self.tests:
+            return True
+        if opposite(test) in self.tests:
+            return False
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +143,7 @@ class TransferNode:
     point: object | None
     inputs: tuple[int, ...]
     condition: object = True
+    evidence: object | None = None
 
 
 @dataclass(frozen=True, eq=False, slots=True)
@@ -145,12 +155,62 @@ class CausalProof:
     condition: object
 
 
-class _Positions:
+@dataclass(frozen=True, slots=True)
+class CompletionOrigin:
+    point: object
+    engine: object
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumptionOrigin:
+    """A real matched Wait, distinct from a native-completion prefix."""
+
+    point: object
+    notification: object
+
+
+class ProtocolPositions:
     def __init__(self, domains):
-        self.domains, self.dispatch = domains, domains.dispatch
+        self.domains = domains
+        self._orders = {}
+
+    @property
+    def dispatch(self):
+        return self.domains.dispatch
 
     def position(self, point):
         return self.domains._positions(self.dispatch.site(point), point.coordinates)
+
+    def order(self, before, after, *, strict):
+        key = before, after, strict
+        if key not in self._orders:
+            left, right = self.position(before), self.position(after)
+            guards = ()
+            if before.actor is after.actor and left is not None and right is not None:
+                common = 0
+                while common < min(len(left), len(right)) and left[common][0] is right[common][0]:
+                    common += 1
+                # Equal cuts denote the same prefix only at the same real
+                # operation/phase. Distinct actions at tied anchors acquire no
+                # order, including endpoints in different child invocations.
+                equal_cut = (
+                    not strict
+                    and common == len(left) == len(right)
+                    and before.operation is after.operation
+                    and before.placement is after.placement
+                )
+                word = tuple(
+                    (
+                        left[i][1],
+                        right[i][1],
+                        i + 1 == common
+                        and (right[i][2] > left[i][2] or equal_cut and right[i][2] == left[i][2]),
+                    )
+                    for i in range(common)
+                )
+                guards = self.domains._order_word(word)
+            self._orders[key] = any_of(*(all_of(*guard.comparisons) for guard in guards))
+        return self._orders[key]
 
 
 class _QueueWord:
@@ -201,14 +261,17 @@ class _QueueWord:
 
     def interval(self, start, end):
         start, end = start + self.size, end + self.size
+        left, right = [], []
         while start < end:
             if start & 1:
-                yield self.tree[start]
+                left.append(self.tree[start])
                 start += 1
             if end & 1:
                 end -= 1
-                yield self.tree[end]
+                right.append(self.tree[end])
             start, end = start // 2, end // 2
+        yield from left
+        yield from reversed(right)
 
     def before(self, point, *, strict):
         graph = self.graph
@@ -224,8 +287,25 @@ class _QueueWord:
             return
         rank = path[self.depth][2]
         first, last = bisect_left(self.keys, rank), bisect_right(self.keys, rank)
-        for start, end in ((0, first), (last, len(self.keys))):
+        # The query first consumes the closed prefix entering this region.
+        # Newer facts inside the tied child remain available for requirements
+        # that the entry state does not cover. Inputs are visited in reverse.
+        for start, end, child in (
+            (last, len(self.keys), False),
+            (first, last, True),
+            (0, first, False),
+        ):
             if start == end:
+                continue
+            if child:
+                for word in self.children[rank]:
+                    yield from word.before(point, strict=strict)
+                for representative, node in self.leaves[rank]:
+                    graph.work.transfer_order_bands += 1
+                    condition = graph.order(representative, point, strict=strict)
+                    if condition is not False:
+                        graph.work.transfer_range_vertices += 1
+                        yield graph.merge((node,), condition=condition)
                 continue
             graph.work.transfer_order_bands += 1
             condition = graph.order(self.examples[self.keys[start]], point, strict=strict)
@@ -234,15 +314,6 @@ class _QueueWord:
             for node in self.interval(start, end):
                 graph.work.transfer_range_vertices += 1
                 yield graph.merge((node,), condition=condition)
-        if first != last:
-            for word in self.children[rank]:
-                yield from word.before(point, strict=strict)
-            for representative, node in self.leaves[rank]:
-                graph.work.transfer_order_bands += 1
-                condition = graph.order(representative, point, strict=strict)
-                if condition is not False:
-                    graph.work.transfer_range_vertices += 1
-                    yield graph.merge((node,), condition=condition)
 
 
 class ProtocolTransfers:
@@ -254,12 +325,15 @@ class ProtocolTransfers:
     No runtime iteration, global LCM, or candidate ID participates here.
     """
 
-    def __init__(self, domains, episodes=None):
+    def __init__(self, domains, episodes=None, *, positions=None, native_composition=False):
         self.domains, self.work = domains, domains.work
-        self.positions = _Positions(domains)
+        self.positions = ProtocolPositions(domains) if positions is None else positions
         self.nodes = [TransferNode("union", None, None, (), False)]
         self.episodes = {}
-        self._unions, self._snapshots, self._orders = {}, {}, {}
+        self._unions, self._snapshots = {}, {}
+        self._consumed_states = {}
+        self._input_orders = {}
+        self.native_acquires = {}
         words = {}
         if episodes is None:
             episodes = self._episodes()
@@ -284,6 +358,9 @@ class ProtocolTransfers:
             for point, node in zip(consumers, acquisitions, strict=True):
                 self.nodes[node] = TransferNode("acquire", notification, point, publications, guard)
                 engine = None if domains._gate(notification) else notification.destination_engine
+                self.native_acquires.setdefault((point.actor, engine, point.operation), []).append(
+                    (point, node)
+                )
                 key = point.actor, engine, self.positions.position(point)[0][:2]
                 words.setdefault(key, []).append((point, node))
         self.words = {}
@@ -292,7 +369,12 @@ class ProtocolTransfers:
         for group in self.episodes.values():
             for episode in group:
                 for point, node in zip(episode.captures, episode.publications, strict=True):
-                    before = self.snapshot(point, episode.notification.source_engine, strict=True)
+                    before = self.snapshot(
+                        point,
+                        episode.notification.source_engine,
+                        strict=True,
+                        native_only=native_composition,
+                    )
                     self.nodes[node] = TransferNode(
                         "capture",
                         episode.notification,
@@ -428,7 +510,37 @@ class ProtocolTransfers:
                     ready.append(parent)
         self.work.transfer_components += len(members)
 
-    def _may_complete(self, number, source, engine, cache):
+    def _origin_matches(self, origin, actor, engine):
+        if actor is not origin.point.actor:
+            return False
+        if isinstance(origin, CompletionOrigin):
+            return engine is origin.engine
+        return (
+            self.domains._gate(origin.notification)
+            or engine is origin.notification.destination_engine
+        )
+
+    def _origin_order(self, origin, capture):
+        return self.order(origin.point, capture, strict=isinstance(origin, ConsumptionOrigin))
+
+    def _inputs(self, number, actor):
+        key = number, actor
+        if key not in self._input_orders:
+            node = self.nodes[number]
+            if node.kind == "acquire":
+                # A quorum still requires every real contribution. One
+                # participant's origin is first sought in that participant's
+                # capture; the acquire guard retains the complete quorum.
+                own, others = [], []
+                for child in node.inputs:
+                    (own if self.nodes[child].point.actor is actor else others).append(child)
+                inputs = (*own, *others)
+            else:
+                inputs = tuple(reversed(node.inputs))
+            self._input_orders[key] = inputs
+        return self._input_orders[key]
+
+    def _may_reach(self, number, origin, cache, facts, assumptions):
         if self._may[number] is None:
             # New query unions only point at already frozen capture snapshots.
             pending = [(number, False)]
@@ -453,52 +565,46 @@ class ProtocolTransfers:
         summary = self._may[number]
         key = id(summary)
         if key not in cache:
-            cache[key] = any(
-                self.order(source, capture, strict=False) is not False
-                for capture in summary.get((source.actor, engine), ())
+            possible = any_of(
+                *(
+                    self._origin_order(origin, capture)
+                    for (actor, engine), points in summary.items()
+                    if self._origin_matches(origin, actor, engine)
+                    for capture in points
+                )
             )
+            truth = facts.truth(possible)
+            if truth is None and isinstance(origin, ConsumptionOrigin):
+                # A may skyline ignores activation when subsuming older
+                # captures. Keep that upper bound: do not add the skyline
+                # representative's guard. Only an impossible order to every
+                # possible origin cut can prune this entire shared component.
+                self.work.consumption_bound_queries += 1
+                answer = self.domains.arithmetic.queries.satisfies((*assumptions, possible))
+                truth = False if answer.impossible else None
+                self.work.consumption_bound_exclusions += int(answer.impossible)
+            cache[key] = truth is not False
         return cache[key]
 
     def order(self, before, after, *, strict):
-        key = before, after, strict
-        if key not in self._orders:
-            left, right = self.positions.position(before), self.positions.position(after)
-            guards = ()
-            if before.actor is after.actor and left is not None and right is not None:
-                common = 0
-                while common < min(len(left), len(right)) and left[common][0] is right[common][0]:
-                    common += 1
-                # Equal cuts denote the same prefix only at the same real
-                # operation/phase. Distinct actions at tied anchors acquire no
-                # order, including endpoints in different child invocations.
-                equal_cut = (
-                    not strict
-                    and common == len(left) == len(right)
-                    and before.operation is after.operation
-                    and before.placement is after.placement
-                )
-                word = tuple(
-                    (
-                        left[i][1],
-                        right[i][1],
-                        i + 1 == common
-                        and (right[i][2] > left[i][2] or equal_cut and right[i][2] == left[i][2]),
-                    )
-                    for i in range(common)
-                )
-                guards = self.domains._order_word(word)
-            self._orders[key] = any_of(*(all_of(*guard.comparisons) for guard in guards))
-        return self._orders[key]
+        return self.positions.order(before, after, strict=strict)
 
-    def snapshot(self, point, engine, *, strict):
-        key = point, engine, strict
+    def snapshot(self, point, engine, *, strict, native_only=False):
+        key = point, engine, strict, native_only
         if key not in self._snapshots:
-            nodes = tuple(
-                node
-                for route in ((point.actor, engine), (point.actor, None))
-                for word in self.words.get(route, ())
-                for node in word.before(point, strict=strict)
-            )
+            if native_only:
+                nodes = tuple(
+                    self.merge((node,), condition=self.order(prior, point, strict=strict))
+                    for route in ((point.actor, engine), (point.actor, None))
+                    for prior, node in self.native_acquires.get((*route, point.operation), ())
+                )
+            else:
+                nodes = tuple(
+                    node
+                    for route in ((point.actor, engine), (point.actor, None))
+                    for word in self.words.get(route, ())
+                    for node in word.before(point, strict=strict)
+                )
             self._snapshots[key] = self.merge(nodes)
         return self._snapshots[key]
 
@@ -509,46 +615,118 @@ class ProtocolTransfers:
         Gray backedges supply no facts; resulting witnesses are immutable
         acyclic derivations rooted in actual retained capture/acquire actions.
         """
-        self.work.completion_queries += 1
+        return self._derive(
+            CompletionOrigin(source, engine),
+            target,
+            destination,
+            excluded=excluded,
+            assumptions=assumptions,
+            strict_target=False,
+        )
+
+    def consumption(self, notification, old, target, engine, *, assumptions=()):
+        """Carry an actual Wait's consumption through retained real gates.
+
+        The origin blocks only its specified queue, or its actual controller
+        for Scalar/cross Wait. A later Set acquires that fact only at a strict
+        capture cut; native readiness alone never creates this origin.
+        """
+        origin = ConsumptionOrigin(old, notification)
+        states = self._consumed_states.setdefault((origin, assumptions), {})
+        hits = self.work.consumption_state_hits
+        proof = self._derive(
+            origin,
+            target,
+            engine,
+            excluded=frozenset((notification,)),
+            assumptions=assumptions,
+            strict_target=True,
+            states=states,
+        )
+        if self.work.consumption_state_hits != hits:
+            if (
+                proof is not None
+                and self.domains.arithmetic.queries.implies(proof.condition, assumptions).proved
+            ):
+                return proof
+            # Cached conditional facts are sufficient witnesses, not a claim
+            # of complete negative reachability. A new admission may require
+            # an alternative through a previously open boundary.
+            self.work.consumption_state_refreshes += 1
+            return self._derive(
+                origin,
+                target,
+                engine,
+                excluded=frozenset((notification,)),
+                assumptions=assumptions,
+                strict_target=True,
+                states=states,
+                reuse=False,
+            )
+        return proof
+
+    def _derive(
+        self,
+        origin,
+        target,
+        destination,
+        *,
+        excluded,
+        assumptions,
+        strict_target,
+        states=None,
+        reuse=True,
+    ):
+        kind = "consumption" if isinstance(origin, ConsumptionOrigin) else "completion"
+
+        def count(field):
+            name = kind + "_" + field
+            setattr(self.work, name, getattr(self.work, name) + 1)
+
+        count("queries")
         facts = _QueryFacts(self.domains.arithmetic, assumptions)
         if any(facts.truth(test) is False for test in assumptions):
             # The caller still proves this empty activation with the shared
             # mathematical service. No real action is pinned by an empty case.
             return CausalProof(self.nodes[0], (), False)
-        if self.positions.position(source) is None or self.positions.position(target) is None:
+        if self.positions.position(origin.point) is None or self.positions.position(target) is None:
             return None
-        root = self.snapshot(target, destination, strict=False)
+        root = self.snapshot(target, destination, strict=strict_target)
         results, possible, visiting, stack = {}, {}, set(), [(root, 0)]
         while stack:
-            poll("completion frontier transfer")
+            poll(kind + " frontier transfer")
             number, next_input = stack[-1]
             node = self.nodes[number]
             if node.notification in excluded:
                 results[number] = None
                 stack.pop()
                 continue
+            if reuse and states is not None and number in states:
+                results[number] = states[number]
+                self.work.consumption_state_hits += 1
+                stack.pop()
+                continue
             if next_input == 0 and number not in visiting:
-                if facts.truth(node.condition) is False or not self._may_complete(
-                    number, source, engine, possible
+                if facts.truth(node.condition) is False or not self._may_reach(
+                    number, origin, possible, facts, assumptions
                 ):
                     results[number] = None
-                    self.work.completion_pruned += 1
+                    count("pruned")
                     stack.pop()
                     continue
-                if (
-                    node.kind == "capture"
-                    and node.point.actor is source.actor
-                    and node.notification.source_engine is engine
+                if node.kind == "capture" and self._origin_matches(
+                    origin, node.point.actor, node.notification.source_engine
                 ):
-                    direct = self.order(source, node.point, strict=False)
+                    direct = self._origin_order(origin, node.point)
                     if facts.truth(direct) is True:
                         results[number] = CausalProof(node, (), all_of(node.condition, direct))
-                        self.work.completion_nodes += 1
+                        count("nodes")
                         stack.pop()
                         continue
             visiting.add(number)
+            ordered = self._inputs(number, origin.point.actor)
             if next_input:
-                previous = results.get(node.inputs[next_input - 1])
+                previous = results.get(ordered[next_input - 1])
                 if previous is not None and facts.truth(previous.condition) is True:
                     # One acquired frontier already covers this query's whole
                     # domain. Preserve its actual proof and the parent's guard;
@@ -557,34 +735,36 @@ class ProtocolTransfers:
                     results[number] = CausalProof(
                         node, (previous,), all_of(node.condition, previous.condition)
                     )
-                    self.work.completion_nodes += 1
-                    self.work.completion_shortcuts += 1
+                    count("nodes")
+                    count("shortcuts")
                     visiting.remove(number)
                     stack.pop()
                     continue
-            if next_input < len(node.inputs):
-                child = node.inputs[next_input]
+            if next_input < len(ordered):
+                # Query the newest acquired frontier first. Earlier prefix
+                # ranges remain available when its activation is incomplete.
+                child = ordered[next_input]
                 stack[-1] = number, next_input + 1
                 if child in visiting:
-                    self.work.completion_cycles += 1
+                    count("cycles")
                     continue
                 if child not in results:
                     stack.append((child, 0))
                 continue
             inputs = tuple(results[i] for i in node.inputs if results.get(i) is not None)
             condition = all_of(node.condition, any_of(*(proof.condition for proof in inputs)))
-            if (
-                node.kind == "capture"
-                and node.point.actor is source.actor
-                and node.notification.source_engine is engine
+            if node.kind == "capture" and self._origin_matches(
+                origin, node.point.actor, node.notification.source_engine
             ):
-                direct = all_of(node.condition, self.order(source, node.point, strict=False))
+                direct = all_of(node.condition, self._origin_order(origin, node.point))
                 if direct is not False:
                     leaf = CausalProof(node, (), direct)
                     inputs = (leaf, *inputs)
                     condition = any_of(direct, condition)
             results[number] = None if condition is False else CausalProof(node, inputs, condition)
-            self.work.completion_nodes += 1
+            count("nodes")
             visiting.remove(number)
             stack.pop()
+        if states is not None:
+            states.update((number, proof) for number, proof in results.items() if proof is not None)
         return results.get(root)

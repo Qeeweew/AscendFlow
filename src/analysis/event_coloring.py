@@ -141,6 +141,41 @@ def counter_group_usage(demands, members, reuses, packs, *, packing=True, time_p
     return None
 
 
+def counter_fifo_partition(demands, packs, members=None):
+    """A concrete finite upper bound using already certified whole words.
+
+    Removing messages preserves a CounterGroup certificate. This greedy
+    partition is a sufficient mapping proposal, never a minimum-ID claim.
+    It neither queries a domain nor derives an event consumption relation.
+    """
+    remaining = {
+        n
+        for n, demand in enumerate(demands)
+        if demand.backlog is not None and (members is None or n in members)
+    }
+    if any(demands[n].width != 1 or demands[n].backlog > CROSS_BACKLOG for n in remaining):
+        return None
+    result = []
+    for pack in sorted(packs, key=lambda values: (-len(values), tuple(sorted(values)))):
+        selected = frozenset(remaining.intersection(pack))
+        if len(selected) < 2 or sum(demands[n].backlog for n in selected) > CROSS_BACKLOG:
+            continue
+        result.append(selected)
+        remaining.difference_update(selected)
+    result.extend(frozenset((n,)) for n in sorted(remaining))
+    return tuple(result)
+
+
+def _structured_counter_colors(problem, group, reserved, capacity):
+    partition = counter_fifo_partition(problem.demands, problem.counter_packs, group)
+    available = tuple(flag for flag in range(capacity) if flag not in reserved.get(None, ()))
+    if partition is None or len(partition) > len(available):
+        return None
+    return {
+        number: (flag,) for pack, flag in zip(partition, available, strict=False) for number in pack
+    }
+
+
 def _components(demands):
     pending = set(range(len(demands)))
     while pending:
@@ -330,22 +365,26 @@ def color_event_resources(problem, *, node_limit=None):
                 problem, group, reserved, capacity, node_limit - nodes, reuse=False
             )
             nodes += work
+        if colors is None and cross and not problem.counter_reuses:
+            colors = _structured_counter_colors(problem, group, reserved, capacity)
         if colors is None:
             colors, work = _color(
                 problem, group, reserved, capacity, node_limit - nodes, reuse=True
             )
             nodes += work
         if colors is None and cross:
-            colors, work = _color(
-                problem,
-                group,
-                reserved,
-                capacity,
-                node_limit - nodes,
-                reuse=True,
-                counter_packing=True,
-            )
-            nodes += work
+            colors = _structured_counter_colors(problem, group, reserved, capacity)
+            if colors is None:
+                colors, work = _color(
+                    problem,
+                    group,
+                    reserved,
+                    capacity,
+                    node_limit - nodes,
+                    reuse=True,
+                    counter_packing=True,
+                )
+                nodes += work
         if colors is None:
             first = problem.demands[group[0]]
             names = [m.name for n in group for m in problem.demands[n].members]
