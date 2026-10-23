@@ -56,29 +56,39 @@ def _ast_only():
     raise CompileError("device syntax requires prim_func or from_source AST capture")
 
 
-def alloc_ub(shape, dtype=f32, *, name=None):
+def alloc_ub(shape, dtype=f32, *, slots=None, name=None):
     _ast_only()
 
 
-def alloc_mask(shape, *, name=None):
+def alloc_mask(shape, *, slots=None, name=None):
     """Explicit packed predicate storage: 32 bytes per whole 64-lane block."""
     _ast_only()
 
 
-def alloc_l1(shape, dtype=f16, *, name=None):
+def alloc_l1(shape, dtype=f16, *, slots=None, name=None):
     _ast_only()
 
 
-def alloc_l0a(shape, dtype=f16, *, name=None):
+def alloc_l0a(shape, dtype=f16, *, slots=None, name=None):
     _ast_only()
 
 
-def alloc_l0b(shape, dtype=f16, *, name=None):
+def alloc_l0b(shape, dtype=f16, *, slots=None, name=None):
     _ast_only()
 
 
-def alloc_l0c(shape, dtype=f32, *, name=None):
+def alloc_l0c(shape, dtype=f32, *, slots=None, name=None):
     _ast_only()
+
+
+def slotted_view(view, *, axis=0):
+    """Bind a static slot axis of existing storage without allocating bytes."""
+    _ast_only()
+
+
+class CopyGroup:
+    def __init__(self, *, name=None):
+        _ast_only()
 
 
 class Kernel:
@@ -102,12 +112,12 @@ class Vector(Cube):
 
 
 class Pipelined:
-    def __init__(self, count, *, issue_order=None):
+    def __init__(self, count, *, name=None, issue_order=None):
         _ast_only()
 
 
 class Dataflow:
-    def __init__(self, count, *, issue_order=None):
+    def __init__(self, count, *, name=None, issue_order=None):
         _ast_only()
 
 

@@ -21,7 +21,7 @@ from xdsl.ir import SSAValue
 from ..diagnostics import require
 from ..dialects.physical import TaskOp
 from ..dialects.source import _dominates
-from ..dialects.structured import PipelineStageOp
+from ..dialects.structured import PipelineStageOp, ReadyGroupOp
 from ..dialects.types import RefType
 from ..mask import (
     ITERATION_VALUES,
@@ -70,6 +70,7 @@ class NativeMemoryFacts:
     templates: tuple[MemoryTemplate, ...]
     addresses: Mapping[SSAValue, AddressFacts]
     native_contract_calls: int
+    ready_groups: tuple[tuple[MemoryTemplate, ...], ...] = ()
 
     @cached_property
     def by_operation(self):
@@ -380,6 +381,31 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 location=str(operation.location),
             )
         templates.append(MemoryTemplate(operation, frame, spec, accesses, scalar_source))
+    by_operation = {template.operation: template for template in templates}
+    groups, grouped = [], set()
+    for operation in control.frames:
+        if not isinstance(operation, ReadyGroupOp):
+            continue
+        operation.verify()
+        members = tuple(by_operation[value.owner] for value in operation.members)
+        require(
+            len({member.spec.engine for member in members}) == 1
+            and all(member.frame is members[0].frame for member in members),
+            "CopyGroup needs one actual source queue and activation; split the group",
+            phase="structured-memory",
+            location=str(operation.location),
+        )
+        require(
+            not any(member.operation in grouped for member in members),
+            "CopyGroup native cannot belong to multiple groups",
+        )
+        grouped.update(member.operation for member in members)
+        groups.append(members)
     return NativeMemoryFacts(
-        module, control, tuple(templates), MappingProxyType(addresses), len(templates)
+        module,
+        control,
+        tuple(templates),
+        MappingProxyType(addresses),
+        len(templates),
+        tuple(groups),
     )

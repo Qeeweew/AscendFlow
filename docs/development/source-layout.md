@@ -67,6 +67,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | 文件/范围 | 职责与输出 |
 |---|---|
 | `frontend/`、`dialects/source.py`、`language.py` | TileLang 风格 AST、typed source、逻辑 Tile 和显式 buffer |
+| source `StorageSelectOp`、`TileSliceOp`、`CopyGroupOp`；physical `ReadyGroupOp` | 实际 root/原 selector/槽轴映射、借用子视图 writer 以及共同 ready 到 native 成员的 typed 对应；均不自行提供异步完成 |
 | `passes/lower_pipeline.py`、`lower_native.py`、`native_recipes.py`、`native_addresses.py` | 参数化控制及 native recipe；尚未建立异步完成 |
 | `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/effects、绑定真实循环的条件读取；消费共享目标描述 |
 | `target/native.py` 的 `NativeSpec` | 一份不可变的 native opcode、参数、operand geometry/effects、寄存器读写及所需值、packet、read reset 与完成规则；逻辑分析和终端共享，不含地址/代次 |

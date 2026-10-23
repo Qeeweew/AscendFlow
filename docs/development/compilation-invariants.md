@@ -16,6 +16,18 @@
 
 每项义务记录输入、建立者、产出、消费者、保持条件及失效条件。不要把所有名为`prove`的函数一概删除；也不要用cache命中率证明职责设计已合理。不建设可伪造的verified标记或庞大通用proof框架。
 
+source 的槽选择保留实际 allocation、原 selector SSA、槽轴、深度和 generation/
+physical 方式。lowering 产生该 selector 对应的真实 modulo 或直接索引；raw view
+与结构化 view 进入相同地址/effects/alias 链。Tile slice 沿共享值 DAG 转发原
+writer，读取的真实区域仍由 admission 检查，切片不定义新值。
+
+CopyGroup 的 typed region 对应 physical ReadyGroupOp 的实际 native 成员。
+内存事实检查相同 queue、参与者与 activation；RAW 共同捕获最后成员的真实
+源前缀，原存储 ownership 和 WAR/WAW 分别保持。内部联系不通过共同 ready
+反向等待。资源规划前完成端点与 quorum 检查，终端投影只移除已消费的组描述。
+独立有限模型从 source 对应记录额外的共同 ready 义务，但只允许实际 Set/Wait
+建立完成顺序；未读取的同组成员也不能提前被宣布完成。
+
 目标原生指令的静态描述由 `NativeSpec` 统一保存，逻辑 memory template 和
 终端 native 共享同一份不可变值；实际地址和循环 read condition 各自绑定真实
 SSA/代次。opcode、参数或地址 operand 数量改变必须更新描述，不能沿用旧

@@ -19,6 +19,7 @@ from ..diagnostics import require
 from ..dialects.source import (
     AllocationOp,
     CompareOp,
+    CopyGroupOp,
     CopyOp,
     DomainOp,
     ElementOp,
@@ -35,6 +36,8 @@ from ..dialects.source import (
     ScaleOp,
     SizeOp,
     StageOp,
+    StorageSelectOp,
+    TileSliceOp,
     ViewOp,
     YieldOp,
     copy_compatible,
@@ -377,10 +380,14 @@ class _Trace:
                 result = self.scalar(region.count.data - 1)
             else:
                 require(
-                    isinstance(owner, INTEGER_OPERATIONS),
+                    isinstance(owner, (*INTEGER_OPERATIONS, StorageSelectOp)),
                     "index expression escaped its source scope",
                 )
-                operands = tuple(visit(operand, depth + 1) for operand in owner.operands)
+                operands = (
+                    (owner.root, visit(owner.selector, depth + 1))
+                    if isinstance(owner, StorageSelectOp)
+                    else tuple(visit(operand, depth + 1) for operand in owner.operands)
+                )
                 result = self._pure(
                     type(owner).create(
                         operands=operands,
@@ -530,16 +537,87 @@ class _Value:
         if isinstance(indices, tuple) and indices == (None, slice(None)):
             require(len(self.shape) == 1, "column broadcast requires one vector")
             return _ColumnBroadcast(self)
-        require(
+        if not (
             isinstance(indices, tuple)
             and len(indices) == 2
             and isinstance(indices[0], slice)
             and indices[0] == slice(None)
             and indices[1] is None
-            and len(self.shape) == 1,
-            "tile values support only [:, None]; slice the physical view explicitly",
-        )
+            and len(self.shape) == 1
+        ):
+            view = self.view[indices]
+            if isinstance(view, (_ColumnBroadcast, _RowBroadcast)):
+                return type(view)(self)
+            op = TileSliceOp.build(
+                operands=[_trace().logical(self.value), view.emit()],
+                result_types=[_tile(view)],
+            )
+            _trace().add(op)
+            _trace().record(op.value)
+            return _Value(view, op.value)
         return _RowBroadcast(self)
+
+
+@dataclass(frozen=True)
+class _SlottedView:
+    storage: _View
+    axis: int
+
+    @property
+    def depth(self):
+        return self.storage.shape[self.axis]
+
+    @property
+    def shape(self):
+        return self.storage.shape[: self.axis] + self.storage.shape[self.axis + 1 :]
+
+    def select(self, selector, *, physical=False):
+        original = _index(selector)
+        if original.value is None:
+            require(
+                original.constant >= 0 and (not physical or original.constant < self.depth),
+                "storage selection exceeds its physical slot axis",
+            )
+        trace = _trace()
+        op = StorageSelectOp.build(
+            operands=[self.storage.buffer.op.ref, trace.scalar(original)],
+            attributes={
+                "axis": IntAttr(self.storage.axes[self.axis]),
+                "depth": IntAttr(self.depth),
+                "mode": StringAttr("physical" if physical else "generation"),
+            },
+            result_types=[IndexType()],
+        )
+        trace.add(op)
+        indices = [slice(None)] * len(self.storage.axes)
+        indices[self.axis] = _Index(op.index)
+        return self.storage[tuple(indices)]
+
+
+@dataclass(frozen=True)
+class _SlottedMask:
+    slots: _SlottedView
+    shape: tuple[int, ...]
+
+    @property
+    def storage(self):
+        return self.slots.storage
+
+    def select(self, selector, *, physical=False):
+        return _MaskBuffer(self.slots.select(selector, physical=physical), self.shape)
+
+
+def slotted_view(view, *, axis=0):
+    view = _view(view)
+    require(
+        type(axis) is int and 0 <= axis < len(view.axes),
+        "slotted_view axis must name a retained static axis",
+    )
+    require(
+        len(view.axes) > 1 and type(view.shape[axis]) is int and view.shape[axis] > 0,
+        "slotted_view needs a positive static slot axis and nonempty payload",
+    )
+    return _SlottedView(view, axis)
 
 
 @dataclass(frozen=True)
@@ -600,13 +678,13 @@ def _mask_type(shape):
 class _MaskBuffer:
     """Explicit packed predicate storage; one 32-byte block per 64 lanes."""
 
-    buffer: _Buffer
+    buffer: _Buffer | _View
     shape: tuple[int, ...]
 
     def __post_init__(self):
-        require(self.buffer.dtype == "u8", "predicate storage must use packed u8 bytes")
+        require(self.view.buffer.dtype == "u8", "predicate storage must use packed u8 bytes")
         require(
-            self.chunks * 32 == self.buffer.shape[0],
+            self.view.shape == (self.chunks * 32,),
             "predicate storage needs exact 32-byte blocks",
         )
 
@@ -618,7 +696,7 @@ class _MaskBuffer:
 
     @property
     def view(self):
-        return self.buffer._full()
+        return self.buffer if isinstance(self.buffer, _View) else self.buffer._full()
 
 
 @dataclass(frozen=True)
@@ -1010,24 +1088,36 @@ def _allocate(
     return _Buffer(op, shape, dtype, memory, layout)
 
 
-def alloc_ub(shape, dtype=f32, *, name=None):
-    return _allocate(shape, dtype, "UB", name=name)
+def _local_storage(shape, dtype, memory, *, slots, name, layout="linear"):
+    require(
+        slots is None or type(slots) is int and slots > 0,
+        "slots must be a positive constexpr integer",
+    )
+    shape = tuple(shape)
+    buffer = _allocate(
+        shape if slots is None else (slots, *shape), dtype, memory, layout=layout, name=name
+    )
+    return buffer if slots is None else slotted_view(buffer)
 
 
-def alloc_l1(shape, dtype=f16, *, name=None):
-    return _allocate(shape, dtype, "L1", layout="NZ", name=name)
+def alloc_ub(shape, dtype=f32, *, slots=None, name=None):
+    return _local_storage(shape, dtype, "UB", slots=slots, name=name)
 
 
-def alloc_l0a(shape, dtype=f16, *, name=None):
-    return _allocate(shape, dtype, "L0A", layout="ZZ", name=name)
+def alloc_l1(shape, dtype=f16, *, slots=None, name=None):
+    return _local_storage(shape, dtype, "L1", layout="NZ", slots=slots, name=name)
 
 
-def alloc_l0b(shape, dtype=f16, *, name=None):
-    return _allocate(shape, dtype, "L0B", layout="ZN", name=name)
+def alloc_l0a(shape, dtype=f16, *, slots=None, name=None):
+    return _local_storage(shape, dtype, "L0A", layout="ZZ", slots=slots, name=name)
 
 
-def alloc_l0c(shape, dtype=f32, *, name=None):
-    return _allocate(shape, dtype, "L0C", layout="NZ", name=name)
+def alloc_l0b(shape, dtype=f16, *, slots=None, name=None):
+    return _local_storage(shape, dtype, "L0B", layout="ZN", slots=slots, name=name)
+
+
+def alloc_l0c(shape, dtype=f32, *, slots=None, name=None):
+    return _local_storage(shape, dtype, "L0C", layout="NZ", slots=slots, name=name)
 
 
 class Kernel:
@@ -1089,6 +1179,16 @@ class Stage(_RegionScope):
         )
 
 
+class CopyGroup(_RegionScope):
+    def __init__(self, *, name=None):
+        trace = _trace()
+        require(_actor_family(trace) is not None, "CopyGroup requires one actual actor")
+        require(name is None or type(name) is str and bool(name), "CopyGroup name must be nonempty")
+        self.op = CopyGroupOp.create(
+            attributes={"label": StringAttr(name or "")}, regions=[Region(Block())]
+        )
+
+
 class Cube(_RegionScope):
     def __init__(self):
         self.op = DomainOp.create(
@@ -1115,8 +1215,9 @@ def _actor_family(trace):
     return None if trace.op.kind.data == "mixed" else trace.op.kind.data
 
 
-def _iteration(count, issue_order):
+def _iteration(count, issue_order, name):
     trace = _trace()
+    require(name is None or type(name) is str and bool(name), "iteration name must be nonempty")
     if type(count) is int:
         require(
             0 <= count <= (1 << 63) - 1,
@@ -1126,6 +1227,7 @@ def _iteration(count, issue_order):
         operands=[] if type(count) is int else [trace.scalar(count)],
         attributes={
             "uid": StringAttr(trace.name("iteration")),
+            **({"label": StringAttr(name)} if name is not None else {}),
             **({"count": IntAttr(count)} if type(count) is int else {}),
             **_issue_order(issue_order),
         },
@@ -1134,12 +1236,12 @@ def _iteration(count, issue_order):
 
 
 class Dataflow:
-    def __init__(self, count, *, issue_order=None):
-        self.op = _iteration(count, issue_order)
+    def __init__(self, count, *, name=None, issue_order=None):
+        self.op = _iteration(count, issue_order, name)
 
 
 class Pipelined:
-    def __init__(self, count, *, issue_order=None):
+    def __init__(self, count, *, name=None, issue_order=None):
         family = _actor_family(_trace())
         require(family is not None, "Pipelined is actor-local; use Dataflow for mixed iterations")
         require(
@@ -1148,7 +1250,7 @@ class Pipelined:
             and all(type(name) is str for name in issue_order),
             "Pipelined issue_order must be a tuple of local stage names",
         )
-        self.op = _iteration(count, None if issue_order is None else {family: issue_order})
+        self.op = _iteration(count, None if issue_order is None else {family: issue_order}, name)
 
 
 def _issue_order(order):
@@ -1376,7 +1478,7 @@ def mul(lhs, rhs, *, out, valid=None, scratch=None, mask=None):
         _trace().record(op.value)
         return _Value(dst, op.value)
     return (
-        _element("mul_scalar", [lhs], out, rhs, valid, mask=mask)
+        _element("mul_scalar", [lhs], out, rhs, valid, mask=mask, scratch=scratch)
         if isinstance(rhs, (float, int))
         else _element("mul", [lhs, rhs], out, valid=valid, mask=mask, scratch=scratch)
     )
@@ -1432,7 +1534,7 @@ def arange(extent):
     return _Coord.arange(extent)
 
 
-def alloc_mask(shape, *, name=None):
+def alloc_mask(shape, *, slots=None, name=None):
     """Explicit packed predicate storage: 32 bytes per whole 64-lane block."""
     from math import prod
 
@@ -1444,8 +1546,14 @@ def alloc_mask(shape, *, name=None):
     lanes = prod(shape)
     require(lanes % 64 == 0, "packed predicates need whole 64-lane blocks")
     chunks = lanes // 64
-    buffer = _allocate((chunks * 32,), "u8", "UB", name=name or _trace().name("mask"))
-    return _MaskBuffer(buffer, shape)
+    buffer = _local_storage(
+        (chunks * 32,), "u8", "UB", slots=slots, name=name or _trace().name("mask")
+    )
+    return (
+        _SlottedMask(buffer, shape)
+        if isinstance(buffer, _SlottedView)
+        else _MaskBuffer(buffer, shape)
+    )
 
 
 def compare(source, threshold, *, kind="gt", out):

@@ -27,7 +27,9 @@
 | `T.Dataflow(count, issue_order=...)` | 共享逻辑迭代域；允许 C/V 代码交替 |
 | `T.Pipelined(count, issue_order=...)` | 单 actor 迭代与本地流水；降低到同一逻辑域表示 |
 | `T.Stage(offset, name=...)` | 最近迭代域内当前 actor 的发射偏移，不是完成边界 |
+| `T.CopyGroup(name=...)` | 单 actor、同激活域的一组 copy 共同对外 ready；各存储的 release 分别推导 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理容量、布局、slot与别名 |
+| `alloc_*(shape, dtype, slots=S)`、`slotted_view(view, axis=0)` | 明确槽轴与每槽 payload，绑定已有 view 时不增加存储 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
 | `copy(..., valid_rows=r)` | 二维 runtime 行前缀；GM→L1 可补零或保留其余 NZ 行，UB→GM 部分写 |
 | `alloc_mask(shape)` | 显式 UB packed predicate 存储，64 lane 一个 32 B 块 |
@@ -75,6 +77,41 @@ count-mode 16 位 Vector Dup，计数以元素为单位，不扩大到完整 rep
 隐含临时 FP32 tile。带 mask 的 fill 和其他算术仍要求显式 f32 目标。
 
 ## 2. 双缓冲示例
+
+独立槽数可以直接声明。shape 是单槽 payload，`slots` 是正 constexpr 整数，
+不受 event bank 的 8 个 ID 限制，实际总容量仍受硬件内存限制。
+
+```python
+x = T.alloc_ub((64,), T.bf16, slots=3)
+x.at(t)          # t % 3 对应的普通 payload view
+x.slot(i)        # 物理槽 i，不取模
+x.storage[i, :]  # 同一 allocation 的普通完整物理 view
+```
+
+`slotted_view(Workspace[group, :, :, :], axis=0)` 从已有 view 的实际槽轴取得
+深度与 stride，不改变 ABI、权限、layout 或 allocation root。切片、raw 地址与
+结构化选择照常可能别名；`at` 保留原 selector 的求值，不初始化、不定义值或
+授权复写。`copy`、算术结果的普通 slice 保留原 writer；该区域被覆盖后读取旧
+Tile 仍会拒绝。`alloc_mask(..., slots=S).at(t)` 同样选择 packed predicate 存储。
+
+`CopyGroup` 只接受一个 actor/Stage/实际迭代及激活域内的直线 copy、纯标量、
+view 和透明 inline；constexpr unroll 展开后适用相同规则。runtime 分支或循环
+可包围整组，不能放在组内；不接受嵌套组或其他计算 effects。
+
+```python
+with T.CopyGroup(name="operands"):
+    av = T.copy(A[t, :], a.at(t))
+    bv = T.copy(B[t, :], b.at(t))
+```
+
+所有成员须具有同一真实源 queue。对外读取某个成员定义的区域时，ready 覆盖
+整组 native 的完成；不同消费 route 分别落实协议。组退出不阻塞、不合并 DMA，
+不提供全局同步，也不将部分写升级为整块定义。每个 buffer 的最后 reader、
+复写保护和 release 继续独立分析。需要提前消费某块时显式拆组。
+两 AIV 保持共享 body 和各自实际 publisher/receiver 贡献。
+
+`Dataflow` 和 `Pipelined` 可选 `name=` 仅用于诊断，控制与调用身份仍由实际 IR
+建立。allocation 缺省 dtype 保持 UB/L0C 为 f32、L1/L0A/L0B 为 f16；BF16 显式声明。
 
 完整当前源码：[scale.py](../../examples/vector/scale.py)。核心结构如下：
 

@@ -19,10 +19,16 @@ from ..dialects.structured import (
     NotificationOp,
     PipelineLoopOp,
     PipelineStageOp,
+    ReadyGroupOp,
 )
 
 
 def lower_execution(module, natives, facts, schedules):
+    # Common readiness has already selected real Set/Wait actions. Its typed
+    # correspondence is retained on the logical module, never emitted as work.
+    for operation in tuple(module.walk()):
+        if isinstance(operation, ReadyGroupOp):
+            operation.parent.erase_op(operation)
     uses = ScalarUses(module, natives, metadata=True)
     root = module.body.block.first_op
 

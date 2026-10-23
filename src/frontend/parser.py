@@ -33,12 +33,19 @@ class _Symbol:
     name: str
 
 
+@dataclass(frozen=True)
+class _StorageMethod:
+    storage: builders._SlottedView | builders._SlottedMask
+    physical: bool
+
+
 _DSL_NAMESPACE = object()
 
 
 _CALLS = {
     "Tensor",
     "Kernel",
+    "CopyGroup",
     "Stage",
     "Cube",
     "Vector",
@@ -49,6 +56,7 @@ _CALLS = {
     "alloc_l0a",
     "alloc_l0b",
     "alloc_l0c",
+    "slotted_view",
     "copy",
     "mul",
     "add",
@@ -423,9 +431,18 @@ class _Parser:
                 for item in node.items:
                     scope = self.expr(item.context_expr)
                     if not isinstance(
-                        scope, (builders.Kernel, builders.Stage, builders.Cube, builders.Vector)
+                        scope,
+                        (
+                            builders.Kernel,
+                            builders.Stage,
+                            builders.Cube,
+                            builders.Vector,
+                            builders.CopyGroup,
+                        ),
                     ):
-                        self.fail(item.context_expr, "expected Kernel/Stage/Cube/Vector scope")
+                        self.fail(
+                            item.context_expr, "expected Kernel/Stage/Cube/Vector/CopyGroup scope"
+                        )
                     value = scopes.enter_context(scope)
                     if item.optional_vars:
                         self.assign(item.optional_vars, value)
@@ -513,8 +530,8 @@ class _Parser:
                     self.env.pop(name, None)
             return
         if symbol.name in {"Pipelined", "Dataflow"}:
-            if len(args) != 1 or set(kwargs) - {"issue_order"}:
-                self.fail(call, f"{symbol.name} requires one count and optional issue_order")
+            if len(args) != 1 or set(kwargs) - {"issue_order", "name"}:
+                self.fail(call, f"{symbol.name} requires one count and optional name/issue_order")
             operation = getattr(builders, symbol.name)(args[0], **kwargs).op
             self.trace.enter(operation)
             self.trace.iterations.append(operation)
@@ -702,7 +719,14 @@ class _Parser:
                 self.fail(node, value.name)
             return value
         if isinstance(node, ast.Attribute):
-            if self.expr(node.value) is not _DSL_NAMESPACE:
+            owner = self.expr(node.value)
+            if isinstance(owner, (builders._SlottedView, builders._SlottedMask)):
+                if node.attr == "storage":
+                    return owner.storage
+                if node.attr in {"at", "slot"}:
+                    return _StorageMethod(owner, node.attr == "slot")
+                self.fail(node, "slotted storage exposes only at, slot and storage")
+            if owner is not _DSL_NAMESPACE:
                 self.fail(node, "attribute access is restricted to registered DSL names")
             if node.attr in _CONSTANTS:
                 return getattr(syntax, node.attr)
@@ -784,6 +808,11 @@ class _Parser:
             return self.trace.index_op(arith.CmpiOp, lhs, rhs, comparison=name)
         if isinstance(node, ast.Call):
             symbol = self.expr(node.func)
+            if isinstance(symbol, _StorageMethod):
+                args, kwargs = self.arguments(node)
+                if len(args) != 1 or kwargs:
+                    self.fail(node, "at/slot requires one selector")
+                return symbol.storage.select(args[0], physical=symbol.physical)
             if isinstance(symbol, InlineFunction):
                 args, kwargs = self.arguments(node)
                 return self.inline(symbol, node, args, kwargs)
