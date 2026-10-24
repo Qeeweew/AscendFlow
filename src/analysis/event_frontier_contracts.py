@@ -107,6 +107,10 @@ class FrozenEventRelations(Mapping):
                 return (certificate,)
         raise AssertionError("frozen frontier mask has no covering certificate")
 
+    def local_mask(self, number):
+        """Numeric permissions for one original local row, without pair expansion."""
+        return self._masks[number] if 0 <= number < len(self._masks) else 0
+
     def cover_group(self, members):
         """Check all selected pairs by row masks, retaining compressed facts.
 

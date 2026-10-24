@@ -6,6 +6,7 @@ Search never queries lifetime facts or changes an instruction's position.
 """
 
 from dataclasses import dataclass
+from heapq import heapify, heappop, heappush
 from itertools import combinations
 
 from ..budget import poll
@@ -90,6 +91,42 @@ class _PeerRelations:
     packs: tuple
     reuses: frozenset
     time_packs: tuple
+
+    def local_conflicts(self, group):
+        """Project missing row permissions through every original private bank.
+
+        Expand actual conflicts from the frozen masks. A peer equality changes
+        only the numeric variable; no original bank or required permission is
+        dropped. Ordinary numeric mappings retain the finite fallback below.
+        """
+        row = getattr(self.original, "local_mask", None)
+        if row is None:
+            return None
+        owners = {old: number for number in group for old in self.groups[number]}
+        banks = {}
+        for old in owners:
+            for bank in self.banks[old]:
+                banks[bank] = banks.get(bank, 0) | (1 << old)
+        result = set()
+        for old, number in owners.items():
+            poll("event conflict projection", credits=len(owners), row=old)
+            common = 0
+            for bank in self.banks[old]:
+                common |= banks[bank]
+            missing = common & ~row(old) & ~(1 << old)
+            while missing:
+                bit = missing & -missing
+                other = bit.bit_length() - 1
+                missing ^= bit
+                target = owners[other]
+                key = min(number, target), max(number, target)
+                if number == target or key in result:
+                    continue
+                # Keep ordinary canonical lookup semantics even for an
+                # explicitly supplied asymmetric numeric row collection.
+                if self.original.get((min(old, other), max(old, other))) is None:
+                    result.add(key)
+        return result
 
     def get(self, key, default=None):
         a, b = key
@@ -310,31 +347,120 @@ def _exclusive_overfull(problem, group, reserved):
     )
 
 
+def _conflicting_demands(problem, group, *, reuse, cross, counter_packing):
+    if reuse and not cross and isinstance(problem.relations, _PeerRelations):
+        sparse = problem.relations.local_conflicts(group)
+        if sparse is not None:
+            yield from sorted(sparse)
+            return
+    # Mapping inputs and whole counter words use the same finite predicates.
+    # Restrict candidates to actual common namespaces before consulting them.
+    banks = {}
+    for number in group:
+        for bank in namespaces(problem.demands[number]):
+            banks.setdefault(bank, []).append(number)
+    seen = set()
+    for members in banks.values():
+        for a, b in combinations(members, 2):
+            pair = min(a, b), max(a, b)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            permitted = (
+                reuse
+                and relation(problem, a, b) is not None
+                and (not cross or counter_packing or pair in problem.counter_reuses)
+            )
+            if not permitted:
+                yield pair
+
+
+def _elimination_colors(adjacency, allowed):
+    """A sufficient local mapping from sparse minimum-degree elimination.
+
+    Ordered/interval components that fit their lists need no search. Different
+    reservation lists can defeat this proposal; the existing bounded solver
+    still handles that residual. No source or temporal fact is queried here.
+    """
+    degrees = [len(row) for row in adjacency]
+    pending = [(degree, number) for number, degree in enumerate(degrees)]
+    heapify(pending)
+    order, removed = [], set()
+    while pending:
+        degree, number = heappop(pending)
+        if number in removed or degree != degrees[number]:
+            continue
+        poll("event structural allocation", vertices=len(adjacency), removed=len(removed))
+        removed.add(number)
+        order.append(number)
+        for neighbor in adjacency[number]:
+            if neighbor not in removed:
+                degrees[neighbor] -= 1
+                heappush(pending, (degrees[neighbor], neighbor))
+    colors = {}
+    for number in reversed(order):
+        forbidden = {colors[n] for n in adjacency[number] if n in colors}
+        color = next((flag for flag in allowed[number] if flag not in forbidden), None)
+        if color is None:
+            return None
+        colors[number] = color
+    return colors
+
+
+def _local_clique_overfull(problem, group, reserved, *, reuse):
+    """Reject a bounded numeric witness before expanding a dense graph.
+
+    All vertices in each row share this bank's finite palette. Peer coupling
+    may supply another reason they need different numbers; this is still a
+    constraint-graph witness, not a physical-occupancy minimum.
+    """
+    banks = {}
+    for number in group:
+        for bank in namespaces(problem.demands[number]):
+            banks.setdefault(bank, []).append(number)
+    for bank, members in banks.items():
+        capacity = len(set(problem.id_pools.ids(bank)).difference(reserved.get(bank, ())))
+        clique, width = [], 0
+        for number in members:
+            if all(not reuse or relation(problem, number, other) is None for other in clique):
+                clique.append(number)
+                width += problem.demands[number].width
+                if width > capacity:
+                    return True
+    return False
+
+
 def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_packing=False):
     demands = problem.demands
     cross = demands[group[0]].backlog is not None
+    choices = {n: _available(problem.id_pools, namespaces(demands[n]), reserved) for n in group}
+    if any(demands[n].width > len(choices[n]) for n in group):
+        return None, 0
+    if not cross and _local_clique_overfull(problem, group, reserved, reuse=reuse):
+        return None, 0
     vertices = tuple((number, lane) for number in group for lane in range(demands[number].width))
     adjacency = [set() for _ in vertices]
-    allowed = []
-    for number, _ in vertices:
-        allowed.append(_available(problem.id_pools, namespaces(demands[number]), reserved))
+    allowed = [choices[number] for number, _ in vertices]
     # Unused IDs with the same admissible vertices are interchangeable.
     # Reservations can distinguish numbers across joint banks, so retain the
     # whole allowed-column signature rather than just a count of used IDs.
     signatures = {
         flag: tuple(flag in choices for choices in allowed) for flag in set().union(*allowed)
     }
-    for i, j in combinations(range(len(vertices)), 2):
-        a, b = vertices[i][0], vertices[j][0]
-        common = set(namespaces(demands[a])).intersection(namespaces(demands[b]))
-        permitted = (
-            reuse
-            and relation(problem, a, b) is not None
-            and (not cross or counter_packing or (min(a, b), max(a, b)) in problem.counter_reuses)
-        )
-        if a == b or common and (not reuse or not permitted):
+    lanes = {}
+    for i, (number, _) in enumerate(vertices):
+        lanes.setdefault(number, []).append(i)
+    for members in lanes.values():
+        for i, j in combinations(members, 2):
             adjacency[i].add(j)
             adjacency[j].add(i)
+    for a, b in _conflicting_demands(
+        problem, group, reuse=reuse, cross=cross, counter_packing=counter_packing
+    ):
+        for i in lanes[a]:
+            adjacency[i].update(lanes[b])
+        for j in lanes[b]:
+            adjacency[j].update(lanes[a])
     # This is a lower bound for the *supported constraint graph*, not a
     # witness of joint physical overlap in some real execution.
     clique = []
@@ -343,6 +469,8 @@ def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_pac
             clique.append(v)
     if len(clique) > capacity:
         return None, 0
+    if not cross and (structural := _elimination_colors(adjacency, allowed)) is not None:
+        return {n: tuple(structural[i] for i in lanes[n]) for n in group}, 0
     colors, nodes = {}, 0
 
     def visit():
