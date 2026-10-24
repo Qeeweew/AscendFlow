@@ -154,7 +154,7 @@ def examples():
         "flash_attention/attention",
         "attention_target",
         "attention.run",
-        (),
+        ("--dtype", "bf16"),
         ("--cases", "256:1024", "768:3072", "--repeats", "1"),
     )
     result.append(
