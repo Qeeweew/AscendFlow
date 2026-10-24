@@ -87,16 +87,16 @@ def test_deleting_a_required_gate_breaks_the_independent_byte_model():
         check_compiled_events(plan, {"n": 3})
 
 
-def test_completion_proof_leaves_are_retained_actions_and_never_their_own_protocol():
+def test_completion_proof_keeps_original_demands_and_retained_support_actions():
     plan = synchronize_structure(chain(runtime=True))
     retained = set(plan.selection.notifications)
     for item in plan.selection.coverage:
         if item.completion is not None:
             proof = item.completion
-            assert proof.notification not in retained
             assert set(proof.supports()) <= retained
-            assert proof.notification not in proof.supports()
             assert proof.covers(item.binding)
+            assert item.binding.requirement is item.requirement
+            assert any(item.requirement is need for need in plan.dependencies.required)
 
 
 def test_completion_preserves_each_sibling_loop_writer_in_a_merged_capture():
@@ -171,7 +171,7 @@ def test_regular_controller_stream_grows_by_real_frontiers_instead_of_all_pairs(
     plan = synchronize_structure(N.from_source(source))
     work = plan.generation.domains.work
     assert work.transfer_nodes <= 6 * blocks
-    assert work.completion_nodes <= 2 * blocks
+    assert work.completion_conclusions <= 2 * blocks
     assert work.transfer_order_bands <= 6 * blocks
     check_compiled_events(plan, invocations=2)
 

@@ -12,7 +12,7 @@ from functools import cached_property
 from ..diagnostics import CompileError, ErrorKind
 from ..memo import memoized_method
 from ..scalar import expression, literal
-from .consumption_frontiers import ConsumptionFrontiers
+from .consumption_frontiers import AcquiredConsumption, ConsumptionFrontiers
 from .event_contracts import CROSS_BACKLOG, LOCAL_CAPACITY, CaseLease, StructuredEventLease
 from .protocol_transfers import (
     CausalProof,
@@ -51,13 +51,13 @@ class Reuse:
 
 
 class HandbackRule:
-    def __init__(self, domains, *, boundaries=()):
+    def __init__(self, domains):
         self.domains = domains
         self.peers = tuple(
             n for n in domains.notifications if n.mechanism is not NotificationKind.PIPE_FENCE
         )
         self.positions = ProtocolPositions(domains)
-        self.boundary_cases = dict(boundaries)
+        self.boundary_cases = {}
         self.declined_boundaries = {}
         self._consumptions = {}
 
@@ -188,7 +188,8 @@ class HandbackRule:
                     if case.empty:
                         continue
                     for offset in offsets:
-                        for sources, consumers in d._instances(peer, case, loop, offset):
+                        for last in (False, True):
+                            sources, consumers = d._boundary(peer, case, loop, offset, last=last)
                             key = peer, sources, consumers
                             if key in seen:
                                 continue
@@ -221,8 +222,6 @@ class HandbackRule:
         assumptions,
         *,
         loop,
-        delta,
-        reentry,
         queue_composition=True,
     ):
         d = self.domains
@@ -260,25 +259,38 @@ class HandbackRule:
             proof = CausalProof(
                 TransferNode("consume-admission", None, target, (), condition), (), condition
             )
-            self.frontiers.add(origin, target, engine, assumptions, proof, answer)
-            return self._handback(origin, target, proof, answer, assumptions)
-        established = self.frontiers.find(origin, target, engine, assumptions)
-        if established is not None:
-            proof, answer = established
-            self.frontiers.add(origin, target, engine, assumptions, proof, answer)
-            return self._handback(origin, target, proof, answer, assumptions)
-        begin = None if loop is None else self._step(old, loop)
-        end = None if loop is None else self._step(target, loop)
-        graph = self._region_transfer(loop, begin, end, queue_composition)
-        proof = graph.consumption(channel, old, target, engine, assumptions=assumptions)
-        if proof is None:
-            return None
-        d.work.handback_cover_queries += 1
-        answer = d.arithmetic.queries.implies(proof.condition, assumptions)
-        if not answer.proved:
-            return None
-        self.frontiers.add_boundaries(origin, target, engine, assumptions, proof)
-        self.frontiers.add(origin, target, engine, assumptions, proof, answer)
+            queue_composition = False
+        else:
+            established = self.frontiers.find(
+                origin, target, engine, assumptions, queue_composition=queue_composition
+            )
+            if established is not None:
+                proof, answer = established
+            else:
+                begin = None if loop is None else self._step(old, loop)
+                end = None if loop is None else self._step(target, loop)
+                graph = self._region_transfer(loop, begin, end, queue_composition)
+                proof = graph.consumption(channel, old, target, engine, assumptions=assumptions)
+                if proof is None:
+                    return None
+                d.work.handback_cover_queries += 1
+                answer = d.arithmetic.queries.implies(proof.condition, assumptions)
+                if not answer.proved:
+                    return None
+                self.frontiers.add_acquisitions(
+                    origin, assumptions, proof, queue_composition=queue_composition
+                )
+        self.frontiers.add(
+            AcquiredConsumption(
+                origin,
+                target,
+                engine,
+                assumptions,
+                proof,
+                answer,
+                queue_composition=queue_composition,
+            )
+        )
         return self._handback(origin, target, proof, answer, assumptions)
 
     def reuse(self, channel, case, window, width, *, reentry, queue_composition=True):
@@ -287,8 +299,8 @@ class HandbackRule:
         result = []
         for phase, delta in window.reuse_phases(width):
             if reentry:
-                old_sources, old_waits = list(d._instances(channel, case, loop, 0))[-1]
-                next_sources, next_waits = next(d._instances(channel, case, loop, delta))
+                old_sources, old_waits = d._boundary(channel, case, loop, 0, last=True)
+                next_sources, next_waits = d._boundary(channel, case, loop, delta, last=False)
             else:
                 shifted = {ordinal: expression("add", ordinal, literal(delta))}
                 old_sources = tuple(d._instance(p, {}, case=case) for p in channel.sources)
@@ -318,8 +330,6 @@ class HandbackRule:
                         target,
                         assumptions,
                         loop=loop,
-                        delta=delta,
-                        reentry=reentry,
                         queue_composition=queue_composition,
                     )
                     if rule is None:

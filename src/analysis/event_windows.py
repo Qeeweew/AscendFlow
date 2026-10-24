@@ -15,7 +15,7 @@ from math import gcd, lcm
 from xdsl.ir import Operation
 
 from ..diagnostics import CompileError, ErrorKind, require
-from ..indexing import arguments, normalize_integral, normalize_or_identity
+from ..indexing import arguments, normalize_integral
 from ..scalar import INT64_MAX, Expr, Fact, expression, literal, substitute
 from ..symbols import Symbol, SymbolKind, is_coordinate
 from .periodic import evaluate_comparison_at, period_of
@@ -140,10 +140,14 @@ class EventWindow:
         """Exact H(value); callers establish nonnegative value and invariants."""
         return _prefix_count(value, self.period, self.residues)
 
-    def first_last(self) -> tuple[Expr, Expr]:
-        """Both values are members under ``nonempty``; otherwise evaluate neither."""
+    def last(self) -> Expr:
+        """Select LAST only under ``nonempty``; FIRST is already ``first``.
+
+        Building a FIRST port must not construct the count-1 or modular
+        backward selection used only at a nonempty invocation's exit.
+        """
         if self.single or self.upper == 0 or not self.residues:
-            return self.first, self.first
+            return self.first
         last = expression("sub", self.count, literal(1))
         if self.period != 1:
             offset = expression("rem", last, literal(self.period))
@@ -151,7 +155,7 @@ class EventWindow:
                 _difference_mod(offset, residue, self.period) for residue in self.residues
             )
             last = expression("sub", last, backward)
-        return self.first, last
+        return last
 
     def project_exists(self) -> WindowExistence:
         """Exact existential elimination of this clock, retaining all parameters."""
@@ -359,12 +363,10 @@ class _Builder:
                 inactive = True
                 break
         self.actual = tuple(dict.fromkeys(actual))
-        self.lower, self.count = (
-            literal(0),
-            literal(0)
-            if inactive
-            else normalize_or_identity(substitute(count, self.parameter_bindings), facts),
-        )
+        # Keep the actual count's structural period for the parent projection.
+        # Expanding rem into quotient arithmetic would discard that fact.
+        self.lower = literal(0)
+        self.count = literal(0) if inactive else substitute(count, self.parameter_bindings)
         self.period, self.residues, self.single = 1, (literal(0),), False
         self.residue_work = 0
         self.invariants, self.pending, self.established = [], [], []

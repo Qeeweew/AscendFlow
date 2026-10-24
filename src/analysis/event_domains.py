@@ -113,8 +113,8 @@ class EventDomains:
     endpoints: Mapping[tuple[BoundPlacement, EventCase], BoundPlacement]
     active: Mapping[tuple[LogicalNotification, EventCase], bool]
     _order_facts: dict[tuple, tuple[ActionGuard, ...]] = field(compare=False, repr=False)
-    _activations: dict[tuple, _InputActivation] = field(compare=False, repr=False)
-    _guard_inputs: dict[tuple, tuple] = field(compare=False, repr=False)
+    _activations: dict[BoundPlacement, _InputActivation] = field(compare=False, repr=False)
+    _guard_inputs: dict[BoundPlacement, tuple] = field(compare=False, repr=False)
     _input_ranges_cache: dict[BoundPlacement, tuple] = field(compare=False, repr=False)
     _boundary_instances: dict[tuple, tuple] = field(compare=False, repr=False)
 
@@ -406,13 +406,8 @@ class EventDomains:
             ),
         )
 
-    def _ambient(self, placement, *, extra_coordinate_guards=()):
-        return tuple(
-            test
-            for test, _ in self._guarded_inputs(
-                placement, extra_coordinate_guards=extra_coordinate_guards
-            )
-        )
+    def _ambient(self, placement):
+        return tuple(test for test, _ in self._guarded_inputs(placement))
 
     def _input_ranges(self, placement):
         """Load contracts known when this actual endpoint executes.
@@ -445,20 +440,16 @@ class EventDomains:
         self._input_ranges_cache[placement] = result
         return result
 
-    def _guarded_inputs(self, placement, *, extra_coordinate_guards=()):
+    def _guarded_inputs(self, placement):
         """Bind each real guard with only its dominating input-load prefix."""
-        key = placement, extra_coordinate_guards
-        if key in self._guard_inputs:
-            return self._guard_inputs[key]
+        if placement in self._guard_inputs:
+            return self._guard_inputs[placement]
         bindings = {
             self.control.loops[loop].ordinal: value for loop, value in placement.coordinates
         }
         bindings[self.control.sid] = literal(1 if placement.actor is Actor.AIV1 else 0)
         translate = substitution(bindings)
         coordinate_guards = dict(placement.coordinate_guards)
-        for loop, guard in extra_coordinate_guards:
-            prior = coordinate_guards.get(loop, ActionGuard())
-            coordinate_guards[loop] = ActionGuard(prior.comparisons + guard.comparisons)
         tests, contracts = {}, []
 
         def append(values):
@@ -528,14 +519,13 @@ class EventDomains:
                 append(bind(test, translate) for test in frame.comparisons)
         append(bind(test, translate) for test in placement.guard.comparisons)
         result = tuple(tests.items())
-        self._guard_inputs[key] = result
+        self._guard_inputs[placement] = result
         return result
 
-    def _activation(self, placement, *, extra_coordinate_guards=()):
-        key = placement, extra_coordinate_guards
-        if key in self._activations:
-            return self._activations[key].tests
-        contexts = self._guarded_inputs(placement, extra_coordinate_guards=extra_coordinate_guards)
+    def _activation(self, placement):
+        if placement in self._activations:
+            return self._activations[placement].tests
+        contexts = self._guarded_inputs(placement)
         original = tuple(test for test, _ in contexts)
 
         def input_expression(value):
@@ -565,21 +555,18 @@ class EventDomains:
             and self.arithmetic.prove(test, tuple(t for _, tests in contracts for t in tests))
         )
         tests = tuple(test for test in original if test not in discharged)
-        self._activations[key] = _InputActivation(original, contexts, discharged, tests)
+        self._activations[placement] = _InputActivation(original, contexts, discharged, tests)
         return tests
 
-    def _instance(self, placement, bindings, *, case, extra_coordinate_guards=()):
-        if (
-            not extra_coordinate_guards
-            and (known := self.endpoints.get((placement, case))) is not None
-        ):
+    def _instance(self, placement, bindings, *, case):
+        if (known := self.endpoints.get((placement, case))) is not None:
             return self._shift_instance(known, bindings) if bindings else known
         # Parameter specialization is separate from a coordinate translation:
         # a replacement coordinate must not itself be shifted a second time.
         translate = substitution(bindings)
         tests = list(case.condition.comparisons)
         inactive = False
-        for test in self._activation(placement, extra_coordinate_guards=extra_coordinate_guards):
+        for test in self._activation(placement):
             specialized = Comparison(
                 translate(case.specialize(test.lhs)),
                 test.predicate,
@@ -744,85 +731,77 @@ class EventDomains:
             return ()
         return self._order_conditions(consume, source)
 
-    def _first_last(self, window):
-        return window.first_last()
+    def _boundary(self, notification, case, loop, offset, *, last):
+        """Bind one actual invocation port in its established existence domain.
 
-    def _instances(self, notification, case, loop, offset, *, terminal=False):
-        # A parent consumes exact first/last ports of the child invocation.
-        # Window projection has already established their membership; do not
-        # solve the selected LAST range again from its expanded arithmetic.
+        Parent coordinates are bound before selecting descendants. The case
+        owns the exact membership and projection; a selected endpoint is not
+        a new range/definedness query or an asynchronous completion fact.
+        """
+        require(not case.empty, "an empty event case has no selected boundary")
+        key = notification, case, loop, offset, last
+        if key in self._boundary_instances:
+            self.work.boundary_instance_reuses += 1
+            return self._boundary_instances[key]
         ancestors = () if loop is None else _loop_ancestors(self.control, loop)
         kept = tuple(w for w in case.windows if w.loop is loop or w.loop in ancestors)
-        for last in (False, True):
-            # A family port is an owned fact for these exact coordinates and
-            # active case. Keep FIRST/LAST independent and construct only the
-            # requested port: asking for FIRST must never force LAST on an
-            # empty or otherwise unavailable child.
-            key = notification, case, loop, offset, last
-            if key in self._boundary_instances:
-                self.work.boundary_instance_reuses += 1
-                yield self._boundary_instances[key]
-                if terminal:
-                    break
+        bindings = {}
+        if loop is not None:
+            ordinal = self.control.loops[loop].ordinal
+            bindings[ordinal] = expression("add", ordinal, literal(offset))
+        for child in case.windows:
+            if child in kept:
                 continue
-            bindings = {}
-            if loop is not None:
-                ordinal = self.control.loops[loop].ordinal
-                bindings[ordinal] = expression("add", ordinal, literal(offset))
-            prerequisites = []
-            for child in case.windows:
-                if child in kept:
-                    continue
-                # These guards are canonical. _instance translates them once,
-                # before evaluating the selected coordinate's lexical tests.
-                prerequisites.append((child.loop, child.nonempty))
-                first, end = self._first_last(child)
-                bindings[self.control.loops[child.loop].ordinal] = substitute(
-                    end if last else first, bindings
-                )
+            # The case's exact projection owns this selection's existence.
+            # Each descendant sees the already selected parent coordinates.
+            selected = child.last() if last else child.first
+            bindings[self.control.loops[child.loop].ordinal] = substitute(selected, bindings)
 
-            if kept:
-                membership = kept[-1].membership.comparisons
-            elif case.windows:
-                membership = case.windows[0].project_exists().guard.comparisons
-            else:
-                membership = self.tests[notification]
-            guard = ActionGuard(
-                tuple(
-                    dict.fromkeys(
-                        case.condition.comparisons
-                        + tuple(
-                            Comparison(
-                                substitute(case.specialize(test.lhs), bindings),
-                                test.predicate,
-                                substitute(case.specialize(test.rhs), bindings),
-                            )
-                            for test in membership
+        if kept:
+            membership = kept[-1].membership.comparisons
+        elif case.windows:
+            membership = case.windows[0].project_exists().guard.comparisons
+        else:
+            membership = self.tests[notification]
+        guard = ActionGuard(
+            tuple(
+                dict.fromkeys(
+                    case.condition.comparisons
+                    + tuple(
+                        Comparison(
+                            substitute(case.specialize(test.lhs), bindings),
+                            test.predicate,
+                            substitute(case.specialize(test.rhs), bindings),
                         )
+                        for test in membership
                     )
                 )
             )
+        )
 
-            def instance(
-                placement, bindings=bindings, prerequisites=tuple(prerequisites), guard=guard
-            ):
-                point = self._instance(
-                    placement,
-                    bindings,
-                    case=case,
-                    extra_coordinate_guards=prerequisites,
-                )
-                return replace(point, guard=guard)
+        translate = substitution(bindings)
 
-            result = (
-                tuple(instance(p) for p in notification.sources),
-                tuple(instance(p) for p in notification.consumers),
+        def instance(placement):
+            # Membership was established from the original activation once.
+            # Rebuilding that activation here only to overwrite its guard
+            # would discard the same projected fact at every selected cut.
+            return replace(
+                placement,
+                coordinates=tuple(
+                    (loop, translate(case.specialize(value)))
+                    for loop, value in placement.coordinates
+                ),
+                guard=guard,
+                substitutions=(),
             )
-            self._boundary_instances[key] = result
-            self.work.boundary_instances += 1
-            yield result
-            if terminal:
-                break
+
+        result = (
+            tuple(instance(p) for p in notification.sources),
+            tuple(instance(p) for p in notification.consumers),
+        )
+        self._boundary_instances[key] = result
+        self.work.boundary_instances += 1
+        return result
 
     def _possible(self, bounds):
         # _validate admitted each original endpoint's ordered evaluation before

@@ -38,7 +38,7 @@ def scratch(order=("b_fill", "b_read", "a_fill", "a_read")):
 
 def test_complete_private_lifetimes_follow_dispatch_without_rebinding_reads():
     result = synchronize_structure(scratch())
-    assert len(result.dependencies.order.packet_partitions) == 1
+    assert len(result.dependencies.packet_partitions) == 1
     a, ar, b, br = (t.operation for t in result.admission.memory.templates)
     raw = [n for n in result.dependencies.needs if n.kind is HazardKind.RAW]
     assert {(n.source.operation, n.consumer.operation) for n in raw} == {(a, ar), (b, br)}
@@ -70,7 +70,7 @@ def test_shifted_private_packets_keep_values_through_fill_and_drain():
             disjoint_external=True,
         )
     )
-    assert len(result.dependencies.order.packet_partitions) == 1
+    assert len(result.dependencies.packet_partitions) == 1
     a, ar, b, br = (t.operation for t in result.executable.natives)
     for n in range(5):
         execution = check_compiled_events(result, {"n": n})
@@ -156,8 +156,8 @@ def test_deleting_actual_store_release_leaves_an_unordered_war():
 def test_shared_l0c_uses_dispatch_neighbors_and_keeps_accumulation_raw():
     result = selected(shared_l0c_qk_pv)
     dependencies = result.dependencies
-    assert len(dependencies.order.packet_partitions) == 1
-    partition = dependencies.order.packet_partitions[0]
+    assert len(dependencies.packet_partitions) == 1
+    partition = dependencies.packet_partitions[0]
     qk, pv = partition.packets
     qk_write, pv_read = (
         qk.summary.first_writes[0].operation,

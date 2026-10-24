@@ -727,10 +727,13 @@ def lower_native_structure(source) -> NativeStructure:
     from ..frontend import PrimFunction
 
     if isinstance(source, PrimFunction):
-        source = source.to_ir()
-    require(isinstance(source, ModuleOp), "native lowering requires typed source IR")
-    source = source.clone()
-    source.verify()
+        # The known parser returns fresh, structurally checked IR directly
+        # into this compilation. It has no external owner to preserve.
+        source = PrimFunction.to_ir(source)
+    else:
+        require(isinstance(source, ModuleOp), "native lowering requires typed source IR")
+        source = source.clone()
+        source.verify()
     program = source.body.block.first_op
     require(
         isinstance(program, ProgramOp) and len(source.body.block.ops) == 1,

@@ -25,7 +25,7 @@ def forbid_analysis(monkeypatch):
         ("ascendflow.passes.lower_native", ("lower_native_structure",)),
         ("ascendflow.analysis.structured_memory", ("collect_native_memory",)),
         ("ascendflow.analysis.structured_bounds", ("admit_memory_bounds",)),
-        ("ascendflow.analysis.structured_dependencies", ("build_structured_dependencies",)),
+        ("ascendflow.analysis.access_order", ("build_access_order",)),
     )
     modules = [(import_module(name), attributes) for name, attributes in targets]
     for module, attributes in modules:

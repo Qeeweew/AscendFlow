@@ -6,10 +6,9 @@ import pytest
 
 from ascendflow import language as N
 from ascendflow.analysis.access_frontier import AccessEndpoint
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.event_contracts import ResourceWork
 from ascendflow.analysis.event_domains import EventDomains
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
-from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_protocols import BoundPlacement, SynchronizationSelection
 from ascendflow.analysis.structured_regions import AccessOccurrence, LoopBinding
@@ -33,10 +32,8 @@ def input_scopes(First:N.Tensor((n,),N.i64),Second:N.Tensor((n,8),N.i64),n:N.i64
                 N.fill(x,0.0)
 """)
     memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = build_structured_dependencies(memory)
-    selection = SynchronizationSelection(
-        replace(dependencies, required=()), bind_structured_dispatch(memory), (), ()
-    )
+    dependencies = build_access_order(memory)
+    selection = SynchronizationSelection(replace(dependencies, required=()), (), ())
     domains = EventDomains(selection, ResourceWork())
     loads = [t for t in memory.templates if t.spec.native == "index_load"]
     fill = next(t for t in memory.templates if t.spec.native == "fill")
@@ -99,10 +96,8 @@ def participant_inputs(First:N.Tensor((2,),N.i64)):
             N.fill(x,0.0)
 """)
     memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = build_structured_dependencies(memory)
-    selection = SynchronizationSelection(
-        replace(dependencies, required=()), bind_structured_dispatch(memory), (), ()
-    )
+    dependencies = build_access_order(memory)
+    selection = SynchronizationSelection(replace(dependencies, required=()), (), ())
     domains = EventDomains(selection, ResourceWork())
     load = next(t for t in memory.templates if t.spec.native == "index_load")
     fill = next(t for t in memory.templates if t.spec.native == "fill")

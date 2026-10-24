@@ -7,9 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from ascendflow.analysis.event_coloring import color_event_resources, counter_group_usage
-from ascendflow.analysis.event_contracts import EventDemand, EventIdPools
-from ascendflow.analysis.event_sharing import CounterReuse, share_counter_time
-from ascendflow.analysis.notification_lifetimes import HandbackRule
+from ascendflow.analysis.event_contracts import CounterReuseGroup, EventDemand, EventIdPools
+from ascendflow.analysis.event_frontier_contracts import CreditSeparation, FrozenEventRelations
+from ascendflow.analysis.event_sharing import share_counter_time
+from ascendflow.analysis.resource_report import event_resource_report
 from ascendflow.analysis.structured_protocols import NotificationKind
 from ascendflow.passes.structured_sync import synchronize_structure
 from ascendflow.target.ascend910b import Actor, Engine
@@ -34,18 +35,37 @@ def test_complete_epochs_keep_empty_calls_reentry_and_two_vector_receivers(plan)
         assert program.resources.work.counter_time_pairs == 0
     else:
         assert program.resources.counter_reuse_groups
-        assert any(isinstance(w, CounterReuse) for w in program.resources.sharing)
+        assert any(isinstance(w, CounterReuseGroup) for w in program.resources.sharing)
     for group in program.resources.counter_reuse_groups:
         assert 0 <= group.event < 16
         assert 0 < group.backlog <= 15
-        for witness in group.witnesses:
-            if witness.handbacks:
-                assert {h.consume.actor for h in witness.handbacks} == {
-                    p.actor for p in witness.earlier.consumers
-                }
-                assert {h.next_set.actor for h in witness.handbacks} == {
-                    p.actor for p in witness.later.sources
-                }
+        for rectangle in group.rectangles:
+            for interface in rectangle.certificate.interfaces:
+                if interface.original is not None:
+                    obligations = ((w.earlier, w.later, w.handbacks) for w in interface.original)
+                elif interface.handbacks:
+                    earlier, later = (
+                        (interface.left.tail, interface.right.head)
+                        if interface.forward
+                        else (interface.right.tail, interface.left.head)
+                    )
+                    obligations = ((earlier, later, interface.handbacks),)
+                else:
+                    obligations = ()
+                for earlier, later, handbacks in obligations:
+                    if handbacks:
+                        assert {h.consume.actor for h in handbacks} == {
+                            p.actor for p in earlier.consumers
+                        }
+                        assert {h.next_set.actor for h in handbacks} == {
+                            p.actor for p in later.sources
+                        }
+    report = event_resource_report(program.resources)
+    assert bool(report["counter_time_reuse"]) == (phases == 17)
+    for group in report["counter_time_reuse"]:
+        assert group["rectangles"]
+        for rectangle in group["rectangles"]:
+            assert report["event_certificates"][rectangle["certificate"]]["interfaces"]
     for count in (0, 1, 2, 3):
         execution = check_compiled_events(program, {"n": count}, invocations=2, max_commands=20000)
         assert count == 0 or execution.bytes_read and execution.bytes_written
@@ -74,7 +94,7 @@ def test_a_required_return_is_needed_even_when_publisher_and_receiver_words_agre
         left, right = forward_messages(program)
         witness = share_counter_time(
             program.domains,
-            HandbackRule(program.domains, boundaries=program.boundaries),
+            program.handbacks,
             left,
             right,
         )
@@ -85,7 +105,7 @@ def test_a_required_return_is_needed_even_when_publisher_and_receiver_words_agre
 
 def test_temporal_complete_credits_use_maximum_instead_of_adding_full_counters():
     demands = tuple(EventDemand((), 1, (), backlog=15) for _ in range(17))
-    reuses = {pair: () for pair in combinations(range(17), 2)}
+    reuses = numeric_reuses(17, combinations(range(17), 2))
     problem = SimpleNamespace(
         demands=demands,
         reservations=(),
@@ -104,16 +124,29 @@ def test_temporal_complete_credits_use_maximum_instead_of_adding_full_counters()
 
 def test_counter_set_requires_one_complete_temporal_or_fifo_premise():
     demands = tuple(EventDemand((), 1, (), backlog=5) for _ in range(3))
-    partial = {(0, 1): (), (1, 2): ()}
+    partial = numeric_reuses(3, ((0, 1), (1, 2)))
     assert counter_group_usage(demands, {0, 1, 2}, partial, (frozenset({0, 2}),)) is None
     assert counter_group_usage(demands, {0, 1, 2}, partial, (frozenset({0, 1, 2}),)) == ("fifo", 15)
 
 
 def test_frozen_fifo_children_compose_with_a_maximum_only_after_time_proof():
     demands = tuple(EventDemand((), 1, (), backlog=7) for _ in range(4))
-    assert counter_group_usage(demands, {0, 1, 2, 3}, {}, ()) is None
+    empty = FrozenEventRelations(())
+    assert counter_group_usage(demands, {0, 1, 2, 3}, empty, ()) is None
     groups = ((frozenset({0, 1}), frozenset({2, 3})),)
-    assert counter_group_usage(demands, {0, 1, 2, 3}, {}, (), time_packs=groups) == (
+    assert counter_group_usage(demands, {0, 1, 2, 3}, empty, (), time_packs=groups) == (
         "time_fifo",
         14,
+    )
+
+
+def numeric_reuses(size, pairs):
+    """Explicit numeric constraints only; these do not grant a DSL handback."""
+    masks = [0] * size
+    for a, b in pairs:
+        masks[a] |= 1 << b
+        masks[b] |= 1 << a
+    return FrozenEventRelations(
+        ((mask, CreditSeparation((), 1 << r, mask)),) if mask else ()
+        for r, mask in enumerate(masks)
     )

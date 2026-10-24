@@ -41,6 +41,14 @@ CopyGroup 的 typed region 对应 physical ReadyGroupOp 的实际 native 成员�
 独立有限模型从 source 对应记录额外的共同 ready 义务，但只允许实际 Set/Wait
 建立完成顺序；未读取的同组成员也不能提前被宣布完成。
 
+原始义务的真实 source/consumer 和共同 ready 前缀先于通知机制选择建立。
+coverage 引用 selection 拥有的同一份 binding，完成消除和动作合并保持其身份。
+选定通知的 anchors 同样引用这些原始 binding，必须属于本通知覆盖的需求；
+新增 coverage 不增加或替换存储归属，复制一份值相等的 binding 不能冒充原始事实。
+闭合私有轮次在输入事实建立时选定真实最后 reader；后续 ownership 直接消费
+原始 RAW 端点，不重新绑定或创建临时通知。CopyGroup 的 ready 前缀不替换
+覆写前的真实 writer 位置，全部 reader/effects 和退休义务继续保留。
+
 目标原生指令的静态描述由 `NativeSpec` 统一保存，逻辑 memory template 和
 终端 native 共享同一份不可变值；实际地址和循环 read condition 各自绑定真实
 SSA/代次。opcode、参数或地址 operand 数量改变必须更新描述，不能沿用旧
@@ -125,21 +133,51 @@ capture 快照及匹配 acquire 的 DAG，不能把数据 ready 替代旧 Wait �
 证明及该输入作用域拥有的数学答案。二维位置索引只从同一阻塞路由和实际调用
 取前沿；在实际 Wait 后取得的事实不能借相同锚点回填更早 capture。改变前提的
 查询仍证明全部激活及两个 cut 的顺序，不复用其他作用域的 proved 标记。
+origin 的阻塞路由区分 controller 与实际 pipe；cross Wait 的名义 destination
+engine 不是它消费的 pipe 前缀。后来的 controller Wait 不能代表更早的 local
+pipe Wait 已消费，反方向仍须保留实际派发顺序及完整激活。
+成功证明中的每个真实 acquire 导出自己的消费子证明，不把最终结论倒灌到更早
+动作。同一 acquire 的条件子证明先合并，再检查完整前提是否覆盖；单侧分支不
+产生无条件事实。controller acquire 的事实可由该 actor 后续实际派发取得，pipe
+acquire 的事实只沿自己的 pipe 延伸。可选队列组合的证明与仅允许 native 边界的
+构造前提分开保存，不能靠查询次序改变正常生命周期的选择政策。
 条件证明可以共享；未覆盖开放边界时继续组合该图，缓存阴性结果不作不可达证明。
 报告按 DAG 引用保留证据，不重新展开全部 relay 历史。
 
-同一 transfer 图的数学剪枝上下文按完整有序前提共享。上下文保留标准化
-差式及常量偏移的上下界，处理严格比较和相反方向，只用于 guard 真值和 may
-可达性的剪枝；它不产生完成/消费事实。实际覆盖仍保留原条件，并由同一
-输入 owner 的数学服务验证完整蕴含。图、输入事实或前提改变时不能复用该表，
-原式定义性和机器整数范围也不由这些数学差式授权。
+生命周期生成与资源规划共享同一 retained program 的消费分析，不只复制边界
+cases 后重建位置、转移图和前沿。完成覆盖消除的临时图在产生独立证明后释放；
+它不交给消费分析沿用，因为删除通知改变了支持动作的前提。
 
-本地事件共享使用分层的真实 publication/consumption 前沿。包围依据完整激活和
+完成/消费查询只证明完整原始前提下的目标 cut，不构造所有条件组合下的可达
+函数。每个有限转移顶点有独立数学命题；真实 capture 为来源提供 seed，既有
+capture/acquire 关系提供带原整数条件的 Horn 规则。固定输入时，最小可达集是
+这些规则的最小模型；没有 seed 的环允许全 false，不能自己建立事实。数学命题
+不进入运行时 IR、guard 或事件 ID。capture 的位置 word 只分段来源顺序，不提供许可。
+
+每个顶点的基础规则建立并注册一次，新查询 cut 只追加自己的规则。目标查询
+使用隔离的规则系统，以原始前提、来源 seed 和实际保留规则标签绑定临时作用域；
+查询结束撤销这些绑定。未启用规则不能提供事实，失败查询不导出或全局保存整图
+蕴含式。该系统保留同一整数服务的不可变输入，不污染普通数学查询。成功结果保存 UNSAT core 所选的实际 seed/transfer 规则、origin、
+目标命题、前提及精确 owned implication。规则叶不是已取得事实；每个实际
+acquire 必须在同一上下文独立证明，才可导出它自己的消费 cut。互斥分支合成的
+出口结论不能倒灌成任一分支内部的无条件取得。支持动作删除仍使相应因果证据失效。
+
+转移语法按实际顶点/边增长，不保存 SCC 祖先矩阵、BDD 或路径展开。每个新
+origin 的规则上下文仍有与有限关系大小相关的成本，SMT 查询也可能 unknown；
+此时不提供覆盖或复用许可。该有限规则合同不表示 parent 已能只消费所有 child
+的开放出口；现有参数窗口及 FIRST/LAST 义务仍独立保持。
+
+本地事件与 counter 时间复用使用分层的真实 publication/consumption 前沿。包围依据完整激活和
 坐标合同下的无条件发射顺序，实际消费仍由 handback 建立，包括各层重入。
+每个实际 publisher/receiver 的包围必须同时成立；同锚点未排序或任一参与者反向
+均不能合并。前沿以子树和成员数保持原始成员，不复制完整历史集合。
 冻结的完整 credit 分离矩形只提供有限编号许可，不以相邻 pair 传递代替 wrap
 义务。未变输入 owner 上的缩环选项可保留端点事实；成员、guard、坐标或输入
 事实变化时重建对应接口。详见 [事件资源](event-resources.md)。
-最终 local 同号组检查逐行消费冻结的 bitmask 覆盖，保留选中的证书子矩形；
+最终时间复用同号组检查逐行消费冻结的 bitmask 覆盖；FIFO-child 组合检查每行
+对所有其他 child 的完整覆盖，child 内仍消费 whole word/quorum/backlog 证书。
+counter 的 peer 数字投影保留原 credit 行，只枚举缺失许可对应的真实冲突。
+保留选中的证书子矩形；
 报告共享端点树和证书，不把矩形重新物化为全部历史消息对。
 
 ## 2. 保证的目标归属与当前缺口
@@ -274,6 +312,10 @@ SMT 查询。每个 query 使用独立 assertion scope，不将上一查询前�
 编译器新构造的无符号floor/ceil/rem必须保持有序guard的定义性：例如先证明选择非空，再求LAST；不能先代数消去或合取后续条件，掩盖此前非法求值。前提变化时重新检查受影响原式；同一有序合取内，后续前缀只追加已成立条件，先前已检查的原始 DAG 节点可保持定义性。该复用不跨 guard 调用，不借后续条件证明更早表达式。运行期guard的短路次序不由数学集合排序决定。
 
 输入/输出IR由本次编译拥有，受控变换保持的事实可继续使用；外部或被修改的物理IR不能借旧结果。当前公共compile拒绝外部物理快照，debug_verify也只有xDSL结构检查，不能宣传为独立同步证明。
+
+DSL 定义通过已知 parser 新建并检查的 source IR 直接交给本次 lowering 拥有，
+不再重复复制和结构验证。外部 source ModuleOp 仍复制并验证，不读取可变 verified
+标记；两者随后进入同一 native、内存、值和同步链。
 
 逻辑pipeline只保存次数、实际stage偏移和发射政策，每个stage只有一个ordinal。
 同步确定后，终端lowering将时钟和存在条件变成真实arith/scf，并保持两个AIV共享body。

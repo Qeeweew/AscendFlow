@@ -19,13 +19,13 @@ class CompletionObligation:
 
 @dataclass(frozen=True, slots=True)
 class CompletionCoverage:
-    """Original ownership and the independent retained-action derivations.
+    """Original demand endpoints and their retained-action derivations.
 
-    The removed notification is a description of the original obligation,
-    not a leaf of any proof. Its origins are never transferred to a relay.
+    Coverage belongs to each RequirementBinding, independently of the
+    candidate notification that happened to group these demands. Only the
+    actual supporting actions remain in the proof.
     """
 
-    notification: object
     dispatch: object
     cases: tuple
     obligations: tuple[CompletionObligation, ...]
@@ -87,7 +87,7 @@ def reduce_completion_prefixes(domains):
         for episode in episodes:
             pairs = {}
             for binding in original:
-                source = domains._instance(binding.source, {}, case=episode.case)
+                source = domains._instance(binding.completion_source, {}, case=episode.case)
                 consumer = domains._instance(binding.consumer, {}, case=episode.case)
                 pairs.setdefault((source, consumer), []).append(binding)
             for (source, consumer), owners in pairs.items():
@@ -124,7 +124,6 @@ def reduce_completion_prefixes(domains):
             break
         else:
             coverage = CompletionCoverage(
-                notification,
                 domains.dispatch,
                 tuple(item.case for item in episodes),
                 tuple(obligations),
@@ -144,7 +143,7 @@ def reduce_completion_prefixes(domains):
                 pending.extend(proof.inputs)
             removed[notification] = coverage
     if not removed:
-        return domains, graph
+        return domains
     selection = domains.selection
     selection = replace(
         selection,
@@ -162,4 +161,4 @@ def reduce_completion_prefixes(domains):
         ),
     )
     domains.work.completion_eliminated += len(removed)
-    return domains.retain(selection), graph
+    return domains.retain(selection)

@@ -10,11 +10,10 @@ from dataclasses import replace
 import pytest
 
 from ascendflow import language as N
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.event_contracts import ResourceWork
 from ascendflow.analysis.event_domains import EventCase, EventDomains
 from ascendflow.analysis.queue_order import QueuePoint, _OrderConstruction
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
-from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_protocols import SynchronizationSelection
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison
@@ -170,8 +169,8 @@ def sequential_domains(count):
         "def sequential():\n    with N.Kernel():\n        x=N.alloc_ub((64,))\n" + body
     )
     memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = replace(build_structured_dependencies(memory), required=())
-    selection = SynchronizationSelection(dependencies, bind_structured_dispatch(memory), (), ())
+    dependencies = replace(build_access_order(memory), required=())
+    selection = SynchronizationSelection(dependencies, (), ())
     notifications = []
     for i in range(0, len(memory.templates), 2):
         source, wait = memory.templates[i : i + 2]
@@ -229,8 +228,8 @@ def boundaries(I:N.Tensor((64,),N.f32),n:N.i64):
                 N.load_scalar(x[:1])
 """)
     memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = replace(build_structured_dependencies(memory), required=())
-    selection = SynchronizationSelection(dependencies, bind_structured_dispatch(memory), (), ())
+    dependencies = replace(build_access_order(memory), required=())
+    selection = SynchronizationSelection(dependencies, (), ())
     domains = EventDomains(selection, ResourceWork())
     (loop,) = domains.control.loops.values()
     case, points = EventCase(ActionGuard(), (), (), ()), []

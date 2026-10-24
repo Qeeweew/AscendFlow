@@ -12,11 +12,11 @@ from ascendflow.analysis.event_frontier_contracts import (
     FrozenEventRelations,
     LocalEventReuse,
 )
-from ascendflow.analysis.event_frontiers import LocalEventFrontiers
+from ascendflow.analysis.event_frontiers import EventFrontiers
 from ascendflow.analysis.notification_lifetimes import HandbackRule
 from ascendflow.passes.structured_sync import synchronize_structure
 from tests.models.structured_events import check_compiled_events
-from tests.support.structured import prepared, selected
+from tests.support.structured import frontier_members, prepared, selected
 from tests.sync.test_stream_event_sharing import conditional_loads, disjoint_loop_episodes
 
 
@@ -48,8 +48,8 @@ def test_real_sequential_frontiers_remove_quadratic_sharing_queries():
         from ascendflow.analysis.resource_report import event_resource_report
 
         report = event_resource_report(plan.resources)
-        assert len(report["local_event_frontiers"]) < 4 * count
-        assert len(report["local_event_certificates"]) < 2 * count
+        assert len(report["event_frontiers"]) < 4 * count
+        assert len(report["event_certificates"]) < 2 * count
         measurements.append(work.frontier_queries)
         if count == 16:
             # Independent event consumption, byte ownership and repeated-body
@@ -63,7 +63,7 @@ def test_distinct_waits_at_one_anchor_do_not_supply_an_enclosure_order():
     domains = prepared(selected(sequential(2)))
     item = domains.notifications[0]
     duplicate = replace(item, name="same_native_anchor")
-    frontiers = LocalEventFrontiers(domains, HandbackRule(domains), (), None)
+    frontiers = EventFrontiers(domains, HandbackRule(domains), (), None)
     # This isolates enclosure, without claiming the duplicate has a paired
     # protocol or owns another physical credit. Real dispatch positions alone
     # cannot order two notification instructions inserted at the same anchor.
@@ -103,10 +103,10 @@ def test_frontiers_retain_every_exhaustive_complete_credit_permission(monkeypatc
                 assert isinstance(certificate, CreditSeparation)
                 assert all(
                     any(
-                        x in p.left.members
-                        and y in p.right.members
-                        or y in p.left.members
-                        and x in p.right.members
+                        x in frontier_members(p.left)
+                        and y in frontier_members(p.right)
+                        or y in frontier_members(p.left)
+                        and x in frontier_members(p.right)
                         for p in certificate.interfaces
                     )
                     for x in left.members
@@ -144,7 +144,7 @@ def test_group_masks_reject_one_missing_credit_permission(monkeypatch):
             rows[a] = tuple(
                 (mask & ~(1 << b), proof) for mask, proof in rows[a] if mask & ~(1 << b)
             )
-            incomplete = FrozenEventRelations(problem.relations._counters, rows)
+            incomplete = FrozenEventRelations(rows)
             assert incomplete.cover_group(members) is None
             observed.append(True)
         return allocation

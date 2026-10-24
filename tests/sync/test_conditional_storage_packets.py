@@ -10,7 +10,7 @@ import pytest
 
 from ascendflow import language as N
 from ascendflow.analysis.access_frontier import QueueEndpoint
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.passes.generate_notifications import _complete_bindings
 from ascendflow.passes.lower_native import lower_native_structure
@@ -57,7 +57,7 @@ def compiled_calls(request):
 
 @pytest.mark.parametrize("n", (0, 1, 2, 3, 4, 7, 10))
 def test_closed_calls_keep_real_prefixes_across_empty_and_short_children(compiled_calls, n):
-    packets = compiled_calls.dependencies.order.packet_partitions
+    packets = compiled_calls.dependencies.packet_partitions
     assert any(packet.closed_invocations for partition in packets for packet in partition.packets)
     assert len(compiled_calls.generation.credits) == 2
     check_compiled_events(compiled_calls, {"n": n}, invocations=2)
@@ -69,11 +69,11 @@ def test_scratch_value_escaping_a_skipped_child_prevents_packet_reordering():
     )
     source += "\n            N.copy(scratch[1,:],Tail[:])\n"
     memory = collect_native_memory(lower_native_structure(N.from_source(source)).module)
-    dependencies = build_structured_dependencies(memory)
+    dependencies = build_access_order(memory)
     # The last observable value depends on which optional invocation ran.
     # Its cell must retain source-order requirements, even though every
     # nonempty child itself starts with a complete write.
-    partitions = dependencies.order.packet_partitions
+    partitions = dependencies.packet_partitions
     assert not any(partition.cell.start == 256 for partition in partitions)
 
 
@@ -83,19 +83,19 @@ def test_closed_prefixes_do_not_license_one_binary_id_for_a_whole_cell():
     # the consumption of an earlier flag. Remove only this lifetime protection
     # by coalescing the actual ready instructions for one physical cell.
     memory = native_memory(N.from_source(SCRATCH_CALLS, disjoint_external=True))
-    dependencies = build_structured_dependencies(memory)
+    dependencies = build_access_order(memory)
     # Exercise the general forwarding-prefix rule without taking the new
     # optional closed-round precision. All original requirements remain.
-    dependencies = replace(dependencies, order=replace(dependencies.order, cell_lifetimes=()))
-    selection = bind_notifications(dependencies, dependencies.dispatch)
+    dependencies = replace(dependencies, cell_lifetimes=())
+    selection = bind_notifications(dependencies)
     resources = allocated(_complete_bindings(selection))
     groups = {}
     for assignment in resources.assignments:
         item = assignment.notification
-        if not item.origins:
+        if not item.anchors:
             continue
         key = (
-            frozenset(origin.ownership_key for origin in item.origins),
+            frozenset(b.requirement.ownership_key for b in item.anchors),
             item.source_engine,
             item.destination_engine,
         )

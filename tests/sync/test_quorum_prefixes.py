@@ -5,8 +5,7 @@ from xdsl.dialects.builtin import ArrayAttr, StringAttr
 
 from ascendflow import compile
 from ascendflow import language as N
-from ascendflow.analysis.event_contracts import SUPPORTED_CROSS_IDS
-from ascendflow.analysis.event_sharing import CounterSharing
+from ascendflow.analysis.event_contracts import SUPPORTED_CROSS_IDS, CounterFIFOGroup
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.dialects.io import parse
 from ascendflow.dialects.structured import NotificationOp
@@ -62,7 +61,8 @@ def messages(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
     packed = [
         witness
         for witness in plan.resources.sharing
-        if isinstance(witness, CounterSharing) and witness.earlier.sources[0].actor is Actor.AIC
+        if isinstance(witness, CounterFIFOGroup)
+        and witness.certificate.messages[0][2].sources[0].actor is Actor.AIC
     ]
     # Reversing the imports needs the last publication first. Its existing
     # prefix acquire covers the remaining imports before resource allocation.
@@ -70,10 +70,12 @@ def messages(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
     if reverse:
         # Reversed messages may still pack mutually exclusive ring residues
         # at identical sites; they cannot share distinct reversed messages.
-        assert all(a.operation is b.operation for w in packed for a, b in w.ordered_points)
-    assert all(
-        len(witness.earlier.sources) == len(witness.later.sources) == 1 for witness in packed
-    )
+        assert all(
+            len({n.sources[0].operation for r, _, n in w.certificate.messages if r in w.resources})
+            == 1
+            for w in packed
+        )
+    assert all(len(n.sources) == 1 for w in packed for _, _, n in w.certificate.messages)
     assert 0 < plan.resources.work.maximum_counter_backlog <= 15
     if messages == 16:
         # Keep the capacity counterexample independently of the allocator's
@@ -164,7 +166,8 @@ def messages(A:N.Tensor((n,{messages},32,16),N.f16),B:N.Tensor((16,16),N.f16),
     packed = [
         witness
         for witness in plan.resources.sharing
-        if isinstance(witness, CounterSharing) and len(witness.earlier.sources) == 2
+        if isinstance(witness, CounterFIFOGroup)
+        and len(witness.certificate.messages[0][2].sources) == 2
     ]
     # Five ring-buffered panels pressure the combined namespace, but either
     # direction's complete words may supply the necessary packing. Seventeen
@@ -173,19 +176,25 @@ def messages(A:N.Tensor((n,{messages},32,16),N.f16),B:N.Tensor((16,16),N.f16),
         assert packed
     if messages <= 4:
         assert not packed
-    for _, certificate, members in plan.resources.counter_groups:
-        assert set(members) <= set(certificate.resources)
+    for group in plan.resources.counter_groups:
+        certificate = group.certificate
+        assert set(group.resources) <= set(certificate.resources)
         assert all(word == certificate.words[0][2] for _, _, word in certificate.words)
         assert all(bound <= 15 for _, bound in certificate.contributions)
     if reverse:
-        assert all(a.operation is b.operation for w in packed for a, b in w.ordered_points)
+        assert all(
+            len({n.sources[0].operation for r, _, n in w.certificate.messages if r in w.resources})
+            == 1
+            for w in packed
+        )
     assignments = {
         assignment.notification: assignment.ids for assignment in plan.resources.assignments
     }
     for witness in packed:
-        assert assignments[witness.earlier] == assignments[witness.later]
-        assert {point.actor for point in witness.earlier.sources} == {Actor.AIV0, Actor.AIV1}
-        assert len(witness.later.sources) == 2
+        for resource, _, notification in witness.certificate.messages:
+            if resource in witness.resources:
+                assert assignments[notification] == (witness.event,)
+                assert {point.actor for point in notification.sources} == {Actor.AIV0, Actor.AIV1}
     assert 0 < plan.resources.work.maximum_counter_backlog <= 15
     for count in (0, 1, 3):
         checked = check_compiled_events(plan, {"n": count})

@@ -66,11 +66,11 @@ def test_uncertain_waw_without_a_reader_still_needs_completion():
 
 
 def test_alias_regions_are_ordering_facts_not_exact_kills_or_private_packet_credits():
-    from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+    from ascendflow.analysis.access_order import build_access_order
     from ascendflow.passes.lower_native import lower_native_structure
 
     memory = collect_native_memory(lower_native_structure(N.from_source(ALIASES)).module)
-    dependencies = build_structured_dependencies(memory)
+    dependencies = build_access_order(memory)
     assert any(
         isinstance(n.cell, AliasRegion) and n.kind is HazardKind.RAW for n in dependencies.required
     )
@@ -78,7 +78,7 @@ def test_alias_regions_are_ordering_facts_not_exact_kills_or_private_packet_cred
     assert any(
         isinstance(n.cell, AliasRegion) and n.kind is HazardKind.WAR for n in dependencies.required
     )
-    assert all(not isinstance(p.cell, AliasRegion) for p in dependencies.order.packet_partitions)
+    assert all(not isinstance(p.cell, AliasRegion) for p in dependencies.packet_partitions)
 
 
 def test_shifted_ring_reads_preserve_the_previous_iteration_value():

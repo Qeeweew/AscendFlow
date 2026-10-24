@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -18,8 +17,8 @@ if TYPE_CHECKING:
     from .cell_ownership import PersistentCellCredit
     from .event_counter_groups import CounterGroup, CounterTimeGroups
     from .event_domains import EventCase
-    from .event_frontier_contracts import FrozenEventRelations, LocalEventReuse
-    from .event_sharing import CounterReuse, CounterSharing, EventSharing
+    from .event_frontier_contracts import FrozenEventRelations, LocalEventReuse, SelectedSeparation
+    from .event_sharing import EventSharing
     from .event_windows import EventWindow
     from .notification_lifetimes import Reuse
     from .queue_order import QueueOrder
@@ -162,7 +161,7 @@ class EventResourceProblem:
 
     Construct with plan_event_resources. Relations cover all members of each
     selected occupation, retaining its logical credit. Missing/None gives no permission.
-    CounterSharing pairs still require a whole CounterGroup for FIFO packing.
+    Counter FIFO packing retains a whole CounterGroup, including tied-anchor exclusion.
     Work is diagnostic accounting only and never an allocation premise.
     """
 
@@ -176,7 +175,7 @@ class EventResourceProblem:
     peers: tuple[tuple[int, int], ...]
     counter_groups: tuple[CounterGroup, ...]
     counter_compositions: tuple[CounterTimeGroups, ...]
-    counter_reuses: Mapping[tuple[int, int], tuple[CounterReuse, ...]]
+    counter_reuses: FrozenEventRelations
     id_pools: EventIdPools
     reservations: tuple[EventReservation, ...]
     relations: FrozenEventRelations
@@ -194,11 +193,20 @@ class EventAllocation:
     """A checked finite mapping of every demand's virtual lanes to real IDs."""
 
     ids: tuple[tuple[int, ...], ...]
-    sharing: tuple[EventSharing | LocalEventReuse | CounterSharing | CounterReuse, ...]
-    counter_groups: tuple = ()
+    sharing: tuple[EventSharing | LocalEventReuse | CounterFIFOGroup | CounterReuseGroup, ...]
+    counter_groups: tuple[CounterFIFOGroup, ...] = ()
     option: int = 0
     counter_reuse_groups: tuple[CounterReuseGroup, ...] = ()
     counter_compositions: tuple = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CounterFIFOGroup:
+    """Selected complete credits of one established FIFO word at an actual ID."""
+
+    event: int
+    certificate: CounterGroup
+    resources: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,7 +215,7 @@ class CounterReuseGroup:
     resources: tuple[int, ...]
     messages: tuple[tuple[int, LogicalNotification], ...]
     backlog: int
-    witnesses: tuple[CounterReuse, ...]
+    rectangles: tuple[SelectedSeparation, ...]
 
 
 @dataclass(slots=True)
@@ -240,7 +248,10 @@ class ResourceWork:
     allocated_cross_ids: int = 0
     maximum_counter_backlog: int = 0
     persistent_cells: int = 0
-    coloring_nodes: int = 0
+    allocation_queries: int = 0
+    allocation_variables: int = 0
+    allocation_constraints: int = 0
+    allocation_seconds: float = 0.0
     peer_equalities: int = 0
     counter_groups: int = 0
     counter_compositions: int = 0
@@ -253,37 +264,29 @@ class ResourceWork:
     transfer_words: int = 0
     transfer_nodes: int = 0
     transfer_edges: int = 0
+    transfer_rules: int = 0
     transfer_order_bands: int = 0
     transfer_range_vertices: int = 0
     completion_queries: int = 0
-    completion_nodes: int = 0
-    completion_cycles: int = 0
+    completion_rule_instances: int = 0
+    completion_conclusions: int = 0
     completion_eliminated: int = 0
-    transfer_components: int = 0
-    transfer_may_points: int = 0
-    completion_pruned: int = 0
-    completion_shortcuts: int = 0
+    transfer_capture_words: int = 0
+    transfer_capture_bands: int = 0
     consumption_queries: int = 0
-    consumption_nodes: int = 0
-    consumption_cycles: int = 0
-    consumption_pruned: int = 0
-    consumption_shortcuts: int = 0
+    consumption_rule_instances: int = 0
+    consumption_conclusions: int = 0
     consumption_instances: int = 0
     consumption_regions: int = 0
     consumption_frontier_words: int = 0
     consumption_frontier_queries: int = 0
+    consumption_frontier_answer_reuses: int = 0
     consumption_frontier_hits: int = 0
     consumption_fact_reuses: int = 0
-    consumption_state_hits: int = 0
-    consumption_state_refreshes: int = 0
     counter_structure_ids: int = 0
     consumption_acquired_boundaries: int = 0
-    consumption_bound_queries: int = 0
-    consumption_bound_exclusions: int = 0
     phase_occupancies: int = 0
     phase_candidates: int = 0
-    transfer_fact_contexts: int = 0
-    transfer_fact_reuses: int = 0
 
 
 @dataclass(frozen=True)
@@ -299,9 +302,9 @@ class StructuredEventPlan:
     banks: tuple[EventBankUsage, ...]
     id_pools: EventIdPools
     occupancies: tuple[EventDemand, ...]
-    sharing: tuple[EventSharing | LocalEventReuse | CounterSharing | CounterReuse, ...] = ()
+    sharing: tuple[EventSharing | LocalEventReuse | CounterFIFOGroup | CounterReuseGroup, ...] = ()
     persistent: tuple[PersistentEventAssignment, ...] = ()
-    counter_groups: tuple = ()
+    counter_groups: tuple[CounterFIFOGroup, ...] = ()
     preferred_leases: tuple[StructuredEventLease, ...] = ()
     counter_reuse_groups: tuple[CounterReuseGroup, ...] = ()
     counter_compositions: tuple = ()

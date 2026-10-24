@@ -18,6 +18,7 @@ from ascendflow.analysis.event_contracts import (
     EventReservation,
     ResourceWork,
 )
+from ascendflow.analysis.event_frontier_contracts import FrozenEventRelations
 from ascendflow.analysis.notification_lifetimes import HandbackRule, Reuse
 from ascendflow.analysis.structured_protocols import NotificationKind
 from ascendflow.analysis.structured_resources import _mapped_event
@@ -119,7 +120,7 @@ def private_bank_problem(*, both_coupled):
         reservations=reservations,
         peers=((0, 2), (1, 3)) if both_coupled else ((1, 2),),
         counter_groups=(),
-        counter_reuses={},
+        counter_reuses=FrozenEventRelations(()),
         relations={},
         id_pools=EventIdPools(),
     ), (a, b)
@@ -182,11 +183,11 @@ def bounded(X:N.Tensor((n,64),N.f32),Meta:N.Tensor((n,),N.i64),
 
 
 def test_metadata_selected_last_is_not_built_for_an_absent_parent_carry():
+    from ascendflow.analysis.access_order import build_access_order
     from ascendflow.analysis.event_contracts import ResourceWork
     from ascendflow.analysis.event_domains import EventDomains
     from ascendflow.analysis.structured_admission import admit_structured_memory
     from ascendflow.analysis.structured_bounds import admit_memory_bounds
-    from ascendflow.analysis.structured_dependencies import build_structured_dependencies
     from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
     from ascendflow.analysis.structured_memory import collect_native_memory
     from ascendflow.passes.lower_native import lower_native_structure
@@ -200,8 +201,8 @@ def test_metadata_selected_last_is_not_built_for_an_absent_parent_carry():
     bounds = admit_memory_bounds(memory)
     admission = admit_structured_memory(structure, memory, bounds)
     dispatch = bind_structured_dispatch(memory)
-    dependencies = build_structured_dependencies(memory, admission=admission, dispatch=dispatch)
-    selection = bind_notifications(dependencies, dispatch)
+    dependencies = build_access_order(memory, admission=admission, dispatch=dispatch)
+    selection = bind_notifications(dependencies)
     selection.require_closed()
     absences = [c.absence for c in selection.coverage if c.absence is not None]
     assert absences and all(a.answer.impossible and a.premises for a in absences)

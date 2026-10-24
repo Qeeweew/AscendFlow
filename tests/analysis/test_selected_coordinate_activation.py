@@ -15,11 +15,11 @@ from ascendflow.analysis.access_frontier import (
     LoopResidueSelection,
     ResiduePosition,
 )
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.event_contracts import ResourceWork
 from ascendflow.analysis.event_domains import EventDomains
 from ascendflow.analysis.event_windows import _Builder
 from ascendflow.analysis.hazards import HazardKind
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_protocols import (
@@ -58,11 +58,9 @@ def selected_context():
                         N.mul(value,2.0,out=x[:])
 """)
     memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = build_structured_dependencies(memory)
+    dependencies = build_access_order(memory)
     base = dependencies.required[0]
-    selection = SynchronizationSelection(
-        replace(dependencies, required=()), bind_structured_dispatch(memory), (), ()
-    )
+    selection = SynchronizationSelection(replace(dependencies, required=()), (), ())
     return EventDomains(selection, ResourceWork()), base
 
 

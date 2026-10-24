@@ -8,9 +8,9 @@ rule. Neither protocol names nor the old resource plan qualify the mutation.
 from dataclasses import replace
 
 from ascendflow import language as N
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.structured_admission import admit_structured_memory
 from ascendflow.analysis.structured_bounds import admit_memory_bounds
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_schedule import ActionGuard, Comparison, Placement, SyncAction
@@ -74,8 +74,8 @@ def seeded_credit_probe(*, cross=False, remove=None, missing_lane=False, late_re
     bounds = admit_memory_bounds(memory)
     admission = admit_structured_memory(structure, memory, bounds)
     dispatch = bind_structured_dispatch(memory)
-    dependencies = build_structured_dependencies(memory, admission=admission, dispatch=dispatch)
-    generation = generate_notifications(dependencies, dispatch)
+    dependencies = build_access_order(memory, admission=admission, dispatch=dispatch)
+    generation = generate_notifications(dependencies)
     resources = allocated(generation)
     original = collect_native_memory(structure.module.clone())
     root = structure.module.body.block.first_op

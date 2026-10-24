@@ -17,12 +17,12 @@ from ..analysis.access_frontier import (
     QueueEndpoint,
     ResiduePosition,
 )
+from ..analysis.access_order import AccessOrder
 from ..analysis.acquired_prefixes import AcquiredPrefixes
 from ..analysis.hazards import HazardKind
 from ..analysis.integer_facts import IntegerFacts
 from ..analysis.region_coordinates import ScalarScope
 from ..analysis.smt import all_of, any_of
-from ..analysis.structured_dependencies import StructuredDependencies
 from ..analysis.structured_dispatch import StructuredDispatch
 from ..analysis.structured_protocols import (
     BindingWork,
@@ -609,19 +609,36 @@ def _clock(need, source, consumer, memory):
     return None
 
 
-def _bind_notification(need, dispatch, effective_guards, *, ready_source=None):
+def _bind_requirement(need, dispatch, effective_guards, *, ready_source=None):
     memory = dispatch.memory
     consumer = _bind_endpoint(
         need, need.consumer, memory, source=False, effective_guards=effective_guards
     )
     source = _bind_endpoint(
         need,
-        need.source if ready_source is None else ready_source,
+        need.source,
         memory,
         source=True,
         consumer_coordinates=consumer.coordinates,
         effective_guards=effective_guards,
     )
+    ready = None
+    if ready_source is not None and ready_source != need.source:
+        ready = _bind_endpoint(
+            need,
+            ready_source,
+            memory,
+            source=True,
+            consumer_coordinates=consumer.coordinates,
+            effective_guards=effective_guards,
+        )
+    return RequirementBinding(need, source, consumer, ready)
+
+
+def _notification_for(binding, dispatch):
+    """Choose a mechanism for endpoints already bound to the original need."""
+    need, source, consumer = binding.requirement, binding.completion_source, binding.consumer
+    memory = dispatch.memory
     a, b = (dispatch.site(p) for p in (source, consumer))
     cross = source.actor is not consumer.actor
     require(
@@ -652,19 +669,20 @@ def _bind_notification(need, dispatch, effective_guards, *, ready_source=None):
         need.period,
         need.distance,
         need.domains,
-        (need,),
+        (binding,),
     )
 
 
-def _implicit(notification, order):
-    source, consumer = notification.sources[0], notification.consumers[0]
+def _implicit(binding, order):
+    source, consumer = binding.completion_source, binding.consumer
     if (
         source.actor is not consumer.actor
-        or order.compare(source, consumer, notification.requirements[0]) != -1
+        or order.compare(source, consumer, binding.requirement) != -1
     ):
         return None
     native = order.dispatch.site(source)
-    if native.engine is Engine.S and notification.destination_engine is Engine.S:
+    destination = order.dispatch.site(consumer).engine
+    if native.engine is Engine.S and destination is Engine.S:
         # Hierarchical issue order also orders a completed loop's Scalar
         # memory instructions before the following Scalar access. PIPE_S is
         # not an asynchronous queue that needs a pipe_barrier. In particular,
@@ -673,7 +691,7 @@ def _implicit(notification, order):
         return "ordered Scalar memory instructions before later Scalar admission"
     if native.engine is Engine.S and native.implicit_completion:
         return "synchronous Scalar source retirement before controller dispatch"
-    if native.engine is notification.destination_engine and native.implicit_completion:
+    if native.engine is destination and native.implicit_completion:
         return "qualified native completion before later same-engine admission"
     return None
 
@@ -906,31 +924,30 @@ def _quorums(notifications, order):
                 sources=sources,
                 consumers=consumers,
                 requirements=requirements,
-                origins=tuple(n for item in items for n in item.origins),
+                anchors=tuple(b for item in items for b in item.anchors),
             )
         )
     return tuple(local), tuple(unresolved)
 
 
-def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
+def bind_notifications(dependencies: AccessOrder) -> SynchronizationSelection:
     """Consume all finite recursive needs through one capture/acquire contract.
 
     This internal step establishes coverage and preserves its original
     ownership edges. generate_notifications then constructs pairing, phase
     order and complete lifetimes. Coverage alone cannot authorize allocation.
     """
-    require(isinstance(dependencies, StructuredDependencies), "selection needs actual dependencies")
+    require(isinstance(dependencies, AccessOrder), "selection needs actual access order")
+    dispatch = dependencies.dispatch
     require(
         isinstance(dispatch, StructuredDispatch) and dispatch.memory is dependencies.memory,
         "selection and dispatch belong to different owned memory facts",
     )
     order = _IssueOrder(dispatch)
     notifications, coverage, unresolved = [], [], []
-    bindings = {}
+    bindings, bound_bundles = {}, []
     owned = {
-        need: lifetime
-        for lifetime in dependencies.order.cell_lifetimes
-        for need in lifetime.requirements
+        need: lifetime for lifetime in dependencies.cell_lifetimes for need in lifetime.requirements
     }
     bundles = {}
     ready_groups = {
@@ -940,7 +957,9 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
         if need in owned:
             coverage.append(
                 NotificationCoverage(
-                    need, "persistent private-cell ownership round", ownership=owned[need]
+                    need,
+                    "persistent private-cell ownership round",
+                    ownership=owned[need],
                 )
             )
             continue
@@ -991,43 +1010,65 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
                     need.source,
                     endpoint=AccessEndpoint.from_template(group[-1], need.source.participant),
                 )
-            item = replace(
-                _bind_notification(need, dispatch, order.guards(need), ready_source=ready_source),
-                requirements=tuple(bundle),
+            bound = _bind_requirement(need, dispatch, order.guards(need), ready_source=ready_source)
+            originals = tuple(
+                bound if original is need else replace(bound, requirement=original)
+                for original in bundle
             )
-            for original in bundle:
-                bindings[original] = RequirementBinding(
-                    original, item.sources[0], item.consumers[0]
-                )
-            if rule := _implicit(item, order):
+            bindings.update((binding.requirement, binding) for binding in originals)
+            bound_bundles.append(originals)
+        except CompileError as error:
+            unresolved.extend(UnresolvedSynchronization(n, error.message) for n in bundle)
+
+    # All source/domain/endpoints above belong to the original obligations.
+    # Mechanisms below consume them; implicit and ownership facts never need
+    # a temporary notification, nor can later action coalescing replace them.
+    for bundle in bound_bundles:
+        bound = bundle[0]
+        need, source, consumer = bound.requirement, bound.completion_source, bound.consumer
+        try:
+            a, b = dispatch.site(source), dispatch.site(consumer)
+            if rule := _implicit(bound, order):
                 coverage.extend(
                     NotificationCoverage(
-                        n,
+                        original.requirement,
                         rule,
                         ordering=OrderingWitness(
                             rule,
-                            item.sources[0],
-                            item.consumers[0],
-                            item.source_engine,
-                            item.destination_engine,
+                            source,
+                            consumer,
+                            a.engine,
+                            b.engine,
                             ("same actor", "proved hierarchical issue order"),
                         ),
+                        binding=original,
                     )
-                    for n in bundle
+                    for original in bundle
                 )
             elif (
-                item.mechanism is NotificationKind.PIPE_FENCE
-                and order.compare(item.sources[0], item.consumers[0], need) != -1
+                source.actor is consumer.actor
+                and a.engine is b.engine
+                and order.compare(source, consumer, need) != -1
             ):
-                unresolved.append(
+                unresolved.extend(
                     UnresolvedSynchronization(
-                        need, "same-engine source is not proved issued before its consumer fence"
+                        original.requirement,
+                        "same-engine source is not proved issued before its consumer fence",
                     )
+                    for original in bundle
                 )
             else:
-                notifications.append(item)
+                notifications.append(
+                    replace(
+                        _notification_for(bound, dispatch),
+                        requirements=tuple(original.requirement for original in bundle),
+                    )
+                )
         except CompileError as error:
-            unresolved.append(UnresolvedSynchronization(need, error.message))
+            unresolved.extend(
+                UnresolvedSynchronization(original.requirement, error.message)
+                for original in bundle
+            )
     # Physical cells own complete credits. Keep slot-residue notifications
     # distinct; resource planning establishes virtual peers before numbering.
     grouped = _group_captures(notifications, order)
@@ -1051,5 +1092,10 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
                 )
             )
     return SynchronizationSelection(
-        dependencies, dispatch, selected, tuple(coverage), tuple(unresolved), order.binding_work
+        dependencies,
+        selected,
+        tuple(coverage),
+        tuple(unresolved),
+        order.binding_work,
+        tuple(bindings.values()),
     )

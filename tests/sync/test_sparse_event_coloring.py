@@ -19,14 +19,13 @@ class CountedRows:
         self.masks = tuple(masks)
         self.pair_queries = self.row_queries = 0
         self.frozen = FrozenEventRelations(
-            {},
             tuple(
                 ((mask, CreditSeparation((), 1 << n, mask)),) if mask else ()
                 for n, mask in enumerate(masks)
             ),
         )
 
-    def local_mask(self, number):
+    def row_mask(self, number):
         self.row_queries += 1
         return self.masks[number]
 
@@ -62,7 +61,7 @@ def path_constraints(size, *, width=1, peers=False):
             reservations=(),
             peers=tuple((n, size + n) for n in range(size)) if peers else (),
             counter_groups=(),
-            counter_reuses={},
+            counter_reuses=FrozenEventRelations(()),
             relations=relations,
             id_pools=EventIdPools(local=flags),
         ),
@@ -73,13 +72,13 @@ def path_constraints(size, *, width=1, peers=False):
 
 @pytest.mark.parametrize("size", [16, 64, 256])
 @pytest.mark.parametrize("width,peers", [(1, False), (2, False), (1, True)])
-def test_ordered_sparse_constraints_do_not_build_every_vertex_pair_or_search(size, width, peers):
+def test_sparse_constraints_only_expand_actual_conflicts(size, width, peers):
     numeric, edges, relations = path_constraints(size, width=width, peers=peers)
     try:
-        assigned, nodes = color_event_resources(numeric, node_limit=0)
+        assigned, option = color_event_resources(numeric)
     except CompileError as error:
         pytest.fail(f"sparse numeric graph used {relations.pair_queries} pair lookups: {error}")
-    assert nodes == 0
+    assert option == 0
     assert relations.pair_queries < 24 * size
     assert relations.row_queries <= 2 * size
     for n, values in enumerate(assigned):
@@ -103,6 +102,6 @@ def test_an_overfull_fixed_clique_does_not_expand_its_dense_remainder():
     numeric, _, _ = path_constraints(1024)
     rows = numeric.relations = CountedRows((0,) * len(numeric.demands))
     with pytest.raises(NoEventAssignment, match="not a hardware minimum"):
-        color_event_resources(numeric, node_limit=0)
+        color_event_resources(numeric)
     assert rows.pair_queries < 16
     assert rows.row_queries == 0

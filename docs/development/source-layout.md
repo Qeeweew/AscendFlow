@@ -41,9 +41,9 @@ compile / Compilation
     lower_native_structure                # DSL→source、静态原式诊断、native lowering
     collect_native_memory
     physical contracts → admission → dispatch
-    access_order → dependencies             # 可能冲突顺序、region 队列端口和局部 packet
+    build_access_order                    # 唯一 dispatch/存储义务；region 队列端口和局部 packet
     generate_notifications
-      bind_notifications                 # 覆盖、真实位置及原始 ownership edges
+      bind_notifications                 # 先绑定原始义务，再选择/合并通知；保留 ownership edges
       EventDomains                       # 新 guard 定义性、复用实际 SSA、坐标往返、配对
       reduce_completion_prefixes         # 冻结实际 capture，逐原始义务证明多段完成覆盖
       bind_cell_credits                  # 稀疏私有轮次的端点与本地发射前提
@@ -51,7 +51,7 @@ compile / Compilation
       construct_cell_channels            # 物理 lifetime credit 归纳
       HandbackRule                       # 无稳定 cell 的有限/ring 生命周期
     plan_event_resources                # 冻结首选/有限缩环、虚拟动作、复用及整组 FIFO
-    allocate_structured_events          # 先首选后有限选项；只分配编号，不查询域或 handback
+    allocate_structured_events          # 联合选择已证有限选项和编号，不查询域或 handback
     materialize_notifications
     ScalarFacts                         # 可选控制/标量优化范围
     executable projection               # 独立终端模块；映射 native、geometry 与 SSA 范围
@@ -75,25 +75,25 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/registers.py` | 每个 block 一次建立常量 SPR 输入要求/输出集合；序列、分支与循环组合，只提供定义事实 |
 | `target/layout.py`、`analysis/structured_addresses.py` | L1 NZ allocation 形状、C0、偏移与条带几何；解码一次并将物理 M 交给 native 和终端消费 |
 | `analysis/matrix_regions.py` | L1 全 rank 逻辑矩形、实际部分定义及 writer 来源、精确相邻拼接与固定连续遍历摘要；不含 ready、退休或事件事实 |
-| `analysis/smt.py`、`integer_facts.py`、`guard_cover.py` | 原式数学关系与条件覆盖共用 Z3 查询；定义性和机器范围独立，输入环境与完整前提限定缓存 |
+| `analysis/smt.py`、`integer_facts.py`、`guard_cover.py` | 原式数学关系与条件覆盖共用 Z3 查询；有限规则使用隔离临时上下文，输出完整前提及实际支持规则的 owned implication；定义性和机器范围独立 |
 | `memo.py` | 编译作用域和分析对象拥有的自动 memoization；统一释放表，语义键由查询声明，可变事实仍按原职责失效 |
 | `indexing.py`、`IndexRanges` | 编译内原式代数查询与固定输入环境下的范围 DAG；保留每个范围的完整调用域，不导出其他原式的求值资格 |
 | `analysis/structured_bounds.py`、`structured_admission.py` | 静态非法、物理容量、源/native 对应、别名、存储实例、按读取上下文增量维护的精确定义字节并集和借用 Tile；动态源 bounds 与 group/peer 独立性属于输入合同 |
 | `analysis/structured_access.py`、`structured_regions.py` | 按真实地址周期建立可选精确 cell 与可能别名的 AliasRegion；独立 RegisterCell 接入共同顺序传递，不伪造 tensor 字节或完整定义 |
-| `analysis/access_order.py`、`storage_packets.py`、`storage_word.py`、`structured_dependencies.py` | 可能冲突的 RAW/WAR/WAW、条件访问的并集及完整入口可用域、单次激活证明、共同队列端口、局部完整 packet 的实际复用 |
+| `analysis/access_order.py`、`storage_packets.py`、`storage_word.py` | 可能冲突的 RAW/WAR/WAW、条件访问的并集及完整入口可用域、单次激活证明、共同队列端口、局部完整 packet 的实际复用 |
 | `analysis/local_schedule.py`、`structured_dispatch.py` | 按迭代域和 actor family 建立本地 stage 顺序与 horizon；派发消费该顺序并绑定 native、控制入口/出口的位置 |
-| `passes/notification_binding.py`、`analysis/structured_protocols.py` | 复用已经必要的 capture/acquire、建立完整 quorum；保留自身 origin，不将新增 coverage 当作 ownership，不按 Stage 合并独立完成边界 |
+| `passes/notification_binding.py`、`analysis/structured_protocols.py` | 原始需求先拥有真实 source/consumer 和可选共同 ready，随后选择机制、复用已有 capture/acquire、建立完整 quorum；合并不替换原始 binding，不将新增 coverage 当作 ownership |
 | `analysis/acquired_prefixes.py` | 按真实激活类与层级发射 word 查询已有 capture/acquire pair；保留每个 participant 的 lexical 分段与原最早匹配，不扫描同 word 的全部获取历史，不提供事件消费资格 |
-| `analysis/position_words.py`、`protocol_transfers.py`、`completion_prefixes.py` | 共用层级位置和真实 Set/Wait 快照 DAG；完成和消费有独立 origin；逐合并前需求验证完成覆盖，排除自身及已删协议，固定保留支持动作 |
-| `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期 |
+| `analysis/position_words.py`、`protocol_transfers.py`、`completion_prefixes.py` | 共用层级位置和真实 Set/Wait 快照；实际 capture 按位置 word 的 lexical bands 绑定来源；有限 Horn 规则直接证明完整前提下的目标 cut，保留实际支持规则和独立 acquire 结论；完成和消费的 origin 分别保持，完成删除固定保留支持动作 |
+| `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期；保留同一输入 owner 的消费分析交给资源规划，完成消除的临时图不向下游保留 |
 | `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |
 | `analysis/queue_order.py` | 每层 actor clock-origin 差约束、按实际路由/有限时间类建立的稀疏阻塞区间索引、零距离 DAG 与正距离前进；child 仅导出 open ports 和 may-block cuts |
-| `analysis/cell_channels.py` | 相同完整物理 ownership 集合和 role 的非重复 credit；原始值/存储 lifetime 归纳 |
-| `analysis/cell_ownership.py` | 从原始 body/全部 effects 建立闭合私有轮次，绑定真实 acquire/return、校验实际本地发射前提；不将队列端口当成 native lifetime |
-| `analysis/notification_lifetimes.py`、`consumption_frontiers.py` | 实际 reuse window 与 FIRST/LAST 端口、独立消费 origin、真实取得 cut 的二维前沿索引；共享未变条件事实并继续组合开放边界，不设固定 relay 深度 |
-| `analysis/event_planning.py`、`event_sharing.py`、`event_counter_groups.py`、`event_peers.py` | 保留 logical credit 的实际 local 成员 phase 占用、重叠 FIFO 候选、实际首末端口 word 拼接、FIFO 子组间完整消费回传、逐 publisher 积压及虚拟 AIV 对应；冻结实际数字池、组合与有限协议选项 |
-| `analysis/event_frontiers.py`、`event_frontier_contracts.py` | 本地事件真实发布/消费区间的分层包围与 handback 分离；失败接口细分，冻结完整 credit 的有限复用矩形；最终组检查逐行消费 mask，报告共享端点树/证书而不展开消息对 |
-| `analysis/event_coloring.py`、`structured_resources.py`、`event_contracts.py` | 联合专属、已证 FIFO 的结构分配和有限残余；时间复用保持完整消费前提；持久 token 与配置/drain 台账，全部选项共享工作上限，只消费冻结约束及物化编号 |
+| `analysis/cell_channels.py` | 直接消费原始 anchor binding 的物理 ownership 集合和 role；按实际 Set/Wait 位置归集激活，仅检查共同位置的重叠，最终成员一次冻结 |
+| `analysis/cell_ownership.py` | 从原始 body/全部 effects 建立闭合私有轮次，一次选定真实最后 reader；消费原始 binding 形成 acquire/return，不重建端点或临时通知，继续校验本地发射前提 |
+| `analysis/notification_lifetimes.py`、`consumption_frontiers.py` | 实际 reuse window 与 FIRST/LAST 端口、独立消费 origin、真实取得 cut 的二维前沿索引；导出各 acquire 自己的子证明并合并其条件域，区分 controller/pipe 和构造前提；继续组合开放边界，不设固定 relay 深度 |
+| `analysis/event_planning.py`、`event_sharing.py`、`event_counter_groups.py`、`event_peers.py` | 保留 logical credit 的实际 local 成员 phase 占用；FIFO 建立完整过滤 word/积压和同锚点激活互斥，编号直接消费 word 子集；实际首末端口拼接、FIFO 子组间完整消费回传、逐 publisher 积压及虚拟 AIV 对应；冻结数字池、组合与有限协议选项 |
+| `analysis/event_frontiers.py`、`event_frontier_contracts.py` | local/counter 的实际发布/消费区间分层包围与 handback 分离，每个参与者保留自己的端点；失败接口细分，冻结完整 credit 的复用矩形；编号及 FIFO-child 组合逐行消费 mask，报告引用子树/证书，不复制历史成员或展开许可对 |
+| `analysis/event_coloring.py`、`structured_resources.py`、`event_contracts.py` | 联合专属、已证 FIFO 的结构分配和有限残余；时间复用保持完整消费前提；持久 token 与配置/drain 台账，全部残余选项组成一份 Z3 有限问题，只消费冻结约束及物化编号 |
 | `passes/materialize_structure.py` | 插入确定动作、共享同位置短路 guard 前缀；不改变 native 或 issue order |
 | `passes/executable.py` | 终端模块、native 对应、共享 NativeSpec 与最终 SSA 范围；不携带逻辑控制、地址证明或同步求解入口 |
 | `passes/lower_execution.py` | 将 count/stage 表示降为实际 arith/scf；按 family 保持 issue order，移动原 native，不复制双 AIV body |

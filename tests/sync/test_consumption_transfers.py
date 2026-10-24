@@ -4,9 +4,12 @@ import pytest
 
 from ascendflow import language as N
 from ascendflow.analysis.event_coloring import NoEventAssignment
+from ascendflow.analysis.notification_lifetimes import HandbackRule
 from ascendflow.analysis.protocol_transfers import ProtocolTransfers
+from ascendflow.analysis.structured_schedule import Comparison
 from ascendflow.dialects.structured import NotificationOp
 from ascendflow.passes.structured_sync import synchronize_structure
+from ascendflow.scalar import Expr, literal
 from ascendflow.target.ascend910b import Engine
 from tests.models.structured_events import EventModelError, check_compiled_events
 
@@ -85,6 +88,42 @@ def test_nine_cube_phases_reuse_binary_ids_through_three_real_handoffs():
     assert plan.resources.sharing
     assert plan.generation.domains.work.consumption_queries
     assert plan.generation.domains.work.consumption_regions
+    check_compiled_events(plan, invocations=2)
+
+
+def test_consumption_words_reuse_only_exact_mathematical_questions():
+    plan = synchronize_structure(cube_chain())
+    domains = plan.generation.domains
+    messages = [
+        n
+        for n in domains.notifications
+        if n.source_engine is Engine.MTE2 and n.destination_engine is Engine.MTE1
+    ]
+    earlier, later = messages[0], messages[-1]
+    old, target = earlier.consumers[0], later.sources[0]
+    # Add an explicit conditional domain to a real established handback. Its
+    # proof cannot supply an unconditional conclusion when the domain weakens.
+    selector = Expr("argument", ("frontier_selector",))
+    active = Comparison(selector, "==", literal(1))
+    assumptions = (active,)
+    rule = HandbackRule(domains)
+    assert rule.establish(earlier, old, later, target, assumptions, loop=None)
+    origin = next(iter(rule.frontiers.words.values())).example.origin
+    work = domains.work
+    for context, expected in ((assumptions, True), ((), False), (assumptions, True)):
+        result = rule.frontiers.find(origin, target, later.source_engine, context)
+        assert (result is not None) is expected
+        queries = work.consumption_frontier_queries
+        for _ in range(16):
+            repeated = rule.frontiers.find(origin, target, later.source_engine, context)
+            assert (repeated is not None) is expected
+        assert work.consumption_frontier_queries == queries
+        if result is not None:
+            proof, answer = result
+            assert domains.arithmetic.queries.owns_implication(answer, proof.condition, context)
+            assert earlier not in proof_protocols(proof)
+    assert work.consumption_frontier_answer_reuses >= 48
+    assert rule.frontiers.find(origin, earlier.sources[0], later.source_engine, assumptions) is None
     check_compiled_events(plan, invocations=2)
 
 

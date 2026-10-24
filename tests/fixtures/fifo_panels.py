@@ -8,6 +8,38 @@ from ascendflow import language as N
 
 
 @N.prim_func(disjoint_external=True)
+def conditional_panels(
+    A: N.Tensor((16, 16), N.bf16),
+    B: N.Tensor((16, 16), N.bf16),
+    Work: N.Tensor((PANELS, 16, 16), N.f32, access="write"),
+    Out: N.Tensor((PANELS, 16, 16), N.f32, access="write", write_disjoint=True),
+    n: N.i64,
+    PANELS: N.constexpr = 4,
+):
+    with N.Kernel(1, kind="mixed"):
+        a1 = N.alloc_l1((16, 16), N.bf16)
+        b1 = N.alloc_l1((16, 16), N.bf16)
+        a0 = N.alloc_l0a((16, 16), N.bf16)
+        b0 = N.alloc_l0b((16, 16), N.bf16)
+        c0 = N.alloc_l0c((16, 16), N.f32)
+        x = N.alloc_ub((8, 16), N.f32)
+        with N.Cube():
+            N.copy(A, a1)
+            N.copy(B, b1)
+            N.copy(a1, a0)
+            N.copy(b1, b0)
+            N.matmul(a0, b0, accum=c0, initialize=True)
+        for panel in N.unroll(PANELS):
+            with N.Cube():
+                if n > panel:
+                    N.copy(c0, Work[panel, :, :])
+            with N.Vector() as lane:
+                if n > panel:
+                    N.copy(Work[panel, lane * 8 : lane * 8 + 8, :], x)
+                    N.copy(x, Out[panel, lane * 8 : lane * 8 + 8, :])
+
+
+@N.prim_func(disjoint_external=True)
 def fifo_panels(
     A: N.Tensor((16, 16), N.bf16),
     B: N.Tensor((16, 16), N.bf16),

@@ -11,10 +11,9 @@ import pytest
 
 from ascendflow import language as N
 from ascendflow.analysis.access_frontier import AccessEndpoint
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.event_contracts import ResourceWork
 from ascendflow.analysis.event_domains import EventCase, EventDomains
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
-from ascendflow.analysis.structured_dispatch import bind_structured_dispatch
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_protocols import (
     BoundPlacement,
@@ -32,8 +31,8 @@ from tests.models.structured_domains import actual_dispatch
 
 def domains_for(source):
     memory = collect_native_memory(lower_native_structure(N.from_source(source)).module)
-    dependencies = replace(build_structured_dependencies(memory), required=())
-    selection = SynchronizationSelection(dependencies, bind_structured_dispatch(memory), (), ())
+    dependencies = replace(build_access_order(memory), required=())
+    selection = SynchronizationSelection(dependencies, (), ())
     return EventDomains(selection, ResourceWork())
 
 

@@ -1,4 +1,4 @@
-"""Frozen local-event interval certificates and numeric reuse lookup.
+"""Frozen event-consumption interval certificates and numeric reuse lookup.
 
 These records contain real endpoints, enclosure links and established
 consumption handbacks. Numeric group checks and compressed reporting perform
@@ -9,14 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 
 
 @dataclass(frozen=True, eq=False, slots=True)
 class EventFrontier:
     head: object
     tail: object
-    members: frozenset
+    size: int = 1
     children: tuple[EventFrontier, ...] = ()
     # Actual unconditional issue enclosures of the child extremal endpoints.
     enclosure: tuple = ()
@@ -64,13 +63,12 @@ class LocalEventReuse:
 
 @dataclass(frozen=True, init=False, slots=True)
 class FrozenEventRelations(Mapping):
-    """Pure finite reuse lookup over explicit counters and local rectangles."""
+    """Pure finite lookup of established complete-credit consumption rectangles."""
 
-    _counters: Mapping
     _rows: tuple
     _masks: tuple[int, ...]
 
-    def __init__(self, counters, rows):
+    def __init__(self, rows):
         rows = tuple(tuple(row) for row in rows)
         for number, row in enumerate(rows):
             bit = 1 << number
@@ -83,7 +81,6 @@ class FrozenEventRelations(Mapping):
                     else 0
                 )
                 assert mask and not mask & ~allowed, "reuse row escapes its certified rectangle"
-        object.__setattr__(self, "_counters", MappingProxyType(dict(counters)))
         object.__setattr__(self, "_rows", rows)
         object.__setattr__(self, "_masks", tuple(self._union(row) for row in self._rows))
 
@@ -95,8 +92,6 @@ class FrozenEventRelations(Mapping):
         return result
 
     def __getitem__(self, key):
-        if key in self._counters:
-            return self._counters[key]
         a, b = key
         if not (0 <= a < len(self._rows) and 0 <= b < len(self._rows)) or not self._masks[a] & (
             1 << b
@@ -107,34 +102,55 @@ class FrozenEventRelations(Mapping):
                 return (certificate,)
         raise AssertionError("frozen frontier mask has no covering certificate")
 
-    def local_mask(self, number):
-        """Numeric permissions for one original local row, without pair expansion."""
+    def row_mask(self, number):
+        """Numeric permissions for one original row, without pair expansion."""
         return self._masks[number] if 0 <= number < len(self._masks) else 0
 
-    def cover_group(self, members):
-        """Check all selected pairs by row masks, retaining compressed facts.
-
-        This consumes the same frozen permissions as individual lookup. A
-        missing permission in either selected row rejects the whole group.
-        No message-pair projection, domain query or handback is performed.
-        """
+    def permits_group(self, members):
+        """Check a complete temporal group without projecting its pairs."""
+        members = tuple(members)
+        if len(members) < 2:
+            return True
         mask = sum(1 << number for number in members)
-        for number in members:
-            if not 0 <= number < len(self._rows) or (mask ^ (1 << number)) & ~self._masks[number]:
-                return None
+        return all(
+            0 <= number < len(self._rows) and not (mask ^ (1 << number)) & ~self._masks[number]
+            for number in members
+        )
+
+    def cover_group(self, members):
+        return self.cover_groups(tuple(frozenset((number,)) for number in members))
+
+    def cover_groups(self, groups):
+        """Check cross-group rows and retain selected certificate rectangles.
+
+        A FIFO child owns its internal word; temporal permissions must cover
+        every complete credit in all other children. Singleton children give
+        ordinary complete-credit time reuse. Missing either row rejects it.
+        """
+        masks = tuple(sum(1 << number for number in group) for group in groups)
+        mask = sum(masks)
+        assert mask == self._union((value, None) for value in masks), "reuse groups overlap"
         certificates = {}
-        for number in sorted(members):
-            for others, certificate in self._rows[number]:
-                if others & mask:
-                    certificates.setdefault(certificate, None)
+        for group, own in zip(groups, masks, strict=True):
+            other = mask ^ own
+            if not other:
+                continue
+            for number in sorted(group):
+                if not 0 <= number < len(self._rows) or other & ~self._masks[number]:
+                    return None
+                for others, certificate in self._rows[number]:
+                    if others & other:
+                        certificates.setdefault(certificate, None)
         return tuple(
             SelectedSeparation(c.left & mask, c.right & mask, c)
             for c in certificates
             if c.left & mask and c.right & mask
         )
 
+    def __bool__(self):
+        return any(self._masks)
+
     def __iter__(self):
-        yield from self._counters
         for a, mask in enumerate(self._masks):
             mask &= ~((1 << (a + 1)) - 1)
             while mask:
@@ -143,6 +159,4 @@ class FrozenEventRelations(Mapping):
                 mask ^= low
 
     def __len__(self):
-        return len(self._counters) + sum(
-            (mask >> (a + 1)).bit_count() for a, mask in enumerate(self._masks)
-        )
+        return sum((mask >> (a + 1)).bit_count() for a, mask in enumerate(self._masks))

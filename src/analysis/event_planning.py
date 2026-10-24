@@ -5,10 +5,7 @@ query callbacks; changing candidate IDs cannot trigger another domain proof.
 """
 
 from collections import Counter
-from itertools import combinations
-from types import MappingProxyType
 
-from ..budget import poll
 from ..diagnostics import require
 from ..dialects.physical import FixConfigOp
 from ..scalar import expression, literal
@@ -27,10 +24,9 @@ from .event_contracts import (
 )
 from .event_counter_groups import plan_counter_groups, plan_counter_time_groups
 from .event_frontier_contracts import FrozenEventRelations
-from .event_frontiers import LocalEventFrontiers
+from .event_frontiers import EventFrontiers
 from .event_peers import bind_event_peers
-from .event_sharing import CellPhaseSharing, share_counter_time, share_counters, share_events
-from .notification_lifetimes import HandbackRule
+from .event_sharing import CellPhaseSharing, share_counter_time, share_events
 from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard, Placement
 
@@ -139,10 +135,10 @@ class _Planning:
         self.leases = {v.notification: v for v in program.leases} if leases is None else leases
         self.channels = {m: c for c in program.channels for m in c.members}
         self.demands, self.uses, self.actions, self.reservations = [], [], [], []
-        self.handbacks = (
-            HandbackRule(self.domains, boundaries=program.boundaries)
-            if established is None
-            else established.handbacks
+        self.handbacks = program.handbacks
+        require(
+            self.handbacks.domains is self.domains,
+            "consumption facts belong to another retained notification program",
         )
         self.compatibility = {} if established is None else established.compatibility
         self.counter_compatibility = (
@@ -151,6 +147,7 @@ class _Planning:
         self.paired = set() if established is None else established.paired
         self.pressured = set()
         self.frontiers = None if established is None else established.frontiers
+        self.counter_frontiers = None if established is None else established.counter_frontiers
 
     def action(
         self,
@@ -355,6 +352,10 @@ class _Planning:
                         )
 
     def compatible(self, left, right):
+        require(
+            left.mechanism is right.mechanism is NotificationKind.LOCAL_EVENT,
+            "local event permission received a non-local protocol",
+        )
         pair = frozenset((left, right))
         if pair not in self.compatibility:
             credit = self.channels.get(left)
@@ -367,11 +368,7 @@ class _Planning:
             elif self.domains._exclusive(left, right):
                 result = ()
             else:
-                witness = (
-                    share_counters(self.domains, left, right)
-                    if left.mechanism is NotificationKind.CROSS_EVENT
-                    else share_events(self.domains, self.handbacks, left, right)
-                )
+                witness = share_events(self.domains, self.handbacks, left, right)
                 result = None if witness is None else (witness,)
             self.compatibility[pair] = result
             self.domains.work.sharing_pairs += 1
@@ -380,41 +377,37 @@ class _Planning:
         return self.compatibility[pair]
 
     def relations(self, peers):
-        result = {}
         # Facts about optional reuse must not choose a different mapping for
         # a bank that can hold every preferred credit exclusively.
         pressured = exclusive_pressure_banks(self.demands, self.reservations, peers, self.id_pools)
         self.pressured = pressured
-        counters = [i for i, demand in enumerate(self.demands) if demand.backlog is not None]
-        for a, b in combinations(counters, 2):
-            left, right = self.demands[a], self.demands[b]
-            if left.persistent is not None or right.persistent is not None:
-                continue
-            if None not in pressured:
-                continue
-            poll("virtual event reuse constraints", pairs=len(result))
-            witnesses = []
-            for prior in left.members:
-                for member in right.members:
-                    relation = self.compatible(prior, member)
-                    if relation is None:
-                        break
-                    witnesses.extend(relation)
-                else:
-                    continue
-                result[a, b] = None
-                break
-            else:
-                result[a, b] = tuple(witnesses)
-        self.frontiers = LocalEventFrontiers(
+        banks = {}
+        for number, demand in enumerate(self.demands):
+            if demand.backlog is None and demand.persistent is None:
+                for bank in demand.banks:
+                    if bank in pressured:
+                        banks.setdefault(bank, []).append(number)
+        self.frontiers = EventFrontiers(
             self.domains, self.handbacks, self.demands, self.compatible, established=self.frontiers
         )
-        return FrozenEventRelations(result, self.frontiers.build(pressured))
+        return FrozenEventRelations(self.frontiers.build(banks.values()))
+
+    def counter_time_permission(self, left, right):
+        key = frozenset((left, right))
+        if key not in self.counter_compatibility:
+            self.counter_compatibility[key] = share_counter_time(
+                self.domains, self.handbacks, left, right
+            )
+            self.domains.work.counter_time_pairs += 1
+        else:
+            self.domains.work.counter_time_cache_hits += 1
+        witness = self.counter_compatibility[key]
+        return None if witness is None else (witness,)
 
     def time_relations(self, counter_groups):
-        result = {}
+        empty = FrozenEventRelations(() for _ in self.demands)
         if None not in self.pressured:
-            return MappingProxyType(result)
+            return empty
         partition = counter_fifo_partition(
             self.demands, tuple(frozenset(group.resources) for group in counter_groups)
         )
@@ -423,31 +416,32 @@ class _Planning:
             # has its own whole word, progress, quorum and backlog certificate;
             # no new consumption question is needed for candidate integers.
             self.domains.work.counter_structure_ids = len(partition)
-            return MappingProxyType(result)
-        counters = [i for i, d in enumerate(self.demands) if d.backlog is not None]
-        for a, b in combinations(counters, 2):
-            witnesses = []
-            for left in self.demands[a].members:
-                for right in self.demands[b].members:
-                    key = frozenset((left, right))
-                    if key not in self.counter_compatibility:
-                        poll("mode-2 consumption handbacks", pairs=len(self.counter_compatibility))
-                        self.counter_compatibility[key] = share_counter_time(
-                            self.domains, self.handbacks, left, right
-                        )
-                        self.domains.work.counter_time_pairs += 1
-                    else:
-                        self.domains.work.counter_time_cache_hits += 1
-                    witness = self.counter_compatibility[key]
-                    if witness is None:
-                        break
-                    witnesses.append(witness)
-                else:
-                    continue
-                break
-            else:
-                result[a, b] = tuple(witnesses)
-        return MappingProxyType(result)
+            return empty
+        routes = {}
+        for number, demand in enumerate(self.demands):
+            if demand.backlog is None:
+                continue
+            keys = {
+                (
+                    n.source_engine,
+                    n.destination_engine,
+                    tuple(p.actor for p in n.sources),
+                    tuple(p.actor for p in n.consumers),
+                )
+                for n in demand.members
+            }
+            # The member rule requires identical routes for every pair.
+            # A mixed-route complete credit cannot time-share another one.
+            if len(keys) == 1:
+                routes.setdefault(next(iter(keys)), []).append(number)
+        self.counter_frontiers = EventFrontiers(
+            self.domains,
+            self.handbacks,
+            self.demands,
+            self.counter_time_permission,
+            established=self.counter_frontiers,
+        )
+        return FrozenEventRelations(self.counter_frontiers.build(routes.values()))
 
     def build(self):
         self.reservations_and_credits()
@@ -470,12 +464,14 @@ class _Planning:
         peers, actions = bind_event_peers(self.demands, self.actions)
         relations = self.relations(peers)
         self.domains.work.peer_equalities = len(peers)
-        counter_groups = plan_counter_groups(
-            self.program,
-            self.demands,
-            relations,
-            compatible=self.compatible,
-            handbacks=self.handbacks,
+        counter_groups = (
+            plan_counter_groups(
+                self.program,
+                self.demands,
+                handbacks=self.handbacks,
+            )
+            if None in self.pressured
+            else ()
         )
         self.domains.work.counter_groups = len(counter_groups)
         time_relations = self.time_relations(counter_groups)

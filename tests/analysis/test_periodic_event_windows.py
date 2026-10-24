@@ -90,7 +90,7 @@ def _oracle(window, count, active: Callable[[int], bool], *, context=None, perio
                 assert successors[width].evaluate(values) == target
                 assert g + phases[0] == target
     if members:
-        first, last = window.first_last()
+        first, last = window.first, window.last()
         assert (first.evaluate(context), last.evaluate(context)) == (members[0], members[-1])
         assert [window.rank().evaluate(context | {"g": g}) for g in members] == list(
             range(len(members))
