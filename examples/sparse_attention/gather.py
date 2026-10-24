@@ -95,8 +95,6 @@ def gather_compressed(
     masks,
     available,
     cutoff,
-    group,
-    slot,
     sid,
     BK,
     ROWS,
@@ -111,7 +109,6 @@ def gather_compressed(
     # With one slot, publish the previous block before reusing its storage.
     ORDER = ("sparse_publish", "sparse_load") if SLOTS == 1 else ("sparse_load", "sparse_publish")
     for block in N.Pipelined(BK // 2 // ROWS, issue_order=ORDER):
-        bank = block % SLOTS
         start = sid * (BK // 2) + block * ROWS
         with N.Stage(0, name="sparse_load"):
             for row in N.serial(ROWS):
@@ -122,13 +119,13 @@ def gather_compressed(
                         page = N.load_index(
                             CmpTable[index // (PAGE // RATIO) : index // (PAGE // RATIO) + 1]
                         )
-                        N.copy(Cmp[page, index % (PAGE // RATIO), 0, :], rows[bank, row, :])
-                        N.store_scalar(zero, out=masks[bank, row : row + 1])
+                        N.copy(Cmp[page, index % (PAGE // RATIO), 0, :], rows.at(block)[row, :])
+                        N.store_scalar(zero, out=masks.at(block)[row : row + 1])
                     else:
-                        N.store_scalar(masked, out=masks[bank, row : row + 1])
+                        N.store_scalar(masked, out=masks.at(block)[row : row + 1])
                 else:
-                    N.store_scalar(masked, out=masks[bank, row : row + 1])
+                    N.store_scalar(masked, out=masks.at(block)[row : row + 1])
         with N.Stage(1, name="sparse_publish"):
             # Masks and rows are in the same MTE3 publication prefix.
-            N.copy(masks[bank, :], Bias[group, slot, start : start + ROWS])
-            N.copy(rows[bank, :, :], KV[group, slot, start : start + ROWS, :])
+            N.copy(masks.at(block), Bias[start : start + ROWS])
+            N.copy(rows.at(block), KV[start : start + ROWS, :])
