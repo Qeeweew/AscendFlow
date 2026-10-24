@@ -161,7 +161,7 @@ class EventResourceProblem:
     """Owned, frozen resource premises; no domain or solver service is exposed.
 
     Construct with plan_event_resources. Relations cover all members of each
-    complete credit. A missing/None relation supplies no reuse permission.
+    selected occupation, retaining its logical credit. Missing/None gives no permission.
     CounterSharing pairs still require a whole CounterGroup for FIFO packing.
     Work is diagnostic accounting only and never an allocation premise.
     """
@@ -282,6 +282,8 @@ class ResourceWork:
     consumption_bound_exclusions: int = 0
     phase_occupancies: int = 0
     phase_candidates: int = 0
+    transfer_fact_contexts: int = 0
+    transfer_fact_reuses: int = 0
 
 
 @dataclass(frozen=True)

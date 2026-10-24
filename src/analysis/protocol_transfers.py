@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from ..budget import poll
-from ..scalar import literal, substitute
+from ..scalar import expression, literal, substitute
 from .event_domains import EventCase
 from .guard_cover import opposite
 from .smt import all_of, any_of
@@ -69,6 +69,29 @@ class _QueryFacts:
             for value, number in self.equalities.items()
             if value.kind == "argument"
         }
+        self.shapes, self.differences = {}, {}
+        for test in assumptions:
+            base, offset = self._difference(test.lhs, test.rhs)
+            low, high = self.differences.get(base, (None, None))
+            if test.predicate in {">", ">=", "=="}:
+                bound = -offset + int(test.predicate == ">")
+                low = bound if low is None else max(low, bound)
+            if test.predicate in {"<", "<=", "=="}:
+                bound = -offset - int(test.predicate == "<")
+                high = bound if high is None else min(high, bound)
+            self.differences[base] = low, high
+            negative, shift = self._shape(expression("mul", literal(-1), base))
+            # Negating a normalized nonconstant sum introduces no offset.
+            # Keep the offset explicitly so this remains an upper/lower
+            # bound if normalization later learns additional equivalences.
+            a, b = self.differences.get(negative, (None, None))
+            if high is not None:
+                bound = -high - shift
+                a = bound if a is None else max(a, bound)
+            if low is not None:
+                bound = -low - shift
+                b = bound if b is None else min(b, bound)
+            self.differences[negative] = a, b
 
     def normalize(self, value):
         return (
@@ -76,6 +99,26 @@ class _QueryFacts:
             if self.atoms
             else self.arithmetic.normalize(value)
         )
+
+    def _shape(self, value):
+        if value not in self.shapes:
+            pending, terms, constant = [self.normalize(value)], [], 0
+            while pending:
+                part = pending.pop()
+                if part.constant is not None:
+                    constant += part.constant
+                elif part.kind == "add":
+                    pending.extend(reversed(part.args))
+                else:
+                    terms.append(part)
+            base = literal(0)
+            for term in terms:
+                base = expression("add", base, term)
+            self.shapes[value] = base, constant
+        return self.shapes[value]
+
+    def _difference(self, lhs, rhs):
+        return self._shape(expression("sub", lhs, rhs))
 
     def truth(self, condition):
         pending = [(condition, False)]
@@ -122,7 +165,24 @@ class _QueryFacts:
             return True
         if opposite(test) in self.tests:
             return False
-        return None
+        base, offset = self._difference(lhs, rhs)
+        low, high = self.differences.get(base, (None, None))
+        low = None if low is None else low + offset
+        high = None if high is None else high + offset
+        positive = low is not None and low > 0
+        nonnegative = low is not None and low >= 0
+        negative = high is not None and high < 0
+        nonpositive = high is not None and high <= 0
+        zero = low == high == 0
+        yes, no = {
+            ">": (positive, nonpositive),
+            ">=": (nonnegative, negative),
+            "<": (negative, nonnegative),
+            "<=": (nonpositive, positive),
+            "==": (zero, positive or negative),
+            "!=": (positive or negative, zero),
+        }[test.predicate]
+        return True if yes else False if no else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +392,7 @@ class ProtocolTransfers:
         self.episodes = {}
         self._unions, self._snapshots = {}, {}
         self._consumed_states = {}
+        self._query_facts = {}
         self._input_orders = {}
         self.native_acquires = {}
         words = {}
@@ -684,7 +745,12 @@ class ProtocolTransfers:
             setattr(self.work, name, getattr(self.work, name) + 1)
 
         count("queries")
-        facts = _QueryFacts(self.domains.arithmetic, assumptions)
+        if assumptions not in self._query_facts:
+            self._query_facts[assumptions] = _QueryFacts(self.domains.arithmetic, assumptions)
+            self.work.transfer_fact_contexts += 1
+        else:
+            self.work.transfer_fact_reuses += 1
+        facts = self._query_facts[assumptions]
         if any(facts.truth(test) is False for test in assumptions):
             # The caller still proves this empty activation with the shared
             # mathematical service. No real action is pinned by an empty case.
