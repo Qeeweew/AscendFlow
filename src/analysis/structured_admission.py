@@ -177,6 +177,23 @@ def _span(access, bindings):
     return _collapse(result)
 
 
+def _logical_allocation_span(access):
+    # Use logical extents, excluding any allocation alignment padding. The
+    # admitted source/native mapping keeps every legal read inside this span.
+    size = literal(ITEMSIZE[access.address.geometry.dtype])
+    for extent in access.address.axes.extents:
+        size = expression("mul", size, extent)
+    return _Span(literal(0), size)
+
+
+def _read_enclosures(access, actor, memory, bounds):
+    """Existing source/native enclosures, without enlarging any real access."""
+    yield _logical_allocation_span(access)
+    bindings = _participant(actor, memory.control.sid)
+    for enclosing in bounds.addresses[access.address.operation.ref].enclosures:
+        yield _Span(substitute(enclosing.origin, bindings), literal(enclosing.nbytes))
+
+
 def _collapse(span):
     if span.rows > 1 and span.width.constant is not None and span.width.constant >= span.pitch:
         return _Span(
@@ -1094,18 +1111,17 @@ def admit_structured_memory(
                 candidates, writers = spans.before(instance, template)
                 needed = _span(access, _participant(actor, memory.control.sid))
                 # The checked source/native mapping keeps every legal read
-                # inside the logical allocation. Once real writers define all
-                # of it, querying the dynamic read's bounds would duplicate the
-                # caller's access contract. Do not include allocation padding,
-                # or turn this numerical fact into readiness/ownership/KILL.
-                size = literal(ITEMSIZE[access.address.geometry.dtype])
-                for extent in access.address.axes.extents:
-                    size = expression("mul", size, extent)
-                whole = _Span(literal(0), size)
+                # inside its logical allocation and retained prefix planes.
+                # Once real writers define one such enclosure, querying the
+                # dynamic read's bounds would duplicate the caller's access
+                # contract. Do not include allocation padding, or turn this
+                # numerical fact into readiness/ownership/KILL.
                 _require(
-                    _covers(candidates, whole, template.frame, facts, work)
-                    or needed != whole
-                    and _covers(candidates, needed, template.frame, facts, work),
+                    any(
+                        _covers(candidates, enclosing, template.frame, facts, work)
+                        for enclosing in _read_enclosures(access, actor, memory, bounds)
+                    )
+                    or _covers(candidates, needed, template.frame, facts, work),
                     "native reads storage without a proved initialized writer coverage",
                     template.operation,
                     witness=(
@@ -1217,8 +1233,13 @@ def admit_structured_memory(
                     definitions.add(expected, (writer.operation,), facts)
                 covered = definitions.covering(needed, reader.frame.domains(), facts) is not None
             else:
-                covered = expected is not None and _covers(
-                    [expected], needed, reader.frame, facts, work
+                # A selected writer defining a complete retained plane also
+                # defines every legal indirect subview of it. Retain this
+                # writer identity: another initialized writer cannot stand in
+                # for it, and the real read still undergoes overwrite checks.
+                covered = expected is not None and (
+                    expected in _read_enclosures(access, actor, memory, bounds)
+                    or _covers([expected], needed, reader.frame, facts, work)
                 )
             _require(
                 covered,

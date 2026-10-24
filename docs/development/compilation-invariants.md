@@ -21,6 +21,12 @@ physical 方式。lowering 产生该 selector 对应的真实 modulo 或直接�
 与结构化 view 进入相同地址/effects/alias 链。Tile slice 沿共享值 DAG 转发原
 writer，读取的真实区域仍由 admission 检查，切片不定义新值。
 
+选中的真实 writer 若已定义完整逻辑 allocation 或已建立 enclosure 的完整槽平面，
+其 Tile 可供该范围内合法的间接子视图读取；不重复证明调用方动态索引的 bounds。
+普通初始化检查也消费同一 source/native enclosure 及真实完整 writer。完整范围排除 allocation padding，
+不能由其他 writer 的初始化补大当前 Tile。实际读取仍检查 participant、原 writer
+及之后的可能覆盖；该数值定义事实不提供 ready、ownership 或事件消费。
+
 返回部分 row-prefix copy 的 Tile 表示该更新点的目标区域。其保留部分必须在
 更新发生时已有定义：admission 在真实 native 更新后、下一个 writer 前，从既有
 region/字节 transfer 冻结来源快照，并分别保存实际 participant。完整 payload
