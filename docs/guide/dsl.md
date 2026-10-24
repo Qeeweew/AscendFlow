@@ -32,11 +32,11 @@
 | `alloc_*(shape, dtype, slots=S)`、`slotted_view(view, axis=0)` | 明确槽轴与每槽 payload，绑定已有 view 时不增加存储 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
 | `copy(..., valid_rows=r)` | 二维 runtime 行前缀；GM→L1 可补零或保留其余 NZ 行，UB→GM 部分写 |
-| `alloc_mask(shape)` | 显式 UB packed predicate 存储，64 lane 一个 32 B 块 |
+| `alloc_mask(shape, slots=S)` | 显式 UB packed predicate 存储，每槽的64 lane占一个32 B块；不指定slots时为普通存储 |
 | `fill(destination, value)` | 连续 f32/f16/bf16 UB view 的完整写入；b16 使用精确 16 位 Vector Dup |
 | `arange(n)`、比较、`& \| ~` | 精确整数逻辑 lane 坐标与带shape谓词，支持singleton轴广播 |
 | `compare(x, threshold, kind=..., out=...)` | f32逐lane比较写入packed predicate；结果绑定该次实际读写 |
-| `materialize/mask_and/mask_or/mask_not(..., out=...)` | 显式物化与packed位布尔组合；mask_and/mask_or/mask_not的out需独立存储 |
+| `materialize/mask_and/mask_or/mask_not(..., out=...)` | 显式物化与packed位布尔组合；布尔组合的out须与输入真实字节范围分离，允许同一allocation的不同槽 |
 | `where(p, x, y, out=...)` | 两路均已定义的完整选择，不短路非法load |
 | `fill/mul/add/sub/div/maximum/exp/sqrt/rsqrt(..., mask=p)` | 显式谓词更新；mask=False lane保留目标旧值 |
 

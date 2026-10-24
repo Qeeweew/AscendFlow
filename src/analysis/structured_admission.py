@@ -34,9 +34,11 @@ from ..target.ascend910b import Actor
 from ..target.native import ITEMSIZE
 from .matrix_regions import RegionDefinitions
 from .native import ConditionalRead
+from .smt import any_of, query_service
 from .structured_bounds import MemoryBoundsFacts
 from .structured_control import LogicalLoop
 from .structured_memory import MemoryAccess, MemoryTemplate, NativeMemoryFacts
+from .structured_schedule import Comparison
 from .value_bindings import LastTile, TileDefinition, TileUse
 
 if TYPE_CHECKING:
@@ -705,18 +707,48 @@ def _native_aliases(memory):
                 ):
                     continue
                 a, b = source.address, destination.address
-                if a.geometry == b.geometry and (
-                    a.offset == b.offset or equivalent(a.offset, b.offset, facts)
+                packed = template.spec.native in {"mask_and", "mask_or", "mask_not"}
+                if (
+                    not packed
+                    and a.geometry == b.geometry
+                    and (a.offset == b.offset or equivalent(a.offset, b.offset, facts))
                 ):
                     continue
                 delta = normalize(expression("sub", b.offset, a.offset), facts)
                 low, high = interval(delta, template.frame.domains(), facts)
                 source_span = a.geometry.nbytes + (a.geometry.rows - 1) * a.geometry.row_stride
                 destination_span = b.geometry.nbytes + (b.geometry.rows - 1) * b.geometry.row_stride
+                separated = nonnegative(
+                    expression("sub", low, literal(source_span)), facts
+                ) or nonnegative(expression("sub", literal(-destination_span), high), facts)
+                if not separated:
+                    premises = (
+                        tuple(
+                            test
+                            for coordinate, lower, upper in template.frame.domains()
+                            for test in (
+                                Comparison(coordinate, ">=", lower),
+                                Comparison(coordinate, "<=", upper),
+                            )
+                        )
+                        + template.frame.predicates()
+                    )
+                    separated = (
+                        query_service(facts)
+                        .implies(
+                            any_of(
+                                Comparison(delta, ">=", literal(source_span)),
+                                Comparison(delta, "<=", literal(-destination_span)),
+                            ),
+                            premises,
+                        )
+                        .proved
+                    )
                 _require(
-                    nonnegative(expression("sub", low, literal(source_span)), facts)
-                    or nonnegative(expression("sub", literal(-destination_span), high), facts),
-                    "native read/write aliases need identical views or proved disjoint byte ranges",
+                    separated,
+                    "masked boolean combination output needs distinct predicate storage"
+                    if packed
+                    else "native read/write aliases need identical views or proved disjoint byte ranges",
                     template.operation,
                     witness=(
                         a.root.owner.sym_name.data,

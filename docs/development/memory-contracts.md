@@ -38,6 +38,13 @@ native operand 对应、内部物理容量以及目标指令能力。对应检�
 合法访问只提供它实际发生时的局部空间前提，不提供全局范围、循环非空、地址
 唯一性、初始化、ownership、完成或事件消费。无法精确分区时保留可能别名顺序。
 
+packed predicate 的布尔组合要求输出与全部输入的真实字节范围分离。
+`alloc_mask(..., slots=S)` 中不同的物理槽可以共享一个 allocation root；
+source 和 lowering 保留实际 selector，native admission 用同一份地址和完整
+已求值 branch/loop 前提建立分离。相同范围或未知重叠不能获得许可。谓词的
+descriptor 和逻辑 Tile 仍指向原 writer，另一个已初始化兄弟槽不能替代它。
+这份空间许可不提供谓词 ready 或源/目标槽的 reader 退休。
+
 ## Tensor 声明
 
 ```python

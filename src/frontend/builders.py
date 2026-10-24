@@ -1677,10 +1677,9 @@ def _mask_combine(lhs, rhs, kind, out):
         "masked boolean combination requires equal predicate shapes",
     )
     sources = (lhs.storage,) if unary else (lhs.storage, rhs.storage)
-    require(
-        all(storage.view.buffer.op is not out.buffer.op for storage in sources),
-        "masked boolean combination output needs distinct predicate storage",
-    )
+    # Source views retain the actual root and selector. Native admission
+    # proves disjoint packed ranges; allocation identity alone cannot decide
+    # whether separate slots alias, and SSA comparisons are device values.
     from ..dialects.source import MaskCombineOp as Combine
 
     dependencies = [_trace().logical(storage.tile.value) for storage in sources]

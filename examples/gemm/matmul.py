@@ -14,38 +14,31 @@ def import_panel(inputs, buffers, geometry, coordinates):
     A, B = inputs
     a1, b1 = buffers
     mvalid, kvalid, nvalid = geometry
-    row, k, panel, column = coordinates
-    T.copy(
-        A[row : row + mvalid, k : k + kvalid],
-        a1[panel % 2, :, :],
-        pad_value=0,
-    )
-    T.copy(
-        B[k : k + kvalid, column : column + nvalid],
-        b1[panel % 2, :, :],
-        pad_value=0,
-    )
+    row, k, column = coordinates
+    with T.CopyGroup(name="panels"):
+        av = T.copy(A[row : row + mvalid, k : k + kvalid], a1, pad_value=0)
+        bv = T.copy(B[k : k + kvalid, column : column + nvalid], b1, pad_value=0)
+    return av, bv
 
 
 @T.inline
 def accumulate_panel(inputs, buffers, geometry, coordinates):
-    (C,) = inputs
-    a1, a0, b1, b0, c0 = buffers
+    C, av, bv = inputs
+    a0, b0, c0 = buffers
     BK, CK, parts, BN, final, nvalid, mvalid = geometry
     panel, kbase, panels, column, row = coordinates
     for chunk in T.unroll(BK // CK):
         aa = T.copy(
-            a1[panel % 2, :, chunk * CK : (chunk + 1) * CK],
-            a0[chunk % 2, :, :],
+            av[:, chunk * CK : (chunk + 1) * CK],
+            a0.at(chunk),
         )
         for part in T.unroll(parts):
             bb = T.copy(
-                b1[
-                    panel % 2,
+                bv[
                     chunk * CK : (chunk + 1) * CK,
                     part * BN : (part + 1) * BN,
                 ],
-                b0[(chunk * parts + part) % 2, :, :],
+                b0.at(chunk * parts + part),
             )
             T.matmul(
                 aa,
@@ -96,10 +89,10 @@ def gemm(
         assert BM % 16 == 0 and BN % 16 == 0 and BK % 16 == 0, "tiles need complete Cube fractals"
         assert CK > 0 and BK % CK == 0, "BK must contain complete Cube chunks"
         assert L2_TILE >= 0, "L2_TILE must be nonnegative; zero selects the cache budget"
-        a1 = T.alloc_l1((2, BM, BK), DTYPE)
-        b1 = T.alloc_l1((2, BK, BN * COL_PARTS), DTYPE)
-        a0 = T.alloc_l0a((2, BM, CK), DTYPE)
-        b0 = T.alloc_l0b((2, CK, BN), DTYPE)
+        a1 = T.alloc_l1((BM, BK), DTYPE, slots=2)
+        b1 = T.alloc_l1((BK, BN * COL_PARTS), DTYPE, slots=2)
+        a0 = T.alloc_l0a((BM, CK), DTYPE, slots=2)
+        b0 = T.alloc_l0b((CK, BN), DTYPE, slots=2)
         c0 = T.alloc_l0c((COL_PARTS, BM, BN), T.f32)
         # Unaligned output rows stay with one Cube to avoid overlapping byte fragments.
         balanced = M % BM == 0 and N % (BN * COL_PARTS) == 0
@@ -120,19 +113,19 @@ def gemm(
                         column = nbase + col_start + (0 if balanced else col * BN * COL_PARTS)
                         for kbase, panels, kvalid in T.tile_ranges(K, BK):
                             final = kbase + panels * BK >= K
-                            for panel in T.Pipelined(panels):
+                            for panel in T.Pipelined(panels, issue_order=("load", "compute")):
                                 k = kbase + panel * BK
                                 with T.Stage(0, name="load"):
-                                    import_panel(
+                                    av, bv = import_panel(
                                         (A, B),
-                                        (a1, b1),
+                                        (a1.at(panel), b1.at(panel)),
                                         (mvalid, kvalid, nvalid),
-                                        (row, k, panel, column),
+                                        (row, k, column),
                                     )
                                 with T.Stage(1, name="compute"):
                                     accumulate_panel(
-                                        (C,),
-                                        (a1, a0, b1, b0, c0),
+                                        (C, av, bv),
+                                        (a0, b0, c0),
                                         (BK, CK, parts, BN, final, nvalid, mvalid),
                                         (panel, kbase, panels, column, row),
                                     )

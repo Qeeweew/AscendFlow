@@ -10,24 +10,24 @@ from ascendflow import language as T
 
 
 @T.inline
-def softmax_compute(x, statistic, slot, partial, D, broadcast, y):
+def softmax_compute(x, statistic, partial, D, broadcast, y):
     maximum = T.reduce_max(
-        x[slot, :, :],
+        x,
         axis=1,
         out=statistic,
         scratch=partial[:, : D // 64],
         order="r64_then_packed_merge",
     )
-    T.sub(x[slot, :, :], maximum[:, None], out=y[slot, :, :], scratch=broadcast)
-    T.exp(y[slot, :, :], out=y[slot, :, :])
+    shifted = T.sub(x, maximum[:, None], out=y, scratch=broadcast)
+    exponentials = T.exp(shifted, out=y)
     total = T.reduce_sum(
-        y[slot, :, :],
+        exponentials,
         axis=1,
         out=statistic,
         scratch=partial[:, : D // 64],
         order="r64_then_packed_merge",
     )
-    T.div(y[slot, :, :], total[:, None], out=y[slot, :, :], scratch=broadcast)
+    return T.div(exponentials, total[:, None], out=y, scratch=broadcast)
 
 
 @T.prim_func(disjoint_external=True)
@@ -40,17 +40,16 @@ def softmax(
     GROUPS: T.constexpr = 32,
 ):
     with T.Kernel(GROUPS, kind="vector") as group:
-        x = T.alloc_ub((2, R, D), T.f32, name="inputs")
-        y = T.alloc_ub((2, R, D), T.f32, name="outputs")
+        x = T.alloc_ub((R, D), T.f32, slots=2, name="inputs")
+        y = T.alloc_ub((R, D), T.f32, slots=2, name="outputs")
         # Packed merge reads each partial row at a 32-byte boundary.
         partial = T.alloc_ub((R, ((D // 64 + 7) // 8) * 8), T.f32, name="partial")
         statistic = T.alloc_ub((R,), T.f32, name="statistic")
         broadcast = T.alloc_ub((R, 8), T.f32, name="broadcast")
         for tile in T.Pipelined(tiles, issue_order=("store", "load", "compute")):
-            slot = tile % 2
             with T.Stage(0, name="load"):
-                T.copy(X[group, tile, :, :], x[slot, :, :])
+                loaded = T.copy(X[group, tile, :, :], x.at(tile))
             with T.Vector(), T.Stage(1, name="compute"):
-                softmax_compute(x, statistic, slot, partial, D, broadcast, y)
+                normalized = softmax_compute(loaded, statistic, partial, D, broadcast, y.at(tile))
             with T.Stage(2, name="store"):
-                T.copy(y[slot, :, :], Y[group, tile, :, :])
+                T.copy(normalized, Y[group, tile, :, :])

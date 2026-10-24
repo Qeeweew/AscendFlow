@@ -114,7 +114,7 @@ def examples():
         "gemm/batched",
         "batched_matmul",
         "gemm.run",
-        ("--variant", "generated"),
+        ("--variant", "generated", "--dtype", "bf16"),
         ("--tiles", "0", "1", "7", "--repeats", "1"),
     )
     add(
@@ -122,7 +122,7 @@ def examples():
         "gemm/reduction",
         "reduction_gemm",
         "gemm.run_reduction",
-        ("--variant", "generated"),
+        ("--variant", "generated", "--dtype", "bf16"),
         ("--panels", "0", "1", "7", "--repeats", "1"),
     )
     add(
@@ -130,7 +130,7 @@ def examples():
         "gemm/hierarchical",
         "hierarchical_gemm",
         "gemm.run_hierarchical",
-        ("--variant", "generated"),
+        ("--variant", "generated", "--dtype", "bf16"),
         ("--cases", "0:0", "1:0", "1:1", "3:7", "--repeats", "1"),
     )
     add(
@@ -146,7 +146,7 @@ def examples():
         "gemm/matmul",
         "gemm",
         "gemm.run_matmul",
-        ("--m", "129", "--n", "257", "--k", "259"),
+        ("--m", "129", "--n", "257", "--k", "259", "--dtype", "bf16"),
         ("--scope", "full", "--warmup", "1", "--repeats", "1"),
     )
     add(

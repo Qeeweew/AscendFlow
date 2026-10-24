@@ -51,14 +51,13 @@ def masks(
         scratch = N.alloc_ub((ROWS, COLUMNS), N.f32, name="scratch")
         results = N.alloc_ub((ROWS, COLUMNS), N.f32, name="results")
         fill_work = N.alloc_ub((ROWS, COLUMNS), N.f32, name="fill_work")
-        bits_p = N.alloc_mask((ROWS, COLUMNS), name="bits_p")
-        bits_q = N.alloc_mask((ROWS, COLUMNS), name="bits_q")
-        bits_not = N.alloc_mask((ROWS, COLUMNS), name="bits_not")
-        bits_or = N.alloc_mask((ROWS, COLUMNS), name="bits_or")
-        bits_and = N.alloc_mask((ROWS, COLUMNS), name="bits_and")
-        N.copy(X, coord_work)
-        N.copy(X, data_work)
-        N.copy(Z, z_work)
+        predicates = N.alloc_mask((ROWS, COLUMNS), slots=5, name="predicates")
+        # These imports have one source queue and one consumer route. Their
+        # joint ready leaves each payload's later reuse independent.
+        with N.CopyGroup(name="inputs"):
+            coordinate_value = N.copy(X, coord_work)
+            data_value = N.copy(X, data_work)
+            z_value = N.copy(Z, z_work)
         rows = N.arange(ROWS)[:, None]
         cols = N.arange(COLUMNS)[None, :]
         interval = (cols >= lo) & (cols < hi)
@@ -72,25 +71,25 @@ def masks(
         boolean = different & origin
         # Preserve-update masked arithmetic, then an ordinary count op, then a
         # masked fill whose false lanes must keep the count result.
-        N.mul(coord_work, 2.0, out=coord_work, mask=interval)
-        N.add(coord_work, 1.0, out=coord_work)
-        N.fill(coord_work, -3.0, mask=boolean)
-        N.copy(coord_work, Y0)
+        coordinate_value = N.mul(coordinate_value, 2.0, out=coord_work, mask=interval)
+        coordinate_value = N.add(coordinate_value, 1.0, out=coord_work)
+        coordinate_value = N.fill(coord_work, -3.0, mask=boolean)
+        N.copy(coordinate_value, Y0)
         # Data predicates: p is bound before data_work is overwritten.
-        p = N.compare(data_work, 0.25, kind="gt", out=bits_p)
-        N.mul(data_work, 5.0, out=data_work)
-        q_pred = N.compare(data_work, z_work, kind="gt", out=bits_q)
-        n = N.mask_not(p, out=bits_not)
-        both = N.mask_and(p, q_pred, out=bits_and)
+        p = N.compare(data_value, 0.25, kind="gt", out=predicates.slot(0))
+        data_value = N.mul(data_value, 5.0, out=data_work)
+        q_pred = N.compare(data_value, z_value, kind="gt", out=predicates.slot(1))
+        n = N.mask_not(p, out=predicates.slot(2))
+        both = N.mask_and(p, q_pred, out=predicates.slot(4))
         # either is neither q_pred&p alone nor ~p alone: true-p lanes need the
         # AND, false-p lanes need the NOT+OR, so all three are observable.
-        either = N.mask_or(both, n, out=bits_or)
-        N.where(either, data_work, z_work, out=results)
+        either = N.mask_or(both, n, out=predicates.slot(3))
+        selected = N.where(either, data_value, z_value, out=results)
         # A data-predicate preserve update reuses explicit scratch storage.
-        N.copy(results, fill_work)
-        N.fill(fill_work, -9.0, mask=both, scratch=scratch)
-        N.copy(results, Y1)
-        N.copy(fill_work, Y2)
+        N.copy(selected, fill_work)
+        filled = N.fill(fill_work, -9.0, mask=both, scratch=scratch)
+        N.copy(selected, Y1)
+        N.copy(filled, Y2)
 
 
 def main():

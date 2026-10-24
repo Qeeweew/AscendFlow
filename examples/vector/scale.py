@@ -20,16 +20,15 @@ def scale(
     B: N.constexpr = 64,
 ):
     with N.Kernel(1, kind="vector"):
-        x = N.alloc_ub((2, B), N.f32, name="inputs")
-        y = N.alloc_ub((2, B), N.f32, name="outputs")
-        for t in N.Pipelined(tiles):
-            slot = t % 2
+        x = N.alloc_ub((B,), N.f32, slots=2, name="inputs")
+        y = N.alloc_ub((B,), N.f32, slots=2, name="outputs")
+        for t in N.Pipelined(tiles, issue_order=("load", "compute", "store")):
             with N.Stage(0, name="load"):
-                N.copy(X[t, :], x[slot, :])
+                loaded = N.copy(X[t, :], x.at(t))
             with N.Vector(), N.Stage(1, name="compute"):
-                N.mul(x[slot, :], 2.0, out=y[slot, :])
+                scaled = N.mul(loaded, 2.0, out=y.at(t))
             with N.Stage(2, name="store"):
-                N.copy(y[slot, :], Y[t, :])
+                N.copy(scaled, Y[t, :])
 
 
 def main():

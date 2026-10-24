@@ -861,8 +861,9 @@ class MaskCombineOp(IRDLOperation):
             or tuple(size.data for size in self.result.type.shape) != shape
         ):
             raise VerifyException("mask combination needs explicit packed result blocks")
-        if _mask_storage(self.out) in {_mask_storage(storage) for storage in operands}:
-            raise VerifyException("mask combination output needs distinct predicate storage")
+        # Packed views may occupy separate slots of one allocation. Actual
+        # native read/write disjointness is checked with their SSA addresses
+        # during admission, including identical and unknown-overlap views.
 
 
 @irdl_op_definition

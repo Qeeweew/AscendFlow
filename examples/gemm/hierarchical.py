@@ -24,19 +24,19 @@ def hierarchical_gemm(
     DTYPE: T.constexpr = T.f16,
 ):
     with T.Kernel(GROUPS, kind="cube") as group:
-        a1 = T.alloc_l1((3, M, BK), DTYPE, name="a1")
-        b1 = T.alloc_l1((3, N, BK), DTYPE, name="b1")
-        a0 = T.alloc_l0a((2, M, BK), DTYPE, name="a0")
-        b0 = T.alloc_l0b((2, BK, N), DTYPE, name="b0")
+        a1 = T.alloc_l1((M, BK), DTYPE, slots=3, name="a1")
+        b1 = T.alloc_l1((N, BK), DTYPE, slots=3, name="b1")
+        a0 = T.alloc_l0a((M, BK), DTYPE, slots=2, name="a0")
+        b0 = T.alloc_l0b((BK, N), DTYPE, slots=2, name="b0")
         c0 = T.alloc_l0c((M, N), T.f32, name="c0")
         for output in T.serial(outputs):
-            for k in T.Pipelined(panels):
-                with T.Stage(0, name="load"):
-                    av = T.copy(A[group, output, k, :, :], a1[k % 3, :, :])
-                    bv = T.copy(B[group, output, k, :, :], b1[k % 3, :, :])
+            for k in T.Pipelined(panels, issue_order=("load", "operands", "compute")):
+                with T.Stage(0, name="load"), T.CopyGroup(name="panels"):
+                    av = T.copy(A[group, output, k, :, :], a1.at(k))
+                    bv = T.copy(B[group, output, k, :, :], b1.at(k))
                 with T.Stage(1, name="operands"):
-                    aa = T.copy(av, a0[k % 2, :, :])
-                    bb = T.copy(bv, b0[k % 2, :, :], transpose=True)
+                    aa = T.copy(av, a0.at(k))
+                    bb = T.copy(bv, b0.at(k), transpose=True)
                 with T.Stage(2, name="compute"):
                     value = T.matmul(aa, bb, accum=c0[:, :], initialize=(k == 0))
                     if k == panels - 1:
