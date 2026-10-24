@@ -534,28 +534,22 @@ class _Value:
         return self.view.shape
 
     def __getitem__(self, indices):
-        if isinstance(indices, tuple) and indices == (None, slice(None)):
-            require(len(self.shape) == 1, "column broadcast requires one vector")
-            return _ColumnBroadcast(self)
-        if not (
-            isinstance(indices, tuple)
-            and len(indices) == 2
-            and isinstance(indices[0], slice)
-            and indices[0] == slice(None)
-            and indices[1] is None
-            and len(self.shape) == 1
-        ):
-            view = self.view[indices]
-            if isinstance(view, (_ColumnBroadcast, _RowBroadcast)):
-                return type(view)(self)
-            op = TileSliceOp.build(
-                operands=[_trace().logical(self.value), view.emit()],
-                result_types=[_tile(view)],
-            )
-            _trace().add(op)
-            _trace().record(op.value)
-            return _Value(view, op.value)
-        return _RowBroadcast(self)
+        # Share the actual view grammar. Comparing a tuple/slice containing
+        # device indices to a Python broadcast pattern would evaluate their
+        # overloaded predicates. A broadcast must also retain its selected
+        # subview, rather than silently reading the entire parent Tile.
+        view = self.view[indices]
+        broadcast = type(view) if isinstance(view, (_ColumnBroadcast, _RowBroadcast)) else None
+        if broadcast is not None:
+            view = view.source
+        op = TileSliceOp.build(
+            operands=[_trace().logical(self.value), view.emit()],
+            result_types=[_tile(view)],
+        )
+        _trace().add(op)
+        _trace().record(op.value)
+        value = _Value(view, op.value)
+        return value if broadcast is None else broadcast(value)
 
 
 @dataclass(frozen=True)

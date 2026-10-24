@@ -94,6 +94,11 @@ x.storage[i, :]  # 同一 allocation 的普通完整物理 view
 授权复写。`copy`、算术结果的普通 slice 保留原 writer；该区域被覆盖后读取旧
 Tile 仍会拒绝。`alloc_mask(..., slots=S).at(t)` 同样选择 packed predicate 存储。
 
+Tile 的运行时行索引和固定宽度切片沿用普通 view 的地址语义，例如 `tile[i,:]`
+和 `tile[i:i+R,:]`。切片广播保留所选子向量及其 writer，例如
+`v[None,b:b+64]` 或 `v[b:b+8,None]`；不会改读整个父 Tile。
+实际 native 的 shape、对齐、scratch 和别名合同仍须满足。
+
 部分 `copy(..., valid_rows=r)` 返回的 Tile 保留更新时目标未写区域的既有值。
 要读取整个返回区域，其余部分须在该更新点已有定义；更新后才进行的初始化
 不能补到这个旧 Tile。读取 raw view 仍按其实际读取时的存储状态检查。
