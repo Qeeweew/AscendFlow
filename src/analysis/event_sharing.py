@@ -17,6 +17,20 @@ class EventSharing:
 
 
 @dataclass(frozen=True, slots=True)
+class CellPhaseSharing:
+    """Projection of an established physical-cell lifetime onto its members.
+
+    Splitting integer allocation never resets that word or its open uses.
+    The exact original cell channel, ownership and nonduplicate members stay
+    the premise; this supplies no relation to another logical credit.
+    """
+
+    credit: object
+    left: object
+    right: object
+
+
+@dataclass(frozen=True, slots=True)
 class CounterSharing:
     """Pairwise order premises, not a certificate for a whole FIFO group.
 

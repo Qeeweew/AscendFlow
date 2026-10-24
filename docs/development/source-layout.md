@@ -91,7 +91,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/cell_channels.py` | 相同完整物理 ownership 集合和 role 的非重复 credit；原始值/存储 lifetime 归纳 |
 | `analysis/cell_ownership.py` | 从原始 body/全部 effects 建立闭合私有轮次，绑定真实 acquire/return、校验实际本地发射前提；不将队列端口当成 native lifetime |
 | `analysis/notification_lifetimes.py`、`consumption_frontiers.py` | 实际 reuse window 与 FIRST/LAST 端口、独立消费 origin、真实取得 cut 的二维前沿索引；共享未变条件事实并继续组合开放边界，不设固定 relay 深度 |
-| `analysis/event_planning.py`、`event_sharing.py`、`event_counter_groups.py`、`event_peers.py` | 完整 credit 的重叠 FIFO 候选、实际首末端口 word 拼接、FIFO 子组间完整消费回传、逐 publisher 积压及虚拟 AIV 对应；冻结组合与有限缩环选项 |
+| `analysis/event_planning.py`、`event_sharing.py`、`event_counter_groups.py`、`event_peers.py` | 保留 logical credit 的实际 local 成员 phase 占用、重叠 FIFO 候选、实际首末端口 word 拼接、FIFO 子组间完整消费回传、逐 publisher 积压及虚拟 AIV 对应；冻结实际数字池、组合与有限协议选项 |
 | `analysis/event_frontiers.py`、`event_frontier_contracts.py` | 本地事件真实发布/消费区间的分层包围与 handback 分离；失败接口细分，冻结完整 credit 的有限复用矩形；最终组检查逐行消费 mask，报告共享端点树/证书而不展开消息对 |
 | `analysis/event_coloring.py`、`structured_resources.py`、`event_contracts.py` | 联合专属、已证 FIFO 的结构分配和有限残余；时间复用保持完整消费前提；持久 token 与配置/drain 台账，全部选项共享工作上限，只消费冻结约束及物化编号 |
 | `passes/materialize_structure.py` | 插入确定动作、共享同位置短路 guard 前缀；不改变 native 或 issue order |

@@ -124,13 +124,19 @@ class PersistentEventAssignment:
 
 @dataclass(frozen=True, slots=True)
 class EventDemand:
-    """One complete credit's virtual lanes, independent of hardware numbers."""
+    """One occupation's virtual lanes, retaining its logical credit identity.
+
+    A whole credit is the preferred occupation. A phase may instead select
+    actual notification members; their own leases and all pairing still hold.
+    """
 
     members: tuple[LogicalNotification, ...]
     width: int
     banks: tuple[LocalBank, ...]
     backlog: int | None = None
     persistent: PersistentCellCredit | None = None
+    credit: object | None = None
+    phase: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +280,8 @@ class ResourceWork:
     consumption_acquired_boundaries: int = 0
     consumption_bound_queries: int = 0
     consumption_bound_exclusions: int = 0
+    phase_occupancies: int = 0
+    phase_candidates: int = 0
 
 
 @dataclass(frozen=True)
@@ -288,6 +296,7 @@ class StructuredEventPlan:
     channels: tuple[CellChannel, ...]
     banks: tuple[EventBankUsage, ...]
     id_pools: EventIdPools
+    occupancies: tuple[EventDemand, ...]
     sharing: tuple[EventSharing | LocalEventReuse | CounterSharing | CounterReuse, ...] = ()
     persistent: tuple[PersistentEventAssignment, ...] = ()
     counter_groups: tuple = ()

@@ -4,6 +4,7 @@ Only this stage can query occurrence domains or handbacks. The output has no
 query callbacks; changing candidate IDs cannot trigger another domain proof.
 """
 
+from collections import Counter
 from itertools import combinations
 from types import MappingProxyType
 
@@ -12,7 +13,11 @@ from ..diagnostics import require
 from ..dialects.physical import FixConfigOp
 from ..scalar import expression, literal
 from ..target.ascend910b import Actor, Engine, SyncKind
-from .event_coloring import counter_fifo_partition, exclusive_pressure_banks
+from .event_coloring import (
+    counter_fifo_partition,
+    exclusive_pressure_banks,
+    fixed_credit_pressure_banks,
+)
 from .event_contracts import (
     EventDemand,
     EventIdPools,
@@ -24,7 +29,7 @@ from .event_counter_groups import plan_counter_groups, plan_counter_time_groups
 from .event_frontier_contracts import FrozenEventRelations
 from .event_frontiers import LocalEventFrontiers
 from .event_peers import bind_event_peers
-from .event_sharing import share_counter_time, share_counters, share_events
+from .event_sharing import CellPhaseSharing, share_counter_time, share_counters, share_events
 from .notification_lifetimes import HandbackRule
 from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard, Placement
@@ -42,6 +47,7 @@ def plan_event_resources(program, *, id_pools=None):
     planner = _Planning(program, id_pools=id_pools)
     preferred = planner.build()
     alternatives = []
+    last = planner
     leases = dict(planner.leases)
     grouped = {b: a for a, b in preferred.peers}
     for number, demand in enumerate(preferred.demands):
@@ -71,23 +77,64 @@ def plan_event_resources(program, *, id_pools=None):
                     changed = True
         if not changed:
             continue
-        candidate = _Planning(
+        proposed_planner = _Planning(
             program, id_pools=id_pools, leases=proposed, established=planner
-        ).build()
+        )
+        candidate = proposed_planner.build()
         if not set(preferred.peers) <= set(candidate.peers):
             # Do not trade a mirrored protocol for new SID-specific code.
             continue
         leases = proposed
         alternatives.append(candidate)
+        last = proposed_planner
+    coarse = alternatives[-1] if alternatives else preferred
+    phase_banks = fixed_credit_pressure_banks(coarse)
+    if phase_banks:
+        phase_banks = set(phase_banks)
+        for a, b in coarse.peers:
+            banks = set(coarse.demands[a].banks + coarse.demands[b].banks)
+            if banks.intersection(phase_banks):
+                phase_banks.update(banks)
+        candidate = _Planning(
+            program,
+            id_pools=id_pools,
+            leases=leases,
+            established=last,
+            phase_banks=frozenset(phase_banks),
+        ).build()
+
+        def shared_actions(problem):
+            return Counter(
+                (
+                    a.anchor,
+                    a.placement,
+                    a.kind,
+                    a.source,
+                    a.destination,
+                    a.guard,
+                    a.protocols,
+                    a.phase,
+                    a.fixed_id,
+                )
+                for a in problem.actions
+                if len(a.participants) == 2
+            )
+
+        if shared_actions(coarse) <= shared_actions(candidate):
+            alternatives.append(candidate)
+            preferred.work.phase_candidates += 1
     object.__setattr__(preferred, "alternatives", tuple(alternatives))
     preferred.work.protocol_candidates = 1 + len(alternatives)
     return preferred
 
 
 class _Planning:
-    def __init__(self, program, *, id_pools, leases=None, established=None):
+    def __init__(
+        self, program, *, id_pools, leases=None, established=None, phase_banks=frozenset()
+    ):
         self.program = program
         self.id_pools = id_pools
+        self.phase_banks = phase_banks
         self.domains = program.domains
         self.leases = {v.notification: v for v in program.leases} if leases is None else leases
         self.channels = {m: c for c in program.channels for m in c.members}
@@ -165,7 +212,9 @@ class _Planning:
             source, destination = lifetime.source_engine, lifetime.destination_engine
             resource = len(self.demands)
             self.demands.append(
-                EventDemand((), 1, ((actor, source, destination),), persistent=credit)
+                EventDemand(
+                    (), 1, ((actor, source, destination),), persistent=credit, credit=credit
+                )
             )
             for placement, kind in (
                 (Placement.ENTRY, SyncKind.LOCAL_SET),
@@ -220,7 +269,13 @@ class _Planning:
             if not lease.width:
                 self.uses.append((notification, None))
                 continue
-            key = self.channels.get(notification, notification)
+            credit = self.channels.get(notification, notification)
+            split = credit is not notification and any(
+                (p.actor, notification.source_engine, notification.destination_engine)
+                in self.phase_banks
+                for p in notification.sources
+            )
+            key = notification if split else credit
             if key not in known:
                 members = tuple(
                     m
@@ -248,7 +303,16 @@ class _Planning:
                     )
                     backlog = max(c.backlog for m in members for c in self.leases[m].cases)
                 known[key] = len(self.demands)
-                self.demands.append(EventDemand(members, width, banks, backlog))
+                self.demands.append(
+                    EventDemand(
+                        members,
+                        width,
+                        banks,
+                        backlog,
+                        credit=credit,
+                        phase=credit.members.index(notification) if split else None,
+                    )
+                )
             resource = known[key]
             self.uses.append((notification, resource))
             for case in lease.cases:
@@ -293,7 +357,14 @@ class _Planning:
     def compatible(self, left, right):
         pair = frozenset((left, right))
         if pair not in self.compatibility:
-            if self.domains._exclusive(left, right):
+            credit = self.channels.get(left)
+            if (
+                credit is not None
+                and self.channels.get(right) is credit
+                and left.mechanism is NotificationKind.LOCAL_EVENT
+            ):
+                result = (CellPhaseSharing(credit, left, right),)
+            elif self.domains._exclusive(left, right):
                 result = ()
             else:
                 witness = (

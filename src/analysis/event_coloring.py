@@ -270,6 +270,34 @@ def exclusive_pressure_banks(demands, reservations, peers, id_pools):
     return pressured
 
 
+def fixed_credit_pressure_banks(problem):
+    """A finite clique of whole-credit constraints requests phase precision.
+
+    This is a sufficient failure of the frozen coarse mapping, never a
+    physical-occupancy minimum. Do not enumerate compatible member subsets.
+    """
+    groups, reserved = {}, {}
+    for r in problem.reservations:
+        reserved.setdefault(r.bank, set()).add(r.event)
+    for number, demand in enumerate(problem.demands):
+        if demand.backlog is None:
+            for bank in demand.banks:
+                groups.setdefault(bank, []).append(number)
+    result = set()
+    for bank, members in groups.items():
+        clique, width = [], 0
+        capacity = len(set(problem.id_pools.ids(bank)).difference(reserved.get(bank, ())))
+        for number in members:
+            if all(relation(problem, number, prior) is None for prior in clique):
+                clique.append(number)
+                width += problem.demands[number].width
+                if width > capacity:
+                    if any(len(problem.demands[n].members) > 1 for n in members):
+                        result.add(bank)
+                    break
+    return frozenset(result)
+
+
 def _exclusive_overfull(problem, group, reserved):
     """A real exclusive bank count avoids constructing a dense clique."""
     counts = {}
@@ -299,8 +327,10 @@ def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_pac
     for i, j in combinations(range(len(vertices)), 2):
         a, b = vertices[i][0], vertices[j][0]
         common = set(namespaces(demands[a])).intersection(namespaces(demands[b]))
-        permitted = reuse and relation(problem, a, b) is not None and (
-            not cross or counter_packing or (min(a, b), max(a, b)) in problem.counter_reuses
+        permitted = (
+            reuse
+            and relation(problem, a, b) is not None
+            and (not cross or counter_packing or (min(a, b), max(a, b)) in problem.counter_reuses)
         )
         if a == b or common and (not reuse or not permitted):
             adjacency[i].add(j)

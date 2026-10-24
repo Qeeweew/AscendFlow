@@ -10,7 +10,7 @@ from itertools import pairwise
 
 from .event_contracts import LOCAL_CAPACITY, SUPPORTED_CROSS_IDS
 from .event_frontier_contracts import LocalEventReuse
-from .event_sharing import EventSharing
+from .event_sharing import CellPhaseSharing, EventSharing
 from .smt import Boolean
 from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard
@@ -61,6 +61,14 @@ def event_resource_report(plan):
                             "original": None
                             if p.original is None
                             else [type(w).__name__ for w in p.original],
+                            "cell_phases": [
+                                {
+                                    "credit": channels[w.left],
+                                    "members": [numbers[w.left], numbers[w.right]],
+                                }
+                                for w in p.original or ()
+                                if isinstance(w, CellPhaseSharing)
+                            ],
                             "consumption": [
                                 handback(h)
                                 for h in (
@@ -383,6 +391,18 @@ def event_resource_report(plan):
             ],
         },
         "streams": streams,
+        "occupancies": [
+            {
+                "resource": resource,
+                "credit": channels.get(d.members[0]) if d.members else None,
+                "phase": d.phase,
+                "members": [numbers[n] for n in d.members],
+                "width": d.width,
+                "banks": [bank(b) for b in d.banks],
+                "backlog": d.backlog,
+            }
+            for resource, d in enumerate(plan.occupancies)
+        ],
         "id_pools": {
             "local": plan.id_pools.local,
             "cross": plan.id_pools.cross,
