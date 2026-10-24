@@ -31,17 +31,17 @@ def diagonal_gram(buffers, geometry, coordinates):
         inverse,
     ) = buffers
     SCALE, K = geometry
-    ring, block, valid = coordinates
-    N.cast(keys16[ring, :, :], out=keys)
-    N.mul(keys, betas[block : block + 16, None], out=weighted, scratch=rows)
-    N.cast(queries16[ring, :, :], out=queries)
+    block, valid = coordinates
+    key_values = N.cast(keys16, out=keys)
+    N.mul(key_values, betas[:, None], out=weighted, scratch=rows)
+    N.cast(queries16, out=queries)
     N.fill(steps[0, :], 1.0)
-    N.mul(gates[ring, :15, :], -1.0, out=steps[1:16, :])
-    N.add(steps[1:16, :], gates[ring, 1:16, :], out=steps[1:16, :])
+    N.mul(gates[:15, :], -1.0, out=steps[1:16, :])
+    N.add(steps[1:16, :], gates[1:16, :], out=steps[1:16, :])
     N.exp(steps[1:16, :], out=steps[1:16, :])
     N.copy(keys, decay)
     N.fill(diagonal, 0.0)
-    N.fill(attention[ring, :, :], 0.0)
+    N.fill(attention, 0.0)
     # Four causal prefixes avoid evaluating most upper-triangle
     # exp/products, retaining the same FP32 per-score sum tree.
     for quarter in N.unroll(4):
@@ -75,10 +75,11 @@ def diagonal_gram(buffers, geometry, coordinates):
                 SCALE,
                 out=scores[panel : panel + 16],
             )
-            N.copy(scores[panel : panel + 16], attention[ring, local, :])
+            N.copy(scores[panel : panel + 16], attention[local, :])
     N.fill(diagonal, 0.0, mask=upper, scratch=mask_zero)
-    N.fill(attention[ring, :, :], 0.0, mask=strict_upper, scratch=mask_zero)
+    result = N.fill(attention, 0.0, mask=strict_upper, scratch=mask_zero)
     N.copy(diagonal, inverse[:, block : block + 16])
+    return result
 
 
 @N.inline
@@ -109,25 +110,23 @@ def invert_diagonal(buffers, geometry):
         N.add(inverse_tree[:2, :], inverse_tree[2:4, :], out=inverse_tree[:2, :])
         N.add(inverse_tree[0, :], inverse_tree[1, :], out=inverse_tree[0, :])
         N.add(coefficients, inverse_tree[0, :], out=inverse[inverse_row, :])
-    N.add(inverse, identities, out=inverse)
+    return N.add(inverse, identities, out=inverse)
 
 
 @N.inline
-def diagonal_inverse(inputs, buffers, geometry, coordinates):
+def diagonal_inverse(inputs, buffers, geometry):
     Ai32, Diagonal = inputs
-    inverse = buffers[0]
     (BT,) = geometry
-    chunk, head = coordinates
-    invert_diagonal(buffers, geometry)
+    inverted = invert_diagonal(buffers, geometry)
     for plane in N.unroll(BT // 16):
         block = plane * 16
         N.copy(
-            inverse[:, block : block + 16],
-            Ai32[chunk, head, block : block + 16, block : block + 16],
+            inverted[:, block : block + 16],
+            Ai32[block : block + 16, block : block + 16],
         )
         N.copy(
-            inverse[:, block : block + 16],
-            Diagonal[chunk, head, block : block + 16, block : block + 16],
+            inverted[:, block : block + 16],
+            Diagonal[block : block + 16, block : block + 16],
         )
 
 
@@ -152,12 +151,12 @@ def prefill_gram(
 ):
     with N.Kernel(GROUPS, kind="vector") as owner:
         assert K == 128 and BT == 64, "four diagonal blocks share 64-wide Vector rows"
-        keys16 = N.alloc_ub((2, 16, K), DTYPE)
-        queries16 = N.alloc_ub((2, 16, K), DTYPE)
+        keys16 = N.alloc_ub((16, K), DTYPE, slots=2)
+        queries16 = N.alloc_ub((16, K), DTYPE, slots=2)
         keys = N.alloc_ub((16, K), N.f32)
         queries = N.alloc_ub((16, K), N.f32)
         weighted = N.alloc_ub((16, K), N.f32)
-        gates = N.alloc_ub((2, 16, K), N.f32)
+        gates = N.alloc_ub((16, K), N.f32, slots=2)
         decay = N.alloc_ub((16, K), N.f32)
         steps = N.alloc_ub((16, K), N.f32)
         # K and Q products occupy independent panels so both can be issued
@@ -169,7 +168,7 @@ def prefill_gram(
         scores = N.alloc_ub((64,), N.f32)
         betas = N.alloc_ub((BT,), N.f32)
         diagonal = N.alloc_ub((16, 16), N.f32)
-        attention = N.alloc_ub((2, 16, 16), N.f32)
+        attention = N.alloc_ub((16, 16), N.f32, slots=2)
         inverse = N.alloc_ub((16, BT), N.f32)
         coefficients = N.alloc_ub((BT,), N.f32)
         expanded = N.alloc_ub((BT, 64), N.f32)
@@ -201,32 +200,37 @@ def prefill_gram(
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
             valid = N.load_index(Lengths[chunk : chunk + 1])
-            N.copy(Bp[chunk, head, :], betas)
+            beta_values = N.copy(Bp[chunk, head, :], betas)
             N.copy(zeros, Aqk[chunk, head, :, :])
             N.copy(zeros, Diagonal[chunk, head, :, :])
             N.copy(zeros, Ai32[chunk, head, :, :])
             for block_index in N.Pipelined(BT // 16, issue_order=("prefetch", "store", "gram")):
                 block = block_index * 16
-                ring = block_index % 2
-                with N.Stage(0, name="prefetch"):
-                    N.copy(Kp[chunk, head, block : block + 16, :], keys16[ring, :, :])
-                    N.copy(Qp[chunk, head, block : block + 16, :], queries16[ring, :, :])
-                    N.copy(Gp[chunk, head, block : block + 16, :], gates[ring, :, :])
+                with N.Stage(0, name="prefetch"), N.CopyGroup(name="diagonal_operands"):
+                    key_values = N.copy(
+                        Kp[chunk, head, block : block + 16, :], keys16.at(block_index)
+                    )
+                    query_values = N.copy(
+                        Qp[chunk, head, block : block + 16, :], queries16.at(block_index)
+                    )
+                    gate_values = N.copy(
+                        Gp[chunk, head, block : block + 16, :], gates.at(block_index)
+                    )
                 with N.Stage(1, name="gram"):
-                    diagonal_gram(
+                    result = diagonal_gram(
                         (
-                            keys16,
+                            key_values,
                             keys,
-                            betas,
+                            beta_values[block : block + 16],
                             weighted,
                             rows,
-                            queries16,
+                            query_values,
                             queries,
                             steps,
-                            gates,
+                            gate_values,
                             decay,
                             diagonal,
-                            attention,
+                            attention.at(block_index),
                             product,
                             scores,
                             partial,
@@ -236,18 +240,18 @@ def prefill_gram(
                             inverse,
                         ),
                         (SCALE, K),
-                        (ring, block, valid),
+                        (block, valid),
                     )
                 with N.Stage(2, name="store"):
                     N.copy(
-                        attention[ring, :, :],
+                        result,
                         Aqk[chunk, head, block : block + 16, block : block + 16],
                     )
             # Four independent 16x16 blocks share one row recurrence. The
             # 64-wide row layout keeps the multiply and every sum-tree level
             # on complete Vector repeats, preserving each block's FP32 tree.
             diagonal_inverse(
-                (Ai32, Diagonal),
+                (Ai32[chunk, head, :, :], Diagonal[chunk, head, :, :]),
                 (
                     inverse,
                     coefficients,
@@ -259,5 +263,4 @@ def prefill_gram(
                     identities,
                 ),
                 (BT,),
-                (chunk, head),
             )

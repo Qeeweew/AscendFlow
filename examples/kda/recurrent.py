@@ -58,26 +58,26 @@ def recurrent_kda(
         assert INDEXED or INPLACE == False, "inplace snapshots require explicit state indices"
         state = N.alloc_ub((V, K), N.f32, name="state")
         product = N.alloc_ub((BV, K), N.f32, name="product")
-        q = N.alloc_ub((PIPE_SLOTS, K), N.f32, name="q")
-        k = N.alloc_ub((PIPE_SLOTS, K), N.f32, name="k")
-        g = N.alloc_ub((PIPE_SLOTS, K), N.f32, name="gate")
+        q = N.alloc_ub((K,), N.f32, slots=PIPE_SLOTS, name="q")
+        k = N.alloc_ub((K,), N.f32, slots=PIPE_SLOTS, name="k")
+        g = N.alloc_ub((K,), N.f32, slots=PIPE_SLOTS, name="gate")
         norm_work = N.alloc_ub((K,), N.f32, name="norm_work")
         norm_partial = N.alloc_ub((N.max(8, K // 64),), N.f32, name="norm_partial")
         norm_stat = N.alloc_ub((8,), N.f32, name="norm_stat")
-        inputs = N.alloc_ub((PIPE_SLOTS, V), DTYPE, name="inputs")
+        inputs = N.alloc_ub((V,), DTYPE, slots=PIPE_SLOTS, name="inputs")
         reduction = N.alloc_ub(
             (BV * (K // 8 + (K // 64 if K > 512 else 0)),), N.f32, name="reduction"
         )
         projected = N.alloc_ub((BV,), N.f32, name="projected")
-        out = N.alloc_ub((PIPE_SLOTS, V), N.f32, name="output")
+        out = N.alloc_ub((V,), N.f32, slots=PIPE_SLOTS, name="output")
         row_scratch = N.alloc_ub((BV, 8), N.f32, name="row_scratch")
         if DTYPE != N.f32:
-            q_input = N.alloc_ub((PIPE_SLOTS, K), DTYPE, name="q_input")
-            k_input = N.alloc_ub((PIPE_SLOTS, K), DTYPE, name="k_input")
+            q_input = N.alloc_ub((K,), DTYPE, slots=PIPE_SLOTS, name="q_input")
+            k_input = N.alloc_ub((K,), DTYPE, slots=PIPE_SLOTS, name="k_input")
             v_work = N.alloc_ub((BV,), N.f32, name="v_work")
-            out_store = N.alloc_ub((PIPE_SLOTS, V), DTYPE, name="out_store")
+            out_store = N.alloc_ub((V,), DTYPE, slots=PIPE_SLOTS, name="out_store")
         if GATE_DTYPE != N.f32:
-            gate_input = N.alloc_ub((PIPE_SLOTS, K), GATE_DTYPE, name="gate_input")
+            gate_input = N.alloc_ub((K,), GATE_DTYPE, slots=PIPE_SLOTS, name="gate_input")
         if STATE_DTYPE != N.f32:
             state_input = N.alloc_ub((V, K), STATE_DTYPE, name="state_input")
         state_store = N.alloc_ub((V, K), STATE_DTYPE, name="state_store")
@@ -110,68 +110,66 @@ def recurrent_kda(
                     N.fill(state, 0.0)
                 for item in N.Pipelined(eos - bos, issue_order=("store", "load", "compute")):
                     token = bos + item
-                    ring = item % PIPE_SLOTS
-                    with N.Stage(0, name="load"):
+                    with N.Stage(0, name="load"), N.CopyGroup(name="inputs"):
                         if DTYPE == N.f32:
-                            N.copy(Q[token, qhead, :], q[ring, :])
-                            N.copy(Key[token, qhead, :], k[ring, :])
+                            q_value = N.copy(Q[token, qhead, :], q.at(item))
+                            k_value = N.copy(Key[token, qhead, :], k.at(item))
                         else:
-                            N.copy(Q[token, qhead, :], q_input[ring, :])
-                            N.copy(Key[token, qhead, :], k_input[ring, :])
-                        N.copy(Value[token, head, :], inputs[ring, :])
+                            q_loaded = N.copy(Q[token, qhead, :], q_input.at(item))
+                            k_loaded = N.copy(Key[token, qhead, :], k_input.at(item))
+                        input_value = N.copy(Value[token, head, :], inputs.at(item))
                         if GATE_DTYPE == N.f32:
-                            N.copy(Gate[token, head, :], g[ring, :])
+                            gate_value = N.copy(Gate[token, head, :], g.at(item))
                         else:
-                            N.copy(Gate[token, head, :], gate_input[ring, :])
+                            gate_loaded = N.copy(Gate[token, head, :], gate_input.at(item))
                     with N.Vector(), N.Stage(1, name="compute"):
                         if DTYPE != N.f32:
-                            N.cast(q_input[ring, :], out=q[ring, :])
-                            N.cast(k_input[ring, :], out=k[ring, :])
+                            q_value = N.cast(q_loaded, out=q.at(item))
+                            k_value = N.cast(k_loaded, out=k.at(item))
                         if GATE_DTYPE != N.f32:
-                            N.cast(gate_input[ring, :], out=g[ring, :])
+                            gate_value = N.cast(gate_loaded, out=g.at(item))
                         if NORMALIZE:
-                            normalize_qk(
-                                q[ring, :], k[ring, :], norm_work, norm_partial, norm_stat, K
+                            q_value, k_value = normalize_qk(
+                                q_value, k_value, norm_work, norm_partial, norm_stat, K
                             )
-                        N.mul(q[ring, :], SCALE, out=q[ring, :])
-                        N.exp(g[ring, :], out=g[ring, :])
+                        scaled_q = N.mul(q_value, SCALE, out=q.at(item))
+                        decay_value = N.exp(gate_value, out=g.at(item))
                         beta = N.load_scalar(Beta[token, head : head + 1])
                         for part in N.serial(V // BV):
                             row = part * BV
                             if DTYPE == N.f32:
-                                value = inputs[ring, row : row + BV]
+                                value = input_value[row : row + BV]
                             else:
-                                N.cast(inputs[ring, row : row + BV], out=v_work)
-                                value = v_work
+                                value = N.cast(input_value[row : row + BV], out=v_work)
                             delta_step(
                                 state[row : row + BV, :],
-                                q[ring, :],
-                                k[ring, :],
-                                g[ring, :],
+                                scaled_q,
+                                k_value,
+                                decay_value,
                                 value,
                                 beta,
                                 product,
                                 reduction,
                                 projected,
                                 row_scratch,
-                                out[ring, row : row + BV],
+                                out.at(item)[row : row + BV],
                             )
                         if DTYPE != N.f32:
-                            N.cast(out[ring, :], out=out_store[ring, :])
+                            converted_output = N.cast(out.at(item), out=out_store.at(item))
                         # Retiring this snapshot must not block the next carry
                         # update or feed a low-precision export back into it.
                         if STATE_DTYPE != N.f32:
-                            N.cast(state, out=state_store)
+                            snapshot = N.cast(state, out=state_store)
                         else:
-                            N.copy(state, state_store)
+                            snapshot = N.copy(state, state_store)
                     with N.Stage(2, name="store"):
                         if DTYPE == N.f32:
-                            N.copy(out[ring, :], Output[token, head, :])
+                            N.copy(out.at(item), Output[token, head, :])
                         else:
-                            N.copy(out_store[ring, :], Output[token, head, :])
+                            N.copy(converted_output, Output[token, head, :])
                         if INPLACE:
                             destination = N.load_index(Indices[seq, token - bos : token - bos + 1])
                             if destination > 0:
-                                N.copy(state_store, State[destination, head, :, :])
+                                N.copy(snapshot, State[destination, head, :, :])
                         else:
-                            N.copy(state_store, Snapshots[token, head, :, :])
+                            N.copy(snapshot, Snapshots[token, head, :, :])

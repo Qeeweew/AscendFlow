@@ -8,70 +8,59 @@ from ascendflow import language as N
 
 
 @N.inline
-def output_load(inputs, buffers, task):
+def output_load(inputs, buffers):
     QG, Snapshot, Residual, A16 = inputs
     q1, h1, r1, a1 = buffers
-    chunk, head, ring = task
-    N.copy(QG[chunk, head, :, :], q1[ring, :, :])
-    N.copy(Snapshot[chunk, head, :, :], h1[ring, :, :])
-    N.copy(Residual[chunk, head, :, :], r1[ring, :, :])
-    N.copy(A16[chunk, head, :, :], a1[ring, :, :])
+    with N.CopyGroup(name="output_operands"):
+        query = N.copy(QG, q1)
+        history = N.copy(Snapshot, h1)
+        residual = N.copy(Residual, r1)
+        attention = N.copy(A16, a1)
+    return query, history, residual, attention
 
 
 @N.inline
-def output_products(operands, buffers, destination, geometry, task):
+def output_products(operands, buffers, destination, geometry):
     q1, h1, r1, a1 = operands
     a0, b0, products0 = buffers
-    OutputProducts, owner = destination
     K, CK = geometry
-    (ring,) = task
     for part in N.unroll(K // CK):
-        aa = N.copy(q1[ring, :, part * CK : (part + 1) * CK], a0[part, :, :])
-        bb = N.copy(h1[ring, :, part * CK : (part + 1) * CK], b0[part, :, :], transpose=True)
-        N.matmul(aa, bb, accum=products0[ring, :, :K], initialize=part == 0)
-    aa = N.copy(a1[ring, :, :], a0[0, :, :])
-    bb = N.copy(r1[ring, :, :], b0[0, :, :])
-    N.matmul(aa, bb, accum=products0[ring, :, K:], initialize=True)
-    N.copy(products0[ring, :, :], OutputProducts[owner, ring, :, :])
+        aa = N.copy(q1[:, part * CK : (part + 1) * CK], a0.slot(part))
+        bb = N.copy(h1[:, part * CK : (part + 1) * CK], b0.slot(part), transpose=True)
+        N.matmul(aa, bb, accum=products0[:, :K], initialize=part == 0)
+    aa = N.copy(a1, a0.slot(0))
+    bb = N.copy(r1, b0.slot(0))
+    N.matmul(aa, bb, accum=products0[:, K:], initialize=True)
+    N.copy(products0, destination)
 
 
 @N.inline
-def output_import(buffers, task, geometry):
-    OutputProducts, products = buffers
-    owner, ring, lane = task
-    (BT,) = geometry
-    row = lane * (BT // 2)
-    N.copy(OutputProducts[owner, ring, row : row + BT // 2, :], products[ring, :, :])
-
-
-@N.inline
-def output_merge(buffers, task, geometry):
+def output_merge(buffers, geometry):
     products, total, output = buffers
-    (ring,) = task
     (K,) = geometry
-    N.add(products[ring, :, :K], products[ring, :, K:], out=total[ring, :, :])
-    N.cast(total[ring, :, :], out=output[ring, :, :])
+    merged = N.add(products[:, :K], products[:, K:], out=total)
+    return N.cast(merged, out=output)
 
 
 @N.inline
 def output_store(buffers, task, geometry):
     output, Output, Starts, Lengths = buffers
-    chunk, head, ring, lane = task
+    chunk, lane = task
     (BT, NC) = geometry
     row = lane * (BT // 2)
     if chunk % NC < NC - 1:
-        full_start = N.load_index(Starts[chunk : chunk + 1])
+        full_start = N.load_index(Starts)
         N.copy(
-            output[ring, :, :],
-            Output[full_start + row : full_start + row + BT // 2, head, :],
+            output,
+            Output[full_start + row : full_start + row + BT // 2, :],
         )
     else:
-        tail_start = N.load_index(Starts[chunk : chunk + 1])
-        valid = N.load_index(Lengths[chunk : chunk + 1])
+        tail_start = N.load_index(Starts)
+        valid = N.load_index(Lengths)
         for token in N.serial(N.min(BT // 2, N.max(0, valid - row))):
             N.copy(
-                output[ring, token, :],
-                Output[tail_start + row + token, head, :],
+                output[token, :],
+                Output[tail_start + row + token, :],
             )
 
 
@@ -100,33 +89,57 @@ def prefill_output(
     with N.Kernel(GROUPS, kind="mixed") as owner:
         assert K == 128 and BT == 64 and CK == 64 and BV == 64, "output tile policy"
         assert CHUNKS == SEQUENCES * NC, "each sequence has NC nonempty chunks"
-        q1 = N.alloc_l1((2, BT, K), DTYPE)
-        h1 = N.alloc_l1((2, K, K), DTYPE)
-        r1 = N.alloc_l1((2, BT, K), DTYPE)
-        a1 = N.alloc_l1((2, BT, BT), DTYPE)
-        a0 = N.alloc_l0a((2, BT, CK), DTYPE)
-        b0 = N.alloc_l0b((2, CK, K), DTYPE)
+        q1 = N.alloc_l1((BT, K), DTYPE, slots=2)
+        h1 = N.alloc_l1((K, K), DTYPE, slots=2)
+        r1 = N.alloc_l1((BT, K), DTYPE, slots=2)
+        a1 = N.alloc_l1((BT, BT), DTYPE, slots=2)
+        a0 = N.alloc_l0a((BT, CK), DTYPE, slots=2)
+        b0 = N.alloc_l0b((CK, K), DTYPE, slots=2)
         # Adjacent NZ column intervals let one FIX publish both products.
         # Each AIV imports a contiguous half of the rows, then adds in FP32.
-        products0 = N.alloc_l0c((2, BT, 2 * K), N.f32)
-        products = N.alloc_ub((2, BT // 2, 2 * K), N.f32)
-        total = N.alloc_ub((2, BT // 2, K), N.f32)
-        output = N.alloc_ub((2, BT // 2, K), DTYPE)
+        products0 = N.alloc_l0c((BT, 2 * K), N.f32, slots=2)
+        products = N.alloc_ub((BT // 2, 2 * K), N.f32, slots=2)
+        total = N.alloc_ub((BT // 2, K), N.f32, slots=2)
+        output = N.alloc_ub((BT // 2, K), DTYPE, slots=2)
+        product_values = N.slotted_view(OutputProducts[owner, :, :, :])
         for task in N.Dataflow(
             N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS),
+            issue_order={"cube": ("load", "products"), "vector": ("import", "merge", "store")},
         ):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
-            ring = task % 2
             with N.Cube(), N.Stage(0, name="load"):
-                output_load((QG, Snapshot, Residual, A16), (q1, h1, r1, a1), (chunk, head, ring))
+                query, history, residual, attention = output_load(
+                    (
+                        QG[chunk, head, :, :],
+                        Snapshot[chunk, head, :, :],
+                        Residual[chunk, head, :, :],
+                        A16[chunk, head, :, :],
+                    ),
+                    (q1.at(task), h1.at(task), r1.at(task), a1.at(task)),
+                )
             with N.Cube(), N.Stage(1, name="products"):
                 output_products(
-                    (q1, h1, r1, a1), (a0, b0, products0), (OutputProducts, owner), (K, CK), (ring,)
+                    (query, history, residual, attention),
+                    (a0, b0, products0.at(task)),
+                    product_values.at(task),
+                    (K, CK),
                 )
             with N.Vector() as lane, N.Stage(0, name="import"):
-                output_import((OutputProducts, products), (owner, ring, lane), (BT,))
+                row = lane * (BT // 2)
+                imported = N.copy(
+                    product_values.at(task)[row : row + BT // 2, :], products.at(task)
+                )
             with N.Vector(), N.Stage(1, name="merge"):
-                output_merge((products, total, output), (ring,), (K,))
+                result = output_merge((imported, total.at(task), output.at(task)), (K,))
             with N.Vector() as lane, N.Stage(2, name="store"):
-                output_store((output, Output, Starts, Lengths), (chunk, head, ring, lane), (BT, NC))
+                output_store(
+                    (
+                        result,
+                        Output[:, head, :],
+                        Starts[chunk : chunk + 1],
+                        Lengths[chunk : chunk + 1],
+                    ),
+                    (chunk, lane),
+                    (BT, NC),
+                )

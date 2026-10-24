@@ -41,6 +41,13 @@ Prepare 在同一 kernel 内分别循环处理非末块与每序列末块。非�
 随后用单位矩阵乘发布完整前缀。末块即使有 64 个有效 token，也保持该求和次序。
 FP32 carry、BF16 snapshot 和矩阵乘输入精度分别遵守上述数值合同。
 
+所有阶段以显式 slots/at 表达时间缓冲，helper 接收当前输入 Tile 或实际 payload
+view。跨块 Gram、块逆和 W/U 的同队列操作数导入使用 CopyGroup 共同 ready，
+每份 L1/L0 的 release 仍取自己的最后 reader。融合 Prepare 显式选择原有的
+固定 workspace 面，不轮换到额外面；full/tail 继续共享原来的 L1、L0 和私有 UB。
+Q/Key 归一化、前缀、Gram 与变换之间的 phase alias 保留实际 root，既不增加
+scratch，也不按每阶段重新分配存储。全部原生模板和各 bank 字节容量保持。
+
 块逆使用 `[[D0,0],[-D1*A10*D0,D1]]` 合并 16→32→64，乘法输入保持 FP32。
 对角逆的四个矩阵沿列合并，使乘法及加法树填满 64 个 FP32 lane；行依赖仍在核内顺序执行。
 跨块 Gram 采用 16/32-token 分层矩形；四次 FP32 GEMM 的结果占用同一

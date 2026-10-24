@@ -8,79 +8,73 @@ from ascendflow import language as N
 
 
 @N.inline
-def scan_prefetch_vector(inputs, buffers, geometry, coordinates):
+def scan_prefetch_vector(inputs, buffers):
     Lengths, Gp, U = inputs
     last_gate, u16 = buffers
-    (BV,) = geometry
-    chunk, head, ring, lane = coordinates
-    valid = N.load_index(Lengths[chunk : chunk + 1])
-    N.copy(Gp[chunk, head, valid - 1, :], last_gate[ring, :])
-    N.exp(last_gate[ring, :], out=last_gate[ring, :])
-    N.copy(U[chunk, head, :, lane * BV : (lane + 1) * BV], u16[ring, :, :])
+    valid = N.load_index(Lengths)
+    gate = N.copy(Gp[valid - 1, :], last_gate)
+    decay = N.exp(gate, out=last_gate)
+    value = N.copy(U, u16)
+    return decay, value
 
 
 @N.inline
-def scan_prefetch_cube(K, CK, W32, a32_1, chunk, head, ring, KG, kg1):
+def scan_prefetch_cube(K, CK, W32, a32_1, KG, kg1):
     for part in N.unroll(K // CK):
         N.copy(
-            W32[chunk, head, :, part * CK : (part + 1) * CK],
-            a32_1[ring, part, :, :],
+            W32[:, part * CK : (part + 1) * CK],
+            a32_1[part, :, :],
         )
-    N.copy(KG[chunk, head, :, :], kg1[ring, :, :])
+    return N.copy(KG, kg1)
 
 
 @N.inline
-def publish_history_and_snapshot(carry, History, seq, head, lane, BV, state16, Snapshot, chunk):
-    N.copy(carry, History[seq, head, lane * BV : (lane + 1) * BV, :])
-    N.cast(carry, out=state16)
-    N.copy(state16, Snapshot[chunk, head, lane * BV : (lane + 1) * BV, :])
+def publish_history_and_snapshot(carry, History, state16, Snapshot):
+    N.copy(carry, History)
+    snapshot = N.cast(carry, out=state16)
+    N.copy(snapshot, Snapshot)
 
 
 @N.inline
-def project_history(inputs, buffers, geometry, coordinates):
+def project_history(inputs, buffers, geometry):
     History, Projection = inputs
     b32_1, a32_0, b32_0, a32_1, score0 = buffers
     K, CK = geometry
-    seq, head, ring, chunk = coordinates
     for part in N.unroll(K // CK):
-        bb = N.copy(History[seq, head, :, part * CK : (part + 1) * CK], b32_1)
-        aa = N.copy(a32_1[ring, part, :, :], a32_0)
+        bb = N.copy(History[:, part * CK : (part + 1) * CK], b32_1)
+        aa = N.copy(a32_1[part, :, :], a32_0)
         bb = N.copy(bb, b32_0, transpose=True)
-        N.matmul(aa, bb, accum=score0, initialize=part == 0)
-    N.copy(score0, Projection[chunk, head, :, :])
+        result = N.matmul(aa, bb, accum=score0, initialize=part == 0)
+    N.copy(result, Projection)
 
 
 @N.inline
-def form_residual(inputs, buffers, geometry, coordinates):
+def form_residual(inputs, buffers):
     Projection, Residual = inputs
     u16, other, scratch, r16 = buffers
-    (BV,) = geometry
-    ring, chunk, head, lane = coordinates
-    N.cast(u16[ring, :, :], out=other)
-    N.copy(Projection[chunk, head, :, lane * BV : (lane + 1) * BV], scratch)
-    N.sub(other, scratch, out=scratch)
-    N.cast(scratch, out=r16)
-    N.copy(r16, Residual[chunk, head, :, lane * BV : (lane + 1) * BV])
+    value = N.cast(u16, out=other)
+    projection = N.copy(Projection, scratch)
+    residual = N.sub(value, projection, out=scratch)
+    rounded = N.cast(residual, out=r16)
+    N.copy(rounded, Residual)
 
 
 @N.inline
-def form_state_delta(inputs, buffers, coordinates):
+def form_state_delta(inputs, buffers):
     Residual, Delta = inputs
     res1, update_a0, right0, kg1, state0 = buffers
-    chunk, head, ring = coordinates
-    rr = N.copy(Residual[chunk, head, :, :], res1)
+    rr = N.copy(Residual, res1)
     aa = N.copy(rr, update_a0, transpose=True)
-    bb = N.copy(kg1[ring, :, :], right0)
-    N.matmul(aa, bb, accum=state0, initialize=True)
-    N.copy(state0, Delta[chunk, head, :, :])
+    bb = N.copy(kg1, right0)
+    result = N.matmul(aa, bb, accum=state0, initialize=True)
+    N.copy(result, Delta)
 
 
 @N.inline
-def update_fp32_carry(last_gate, ring, carry, update, Delta, chunk, head, lane, BV):
-    decay = last_gate[ring, :]
-    N.mul(carry, decay[None, :], out=carry)
-    N.copy(Delta[chunk, head, lane * BV : (lane + 1) * BV, :], update)
-    N.add(carry, update, out=carry)
+def update_fp32_carry(decay, carry, update, Delta):
+    decayed = N.mul(carry, decay[None, :], out=carry)
+    delta = N.copy(Delta, update)
+    N.add(decayed, delta, out=carry)
 
 
 @N.prim_func(disjoint_external=True)
@@ -113,18 +107,18 @@ def prefill_scan(
         assert CHUNKS == SEQUENCES * NC, "each sequence has NC nonempty chunks"
         carry = N.alloc_ub((BV, K), N.f32)
         state16 = N.alloc_ub((BV, K), DTYPE)
-        u16 = N.alloc_ub((2, BT, BV), DTYPE)
+        u16 = N.alloc_ub((BT, BV), DTYPE, slots=2)
         scratch = N.alloc_ub((BT, BV), N.f32)
         other = N.alloc_ub((BT, BV), N.f32)
         r16 = N.alloc_ub((BT, BV), DTYPE)
         update = N.alloc_ub((BV, K), N.f32)
-        last_gate = N.alloc_ub((2, K), N.f32)
-        a32_1 = N.alloc_l1((2, K // CK, BT, CK), N.f32)
+        last_gate = N.alloc_ub((K,), N.f32, slots=2)
+        a32_1 = N.alloc_l1((K // CK, BT, CK), N.f32, slots=2)
         b32_1 = N.alloc_l1((K, CK), N.f32)
         a32_0 = N.alloc_l0a((BT, CK), N.f32)
         b32_0 = N.alloc_l0b((CK, K), N.f32)
         res1 = N.alloc_l1((BT, K), DTYPE)
-        kg1 = N.alloc_l1((2, BT, K), DTYPE)
+        kg1 = N.alloc_l1((BT, K), DTYPE, slots=2)
         update_a0 = N.alloc_l0a((K, BT), DTYPE)
         right0 = N.alloc_l0b((BT, K), DTYPE)
         score0 = N.alloc_l0c((BT, K), N.f32)
@@ -134,40 +128,61 @@ def prefill_scan(
             seq, head = flat // H, flat % H
             with N.Vector() as initial_lane:
                 N.copy(Initial[seq, head, initial_lane * BV : (initial_lane + 1) * BV, :], carry)
-            for local in N.Dataflow(NC):
+            for local in N.Dataflow(
+                NC,
+                issue_order={
+                    "cube": ("prefetch_cube", "projection", "delta"),
+                    "vector": ("prefetch_vector", "history", "residual", "carry"),
+                },
+            ):
                 chunk = seq * NC + local
-                ring = local % 2
                 with N.Vector() as lane, N.Stage(0, name="prefetch_vector"):
-                    scan_prefetch_vector(
-                        (Lengths, Gp, U), (last_gate, u16), (BV,), (chunk, head, ring, lane)
+                    decay, values = scan_prefetch_vector(
+                        (
+                            Lengths[chunk : chunk + 1],
+                            Gp[chunk, head, :, :],
+                            U[chunk, head, :, lane * BV : (lane + 1) * BV],
+                        ),
+                        (last_gate.at(local), u16.at(local)),
                     )
                 with N.Cube(), N.Stage(0, name="prefetch_cube"):
-                    scan_prefetch_cube(K, CK, W32, a32_1, chunk, head, ring, KG, kg1)
+                    keys = scan_prefetch_cube(
+                        K,
+                        CK,
+                        W32[chunk, head, :, :],
+                        a32_1.at(local),
+                        KG[chunk, head, :, :],
+                        kg1.at(local),
+                    )
                 with N.Vector() as lane, N.Stage(1, name="history"):
                     publish_history_and_snapshot(
-                        carry, History, seq, head, lane, BV, state16, Snapshot, chunk
+                        carry,
+                        History[seq, head, lane * BV : (lane + 1) * BV, :],
+                        state16,
+                        Snapshot[chunk, head, lane * BV : (lane + 1) * BV, :],
                     )
                 with N.Cube(), N.Stage(1, name="projection"):
                     project_history(
-                        (History, Projection),
-                        (b32_1, a32_0, b32_0, a32_1, score0),
+                        (History[seq, head, :, :], Projection[chunk, head, :, :]),
+                        (b32_1, a32_0, b32_0, a32_1.at(local), score0),
                         (K, CK),
-                        (seq, head, ring, chunk),
                     )
                 with N.Vector() as lane, N.Stage(1, name="residual"):
                     form_residual(
-                        (Projection, Residual),
-                        (u16, other, scratch, r16),
-                        (BV,),
-                        (ring, chunk, head, lane),
+                        (
+                            Projection[chunk, head, :, lane * BV : (lane + 1) * BV],
+                            Residual[chunk, head, :, lane * BV : (lane + 1) * BV],
+                        ),
+                        (values, other, scratch, r16),
                     )
                 with N.Cube(), N.Stage(1, name="delta"):
                     form_state_delta(
-                        (Residual, Delta),
-                        (res1, update_a0, right0, kg1, state0),
-                        (chunk, head, ring),
+                        (Residual[chunk, head, :, :], Delta[chunk, head, :, :]),
+                        (res1, update_a0, right0, keys, state0),
                     )
                 with N.Vector() as lane, N.Stage(1, name="carry"):
-                    update_fp32_carry(last_gate, ring, carry, update, Delta, chunk, head, lane, BV)
+                    update_fp32_carry(
+                        decay, carry, update, Delta[chunk, head, lane * BV : (lane + 1) * BV, :]
+                    )
             with N.Vector() as final_lane:
                 N.copy(carry, Final[seq, head, final_lane * BV : (final_lane + 1) * BV, :])
