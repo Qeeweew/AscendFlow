@@ -1,4 +1,4 @@
-"""Completion coverage from frozen real queue captures and matching gates."""
+"""Construct retained synchronization by admitting actual support frontiers."""
 
 from dataclasses import dataclass, replace
 
@@ -52,38 +52,25 @@ class CompletionCoverage:
             pending.extend(proof.inputs)
 
 
-def reduce_completion_prefixes(domains):
-    """Freeze captures once, then remove only independently covered actions.
+def select_completion_frontiers(domains):
+    """Admit a complete support frontier before publishing its coverage.
 
-    A protocol supporting an accepted deletion is pinned. No later deletion
-    can invalidate it, and every query excludes both its candidate and all
-    already removed protocols. Resource and consumption facts are established
-    afterwards on the final retained set.
+    The candidate graph proposes real actions, not acquired facts. A proposal
+    excludes both its own candidate and every previously covered candidate.
+    When a successful proposal uses new actions, check whether the already
+    admitted actions suffice instead. A solver core must not needlessly admit
+    alternatives. Admit the chosen support together, then publish its coverage.
+    Static consumer order is not dynamic acquire order across loop instances.
     """
     graph = ProtocolTransfers(domains)
+
     bindings = {}
     for item in domains.selection.coverage:
         if item.notification is not None:
             bindings.setdefault(item.notification, []).append(item.binding)
-    removed, pinned, visited = {}, set(), set()
-    for notification in domains.notifications:
-        if notification in pinned:
-            continue
-        original = bindings.get(notification, ())
-        # Hand-assembled internal selections without original endpoint facts
-        # retain their protocols and all existing checks.
-        if not original or any(item is None for item in original):
-            continue
-        episodes = graph.episodes.get(notification, ())
-        expected = (
-            1
-            if notification.mechanism is NotificationKind.PIPE_FENCE
-            else sum(domains.active[notification, case] for case in domains.cases[notification])
-        )
-        if not episodes or len(episodes) != expected:
-            continue
+
+    def cover(original, episodes, excluded):
         obligations = []
-        excluded = frozenset((*removed, notification))
         for episode in episodes:
             pairs = {}
             for binding in original:
@@ -91,9 +78,8 @@ def reduce_completion_prefixes(domains):
                 consumer = domains._instance(binding.consumer, {}, case=episode.case)
                 pairs.setdefault((source, consumer), []).append(binding)
             for (source, consumer), owners in pairs.items():
-                # Each demand has its own activation. Conjoining unrelated
-                # writers' guards could turn two real obligations into an
-                # empty domain and incorrectly delete their common protocol.
+                # Each demand keeps its own activation. Unrelated writers'
+                # guards must not be conjoined into a vacuous obligation.
                 assumptions = tuple(
                     dict.fromkeys(
                         test
@@ -110,55 +96,73 @@ def reduce_completion_prefixes(domains):
                     assumptions=assumptions,
                 )
                 if proof is None:
-                    break
+                    return None
                 answer = domains.arithmetic.queries.implies(proof.condition, assumptions)
                 if not answer.proved:
-                    break
+                    return None
                 obligations.append(
                     CompletionObligation(
                         tuple(owners), source, consumer, episode.case, proof, answer
                     )
                 )
-            else:
-                continue
-            break
-        else:
-            coverage = CompletionCoverage(
-                domains.dispatch,
-                tuple(item.case for item in episodes),
-                tuple(obligations),
-            )
-            pending = [item.proof for item in obligations]
-            while pending:
-                proof = pending.pop()
-                if proof in visited:
-                    continue
-                visited.add(proof)
-                if proof.node.notification is not None:
-                    require(
-                        proof.node.notification not in excluded,
-                        "completion proof depends on a deleted protocol",
-                    )
-                    pinned.add(proof.node.notification)
-                pending.extend(proof.inputs)
-            removed[notification] = coverage
-    if not removed:
+        return CompletionCoverage(
+            domains.dispatch,
+            tuple(item.case for item in episodes),
+            tuple(obligations),
+        )
+
+    covered, retained = {}, set()
+    for notification in domains.notifications:
+        if notification in retained:
+            continue
+        original = bindings.get(notification, ())
+        # Hand-assembled internal selections without original endpoint facts
+        # retain their protocols and all existing checks.
+        if not original or any(item is None for item in original):
+            retained.add(notification)
+            continue
+        episodes = graph.episodes.get(notification, ())
+        expected = (
+            1
+            if notification.mechanism is NotificationKind.PIPE_FENCE
+            else sum(domains.active[notification, case] for case in domains.cases[notification])
+        )
+        if not episodes or len(episodes) != expected:
+            retained.add(notification)
+            continue
+        excluded = frozenset((*covered, notification))
+        coverage = cover(original, episodes, excluded)
+        if coverage is not None:
+            support = frozenset(coverage.supports())
+            require(not support & excluded, "completion frontier depends on an absent protocol")
+            if support - retained:
+                unavailable = frozenset(n for n in domains.notifications if n not in retained)
+                existing = cover(original, episodes, unavailable)
+                if existing is not None:
+                    coverage = existing
+                    support = frozenset(coverage.supports())
+                    require(support <= retained, "existing frontier proposes a new protocol")
+            retained.update(support)
+            covered[notification] = coverage
+            continue
+        retained.add(notification)
+    if not covered:
         return domains
     selection = domains.selection
     selection = replace(
         selection,
-        notifications=tuple(item for item in selection.notifications if item not in removed),
+        notifications=tuple(item for item in selection.notifications if item in retained),
         coverage=tuple(
             replace(
                 item,
                 notification=None,
-                completion=removed[item.notification],
-                rule="composed actual queue completion prefixes",
+                completion=covered[item.notification],
+                rule="already acquired queue completion frontier",
             )
-            if item.notification in removed
+            if item.notification in covered
             else item
             for item in selection.coverage
         ),
     )
-    domains.work.completion_eliminated += len(removed)
+    domains.work.completion_covered += len(covered)
     return domains.retain(selection)

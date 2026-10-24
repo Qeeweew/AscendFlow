@@ -14,6 +14,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 
 from ..budget import poll
+from ..memo import memoized_method
 from ..scalar import Expr, literal
 from ..symbols import Symbol, SymbolKind
 from .event_domains import EventCase
@@ -100,6 +101,7 @@ class ProtocolPositions:
     def dispatch(self):
         return self.domains.dispatch
 
+    @memoized_method
     def position(self, point):
         return self.domains._positions(self.dispatch.site(point), point.coordinates)
 
@@ -334,9 +336,8 @@ class ProtocolTransfers:
         for (route, _), entries in words.items():
             self.capture_words.setdefault(route, []).append(_CaptureWord(entries, self.positions))
         self.work.transfer_capture_words += len(words)
-        self.propositions, self.rules = [], []
+        self.propositions, self.rules = {}, {}
         self._rule_system = None
-        self._compile_rules()
         self.ready = True
 
     def _episodes(self):
@@ -376,16 +377,19 @@ class ProtocolTransfers:
                 self.work.transfer_edges += len(inputs)
         return self._unions[key]
 
-    def _compile_rules(self):
-        first = len(self.propositions)
-        for number in range(first, len(self.nodes)):
+    def _proposition(self, number):
+        if number not in self.propositions:
             symbol = Symbol(f"reached_{number}", SymbolKind.SSA, object())
-            self.propositions.append(Comparison(Expr("argument", (symbol,)), "==", literal(0)))
-        for number in range(first, len(self.nodes)):
+            self.propositions[number] = Comparison(Expr("argument", (symbol,)), "==", literal(0))
+        return self.propositions[number]
+
+    def _rule(self, number):
+        if number not in self.rules:
             node = self.nodes[number]
-            premise = all_of(node.condition, any_of(*(self.propositions[i] for i in node.inputs)))
-            self.rules.append(TransferRule(node, premise, self.propositions[number]))
-        self.work.transfer_rules += len(self.nodes) - first
+            premise = all_of(node.condition, any_of(*(self._proposition(i) for i in node.inputs)))
+            self.rules[number] = TransferRule(node, premise, self._proposition(number))
+            self.work.transfer_rules += 1
+        return self.rules[number]
 
     def _origin_matches(self, origin, actor, engine):
         if actor is not origin.point.actor:
@@ -409,7 +413,7 @@ class ProtocolTransfers:
                         if node.notification not in excluded:
                             premise = all_of(node.condition, order)
                             if premise is not False:
-                                yield TransferRule(node, premise, self.propositions[number], True)
+                                yield number, premise
 
     def order(self, before, after, *, strict):
         return self.positions.order(before, after, strict=strict)
@@ -465,6 +469,7 @@ class ProtocolTransfers:
             strict_target=True,
         )
 
+    @memoized_method
     def _derive(
         self,
         origin,
@@ -480,6 +485,12 @@ class ProtocolTransfers:
         Existing guarded transfer rules are shared; only the real origin's
         capture seeds belong to this query. Exported acquires are proved
         separately in the same temporary context.
+
+        Real actions and their input snapshots are immutable. Appending a
+        query cut cannot change an existing cut's predecessors. Exact queries
+        therefore share their result, including an unsuccessful coverage
+        attempt; changed premises, origin, target or exclusions have new keys.
+        A failed coverage attempt never asserts that a prefix is unreachable.
         """
         kind = "consumption" if isinstance(origin, ConsumptionOrigin) else "completion"
         name = kind + "_queries"
@@ -487,22 +498,72 @@ class ProtocolTransfers:
         if self.positions.position(origin.point) is None or self.positions.position(target) is None:
             return None
         root = self.snapshot(target, destination, strict=strict_target)
-        self._compile_rules()
-        predicates = tuple(
-            rule.predicate
-            for rule in self.rules[
-                0 if self._rule_system is None else len(self._rule_system.rules) :
-            ]
+        # Only antecedents of the requested cut can affect its least model.
+        # Stop at unavailable actions: neither their transfer nor their seed
+        # may establish a fact. The other propositions can all be false in a
+        # countermodel, including an unseeded cycle. This is a query slice,
+        # not a causal fact or a claim that the remaining graph is acyclic.
+        pending, relevant = [root], set()
+        while pending:
+            number = pending.pop()
+            node = self.nodes[number]
+            if number in relevant or node.notification in excluded or node.condition is False:
+                continue
+            relevant.add(number)
+            pending.extend(node.inputs)
+        captures = tuple(
+            (number, premise)
+            for number, premise in self._capture_seeds(origin, excluded)
+            if number in relevant
+        )
+        # A target ancestor without a path from an actual origin seed cannot
+        # acquire that origin. Intersect both structural directions before
+        # asking about guards. In particular, an unseeded SCC needs no SMT.
+        successors = {number: [] for number in relevant}
+        for number in relevant:
+            for child in self.nodes[number].inputs:
+                if child in successors:
+                    successors[child].append(number)
+        pending = [number for number, _ in captures]
+        grounded = set()
+        while pending:
+            number = pending.pop()
+            if number not in grounded:
+                grounded.add(number)
+                pending.extend(successors[number])
+        if root not in grounded:
+            return None
+        # Reuse an actual input model, never sampled parameters. Keeping every
+        # guard with an unknown interpretation gives an upper reachability
+        # bound. If even that bound misses the target, this model already
+        # refutes complete coverage; no symbolic propagation query is needed.
+        evaluate = self.domains.arithmetic.queries.witness_evaluation(assumptions)
+        if evaluate is not None:
+            pending = [number for number, premise in captures if evaluate(premise) is not False]
+            possible = set()
+            while pending:
+                number = pending.pop()
+                if number in possible or evaluate(self.nodes[number].condition) is False:
+                    continue
+                possible.add(number)
+                pending.extend(successors[number])
+            if root not in possible:
+                name = kind + "_countermodels"
+                setattr(self.work, name, getattr(self.work, name) + 1)
+                return None
+        enabled = tuple(sorted(grounded))
+        seeds = tuple(
+            TransferRule(self.nodes[number], premise, self._proposition(number), True)
+            for number, premise in captures
         )
         if self._rule_system is None:
-            self._rule_system = self.domains.arithmetic.queries.rule_system(predicates)
-        else:
-            self._rule_system.extend(predicates)
-        enabled = tuple(
-            i for i, rule in enumerate(self.rules) if rule.node.notification not in excluded
-        )
-        seeds = tuple(self._capture_seeds(origin, excluded))
-        rules = (*self.rules, *seeds)
+            self._rule_system = self.domains.arithmetic.queries.rule_system()
+            self._registered = {}
+        added = tuple(number for number in enabled if number not in self._registered)
+        self._rule_system.extend(tuple(self._rule(number).predicate for number in added))
+        for number in added:
+            self._registered[number] = len(self._registered)
+        rules = tuple(self._rule(number) for number in self._registered) + seeds
         name = kind + "_rule_instances"
         setattr(self.work, name, getattr(self.work, name) + len(enabled) + len(seeds))
         leaves = {}
@@ -523,7 +584,7 @@ class ProtocolTransfers:
                 origin,
                 assumptions,
                 support,
-                self.propositions[number],
+                self._proposition(number),
                 inference.answer,
             )
             name = kind + "_conclusions"
@@ -531,9 +592,11 @@ class ProtocolTransfers:
             return CausalProof(self.nodes[number], tuple(inputs), inference.condition, deduction)
 
         with self._rule_system.assuming(
-            assumptions, extra=tuple(rule.predicate for rule in seeds), enabled=enabled
+            assumptions,
+            extra=tuple(rule.predicate for rule in seeds),
+            enabled=tuple(self._registered[number] for number in enabled),
         ) as context:
-            result = context.prove(self.propositions[root])
+            result = context.prove(self._proposition(root))
             if not result.answer.proved:
                 return None
             proof = establish(root, result)
@@ -546,7 +609,7 @@ class ProtocolTransfers:
             for number, node in enumerate(self.nodes):
                 if number != root and node.kind == "acquire" and node in supported:
                     poll("consumption acquired cut", vertex=number)
-                    answer = context.prove(self.propositions[number])
+                    answer = context.prove(self._proposition(number))
                     if answer.answer.proved:
                         acquired.append(establish(number, answer))
             return CausalProof(

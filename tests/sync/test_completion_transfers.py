@@ -51,7 +51,7 @@ def direct_load_to_store(plan):
 @pytest.mark.parametrize("runtime", [False, True])
 def test_composed_prefix_covers_direct_bf16_load_to_store(runtime):
     plan = synchronize_structure(chain(runtime=runtime))
-    assert plan.generation.domains.work.completion_eliminated
+    assert plan.generation.domains.work.completion_covered
     assert not direct_load_to_store(plan)
     assert any(item.completion is not None for item in plan.selection.coverage)
     for count in (1,) if not runtime else (0, 1, 2, 7):
@@ -97,6 +97,39 @@ def test_completion_proof_keeps_original_demands_and_retained_support_actions():
             assert proof.covers(item.binding)
             assert item.binding.requirement is item.requirement
             assert any(item.requirement is need for need in plan.dependencies.required)
+
+
+def test_support_frontier_admits_all_proposed_real_actions(monkeypatch):
+    from ascendflow.analysis.protocol_transfers import ProtocolTransfers
+
+    completion, proposals = ProtocolTransfers.completion, []
+
+    def checked(graph, *args, **kwargs):
+        available = set(graph.domains.notifications) - kwargs["excluded"]
+        proof = completion(graph, *args, **kwargs)
+        pending, seen = [proof] if proof is not None else [], set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current.node.notification is not None:
+                assert current.node.notification in available
+            pending.extend(current.inputs)
+        if proof is not None:
+            proposals.append(proof)
+        return proof
+
+    monkeypatch.setattr(ProtocolTransfers, "completion", checked)
+    plan = synchronize_structure(chain(runtime=True))
+    assert proposals
+    retained = set(plan.selection.notifications)
+    for item in plan.selection.coverage:
+        if item.completion is not None:
+            assert set(item.completion.supports()) <= retained
+    assert not direct_load_to_store(plan)
+    for count in (0, 1, 3):
+        check_compiled_events(plan, {"n": count}, invocations=2)
 
 
 def test_completion_preserves_each_sibling_loop_writer_in_a_merged_capture():

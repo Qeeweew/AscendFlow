@@ -12,7 +12,7 @@ from time import perf_counter
 
 from ..analysis.cell_channels import CellChannel, construct_cell_channels
 from ..analysis.cell_ownership import LocalCreditOrder, PersistentCellCredit, bind_cell_credits
-from ..analysis.completion_prefixes import reduce_completion_prefixes
+from ..analysis.completion_prefixes import select_completion_frontiers
 from ..analysis.event_contracts import ResourceWork, StructuredEventLease
 from ..analysis.event_domains import EventDomains
 from ..analysis.notification_lifetimes import HandbackRule
@@ -48,7 +48,7 @@ def _complete_bindings(selection, *, binding_s=0.0):
     started = perf_counter()
     domains = EventDomains(selection, ResourceWork())
     domained = perf_counter()
-    domains = reduce_completion_prefixes(domains)
+    domains = select_completion_frontiers(domains)
     selection = domains.selection
     prefixed = perf_counter()
     credits, credit_order = bind_cell_credits(domains)

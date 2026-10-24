@@ -15,7 +15,6 @@ from ascendflow.analysis.protocol_transfers import (
     ConsumptionOrigin,
     ProtocolTransfers,
     TransferNode,
-    TransferRule,
 )
 from ascendflow.analysis.smt import IntegerQueryService, all_of, any_of, negate
 from ascendflow.analysis.structured_schedule import Comparison
@@ -28,15 +27,14 @@ def relation(nodes, captures, root):
     graph.domains = SimpleNamespace(arithmetic=IntegerFacts({}))
     graph.positions = SimpleNamespace(position=lambda _: (0,))
     graph.snapshot = lambda *args, **kwargs: root
-    graph.propositions, graph.rules = [], []
+    graph.propositions, graph.rules = {}, {}
     graph._rule_system = None
-    graph._compile_rules()
 
     def seeds(origin, excluded):
         for number in captures:
             node = nodes[number]
             if node.notification not in excluded:
-                yield TransferRule(node, node.condition, graph.propositions[number], True)
+                yield number, node.condition
 
     graph._capture_seeds = seeds
     return graph
@@ -154,8 +152,8 @@ def test_branch_product_needs_only_linear_rules_and_one_required_conclusion(laye
     checks = graph.domains.arithmetic.queries.statistics.solver_checks
     proof = derive(graph, object(), tuple(factors))
     assert proof is not None
-    assert graph.work.transfer_rules == len(nodes)
-    assert graph.work.completion_rule_instances == 2 * (len(nodes) + 1)
+    assert graph.work.transfer_rules == len(graph.rules) <= len(nodes)
+    assert graph.work.completion_rule_instances <= 2 * (len(nodes) + 1)
     assert graph.domains.arithmetic.queries.statistics.solver_checks == checks + 1
     assert len(proof.deduction.rules) <= len(nodes) + 1
     assert_owned(graph, proof, tuple(factors), frozenset())
@@ -173,6 +171,7 @@ def test_unseeded_cycle_and_missing_acquire_arm_cannot_export_a_fact():
     ]
     graph = relation(nodes, (), 3)
     assert derive(graph, point, ()) is None
+    assert graph.domains.arithmetic.queries.statistics.solver_checks == 0
     graph = relation(nodes, (1,), 3)
     assert derive(graph, point, (), consumption=True) is None
     proof = derive(graph, point, (a,), consumption=True)
@@ -201,6 +200,45 @@ def test_related_integer_guards_remain_correlated_inside_rules():
     assert_owned(graph, proof, (positive,), frozenset())
 
 
+def test_repeated_failed_cut_does_not_reprove_or_deny_a_stronger_scope():
+    point = object()
+    value = Expr("argument", ("condition",))
+    positive = Comparison(value, ">", literal(0))
+    nodes = [
+        TransferNode("union", None, None, (), False),
+        TransferNode("capture", object(), point, (), positive),
+        TransferNode("acquire", object(), point, (1,)),
+    ]
+    graph = relation(nodes, (1,), 2)
+    assert derive(graph, point, ()) is None
+    checks = graph.domains.arithmetic.queries.statistics.solver_checks
+    assert derive(graph, point, ()) is None
+    assert graph.domains.arithmetic.queries.statistics.solver_checks == checks
+    proof = derive(graph, point, (positive,))
+    assert proof is not None
+    assert_owned(graph, proof, (positive,), frozenset())
+    assert derive(graph, point, (positive,), frozenset((nodes[1].notification,))) is None
+
+
+def test_existing_input_model_refutes_coverage_without_a_rule_query():
+    point, value = object(), Expr("argument", ("condition",))
+    positive = Comparison(value, ">", literal(0))
+    nodes = [
+        TransferNode("union", None, None, (), False),
+        TransferNode("capture", object(), point, (), positive),
+        TransferNode("acquire", object(), point, (1,)),
+    ]
+    graph = relation(nodes, (1,), 2)
+    queries = graph.domains.arithmetic.queries
+    assert queries.satisfies((negate(positive),)).satisfied
+    checks = queries.statistics.solver_checks
+    assert derive(graph, point, ()) is None
+    assert queries.statistics.solver_checks == checks
+    assert graph.work.completion_countermodels == 1
+    assert not graph.rules
+    assert derive(graph, point, (positive,)) is not None
+
+
 def test_unconditional_exit_does_not_export_either_conditional_acquire():
     point = object()
     selector = Expr("argument", ("branch",))
@@ -214,7 +252,33 @@ def test_unconditional_exit_does_not_export_either_conditional_acquire():
         TransferNode("union", None, None, (2, 3)),
     ]
     graph = relation(nodes, (1,), 4)
+    # This model has no interpretation for selector. Unknown branch guards
+    # must stay possible, rather than falsely refuting their complete union.
+    assert graph.domains.arithmetic.queries.satisfies(()).satisfied
     proof = derive(graph, point, (), consumption=True)
     assert proof is not None
     assert all(child.node.kind != "acquire" for child in proof.inputs)
     assert_owned(graph, proof, (), frozenset())
+
+
+@pytest.mark.parametrize("unrelated", (0, 256))
+def test_required_cut_is_independent_of_disconnected_protocol_rules(unrelated):
+    point = object()
+    nodes = [
+        TransferNode("union", None, None, (), False),
+        TransferNode("capture", object(), point, ()),
+        TransferNode("acquire", object(), point, (1,)),
+    ]
+    for number in range(3, unrelated + 3):
+        test = Comparison(Expr("argument", (f"unrelated_{number}",)), "==", literal(0))
+        nodes.append(TransferNode("union", None, None, (number,), test))
+    graph = relation(nodes, (1,), 2)
+    proof = derive(graph, point, ())
+    assert proof is not None
+    assert_owned(graph, proof, (), frozenset())
+    assert graph.work.completion_rule_instances == 3
+    assert graph.domains.arithmetic.queries.statistics.rule_encodings == 2
+    assert graph.domains.arithmetic.queries.statistics.rule_assertions == 3
+    # Removing the one actual publication still denies the target; unrelated
+    # rule cycles cannot seed it or make this query's activation inconsistent.
+    assert derive(graph, point, (), frozenset((nodes[1].notification,))) is None

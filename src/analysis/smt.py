@@ -54,6 +54,7 @@ from z3 import (
     BitVecVal,
     BoolRef,
     BoolVal,
+    CheckSatResult,
     FreshBool,
     Function,
     If,
@@ -65,13 +66,14 @@ from z3 import (
     Solver,
     URem,
     is_bv_value,
+    is_false,
     is_true,
     main_ctx,
     sat,
     unsat,
 )
 from z3.z3 import _to_ast_array
-from z3.z3core import Z3_mk_and, Z3_mk_or
+from z3.z3core import Z3_mk_and, Z3_mk_or, Z3_solver_assert, Z3_solver_check_assumptions
 
 from ..budget import poll, remaining
 from ..diagnostics import CompileError, ErrorKind, require
@@ -367,6 +369,7 @@ class Statistics:
     solver_checks: int = 0
     model_reuses: int = 0
     elementary_proofs: int = 0
+    rule_encodings: int = 0
     rule_assertions: int = 0
 
     def record(self, kind, elapsed, *, cached):
@@ -394,6 +397,7 @@ class Statistics:
             "solver_checks": self.solver_checks,
             "model_reuses": self.model_reuses,
             "elementary_proofs": self.elementary_proofs,
+            "rule_encodings": self.rule_encodings,
             "rule_assertions": self.rule_assertions,
         }
 
@@ -428,17 +432,33 @@ def _or(*values):
     return _boolean_packet(Z3_mk_or, values)
 
 
-class _RuleSystem:
-    """One isolated finite relation; invariant rules are asserted once.
+def _assert_booleans(solver, values):
+    """Submit this encoder's typed ASTs in the original assertion order.
 
-    A rule label occurs only as the premise of its guarded assertion. Query
-    scopes assume exactly the enabled labels. Every other label may be false,
-    so disabled rules cannot establish a conclusion or enter its UNSAT core.
-    Only the query's original premises and real seeds are temporary.
+    Identical to Solver.assert_exprs after BoolSort.cast: every value already
+    is a BoolRef in this solver's context. Preserve separate assertions and
+    labels, including the exact unsat-core attribution.
+    """
+    require(
+        all(isinstance(value, BoolRef) and value.ctx is solver.ctx for value in values),
+        "rule assertions need BoolRefs in the solver context",
+    )
+    for value in values:
+        Z3_solver_assert(solver.ctx.ref(), solver.solver, value.as_ast())
+
+
+class _RuleSystem:
+    """One isolated finite relation; invariant predicates are encoded once.
+
+    Only enabled assertions enter a query scope. Omitting the others is the
+    exact existential elimination of their free enabling labels: each occurs
+    only in its own assertion's antecedent and can be false. Their arithmetic
+    guards therefore need not participate in the current solver search.
     """
 
     def __init__(self, service, rules):
         self.service, self.rules, self.labels, self.indices = service, [], [], {}
+        self.assertions = []
         self.active, self.preparation_seconds = False, 0.0
         self.solver = Solver()
         self.solver.set(random_seed=0, unsat_core=True)
@@ -460,8 +480,8 @@ class _RuleSystem:
             self.indices[label.get_id()] = len(self.rules)
             self.rules.append(rule)
             self.labels.append(label)
-            self.solver.add(_or(Not(label), self.service._comparison(rule)))
-            self.service.statistics.rule_assertions += 1
+            self.assertions.append(_or(Not(label), self.service._comparison(rule)))
+            self.service.statistics.rule_encodings += 1
         self.preparation_seconds += perf_counter() - started
 
     @contextmanager
@@ -498,9 +518,12 @@ class _RuleContext:
         self.rules, self.assumptions = (*system.rules, *extra), assumptions
         self.answers, self.extra_indices = {}, {}
         self.enabled = tuple(system.labels[i] for i in enabled)
+        self.enabled_ast, self.enabled_size = _to_ast_array(self.enabled)
         self.solver = system.solver
         self.solver.push()
-        self.solver.add(*context)
+        _assert_booleans(self.solver, context)
+        _assert_booleans(self.solver, tuple(system.assertions[i] for i in enabled))
+        self.service.statistics.rule_assertions += len(enabled)
         for index, rule in enumerate(extra, len(system.rules)):
             label = FreshBool("seed")
             self.extra_indices[label.get_id()] = index
@@ -527,7 +550,13 @@ class _RuleContext:
         solver.push()
         try:
             solver.add(Not(service._comparison(conclusion)))
-            outcome = solver.check(*self.enabled)
+            # Same native call as Solver.check, with this immutable scope's
+            # already typed labels. Keep their BoolRefs alive in self.enabled.
+            outcome = CheckSatResult(
+                Z3_solver_check_assumptions(
+                    solver.ctx.ref(), solver.solver, self.enabled_size, self.enabled_ast
+                )
+            )
             elapsed = perf_counter() - started
             support = ()
             if outcome == unsat:
@@ -622,6 +651,24 @@ class IntegerQueryService:
     def rule_system(self, rules=()):
         """Prepare one isolated finite relation under the immutable inputs."""
         return _RuleSystem(self, rules)
+
+    def _model_truth(self, model, values, predicate):
+        if predicate not in values:
+            value = model.eval(self._comparison(predicate), model_completion=False)
+            values[predicate] = True if is_true(value) else False if is_false(value) else None
+        return values[predicate]
+
+    def witness_evaluation(self, assumptions):
+        """Evaluate guards in one existing SMT model of the complete premises.
+
+        A missing interpretation returns None, never false. This supplies no
+        universal fact and performs no new search or model completion.
+        """
+        self._context(assumptions)
+        for model, values in self._witnesses:
+            if all(self._model_truth(model, values, test) is True for test in assumptions):
+                return lambda test: self._model_truth(model, values, test)
+        return None
 
     # -- encoding ---------------------------------------------------------
     @memoized_method
@@ -890,11 +937,7 @@ class IntegerQueryService:
             # every actual premise and this objective to hold in that model.
             valid = True
             for test in assumptions:
-                if test not in values:
-                    values[test] = is_true(
-                        model.eval(self._comparison(test), model_completion=False)
-                    )
-                if not values[test]:
+                if self._model_truth(model, values, test) is not True:
                     valid = False
                     break
             if valid and is_true(model.eval(objective, model_completion=False)):

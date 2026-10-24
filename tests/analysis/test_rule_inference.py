@@ -81,7 +81,7 @@ def test_deep_negation_preserves_shared_formula_and_original_order():
     assert queries.implies(negate(opposite), (p,)).proved
 
 
-def test_relation_is_asserted_once_and_origin_seeds_never_leak_to_other_scopes():
+def test_relation_is_encoded_once_and_origin_seeds_never_leak_to_other_scopes():
     p, q, r = map(proposition, ("p", "q", "r"))
     queries = IntegerQueryService({})
     system = queries.rule_system((any_of(negate(p), q),))
@@ -102,16 +102,18 @@ def test_relation_is_asserted_once_and_origin_seeds_never_leak_to_other_scopes()
         assert proof.support == (0, 1, 2)
         assert queries.owns_implication(proof.answer, proof.condition, ())
     assert len(system.rules) == 2
-    assert queries.statistics.rule_assertions == 5
+    assert queries.statistics.rule_encodings == 2
+    assert queries.statistics.rule_assertions == 7
     # Failed scoped deductions store no global implication/model.
     assert all(answer.proved for answer in queries._answers.values())
 
 
-def test_complete_premises_change_without_reasserting_or_strengthening_the_relation():
+def test_complete_premises_change_without_reencoding_or_strengthening_the_relation():
     p, q, active = map(proposition, ("p", "q", "active"))
     queries = IntegerQueryService({})
     system = queries.rule_system((any_of(negate(p), q), any_of(negate(active), p)))
     for premises, expected in (((active,), True), ((), False), ((negate(active),), False)):
         with system.assuming(premises) as context:
             assert context.prove(q).answer.proved == expected
-    assert queries.statistics.rule_assertions == 2
+    assert queries.statistics.rule_encodings == 2
+    assert queries.statistics.rule_assertions == 6
