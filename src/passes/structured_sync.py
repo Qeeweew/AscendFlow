@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING
 
 from xdsl.dialects.builtin import ModuleOp
 
+from ..analysis.access_order import AccessOrder, build_access_order
 from ..analysis.smt import query_statistics
 from ..analysis.structured_admission import StructuredAdmission, admit_structured_memory
 from ..analysis.structured_bounds import admit_memory_bounds
-from ..analysis.structured_dependencies import StructuredDependencies, build_structured_dependencies
 from ..analysis.structured_dispatch import bind_structured_dispatch
 from ..analysis.structured_memory import collect_native_memory
 from ..analysis.structured_protocols import SynchronizationSelection
@@ -50,7 +50,7 @@ class StructuredSynchronization:
 
     structure: NativeStructure
     admission: StructuredAdmission
-    dependencies: StructuredDependencies
+    dependencies: AccessOrder
     selection: SynchronizationSelection
     resources: StructuredEventPlan
     before_ir: str
@@ -164,12 +164,12 @@ def synchronize_structure(source, *, id_pools=None) -> StructuredSynchronization
     dispatch = stage("dispatch", bind_structured_dispatch, memory)
     dependencies = stage(
         "dependencies",
-        build_structured_dependencies,
+        build_access_order,
         memory,
         admission=admission,
         dispatch=dispatch,
     )
-    program = generate_notifications(dependencies, dispatch)
+    program = generate_notifications(dependencies)
     timings.extend(program.timings)
     problem = stage("event_constraints", plan_event_resources, program, id_pools=id_pools)
     resources = stage("event_banks", allocate_structured_events, problem)

@@ -12,13 +12,12 @@ from time import perf_counter
 
 from ..analysis.cell_channels import CellChannel, construct_cell_channels
 from ..analysis.cell_ownership import LocalCreditOrder, PersistentCellCredit, bind_cell_credits
-from ..analysis.completion_prefixes import reduce_completion_prefixes
+from ..analysis.completion_prefixes import select_completion_frontiers
 from ..analysis.event_contracts import ResourceWork, StructuredEventLease
-from ..analysis.event_domains import EventCase, EventDomains
+from ..analysis.event_domains import EventDomains
 from ..analysis.notification_lifetimes import HandbackRule
-from ..analysis.protocol_transfers import ProtocolTransfers
 from ..analysis.queue_order import QueueOrder, establish_queue_order
-from ..analysis.structured_protocols import LogicalNotification, SynchronizationSelection
+from ..analysis.structured_protocols import SynchronizationSelection
 from .notification_binding import bind_notifications
 
 
@@ -29,19 +28,18 @@ class NotificationProgram:
     order: QueueOrder
     leases: tuple[StructuredEventLease, ...]
     channels: tuple[CellChannel, ...]
-    boundaries: tuple[tuple[LogicalNotification, tuple[EventCase, ...]], ...]
+    handbacks: HandbackRule
     timings: tuple[tuple[str, float], ...]
     credits: tuple[PersistentCellCredit, ...]
     credit_order: LocalCreditOrder
-    transfers: ProtocolTransfers
 
     def __init__(self, *args, **kwargs):
         raise TypeError("construct notifications with generate_notifications")
 
 
-def generate_notifications(dependencies, dispatch):
+def generate_notifications(dependencies):
     started = perf_counter()
-    selection = bind_notifications(dependencies, dispatch)
+    selection = bind_notifications(dependencies)
     return _complete_bindings(selection, binding_s=perf_counter() - started)
 
 
@@ -50,7 +48,7 @@ def _complete_bindings(selection, *, binding_s=0.0):
     started = perf_counter()
     domains = EventDomains(selection, ResourceWork())
     domained = perf_counter()
-    domains, transfers = reduce_completion_prefixes(domains)
+    domains = select_completion_frontiers(domains)
     selection = domains.selection
     prefixed = perf_counter()
     credits, credit_order = bind_cell_credits(domains)
@@ -76,11 +74,10 @@ def _complete_bindings(selection, *, binding_s=0.0):
         ("order", order),
         ("leases", leases),
         ("channels", channels),
-        ("boundaries", tuple(rule.boundary_cases.items())),
+        ("handbacks", rule),
         ("timings", timings),
         ("credits", credits),
         ("credit_order", credit_order),
-        ("transfers", transfers),
     ):
         object.__setattr__(result, name, value)
     return result

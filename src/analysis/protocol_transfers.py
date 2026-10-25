@@ -11,178 +11,17 @@ have distinct origins and queries.
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections import deque
-from dataclasses import dataclass
-from types import MappingProxyType
+from dataclasses import dataclass, field
 
 from ..budget import poll
-from ..scalar import expression, literal, substitute
+from ..memo import memoized_method
+from ..scalar import Expr, literal
+from ..symbols import Symbol, SymbolKind
 from .event_domains import EventCase
-from .guard_cover import opposite
-from .smt import all_of, any_of
+from .position_words import PositionWord, position_word
+from .smt import all_of, any_of, negate
 from .structured_protocols import NotificationKind
-from .structured_schedule import ActionGuard
-
-
-class _QueryFacts:
-    """Elementary guard facts for pruning, never a new causal permission."""
-
-    def __init__(self, arithmetic, assumptions):
-        self.arithmetic = arithmetic
-        self.tests, self.equalities, self.cache = set(), {}, {}
-        intervals = {}
-        for test in assumptions:
-            lhs, rhs = arithmetic.normalize(test.lhs), arithmetic.normalize(test.rhs)
-            self.tests.add(type(test)(lhs, test.predicate, rhs))
-            if test.predicate == "==":
-                if rhs.constant is not None:
-                    self.equalities[lhs] = rhs.constant
-                if lhs.constant is not None:
-                    self.equalities[rhs] = lhs.constant
-            if rhs.constant is not None:
-                low, high = intervals.get(lhs, (None, None))
-                value = rhs.constant
-                if test.predicate in {">", ">=", "=="}:
-                    bound = value + int(test.predicate == ">")
-                    low = bound if low is None else max(low, bound)
-                if test.predicate in {"<", "<=", "=="}:
-                    bound = value - int(test.predicate == "<")
-                    high = bound if high is None else min(high, bound)
-                intervals[lhs] = low, high
-            elif lhs.constant is not None:
-                # Keep the same scalar identity when the literal is on the left.
-                flip = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "==": "==", "!=": "!="}
-                low, high = intervals.get(rhs, (None, None))
-                relation, value = flip[test.predicate], lhs.constant
-                if relation in {">", ">=", "=="}:
-                    bound = value + int(relation == ">")
-                    low = bound if low is None else max(low, bound)
-                if relation in {"<", "<=", "=="}:
-                    bound = value - int(relation == "<")
-                    high = bound if high is None else min(high, bound)
-                intervals[rhs] = low, high
-        for value, (low, high) in intervals.items():
-            if low is not None and low == high:
-                self.equalities[value] = low
-        self.atoms = {
-            value: literal(number)
-            for value, number in self.equalities.items()
-            if value.kind == "argument"
-        }
-        self.shapes, self.differences = {}, {}
-        for test in assumptions:
-            base, offset = self._difference(test.lhs, test.rhs)
-            low, high = self.differences.get(base, (None, None))
-            if test.predicate in {">", ">=", "=="}:
-                bound = -offset + int(test.predicate == ">")
-                low = bound if low is None else max(low, bound)
-            if test.predicate in {"<", "<=", "=="}:
-                bound = -offset - int(test.predicate == "<")
-                high = bound if high is None else min(high, bound)
-            self.differences[base] = low, high
-            negative, shift = self._shape(expression("mul", literal(-1), base))
-            # Negating a normalized nonconstant sum introduces no offset.
-            # Keep the offset explicitly so this remains an upper/lower
-            # bound if normalization later learns additional equivalences.
-            a, b = self.differences.get(negative, (None, None))
-            if high is not None:
-                bound = -high - shift
-                a = bound if a is None else max(a, bound)
-            if low is not None:
-                bound = -low - shift
-                b = bound if b is None else min(b, bound)
-            self.differences[negative] = a, b
-
-    def normalize(self, value):
-        return (
-            self.arithmetic.normalize(substitute(value, self.atoms))
-            if self.atoms
-            else self.arithmetic.normalize(value)
-        )
-
-    def _shape(self, value):
-        if value not in self.shapes:
-            pending, terms, constant = [self.normalize(value)], [], 0
-            while pending:
-                part = pending.pop()
-                if part.constant is not None:
-                    constant += part.constant
-                elif part.kind == "add":
-                    pending.extend(reversed(part.args))
-                else:
-                    terms.append(part)
-            base = literal(0)
-            for term in terms:
-                base = expression("add", base, term)
-            self.shapes[value] = base, constant
-        return self.shapes[value]
-
-    def _difference(self, lhs, rhs):
-        return self._shape(expression("sub", lhs, rhs))
-
-    def truth(self, condition):
-        pending = [(condition, False)]
-        while pending:
-            current, done = pending.pop()
-            if current in self.cache:
-                continue
-            if type(current) is bool:
-                self.cache[current] = current
-            elif hasattr(current, "kind"):
-                if not done:
-                    pending.append((current, True))
-                    pending.extend((part, False) for part in reversed(current.operands))
-                    continue
-                parts = tuple(self.cache[part] for part in current.operands)
-                if current.kind == "and":
-                    answer = (
-                        False if False in parts else True if all(p is True for p in parts) else None
-                    )
-                else:
-                    answer = (
-                        True if True in parts else False if all(p is False for p in parts) else None
-                    )
-                self.cache[current] = answer
-            else:
-                self.cache[current] = self._atomic_truth(current)
-        return self.cache[condition]
-
-    def _atomic_truth(self, condition):
-        lhs, rhs = self.normalize(condition.lhs), self.normalize(condition.rhs)
-        test = type(condition)(lhs, condition.predicate, rhs)
-        left = lhs.constant if lhs.constant is not None else self.equalities.get(lhs)
-        right = rhs.constant if rhs.constant is not None else self.equalities.get(rhs)
-        if left is not None and right is not None:
-            return {
-                "==": left == right,
-                "!=": left != right,
-                "<": left < right,
-                "<=": left <= right,
-                ">": left > right,
-                ">=": left >= right,
-            }[test.predicate]
-        if test in self.tests:
-            return True
-        if opposite(test) in self.tests:
-            return False
-        base, offset = self._difference(lhs, rhs)
-        low, high = self.differences.get(base, (None, None))
-        low = None if low is None else low + offset
-        high = None if high is None else high + offset
-        positive = low is not None and low > 0
-        nonnegative = low is not None and low >= 0
-        negative = high is not None and high < 0
-        nonpositive = high is not None and high <= 0
-        zero = low == high == 0
-        yes, no = {
-            ">": (positive, nonpositive),
-            ">=": (nonnegative, negative),
-            "<": (negative, nonnegative),
-            "<=": (nonpositive, positive),
-            "==": (zero, positive or negative),
-            "!=": (positive or negative, zero),
-        }[test.predicate]
-        return True if yes else False if no else None
+from .structured_schedule import ActionGuard, Comparison
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,11 +47,35 @@ class TransferNode:
 
 @dataclass(frozen=True, eq=False, slots=True)
 class CausalProof:
-    """A shared acyclic derivation whose leaves name real retained actions."""
+    """An established cut, with immutable real-action support and deduction."""
 
     node: TransferNode
     inputs: tuple[CausalProof, ...]
     condition: object
+    deduction: TransferDeduction | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TransferRule:
+    """One actual capture seed or existing guarded transfer, never a fact."""
+
+    node: TransferNode
+    premise: object
+    conclusion: object
+    seed: bool = False
+    predicate: object = field(init=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "predicate", any_of(negate(self.premise), self.conclusion))
+
+
+@dataclass(frozen=True, slots=True)
+class TransferDeduction:
+    origin: object
+    premises: tuple
+    rules: tuple[TransferRule, ...]
+    conclusion: object
+    answer: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +101,7 @@ class ProtocolPositions:
     def dispatch(self):
         return self.domains.dispatch
 
+    @memoized_method
     def position(self, point):
         return self.domains._positions(self.dispatch.site(point), point.coordinates)
 
@@ -376,6 +240,26 @@ class _QueueWord:
                 yield graph.merge((node,), condition=condition)
 
 
+class _CaptureWord:
+    def __init__(self, entries, positions):
+        ranks, examples = {}, {}
+        for number, node in entries:
+            rank = positions.position(node.point)[-1][2]
+            ranks.setdefault(rank, []).append(number)
+            examples[rank] = (node.point,)
+        self.positions = PositionWord(examples.items(), positions)
+        self.members = tuple(tuple(ranks[rank]) for rank in self.positions.keys)
+
+    def seeds(self, graph, origin):
+        for start, end, (point,) in self.positions.bands((origin.point,)):
+            graph.work.transfer_capture_bands += 1
+            condition = graph._origin_order(origin, point)
+            if condition is not False:
+                for group in self.members[start:end]:
+                    for number in group:
+                        yield number, condition
+
+
 class ProtocolTransfers:
     """One owned set of capture snapshots, independent of integer event IDs.
 
@@ -391,9 +275,6 @@ class ProtocolTransfers:
         self.nodes = [TransferNode("union", None, None, (), False)]
         self.episodes = {}
         self._unions, self._snapshots = {}, {}
-        self._consumed_states = {}
-        self._query_facts = {}
-        self._input_orders = {}
         self.native_acquires = {}
         words = {}
         if episodes is None:
@@ -445,7 +326,18 @@ class ProtocolTransfers:
                     )
         self.work.transfer_nodes += len(self.nodes)
         self.work.transfer_edges += sum(len(node.inputs) for node in self.nodes)
-        self._build_may_prefixes()
+        self.capture_words = {}
+        words = {}
+        for number, node in enumerate(self.nodes):
+            if node.kind == "capture":
+                route = node.point.actor, node.notification.source_engine
+                key = route, position_word((node.point,), self.positions)[0]
+                words.setdefault(key, []).append((number, node))
+        for (route, _), entries in words.items():
+            self.capture_words.setdefault(route, []).append(_CaptureWord(entries, self.positions))
+        self.work.transfer_capture_words += len(words)
+        self.propositions, self.rules = {}, {}
+        self._rule_system = None
         self.ready = True
 
     def _episodes(self):
@@ -483,93 +375,21 @@ class ProtocolTransfers:
             if getattr(self, "ready", False):
                 self.work.transfer_nodes += 1
                 self.work.transfer_edges += len(inputs)
-                self._may.append(None)
         return self._unions[key]
 
-    def _join_may(self, result, other):
-        """Upper bounds only: a later possible capture subsumes an older one.
+    def _proposition(self, number):
+        if number not in self.propositions:
+            symbol = Symbol(f"reached_{number}", SymbolKind.SSA, object())
+            self.propositions[number] = Comparison(Expr("argument", (symbol,)), "==", literal(0))
+        return self.propositions[number]
 
-        Guards and protocol availability are deliberately ignored. This may
-        retain too much, but cannot authorize a completion. It only permits
-        skipping a subtree which has no possible covering origin capture.
-        """
-        for key, points in other.items():
-            frontier = result.setdefault(key, [])
-            for point in points:
-                if any(self.order(point, prior, strict=False) is True for prior in frontier):
-                    continue
-                frontier[:] = [
-                    prior
-                    for prior in frontier
-                    if self.order(prior, point, strict=False) is not True
-                ]
-                frontier.append(point)
-
-    def _build_may_prefixes(self):
-        """Factor cyclic positional dependencies without using them as proof."""
-        reverse = [[] for _ in self.nodes]
-        for number, node in enumerate(self.nodes):
-            for child in node.inputs:
-                reverse[child].append(number)
-        visited, finished = set(), []
-        for start in range(len(self.nodes)):
-            if start in visited:
-                continue
-            stack = [(start, False)]
-            while stack:
-                number, done = stack.pop()
-                if done:
-                    finished.append(number)
-                elif number not in visited:
-                    visited.add(number)
-                    stack.append((number, True))
-                    stack.extend((child, False) for child in reversed(self.nodes[number].inputs))
-        component, members = {}, []
-        for start in reversed(finished):
-            if start in component:
-                continue
-            group, pending = [], [start]
-            while pending:
-                number = pending.pop()
-                if number in component:
-                    continue
-                component[number] = len(members)
-                group.append(number)
-                pending.extend(reverse[number])
-            members.append(group)
-        dependencies = [set() for _ in members]
-        parents = [set() for _ in members]
-        for number, node in enumerate(self.nodes):
-            own = component[number]
-            for child in node.inputs:
-                other = component[child]
-                if own != other:
-                    dependencies[own].add(other)
-                    parents[other].add(own)
-        ready = deque(i for i, values in enumerate(dependencies) if not values)
-        waiting = [len(values) for values in dependencies]
-        self._may = [None] * len(self.nodes)
-        while ready:
-            own = ready.popleft()
-            frontier = {}
-            for other in dependencies[own]:
-                self._join_may(frontier, self._may[members[other][0]])
-            for number in members[own]:
-                node = self.nodes[number]
-                if node.kind == "capture":
-                    self._join_may(
-                        frontier,
-                        {(node.point.actor, node.notification.source_engine): (node.point,)},
-                    )
-            summary = MappingProxyType({key: tuple(points) for key, points in frontier.items()})
-            for number in members[own]:
-                self._may[number] = summary
-            self.work.transfer_may_points += sum(map(len, summary.values()))
-            for parent in parents[own]:
-                waiting[parent] -= 1
-                if waiting[parent] == 0:
-                    ready.append(parent)
-        self.work.transfer_components += len(members)
+    def _rule(self, number):
+        if number not in self.rules:
+            node = self.nodes[number]
+            premise = all_of(node.condition, any_of(*(self._proposition(i) for i in node.inputs)))
+            self.rules[number] = TransferRule(node, premise, self._proposition(number))
+            self.work.transfer_rules += 1
+        return self.rules[number]
 
     def _origin_matches(self, origin, actor, engine):
         if actor is not origin.point.actor:
@@ -584,68 +404,16 @@ class ProtocolTransfers:
     def _origin_order(self, origin, capture):
         return self.order(origin.point, capture, strict=isinstance(origin, ConsumptionOrigin))
 
-    def _inputs(self, number, actor):
-        key = number, actor
-        if key not in self._input_orders:
-            node = self.nodes[number]
-            if node.kind == "acquire":
-                # A quorum still requires every real contribution. One
-                # participant's origin is first sought in that participant's
-                # capture; the acquire guard retains the complete quorum.
-                own, others = [], []
-                for child in node.inputs:
-                    (own if self.nodes[child].point.actor is actor else others).append(child)
-                inputs = (*own, *others)
-            else:
-                inputs = tuple(reversed(node.inputs))
-            self._input_orders[key] = inputs
-        return self._input_orders[key]
-
-    def _may_reach(self, number, origin, cache, facts, assumptions):
-        if self._may[number] is None:
-            # New query unions only point at already frozen capture snapshots.
-            pending = [(number, False)]
-            while pending:
-                current, done = pending.pop()
-                if self._may[current] is not None:
-                    continue
-                if done:
-                    frontier = {}
-                    for child in self.nodes[current].inputs:
-                        self._join_may(frontier, self._may[child])
-                    self._may[current] = MappingProxyType(
-                        {key: tuple(points) for key, points in frontier.items()}
-                    )
-                else:
-                    pending.append((current, True))
-                    pending.extend(
-                        (child, False)
-                        for child in self.nodes[current].inputs
-                        if self._may[child] is None
-                    )
-        summary = self._may[number]
-        key = id(summary)
-        if key not in cache:
-            possible = any_of(
-                *(
-                    self._origin_order(origin, capture)
-                    for (actor, engine), points in summary.items()
-                    if self._origin_matches(origin, actor, engine)
-                    for capture in points
-                )
-            )
-            truth = facts.truth(possible)
-            if truth is None and isinstance(origin, ConsumptionOrigin):
-                # A may skyline ignores activation when subsuming older
-                # captures. Keep that upper bound: do not add the skyline
-                # representative's guard. Only an impossible order to every
-                # possible origin cut can prune this entire shared component.
-                self.work.consumption_bound_queries += 1
-                answer = self.domains.arithmetic.queries.satisfies((*assumptions, possible))
-                truth = False if answer.impossible else None
-                self.work.consumption_bound_exclusions += int(answer.impossible)
-            cache[key] = truth is not False
-        return cache[key]
+    def _capture_seeds(self, origin, excluded):
+        for (actor, engine), words in self.capture_words.items():
+            if self._origin_matches(origin, actor, engine):
+                for word in words:
+                    for number, order in word.seeds(self, origin):
+                        node = self.nodes[number]
+                        if node.notification not in excluded:
+                            premise = all_of(node.condition, order)
+                            if premise is not False:
+                                yield number, premise
 
     def order(self, before, after, *, strict):
         return self.positions.order(before, after, strict=strict)
@@ -673,8 +441,8 @@ class ProtocolTransfers:
         """Derive one origin queue prefix at a real consumer admission.
 
         Excluded protocols cannot support themselves or another deletion.
-        Gray backedges supply no facts; resulting witnesses are immutable
-        acyclic derivations rooted in actual retained capture/acquire actions.
+        The deduction retains the real capture/acquire rules supporting the
+        conclusion under these complete original premises.
         """
         return self._derive(
             CompletionOrigin(source, engine),
@@ -692,40 +460,16 @@ class ProtocolTransfers:
         for Scalar/cross Wait. A later Set acquires that fact only at a strict
         capture cut; native readiness alone never creates this origin.
         """
-        origin = ConsumptionOrigin(old, notification)
-        states = self._consumed_states.setdefault((origin, assumptions), {})
-        hits = self.work.consumption_state_hits
-        proof = self._derive(
-            origin,
+        return self._derive(
+            ConsumptionOrigin(old, notification),
             target,
             engine,
             excluded=frozenset((notification,)),
             assumptions=assumptions,
             strict_target=True,
-            states=states,
         )
-        if self.work.consumption_state_hits != hits:
-            if (
-                proof is not None
-                and self.domains.arithmetic.queries.implies(proof.condition, assumptions).proved
-            ):
-                return proof
-            # Cached conditional facts are sufficient witnesses, not a claim
-            # of complete negative reachability. A new admission may require
-            # an alternative through a previously open boundary.
-            self.work.consumption_state_refreshes += 1
-            return self._derive(
-                origin,
-                target,
-                engine,
-                excluded=frozenset((notification,)),
-                assumptions=assumptions,
-                strict_target=True,
-                states=states,
-                reuse=False,
-            )
-        return proof
 
+    @memoized_method
     def _derive(
         self,
         origin,
@@ -735,102 +479,139 @@ class ProtocolTransfers:
         excluded,
         assumptions,
         strict_target,
-        states=None,
-        reuse=True,
     ):
+        """Prove the required cut under its complete original premises.
+
+        Existing guarded transfer rules are shared; only the real origin's
+        capture seeds belong to this query. Exported acquires are proved
+        separately in the same temporary context.
+
+        Real actions and their input snapshots are immutable. Appending a
+        query cut cannot change an existing cut's predecessors. Exact queries
+        therefore share their result, including an unsuccessful coverage
+        attempt; changed premises, origin, target or exclusions have new keys.
+        A failed coverage attempt never asserts that a prefix is unreachable.
+        """
         kind = "consumption" if isinstance(origin, ConsumptionOrigin) else "completion"
-
-        def count(field):
-            name = kind + "_" + field
-            setattr(self.work, name, getattr(self.work, name) + 1)
-
-        count("queries")
-        if assumptions not in self._query_facts:
-            self._query_facts[assumptions] = _QueryFacts(self.domains.arithmetic, assumptions)
-            self.work.transfer_fact_contexts += 1
-        else:
-            self.work.transfer_fact_reuses += 1
-        facts = self._query_facts[assumptions]
-        if any(facts.truth(test) is False for test in assumptions):
-            # The caller still proves this empty activation with the shared
-            # mathematical service. No real action is pinned by an empty case.
-            return CausalProof(self.nodes[0], (), False)
+        name = kind + "_queries"
+        setattr(self.work, name, getattr(self.work, name) + 1)
         if self.positions.position(origin.point) is None or self.positions.position(target) is None:
             return None
         root = self.snapshot(target, destination, strict=strict_target)
-        results, possible, visiting, stack = {}, {}, set(), [(root, 0)]
-        while stack:
-            poll(kind + " frontier transfer")
-            number, next_input = stack[-1]
+        # Only antecedents of the requested cut can affect its least model.
+        # Stop at unavailable actions: neither their transfer nor their seed
+        # may establish a fact. The other propositions can all be false in a
+        # countermodel, including an unseeded cycle. This is a query slice,
+        # not a causal fact or a claim that the remaining graph is acyclic.
+        pending, relevant = [root], set()
+        while pending:
+            number = pending.pop()
             node = self.nodes[number]
-            if node.notification in excluded:
-                results[number] = None
-                stack.pop()
+            if number in relevant or node.notification in excluded or node.condition is False:
                 continue
-            if reuse and states is not None and number in states:
-                results[number] = states[number]
-                self.work.consumption_state_hits += 1
-                stack.pop()
-                continue
-            if next_input == 0 and number not in visiting:
-                if facts.truth(node.condition) is False or not self._may_reach(
-                    number, origin, possible, facts, assumptions
-                ):
-                    results[number] = None
-                    count("pruned")
-                    stack.pop()
+            relevant.add(number)
+            pending.extend(node.inputs)
+        captures = tuple(
+            (number, premise)
+            for number, premise in self._capture_seeds(origin, excluded)
+            if number in relevant
+        )
+        # A target ancestor without a path from an actual origin seed cannot
+        # acquire that origin. Intersect both structural directions before
+        # asking about guards. In particular, an unseeded SCC needs no SMT.
+        successors = {number: [] for number in relevant}
+        for number in relevant:
+            for child in self.nodes[number].inputs:
+                if child in successors:
+                    successors[child].append(number)
+        pending = [number for number, _ in captures]
+        grounded = set()
+        while pending:
+            number = pending.pop()
+            if number not in grounded:
+                grounded.add(number)
+                pending.extend(successors[number])
+        if root not in grounded:
+            return None
+        # Reuse an actual input model, never sampled parameters. Keeping every
+        # guard with an unknown interpretation gives an upper reachability
+        # bound. If even that bound misses the target, this model already
+        # refutes complete coverage; no symbolic propagation query is needed.
+        evaluate = self.domains.arithmetic.queries.witness_evaluation(assumptions)
+        if evaluate is not None:
+            pending = [number for number, premise in captures if evaluate(premise) is not False]
+            possible = set()
+            while pending:
+                number = pending.pop()
+                if number in possible or evaluate(self.nodes[number].condition) is False:
                     continue
-                if node.kind == "capture" and self._origin_matches(
-                    origin, node.point.actor, node.notification.source_engine
-                ):
-                    direct = self._origin_order(origin, node.point)
-                    if facts.truth(direct) is True:
-                        results[number] = CausalProof(node, (), all_of(node.condition, direct))
-                        count("nodes")
-                        stack.pop()
-                        continue
-            visiting.add(number)
-            ordered = self._inputs(number, origin.point.actor)
-            if next_input:
-                previous = results.get(ordered[next_input - 1])
-                if previous is not None and facts.truth(previous.condition) is True:
-                    # One acquired frontier already covers this query's whole
-                    # domain. Preserve its actual proof and the parent's guard;
-                    # inspecting the rest of the union cannot enlarge that
-                    # guarded fact under these same assumptions.
-                    results[number] = CausalProof(
-                        node, (previous,), all_of(node.condition, previous.condition)
+                possible.add(number)
+                pending.extend(successors[number])
+            if root not in possible:
+                name = kind + "_countermodels"
+                setattr(self.work, name, getattr(self.work, name) + 1)
+                return None
+        enabled = tuple(sorted(grounded))
+        seeds = tuple(
+            TransferRule(self.nodes[number], premise, self._proposition(number), True)
+            for number, premise in captures
+        )
+        if self._rule_system is None:
+            self._rule_system = self.domains.arithmetic.queries.rule_system()
+            self._registered = {}
+        added = tuple(number for number in enabled if number not in self._registered)
+        self._rule_system.extend(tuple(self._rule(number).predicate for number in added))
+        for number in added:
+            self._registered[number] = len(self._registered)
+        rules = tuple(self._rule(number) for number in self._registered) + seeds
+        name = kind + "_rule_instances"
+        setattr(self.work, name, getattr(self.work, name) + len(enabled) + len(seeds))
+        leaves = {}
+
+        def establish(number, inference):
+            support = tuple(rules[index] for index in inference.support)
+            inputs = []
+            for index in inference.support:
+                if index not in leaves:
+                    rule = rules[index]
+                    node = rule.node
+                    leaf = TransferNode(
+                        node.kind + "-rule", node.notification, node.point, (), rule.predicate, rule
                     )
-                    count("nodes")
-                    count("shortcuts")
-                    visiting.remove(number)
-                    stack.pop()
-                    continue
-            if next_input < len(ordered):
-                # Query the newest acquired frontier first. Earlier prefix
-                # ranges remain available when its activation is incomplete.
-                child = ordered[next_input]
-                stack[-1] = number, next_input + 1
-                if child in visiting:
-                    count("cycles")
-                    continue
-                if child not in results:
-                    stack.append((child, 0))
-                continue
-            inputs = tuple(results[i] for i in node.inputs if results.get(i) is not None)
-            condition = all_of(node.condition, any_of(*(proof.condition for proof in inputs)))
-            if node.kind == "capture" and self._origin_matches(
-                origin, node.point.actor, node.notification.source_engine
-            ):
-                direct = all_of(node.condition, self._origin_order(origin, node.point))
-                if direct is not False:
-                    leaf = CausalProof(node, (), direct)
-                    inputs = (leaf, *inputs)
-                    condition = any_of(direct, condition)
-            results[number] = None if condition is False else CausalProof(node, inputs, condition)
-            count("nodes")
-            visiting.remove(number)
-            stack.pop()
-        if states is not None:
-            states.update((number, proof) for number, proof in results.items() if proof is not None)
-        return results.get(root)
+                    leaves[index] = CausalProof(leaf, (), rule.predicate)
+                inputs.append(leaves[index])
+            deduction = TransferDeduction(
+                origin,
+                assumptions,
+                support,
+                self._proposition(number),
+                inference.answer,
+            )
+            name = kind + "_conclusions"
+            setattr(self.work, name, getattr(self.work, name) + 1)
+            return CausalProof(self.nodes[number], tuple(inputs), inference.condition, deduction)
+
+        with self._rule_system.assuming(
+            assumptions,
+            extra=tuple(rule.predicate for rule in seeds),
+            enabled=tuple(self._registered[number] for number in enabled),
+        ) as context:
+            result = context.prove(self._proposition(root))
+            if not result.answer.proved:
+                return None
+            proof = establish(root, result)
+            if isinstance(origin, CompletionOrigin):
+                return proof
+            # A rule is not an acquired fact. Only independently established
+            # real acquires may become inputs for future boundary composition.
+            supported = {rules[index].node for index in result.support}
+            acquired = []
+            for number, node in enumerate(self.nodes):
+                if number != root and node.kind == "acquire" and node in supported:
+                    poll("consumption acquired cut", vertex=number)
+                    answer = context.prove(self._proposition(number))
+                    if answer.answer.proved:
+                        acquired.append(establish(number, answer))
+            return CausalProof(
+                proof.node, (*proof.inputs, *acquired), proof.condition, proof.deduction
+            )

@@ -1,8 +1,8 @@
 """Native reader retirement and source-value bindings on structured dependencies."""
 
 from ascendflow import language as N
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.hazards import HazardKind
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.passes.lower_native import lower_native_structure
 from ascendflow.target.ascend910b import Actor, Engine, Milestone
@@ -11,7 +11,7 @@ from tests.models.dependency_edges import materialized_edges
 
 def dependencies(source):
     structure = lower_native_structure(N.from_source(source, disjoint_external=True))
-    result = build_structured_dependencies(collect_native_memory(structure.module))
+    result = build_access_order(collect_native_memory(structure.module))
     return result
 
 

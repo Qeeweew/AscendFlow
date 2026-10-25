@@ -43,6 +43,8 @@ AscendFlow 在 example 表达裁剪、对角 mask 和任务顺序，通用编译
 - 本地二值flag按bank分配有限ID，消费先于复用；AscendC TPipe本身可能预置/占用event，手写参考与裸ASC分别记录。
 - CANN 2201的 `GetfftsConfig` 使用 mode=2 和 `flag_id & 0xf`，因此只分配 0..15，禁止 overflow alias。
 - mode2跨核通知、双AIV贡献及GM可见性属于具体硬件协议。`asc_sync_block_wait`在2201调用`wait_flag_dev`，阻塞控制器后续派发，不能按某一MTE queue wait处理。
+  2201 的宏丢弃名义 pipe 参数；有限事件模型也不能给该 Wait 添加来自此 pipe
+  先前 native/local Wait 的顺序边。先前已派发的异步队列不因 controller 等待而退休。
 - mode-2 按实际发送者/接收者保留计数贡献，同一发送者、同一 source pipe 的
   贡献保持 FIFO；该性质不提供普通 native end 之间的完成顺序。AIC 的 Wait
   消费两个 AIV 各自的下一份贡献，快 AIV 的后续贡献不能替代另一个 AIV。

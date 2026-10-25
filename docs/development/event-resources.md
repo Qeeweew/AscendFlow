@@ -20,29 +20,30 @@ counter 候选组及预留。域和 handback 查询只在规划阶段发生。
 `EventDomains`、SMT callback 或补造 handback 的入口。分配不能移动 native、
 Wait、修改 buffer 数量或添加 controller gate。物化继续同一条 source 编译链。
 
-## 专属优先和有限搜索
+## 专属优先和有限联合选择
 
 local namespace 是 `(actor, source pipe, destination pipe)`，每 bank 8 ID。
 两个 AIV 的私有 bank 分开计数；cross mode-2 使用 mixed 组内的 16 个 base ID，
 不能通过大于 15 的整数扩容。配置、最终 drain 和持久 token 进入同一台账。
 
-分配先尝试专属连续映射，必要时使用显式有限映射；快速摆放失败后先检查联合
-专属着色，再使用已建立的复用约束。DSATUR 采用结构顺序打破平局，全部协议
-选项的回溯合计最多 16384 个节点，搜索中没有域查询。
-mode-2 规划先用已有整组 FIFO 证书构造一个具体分区；该分区已能放入 ID 池时，
-不再为编号候选逐对建立额外消费回传。删除组内未选成员继续保留同一 word、
-quorum、进展和 backlog 证据。分配器直接消费这个有限分区，不查询 source 域。
-分区不能证明可放入时继续建立时间复用约束；已有时间证据先于一般 FIFO 残余
-着色使用。结构分区是可行映射的上界，不声称全局最少 ID。
-资源分量按 bank 的连通关系建立，AIV 取商后的许可仅在残余冲突确实查询时
-投影全部原私有 bank 的约束。专属单 bank 计数已超出实际可用池时无需构造
-稠密 clique；能直接专属摆放或按已证 FIFO 分区分配的输入也不枚举所有资源对。
-一般残余 `_color` 目前仍构造顶点冲突图，不把上述快路径称为全面稀疏编号。
-尚未使用且对全部顶点具有相同可用性的 ID，只尝试一个代表；它们在冻结约束中
-可互换。不同 bank 的预留通过完整可用性列区分，已使用的 ID 不按此规则合并。
-连续环仍只是摆放偏好，不因对称剪枝改变 lane 异号或整组 counter 检查。
-工作耗尽与已建立约束下无解分开诊断；保守约束图的 clique 不能证明
-实际硬件最小需求。非连续映射降为小型有符号 min/max 表达式。
+分配先作专属连续映射；已有完整 FIFO word 的分区能直接放入时同样返回
+具体映射。这两种构造不枚举所有资源对，不声称全局最少 ID。其余情况把全部
+已冻结协议选项和实际 lane 数字构成一份 Z3 有限问题，词典序优先原选项，再
+优先每个独立 bank 分量的专属映射。没有 Python DSATUR、编号递归或选项重试。
+
+local 从冻结行 mask 的缺失许可展开实际冲突，保留每个原私有 bank；只对
+实际冲突展开 lane 异号约束。已知超额 clique 在构造稠密余部前拒绝。位图成本
+还依赖 mask 字长，普通显式数字输入继续按实际公共 bank 检查许可。
+
+counter 同号集必须选已有整组证书之一：完整时间分离使至多一个 credit 活跃，
+各 backlog≤15；同一 FIFO word 的过滤子集使所选 backlog 之和≤15；已证时间
+组合使各 FIFO child 所选 backlog 和的最大值≤15。模式变量只选已有证书，
+不产生完成或消费事实，也不枚举所有兼容子集。
+
+求解沿用 2 秒局部上限并服从编译整体剩余期限。UNKNOWN 和未确定最优偏好
+均不授权分配；UNSAT core 标出有限选项、pool、lane 或分离约束，只能说明
+这些冻结前提下无解，不能证明实际硬件最小需求。统计分别记录变量、约束、
+求解次数与耗时。非连续映射仍降为小型有符号 min/max 表达式。
 
 着色顶点是 `(占用, lane)`，占用可包含完整 credit 或其实际 phase 成员。
 同一占用的不同 lane 必须异号；有公共 bank 且没有完整复用许可的顶点也必须
@@ -66,7 +67,7 @@ AIV peer 只对编号变量取商：一个共同编号须在每个原私有 bank
 
 受压分量可准备逐维更小的协议，保留其余维度的事实，重新建立改变的 phase、
 配对及 handback。镜像 AIV 联合调整并保留 peer 对应。规划冻结按结构顺序累计
-缩环的有限选项；分配先穷尽首选协议的资源约束，失败后才尝试这些选项。
+缩环的有限选项；联合求解以选项序号为首要目标，保留首选协议优先政策。
 当前不枚举所有嵌套环组合、任意相位或所有最小修改子集，有限选项失败仍可能
 属于支持边界。它们不改变 native、buffer、通知位置或激活，不增加 Wait。
 
@@ -85,7 +86,7 @@ AIV peer 只对编号变量取商：一个共同编号须在每个原私有 bank
 
 镜像 AIV 同时准备 phase 选项，保留两个原私有 bank 的编号交集；原有共用
 通知序列的次序、重复数和完整 guard 必须继续保持。整数分配失败时才选用
-已经冻结的后续选项，所有选项仍共享原搜索工作上限。当前该规则细分 local
+已经冻结的后续选项，所有选项在同一有限问题中选择。当前该规则细分 local
 稳定 cell 的通知成员；mode-2 继续使用完整 word/quorum/backlog 合同，普通
 runtime ring 内不同 lane 的进一步共享仍须额外证明，不能由此规则推出。
 
@@ -110,9 +111,12 @@ local 的两份完整 credit 只有全部成员及实际 occurrence 的占用区
 真实 FIRST/LAST/family 端点，并检查坐标往返及完整激活。未来放宽坐标映射时，
 必须重审实际首末顺序，不能只保留可逆性就继续复用整段 invocation 证明。
 
-本地事件规划按受压 bank 建立完整 credit 的分层消费前沿。同一激活类保留
+事件规划按受压 local bank 或实际 counter route 建立完整 credit 的分层消费前沿。
+counter 先尝试现有完整 FIFO word 分区；已放入 ID 池时不求可选时间复用。
+同一激活类保留
 最早的真实 publisher 和最晚的真实 consumer；合并必须具有相同的完整 guard、
-坐标、case、输入范围及参与者合同，并证明真实端点间的无条件发射包围关系。
+坐标、case、输入范围及参与者合同，并在每个实际 publisher/receiver 上证明
+真实端点间的无条件发射包围关系。一个 AIV 的顺序不能代表另一个 AIV。
 同一 native 锚点上的两条不同通知没有由此确定的相对顺序，不能据 rank 相等合并。
 包围只提供 issue/queue 前缀覆盖，不建立新的完成、消费或 quorum 贡献。
 
@@ -123,13 +127,26 @@ A→C：链尾到下一次链首的消费义务仍须独立成立。不同激活
 仍可能需要稠密的接口检查；本规则不承诺所有程序都具有线性分析成本。
 
 已建立的完整 credit 分离冻结为 `CreditSeparation` 和有限 bitmask 矩形。
-编号器只查这份不可变数字关系。最终 local 同号组逐行检查成员 mask 的完整覆盖，
+编号器只查这份不可变数字关系。纯时间复用同号组逐行检查成员 mask 的完整覆盖，
 任一成员缺少对其他 credit 的许可即拒绝；检查和报告保留所选子矩形，不再展开
 每对消息。报告以 `LocalEventReuse` 记录 bank、ID、完整 credit 成员与所选矩形，
-共享的 `local_event_certificates` / `local_event_frontiers` 表保存证书和真实端点树。
+counter 的 `CounterReuseGroup` 同样保留完整 credit 和所选矩形，其逐 publisher
+backlog 为不干涉 credit 的最大值。FIFO-child 组合逐行检查其他 child 的完整
+集合，child 内保持 whole word/quorum 和 backlog 求和，再取各 child 上界最大值。
+共享的 `event_certificates` / `event_frontiers` 表保存证书和真实端点树。
+前沿只保留 head/tail、子树和成员数，不在每次 join 复制完整成员集合；报告按树
+保存各实际参与者的 enclosure，不重新展开 counter credit/member 许可对。
 这些操作不重新调用域或 handback 分析；逐消息对展开仅用于开发对照测试。
 缩环选项只改变 width/phase 时，共用同一输入 owner 的
 激活、真实端点、包围和消费事实；完整成员集合或输入 owner 改变即不能沿用。
+
+完成/消费 transfer 共用同一不可变整数输入及完整有序前提的数学服务；有限
+规则使用隔离上下文，冻结的消费证据只保存实际支持规则、前提及 owned Answer，
+不携带 solver 或分析回调。删除协议后，未变的数学输入可以随域事实投影；
+它们不保存协议图或完成/消费许可。消费前沿 word 内相同前提及 before/after 位置关系可复用原查询
+服务的数学答案，每次接受仍引用当前候选的实际 Wait、取得 cut 和原始证明。
+更弱的激活、不同位置关系或另一输入 owner 都不能借用旧答案。该复用不豁免
+原式定义性、溢出、真实 gate 或参与者义务。
 
 ## AIV 共用代码
 
@@ -161,10 +178,10 @@ episode、各层重入及整段 invocation 的 LAST→FIRST；空 child 不提�
 当前 handback 子集要求实际 clock 为单位平移，或无 clock 的单次固定位置。
 输入 guard 在整个 invocation 中互斥时也可直接取得不干涉关系。
 
-cross Wait 阻塞整个 controller。当前规则使用一条已经需要的、反方向的完整
-quorum 回传：旧消费先于它的发布，它的接收又先于新 Set。逐 receiver/publisher
-检查全部组合，不将同 actor 的源码先后冒充跨核完成，也不搜索两段 queue handoff。
-后者缺少该直接回传时不提供时间复用资格。
+cross Wait 阻塞整个 controller。消费事实可沿已保留的真实 capture/acquire 继续
+传递，各次取得都绑定实际 queue/controller 和位置。每个旧 receiver 到每个新
+publisher 的义务保留完整 quorum；同 actor 源码先后、native ready 或删除前的
+图不能替代该事实。必要反馈、参与者或实际取得 cut 缺失时不取得时间复用许可。
 
 规划对两个完整 credit 的所有成员建立证据；实际同号组的每对 credit 都须有
 不干涉关系。于是任一执行点至多一个 credit 尚有未消费贡献，积压取各 credit
@@ -175,8 +192,14 @@ quorum 回传：旧消费先于它的发布，它的接收又先于新 Set。逐
 
 并发 packing 使用规划阶段建立的 `CounterGroup`，不同于 local 二值着色。
 叶子 word 的充分规则要求每个 publisher 和 receiver 上的消息属于相同实际 clock、
-scope、stage 及坐标映射；所有参与者的完整消息 word 相同。逐 credit 的成员
-兼容仍先检查，但两两兼容不能代替整组 word 检查。
+scope、stage 及坐标映射；所有参与者的完整消息 word 相同。EventDomains 已经
+在实际坐标中建立每条消息全部端点的激活对应，所以各参与者实际执行相同的
+过滤 word。结构、积压和该共同 word 一次建立；不额外构造 member-pair 顺序表。
+
+不同通知在同一锚点没有自然先后。每个实际 actor/phase 的 tied group 使用各
+消息全部 case 的完整激活，逐项累计 seen 和 overlap，证明最多一条激活；
+条件 DAG 随消息数增长，不枚举 guard 两两积。无法证明即拒绝该 FIFO 候选，
+不选择新动作顺序。不同 guard 可以在共同 word 中过滤；不要求它们字面相同。
 
 同号会增加 counter 发布效果的 FIFO，接收沿既有 controller 顺序；两者分别记账。
 实际 clock 必须是保留各层 invocation 的单位平移。不同 stage 间跨迭代交错不属于此规则。互斥成员只有
@@ -195,6 +218,17 @@ word、quorum、FIFO 和积压证据，故分配可选择其子集；最终检�
 候选规划保留通用贪心候选，并按完整激活/clock 形状建立额外整组候选；候选允许
 重叠，不把第一份分区当作唯一可能映射。结构分桶只选择候选，不代替完整证书。
 候选集合有限且不保证全局最优，不枚举所有成员子集。
+
+编号直接选择完整 word 的子集，以 CounterFIFOGroup 保存实际 ID、所选完整
+credit 和原证书；不再逐 pair 投影兼容前提。证书保留同锚点完整互斥证明。
+不同 clock 的 child word 保留自身证书，parent 另外保存每个参与者的实际
+拼接边界；报告按这些对象交接，不复制或重建历史配对表。
+
+数字 FIFO 分区每次优先选择覆盖最多尚未覆盖 credit 的候选。候选被其他 word
+部分覆盖后，其旧大小仅是上界，须更新收益，不能继续按原大小消耗剩余资源。
+合法 word 的正 backlog 总和不超过 15，更新次数受其实际 credit 数限制。这是
+一份有限的映射提案，不保证一般集合覆盖最优；只在提案确实放入池时跳过可选
+时间复用，失败仍不能声称硬件最低需求。
 
 不同 clock 的 word 可以保留为 `CounterGroup.episodes`，用每个实际 publisher 和
 receiver 上的 LAST→FIRST 发射位置证明整个调用内的顺序拼接。各片段继续使用自身

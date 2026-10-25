@@ -7,8 +7,8 @@ from xdsl.dialects.builtin import StringAttr
 
 from ascendflow import compile
 from ascendflow import language as N
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.hazards import HazardKind
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.diagnostics import CompileError
 from ascendflow.dialects.io import parse
@@ -33,7 +33,7 @@ def permuted(X:N.Tensor((8,64),N.f32),
 def test_disjoint_output_contract_accepts_symbolic_permutations_and_keeps_ub_release():
     source = N.from_source(PERMUTED, disjoint_external=True)
     memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = build_structured_dependencies(memory)
+    dependencies = build_access_order(memory)
     assert dependencies.work.disjoint_writes == 1
     assert not any(need.cell.root.owner.sym_name.data == "Y" for need in dependencies.needs)
     assert any(need.kind is HazardKind.WAR for need in dependencies.required)
@@ -55,9 +55,7 @@ def test_disjoint_write_declaration_does_not_assert_its_own_truth():
 
 def test_unknown_output_permutation_keeps_order_without_a_grid_inverse():
     source = N.from_source(PERMUTED.replace(",write_disjoint=True", ""), disjoint_external=True)
-    dependencies = build_structured_dependencies(
-        collect_native_memory(lower_native_structure(source).module)
-    )
+    dependencies = build_access_order(collect_native_memory(lower_native_structure(source).module))
     assert dependencies.work.alias_regions
     assert any(
         n.kind is HazardKind.WAW and n.cell.root.owner.sym_name.data == "Y"
@@ -87,7 +85,7 @@ def test_disjoint_writes_do_not_remove_raw_or_war_on_a_read_write_tensor():
         disjoint_external=True,
     )
     memory = collect_native_memory(lower_native_structure(source).module)
-    dependencies = build_structured_dependencies(memory)
+    dependencies = build_access_order(memory)
     assert dependencies.work.disjoint_writes == 0
     assert {n.kind for n in dependencies.required if n.cell.root.owner.sym_name.data == "Y"} >= {
         HazardKind.RAW,

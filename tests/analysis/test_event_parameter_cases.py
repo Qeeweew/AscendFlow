@@ -42,7 +42,7 @@ def parameter_domain(base, period):
         original,
         requirements=(),
         domains=(),
-        origins=(),
+        anchors=(),
         sources=tuple(replace(b, guard=ActionGuard((predicate,))) for b in original.sources),
         consumers=tuple(replace(b, guard=ActionGuard((predicate,))) for b in original.consumers),
     )
@@ -53,6 +53,7 @@ def parameter_domain(base, period):
         dependencies=replace(base.dependencies, required=()),
         notifications=(notification,),
         coverage=(),
+        bindings=(),
     )
     return EventDomains(selection, ResourceWork()), notification
 
@@ -96,7 +97,7 @@ def test_empty_intersection_does_not_hide_mismatched_endpoints(base):
         original,
         requirements=(),
         domains=(),
-        origins=(),
+        anchors=(),
         sources=tuple(
             replace(b, guard=ActionGuard((Comparison(m, "==", literal(0)),)))
             for b in original.sources
@@ -111,6 +112,7 @@ def test_empty_intersection_does_not_hide_mismatched_endpoints(base):
         dependencies=replace(base.dependencies, required=()),
         notifications=(notification,),
         coverage=(),
+        bindings=(),
     )
     with pytest.raises(CompileError, match="activation domains are not proved equivalent"):
         EventDomains(selection, ResourceWork())
@@ -166,7 +168,7 @@ def test_endpoint_cannot_borrow_another_endpoints_division_prefix(base):
         original,
         requirements=(),
         domains=(),
-        origins=(),
+        anchors=(),
         sources=tuple(
             replace(b, guard=ActionGuard((prerequisite, division))) for b in original.sources
         ),
@@ -179,6 +181,7 @@ def test_endpoint_cannot_borrow_another_endpoints_division_prefix(base):
         dependencies=replace(base.dependencies, required=()),
         notifications=(notification,),
         coverage=(),
+        bindings=(),
     )
     with pytest.raises(CompileError, match="ordered activation prefix"):
         EventDomains(selection, ResourceWork())
@@ -198,7 +201,7 @@ def test_mathematically_empty_domain_does_not_hide_undefined_source_remainder(ba
         original,
         requirements=(),
         domains=(),
-        origins=(),
+        anchors=(),
         sources=tuple(replace(b, guard=ActionGuard((bad,))) for b in original.sources),
         consumers=tuple(replace(b, guard=ActionGuard((bad,))) for b in original.consumers),
     )
@@ -207,6 +210,7 @@ def test_mathematically_empty_domain_does_not_hide_undefined_source_remainder(ba
         dependencies=replace(base.dependencies, required=()),
         notifications=(notification,),
         coverage=(),
+        bindings=(),
     )
     with pytest.raises(CompileError, match="ordered activation prefix"):
         EventDomains(selection, ResourceWork())

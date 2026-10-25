@@ -1,21 +1,18 @@
 """Assign finite IDs to frozen virtual event resource constraints.
 
-This module has no domain, memory-analysis, handback or solver dependency.
+This module has no domain, memory-analysis or handback dependency.
 Allocation and rendering cannot establish new reuse facts or change sites.
 """
-
-from itertools import combinations
 
 from ..diagnostics import require
 from ..scalar import expression, literal
 from .event_coloring import (
-    MAX_COLORING_NODES,
-    NoEventAssignment,
     color_event_resources,
     counter_group_usage,
 )
 from .event_contracts import (
     CROSS_BACKLOG,
+    CounterFIFOGroup,
     CounterReuseGroup,
     EventAllocation,
     EventBankUsage,
@@ -30,32 +27,63 @@ from .structured_protocols import NotificationKind
 from .structured_schedule import SyncAction
 
 
+def _check_fifo_subset(problem, certificate, members):
+    """Check frozen word/materialization correspondence without new analysis."""
+    expected = {
+        (r, m): notification
+        for r in members
+        for m, notification in enumerate(problem.demands[r].members)
+    }
+    records = tuple((r, m, n) for r, m, n in certificate.messages if r in members)
+    actual = {(r, m): n for r, m, n in records}
+    require(
+        len(records) == len(actual) == len(expected)
+        and actual.keys() == expected.keys()
+        and all(actual[key] is notification for key, notification in expected.items()),
+        "FIFO word lost its complete-credit message correspondence",
+    )
+    first = next(iter(expected.values()))
+    roles = tuple(("publish", p.actor) for p in first.sources) + tuple(
+        ("consume", p.actor) for p in first.consumers
+    )
+    require(
+        tuple((phase, actor) for phase, actor, _ in certificate.words) == roles,
+        "FIFO word lost an actual publisher or receiver",
+    )
+    words = tuple(
+        tuple(key for key in word if key[0] in members) for _, _, word in certificate.words
+    )
+    require(
+        all(len(word) == len(expected) and set(word) == expected.keys() for word in words)
+        and all(word == words[0] for word in words[1:]),
+        "FIFO word lost its common complete-credit message sequence",
+    )
+    bound = sum(problem.demands[r].backlog for r in members)
+    require(
+        tuple(actor for actor, _ in certificate.contributions)
+        == tuple(p.actor for p in first.sources)
+        and all(bound <= maximum <= CROSS_BACKLOG for _, maximum in certificate.contributions),
+        "FIFO word lost its per-publisher backlog bound",
+    )
+
+
 def allocate_event_ids(problem):
-    """Prefer exclusive IDs; color only frozen constraints under pressure."""
+    """Select IDs and a frozen protocol without reentering source analysis."""
     require(
         isinstance(problem, EventResourceProblem),
         "allocation requires a generated virtual event resource problem",
     )
-    nodes, failure = 0, None
     preferred = problem
-    for option, candidate in enumerate((preferred, *preferred.alternatives)):
+    candidates = (preferred, *preferred.alternatives)
+    for candidate in candidates:
         require(
             candidate.selection is preferred.selection
             and candidate.order is preferred.order
             and candidate.id_pools is preferred.id_pools,
             "protocol option belongs to another generated notification program",
         )
-        try:
-            ids, work = color_event_resources(candidate, node_limit=MAX_COLORING_NODES - nodes)
-        except NoEventAssignment as error:
-            nodes += error.nodes
-            failure = error
-            continue
-        nodes += work
-        problem = candidate
-        break
-    else:
-        raise failure
+    ids, option = color_event_resources(preferred, alternatives=preferred.alternatives)
+    problem = candidates[option]
     require(all(ids[a] == ids[b] for a, b in problem.peers), "AIV peer event mappings differ")
     sharing = []
     occupied = {}
@@ -65,7 +93,6 @@ def allocate_event_ids(problem):
         for b in (None,) if demand.backlog is not None else demand.banks:
             for flag in ids[number]:
                 occupied.setdefault(b, {}).setdefault(flag, set()).add(number)
-    seen = set()
     counter_groups, counter_reuses, compositions = [], [], []
     packs = tuple(frozenset(c.resources) for c in problem.counter_groups)
     time_packs = tuple(c.groups for c in problem.counter_compositions)
@@ -126,57 +153,48 @@ def allocate_event_ids(problem):
                         composition.order is problem.order,
                         "counter composition belongs to another issue order",
                     )
-            witnesses = []
-            for a, c in combinations(sorted(members), 2):
-                key = (a, c)
-                source = (
-                    problem.counter_reuses
-                    if usage is not None and usage[0] == "time"
-                    else problem.relations
-                )
-                if composition is not None:
-                    same = any({a, c} <= group for group in composition.groups)
-                    if same:
-                        certificate = next(
-                            f for f in composition.fifo if {a, c} <= set(f.resources)
-                        )
-                    else:
-                        certificate = None
-                        source = problem.counter_reuses
-                permission = (
-                    tuple(w for x, y, w in certificate.sharing if (x, y) == key)
-                    if certificate is not None and certificate.episodes
-                    else source.get(key)
-                )
-                require(permission is not None, "same ID lacks a complete-credit reuse constraint")
-                witnesses.extend(permission)
-                if key not in seen:
-                    sharing.extend(permission)
-                    seen.add(key)
-            if usage is not None and len(members) > 1:
-                if composition is not None:
-                    compositions.append((event, composition, tuple(sorted(members)), usage[1]))
-                    continue
-                if usage[0] == "time":
-                    counter_reuses.append(
-                        CounterReuseGroup(
-                            event,
-                            tuple(sorted(members)),
-                            tuple(
-                                (r, n) for r in sorted(members) for n in problem.demands[r].members
-                            ),
-                            usage[1],
-                            tuple(witnesses),
-                        )
+            if usage is not None and usage[0] == "time":
+                if len(members) > 1:
+                    rectangles = problem.counter_reuses.cover_group(members)
+                    require(rectangles is not None, "counter reuse lacks a complete selected row")
+                    group = CounterReuseGroup(
+                        event,
+                        tuple(sorted(members)),
+                        tuple((r, n) for r in sorted(members) for n in problem.demands[r].members),
+                        usage[1],
+                        rectangles,
                     )
-                    continue
-                counter_groups.append((event, certificate, tuple(sorted(members))))
+                    counter_reuses.append(group)
+                    sharing.append(group)
+                continue
+            if composition is not None:
+                selected = tuple(group.intersection(members) for group in composition.groups)
+                rectangles = problem.counter_reuses.cover_groups(selected)
+                require(
+                    rectangles is not None, "counter composition lacks a selected cross-child row"
+                )
+                compositions.append(
+                    (event, composition, tuple(sorted(members)), usage[1], rectangles)
+                )
+                fifo = composition.fifo
+            else:
+                fifo = (certificate,) if certificate is not None else ()
+            # Filtering a certified word preserves its order, exclusions and
+            # quorum, and can only reduce its conservative backlog bound.
+            for child in fifo:
+                require(child.order is problem.order, "FIFO child belongs to another issue order")
+                selected = tuple(sorted(members.intersection(child.resources)))
+                if len(selected) > 1:
+                    _check_fifo_subset(problem, child, selected)
+                    group = CounterFIFOGroup(event, child, selected)
+                    sharing.append(group)
+                    if composition is None:
+                        counter_groups.append(group)
     problem.work.allocated_local_ids = sum(
         len(pool) for b, pool in occupied.items() if b is not None
     )
     problem.work.allocated_cross_ids = len(occupied.get(None, ()))
     problem.work.persistent_cells = sum(d.persistent is not None for d in problem.demands)
-    problem.work.coloring_nodes = nodes
     problem.work.selected_protocol_option = option
     problem.work.peer_equalities = len(problem.peers)
     problem.work.phase_occupancies = sum(d.phase is not None for d in problem.demands)

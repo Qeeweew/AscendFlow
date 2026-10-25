@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from ascendflow import language as N
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.hazards import HazardKind
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_regions import AccessOccurrence, LoopOrdinalGuard
 from ascendflow.passes.lower_native import lower_native_structure
@@ -52,10 +52,10 @@ def packet_case(request):
         N.from_source(_source(offsets, reverse), disjoint_external=True)
     )
     memory = collect_native_memory(structure.module)
-    result = build_structured_dependencies(memory)
+    result = build_access_order(memory)
     partitions = [
         partition
-        for partition in result.order.packet_partitions
+        for partition in result.packet_partitions
         if partition.cell.root.owner.sym_name.data == "scratch"
     ]
     assert len(partitions) == 1

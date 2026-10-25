@@ -35,9 +35,10 @@ export ASCEND_RT_VISIBLE_DEVICES=2 ASCEND_DEVICE_ID=0 OPENBLAS_NUM_THREADS=1
 python -m benchmarks.check_examples --output build/examples-device --physical 2
 ```
 
-清单包含 **26 个公开 kernel 入口，按 18 组检查**。每组构建 CANN 共享库，再运行
-小规模全输出 oracle；KDA prefill 一组包含十个 phase specialization（九个入口），
-检查整个 pipeline 的输出和最终状态，不把这一结果称为每个中间矩阵的独立数值验证。
+清单包含 **26 个公开 kernel 入口，按 25 组检查**。每组构建 CANN 共享库，再运行
+小规模全输出 oracle；KDA prefill 一组构建 prepare、scan、output 三个入口，
+检查整个 pipeline 的输出和最终状态。另有六组 fragment 检查，覆盖 Gram、cross Gram、
+Solve 16/32、Transform 和 WU，不把 pipeline 检查称为每个中间矩阵的独立数值验证。
 检查输入与 guard，包含各自适用的空、单次、多次和跨槽复用情况。GEMM 使用
 129×257×259 尾块；dense NT 使用 256×512×256；FA 使用 256:1024、768:3072。
 其他参数见[清单实现](../../benchmarks/check_examples.py)，每次结果保存在指定输出目录。

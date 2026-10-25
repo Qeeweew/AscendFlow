@@ -4,6 +4,7 @@ import pytest
 from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
 from xdsl.utils.exceptions import VerifyException
 
+from ascendflow import compile
 from ascendflow import language as N
 from ascendflow.dialects.io import dump, parse
 from ascendflow.dialects.source import AllocationOp, DomainOp, IterationOp, StageOp, ViewOp
@@ -112,3 +113,7 @@ def test_region_yield_types_are_verified_after_source_roundtrip():
     stage.results[0]._type = TileType(ArrayAttr([IntAttr(32)]), StringAttr("f32"))
     with pytest.raises(VerifyException, match="yield types"):
         source.verify()
+    # Public source IR can have been changed since construction. It does not
+    # inherit the fresh parser result's structural qualification.
+    with pytest.raises(VerifyException, match="yield types"):
+        compile(source)

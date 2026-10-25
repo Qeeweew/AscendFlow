@@ -243,7 +243,7 @@ def exclusive():
         raise AssertionError("optional sharing must not participate without resource pressure")
 
     monkeypatch.setattr(event_planning, "share_events", forbidden)
-    monkeypatch.setattr(event_planning, "share_counters", forbidden)
+    monkeypatch.setattr(event_planning, "plan_counter_groups", forbidden)
     current = compile(source)
     assert current.asc == baseline.asc
     assert current.report["analysis_work"]["resources"]["sharing_pairs"] == 0
@@ -327,8 +327,8 @@ def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch)
     from tests.fixtures.nested import nested_copy
 
     program = _complete_bindings(selected(nested_copy))
-    assert program.boundaries
-    established = dict(program.boundaries)
+    assert program.handbacks.boundary_cases
+    established = dict(program.handbacks.boundary_cases)
     original = event_families.build_event_family
 
     def only_new_premises(domains, notification):
@@ -336,6 +336,12 @@ def test_allocation_consumes_the_existing_child_boundary_membership(monkeypatch)
         return original(domains, notification)
 
     monkeypatch.setattr(event_families, "build_event_family", only_new_premises)
+    from ascendflow.analysis.notification_lifetimes import HandbackRule
+
+    def no_reconstruction(*args, **kwargs):
+        raise AssertionError("resource planning must retain the established consumption analysis")
+
+    monkeypatch.setattr(HandbackRule, "__init__", no_reconstruction)
     problem = plan_event_resources(program)
 
     def no_queries(*args, **kwargs):

@@ -4,8 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from ascendflow.analysis.event_coloring import NoEventAssignment, color_event_resources
+from ascendflow.analysis.event_coloring import (
+    NoEventAssignment,
+    color_event_resources,
+    counter_fifo_partition,
+)
 from ascendflow.analysis.event_contracts import EventDemand, EventIdPools
+from ascendflow.analysis.event_frontier_contracts import FrozenEventRelations
 from ascendflow.analysis.event_planning import plan_event_resources
 from ascendflow.analysis.structured_resources import allocate_structured_events
 from ascendflow.passes.generate_notifications import _complete_bindings
@@ -51,7 +56,7 @@ def numeric(demands, pools, *, peers=(), relations=None, packs=()):
         peers=peers,
         reservations=(),
         relations={} if relations is None else relations,
-        counter_reuses={},
+        counter_reuses=FrozenEventRelations(()),
         counter_groups=tuple(SimpleNamespace(resources=pack) for pack in packs),
     )
 
@@ -84,10 +89,24 @@ def test_exclusive_and_certified_word_paths_do_not_enumerate_reuse_pairs():
     assert color_event_resources(numeric(demands, pools, relations=NoPairQueries()))[1] == 0
     demands = tuple(EventDemand((), 1, (), backlog=1) for _ in range(128))
     packs = tuple(tuple(range(i, min(i + 15, 128))) for i in range(0, 128, 15))
-    ids, nodes = color_event_resources(
+    ids, option = color_event_resources(
         numeric(demands, pools, relations=NoPairQueries(), packs=packs)
     )
-    assert nodes == 0 and len({group[0] for group in ids}) == len(packs)
+    assert option == 0 and len({group[0] for group in ids}) == len(packs)
+
+
+def test_fifo_partition_refreshes_coverage_after_selecting_an_overlapping_word():
+    demands = tuple(EventDemand((), 1, (), backlog=1) for _ in range(18))
+    packs = tuple(
+        frozenset(values) for values in (range(15), range(15, 18), range(0, 18, 2), range(1, 18, 2))
+    )
+    partition = counter_fifo_partition(demands, packs)
+    assert len(partition) == 2
+    assert frozenset().union(*partition) == frozenset(range(18))
+    assert sum(len(group) for group in partition) == 18
+    problem = numeric(demands, EventIdPools(cross=(2, 6)), packs=packs)
+    ids, option = color_event_resources(problem)
+    assert option == 0 and {flags[0] for flags in ids} == {2, 6}
 
 
 def test_real_nested_program_preserves_sparse_local_numbers_across_reentry():

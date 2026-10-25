@@ -1,6 +1,6 @@
 """Native access identities, milestone cuts and explicit loop selections.
 
-Structured dependency composition lives in structured_dependencies. Endpoints
+Structured dependency composition lives in access_order. Endpoints
 retain their actual task, participant and control frame; generation bindings
 belong to structured_regions.AccessOccurrence. Selecting FIRST/LAST ordinals
 establishes no native retirement or completion.

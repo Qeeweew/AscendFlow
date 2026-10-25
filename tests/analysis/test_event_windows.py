@@ -86,7 +86,7 @@ def check_exact_membership(contract, context, count):
     if contract.upper is not None:
         assert len(members) <= contract.upper
     if members:
-        first, last = contract.first_last()
+        first, last = contract.first, contract.last()
         assert first.evaluate(context) == members[0]
         assert last.evaluate(context) == members[-1]
         assert [contract.rank().evaluate(context | {symbol: g}) for g in members] == list(

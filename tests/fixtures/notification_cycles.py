@@ -26,6 +26,7 @@ def isolated(selection, notifications):
         dependencies=replace(selection.dependencies, required=()),
         notifications=notifications,
         coverage=(),
+        bindings=(),
     )
 
 
@@ -202,7 +203,7 @@ def collective_children(*, reverse_vector):
     from xdsl.ir import Block, Region
 
     from ascendflow import language as N
-    from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+    from ascendflow.analysis.access_order import build_access_order
     from ascendflow.analysis.structured_memory import collect_native_memory
     from ascendflow.dialects.physical import EndOp
     from ascendflow.dialects.structured import PipelineLoopOp, PipelineStageOp
@@ -249,8 +250,8 @@ def collective_children(*, reverse_vector):
     )
     structure.module.verify()
     memory = collect_native_memory(structure.module)
-    dependencies = build_structured_dependencies(memory)
-    selection = bind_notifications(dependencies, dependencies.dispatch)
+    dependencies = build_access_order(memory)
+    selection = bind_notifications(dependencies)
     selection.require_closed()
     memory = selection.dependencies.memory
     outer, first, second = tuple(memory.control.loops.values())
@@ -372,6 +373,7 @@ def isolate(selection, notifications):
         dependencies=replace(selection.dependencies, required=()),
         notifications=notifications,
         coverage=(),
+        bindings=(),
     )
 
 
@@ -633,6 +635,7 @@ def nested_channel_cycle():
         dependencies=replace(selection.dependencies, required=()),
         notifications=notifications,
         coverage=(),
+        bindings=(),
     )
 
 
@@ -697,6 +700,7 @@ def finite_ports(*, at_most_one=False):
         dependencies=replace(selection.dependencies, required=()),
         notifications=notifications,
         coverage=(),
+        bindings=(),
     )
 
 

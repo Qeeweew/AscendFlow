@@ -40,6 +40,7 @@ group watchdog enforces the build's hard time limit.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property
 from operator import eq, ge, gt, le, lt, ne
@@ -53,25 +54,29 @@ from z3 import (
     BitVecVal,
     BoolRef,
     BoolVal,
+    CheckSatResult,
+    FreshBool,
     Function,
     If,
     Int,
     IntSort,
     IntVal,
     Not,
+    Optimize,
     Solver,
     URem,
     is_bv_value,
+    is_false,
     is_true,
     main_ctx,
     sat,
     unsat,
 )
 from z3.z3 import _to_ast_array
-from z3.z3core import Z3_mk_and, Z3_mk_or
+from z3.z3core import Z3_mk_and, Z3_mk_or, Z3_solver_assert, Z3_solver_check_assumptions
 
 from ..budget import poll, remaining
-from ..diagnostics import require
+from ..diagnostics import CompileError, ErrorKind, require
 from ..memo import memo_table, memoized, memoized_method
 from ..scalar import DIVISION, INT64_MAX, Expr, Fact, infer
 from ..symbols import Symbol, SymbolKind
@@ -87,13 +92,69 @@ _LOCAL_TIMEOUT_MS = 2000
 _PREDICATES = {"==": eq, "!=": ne, "<": lt, "<=": le, ">": gt, ">=": ge}
 
 
-@dataclass(frozen=True, slots=True)
+def finite_model(constraints, objectives=()):
+    """One existential choice over established premises, never a safety proof.
+
+    Named constraints refer to the frozen caller contracts. No source facts,
+    reachability variables or rule inference enter this finite problem.
+    """
+    optimizer = Optimize()
+    for name, condition in constraints:
+        optimizer.assert_and_track(condition, FreshBool(name))
+    minima = [optimizer.minimize(objective) for objective in objectives]
+    poll("finite resource selection")
+    left = remaining("finite resource selection")
+    timeout = _LOCAL_TIMEOUT_MS if left is None else min(_LOCAL_TIMEOUT_MS, int(left * 1000))
+    optimizer.set(timeout=max(1, timeout))
+    outcome = optimizer.check()
+    poll("finite resource selection")
+    if outcome == sat:
+        require(
+            all(minimum.lower().eq(minimum.upper()) for minimum in minima),
+            "finite resource preference unknown; no allocation permitted",
+            kind=ErrorKind.ANALYSIS_LIMIT,
+            phase="event-id-allocation",
+        )
+        return optimizer.model(), ()
+    if outcome == unsat:
+        return None, tuple(str(item) for item in optimizer.unsat_core())
+    raise CompileError(
+        f"finite resource selection unknown: {optimizer.reason_unknown()}; no allocation permitted",
+        kind=ErrorKind.ANALYSIS_LIMIT,
+        phase="event-id-allocation",
+    )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class Boolean:
     """A mathematical conjunction/union, never an executable guard rewrite."""
 
     kind: str
     operands: tuple
     _hash: int | None = field(default=None, init=False, compare=False, repr=False)
+
+    def __eq__(self, other):
+        if type(other) is not Boolean:
+            return NotImplemented
+        pending, compared = [(self, other)], set()
+        while pending:
+            left, right = pending.pop()
+            if left is right:
+                continue
+            if type(left) is not type(right):
+                return False
+            if not isinstance(left, Boolean):
+                if left != right:
+                    return False
+                continue
+            pair = id(left), id(right)
+            if pair in compared:
+                continue
+            if left.kind != right.kind or len(left.operands) != len(right.operands):
+                return False
+            compared.add(pair)
+            pending.extend(zip(left.operands, right.operands, strict=True))
+        return True
 
     def __hash__(self):
         value = self._hash
@@ -135,6 +196,31 @@ def any_of(*conditions):
         return True
     values = tuple(dict.fromkeys(condition for condition in conditions if condition is not False))
     return False if not values else values[0] if len(values) == 1 else _boolean("or", values)
+
+
+def negate(condition):
+    """Complement shared mathematical syntax without expanding paths."""
+    opposite = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}
+    results, pending = {}, [(condition, False)]
+    while pending:
+        current, done = pending.pop()
+        key = type(current), current
+        if key in results:
+            continue
+        if type(current) is bool:
+            results[key] = not current
+        elif isinstance(current, Comparison):
+            results[key] = Comparison(current.lhs, opposite[current.predicate], current.rhs)
+        elif isinstance(current, Boolean):
+            if not done:
+                pending.append((current, True))
+                pending.extend((part, False) for part in reversed(current.operands))
+            else:
+                combine = any_of if current.kind == "and" else all_of
+                results[key] = combine(*(results[type(p), p] for p in current.operands))
+        else:
+            require(False, "negation requires a mathematical predicate")
+    return results[type(condition), condition]
 
 
 @memoized(key=lambda facts: frozenset(facts.items()))
@@ -226,6 +312,15 @@ class Answer:
 
 
 @dataclass(frozen=True, slots=True)
+class RuleInference:
+    """A successful owned implication and support; failure exports no fact."""
+
+    condition: object | None
+    support: tuple[int, ...]
+    answer: Answer
+
+
+@dataclass(frozen=True, slots=True)
 class Exists:
     """Result of an existential query: is there an instance satisfying it?"""
 
@@ -274,6 +369,8 @@ class Statistics:
     solver_checks: int = 0
     model_reuses: int = 0
     elementary_proofs: int = 0
+    rule_encodings: int = 0
+    rule_assertions: int = 0
 
     def record(self, kind, elapsed, *, cached):
         self.calls += 1
@@ -300,6 +397,8 @@ class Statistics:
             "solver_checks": self.solver_checks,
             "model_reuses": self.model_reuses,
             "elementary_proofs": self.elementary_proofs,
+            "rule_encodings": self.rule_encodings,
+            "rule_assertions": self.rule_assertions,
         }
 
 
@@ -331,6 +430,180 @@ def _and(*values):
 
 def _or(*values):
     return _boolean_packet(Z3_mk_or, values)
+
+
+def _assert_booleans(solver, values):
+    """Submit this encoder's typed ASTs in the original assertion order.
+
+    Identical to Solver.assert_exprs after BoolSort.cast: every value already
+    is a BoolRef in this solver's context. Preserve separate assertions and
+    labels, including the exact unsat-core attribution.
+    """
+    require(
+        all(isinstance(value, BoolRef) and value.ctx is solver.ctx for value in values),
+        "rule assertions need BoolRefs in the solver context",
+    )
+    for value in values:
+        Z3_solver_assert(solver.ctx.ref(), solver.solver, value.as_ast())
+
+
+class _RuleSystem:
+    """One isolated finite relation; invariant predicates are encoded once.
+
+    Only enabled assertions enter a query scope. Omitting the others is the
+    exact existential elimination of their free enabling labels: each occurs
+    only in its own assertion's antecedent and can be false. Their arithmetic
+    guards therefore need not participate in the current solver search.
+    """
+
+    def __init__(self, service, rules):
+        self.service, self.rules, self.labels, self.indices = service, [], [], {}
+        self.assertions = []
+        self.active, self.preparation_seconds = False, 0.0
+        self.solver = Solver()
+        self.solver.set(random_seed=0, unsat_core=True)
+        self.solver.add(*service._input_assertions)
+        self.extend(rules)
+
+    def extend(self, rules):
+        require(not self.active, "cannot extend an active mathematical rule scope")
+        require(
+            isinstance(rules, tuple)
+            and all(type(r) is bool or isinstance(r, (Comparison, Boolean)) for r in rules),
+            "rule system requires immutable mathematical predicates",
+        )
+        started = perf_counter()
+        for index, rule in enumerate(rules):
+            if index % 128 == 0:
+                poll("mathematical rule system", rules=len(rules), prepared=index)
+            label = FreshBool("rule")
+            self.indices[label.get_id()] = len(self.rules)
+            self.rules.append(rule)
+            self.labels.append(label)
+            self.assertions.append(_or(Not(label), self.service._comparison(rule)))
+            self.service.statistics.rule_encodings += 1
+        self.preparation_seconds += perf_counter() - started
+
+    @contextmanager
+    def assuming(self, assumptions=(), *, extra=(), enabled=None):
+        context = _RuleContext(self, assumptions, extra, enabled)
+        try:
+            yield context
+        finally:
+            context.close()
+
+
+class _RuleContext:
+    """One origin/premise scope; only frozen deduction data may escape."""
+
+    def __init__(self, system, assumptions, extra, enabled):
+        require(not system.active, "mathematical rule scopes cannot overlap")
+        require(
+            isinstance(extra, tuple)
+            and all(type(r) is bool or isinstance(r, (Comparison, Boolean)) for r in extra),
+            "rule scope requires immutable mathematical predicates",
+        )
+        if enabled is None:
+            enabled = tuple(range(len(system.rules)))
+        require(
+            isinstance(enabled, tuple)
+            and all(type(i) is int and 0 <= i < len(system.rules) for i in enabled)
+            and len(set(enabled)) == len(enabled),
+            "rule scope needs distinct existing rule indices",
+        )
+        context = system.service._context(assumptions)
+        self.started = perf_counter() - system.preparation_seconds
+        system.preparation_seconds = 0.0
+        self.system, self.service = system, system.service
+        self.rules, self.assumptions = (*system.rules, *extra), assumptions
+        self.answers, self.extra_indices = {}, {}
+        self.enabled = tuple(system.labels[i] for i in enabled)
+        self.enabled_ast, self.enabled_size = _to_ast_array(self.enabled)
+        self.solver = system.solver
+        self.solver.push()
+        _assert_booleans(self.solver, context)
+        _assert_booleans(self.solver, tuple(system.assertions[i] for i in enabled))
+        self.service.statistics.rule_assertions += len(enabled)
+        for index, rule in enumerate(extra, len(system.rules)):
+            label = FreshBool("seed")
+            self.extra_indices[label.get_id()] = index
+            self.solver.assert_and_track(self.service._comparison(rule), label)
+            self.service.statistics.rule_assertions += 1
+        system.active = True
+
+    def prove(self, conclusion):
+        require(self.solver is not None, "mathematical rule context is closed")
+        require(
+            type(conclusion) is bool or isinstance(conclusion, (Comparison, Boolean)),
+            "rule conclusion requires a mathematical predicate",
+        )
+        service, solver = self.service, self.solver
+        cached = self.answers.get(conclusion)
+        if cached is not None:
+            service.statistics.record(cached.answer.kind, cached.answer.elapsed, cached=True)
+            return cached
+        poll("mathematical rule conclusion", rules=len(self.rules))
+        started = self.started
+        self.started = perf_counter()
+        solver.set(timeout=service._local_timeout())
+        service.statistics.solver_checks += 1
+        solver.push()
+        try:
+            solver.add(Not(service._comparison(conclusion)))
+            # Same native call as Solver.check, with this immutable scope's
+            # already typed labels. Keep their BoolRefs alive in self.enabled.
+            outcome = CheckSatResult(
+                Z3_solver_check_assumptions(
+                    solver.ctx.ref(), solver.solver, self.enabled_size, self.enabled_ast
+                )
+            )
+            elapsed = perf_counter() - started
+            support = ()
+            if outcome == unsat:
+                support = tuple(
+                    sorted(
+                        self.extra_indices[value.get_id()]
+                        if value.get_id() in self.extra_indices
+                        else self.system.indices[value.get_id()]
+                        for value in solver.unsat_core()
+                    )
+                )
+                answer = Answer(PROVED, "implies", elapsed)
+            elif outcome == sat:
+                answer = Answer(
+                    COUNTEREXAMPLE, "implies", elapsed, service._model_instance(solver.model())
+                )
+            else:
+                answer = Answer(UNKNOWN, "implies", elapsed, reason=str(solver.reason_unknown()))
+        finally:
+            solver.pop()
+        self.started = perf_counter()
+        if answer.proved:
+            condition = any_of(*(negate(self.rules[i]) for i in support), conclusion)
+            implication = "implies", self.assumptions, ("implies", condition)
+            established = service._answers.get(implication)
+            require(
+                established is None or not established.refuted,
+                "rule inference contradicts an established counterexample",
+            )
+            if established is not None and established.proved:
+                answer = established
+            else:
+                service._answers[implication] = answer
+        else:
+            # Failed deductions grant no fact. Do not build or retain an
+            # O(V+E) implication and model for each unsuccessful origin.
+            condition = None
+        result = RuleInference(condition, support, answer)
+        service.statistics.record(answer.kind, elapsed, cached=False)
+        self.answers[conclusion] = result
+        return result
+
+    def close(self):
+        self.solver.pop()
+        self.solver = None
+        self.system.active = False
+        self.answers.clear()
 
 
 class IntegerQueryService:
@@ -373,6 +646,29 @@ class IntegerQueryService:
                 self._solver.add(integer <= fact.maximum)
             if fact.multiple != 1:
                 self._solver.add(integer % fact.multiple == 0)
+        self._input_assertions = tuple(self._solver.assertions())
+
+    def rule_system(self, rules=()):
+        """Prepare one isolated finite relation under the immutable inputs."""
+        return _RuleSystem(self, rules)
+
+    def _model_truth(self, model, values, predicate):
+        if predicate not in values:
+            value = model.eval(self._comparison(predicate), model_completion=False)
+            values[predicate] = True if is_true(value) else False if is_false(value) else None
+        return values[predicate]
+
+    def witness_evaluation(self, assumptions):
+        """Evaluate guards in one existing SMT model of the complete premises.
+
+        A missing interpretation returns None, never false. This supplies no
+        universal fact and performs no new search or model completion.
+        """
+        self._context(assumptions)
+        for model, values in self._witnesses:
+            if all(self._model_truth(model, values, test) is True for test in assumptions):
+                return lambda test: self._model_truth(model, values, test)
+        return None
 
     # -- encoding ---------------------------------------------------------
     @memoized_method
@@ -641,11 +937,7 @@ class IntegerQueryService:
             # every actual premise and this objective to hold in that model.
             valid = True
             for test in assumptions:
-                if test not in values:
-                    values[test] = is_true(
-                        model.eval(self._comparison(test), model_completion=False)
-                    )
-                if not values[test]:
+                if self._model_truth(model, values, test) is not True:
                     valid = False
                     break
             if valid and is_true(model.eval(objective, model_completion=False)):

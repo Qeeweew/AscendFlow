@@ -158,7 +158,7 @@ def test_dynamic_crt_cannot_certify_a_nonmember_after_i64_intermediate_wrap():
     assert expected_first < INT64_MAX
     assert all(test.evaluate(context | {"g": expected_first}) for test in extra)
     assert window.nonempty.evaluate(context)
-    first, _ = window.first_last()
+    first, _ = window.first, window.last()
     assert first.evaluate(context) == expected_first
     actual_first = _evaluate(first, context, checked=False)
     assert actual_first == expected_first
@@ -215,7 +215,7 @@ def test_dense_multi_residue_first_last_and_reuse_remain_defined_near_i64_limit(
     )
     members = [g for g in range(lower, INT64_MAX) if g % 5 in (0, 3)]
     assert _guard(window.nonempty, {}, checked=True)
-    first, last = window.first_last()
+    first, last = window.first, window.last()
     assert _evaluate(first, {}, checked=True) == members[0]
     assert _evaluate(last, {}, checked=True) == members[-1]
     for width in (1, 2, 3):
@@ -326,7 +326,7 @@ def test_equivalent_selected_last_coordinates_need_no_parameter_partition(select
         assert _guard(window.nonempty, context, checked=True) == bool(members)
         if not members:
             continue
-        first, last = window.first_last()
+        first, last = window.first, window.last()
         assert _evaluate(first, context, checked=True) == members[0]
         assert _evaluate(last, context, checked=True) == members[-1]
         for p in members:

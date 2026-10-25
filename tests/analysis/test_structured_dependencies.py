@@ -6,8 +6,8 @@ import pytest
 
 from ascendflow import language as N
 from ascendflow.analysis.access_frontier import QueueEndpoint
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.hazards import HazardKind
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.analysis.structured_regions import (
     AliasRegion,
@@ -30,7 +30,7 @@ from tests.models.structured_events import check_compiled_events
 def dependencies(source):
     structure = lower_native_structure(N.from_source(source) if isinstance(source, str) else source)
     memory = collect_native_memory(structure.module)
-    return build_structured_dependencies(memory)
+    return build_access_order(memory)
 
 
 def test_scale_real_endpoints_and_all_counts_match_access_trace():
@@ -174,7 +174,7 @@ def test_compound_slot_short_and_long_children_preserve_actual_byte_values(width
     )
     long_cells = [
         transfer
-        for cell, transfer in plan.dependencies.order.summaries[child].items()
+        for cell, transfer in plan.dependencies.summaries[child].items()
         if isinstance(cell, StorageCell)
         and any(
             isinstance(guard, LoopCountGuard)
@@ -219,9 +219,7 @@ def test_strided_native_rows_stay_exact_compressed_rectangles():
                     N.copy(Scratch[0:8,0:128],x)
     """)
     gm = {
-        cell
-        for cell in result.order.summaries[result.memory.module]
-        if cell.root.type.bank.data == "GM"
+        cell for cell in result.summaries[result.memory.module] if cell.root.type.bank.data == "GM"
     }
     assert len(gm) == 2
     assert {cell.rows for cell in gm} == {8, 120}

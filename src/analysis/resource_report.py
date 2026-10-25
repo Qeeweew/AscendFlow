@@ -8,9 +8,14 @@ control facts, not object addresses or the notification-mutated IR walk.
 from functools import cache
 from itertools import pairwise
 
-from .event_contracts import LOCAL_CAPACITY, SUPPORTED_CROSS_IDS
+from .event_contracts import (
+    LOCAL_CAPACITY,
+    SUPPORTED_CROSS_IDS,
+    CounterFIFOGroup,
+    CounterReuseGroup,
+)
 from .event_frontier_contracts import LocalEventReuse
-from .event_sharing import CellPhaseSharing, EventSharing
+from .event_sharing import CellPhaseSharing, CounterReuse, EventSharing
 from .smt import Boolean
 from .structured_protocols import NotificationKind
 from .structured_schedule import ActionGuard
@@ -39,14 +44,23 @@ def event_resource_report(plan):
     frontiers, frontier_numbers = [], {}
     certificates, certificate_numbers = [], {}
 
-    def frontier(value):
-        if value not in frontier_numbers:
-            number = frontier_numbers[value] = len(frontiers)
+    def frontier(root):
+        pending, records = [root], []
+        while pending:
+            value = pending.pop()
+            if value in frontier_numbers:
+                continue
+            frontier_numbers[value] = len(frontiers)
             record = {"head": numbers[value.head], "tail": numbers[value.tail]}
             frontiers.append(record)
-            record["children"] = [frontier(child) for child in value.children]
-            return number
-        return frontier_numbers[value]
+            record["enclosure"] = [
+                {"before": point(a), "after": point(b)} for a, b in value.enclosure
+            ]
+            records.append((record, value.children))
+            pending.extend(reversed(value.children))
+        for record, children in records:
+            record["children"] = [frontier_numbers[child] for child in children]
+        return frontier_numbers[root]
 
     def certificate(value):
         if value not in certificate_numbers:
@@ -76,7 +90,7 @@ def event_resource_report(plan):
                                     *(
                                         h
                                         for w in p.original or ()
-                                        if isinstance(w, EventSharing)
+                                        if isinstance(w, (EventSharing, CounterReuse))
                                         for h in w.handbacks
                                     ),
                                 )
@@ -97,6 +111,8 @@ def event_resource_report(plan):
         return result
 
     def sharing(value):
+        if isinstance(value, (CounterFIFOGroup, CounterReuseGroup)):
+            return {"kind": type(value).__name__, "id": value.event, "resources": value.resources}
         if isinstance(value, LocalEventReuse):
             return {
                 "kind": "LocalEventReuse",
@@ -172,7 +188,14 @@ def event_resource_report(plan):
                 "point": None if node.point is None else point(node.point),
                 "condition": predicate(proof.condition),
             }
-            if node.evidence is not None:
+            if node.kind.endswith("-rule"):
+                rule = node.evidence
+                record["causal_rule"] = {
+                    "seed": rule.seed,
+                    "premise": predicate(rule.premise),
+                    "conclusion": predicate(rule.conclusion),
+                }
+            elif node.evidence is not None:
                 fact = node.evidence
                 record["established_consumption"] = {
                     "protocol": numbers[fact.origin.notification],
@@ -181,6 +204,16 @@ def event_resource_report(plan):
                     "after_actual_wait": fact.after_action,
                     "premises": guard(ActionGuard(fact.premises)),
                     "answer": fact.answer.kind,
+                }
+            if proof.deduction is not None:
+                deduction = proof.deduction
+                record["deduction"] = {
+                    "origin": point(deduction.origin.point),
+                    "protocol": numbers[deduction.origin.notification],
+                    "premises": guard(ActionGuard(deduction.premises)),
+                    "conclusion": predicate(deduction.conclusion),
+                    "answer": deduction.answer.kind,
+                    "support": [predicate(rule.predicate) for rule in deduction.rules],
                 }
             consumption_proofs.append(record)
             records.append((record, proof.inputs))
@@ -260,6 +293,17 @@ def event_resource_report(plan):
                 for phase, actor, shifts in certificate.clock_shifts
             ],
             "fifo_reentry": "matching filtered words in lexicographic clock order",
+            "anchor_exclusions": [
+                {
+                    "phase": phase,
+                    "actor": actor.value,
+                    "messages": word,
+                    "overlap": predicate(condition),
+                    "answer": answer.kind,
+                }
+                for leaf in certificate.episodes or (certificate,)
+                for phase, actor, word, condition, answer in leaf.exclusions
+            ],
             "additional_controller_orders": [],
             "episodes": [
                 {
@@ -292,14 +336,13 @@ def event_resource_report(plan):
                 {"actor": p.actor.value, "maximum": group.backlog} for p in first.sources
             ],
             "backlog_rule": "maximum of noninterfering complete credits",
-            "consumption_handbacks": [
+            "rectangles": [
                 {
-                    "earlier": numbers[w.earlier],
-                    "later": numbers[w.later],
-                    "rule": w.rule,
-                    "handbacks": [handback(h) for h in w.handbacks],
+                    "left": resource_numbers(s.left),
+                    "right": resource_numbers(s.right),
+                    "certificate": certificate(s.certificate),
                 }
-                for w in group.witnesses
+                for s in group.rectangles
             ],
             "additional_counter_effect_order": [],
             "additional_controller_orders": [],
@@ -424,11 +467,11 @@ def event_resource_report(plan):
         "sharing": [sharing(w) for w in plan.sharing],
         "consumption_proofs": consumption_proofs,
         "consumption_predicates": consumption_predicates,
-        "local_event_certificates": certificates,
-        "local_event_frontiers": frontiers,
+        "event_certificates": certificates,
+        "event_frontiers": frontiers,
         "counter_groups": [
-            counter_group(event, certificate, members)
-            for event, certificate, members in plan.counter_groups
+            counter_group(group.event, group.certificate, group.resources)
+            for group in plan.counter_groups
         ],
         "counter_time_reuse": [counter_reuse(group) for group in plan.counter_reuse_groups],
         "counter_compositions": [
@@ -437,7 +480,7 @@ def event_resource_report(plan):
                 "resources": list(members),
                 "groups": [
                     sorted(group.intersection(members))
-                    for group in certificate.groups
+                    for group in composition.groups
                     if group.intersection(members)
                 ],
                 "maximum_backlog": backlog,
@@ -446,22 +489,19 @@ def event_resource_report(plan):
                     counter_group(
                         event, leaf, tuple(sorted(set(leaf.resources).intersection(members)))
                     )
-                    for leaf in certificate.fifo
+                    for leaf in composition.fifo
                     if len(set(leaf.resources).intersection(members)) > 1
                 ],
-                "time_reuses": [
+                "rectangles": [
                     {
-                        "resources": [a, b],
-                        "earlier": numbers[w.earlier],
-                        "later": numbers[w.later],
-                        "rule": w.rule,
-                        "handbacks": [handback(h) for h in w.handbacks],
+                        "left": resource_numbers(s.left),
+                        "right": resource_numbers(s.right),
+                        "certificate": certificate(s.certificate),
                     }
-                    for a, b, w in certificate.witnesses
-                    if a in members and b in members
+                    for s in rectangles
                 ],
             }
-            for event, certificate, members, backlog in plan.counter_compositions
+            for event, composition, members, backlog, rectangles in plan.counter_compositions
         ],
         "actions": [
             {

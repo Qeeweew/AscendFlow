@@ -483,7 +483,10 @@ def _causality(commands):
             if kind in {SyncKind.LOCAL_WAIT.value, SyncKind.CROSS_WAIT.value}
             else command.source
         )
-        queue = *controller, pipe
+        # dav-2201 asc_sync_block_wait ignores its nominal pipe argument and
+        # calls wait_flag_dev(id). It gates controller dispatch, without
+        # joining a previously dispatched native/local Wait on that pipe.
+        queue = None if kind == SyncKind.CROSS_WAIT.value else (*controller, pipe)
         command.issue = node(point.label + ":issue")
         command.begin = node(point.label + ":begin")
         command.end = (
@@ -494,9 +497,12 @@ def _causality(commands):
         edge(controllers.get(controller), command.issue)
         edge(gates.get(controller), command.issue)
         edge(command.issue, command.begin)
-        edge(queues.get(queue), command.begin)
+        if queue is not None:
+            edge(queues.get(queue), command.begin)
         edge(command.begin, command.end)
-        controllers[controller], queues[queue] = command.issue, command.begin
+        controllers[controller] = command.issue
+        if queue is not None:
+            queues[queue] = command.begin
         if kind == "native":
             edge(implicit.get(queue), command.begin)
             ends[queue].append(command.end)

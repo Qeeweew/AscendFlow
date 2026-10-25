@@ -97,7 +97,7 @@ def test_actual_captures_and_acquires_cover_sources_and_earliest_consumers(actua
                 assert all(
                     point.participant is owner.cell.private
                     for body in owner.rounds
-                    for point in (body.writer,) + body.readers
+                    for point in (body.retirement.source,) + body.readers
                 )
                 # This is a complete round obligation, not one relocated
                 # capture/acquire pair. Actual tokens/bytes are checked by
@@ -209,7 +209,7 @@ def test_incomplete_mode2_quorum_stays_explicitly_unresolved(source):
             if not (n.source.participant is Actor.AIV1 and n.consumer.participant is Actor.AIC)
         ),
     )
-    rejected = bind_notifications(broken, result.dispatch)
+    rejected = bind_notifications(broken)
     assert any("quorum" in issue.reason for issue in rejected.unresolved)
     with pytest.raises(CompileError, match="quorum"):
         rejected.require_closed()
@@ -231,18 +231,21 @@ def test_unordered_same_engine_dependency_cannot_be_repaired_by_a_fence():
 
 def test_selection_reuses_owned_memory_dependency_and_native_facts(monkeypatch):
     result = selected(nested_cv)
+    foreign = selected(partitioned_cv).dependencies.memory
 
     def forbidden(*args, **kwargs):
         raise AssertionError("selection rebuilt an owned analysis input")
 
     targets = [
         ("ascendflow.analysis.structured_memory", "collect_native_memory"),
-        ("ascendflow.analysis.structured_dependencies", "build_structured_dependencies"),
+        ("ascendflow.analysis.access_order", "build_access_order"),
         ("ascendflow.target.native", "native_contract"),
     ]
     modules = [(import_module(name), attribute) for name, attribute in targets]
     for module, attribute in modules:
         monkeypatch.setattr(module, attribute, forbidden)
-    again = bind_notifications(result.dependencies, result.dispatch)
+    again = bind_notifications(result.dependencies)
     again.require_closed()
     assert again == result
+    with pytest.raises(CompileError, match="different owned memory facts"):
+        bind_notifications(replace(result.dependencies, memory=foreign))

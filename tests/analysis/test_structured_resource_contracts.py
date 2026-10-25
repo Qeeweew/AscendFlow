@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from ascendflow.analysis.access_frontier import AccessEndpoint
-from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+from ascendflow.analysis.access_order import build_access_order
 from ascendflow.analysis.structured_protocols import (
     BoundPlacement,
     LogicalNotification,
@@ -46,7 +46,8 @@ def finite(X:N.Tensor((3,64),N.f32),O:N.Tensor((3,64),N.f32,access="write")):
 """
 
 
-def test_selected_boundary_facts_keep_case_guards_and_lazy_terminal_selection():
+def test_selected_boundary_facts_keep_case_guards_and_select_only_the_requested_port(monkeypatch):
+    from ascendflow.analysis.event_windows import EventWindow
     from ascendflow.analysis.notification_lifetimes import HandbackRule
 
     domains = prepared(selected(scale))
@@ -56,15 +57,24 @@ def test_selected_boundary_facts_keep_case_guards_and_lazy_terminal_selection():
         if n.mechanism is NotificationKind.LOCAL_EVENT and n.source_engine is Engine.MTE2
     )
     case = next(c for c in HandbackRule(domains)._cases(notification) if c.windows and not c.empty)
-    first = next(domains._instances(notification, case, None, 0))
-    terminal = tuple(domains._instances(notification, case, None, 0, terminal=True))
-    assert len(terminal) == 1 and terminal[0] is first
+
+    def unexpected_last(self):
+        pytest.fail("requesting FIRST constructed a LAST coordinate")
+
+    def unexpected_activation(*args, **kwargs):
+        pytest.fail("selected boundary rebuilt an already projected activation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(EventWindow, "last", unexpected_last)
+        patch.setattr(type(domains), "_activation", unexpected_activation)
+        first = domains._boundary(notification, case, None, 0, last=False)
+    assert domains._boundary(notification, case, None, 0, last=False) is first
     count = domains.control.loops[case.windows[0].loop].count
     strict = replace(
         case,
         condition=ActionGuard(case.condition.comparisons + (Comparison(count, ">", literal(1)),)),
     )
-    other = next(domains._instances(notification, strict, None, 0))
+    other = domains._boundary(notification, strict, None, 0, last=False)
     assert other is not first
     for tiles in (0, 1, 2, 3):
         parameters = {"tiles": tiles, "$group": 0, "$sid": 0}
@@ -72,9 +82,13 @@ def test_selected_boundary_facts_keep_case_guards_and_lazy_terminal_selection():
         restricted = other[0][0].guard.evaluate(parameters)
         assert restricted == (original and count.evaluate(parameters) > 1)
     # LAST remains a separate selected port, including after FIRST was reused.
-    both = tuple(domains._instances(notification, case, None, 0))
-    assert len(both) == 2 and both[0] is first
-    assert len(tuple(domains._instances(notification, case, None, 0, terminal=True))) == 1
+    with monkeypatch.context() as patch:
+        patch.setattr(type(domains), "_activation", unexpected_activation)
+        last = domains._boundary(notification, case, None, 0, last=True)
+    assert domains._boundary(notification, case, None, 0, last=True) is last
+    assert domains._boundary(notification, case, None, 0, last=False) is first
+    with pytest.raises(CompileError, match="empty event case has no selected boundary"):
+        domains._boundary(notification, replace(case, empty=True), None, 0, last=True)
 
 
 @pytest.mark.parametrize("scope", ["branch", "loop"])
@@ -103,7 +117,7 @@ def conditional(Meta:N.Tensor((1,),N.i64),Inner:N.Tensor((1,),N.i64),
             disjoint_external=True,
         )
     )
-    dependencies = build_structured_dependencies(memory)
+    dependencies = build_access_order(memory)
     writer = [t for t in memory.templates if t.spec.engine is Engine.V][-1]
     reader = next(t for t in memory.templates if t.spec.engine is Engine.MTE3)
 
@@ -138,7 +152,6 @@ def conditional(Meta:N.Tensor((1,),N.i64),Inner:N.Tensor((1,),N.i64),
     )
     selection = SynchronizationSelection(
         replace(dependencies, required=()),
-        dependencies.dispatch,
         (notification,),
         (),
     )
@@ -277,6 +290,7 @@ def finite_ports(*, at_most_one=False):
         dependencies=replace(selection.dependencies, required=()),
         notifications=notifications,
         coverage=(),
+        bindings=(),
     )
 
 

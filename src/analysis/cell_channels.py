@@ -19,7 +19,6 @@ from .structured_regions import StorageCell
 
 @dataclass(frozen=True, slots=True)
 class CellChannel:
-    owners: tuple
     members: tuple
 
 
@@ -31,13 +30,14 @@ def owns_stable_cell(notification, control, common_clocks):
     its complete family capture is a real, repeatable lifetime boundary.
     """
     root = control.module.body.block.first_op
-    return bool(notification.origins) and all(
+    return bool(notification.anchors) and all(
         isinstance(n.cell, StorageCell)
         and not isinstance(n.source.endpoint, QueueEndpoint)
         and not isinstance(n.consumer.endpoint, QueueEndpoint)
         and control.invariant_over(n.cell.origin, root)
         and not set(n.cell.streaming).intersection(common_clocks)
-        for n in notification.origins
+        for binding in notification.anchors
+        for n in (binding.requirement,)
     )
 
 
@@ -50,8 +50,8 @@ def _actual_tests(domains, point, case):
     )
 
 
-def _disjoint(domains, left, right):
-    """No duplicate publication or consumption at one native occurrence.
+def _occupations(domains, notification):
+    """Actual publication/consumption sites, with their complete activation.
 
     Different native operations are different occurrences in the cell's
     lifetime word. At the same operation their actual domains must separate.
@@ -59,55 +59,51 @@ def _disjoint(domains, left, right):
     at the common successor writer overlap. Nor can two ready consumers of
     one version merge: their Sets at the common definition overlap.
     """
+    result = {}
     for phase in ("sources", "consumers"):
-        for a in getattr(left, phase):
-            for b in getattr(right, phase):
-                if a.actor is not b.actor:
-                    continue
-                if a.operation is not b.operation:
-                    continue
-                for ac in domains.cases[left]:
-                    for bc in domains.cases[right]:
-                        if not domains.active[left, ac] or not domains.active[right, bc]:
-                            continue
-                        tests = _actual_tests(domains, a, ac) + _actual_tests(domains, b, bc)
-                        if not domains.arithmetic.queries.satisfies(tests).impossible:
-                            return False
-    return True
+        for point in getattr(notification, phase):
+            key = phase, point.actor, point.operation
+            for case in domains.cases[notification]:
+                if domains.active[notification, case]:
+                    result.setdefault(key, []).append(_actual_tests(domains, point, case))
+    return result
 
 
 def construct_cell_channels(domains):
-    channels, leases, remaining = [], [], []
-    groups = {}
+    leases, remaining = [], []
+    groups, occupations, members = {}, [], []
     for item in domains.notifications:
         if item.mechanism is NotificationKind.PIPE_FENCE:
             continue
-        origins = item.origins
         if not owns_stable_cell(item, domains.control, domains.clocks[item]):
             remaining.append(item)
             continue
-        # The origin is produced by binding, retained by cumulative captures
-        # and acquire reuse, and consumed only inside this owned compile.
-        # Every physical participant still has its own exact memory edge.
+        # The anchor bindings already own the actual memory edges. Added
+        # completion coverage never changes this physical ownership set.
         key = (
-            frozenset(n.ownership_key for n in origins),
+            frozenset(b.requirement.ownership_key for b in item.anchors),
             item.source_engine,
             item.destination_engine,
             item.mechanism,
         )
+        sites = _occupations(domains, item)
         candidates = groups.setdefault(key, [])
         for index in candidates:
-            prior = channels[index]
-            if all(_disjoint(domains, other, item) for other in prior.members):
-                channels[index] = replace(
-                    prior,
-                    owners=tuple(dict.fromkeys(prior.owners + origins)),
-                    members=prior.members + (item,),
-                )
+            if all(
+                domains.arithmetic.queries.satisfies(previous + current).impossible
+                for site, tests in sites.items()
+                for previous in occupations[index].get(site, ())
+                for current in tests
+            ):
                 break
         else:
-            candidates.append(len(channels))
-            channels.append(CellChannel(origins, (item,)))
+            index = len(members)
+            candidates.append(index)
+            members.append([])
+            occupations.append({})
+        members[index].append(item)
+        for site, tests in sites.items():
+            occupations[index].setdefault(site, []).extend(tests)
         cases = tuple(
             CaseLease(
                 c,
@@ -122,6 +118,7 @@ def construct_cell_channels(domains):
             if domains.active[item, c]
         )
         leases.append(StructuredEventLease(item, int(bool(cases)), cases))
+    channels = tuple(CellChannel(tuple(group)) for group in members)
     domains.work.cell_channels = len(channels)
     domains.work.cell_members = len(leases)
-    return tuple(channels), tuple(leases), tuple(remaining)
+    return channels, tuple(leases), tuple(remaining)

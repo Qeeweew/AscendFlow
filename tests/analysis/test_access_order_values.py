@@ -31,7 +31,7 @@ def test_equivalent_affine_residues_keep_their_real_storage_identity(step, bias,
     )
     cells = {
         cell
-        for effects in plan.dependencies.order.accesses.effects.values()
+        for effects in plan.dependencies.accesses.effects.values()
         for cell in effects
         if cell.root.type.bank.data == "UB"
     }
@@ -66,7 +66,7 @@ def scratch():
 
 @pytest.mark.parametrize("count", (0, 1, 3))
 def test_two_stage_scratch_preserves_actual_source_read_values(scratch, count):
-    assert scratch.dependencies.order.packet_partitions
+    assert scratch.dependencies.packet_partitions
     check_compiled_events(scratch, {"n": count}, invocations=2)
 
 
@@ -126,12 +126,12 @@ def test_periodic_native_reset_does_not_require_activation_history_closure():
     # Primitive mutation is a target-contract unit fixture, not a second DSL
     # compile path. Definedness/first-reset counterexamples stay in the native
     # admission suite; this checks order generation accepts their real modes.
-    from ascendflow.analysis.structured_dependencies import build_structured_dependencies
+    from ascendflow.analysis.access_order import build_access_order
     from tests.fixtures.conditional_mad import _admit, _retarget, _structure
 
     for period in (1, 2, 3):
         structure = _structure()
         _retarget(structure, period)
         admitted = _admit(structure)
-        result = build_structured_dependencies(admitted.memory, admission=admitted)
+        result = build_access_order(admitted.memory, admission=admitted)
         assert not hasattr(result, "values")

@@ -16,8 +16,7 @@ from xdsl.ir import Operation
 from ..diagnostics import CompileError, ErrorKind, require
 from ..scalar import Expr, substitute
 from ..target.ascend910b import Engine
-from .structured_dependencies import StructuredDependencies
-from .structured_dispatch import StructuredDispatch
+from .access_order import AccessOrder
 from .structured_regions import (
     AccessOccurrence,
     LoopDomain,
@@ -30,6 +29,7 @@ if TYPE_CHECKING:
     from .completion_prefixes import CompletionCoverage
     from .region_coordinates import ScalarScope
     from .smt import Exists
+    from .structured_dispatch import StructuredDispatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,9 +126,9 @@ class LogicalNotification:
     period: int
     distance: int | None
     domains: tuple[LoopDomain, ...] = ()
-    # The original adjacent lifetime/value edges of the selected real capture
-    # and acquire. Coverage can grow; these ownership edges do not change.
-    origins: tuple[StructuredNeed, ...] = ()
+    # Original bindings that own this actual capture/acquire. Coverage can
+    # grow without changing the anchors or recovering them from later actions.
+    anchors: tuple[RequirementBinding, ...] = ()
     _hash: int | None = field(default=None, init=False, compare=False, repr=False)
 
     def __hash__(self):
@@ -148,7 +148,7 @@ class LogicalNotification:
                     self.period,
                     self.distance,
                     self.domains,
-                    self.origins,
+                    self.anchors,
                 )
             )
             object.__setattr__(self, "_hash", value)
@@ -182,11 +182,21 @@ class EmptyOrdinalDomain:
 
 @dataclass(frozen=True, slots=True)
 class RequirementBinding:
-    """Original demand endpoints before capture/quorum/coverage coalescing."""
+    """Actual demand endpoints, independent of a selected notification.
+
+    CopyGroup's required completion prefix may follow the actual writer.
+    Storage admission uses ``source``; completion uses ``completion_source``.
+    Action coalescing changes neither endpoint nor the original requirement.
+    """
 
     requirement: StructuredNeed
     source: BoundPlacement
     consumer: BoundPlacement
+    ready_source: BoundPlacement | None = None
+
+    @property
+    def completion_source(self):
+        return self.source if self.ready_source is None else self.ready_source
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,12 +230,16 @@ class BindingWork:
 
 @dataclass(frozen=True)
 class SynchronizationSelection:
-    dependencies: StructuredDependencies
-    dispatch: StructuredDispatch
+    dependencies: AccessOrder
     notifications: tuple[LogicalNotification, ...]
     coverage: tuple[NotificationCoverage, ...]
     unresolved: tuple[UnresolvedSynchronization, ...] = ()
     binding_work: BindingWork = field(default_factory=BindingWork, compare=False)
+    bindings: tuple[RequirementBinding, ...] = ()
+
+    @property
+    def dispatch(self):
+        return self.dependencies.dispatch
 
     @property
     def closed(self):
@@ -248,9 +262,31 @@ class SynchronizationSelection:
             == {id(item) for item in self.dependencies.required},
             "notification selection lost an actual memory requirement",
         )
+        bindings = {id(item.requirement): item for item in self.bindings}
+        required = {id(item) for item in self.dependencies.required}
+        require(
+            len(bindings) == len(self.bindings)
+            and bindings.keys() <= required
+            and all(
+                (item.binding is not None or item.ownership is not None or item.absence is not None)
+                and (item.binding is None or item.binding is bindings.get(id(item.requirement)))
+                for item in self.coverage
+            ),
+            "coverage lost its original owned requirement binding",
+        )
+        for notification in self.notifications:
+            requirements = {id(need) for need in notification.requirements}
+            require(
+                all(
+                    anchor is bindings.get(id(anchor.requirement))
+                    and id(anchor.requirement) in requirements
+                    for anchor in notification.anchors
+                ),
+                "notification anchor lost its original owned requirement binding",
+            )
         owners = {
             need: lifetime
-            for lifetime in self.dependencies.order.cell_lifetimes
+            for lifetime in self.dependencies.cell_lifetimes
             for need in lifetime.requirements
         }
         require(
@@ -292,15 +328,13 @@ class SynchronizationSelection:
                 and proof.dispatch is self.dispatch
                 and item.binding is not None
                 and item.binding.requirement is item.requirement
-                and proof.covers(item.binding)
-                and any(need is item.requirement for need in proof.notification.requirements),
+                and proof.covers(item.binding),
                 "completion coverage belongs to another requirement or dispatch",
             )
         for proof in completions.values():
             require(
                 proof.obligations
                 and proof.cases
-                and id(proof.notification) not in retained
                 and all(item.answer.proved for item in proof.obligations)
                 and all(id(item) in retained for item in proof.supports()),
                 "completion coverage does not terminate in retained actual actions",

@@ -11,10 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from xdsl.ir import Operation
-
 from ..diagnostics import CompileError, ErrorKind, require
-from ..scalar import Expr
 from ..target.ascend910b import Engine
 from .access_frontier import QueueEndpoint
 from .hazards import HazardKind
@@ -28,12 +25,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class CellRound:
-    loop: Operation
-    writer: AccessOccurrence
+    retirement: StructuredNeed
     readers: tuple[AccessOccurrence, ...]
-    period: int
-    residue: int | Expr
-    sparse: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +34,6 @@ class CellLifetime:
     cell: StorageCell
     rounds: tuple[CellRound, ...]
     requirements: tuple[StructuredNeed, ...]
-    ready: tuple[StructuredNeed, ...]
     source_engine: Engine
     destination_engine: Engine
 
@@ -66,10 +58,11 @@ class LocalCreditOrder:
 
 def infer_cell_lifetimes(builder):
     """Consume body interfaces and actual effects; never search execution paths."""
-    groups = {}
+    groups, sparse_cells, incomplete_cells = {}, set(), set()
+    needs, raw_reads = {}, None
     control, dispatch = builder.memory.control, builder.dispatch
     root = builder.memory.module.body.block.first_op
-    for loop, cell, body, period, residue, sparse in builder.round_interfaces:
+    for loop, cell, body, period, _, sparse in builder.round_interfaces:
         if (
             not isinstance(cell, StorageCell)
             or cell.private is None
@@ -126,48 +119,64 @@ def infer_cell_lifetimes(builder):
             )
         ):
             continue
+        last_reader = max(
+            zip(body.tail_reads, readers, strict=True),
+            key=lambda item: (item[1].stage, item[1].lexical),
+        )[0]
+        if raw_reads is None:
+            raw_reads = {}
+            for need in builder.required:
+                needs.setdefault(need.cell, []).append(need)
+                if need.kind is HazardKind.RAW and need.distance == 0:
+                    raw_reads.setdefault((need.cell, need.loop, need.source, need.consumer), need)
+        retirement = raw_reads.get((cell, loop, writer, last_reader))
+        if retirement is None:
+            incomplete_cells.add(cell)
+            continue
         # The cell's own address period bounds the next visit. Other rings
         # never enter this check, and no runtime count is enumerated.
-        groups.setdefault(cell, []).append(
-            CellRound(loop, writer, body.tail_reads, period, residue, sparse or bool(activation))
-        )
+        groups.setdefault(cell, []).append(CellRound(retirement, body.tail_reads))
+        if sparse or activation:
+            sparse_cells.add(cell)
+    if not sparse_cells:
+        return ()
+    # Invert the established input relations once. No cell needs to rescan
+    # every effect and requirement or compare each need with every round.
+    effects = {}
+    for operation, cells in builder.accesses.effects.items():
+        for cell in cells:
+            if cell in groups:
+                effects.setdefault(cell, set()).add(operation)
     lifetimes = []
     for cell, rounds in groups.items():
-        if not any(r.sparse for r in rounds):
+        if cell not in sparse_cells or cell in incomplete_cells:
             continue
-        operations = {r.writer.operation for r in rounds} | {
+        operations = {r.retirement.source.operation for r in rounds} | {
             p.operation for r in rounds for p in r.readers
         }
-        if operations != {op for op, cells in builder.accesses.effects.items() if cell in cells}:
+        if operations != effects[cell]:
             continue  # A state input or escaping value is not a closed lifetime.
         routes = {
-            (dispatch.site(r.readers[0]).engine, dispatch.site(r.writer).engine) for r in rounds
+            (dispatch.site(r.readers[0]).engine, dispatch.site(r.retirement.source).engine)
+            for r in rounds
         }
         if len(routes) != 1:
             continue
-        ready, replaced = [], []
-        for need in builder.required:
-            if need.cell != cell:
-                continue
-            current = any(
-                need.kind is HazardKind.RAW
-                and need.loop is r.loop
-                and need.distance == 0
-                and need.source == r.writer
-                and need.consumer in r.readers
-                for r in rounds
-            )
-            (ready if current else replaced).append(need)
-        if not replaced or any(
-            not any(n.source == r.writer and n.consumer == p for n in ready)
-            for r in rounds
-            for p in r.readers
-        ):
+        round_reads = {
+            (r.retirement.loop, r.retirement.source, p) for r in rounds for p in r.readers
+        }
+        replaced, covered = [], set()
+        for need in needs.get(cell, ()):
+            edge = need.loop, need.source, need.consumer
+            current = need.kind is HazardKind.RAW and need.distance == 0 and edge in round_reads
+            if current:
+                covered.add(edge)
+            else:
+                replaced.append(need)
+        if not replaced or covered != round_reads:
             continue
         source, destination = routes.pop()
-        lifetimes.append(
-            CellLifetime(cell, tuple(rounds), tuple(replaced), tuple(ready), source, destination)
-        )
+        lifetimes.append(CellLifetime(cell, tuple(rounds), tuple(replaced), source, destination))
     return tuple(lifetimes)
 
 
@@ -179,12 +188,12 @@ def bind_cell_credits(domains):
     seed). Such local queues can finish without a future controller issue; cross
     controller progress remains the existing queue-order rule's obligation.
     """
-    from ..passes.notification_binding import _bind_notification, _IssueOrder
+    from ..passes.notification_binding import _IssueOrder
     from .event_domains import EventCase
     from .structured_protocols import NotificationKind, OrderingWitness
     from .structured_schedule import ActionGuard
 
-    lifetimes = domains.selection.dependencies.order.cell_lifetimes
+    lifetimes = domains.selection.dependencies.cell_lifetimes
     if not lifetimes:
         return (), LocalCreditOrder(())
     order = _IssueOrder(domains.dispatch)
@@ -223,20 +232,19 @@ def bind_cell_credits(domains):
                 )
             )
     credits = []
+    bindings = {item.requirement: item for item in domains.selection.bindings}
     case = EventCase(ActionGuard(), (), (), ())
     for lifetime in lifetimes:
         rounds = []
         for body in lifetime.rounds:
-            reader = max(
-                body.readers,
-                key=lambda p: (domains.dispatch.site(p).stage, domains.dispatch.site(p).lexical),
+            need = body.retirement
+            bound = bindings.get(need)
+            require(
+                bound is not None and bound.requirement is need and need.consumer in body.readers,
+                "persistent retirement lost its original last-reader binding",
             )
-            need = next(
-                n for n in lifetime.ready if n.source == body.writer and n.consumer == reader
-            )
-            paired = _bind_notification(need, domains.dispatch, order.guards(need))
-            acquire = replace(paired.sources[0], placement=Placement.BEFORE)
-            release = replace(paired.consumers[0], placement=Placement.AFTER)
+            acquire = replace(bound.source, placement=Placement.BEFORE)
+            release = replace(bound.consumer, placement=Placement.AFTER)
             actual = tuple(domains._instance(p, {}, case=case) for p in (acquire, release))
             tests = tuple(p.guard.comparisons for p in actual)
             require(

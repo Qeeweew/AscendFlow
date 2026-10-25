@@ -12,7 +12,7 @@ from itertools import pairwise
 from ..diagnostics import require
 from .position_words import position_word
 from .protocol_transfers import CausalProof, TransferNode
-from .smt import all_of
+from .smt import all_of, any_of
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,12 +23,16 @@ class AcquiredConsumption:
     premises: tuple
     proof: CausalProof
     answer: object
+    queue_composition: bool = False
     after_action: bool = False
 
 
 class _FrontierWord:
     def __init__(self, fact, positions, maximum):
         self.example, self.positions = fact, positions
+        self.path = positions.position(fact.origin.point)
+        self.premises = all_of(*fact.premises)
+        self.answers = {}
         self.size = 1 << maximum.bit_length()
         self.best = {}
 
@@ -43,9 +47,8 @@ class _FrontierWord:
                 self.best[node] = target, fact
             node //= 2
 
-    def candidates(self, origin):
-        left = self.positions.position(self.example.origin.point)
-        right = self.positions.position(origin.point)
+    def candidates(self, right):
+        left = self.path
         depth = len(left) - 1
         cuts = {0, self.size}
         if len(right) > depth and left[-1][0] is right[depth][0]:
@@ -88,20 +91,25 @@ class ConsumptionFrontiers:
                     self.maximum.get(scope.parent, 0), scope.parent_lexical * 3 + 2
                 )
 
-    def add(self, origin, target, engine, premises, proof, answer, *, after_action=False):
+    def add(self, fact):
         require(
-            self.domains.arithmetic.queries.owns_implication(answer, proof.condition, premises),
+            self.domains.arithmetic.queries.owns_implication(
+                fact.answer, fact.proof.condition, fact.premises
+            ),
             "consumption frontier lacks its exact owned mathematical implication",
         )
+        origin, target = fact.origin, fact.target
         if self.positions.position(origin.point) is None or self.positions.position(target) is None:
             return
-        fact = AcquiredConsumption(origin, target, engine, premises, proof, answer, after_action)
-        route = origin.point.actor, target.actor, engine
+        route = origin.point.actor, target.actor, fact.engine
         key = (
             route,
-            origin.notification.destination_engine,
-            after_action,
-            premises,
+            None
+            if self.domains._gate(origin.notification)
+            else origin.notification.destination_engine,
+            fact.queue_composition,
+            fact.after_action,
+            fact.premises,
             position_word((origin.point,), self.positions)[0],
             position_word((target,), self.positions)[0],
         )
@@ -112,48 +120,80 @@ class ConsumptionFrontiers:
             self.domains.work.consumption_frontier_words += 1
         self.words[key].add(fact)
 
-    def add_boundaries(self, origin, target, engine, premises, proof):
-        """Export the real acquired cuts, not just a later query endpoint.
+    def add_acquisitions(self, origin, premises, proof, *, queue_composition):
+        """Keep the acquired facts already established throughout this proof.
 
-        Only union factoring is transparent here. An actual acquire already
-        carries this origin; a composed fact of another origin is not opened.
-        Each exported cut keeps its own complete activation implication.
+        A proof's inputs precede its conclusion; the conclusion cannot be
+        backdated to them. Each acquire therefore exports only its own input
+        derivation, and only where that derivation covers the complete domain.
+        Captures and factoring vertices export no acquired fact.
         """
         d = self.domains
-        pending, seen = [proof], set()
+        pending, seen, acquisitions = [proof], set(), {}
         while pending:
             candidate = pending.pop()
             if candidate in seen:
                 continue
             seen.add(candidate)
+            pending.extend(candidate.inputs)
             node = candidate.node
-            if node.kind == "union":
-                pending.extend(candidate.inputs)
-            elif (
-                node.kind == "acquire"
-                and node.point.actor is target.actor
-                and (d._gate(node.notification) or node.notification.destination_engine is engine)
-            ):
-                answer = d.arithmetic.queries.implies(candidate.condition, premises)
-                if answer.proved:
-                    self.add(
-                        origin, node.point, engine, premises, candidate, answer, after_action=True
+            if node.kind == "acquire":
+                acquisitions.setdefault(node, []).append(candidate)
+        for node, alternatives in acquisitions.items():
+            candidate = alternatives[0]
+            if len(alternatives) > 1:
+                candidate = CausalProof(
+                    node,
+                    tuple(dict.fromkeys(p for proof in alternatives for p in proof.inputs)),
+                    any_of(*(proof.condition for proof in alternatives)),
+                )
+            answer = d.arithmetic.queries.implies(candidate.condition, premises)
+            if answer.proved:
+                engine = (
+                    None if d._gate(node.notification) else node.notification.destination_engine
+                )
+                self.add(
+                    AcquiredConsumption(
+                        origin,
+                        node.point,
+                        engine,
+                        premises,
+                        candidate,
+                        answer,
+                        queue_composition=queue_composition,
+                        after_action=True,
                     )
-                    d.work.consumption_acquired_boundaries += 1
+                )
+                d.work.consumption_acquired_boundaries += 1
 
-    def find(self, origin, target, engine, assumptions):
+    def find(self, origin, target, engine, assumptions, *, queue_composition=True):
         d = self.domains
-        route = origin.point.actor, target.actor, engine
+        words = tuple(
+            word
+            for route in dict.fromkeys(
+                (
+                    (origin.point.actor, target.actor, engine),
+                    (origin.point.actor, target.actor, None),
+                )
+            )
+            for word in self.routes.get(route, ())
+        )
+        if not words:
+            return None
+        context = d.arithmetic._context(assumptions)
+        path = self.positions.position(origin.point)
         seen = set()
-        for word in self.routes.get(route, ()):
+        for word in words:
             example = word.example
-            if (
-                not d._gate(origin.notification)
-                and origin.notification.destination_engine
+            if example.queue_composition and not queue_composition:
+                continue
+            if not d._gate(origin.notification) and (
+                d._gate(example.origin.notification)
+                or origin.notification.destination_engine
                 is not example.origin.notification.destination_engine
             ):
                 continue
-            for fact in word.candidates(origin):
+            for fact in word.candidates(path):
                 if id(fact) in seen:
                     continue
                 seen.add(id(fact))
@@ -165,9 +205,20 @@ class ConsumptionFrontiers:
                 after = self.positions.order(fact.target, target, strict=fact.after_action)
                 if before is False or after is False:
                     continue
-                condition = all_of(*fact.premises, before, after)
-                d.work.consumption_frontier_queries += 1
-                answer = d.arithmetic.queries.implies(condition, assumptions)
+                # One word has exactly the same complete premise sequence.
+                # Its lexical bands can ask the same mathematical question at
+                # many real cuts. Cache that answer, never the causal proof:
+                # the latter must still use this candidate's actual Wait/cut.
+                key = context, before, after
+                established = word.answers.get(key)
+                if established is None:
+                    condition = all_of(word.premises, before, after)
+                    d.work.consumption_frontier_queries += 1
+                    answer = d.arithmetic.queries.implies(condition, assumptions)
+                    word.answers[key] = condition, answer
+                else:
+                    condition, answer = established
+                    d.work.consumption_frontier_answer_reuses += 1
                 if not answer.proved:
                     continue
                 # The established implication premises => fact.proof.condition

@@ -28,6 +28,7 @@ from .integer_facts import IntegerFacts
 from .region_coordinates import RegionCoordinates
 from .smt import all_of, any_of
 from .structured_access import PartitionedAccesses, partition_accesses
+from .structured_dispatch import StructuredDispatch, bind_structured_dispatch
 from .structured_memory import NativeMemoryFacts
 from .structured_regions import (
     AccessOccurrence,
@@ -112,6 +113,7 @@ class AccessTransfer:
 class AccessOrder:
     memory: NativeMemoryFacts
     admission: StructuredAdmission | None
+    dispatch: StructuredDispatch
     accesses: PartitionedAccesses
     summaries: Mapping[Operation, Mapping[StorageCell | AliasRegion, AccessTransfer]]
     needs: tuple[StructuredNeed, ...]
@@ -121,7 +123,8 @@ class AccessOrder:
     work: DependencyWork
 
 
-def build_access_order(memory, dispatch, *, admission=None):
+def build_access_order(memory, *, admission=None, dispatch=None):
+    dispatch = bind_structured_dispatch(memory) if dispatch is None else dispatch
     require(dispatch.memory is memory, "access order needs the owned dispatch")
     if admission is not None:
         require(admission.memory is memory, "access admission belongs to another snapshot")
@@ -824,6 +827,7 @@ class _Builder:
         return AccessOrder(
             self.memory,
             self.admission,
+            self.dispatch,
             self.accesses,
             MappingProxyType(self.summaries),
             tuple(self.needs),

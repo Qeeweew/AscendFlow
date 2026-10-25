@@ -1,4 +1,4 @@
-"""Compositional enclosures of local event publication/consumption intervals.
+"""Compositional enclosures of actual event publication/consumption intervals.
 
 Each activation class retains its first actual publisher and last actual
 consumer. Enclosure is issue order on one real source/controller and one
@@ -7,7 +7,9 @@ still establish actual consumption handbacks, including every reentry.
 
 The hierarchy factors complete-credit reuse rectangles. A failed coarse
 interface is refined through the same rule to real message endpoints; it is
-neither a second progress solver nor a dense pair-construction fallback.
+not a second progress solver. Refinement can reach every leaf pair when no
+common enclosure separates the input; the hierarchy does not guarantee
+linear work for arbitrary activation/coordinate classes.
 Frozen rectangles contain data only. ID assignment cannot query domains.
 """
 
@@ -29,7 +31,7 @@ class _CreditNode:
     children: tuple[_CreditNode, ...] = ()
 
 
-class LocalEventFrontiers:
+class EventFrontiers:
     def __init__(self, domains, handbacks, demands, compatible, *, established=None):
         self.domains, self.handbacks, self.demands = domains, handbacks, demands
         self.compatible = compatible
@@ -64,6 +66,7 @@ class LocalEventFrontiers:
             )
 
         key = (
+            notification.mechanism,
             notification.source_engine,
             notification.destination_engine,
             notification.clock,
@@ -94,9 +97,7 @@ class LocalEventFrontiers:
 
     def _leaf(self, notification):
         if notification not in self._leaves:
-            self._leaves[notification] = EventFrontier(
-                notification, notification, frozenset((notification,))
-            )
+            self._leaves[notification] = EventFrontier(notification, notification)
         return self._leaves[notification]
 
     def _join(self, left, right):
@@ -111,28 +112,27 @@ class LocalEventFrontiers:
         consumers = (left.tail, right.tail)
         head = min(sources, key=lambda n: d.dispatch.site(n.sources[0]).lexical)
         tail = max(consumers, key=lambda n: d.dispatch.site(n.consumers[0]).lexical)
-        # Two separate notification instructions at one native anchor have
-        # no relative instruction order in these endpoint facts. Equality
-        # of native positions must not turn one Wait into the other's last
-        # consumer or one Set into the other's first publisher.
-        if any(
-            n is not head
-            and d.dispatch.site(n.sources[0]).lexical == d.dispatch.site(head.sources[0]).lexical
-            for n in sources
-        ) or any(
-            n is not tail
-            and d.dispatch.site(n.consumers[0]).lexical
-            == d.dispatch.site(tail.consumers[0]).lexical
-            for n in consumers
+        bounds = []
+        for selected, choices, phase, before in (
+            (head, sources, "sources", True),
+            (tail, consumers, "consumers", False),
         ):
-            return None
-        bounds = tuple((head.sources[0], n.sources[0]) for n in sources) + tuple(
-            (n.consumers[0], tail.consumers[0]) for n in consumers
-        )
+            selected_points = sorted(getattr(selected, phase), key=lambda p: p.actor.value)
+            for notification in choices:
+                points = sorted(getattr(notification, phase), key=lambda p: p.actor.value)
+                if tuple(p.actor for p in selected_points) != tuple(p.actor for p in points):
+                    return None
+                for endpoint, point in zip(selected_points, points, strict=True):
+                    # Distinct actions at one native anchor are unordered.
+                    if notification is not selected and (
+                        d.dispatch.site(endpoint).lexical == d.dispatch.site(point).lexical
+                    ):
+                        return None
+                    bounds.append((endpoint, point) if before else (point, endpoint))
         if any(d._order_conditions(a, b) != (ActionGuard(),) for a, b in bounds):
             return None
         self.work.frontier_enclosures += 1
-        return EventFrontier(head, tail, left.members | right.members, (left, right), bounds)
+        return EventFrontier(head, tail, left.size + right.size, (left, right), tuple(bounds))
 
     def _combine(self, entries):
         result = {}
@@ -168,7 +168,7 @@ class LocalEventFrontiers:
         if key in self._separations:
             return self._separations[key]
         self.work.frontier_queries += 1
-        if len(left.members) == len(right.members) == 1:
+        if left.size == right.size == 1:
             permission = self.compatible(left.head, right.head)
             result = (
                 None
@@ -186,8 +186,7 @@ class LocalEventFrontiers:
             else:
                 children, other, reverse = (
                     (left.children, right, False)
-                    if left.children
-                    and (not right.children or len(left.members) >= len(right.members))
+                    if left.children and (not right.children or left.size >= right.size)
                     else (right.children, left, True)
                 )
                 assert children, "nontrivial event enclosure lost its actual child interfaces"
@@ -206,7 +205,7 @@ class LocalEventFrontiers:
         return result
 
     def _between(self, left, right):
-        poll("local event consumption frontiers", queries=self.work.frontier_queries)
+        poll("event consumption frontiers", queries=self.work.frontier_queries)
         self.work.frontier_blocks += 1
         proofs = []
         for _, a in left.frontiers:
@@ -244,19 +243,14 @@ class LocalEventFrontiers:
             self._within(right)
             self._between(left, right)
 
-    def build(self, pressured):
-        banks = {}
-        for number, demand in enumerate(self.demands):
-            if demand.backlog is None and demand.persistent is None:
-                for bank in demand.banks:
-                    if bank in pressured:
-                        banks.setdefault(bank, []).append(number)
+    def build(self, groups):
         positions = {operation: i for i, operation in enumerate(self.domains.control.frames)}
-        for resources in banks.values():
-            resources.sort(
+        for resources in groups:
+            resources = sorted(
+                resources,
                 key=lambda r: min(
                     positions[p.operation] for n in self.demands[r].members for p in n.sources
-                )
+                ),
             )
             if len(resources) > 1:
                 self._within(self._node(tuple(resources)))

@@ -1,26 +1,26 @@
-"""Deterministic finite event coloring over frozen reuse constraints.
+"""Finite event mappings from frozen consumption and whole-word certificates.
 
-Distinct namespaces are independent. Prefer exclusive contiguous mappings;
-reuse is considered only in a component whose exclusive placement fails.
-Search never queries lifetime facts or changes an instruction's position.
+Direct exclusive/word constructions need no solver. All residual protocol
+options and IDs form one existential problem; no Python numbering search or
+source/lifetime query participates in allocation.
 """
 
 from dataclasses import dataclass
+from heapq import heapify, heappop, heappush
 from itertools import combinations
+from time import perf_counter
+
+from z3 import And, Distinct, If, Implies, Int, Or, Sum
 
 from ..budget import poll
 from ..diagnostics import CompileError, ErrorKind, require
 from .event_contracts import CROSS_BACKLOG, EventDemand, EventIdPools
-
-MAX_COLORING_NODES = 16384
+from .event_frontier_contracts import FrozenEventRelations
+from .smt import finite_model
 
 
 class NoEventAssignment(CompileError):
-    """Fixed protocol constraints exhausted; another frozen option may apply."""
-
-    def __init__(self, *args, nodes=0, **kwargs):
-        self.nodes = nodes
-        super().__init__(*args, **kwargs)
+    """The complete frozen choice problem has no finite mapping."""
 
 
 def namespaces(demand):
@@ -38,7 +38,7 @@ class _ColoringProblem:
     relations: object
     id_pools: EventIdPools
     counter_packs: tuple[frozenset[int], ...] = ()
-    counter_reuses: frozenset[tuple[int, int]] = frozenset()
+    counter_reuses: object = FrozenEventRelations(())
     counter_time_packs: tuple[tuple[frozenset[int], ...], ...] = ()
 
 
@@ -86,24 +86,45 @@ class _PeerRelations:
     original: object
     groups: tuple
     banks: tuple
-    demands: tuple
-    packs: tuple
-    reuses: frozenset
-    time_packs: tuple
+
+    def local_conflicts(self, group):
+        """Project missing row permissions through every original private bank.
+
+        Expand actual conflicts from the frozen masks. A peer equality changes
+        only the numeric variable; no original bank or required permission is
+        dropped. Ordinary numeric mappings retain the finite fallback below.
+        """
+        row = getattr(self.original, "row_mask", None)
+        if row is None:
+            return None
+        owners = {old: number for number in group for old in self.groups[number]}
+        banks = {}
+        for old in owners:
+            for bank in self.banks[old]:
+                banks[bank] = banks.get(bank, 0) | (1 << old)
+        result = set()
+        for old, number in owners.items():
+            poll("event conflict projection", credits=len(owners), row=old)
+            common = 0
+            for bank in self.banks[old]:
+                common |= banks[bank]
+            missing = common & ~row(old) & ~(1 << old)
+            while missing:
+                bit = missing & -missing
+                other = bit.bit_length() - 1
+                missing ^= bit
+                target = owners[other]
+                key = min(number, target), max(number, target)
+                if number == target or key in result:
+                    continue
+                # Keep ordinary canonical lookup semantics even for an
+                # explicitly supplied asymmetric numeric row collection.
+                if self.original.get((min(old, other), max(old, other))) is None:
+                    result.add(key)
+        return result
 
     def get(self, key, default=None):
         a, b = key
-        if (a, b) in self.reuses:
-            return ()
-        if self.demands[a].backlog is not None:
-            return (
-                ()
-                if (
-                    any({a, b} <= pack for pack in self.packs)
-                    or any({a, b} <= frozenset().union(*groups) for groups in self.time_packs)
-                )
-                else default
-            )
         common = False
         for x in self.groups[a]:
             for y in self.groups[b]:
@@ -115,6 +136,30 @@ class _PeerRelations:
         return () if common else default
 
 
+@dataclass(frozen=True)
+class _CounterRelations:
+    """Keep counter credit rows in their original numeric identity space."""
+
+    original: FrozenEventRelations
+    groups: tuple
+
+    def __bool__(self):
+        return bool(self.original)
+
+    def conflicts(self, members):
+        owners = {self.groups[n][0]: n for n in members}
+        mask = sum(1 << old for old in owners)
+        missing = set()
+        for old, number in owners.items():
+            blocked = mask & ~self.original.row_mask(old) & ~(1 << old)
+            while blocked:
+                bit = blocked & -blocked
+                blocked ^= bit
+                other = owners[bit.bit_length() - 1]
+                missing.add((min(number, other), max(number, other)))
+        yield from sorted(missing)
+
+
 def _equal_numbers(problem):
     demands, groups = _peer_demands(problem.demands, problem.peers)
     owners = {n: i for i, group in enumerate(groups) for n in group}
@@ -123,19 +168,13 @@ def _equal_numbers(problem):
         tuple(frozenset(owners[n] for n in group) for group in c.groups)
         for c in getattr(problem, "counter_compositions", ())
     )
-    # Mode-2 has no peer quotient: each original temporal pair remains one
-    # numeric pair. Local peers must satisfy all original private-bank rows.
-    time = frozenset(
-        (min(owners[a], owners[b]), max(owners[a], owners[b])) for a, b in problem.counter_reuses
-    )
+    # Mode-2 has no peer quotient. Keep its original rows, including when
+    # local peer equalities shift the surrounding numeric variable indices.
+    time = _CounterRelations(problem.counter_reuses, groups)
     relations = _PeerRelations(
         problem.relations,
         groups,
         tuple(frozenset(namespaces(d)) for d in problem.demands),
-        demands,
-        packs,
-        time,
-        time_packs,
     )
     return _ColoringProblem(
         demands, problem.reservations, relations, problem.id_pools, packs, time, time_packs
@@ -152,7 +191,7 @@ def counter_group_usage(demands, members, reuses, packs, *, packing=True, time_p
     permissions alone do not authorize an arbitrary mixed set.
     """
     members = tuple(sorted(members))
-    if all((a, b) in reuses for a, b in combinations(members, 2)):
+    if reuses.permits_group(members):
         return "time", max(demands[n].backlog for n in members)
     if packing and any(set(members) <= group for group in packs):
         return "fifo", sum(demands[n].backlog for n in members)
@@ -180,9 +219,20 @@ def counter_fifo_partition(demands, packs, members=None):
     if any(demands[n].width != 1 or demands[n].backlog > CROSS_BACKLOG for n in remaining):
         return None
     result = []
-    for pack in sorted(packs, key=lambda values: (-len(values), tuple(sorted(values)))):
+    pending = [(-len(pack), tuple(sorted(pack)), pack) for pack in packs]
+    heapify(pending)
+    while pending:
+        size, key, pack = heappop(pending)
         selected = frozenset(remaining.intersection(pack))
-        if len(selected) < 2 or sum(demands[n].backlog for n in selected) > CROSS_BACKLOG:
+        if len(selected) < 2:
+            continue
+        if len(selected) != -size:
+            # Old gains are upper bounds. Refresh them until the largest
+            # remaining word is current; a large consumed word must not
+            # outrank a smaller word that covers more still-live credits.
+            heappush(pending, (-len(selected), key, pack))
+            continue
+        if sum(demands[n].backlog for n in selected) > CROSS_BACKLOG:
             continue
         result.append(selected)
         remaining.difference_update(selected)
@@ -310,190 +360,221 @@ def _exclusive_overfull(problem, group, reserved):
     )
 
 
-def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_packing=False):
-    demands = problem.demands
-    cross = demands[group[0]].backlog is not None
-    vertices = tuple((number, lane) for number in group for lane in range(demands[number].width))
-    adjacency = [set() for _ in vertices]
-    allowed = []
-    for number, _ in vertices:
-        allowed.append(_available(problem.id_pools, namespaces(demands[number]), reserved))
-    # Unused IDs with the same admissible vertices are interchangeable.
-    # Reservations can distinguish numbers across joint banks, so retain the
-    # whole allowed-column signature rather than just a count of used IDs.
-    signatures = {
-        flag: tuple(flag in choices for choices in allowed) for flag in set().union(*allowed)
-    }
-    for i, j in combinations(range(len(vertices)), 2):
-        a, b = vertices[i][0], vertices[j][0]
-        common = set(namespaces(demands[a])).intersection(namespaces(demands[b]))
-        permitted = (
-            reuse
-            and relation(problem, a, b) is not None
-            and (not cross or counter_packing or (min(a, b), max(a, b)) in problem.counter_reuses)
-        )
-        if a == b or common and (not reuse or not permitted):
-            adjacency[i].add(j)
-            adjacency[j].add(i)
-    # This is a lower bound for the *supported constraint graph*, not a
-    # witness of joint physical overlap in some real execution.
-    clique = []
-    for v in sorted(range(len(vertices)), key=lambda v: (-len(adjacency[v]), v)):
-        if all(other in adjacency[v] for other in clique):
-            clique.append(v)
-    if len(clique) > capacity:
-        return None, 0
-    colors, nodes = {}, 0
-
-    def visit():
-        nonlocal nodes
-        nodes += 1
-        poll("event coloring", nodes=nodes, vertices=len(vertices))
-        if nodes > node_limit:
-            raise CompileError(
-                f"event coloring reached its {MAX_COLORING_NODES}-node work limit within capacity {capacity}; "
-                "no infeasibility claim or schedule fallback",
-                kind=ErrorKind.ANALYSIS_LIMIT,
-                phase="event-id-coloring",
-            )
-        if len(colors) == len(vertices):
-            return True
-        v = max(
-            (v for v in range(len(vertices)) if v not in colors),
-            key=lambda v: (
-                len({colors[n] for n in adjacency[v] if n in colors}),
-                len(adjacency[v]),
-                -v,
-            ),
-        )
-        forbidden = {colors[n] for n in adjacency[v] if n in colors}
-        number, lane = vertices[v]
-        bank_set = set(namespaces(demands[number]))
-        used = {
-            color
-            for n, color in colors.items()
-            if bank_set.intersection(namespaces(demands[vertices[n][0]]))
-        }
-        choices = [c for c in allowed[v] if c not in forbidden]
-        # A contiguous ring needs no general selector. Otherwise prefer a
-        # free physical slot before aliasing another complete credit.
-        previous = next(
-            (
-                colors[n] + 1
-                for n, item in enumerate(vertices)
-                if item == (number, lane - 1) and n in colors
-            ),
-            None,
-        )
-        choices.sort(key=lambda c: (c != previous if previous is not None else False, c in used, c))
-        occupied = set(colors.values())
-        tried_unused = set()
-        for color in choices:
-            if color not in occupied:
-                signature = signatures[color]
-                if signature in tried_unused:
-                    continue
-                tried_unused.add(signature)
-            if cross:
-                members = {vertices[n][0] for n, c in colors.items() if c == color} | {number}
-                usage = counter_group_usage(
-                    demands,
-                    members,
-                    problem.counter_reuses,
-                    problem.counter_packs,
-                    packing=counter_packing,
-                    time_packs=problem.counter_time_packs,
-                )
-                if usage is None or usage[1] > CROSS_BACKLOG:
-                    continue
-            colors[v] = color
-            if visit():
-                return True
-            del colors[v]
-        return False
-
-    if not visit():
-        return None, nodes
-    return {
-        n: tuple(colors[i] for i, (number, _) in enumerate(vertices) if number == n) for n in group
-    }, nodes
+def _local_conflicts(problem, group):
+    sparse = problem.relations.local_conflicts(group)
+    if sparse is not None:
+        yield from sorted(sparse)
+        return
+    banks = {}
+    for number in group:
+        for bank in namespaces(problem.demands[number]):
+            banks.setdefault(bank, []).append(number)
+    seen = set()
+    for members in banks.values():
+        for a, b in combinations(members, 2):
+            pair = min(a, b), max(a, b)
+            if pair not in seen:
+                seen.add(pair)
+                if relation(problem, *pair) is None:
+                    yield pair
 
 
-def color_event_resources(problem, *, node_limit=None):
-    node_limit = MAX_COLORING_NODES if node_limit is None else node_limit
-    require(0 <= node_limit <= MAX_COLORING_NODES, "invalid remaining event search work")
-    problem, peers = _equal_numbers(problem)
+def _local_clique_overfull(problem, group, reserved, *, reuse):
+    """Reject a bounded numeric witness before expanding a dense graph.
+
+    All vertices in each row share this bank's finite palette. Peer coupling
+    may supply another reason they need different numbers; this is still a
+    constraint-graph witness, not a physical-occupancy minimum.
+    """
+    banks = {}
+    for number in group:
+        for bank in namespaces(problem.demands[number]):
+            banks.setdefault(bank, []).append(number)
+    for bank, members in banks.items():
+        capacity = len(set(problem.id_pools.ids(bank)).difference(reserved.get(bank, ())))
+        clique, width = [], 0
+        for number in members:
+            if all(not reuse or relation(problem, number, other) is None for other in clique):
+                clique.append(number)
+                width += problem.demands[number].width
+                if width > capacity:
+                    return True
+    return False
+
+
+def _prepare(problem):
+    numeric, peers = _equal_numbers(problem)
     reserved = {}
-    for r in problem.reservations:
-        reserved.setdefault(r.bank, set()).add(r.event)
-    result = {}
-    nodes = 0
-    for group in _components(problem.demands):
-        cross = problem.demands[group[0]].backlog is not None
-        capacity = len(
-            set().union(
-                *(
-                    problem.id_pools.ids(bank)
-                    for number in group
-                    for bank in namespaces(problem.demands[number])
+    for item in numeric.reservations:
+        reserved.setdefault(item.bank, set()).add(item.event)
+    direct, residual = {}, []
+    for group in _components(numeric.demands):
+        choices = {
+            n: _available(numeric.id_pools, namespaces(numeric.demands[n]), reserved) for n in group
+        }
+        if any(numeric.demands[n].width > len(choices[n]) for n in group):
+            return numeric, peers, None, ()
+        if any(
+            numeric.demands[n].backlog is not None and numeric.demands[n].backlog > CROSS_BACKLOG
+            for n in group
+        ):
+            return numeric, peers, None, ()
+        colors = _exclusive(numeric.demands, group, reserved, numeric.id_pools)
+        cross = numeric.demands[group[0]].backlog is not None
+        if colors is None and cross and not numeric.counter_reuses:
+            colors = _structured_counter_colors(numeric, group, reserved)
+        if colors is not None:
+            direct.update(colors)
+        elif not cross and _local_clique_overfull(numeric, group, reserved, reuse=True):
+            return numeric, peers, None, ()
+        else:
+            residual.append((group, choices, not _exclusive_overfull(numeric, group, reserved)))
+    return numeric, peers, direct, tuple(residual)
+
+
+def _counter_constraints(problem, group, lanes, prefix, add):
+    # Each certificate admits every filtered subset of its actual word(s).
+    # A mode selects an existing certificate, never a completion truth value.
+    certificates = tuple((pack,) for pack in problem.counter_packs) + problem.counter_time_packs
+    owners = {n: [] for n in group}
+    for number, groups in enumerate(certificates, 1):
+        for n in frozenset().union(*groups).intersection(group):
+            owners[n].append(number)
+    conflicts = tuple(problem.counter_reuses.conflicts(group))
+    flags = problem.id_pools.cross
+    for flag in flags:
+        poll("counter certificate constraints", members=len(group), event=flag)
+        members = {n: Or(*(value == flag for value in lanes[n])) for n in group}
+        mode = Int(f"{prefix}_counter_{flag}")
+        add(f"counter.{flag}.mode", And(mode >= 0, mode <= len(certificates)))
+        for n in group:
+            add(
+                f"counter.{flag}.member.{n}",
+                Implies(members[n], Or(mode == 0, *(mode == c for c in owners[n]))),
+            )
+            if problem.demands[n].backlog > CROSS_BACKLOG:
+                add(f"counter.{flag}.backlog.{n}", ~members[n])
+        for a, b in conflicts:
+            add(f"counter.{flag}.time.{a}.{b}", Implies(mode == 0, Or(~members[a], ~members[b])))
+        for number, groups in enumerate(certificates, 1):
+            for child, subset in enumerate(groups):
+                terms = [
+                    If(members[n], problem.demands[n].backlog, 0) for n in subset if n in members
+                ]
+                add(
+                    f"counter.{flag}.word.{number}.{child}",
+                    Implies(mode == number, Sum(terms) <= CROSS_BACKLOG),
                 )
-            )
-        )
-        colors = _exclusive(problem.demands, group, reserved, problem.id_pools)
-        if colors is None and not _exclusive_overfull(problem, group, reserved):
-            # Greedy placement can fail even when a different exclusive
-            # mapping fits all peer banks. Exhaust that finite constraint
-            # graph before enabling any optional reuse relation.
-            colors, work = _color(
-                problem, group, reserved, capacity, node_limit - nodes, reuse=False
-            )
-            nodes += work
-        if colors is None and cross and not problem.counter_reuses:
-            colors = _structured_counter_colors(problem, group, reserved)
-        if colors is None:
-            colors, work = _color(
-                problem, group, reserved, capacity, node_limit - nodes, reuse=True
-            )
-            nodes += work
-        if colors is None and cross:
-            colors = _structured_counter_colors(problem, group, reserved)
-            if colors is None:
-                colors, work = _color(
-                    problem,
-                    group,
-                    reserved,
-                    capacity,
-                    node_limit - nodes,
-                    reuse=True,
-                    counter_packing=True,
+    return len(flags)
+
+
+def _constraints(prepared, option, selected, constraints, objectives):
+    problem, _peers, direct, residual = prepared
+    active = selected == option
+    prefix = f"event_{option}"
+
+    def add(name, condition):
+        constraints.append((f"option.{option}.{name}", Implies(active, condition)))
+
+    if direct is None:
+        add("capacity", False)
+        return {}, 0
+    lanes, variables = {}, 0
+    for component, (group, choices, exclusive_possible) in enumerate(residual):
+        poll("event ID constraints", component=component, credits=len(group))
+        current = {
+            n: tuple(Int(f"{prefix}_{n}_{lane}") for lane in range(problem.demands[n].width))
+            for n in group
+        }
+        lanes.update(current)
+        variables += sum(map(len, current.values()))
+        for n in group:
+            for lane, value in enumerate(current[n]):
+                add(f"pool.{n}.{lane}", Or(*(value == flag for flag in choices[n])))
+            add(f"lanes.{n}", Distinct(*current[n]))
+        if exclusive_possible:
+            banks = {}
+            for n in group:
+                for bank in namespaces(problem.demands[n]):
+                    banks.setdefault(bank, []).extend(current[n])
+            exclusive = And(*(Distinct(*values) for values in banks.values()))
+            objectives.append(If(active, If(exclusive, 0, 1), 0))
+        if problem.demands[group[0]].backlog is not None:
+            variables += _counter_constraints(problem, group, current, f"{prefix}_{component}", add)
+        else:
+            for a, b in _local_conflicts(problem, group):
+                add(
+                    f"separation.{a}.{b}",
+                    And(*(left != right for left in current[a] for right in current[b])),
                 )
-                nodes += work
-        if colors is None:
-            first = problem.demands[group[0]]
-            names = [m.name for n in group for m in problem.demands[n].members]
-            names += [
-                problem.demands[n].persistent.name
-                for n in group
-                if problem.demands[n].persistent is not None
-            ]
+    return lanes, variables
+
+
+def color_event_resources(problem, *, alternatives=()):
+    """Select a frozen protocol and all residual IDs in one finite problem.
+
+    Return the actual lane mappings and selected option. The first option is
+    preferred, then exclusive mappings in its independent bank components.
+    SAT provides only a mapping under the frozen premises, never those premises.
+    """
+    started = perf_counter()
+    candidates = (problem, *alternatives)
+    preferred = _prepare(problem)
+    prepared = [preferred]
+    checks = variable_count = constraint_count = 0
+    if preferred[2] is not None and not preferred[3]:
+        option, direct, model, symbolic = 0, preferred[2], None, {}
+    else:
+        prepared.extend(_prepare(candidate) for candidate in alternatives)
+        selected = Int("event_protocol_option")
+        constraints = [("protocol.option", And(selected >= 0, selected < len(candidates)))]
+        objectives = [selected]
+        symbols = []
+        variable_count = 1
+        for number, item in enumerate(prepared):
+            lanes, count = _constraints(item, number, selected, constraints, objectives)
+            symbols.append(lanes)
+            variable_count += count
+        checks, constraint_count = 1, len(constraints)
+        work = getattr(problem, "work", None)
+        if work is not None:
+            work.allocation_queries = checks
+            work.allocation_variables = variable_count
+            work.allocation_constraints = constraint_count
+        try:
+            model, core = finite_model(constraints, objectives)
+        finally:
+            if work is not None:
+                work.allocation_seconds = perf_counter() - started
+        if model is None:
+            capacity = max(
+                (
+                    len(problem.id_pools.ids(bank))
+                    for demand in problem.demands
+                    for bank in namespaces(demand)
+                ),
+                default=0,
+            )
             raise NoEventAssignment(
-                f"no assignment within capacity {capacity} under the selected virtual protocol and "
+                f"no assignment within capacity {capacity} under the frozen protocol options and "
                 "established reuse constraints; this is not a hardware minimum",
                 kind=ErrorKind.UNSUPPORTED,
-                phase="event-id-coloring",
-                location=str(first.members[0].sources[0].operation.location)
-                if first.members
-                else None,
-                witness=(
-                    f"credits={names}",
-                    f"reservations={reserved}",
-                    "missing reuse proof, protocol demand, or joint-bank constraint; no new wait",
-                ),
-                nodes=nodes,
+                phase="event-id-allocation",
+                witness=core,
             )
-        result.update(colors)
+        option = model.eval(selected).as_long()
+        direct, symbolic = prepared[option][2], symbols[option]
+    result = dict(direct)
+    for n, lanes in symbolic.items():
+        result[n] = tuple(model.eval(value).as_long() for value in lanes)
     expanded = {}
-    for unit, group in enumerate(peers):
-        for number in group:
+    for unit, peers in enumerate(prepared[option][1]):
+        for number in peers:
             expanded[number] = result[unit]
-    return tuple(expanded[n] for n in range(len(expanded))), nodes
+    work = getattr(problem, "work", None)
+    if work is not None:
+        work.allocation_queries = checks
+        work.allocation_variables = variable_count
+        work.allocation_constraints = constraint_count
+        work.allocation_seconds = perf_counter() - started
+    return tuple(expanded[n] for n in range(len(expanded))), option

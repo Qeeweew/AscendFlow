@@ -65,8 +65,14 @@ head reader、异步 reader 和未知来源仍保留。ENTRY、Scalar store 及 
 
 完全相同的端点/domain 前提先 bundle，RAW/WAR/WAW 诊断仍分别保留。累计捕获
 只选已经需要且确实更晚发射的 source；复用 acquire 只使用已经存在的更早同
-queue acquire。被选通知保留它自身的原始 ownership edge，不把新增 coverage
+queue acquire。被选通知直接引用自身的原始 anchor binding，不把新增 coverage
 反过来当作捕获者自己的存储归属。
+
+通用 cell credit 按这些原始 binding 的完整物理 ownership 集合和 role 分组。
+同一实际操作的 Set 或 Wait 不能重复发射；构造按 Set/Wait、participant、native
+操作归集真实激活域，只对共同位置检查完整条件是否互斥，unknown 不允许合并。
+无共同动作位置的历史成员不再逐对访问。保持首个可接受 credit 的选择顺序，
+成员逐次追加后只冻结一次；credit 不再额外复制一份累计 owner 列表。
 
 已取得的完成前缀按实际 route、完整激活类、capture/acquire 的层级发射坐标
 建立查询索引。同一个发射 word 只允许最后 lexical 位置变化，其余 scope、
@@ -81,17 +87,34 @@ queue acquire。被选通知保留它自身的原始 ownership edge，不把新�
 配对域建立后，完成前缀还通过实际 capture/acquire 组合。capture 冻结其之前
 已阻塞本 queue/controller 的 Wait 所取得的来源；后来才执行的 Wait 不能回填。
 native issue 本身不产生完成事实。同锚点不同动作不因位置相等取得先后关系。
-条件前缀的合取/并集保持共享 DAG，由原始需求的完整激活前提证明覆盖。
+有限 capture/acquire 关系保留各自的原整数条件。查询只要求在原始需求的完整
+激活前提下必然取得目标事实，以实际 seed 和既有转移的 Horn 规则建立结论，
+不构造所有分支组合的可达函数。没有来源的环不能自证。证明保留真实支持规则
+及完整前提的 owned implication；规则本身不是已取得的事实。
 层级位置索引将不同 sibling region 的内部获取合为共享出口范围；查询只进入
 与目标位置重合的 child，开放分支的激活仍保留在每个真实获取上。range 节点
-不成为新 gate，空 child 不提供完成事实。SCC 的可能来源上界仅用于查询剪枝，
-同一不可变上界在当前原始需求的查询中复用，不作为完成证据。
+不成为新 gate，空 child 不提供完成事实。有限规则也不把这些共享范围当作已经
+完成 child 内部义务的无条件摘要。
 
-每条合并前需求保留独立的 source/consumer binding，包含 CopyGroup 明确授权的
-共同 ready。删除一个合并通知前逐 binding、逐参数 case 检查；只为相同真实端点
+机制选择前，每条普通需求先拥有真实 source/consumer binding；CopyGroup 另保留
+明确授权的共同 ready 前缀。ownership 替代的跨轮次义务由原始 lifetime 覆盖，
+不为它们构造临时通知。selection 及 coverage 共同持有同一份原始 binding；
+合并和完成覆盖不替换该身份。接纳一个候选通知前逐 binding、逐参数 case 检查；只为相同真实端点
 共享查询，不能用代表 source 替代其他 writer，也不能合取互斥 writer 的激活条件
-制造空域。证明排除自身及此前已删除的协议，成功证明引用的实际支持协议保持
-保留。cell credit、消费、进展和资源许可随后在保留集合上建立。
+制造空域。候选图只提出真实支持前沿，查询排除自身及全部已覆盖候选。
+成功方案含有新支持时，再仅用已接纳动作尝试完整覆盖，避免 solver core 夹带
+额外候选。全部原始义务覆盖成立时，先接纳证书实际使用的全部协议，再发布覆盖；
+否则接纳原候选。已接纳协议不再参与覆盖选择，保留集合只增不减。
+静态 consumer 位置不代表循环代次间的动态 acquire 顺序；所有顺序仍由完整
+坐标、guard 和真实 capture/acquire 证明，不需要后续删边或支持固定集合。
+来源种子正向闭包与目标反向闭包之外的规则不参与该次证明；没有真实 seed
+的环不能建立完成事实。cell credit、消费、进展和资源许可随后在保留集合上建立。
+
+闭合私有轮次在已检查的同参与者、同读取队列及实际 stage/lexical 顺序下，一次
+选定最后 reader。退休直接消费原始 RAW binding：覆写许可放在真实 writer 前，
+返回许可放在最后 reader 后。共同 ready 可以晚于 writer，不能把覆写许可随之
+移到组末尾。全部 reader 和完整 effects 仍属于 lifetime；最后 reader 是同队列
+顺序已成立后的退休里程碑，不删除其他 reader。
 
 以上规则也适用于已经完整的跨核 quorum：每个 producer 的捕获都覆盖所需
 source，每个 receiver 的已有 acquire 都先于所需 consumer，才能复用。
@@ -257,7 +280,7 @@ queue/controller 传递。相同前沿通过共享位置范围索引和不可变
 环政策与规则能力分开：先用有限次数或 native 边界 handback 构造首选协议；
 该流自身无法在容量内构造时才直接用 queue-composition。已有合法首选环的
 额外缩环只作为受压时的有限资源选项。每个选项保留原语、动作位置和激活，
-冻结自己的 phase/handback；纯编号阶段先试首选，失败后再试它们，不能回调
+冻结自己的 phase/handback；纯编号阶段联合选择并优先首选协议，不能回调
 域分析。选择次序、工作上限及当前支持子集见[事件资源](event-resources.md)。
 
 每个 case 的 radix/window 单独保持。首末选取先检查非空，外层 reentry 连接真实
@@ -267,9 +290,13 @@ queue/controller 传递。相同前沿通过共享位置范围索引和不可变
 稳定 cell 本身不需要 dense ordinal。若 streaming 使用者额外需要某个 child
 handoff，其成员和 FIRST/LAST 边界才按需建立；已有普遍配对在域特化后保持。
 精确 projection 消去被选中的内部时钟，父层保留自由祖先的 membership，
-不从展开的 LAST 算式重新推导其已成立的范围。候选 handoff 只在旧 Wait 与
+不从展开的 LAST 算式重新推导其已成立的范围。端口只选择所需 FIRST 或 LAST，
+并直接携带这份 membership，不在所选坐标上重建一份随即被覆盖的原 activation。
+窗口 count 保留原表达式经参数代换后的结构，周期信息不会先被 quotient 展开丢失；
+数学查询另用分析视图，原式求值与配对准入保持。候选 handoff 只在旧 Wait 与
 下一 Set 的 physical-step 区间内，范围由有限 width 决定，不随 runtime 长度展开。
-已建立的边界 cases 随 `NotificationProgram.boundaries` 传给资源规划器，原式、
+已建立的边界 cases、位置、消费前沿和 region transfer 随 `NotificationProgram.handbacks`
+交给资源规划器继续使用；两阶段引用同一 retained program 的消费分析。原式、
 坐标和成员未变时直接消费。新共享关系所需的新增边界在资源规划阶段只建立一次，
 编号分配不查询域或 handback。
 
