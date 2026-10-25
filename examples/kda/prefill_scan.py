@@ -20,12 +20,14 @@ def scan_prefetch_vector(inputs, buffers):
 
 @N.inline
 def scan_prefetch_cube(K, CK, W32, a32_1, KG, kg1):
-    for part in N.unroll(K // CK):
-        N.copy(
-            W32[:, part * CK : (part + 1) * CK],
-            a32_1[part, :, :],
-        )
-    return N.copy(KG, kg1)
+    with N.CopyGroup(name="scan_operands"):
+        for part in N.unroll(K // CK):
+            N.copy(
+                W32[:, part * CK : (part + 1) * CK],
+                a32_1[part, :, :],
+            )
+        keys = N.copy(KG, kg1)
+    return keys
 
 
 @N.inline

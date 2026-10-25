@@ -68,6 +68,10 @@ def assert_owned(graph, proof, premises, excluded):
             assert current.condition == any_of(
                 *(negate(rule.predicate) for rule in deduction.rules), deduction.conclusion
             )
+        elif current.node.kind in {"capture", "acquire", "union"}:
+            # Elementary propagation retains ordinary activation predicates,
+            # with no temporary rule propositions or axioms to borrow.
+            assert IntegerQueryService({}).implies(current.condition, premises).proved
         pending.extend(current.inputs)
 
 
@@ -276,9 +280,10 @@ def test_required_cut_is_independent_of_disconnected_protocol_rules(unrelated):
     proof = derive(graph, point, ())
     assert proof is not None
     assert_owned(graph, proof, (), frozenset())
-    assert graph.work.completion_rule_instances == 3
-    assert graph.domains.arithmetic.queries.statistics.rule_encodings == 2
-    assert graph.domains.arithmetic.queries.statistics.rule_assertions == 3
+    assert graph.work.completion_forward_cuts == 1
+    assert graph.work.completion_rule_instances == 0
+    assert graph.domains.arithmetic.queries.statistics.rule_encodings == 0
+    assert graph.domains.arithmetic.queries.statistics.rule_assertions == 0
     # Removing the one actual publication still denies the target; unrelated
     # rule cycles cannot seed it or make this query's activation inconsistent.
     assert derive(graph, point, (), frozenset((nodes[1].notification,))) is None

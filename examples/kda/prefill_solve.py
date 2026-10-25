@@ -41,9 +41,10 @@ def read_inverse_blocks(inputs, raw, coordinates):
     Blocks, Off = inputs
     (lane,) = coordinates
     row = lane * 16
-    N.copy(Blocks[row : row + 16, :], raw[:16, :])
-    N.copy(Blocks[row + 32 : row + 48, 32:64], raw[16:32, 32:64])
-    N.copy(Off[row : row + 16, :], raw[16:32, :32])
+    with N.CopyGroup(name="inverse_blocks"):
+        N.copy(Blocks[row : row + 16, :], raw[:16, :])
+        N.copy(Blocks[row + 32 : row + 48, 32:64], raw[16:32, 32:64])
+        N.copy(Off[row : row + 16, :], raw[16:32, :32])
 
 
 @N.inline
@@ -61,6 +62,36 @@ def pack_inverse_blocks(inputs, buffers, coordinates):
     Blocks, Off, Inverse = inputs
     read_inverse_blocks((Blocks, Off), buffers[0], coordinates)
     publish_inverse_blocks(Inverse, buffers, coordinates)
+
+
+@N.inline
+def solve_chunk_inverse(Diagonal, Negative, Ai32, Merge16, Merge32, Off32, a1, b1, cube16, cube32):
+    a016, b016, c016 = cube16
+    a032, b032, c032 = cube32
+    # Rows 0:16 of b1 serve the two small merges. Rows 32:64 preserve
+    # the large negative block, acquired first to capture both AIV prefixes.
+    # All B loads use the same physical leading M=64, including this subview.
+    negative32 = N.copy(Negative[32:64, :32], b1[32:64, :32])
+    for pair in N.unroll(2):
+        left, right = pair * 32, pair * 32 + 16
+        diagonal16, negative16 = solve_import(
+            (Diagonal, Negative), (a1[:16, :16], b1[:16, :16]), (16,), (right, left)
+        )
+        merge_inverse_blocks(
+            (
+                Merge16,
+                Diagonal[left : left + 16, left : left + 16],
+                Ai32[right : right + 16, left : left + 16],
+            ),
+            (diagonal16, negative16),
+            (a016, a1[:16, :16], b016, b1[:16, :16], c016),
+        )
+    diagonal32 = N.copy(Ai32[32:64, 32:64], a1[:32, :32])
+    merge_inverse_blocks(
+        (Merge32, Ai32[:32, :32], Off32),
+        (diagonal32, negative32),
+        (a032, a1[:32, :32], b032, b1[:32, :32], c032),
+    )
 
 
 @N.prim_func(disjoint_external=True)

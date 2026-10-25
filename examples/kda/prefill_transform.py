@@ -8,62 +8,76 @@ from ascendflow import language as N
 
 
 @N.inline
-def transform_prefix(inputs, buffers):
-    Lengths, Bp, Gp = inputs
-    beta, gates, last, factor = buffers
-    valid = N.load_index(Lengths)
-    beta_value = N.copy(Bp, beta)
-    gate_values = N.copy(Gp, gates)
-    last_value = N.copy(Gp[valid - 1, :], last)
-    factors = N.exp(gate_values, out=factor)
-    return beta_value, gate_values, last_value, factors
+def form_transform_rows(inputs, outputs, buffers, geometry, lane):
+    """Reuse FP32 K and exp(G), preserving all BF16 rounding boundaries."""
+    Qp, Kp, Vp, Gp, Bp = inputs
+    Right, KG, QG = outputs
+    raw, packed, work, gates, factor, exponential, last, beta, rows = buffers
+    SCALE, ROWS = geometry
+    row = lane * ROWS
+    with N.CopyGroup(name="transform_inputs"):
+        N.copy(Gp[row : row + ROWS, :], gates)
+        N.copy(Bp[row : row + ROWS], beta[:ROWS])
+        N.copy(Kp[row : row + ROWS, :], raw)
+    N.exp(gates, out=exponential)
+    key_values = N.cast(raw, out=work)
+    # The FP32 key is now independent of raw. Prefetch V while computing
+    # the two key transforms; later do the same for Q after casting V.
+    N.copy(Vp[row : row + ROWS, :], raw)
+    N.mul(key_values, beta[:ROWS, None], out=factor, scratch=rows)
+    N.mul(factor, exponential, out=factor)
+    N.cast(factor, out=packed)
+    N.copy(packed, Right[0, row : row + ROWS, :])
+    N.mul(gates, -1.0, out=factor)
+    N.add(factor, last[None, :], out=factor)
+    N.exp(factor, out=factor)
+    N.mul(key_values, factor, out=factor)
+    N.cast(factor, out=packed)
+    N.copy(packed, KG[row : row + ROWS, :])
+    N.cast(raw, out=work)
+    N.copy(Qp[row : row + ROWS, :], raw)
+    N.mul(work, beta[:ROWS, None], out=work, scratch=rows)
+    N.cast(work, out=packed)
+    N.copy(packed, Right[1, row : row + ROWS, :])
+    N.cast(raw, out=work)
+    N.mul(work, SCALE, out=work)
+    N.cast(work, out=packed)
+    N.cast(packed, out=work)
+    N.mul(work, exponential, out=work)
+    N.cast(work, out=packed)
+    N.copy(packed, QG[row : row + ROWS, :])
 
 
 @N.inline
-def form_right_inputs(inputs, buffers):
-    Kp, Right, Vp = inputs
-    raw, work, beta, rows, factor, packed = buffers
-    loaded = N.copy(Kp, raw)
-    value = N.cast(loaded, out=work)
-    weighted = N.mul(value, beta[:, None], out=work, scratch=rows)
-    decayed = N.mul(weighted, factor, out=work)
-    rounded = N.cast(decayed, out=packed)
-    N.copy(rounded, Right[0, :, :])
-    loaded = N.copy(Vp, raw)
-    value = N.cast(loaded, out=work)
-    weighted = N.mul(value, beta[:, None], out=work, scratch=rows)
-    rounded = N.cast(weighted, out=packed)
-    N.copy(rounded, Right[1, :, :])
+def form_transform_inputs(inputs, outputs, buffers, geometry, coordinates):
+    Qp, Kp, Vp, Gp, Bp, tail_last, full_last = inputs
+    Right, KG, QG = outputs
+    last = buffers[6]
+    SCALE, task, tail_start = geometry
+    (lane,) = coordinates
+    if task < tail_start:
+        # Both AIVs read this row. The chunk output remains live while the
+        # next inputs may already overwrite each peer's LocalGp half.
+        N.copy(full_last, last)
+    else:
+        N.copy(tail_last, last)
+    form_transform_rows(
+        (Qp, Kp, Vp, Gp, Bp),
+        (Right, KG, QG),
+        buffers,
+        (SCALE, 32),
+        lane,
+    )
 
 
 @N.inline
-def form_decayed_keys(inputs, buffers):
-    Kp, KG = inputs
-    gates, factor, last, raw, work, packed = buffers
-    negative = N.mul(gates, -1.0, out=factor)
-    difference = N.add(negative, last[None, :], out=factor)
-    factors = N.exp(difference, out=factor)
-    loaded = N.copy(Kp, raw)
-    value = N.cast(loaded, out=work)
-    decayed = N.mul(value, factors, out=work)
-    rounded = N.cast(decayed, out=packed)
-    N.copy(rounded, KG)
-
-
-@N.inline
-def form_scaled_queries(inputs, buffers, geometry):
-    Qp, QG = inputs
-    raw, work, packed, gates, factor = buffers
-    (SCALE,) = geometry
-    loaded = N.copy(Qp, raw)
-    value = N.cast(loaded, out=work)
-    scaled = N.mul(value, SCALE, out=work)
-    rounded = N.cast(scaled, out=packed)
-    value = N.cast(rounded, out=work)
-    factors = N.exp(gates, out=factor)
-    decayed = N.mul(value, factors, out=work)
-    rounded = N.cast(decayed, out=packed)
-    N.copy(rounded, QG)
+def publish_attention(Aqk, A16, raw, packed, lane):
+    # Called after inverse acquisition, which carries both peers' Aqk writes.
+    # Both 16-row panels form one contiguous peer-owned 32-row plane.
+    row = lane * 32
+    N.copy(Aqk[row : row + 32, :], raw)
+    N.cast(raw, out=packed)
+    N.copy(packed, A16[row : row + 32, :])
 
 
 @N.prim_func(disjoint_external=True)
@@ -93,6 +107,9 @@ def prefill_transform(
         work = N.alloc_ub((BT, K), N.f32)
         gates = N.alloc_ub((BT, K), N.f32)
         factor = N.alloc_ub((BT, K), N.f32)
+        # Keep exp(G) and the FP32 K while forming both key transforms.
+        # The temporary is reused for RHS weighting and last-G decay.
+        transformed = N.alloc_ub((BT, K), N.f32)
         last = N.alloc_ub((K,), N.f32)
         beta = N.alloc_ub((BT,), N.f32)
         rows = N.alloc_ub((BT, 8), N.f32)
@@ -101,22 +118,20 @@ def prefill_transform(
         for task in N.serial(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
-            beta_value, gate_values, last_value, factors = transform_prefix(
-                (Lengths[chunk : chunk + 1], Bp[chunk, head, :], Gp[chunk, head, :, :]),
-                (beta, gates, last, factor),
-            )
-            form_right_inputs(
-                (Kp[chunk, head, :, :], Right[chunk, head, :, :, :], Vp[chunk, head, :, :]),
-                (raw, work, beta_value, rows, factors, packed),
-            )
-            form_decayed_keys(
-                (Kp[chunk, head, :, :], KG[chunk, head, :, :]),
-                (gate_values, factor, last_value, raw, work, packed),
-            )
-            form_scaled_queries(
-                (Qp[chunk, head, :, :], QG[chunk, head, :, :]),
-                (raw, work, packed, gate_values, factor),
-                (SCALE,),
+            valid = N.load_index(Lengths[chunk : chunk + 1], minimum=1, maximum=BT)
+            N.copy(Gp[chunk, head, valid - 1, :], last)
+            form_transform_rows(
+                (
+                    Qp[chunk, head, :, :],
+                    Kp[chunk, head, :, :],
+                    Vp[chunk, head, :, :],
+                    Gp[chunk, head, :, :],
+                    Bp[chunk, head, :],
+                ),
+                (Right[chunk, head, :, :, :], KG[chunk, head, :, :], QG[chunk, head, :, :]),
+                (raw, packed, work, gates, transformed, factor, last, beta, rows),
+                (SCALE, BT),
+                0,
             )
             attention = N.copy(Aqk[chunk, head, :, :], af32)
             rounded = N.cast(attention, out=af16)

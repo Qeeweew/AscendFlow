@@ -138,3 +138,48 @@ def shared_l0c_qk_pv(
                     b = N.copy(x, pv_b[j % 2, :, :], transpose=True)
                     N.matmul(a, b, accum=c[0, :, :], initialize=(j == 0))
                 N.copy(c[0, :, :], Y[group, t, :, :])
+
+
+@N.prim_func(disjoint_external=True)
+def metadata_panels(
+    X: N.Tensor((n, 32, 64), N.f32),
+    Meta: N.Tensor((n,), N.i64),
+    Y: N.Tensor((n, 32, 64), N.f32, access="write"),
+    n: N.i64,
+):
+    with N.Kernel():
+        x = N.alloc_ub((16, 64), N.f32)
+        for t in N.Pipelined(n):
+            valid = N.load_index(Meta[t : t + 1], minimum=0, maximum=32)
+            for panel in N.serial(2):
+                if panel * 16 + 16 <= valid:
+                    N.copy(X[t, panel * 16 : panel * 16 + 16, :], x)
+                else:
+                    N.fill(x, 0.0)
+                    for token in N.serial(16):
+                        if panel * 16 + token < valid:
+                            N.copy(X[t, panel * 16 + token, :], x[token, :])
+                N.copy(x, Y[t, panel * 16 : panel * 16 + 16, :])
+
+
+@N.prim_func(disjoint_external=True)
+def metadata_mixed_panels(
+    X: N.Tensor((n, 2, 32, 64), N.f32),
+    Meta: N.Tensor((n, 2), N.i64),
+    Y: N.Tensor((n, 2, 32, 64), N.f32, access="write"),
+    n: N.i64,
+):
+    with N.Kernel(kind="mixed"):
+        x = N.alloc_ub((16, 64), N.f32)
+        with N.Vector() as lane:
+            for t in N.Pipelined(n):
+                valid = N.load_index(Meta[t, lane : lane + 1], minimum=0, maximum=32)
+                for panel in N.serial(2):
+                    if panel * 16 + 16 <= valid:
+                        N.copy(X[t, lane, panel * 16 : panel * 16 + 16, :], x)
+                    else:
+                        N.fill(x, 0.0)
+                        for token in N.serial(16):
+                            if panel * 16 + token < valid:
+                                N.copy(X[t, lane, panel * 16 + token, :], x[token, :])
+                    N.copy(x, Y[t, lane, panel * 16 : panel * 16 + 16, :])

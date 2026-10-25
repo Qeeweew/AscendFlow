@@ -149,6 +149,65 @@ def peers(Flags:N.Tensor((2,),N.i32),
         admit(source)
 
 
+def _sid_contributions(body):
+    return f"""
+def roles(Scratch:N.Tensor((64,16),N.f32,access="write"), flag:N.i64(minimum=0)):
+    with N.Kernel(1,kind="mixed"):
+        x=N.alloc_ub((48,16),N.f32)
+        matrix=N.alloc_l1((64,16),N.f32)
+        with N.Vector() as sid:
+            N.fill(x,1.0)
+{body}
+        with N.Cube():
+            N.copy(Scratch,matrix)
+"""
+
+
+def test_sid_roles_contribute_their_actual_distinct_gm_regions():
+    from ascendflow.passes.structured_sync import synchronize_structure
+    from tests.models.structured_events import check_compiled_events
+
+    source = _sid_contributions(
+        "            if sid==0:\n"
+        "                N.copy(x[:16,:],Scratch[:16,:])\n"
+        "            else:\n"
+        "                N.copy(x,Scratch[16:64,:])"
+    )
+    admit(source)
+    plan = synchronize_structure(N.from_source(source, disjoint_external=True))
+    execution = check_compiled_events(plan, {"flag": 0})
+    assert execution.bytes_read and execution.bytes_written
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The inactive AIV1 copy would fill the missing half if its guard
+        # were dropped instead of evaluated for its actual participant.
+        "            if sid==0:\n                N.copy(x[:32,:],Scratch[sid*32:sid*32+32,:])",
+        # Binding SID cannot turn an unknown uniform condition into true.
+        "            if flag>0:\n                N.copy(x[:32,:],Scratch[sid*32:sid*32+32,:])",
+    ],
+)
+def test_bound_sid_does_not_invent_inactive_or_conditional_contributions(body):
+    with pytest.raises(CompileError, match="initialized writer coverage"):
+        admit(_sid_contributions(body))
+
+
+def test_bound_sid_does_not_share_aiv_private_ub_initialization():
+    source = """
+def private(Y:N.Tensor((2,16,16),N.f32,access="write")):
+    with N.Kernel(1,kind="mixed"):
+        x=N.alloc_ub((16,16),N.f32)
+        with N.Vector() as sid:
+            if sid==0:
+                N.fill(x,1.0)
+            N.copy(x,Y[sid,:,:])
+"""
+    with pytest.raises(CompileError, match="initialized writer coverage"):
+        admit(source)
+
+
 def test_actual_nested_pipeline_keeps_all_conditional_writer_completions(monkeypatch):
     from tests.models.structured_events import _Interpret
 

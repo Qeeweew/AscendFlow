@@ -55,7 +55,7 @@ def parameter_domain(base, period):
         coverage=(),
         bindings=(),
     )
-    return EventDomains(selection, ResourceWork()), notification
+    return EventDomains(selection, ResourceWork()).for_lifetimes(), notification
 
 
 @pytest.mark.parametrize("period", (2, 5))

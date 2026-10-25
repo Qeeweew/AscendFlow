@@ -11,17 +11,19 @@ have distinct origins and queries.
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from collections import deque
 from dataclasses import dataclass, field
 
 from ..budget import poll
+from ..diagnostics import require
 from ..memo import memoized_method
-from ..scalar import Expr, literal
+from ..scalar import expression, literal, substitute
 from ..symbols import Symbol, SymbolKind
 from .event_domains import EventCase
 from .position_words import PositionWord, position_word
-from .smt import all_of, any_of, negate
+from .smt import Boolean, all_of, any_of, conjuncts, negate
 from .structured_protocols import NotificationKind
-from .structured_schedule import ActionGuard, Comparison
+from .structured_schedule import ActionGuard
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +92,10 @@ class ConsumptionOrigin:
 
     point: object
     notification: object
+
+
+def _forwarding(node):
+    return node.kind == "union" and len(node.inputs) <= 1
 
 
 class ProtocolPositions:
@@ -343,11 +349,12 @@ class ProtocolTransfers:
     def _episodes(self):
         domains = self.domains
         fence = EventCase(ActionGuard(), (), (), ())
+        original, captures = [], {}
         for notification in domains.notifications:
             for case in domains.cases.get(notification, (fence,)):
                 if case.empty or not domains.active.get((notification, case), True):
                     continue
-                yield (
+                episode = (
                     notification,
                     case,
                     tuple(
@@ -357,6 +364,70 @@ class ProtocolTransfers:
                         domains._instance(point, {}, case=case) for point in notification.consumers
                     ),
                 )
+                original.append(episode)
+                points = (
+                    episode[3]
+                    if notification.mechanism is NotificationKind.PIPE_FENCE
+                    else episode[2]
+                )
+                for point in points:
+                    key = (
+                        point.actor,
+                        notification.source_engine,
+                        point.operation,
+                        point.placement,
+                        tuple(loop for loop, _ in point.coordinates),
+                    )
+                    captures.setdefault(key, []).append(point)
+                yield episode
+        # A memory edge's canonical generation need not be the publisher's
+        # generation. Reuse actual capture coordinates already present in
+        # this graph to instantiate the same paired protocol at that epoch.
+        # These are real actions of the retained stream, never extra output.
+        seen = set(original)
+        for notification, case, sources, consumers in original:
+            points = consumers if notification.mechanism is NotificationKind.PIPE_FENCE else sources
+            for point in points:
+                key = (
+                    point.actor,
+                    notification.source_engine,
+                    point.operation,
+                    point.placement,
+                    tuple(loop for loop, _ in point.coordinates),
+                )
+                for other in captures[key]:
+                    bindings = {}
+                    for (loop, value), (_, target) in zip(
+                        point.coordinates, other.coordinates, strict=True
+                    ):
+                        current = substitute(value, bindings)
+                        delta = domains.arithmetic.exact_constant(
+                            expression("sub", target, current)
+                        )
+                        if delta == 0:
+                            continue
+                        ordinal = domains.control.loops[loop].ordinal
+                        if (
+                            delta is None
+                            or domains.arithmetic.exact_constant(
+                                expression("sub", current, ordinal)
+                            )
+                            is None
+                        ):
+                            break
+                        bindings[ordinal] = expression("add", ordinal, literal(delta))
+                    else:
+                        if not bindings:
+                            continue
+                        episode = (
+                            notification,
+                            case,
+                            tuple(domains._shift_instance(p, bindings) for p in sources),
+                            tuple(domains._shift_instance(p, bindings) for p in consumers),
+                        )
+                        if episode not in seen:
+                            seen.add(episode)
+                            yield episode
 
     def reserve(self):
         self.nodes.append(None)
@@ -378,14 +449,35 @@ class ProtocolTransfers:
         return self._unions[key]
 
     def _proposition(self, number):
-        if number not in self.propositions:
-            symbol = Symbol(f"reached_{number}", SymbolKind.SSA, object())
-            self.propositions[number] = Comparison(Expr("argument", (symbol,)), "==", literal(0))
+        # A guarded forwarding range is an edge, not an independent causal
+        # state. Keep join states shared: substituting their entire Boolean
+        # closure into every caller destroys useful solver factoring.
+        pending = [(number, False)]
+        while pending:
+            current, done = pending.pop()
+            if current in self.propositions:
+                continue
+            node = self.nodes[current]
+            if not _forwarding(node):
+                symbol = Symbol(f"reached_{current}", SymbolKind.SSA, object())
+                self.propositions[current] = Boolean("atom", (symbol, True))
+            elif done:
+                self.propositions[current] = all_of(
+                    node.condition, any_of(*(self.propositions[i] for i in node.inputs))
+                )
+            else:
+                require(
+                    all(self.nodes[i].kind != "union" or i < current for i in node.inputs),
+                    "a queue-prefix union must refer to established ranges or real actions",
+                )
+                pending.append((current, True))
+                pending.extend((i, False) for i in reversed(node.inputs))
         return self.propositions[number]
 
     def _rule(self, number):
         if number not in self.rules:
             node = self.nodes[number]
+            require(not _forwarding(node), "a forwarding expression needs no transfer rule")
             premise = all_of(node.condition, any_of(*(self._proposition(i) for i in node.inputs)))
             self.rules[number] = TransferRule(node, premise, self._proposition(number))
             self.work.transfer_rules += 1
@@ -469,6 +561,33 @@ class ProtocolTransfers:
             strict_target=True,
         )
 
+    def _forward(self, captures, successors, root, assumptions):
+        """Propagate already enabled edges, keeping the actual capture path.
+
+        Every reached node has a finite path from a real seed, and every
+        guard on that path is an explicit conjunct of the caller's premises.
+        Induction over that path establishes the same transfer relation as
+        the rule system, including through seeded cycles. No unseeded cycle
+        or merely possible edge can enter this closure.
+        """
+        known, paths = conjuncts(assumptions), {}
+        pending = deque((number, None, premise) for number, premise in captures)
+        while pending:
+            number, previous, condition = pending.popleft()
+            if number in paths or not conjuncts((condition,)) <= known:
+                continue
+            node = self.nodes[number]
+            proof = CausalProof(
+                node,
+                () if previous is None else (previous,),
+                condition if previous is None else all_of(previous.condition, condition),
+            )
+            paths[number] = proof
+            if number == root:
+                return proof
+            pending.extend((i, proof, self.nodes[i].condition) for i in successors[number])
+        return None
+
     @memoized_method
     def _derive(
         self,
@@ -533,6 +652,17 @@ class ProtocolTransfers:
                 pending.extend(successors[number])
         if root not in grounded:
             return None
+        proof = self._forward(captures, successors, root, assumptions)
+        if proof is not None:
+            # The mathematical service owns this implication too. Here its
+            # explicit-conjunct rule suffices; there are no temporary axioms.
+            answer = self.domains.arithmetic.queries.implies(proof.condition, assumptions)
+            require(answer.proved, "forward transfer lost its explicit activation premises")
+            name = kind + "_forward_cuts"
+            setattr(self.work, name, getattr(self.work, name) + 1)
+            name = kind + "_conclusions"
+            setattr(self.work, name, getattr(self.work, name) + 1)
+            return proof
         # Reuse an actual input model, never sampled parameters. Keeping every
         # guard with an unknown interpretation gives an upper reachability
         # bound. If even that bound misses the target, this model already
@@ -551,7 +681,9 @@ class ProtocolTransfers:
                 name = kind + "_countermodels"
                 setattr(self.work, name, getattr(self.work, name) + 1)
                 return None
-        enabled = tuple(sorted(grounded))
+        enabled = tuple(
+            number for number in sorted(grounded) if not _forwarding(self.nodes[number])
+        )
         seeds = tuple(
             TransferRule(self.nodes[number], premise, self._proposition(number), True)
             for number, premise in captures

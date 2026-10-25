@@ -58,6 +58,36 @@ def test_composed_prefix_covers_direct_bf16_load_to_store(runtime):
         check_compiled_events(plan, {"n": count}, invocations=2)
 
 
+def test_actual_capture_epoch_covers_next_stage_overwrite_of_an_unread_half():
+    source = N.from_source(
+        """
+def epochs(X:N.Tensor((n,128),N.f32),Y:N.Tensor((n,64),N.f32,access="write"),
+           O:N.Tensor((n,64),N.f32,access="write"),n:N.i64):
+    with N.Kernel():
+        x=N.alloc_ub((128,))
+        y=N.alloc_ub((64,))
+        for t in N.Pipelined(n,issue_order=("finish","start")):
+            with N.Stage(0,name="start"):
+                N.fill(x[:64],1.0)
+                N.copy(x[:64],Y[t,:])
+            with N.Stage(1,name="finish"):
+                N.copy(X[t,:],x)
+                value=N.mul(x[64:],2.0,out=y)
+                N.copy(value,O[t,:])
+""",
+        disjoint_external=True,
+    )
+    plan = synchronize_structure(source)
+    ready = [
+        n
+        for n in plan.selection.notifications
+        if (n.source_engine, n.destination_engine) == (Engine.MTE2, Engine.V)
+    ]
+    assert len(ready) == 1
+    for count in (0, 1, 2, 5):
+        check_compiled_events(plan, {"n": count}, invocations=2)
+
+
 def test_acquire_after_the_needed_capture_cannot_backdate_a_prefix():
     plan = synchronize_structure(chain(late_capture=True, runtime=True))
     assert direct_load_to_store(plan)

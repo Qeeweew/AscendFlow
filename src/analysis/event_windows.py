@@ -662,10 +662,39 @@ class _Builder:
         if self.residue_test(test):
             return
         part = self.linear(expression("sub", test.lhs, test.rhs))
-        if part is None or part[0] not in {-1, 0, 1}:
+        if part is None:
             self.pending.append(test)
             return
         coefficient, offset = part
+        if abs(coefficient) > 1:
+            predicate = test.predicate
+            if predicate == "!=":
+                # A missing interior point is not an interval.
+                self.pending.append(test)
+                return
+            if coefficient < 0:
+                offset = expression("mul", literal(-1), offset)
+                predicate = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "=="}[predicate]
+
+            def cut(inclusive):
+                # For g>=0 and a>0, a*g+b < s iff
+                # g < ceil(max(0,s-b)/a). Clipping at zero avoids
+                # unsigned division of a negative mathematical boundary.
+                numerator = expression("sub", literal(int(inclusive)), offset)
+                return expression(
+                    "ceildiv",
+                    expression("max", literal(0), numerator),
+                    literal(abs(coefficient)),
+                )
+
+            if predicate in {">", ">=", "=="}:
+                self.lower = expression("max", self.lower, cut(predicate == ">"))
+            if predicate in {"<", "<=", "=="}:
+                self.count = expression("min", self.count, cut(predicate != "<"))
+            if predicate == "==":
+                self.single = True
+            self.lower = expression("min", self.lower, self.count)
+            return
         if coefficient == 0:
             self.add_invariant(Comparison(offset, test.predicate, literal(0)))
             return

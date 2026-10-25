@@ -441,6 +441,17 @@ def _counter_constraints(problem, group, lanes, prefix, add):
         for n in frozenset().union(*groups).intersection(group):
             owners[n].append(number)
     conflicts = tuple(problem.counter_reuses.conflicts(group))
+    if not certificates:
+        # With time separation alone, every conflicting pair must use distinct
+        # numbers. Pool membership is already asserted by the caller, so these
+        # lane inequalities are exactly the per-ID exclusions below, without
+        # repeating the same graph for every hardware counter.
+        for a, b in conflicts:
+            add(
+                f"counter.time.{a}.{b}",
+                And(*(left != right for left in lanes[a] for right in lanes[b])),
+            )
+        return 0
     flags = problem.id_pools.cross
     for flag in flags:
         poll("counter certificate constraints", members=len(group), event=flag)
@@ -502,11 +513,27 @@ def _constraints(prepared, option, selected, constraints, objectives):
         if problem.demands[group[0]].backlog is not None:
             variables += _counter_constraints(problem, group, current, f"{prefix}_{component}", add)
         else:
-            for a, b in _local_conflicts(problem, group):
+            conflicts = set(_local_conflicts(problem, group))
+            for a, b in sorted(conflicts):
                 add(
                     f"separation.{a}.{b}",
                     And(*(left != right for left in current[a] for right in current[b])),
                 )
+            palette = choices[group[0]]
+            if all(choices[n] == palette for n in group):
+                # All numbers in this component have identical permissions.
+                # Fix one actual conflict clique by a palette permutation;
+                # every legal mapping has such an equivalent representative.
+                # This removes color-name symmetry, without finding a coloring
+                # or changing any frozen lifetime/phase constraint.
+                clique = []
+                for n in group:
+                    if all((min(n, m), max(n, m)) in conflicts for m in clique):
+                        clique.append(n)
+                anchor = tuple(value for n in clique for value in current[n])
+                if len(anchor) <= len(palette):
+                    for lane, (value, flag) in enumerate(zip(anchor, palette)):
+                        add(f"palette.{component}.{lane}", value == flag)
     return lanes, variables
 
 

@@ -9,9 +9,10 @@ one ID per use. Numbering consumes these established facts without new queries.
 from dataclasses import dataclass
 from functools import cached_property
 
-from ..diagnostics import CompileError, ErrorKind
+from ..diagnostics import CompileError, ErrorKind, require
 from ..memo import memoized_method
-from ..scalar import expression, literal
+from ..scalar import Expr, expression, literal
+from ..symbols import Symbol, SymbolKind
 from .consumption_frontiers import AcquiredConsumption, ConsumptionFrontiers
 from .event_contracts import CROSS_BACKLOG, LOCAL_CAPACITY, CaseLease, StructuredEventLease
 from .protocol_transfers import (
@@ -22,7 +23,7 @@ from .protocol_transfers import (
     TransferNode,
 )
 from .structured_protocols import NotificationKind
-from .structured_schedule import ActionGuard
+from .structured_schedule import ActionGuard, Comparison
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +45,8 @@ class ConsumptionDerivation:
 @dataclass(frozen=True, slots=True)
 class Reuse:
     loop: object | None
-    delta: int
+    # None denotes every positive gap, with independent later coordinates.
+    delta: int | None
     upper_uses: int | None
     condition: ActionGuard
     handbacks: tuple[Handback, ...] = ()
@@ -86,7 +88,7 @@ class HandbackRule:
         return case
 
     @memoized_method
-    def ordered_stream(self, notification, case):
+    def _translated_stream(self, notification, *, consumer_families=False):
         """Canonical clocks advance the real sites by unit translations.
 
         Selected child FIRST/LAST coordinates are allowed only when independent
@@ -94,10 +96,10 @@ class HandbackRule:
         """
         domains = self.domains
         clocks = domains.clocks[notification]
-        if not clocks or tuple(w.loop for w in case.windows) != clocks:
+        if not clocks:
             return False
         for point in notification.sources + notification.consumers:
-            if point.families:
+            if point.families and (not consumer_families or point in notification.sources):
                 return False
             actual = dict(point.coordinates)
             for loop in clocks:
@@ -116,6 +118,11 @@ class HandbackRule:
                 return False
         return True
 
+    def ordered_stream(self, notification, case):
+        return tuple(w.loop for w in case.windows) == self.domains.clocks[
+            notification
+        ] and self._translated_stream(notification)
+
     def _cases(self, peer):
         cases = self.domains.cases[peer]
         if self.domains.clocks[peer] and not any(c.windows for c in cases):
@@ -126,6 +133,8 @@ class HandbackRule:
                 # additionally require exact invocation boundary membership.
                 # Universal pairing survives this domain specialization.
                 try:
+                    if peer in self.domains._window_errors:
+                        raise self.domains._window_errors[peer]
                     cases = build_event_family(self.domains, peer)
                 except CompileError as error:
                     if error.kind is not ErrorKind.UNSUPPORTED or error.phase not in {
@@ -475,9 +484,113 @@ class HandbackRule:
         return StructuredEventLease(channel, max((c.width for c in cases), default=0), tuple(cases))
 
     def lease(self, notification):
+        if any(
+            not c.empty and not c.windows and self.domains.clocks[notification]
+            for c in self.domains.cases[notification]
+        ):
+            result = self._sparse_local_lease(notification)
+            if result is not None:
+                return result
+            if notification in self.domains._window_errors:
+                raise self.domains._window_errors[notification]
+        require(
+            all(
+                tuple(window.loop for window in c.windows) == self.domains.clocks[notification]
+                for c in self.domains.cases[notification]
+                if self.domains.active[notification, c]
+            ),
+            "queue handback needs exact membership for every common clock",
+            kind=ErrorKind.UNSUPPORTED,
+            phase="notification-generation-lifetime",
+        )
         cases = tuple(
             self.case(notification, c)
             for c in self.domains.cases[notification]
             if self.domains.active[notification, c]
         )
         return StructuredEventLease(notification, max((c.width for c in cases), default=0), cases)
+
+    def _sparse_local_lease(self, channel):
+        """One binary flag when every later publication follows consumption.
+
+        Partition two arbitrary uses by their first differing common clock.
+        That clock advances by 1+gap, gap>=0; descendant coordinates are fresh.
+        Earlier coordinates remain equal. This covers all strictly ordered
+        uses, including empty gaps and nested reentry, without dense ranks.
+        The channel is excluded from each retained-action consumption proof.
+        """
+        d = self.domains
+        cases = d.cases[channel]
+        if (
+            channel.mechanism is not NotificationKind.LOCAL_EVENT
+            or len(channel.sources) != 1
+            or len(channel.consumers) != 1
+            or channel.sources[0].actor is not channel.consumers[0].actor
+            or len(cases) != 1
+            or cases[0].windows
+            or not self._translated_stream(channel, consumer_families=True)
+        ):
+            return None
+        case = cases[0]
+        if not d.active[channel, case]:
+            return StructuredEventLease(channel, 0, ())
+        source, wait = (
+            d._instance(p, {}, case=case) for p in (channel.sources[0], channel.consumers[0])
+        )
+        clocks, uses = d.clocks[channel], []
+        for index, loop in enumerate(clocks):
+            ordinal = d.control.loops[loop].ordinal
+            gap = Expr("argument", (Symbol("$reuse_gap", SymbolKind.ORDINAL, object()),))
+            shifted = {ordinal: expression("add", expression("add", ordinal, literal(1)), gap)}
+            for child in clocks[index + 1 :]:
+                coordinate = d.control.loops[child].ordinal
+                shifted[coordinate] = Expr(
+                    "argument", (Symbol("$reuse_next", SymbolKind.ORDINAL, object()),)
+                )
+            next_source, next_wait = (
+                d._instance(p, shifted, case=case)
+                for p in (channel.sources[0], channel.consumers[0])
+            )
+            condition = ActionGuard((Comparison(gap, ">=", literal(0)),))
+            assumptions = tuple(
+                dict.fromkeys(
+                    condition.comparisons
+                    + tuple(
+                        test
+                        for p in (source, wait, next_source, next_wait)
+                        for test in (*p.guard.comparisons, *d._input_ranges(p))
+                    )
+                )
+            )
+            if d.arithmetic.queries.satisfies(assumptions).impossible:
+                uses.append(Reuse(loop, None, 1, condition))
+                continue
+            begin, end = self._step(wait, loop), self._step(source, loop)
+            if begin is None or end is None:
+                return None
+            # Search only the actual old invocation and its adjacent return
+            # horizon. The later target may be arbitrarily far away; exact
+            # queue order must bridge that gap. Failure gives no permission.
+            graph = self._region_transfer(loop, begin, end + 1, True)
+            proof = graph.consumption(
+                channel, wait, next_source, channel.source_engine, assumptions=assumptions
+            )
+            if proof is None:
+                return None
+            answer = d.arithmetic.queries.implies(proof.condition, assumptions)
+            if not answer.proved:
+                return None
+            handbacks = self._handback(
+                ConsumptionOrigin(wait, channel), next_source, proof, answer, assumptions
+            )
+            uses.append(Reuse(loop, None, None, condition, handbacks))
+        lease = CaseLease(
+            case,
+            1,
+            literal(0),
+            (),
+            tuple(uses[-1:]),
+            tuple(uses[:-1]),
+            policy="ordered-local-handback",
+        )
+        return StructuredEventLease(channel, 1, (lease,))

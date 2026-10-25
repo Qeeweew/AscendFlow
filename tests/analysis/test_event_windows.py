@@ -114,6 +114,24 @@ def test_runtime_true_count_empty_short_and_nonzero_first(control):
         check_exact_membership(contract, {"n": count, "m": 0}, count)
 
 
+@pytest.mark.parametrize("coefficient", [-16, -3, 2, 16])
+@pytest.mark.parametrize("predicate", ["<", "<=", ">", ">=", "=="])
+@pytest.mark.parametrize("bias", [-17, 0, 17])
+def test_scaled_affine_guards_have_exact_integer_boundaries(control, coefficient, predicate, bias):
+    logical = next(iter(control.loops.values()))
+    parameter = next(name for name in control.environment.facts if str(name) == "m")
+    offset = expression("add", Expr("argument", (parameter,)), literal(bias))
+    test = Comparison(
+        expression("add", expression("mul", literal(coefficient), logical.ordinal), offset),
+        predicate,
+        literal(0),
+    )
+    contract = window(control, logical, (test,))
+    for count in (0, 1, 2, 7, 19):
+        for parameter in (0, 1, 2, 15, 16, 17, 32):
+            check_exact_membership(contract, {"n": count, "m": parameter}, count)
+
+
 def test_clamped_owner_count_keeps_empty_and_nonempty_invocations():
     source = N.from_source("""
     def owners(n:N.i64(minimum=8, multiple_of=8)):

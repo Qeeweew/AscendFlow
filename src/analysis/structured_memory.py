@@ -57,10 +57,7 @@ class MemoryTemplate:
     spec: native.NativeSpec
     accesses: tuple[MemoryAccess, ...]
     scalar_source: TaskOp | None
-
-    @property
-    def participants(self):
-        return self.frame.participants
+    participants: tuple[Actor, ...]
 
 
 @dataclass(frozen=True)
@@ -380,7 +377,22 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 phase="structured-memory",
                 location=str(operation.location),
             )
-        templates.append(MemoryTemplate(operation, frame, spec, accesses, scalar_source))
+        # Validate the native contract above even for an inactive SID role.
+        # Only accesses actually executed by a participant enter dependency
+        # and initialization analysis; unknown conditions remain conditional.
+        participants = tuple(
+            actor
+            for actor in frame.participants
+            if not any(
+                test.lhs.constant is not None
+                and test.rhs.constant is not None
+                and not test.evaluate({})
+                for test in control.participant_comparisons(frame.predicates(), actor)
+            )
+        )
+        templates.append(
+            MemoryTemplate(operation, frame, spec, accesses, scalar_source, participants)
+        )
     by_operation = {template.operation: template for template in templates}
     groups, grouped = [], set()
     for operation in control.frames:

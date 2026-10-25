@@ -22,7 +22,9 @@ from tests.models.structured_events import check_compiled_events
 def plan(request):
     # The large case must need temporal reuse after certified FIFO words have
     # been packed. A legal subset makes that need explicit as policy changes.
-    pools = EventIdPools(cross=tuple(range(5 if request.param == 17 else 16)))
+    # Capture-epoch completion coverage reduces the unshared plan to four
+    # counters. Three keeps this a real temporal-reuse test.
+    pools = EventIdPools(cross=tuple(range(3 if request.param == 17 else 16)))
     return request.param, synchronize_structure(
         counter_epochs.specialize(PHASES=request.param), id_pools=pools
     )
@@ -34,7 +36,7 @@ def test_complete_epochs_keep_empty_calls_reentry_and_two_vector_receivers(plan)
         assert not program.resources.counter_reuse_groups
         assert program.resources.work.counter_time_pairs == 0
     else:
-        assert program.resources.counter_reuse_groups
+        assert bool(program.resources.counter_reuse_groups), "pressure must require temporal reuse"
         assert any(isinstance(w, CounterReuseGroup) for w in program.resources.sharing)
     for group in program.resources.counter_reuse_groups:
         assert 0 <= group.event < 16

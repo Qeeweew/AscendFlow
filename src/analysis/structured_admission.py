@@ -207,20 +207,20 @@ def _guards(frame, environment):
     for scope in frame.ancestors():
         if scope.branch is None:
             continue
-        if len(scope.comparisons) != 1:
-            result.append((scope.operation.cond, scope.branch))
-            continue
-        (test,) = scope.comparisons
-        predicate = test.predicate
-        if scope.branch:
-            predicate = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}[
-                predicate
-            ]
+        # Definition coverage joins the two regions of the *same* branch.
+        # Retain its original condition on both sides, independently of the
+        # arithmetic conjunction exported for an individual selected path.
+        compare = scope.operation.cond.owner
+        if isinstance(compare, arith.CmpiOp) and compare.predicate.value.data < 6:
+            left, right = (environment.expression(value) for value in compare.operands)
+            predicate = compare.predicate.value.data
+        else:
+            left, right, predicate = environment.expression(scope.operation.cond), literal(0), 1
         result.append(
             (
-                test.lhs,
-                test.rhs,
-                ("==", "!=", "<", "<=", ">", ">=").index(predicate),
+                left,
+                right,
+                predicate,
                 scope.branch,
             )
         )
@@ -247,6 +247,19 @@ def _same_guard(left, right, facts):
             and equivalent(b, c, facts)
         )
     )
+
+
+def _bound_guard(guard, bindings, facts):
+    """Evaluate only a condition fixed by the actual writer coordinates."""
+    if len(guard) != 4:
+        return None
+    left, right, predicate, branch = guard
+    a = exact_constant(substitute(left, bindings), facts)
+    b = exact_constant(substitute(right, bindings), facts)
+    if a is None or b is None:
+        return None
+    selected = (a == b, a != b, a < b, a <= b, a > b, a >= b)[predicate]
+    return not selected if branch else selected
 
 
 def _nonempty_count(loop, facts, bindings):
@@ -324,6 +337,16 @@ def _writer_coordinates(
             continue
         if any(_same_guard(guard, other, facts) for other in reader_guards):
             continue
+        # SID is private to each actual participant. A true source guard
+        # contributes this writer's bytes; a false one contributes none.
+        # Matching inactive source/reader paths above remain vacuous. This
+        # does not combine branch contributions from different actors or
+        # provide ready, ownership, or reader-retirement facts.
+        active = _bound_guard(guard, bindings, facts)
+        if active is True:
+            continue
+        if active is False:
+            return None
         first = None
         if len(guard) == 4:
             left, right, predicate, branch = guard

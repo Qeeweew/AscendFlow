@@ -94,6 +94,12 @@ footprint，再沿可证明非空的 writer loop 汇总。对 child loop 不变�
 body 内的范围排除零次路径。不同 AIV 的独立条件、不同 metadata 定义、
 缺少的叶分支、错位或不完整写入不能拼接成完整定义。
 
+SID 分支按实际 participant 代入。原生内存事实仍检查完整指令合同，再排除
+在该 participant 上能证明恒假的访问；其他条件保留原 SSA 与 activation。
+共享 GM 可以联合不同 AIV 实际无条件写入的不同区域，不能镜像未执行的 peer
+写入来填满缺口，也不能将未知 metadata 条件当真。私有 UB 的定义不跨 AIV
+共享。该投影只建立执行归属，不提供 ready、最后 reader 退休或 quorum。
+
 这里建立的是数值初始化，不是异步 ready、精确 ownership KILL 或事件消费。
 真实 writer 若覆盖整个逻辑 allocation，其内任意合法动态读取已具备数值定义，
 不再证明该读取的动态包含关系。完整覆盖不包含 allocation 尾部的对齐 padding；

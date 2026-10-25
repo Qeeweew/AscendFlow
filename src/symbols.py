@@ -21,6 +21,8 @@ class SymbolKind(str, Enum):
     METADATA = "metadata"
     CARRY = "carry"
     SSA = "ssa"
+    PREDICATE = "predicate"
+    SELECTION = "selection"
 
 
 def _binding_order(origin):

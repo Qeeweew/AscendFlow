@@ -69,7 +69,7 @@ from ..dialects.structured import (
     ReadyGroupOp,
 )
 from ..dialects.types import TaskType, TileType, ref_type
-from ..indexing import multiple_of, validate_static_arithmetic
+from ..indexing import multiple_of, pure_scalar_selection, validate_static_arithmetic
 from ..scalar import facts_from_sizes, from_ssa
 from ..target.native import ITEMSIZE
 from ..target.scalars import INTEGER_OPERATIONS
@@ -187,6 +187,12 @@ class _Lowerer:
                 selector = operation.result
             scope.pure[value] = selector
             return selector
+        if pure_scalar_selection(owner):
+            # A pure scalar selection can be rebound to each stage's actual
+            # ordinal. Preserve its branches: an unselected expression may
+            # contain a division that is defined only in that branch.
+            self.conditional(owner, scope)
+            return scope.values[value]
         _unsupported(
             isinstance(owner, (arith.ConstantOp, arith.CmpiOp, PredicateOp))
             or type(owner) in INTEGER_OPERATIONS,
@@ -695,7 +701,11 @@ class _Lowerer:
                     self.work["source_operations"] += 1
                     _unsupported(actor is None, "actor domains cannot nest", child)
                     collect(child.body.block, child)
-                elif isinstance(child, descriptors) or type(child) in INTEGER_OPERATIONS:
+                elif (
+                    isinstance(child, descriptors)
+                    or type(child) in INTEGER_OPERATIONS
+                    or pure_scalar_selection(child)
+                ):
                     self.work["source_operations"] += 1
                 else:
                     ordinary.append(child)

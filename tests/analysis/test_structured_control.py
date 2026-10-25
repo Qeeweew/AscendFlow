@@ -5,8 +5,10 @@ from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import IndexType
 
 from ascendflow import language as N
+from ascendflow.analysis.smt import IntegerQueryService, negate
 from ascendflow.analysis.structured_addresses import StructuredAddresses, check_static_axes
 from ascendflow.analysis.structured_control import _division_iteration_range, build_control_facts
+from ascendflow.analysis.structured_schedule import Comparison
 from ascendflow.dialects.physical import TaskOp
 from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
 from ascendflow.passes.lower_native import lower_native_structure
@@ -69,6 +71,66 @@ def test_distinct_loop_operations_never_share_a_clock_by_label_or_bound():
     assert first.operation is not second.operation
     assert first.ordinal != second.ordinal
     assert first.count == second.count
+
+
+@pytest.mark.parametrize("index", ["t//2 if t%2==0 else (t+1)//2", "0 if t==0 else 16//t"])
+def test_pure_integer_selection_keeps_value_across_actual_stage_copies(index):
+    from ascendflow.scalar import substitute
+
+    source = N.from_source(
+        f"""
+        def selected(X:N.Tensor((64,64),N.f32),Y:N.Tensor((64,64),N.f32,access="write"),n:N.i64):
+            with N.Kernel():
+                x=N.alloc_ub((64,),slots=2)
+                for t in N.Pipelined(n):
+                    item={index}
+                    with N.Stage(0):
+                        N.copy(X[item,:],x.at(t))
+                    with N.Stage(1):
+                        N.copy(x.at(t),Y[item,:])
+    """,
+        disjoint_external=True,
+    )
+    structure = lower_native_structure(source)
+    control = build_control_facts(structure.module)
+    copies = [op for op in structure.module.walk() if isinstance(op, scf.IfOp) and op.results]
+    assert len(copies) == 2
+    first, second = (control.environment.expression(op.results[0]) for op in copies)
+    assert first.args[0].kind is second.args[0].kind is SymbolKind.SELECTION
+    assert first.args[0].origin is not second.args[0].origin
+    queries = IntegerQueryService(control.environment.facts)
+    assert queries.implies(Comparison(first, "==", second)).proved
+    (loop,) = control.loops.values()
+    later = substitute(second, {loop.ordinal: expression("add", loop.ordinal, literal(1))})
+    assert queries.satisfies((Comparison(first, "!=", later),)).satisfied
+    assert not control.invariant_over(first, loop.operation)
+    # The partial division stays inside its selected region in both copies.
+    if "16//t" in index:
+        assert queries.implies(
+            Comparison(first, "==", literal(0)), (Comparison(loop.ordinal, "==", literal(0)),)
+        ).proved
+        divisions = [op for op in structure.module.walk() if isinstance(op, arith.DivUIOp)]
+        assert len(divisions) == 2 and all(op.parent_op() in copies for op in divisions)
+
+
+def test_effectful_integer_selection_stays_an_actual_unknown_snapshot():
+    source = N.from_source(
+        """
+        def effect(Meta:N.Tensor((n,),N.i64),n:N.i64):
+            with N.Kernel():
+                x=N.alloc_ub((64,))
+                for t in N.serial(n):
+                    item=N.load_index(Meta[t:t+1]) if t%2==0 else 0
+                    if item==0:
+                        N.fill(x,1.0)
+    """,
+        disjoint_external=True,
+    )
+    structure = lower_native_structure(source)
+    control = build_control_facts(structure.module)
+    selected = next(op for op in structure.module.walk() if isinstance(op, scf.IfOp) and op.results)
+    result = control.environment.expression(selected.results[0])
+    assert result.args[0].kind is SymbolKind.CARRY
 
 
 def test_scalar_prefix_keeps_load_and_branch_results_after_their_real_definitions():
@@ -163,6 +225,56 @@ def test_scalar_carry_retains_unknown_range_instead_of_an_assumed_nonnegative_va
     carry = control.environment.expression(serial.operation.results[0])
     assert carry.kind == "argument" and carry.args[0] not in control.environment.facts
     assert pipeline.upper is carry
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "n<split or n%2==0",
+        "n>=split and n%2==0",
+        "(n<split or n==0) and (split==0 or n%2==1)",
+        "n==0 or split//n>0",
+    ],
+)
+def test_boolean_results_keep_exact_short_circuit_integer_semantics(condition):
+    source = N.from_source(f"""
+        def booleans(n:N.i64,split:N.i64):
+            with N.Kernel():
+                x=N.alloc_ub((64,))
+                if {condition}:
+                    N.fill(x,1.0)
+    """)
+    structure = lower_native_structure(source)
+    control = build_control_facts(structure.module)
+    branch = next(
+        op for op in structure.module.walk() if isinstance(op, scf.IfOp) and not op.results
+    )
+    actual = Comparison(control.environment.expression(branch.cond), "!=", literal(0))
+    queries = IntegerQueryService(control.environment.facts)
+    inputs = {str(name): Expr("argument", (name,)) for name in control.environment.facts}
+    for n in range(4):
+        for split in range(4):
+            values = {"n": n, "split": split}
+            premises = tuple(
+                Comparison(inputs[name], "==", literal(v)) for name, v in values.items()
+            )
+            expected = eval(condition, {"__builtins__": {}}, values)
+            assert queries.implies(actual if expected else negate(actual), premises).proved
+
+
+def test_boolean_invariance_retains_each_actual_loop_capture():
+    source = N.from_source("""
+        def booleans(n:N.i64,split:N.i64):
+            with N.Kernel():
+                x=N.alloc_ub((64,))
+                for t in N.Pipelined(n):
+                    if t<split or n==0:
+                        N.fill(x,1.0)
+    """)
+    control = build_control_facts(lower_native_structure(source).module)
+    (loop,) = control.loops.values()
+    branch = next(op for op in control.branches if not op[0].results)[0]
+    assert not control.invariant_over(control.environment.expression(branch.cond), loop.operation)
 
 
 @pytest.mark.parametrize("division", ["ceildiv", "floordiv"])
