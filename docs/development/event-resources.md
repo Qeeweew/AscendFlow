@@ -1,8 +1,9 @@
 # 事件资源的事实、政策与编号
 
 事件 ID 是硬件资源映射，不能代替 buffer slot、Stage、消息身份或 ownership。
-一个完整 physical credit 的全部成员先取得共同资源身份；不同 credit 的复用
-仍需独立证据。逻辑数据、物理存储和通知消费各自保留生命周期。
+physical credit 保留完整的 ownership 和成员身份。首选映射让全部成员共用
+资源；资源规划也可将实际成员作为不同 phase 占用，不同 credit 的复用仍需
+独立消费证据。逻辑数据、物理存储和通知消费各自保留生命周期。
 
 ## 当前编译接口
 
@@ -10,6 +11,10 @@
 `event_planning.plan_event_resources` 消费它，冻结 `EventResourceProblem`：
 虚拟 lane/phase、固定动作位置、全部成员的复用关系、AIV peer 相等约束、
 counter 候选组及预留。域和 handback 查询只在规划阶段发生。
+`EventIdPools` 在进入规划时保存实际可分配的整数集合及私有 bank 覆盖；所有
+缩环选项引用同一份不可变池。local 只允许 0..7、cross 只允许 0..15 的子集，
+检查整数类型、重复及 bank 身份；固定预留仍占据原硬件编号，即使它不属于
+该可分配子池。编号器保持这些实际数字，不用子池长度重新构造 0 起始的编号。
 
 `event_coloring` 和 `structured_resources` 只消费有限数字约束，不取得
 `EventDomains`、SMT callback 或补造 handback 的入口。分配不能移动 native、
@@ -23,16 +28,25 @@ local namespace 是 `(actor, source pipe, destination pipe)`，每 bank 8 ID。
 
 分配先尝试专属连续映射，必要时使用显式有限映射；快速摆放失败后先检查联合
 专属着色，再使用已建立的复用约束。DSATUR 采用结构顺序打破平局，全部协议
-选项的回溯合计最多 16384 个节点，搜索中没有
-域查询。mode-2 在专属映射之后先尝试时间复用，最后才启用并发 FIFO packing。
+选项的回溯合计最多 16384 个节点，搜索中没有域查询。
+mode-2 规划先用已有整组 FIFO 证书构造一个具体分区；该分区已能放入 ID 池时，
+不再为编号候选逐对建立额外消费回传。删除组内未选成员继续保留同一 word、
+quorum、进展和 backlog 证据。分配器直接消费这个有限分区，不查询 source 域。
+分区不能证明可放入时继续建立时间复用约束；已有时间证据先于一般 FIFO 残余
+着色使用。结构分区是可行映射的上界，不声称全局最少 ID。
+资源分量按 bank 的连通关系建立，AIV 取商后的许可仅在残余冲突确实查询时
+投影全部原私有 bank 的约束。专属单 bank 计数已超出实际可用池时无需构造
+稠密 clique；能直接专属摆放或按已证 FIFO 分区分配的输入也不枚举所有资源对。
+一般残余 `_color` 目前仍构造顶点冲突图，不把上述快路径称为全面稀疏编号。
 尚未使用且对全部顶点具有相同可用性的 ID，只尝试一个代表；它们在冻结约束中
 可互换。不同 bank 的预留通过完整可用性列区分，已使用的 ID 不按此规则合并。
 连续环仍只是摆放偏好，不因对称剪枝改变 lane 异号或整组 counter 检查。
 工作耗尽与已建立约束下无解分开诊断；保守约束图的 clique 不能证明
 实际硬件最小需求。非连续映射降为小型有符号 min/max 表达式。
 
-着色顶点是 `(完整 credit, lane)`。同一 credit 的不同 lane 必须异号；有公共
-bank 且没有完整复用许可的顶点也必须异号。预留和持久 token 固定在原 bank。
+着色顶点是 `(占用, lane)`，占用可包含完整 credit 或其实际 phase 成员。
+同一占用的不同 lane 必须异号；有公共 bank 且没有完整复用许可的顶点也必须
+异号。预留和持久 token 固定在原 bank。
 AIV peer 只对编号变量取商：一个共同编号须在每个原私有 bank 中合法，原成员
 之间的全部约束继续保留。满足这些冻结约束只能证明有限映射合法，不能替
 上游建立者证明生命周期或 sharing 前提正确。
@@ -55,6 +69,25 @@ AIV peer 只对编号变量取商：一个共同编号须在每个原私有 bank
 缩环的有限选项；分配先穷尽首选协议的资源约束，失败后才尝试这些选项。
 当前不枚举所有嵌套环组合、任意相位或所有最小修改子集，有限选项失败仍可能
 属于支持边界。它们不改变 native、buffer、通知位置或激活，不增加 Wait。
+
+## local 成员 phase 占用
+
+若冻结的完整 credit 冲突约束已有超出实际可用池的 clique，规划为该 bank
+准备一份实际成员 phase 选项。这个判据只说明当前粗映射放不下，不说明硬件
+最少需求。它不枚举全部兼容子集，也不把同一时刻的观测峰值当作映射许可。
+
+每个 phase 仍指向原 `CellChannel` 和原通知成员，保留其完整 case、配对、环
+生命周期和真实 Set/Wait。原 physical-cell 归纳允许同一 credit 的非重复成员
+继续同号；这份投影记录为 `CellPhaseSharing`，不能用于不同 credit 之间。
+跨 credit 的同号组按实际选中成员重新建立完整消费前沿，包括各层 LAST/FIRST
+与重入，编号仅消费冻结的许可。一个早期成员相冲突，不再强迫两个 credit
+所有后续成员也异号。整个过程不改变 ready 粒度、native、buffer 容量或 gate。
+
+镜像 AIV 同时准备 phase 选项，保留两个原私有 bank 的编号交集；原有共用
+通知序列的次序、重复数和完整 guard 必须继续保持。整数分配失败时才选用
+已经冻结的后续选项，所有选项仍共享原搜索工作上限。当前该规则细分 local
+稳定 cell 的通知成员；mode-2 继续使用完整 word/quorum/backlog 合同，普通
+runtime ring 内不同 lane 的进一步共享仍须额外证明，不能由此规则推出。
 
 ## 环复用与 local 不干涉的组合理由
 
@@ -186,6 +219,10 @@ credit 的积压求和，包含跨片段尚未消费的贡献，不把循环退�
 预留、编号、sharing 与物化动作；`protocol_selection` 区分首选环、选中协议及
 受影响消息流；`counter_time_reuse` 保存旧消费、新发布、回传及最大积压，
 `counter_groups` 保存并发 word、顺序片段及求和积压，`counter_compositions` 保存
-FIFO 子组、时间回传和最大积压。报告是诊断输出，不能作为外部输入的 verified
+FIFO 子组、时间回传和最大积压。消费证明和布尔条件以
+`consumption_proofs/consumption_predicates` 共享 DAG 引用，保留实际取得 cut、
+原始前提及数学答案，不展开全部 relay 历史。报告是诊断输出，不能作为外部输入的 verified
 标记。独立有限模型读取真实指令、字节版本、二值消费和逐发送者贡献。
+`occupancies` 显式对应整数资源、原 logical credit、实际 phase 成员及 width，
+local 复用矩形中的 resource 编号引用这份表。`id_pools` 保留实际可分配数字。
 CPU 检查、ASC 对照、CANN、设备数值、编译耗时与 msprof 性能分别给出资格。

@@ -6,6 +6,7 @@ from .frontend.contracts import dynamic
 from .frontend.parser import capture as _capture
 from .frontend.parser import from_source
 from .frontend.syntax import (
+    CopyGroup,
     Cube,
     Dataflow,
     DType,
@@ -51,6 +52,7 @@ from .frontend.syntax import (
     reduce_sum,
     rsqrt,
     serial,
+    slotted_view,
     sqrt,
     store_scalar,
     sub,
@@ -79,6 +81,7 @@ def inline(function):
 
 
 __all__ = [
+    "CopyGroup",
     "Cube",
     "DType",
     "Dataflow",
@@ -128,6 +131,7 @@ __all__ = [
     "reduce_sum",
     "rsqrt",
     "serial",
+    "slotted_view",
     "sqrt",
     "store_scalar",
     "sub",

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -34,9 +34,11 @@ from ..target.ascend910b import Actor
 from ..target.native import ITEMSIZE
 from .matrix_regions import RegionDefinitions
 from .native import ConditionalRead
+from .smt import any_of, query_service
 from .structured_bounds import MemoryBoundsFacts
 from .structured_control import LogicalLoop
 from .structured_memory import MemoryAccess, MemoryTemplate, NativeMemoryFacts
+from .structured_schedule import Comparison
 from .value_bindings import LastTile, TileDefinition, TileUse
 
 if TYPE_CHECKING:
@@ -108,10 +110,25 @@ class DefinitionSources(Sequence):
 
 
 @dataclass(frozen=True, slots=True)
+class ValueSnapshot:
+    """Defined entry/update sources frozen at an actual borrowed-value cut.
+
+    The shared source prefix is numerical state, never completion or reader
+    retirement. Later writes cannot change this snapshot's source membership.
+    """
+
+    definition: TileDefinition
+    instance: StorageInstance
+    writers: tuple[TaskOp, ...] | DefinitionSources
+    external: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class TileAdmission:
     use: TileUse
     definition: TileDefinition
     selections: tuple[tuple[LogicalLoop, Expr], ...]
+    snapshots: tuple[ValueSnapshot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,6 +175,23 @@ def _span(access, bindings):
         geometry.row_stride,
     )
     return _collapse(result)
+
+
+def _logical_allocation_span(access):
+    # Use logical extents, excluding any allocation alignment padding. The
+    # admitted source/native mapping keeps every legal read inside this span.
+    size = literal(ITEMSIZE[access.address.geometry.dtype])
+    for extent in access.address.axes.extents:
+        size = expression("mul", size, extent)
+    return _Span(literal(0), size)
+
+
+def _read_enclosures(access, actor, memory, bounds):
+    """Existing source/native enclosures, without enlarging any real access."""
+    yield _logical_allocation_span(access)
+    bindings = _participant(actor, memory.control.sid)
+    for enclosing in bounds.addresses[access.address.operation.ref].enclosures:
+        yield _Span(substitute(enclosing.origin, bindings), literal(enclosing.nbytes))
 
 
 def _collapse(span):
@@ -351,6 +385,27 @@ def _writer_coordinates(
             return None
         bindings[first.ordinal] = literal(0)
     return bindings, windows
+
+
+def _value_payload(access):
+    """The declared result view, separately from a prefix's actual writes.
+
+    This is only an enclosure for a borrowed value. It cannot establish any
+    initialized byte; that needs the frozen definition state at the update.
+    """
+    address = access.address
+    if address.valid_rows is None:
+        return access
+    matrix = address.matrix
+    if matrix is not None:
+        matrix = replace(
+            matrix,
+            stops=tuple(
+                expression("add", start, literal(width))
+                for start, width in zip(matrix.starts, address.axes.widths, strict=True)
+            ),
+        )
+    return replace(access, address=replace(address, valid_rows=None, matrix=matrix))
 
 
 def _writer_span(writer, access, actor, reader, memory, **options):
@@ -669,18 +724,48 @@ def _native_aliases(memory):
                 ):
                     continue
                 a, b = source.address, destination.address
-                if a.geometry == b.geometry and (
-                    a.offset == b.offset or equivalent(a.offset, b.offset, facts)
+                packed = template.spec.native in {"mask_and", "mask_or", "mask_not"}
+                if (
+                    not packed
+                    and a.geometry == b.geometry
+                    and (a.offset == b.offset or equivalent(a.offset, b.offset, facts))
                 ):
                     continue
                 delta = normalize(expression("sub", b.offset, a.offset), facts)
                 low, high = interval(delta, template.frame.domains(), facts)
                 source_span = a.geometry.nbytes + (a.geometry.rows - 1) * a.geometry.row_stride
                 destination_span = b.geometry.nbytes + (b.geometry.rows - 1) * b.geometry.row_stride
+                separated = nonnegative(
+                    expression("sub", low, literal(source_span)), facts
+                ) or nonnegative(expression("sub", literal(-destination_span), high), facts)
+                if not separated:
+                    premises = (
+                        tuple(
+                            test
+                            for coordinate, lower, upper in template.frame.domains()
+                            for test in (
+                                Comparison(coordinate, ">=", lower),
+                                Comparison(coordinate, "<=", upper),
+                            )
+                        )
+                        + template.frame.predicates()
+                    )
+                    separated = (
+                        query_service(facts)
+                        .implies(
+                            any_of(
+                                Comparison(delta, ">=", literal(source_span)),
+                                Comparison(delta, "<=", literal(-destination_span)),
+                            ),
+                            premises,
+                        )
+                        .proved
+                    )
                 _require(
-                    nonnegative(expression("sub", low, literal(source_span)), facts)
-                    or nonnegative(expression("sub", literal(-destination_span), high), facts),
-                    "native read/write aliases need identical views or proved disjoint byte ranges",
+                    separated,
+                    "masked boolean combination output needs distinct predicate storage"
+                    if packed
+                    else "native read/write aliases need identical views or proved disjoint byte ranges",
                     template.operation,
                     witness=(
                         a.root.owner.sym_name.data,
@@ -932,6 +1017,7 @@ def admit_structured_memory(
         "span_region_transfers": 0,
         "definition_source_nodes": 0,
         "definition_source_members": 0,
+        "value_snapshot_queries": 0,
     }
     for root in bounds.allocations:
         initialized = root.owner.initialized.data
@@ -970,6 +1056,13 @@ def admit_structured_memory(
     templates = {item.operation: item for item in memory.templates}
     positions = {item.operation: index for index, item in enumerate(memory.templates)}
     selected_values = _selected_values(structure, memory, templates, facts)
+    partial_values, snapshots = {}, {}
+    for selected in selected_values:
+        use, reader, _, binding, _ = selected
+        writer = templates[binding.operation]
+        output = writer.accesses[binding.operand]
+        if output.address.valid_rows is not None:
+            partial_values.setdefault(binding.operation, []).append(selected)
     write_buckets = {}
     for template in memory.templates:
         if template.frame.statically_empty:
@@ -1018,18 +1111,17 @@ def admit_structured_memory(
                 candidates, writers = spans.before(instance, template)
                 needed = _span(access, _participant(actor, memory.control.sid))
                 # The checked source/native mapping keeps every legal read
-                # inside the logical allocation. Once real writers define all
-                # of it, querying the dynamic read's bounds would duplicate the
-                # caller's access contract. Do not include allocation padding,
-                # or turn this numerical fact into readiness/ownership/KILL.
-                size = literal(ITEMSIZE[access.address.geometry.dtype])
-                for extent in access.address.axes.extents:
-                    size = expression("mul", size, extent)
-                whole = _Span(literal(0), size)
+                # inside its logical allocation and retained prefix planes.
+                # Once real writers define one such enclosure, querying the
+                # dynamic read's bounds would duplicate the caller's access
+                # contract. Do not include allocation padding, or turn this
+                # numerical fact into readiness/ownership/KILL.
                 _require(
-                    _covers(candidates, whole, template.frame, facts, work)
-                    or needed != whole
-                    and _covers(candidates, needed, template.frame, facts, work),
+                    any(
+                        _covers(candidates, enclosing, template.frame, facts, work)
+                        for enclosing in _read_enclosures(access, actor, memory, bounds)
+                    )
+                    or _covers(candidates, needed, template.frame, facts, work),
                     "native reads storage without a proved initialized writer coverage",
                     template.operation,
                     witness=(
@@ -1068,6 +1160,34 @@ def admit_structured_memory(
                     if signature not in defined_writes:
                         spans.write(key, template, access, actor)
                         defined_writes.add(signature)
+        # Query the existing incremental definition transfers at the real
+        # update cut. Querying after all templates would let a later writer
+        # initialize preserved bytes retroactively. Each context still moves
+        # its prefix cursor only forward, once per newly encountered writer.
+        for use, reader, _, binding, _ in partial_values.get(template.operation, ()):
+            access = reader.accesses[use.operand]
+            for actor in reader.participants:
+                participant = actor if actor in template.participants else template.participants[0]
+                instance = StorageInstance(
+                    access.address.root,
+                    None if access.address.geometry.bank == "GM" else participant,
+                )
+                work["value_snapshot_queries"] += 1
+                origins = ()
+                external = bool(instance.root.owner.initialized.data)
+                if external:
+                    covered = True
+                elif access.address.matrix is not None:
+                    definitions = matrices.before(instance, reader)
+                    needed = access.address.matrix.bind(_participant(actor, memory.control.sid))
+                    origins = definitions.covering(needed, reader.frame.domains(), facts)
+                    covered = origins is not None
+                else:
+                    candidates, origins = spans.before(instance, reader)
+                    needed = _span(access, _participant(actor, memory.control.sid))
+                    covered = _covers(candidates, needed, reader.frame, facts, work)
+                if covered:
+                    snapshots[use, actor] = ValueSnapshot(binding, instance, origins, external)
     values = []
     for use, reader, selected, binding, substitutions in selected_values:
         assert isinstance(binding, TileDefinition)
@@ -1085,10 +1205,17 @@ def admit_structured_memory(
                 "logical Tile has ambiguous producer participant ownership",
                 use.reader,
             )
+            snapshot = snapshots.get((use, actor))
+            if output.address.valid_rows is not None:
+                _require(
+                    snapshot is not None,
+                    "logical Tile partial update has no initialized entry/update snapshot",
+                    use.reader,
+                )
             matrix = access.address.matrix is not None
             expected = (_writer_matrix if matrix else _writer_span)(
                 writer,
-                output,
+                _value_payload(output) if snapshot is not None else output,
                 participant,
                 reader,
                 memory,
@@ -1106,8 +1233,13 @@ def admit_structured_memory(
                     definitions.add(expected, (writer.operation,), facts)
                 covered = definitions.covering(needed, reader.frame.domains(), facts) is not None
             else:
-                covered = expected is not None and _covers(
-                    [expected], needed, reader.frame, facts, work
+                # A selected writer defining a complete retained plane also
+                # defines every legal indirect subview of it. Retain this
+                # writer identity: another initialized writer cannot stand in
+                # for it, and the real read still undergoes overwrite checks.
+                covered = expected is not None and (
+                    expected in _read_enclosures(access, actor, memory, bounds)
+                    or _covers([expected], needed, reader.frame, facts, work)
                 )
             _require(
                 covered,
@@ -1182,7 +1314,18 @@ def admit_structured_memory(
                     use.reader,
                     witness=(binding.operation.uid.data, other.operation.uid.data),
                 )
-        values.append(TileAdmission(use, binding, tuple(selected)))
+        values.append(
+            TileAdmission(
+                use,
+                binding,
+                tuple(selected),
+                tuple(
+                    snapshots[use, actor]
+                    for actor in reader.participants
+                    if (use, actor) in snapshots
+                ),
+            )
+        )
     work["read_proofs"], work["tile_uses"] = len(reads), len(values)
     work["storage_instances"] = len(instances)
     work["configuration_writers"] = len(configurations)

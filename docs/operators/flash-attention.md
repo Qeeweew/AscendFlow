@@ -17,6 +17,14 @@
 
 Q/K/V/O与workspace的真实指针区间遵守外部disjoint合同；局部L1/L0/UB以及上述GM环仍按真实访问同步，不能因变量名不同认为无复用。
 
+两槽 workspace 通过每组的 `slotted_view` 绑定。dense 以
+`query * kv_tiles + kv` 选择 generation，causal 以当前 `kv` 选择；Score/P/PV
+与 alpha 使用同一 generation。helper 接收已选出的 payload view，不重新计算
+group 或槽地址。L1/L0/UB 的时间槽显式声明 `slots` 并以 `at` 选择；Q/P 的
+固定 part 平面用 `slot(part)`，保留它们在两个计算阶段之间的实际别名。
+输入、操作数和转换输出在阶段间传递对应 Tile；FP32 在线状态及部分累加
+继续用普通 view 原地更新，不要求循环状态成为完整写入的值 DAG。
+
 QK产生FP32 score，online softmax保留FP32 m/l；denominator使用未舍入p32，P显式RN后进入PV。O在FP32 rescale/add，最后归一化并RN输出。FP32求和树允许按误差合同调整；其余算法/舍入边界不自动获得修改授权。
 
 默认AIC先新QK后旧PV、AIV先新softmax后旧update。每个K/V分块服务两个BM128行片，减少重复的GM→L1读取。QK子流水有 load_k、operand_k、qk_emit 三个偏移，发射顺序为 load_k、qk_emit、operand_k；qk_emit 内每片 MAD 后紧接自己的 FIX export。两个片的结果独立发布，槽覆盖等待对应的真实最后 reader。

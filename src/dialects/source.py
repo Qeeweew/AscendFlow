@@ -98,7 +98,7 @@ def source_yield_origin(value):
     actual read. This query only identifies the descriptor behind its yields.
     """
     seen = set()
-    while isinstance(value.owner, (DomainOp, StageOp, IterationOp)):
+    while isinstance(value.owner, (DomainOp, StageOp, IterationOp, CopyGroupOp)):
         terminator = value.owner.body.block.last_op
         if (
             value in seen
@@ -299,6 +299,7 @@ class IterationOp(IRDLOperation):
 
     name = "npu_source.iteration"
     uid = attr_def(StringAttr)
+    label = opt_attr_def(StringAttr)
     count = opt_attr_def(IntAttr)
     limit = opt_operand_def(IndexType)
     issue_order = opt_attr_def(DictionaryAttr)
@@ -398,6 +399,106 @@ class DomainOp(IRDLOperation):
             parent = parent.parent_op()
 
 
+@irdl_op_definition
+class CopyGroupOp(IRDLOperation):
+    """One actor/activation's explicitly common ready boundary.
+
+    The region is transparent to storage versioning and does not wait on exit.
+    Native lowering must establish a common real publication queue.
+    """
+
+    name = "npu_source.copy_group"
+    label = attr_def(StringAttr)
+    body = region_def("single_block")
+    values = var_result_def(TileType | MaskType)
+    traits = traits_def(RecursiveMemoryEffect())
+
+    def verify_(self):
+        from xdsl.dialects import arith
+
+        from ..target.scalars import INTEGER_OPERATIONS
+
+        _verify_yield(self)
+        if self.body.block.args:
+            raise VerifyException("CopyGroup has no execution coordinate")
+        if not any(isinstance(op, CopyOp) for op in self.body.block.ops):
+            raise VerifyException("CopyGroup requires at least one copy")
+        for op in self.body.block.ops:
+            if (
+                not isinstance(
+                    op,
+                    (
+                        CopyOp,
+                        ViewOp,
+                        StorageSelectOp,
+                        TileSliceOp,
+                        YieldOp,
+                        PredicateOp,
+                        arith.ConstantOp,
+                        arith.CmpiOp,
+                    ),
+                )
+                and type(op) not in INTEGER_OPERATIONS
+            ):
+                raise VerifyException(
+                    "CopyGroup accepts only straight-line copies and pure descriptors"
+                )
+        parent = self.parent_op()
+        while parent is not None:
+            if isinstance(parent, CopyGroupOp):
+                raise VerifyException("CopyGroup cannot nest")
+            parent = parent.parent_op()
+
+
+@irdl_op_definition
+class StorageSelectOp(IRDLOperation):
+    """Original selector and actual allocation axis of an at/slot reference."""
+
+    name = "npu_source.storage_select"
+    root = operand_def(TensorType)
+    selector = operand_def(IndexType)
+    axis = attr_def(IntAttr)
+    depth = attr_def(IntAttr)
+    mode = attr_def(StringAttr)
+    index = result_def(IndexType)
+
+    def verify_(self):
+        if not isinstance(self.root.owner, AllocationOp):
+            raise VerifyException("storage selection requires its original allocation root")
+        axis, depth = self.axis.data, self.depth.data
+        if (
+            not 0 <= axis < len(self.root.type.shape)
+            or not 0 < depth <= self.root.type.shape.data[axis].data
+        ):
+            raise VerifyException("storage selection needs a positive static slot axis")
+        if self.mode.data not in {"generation", "physical"}:
+            raise VerifyException("unknown storage selector mode")
+        _verify_index_provenance(self.selector, self, set(), {}, {})
+        _dominates(self.root, self, {}, {})
+        value = _constant_index(self.selector)
+        if value is not None and (value < 0 or self.mode.data == "physical" and value >= depth):
+            raise VerifyException("storage selection exceeds its physical slot axis")
+
+
+@irdl_op_definition
+class TileSliceOp(IRDLOperation):
+    """A borrowed subview of the same writer, with no read or fresh version."""
+
+    name = "npu_source.tile_slice"
+    source = operand_def(TileType)
+    view = operand_def(TensorType)
+    value = result_def(TileType)
+
+    def verify_(self):
+        if (
+            self.value.type.shape != self.view.type.shape
+            or self.value.type.dtype != self.view.type.dtype
+        ):
+            raise VerifyException("borrowed Tile slice must match its physical view")
+        if self.source.type.dtype != self.value.type.dtype:
+            raise VerifyException("borrowed Tile slice cannot change dtype")
+
+
 def _dominates(value, use, positions, ancestors):
     """Require a definition before its use along the enclosing source regions."""
     if use not in ancestors:
@@ -449,6 +550,9 @@ def _verify_index_provenance(value, use, seen, positions, ancestors):
             continue
         if isinstance(owner, IndexReadOp):
             continue
+        if isinstance(owner, StorageSelectOp):
+            pending.append((owner.selector, owner))
+            continue
         if isinstance(owner, (scf.IfOp, scf.ForOp)):
             pending.extend((operand, owner) for operand in owner.operands)
             for region in owner.regions:
@@ -474,6 +578,14 @@ def _constant_index(value, memo=None):
         result = None
         if isinstance(owner, arith.ConstantOp):
             result = owner.value.value.data
+        elif isinstance(owner, StorageSelectOp):
+            selector = visit(owner.selector)
+            if selector is not None:
+                if selector < 0 or owner.mode.data == "physical" and selector >= owner.depth.data:
+                    raise VerifyException("storage selection exceeds its physical slot axis")
+                result = (
+                    selector % owner.depth.data if owner.mode.data == "generation" else selector
+                )
         elif hasattr(owner, "operands") and len(owner.operands) == 2:
             lhs, rhs = (visit(operand) for operand in owner.operands)
             if lhs is not None and rhs is not None:
@@ -749,8 +861,9 @@ class MaskCombineOp(IRDLOperation):
             or tuple(size.data for size in self.result.type.shape) != shape
         ):
             raise VerifyException("mask combination needs explicit packed result blocks")
-        if _mask_storage(self.out) in {_mask_storage(storage) for storage in operands}:
-            raise VerifyException("mask combination output needs distinct predicate storage")
+        # Packed views may occupy separate slots of one allocation. Actual
+        # native read/write disjointness is checked with their SSA addresses
+        # during admission, including identical and unknown-overlap views.
 
 
 @irdl_op_definition
@@ -1206,6 +1319,9 @@ SOURCE = Dialect(
         IterationOp,
         StageOp,
         DomainOp,
+        CopyGroupOp,
+        StorageSelectOp,
+        TileSliceOp,
         ViewOp,
         PredicateOp,
         MaskOp,

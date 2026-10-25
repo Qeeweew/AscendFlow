@@ -16,41 +16,45 @@ from ascendflow import language as N
 @N.inline
 def qk(query, key, scores, buffers):
     q1, q0, score0 = buffers
-    N.copy(query, q1)
-    N.copy(q1, q0)
-    N.matmul(q0, key, accum=score0, initialize=True)
-    N.copy(score0, scores)
+    loaded = N.copy(query, q1)
+    operand = N.copy(loaded, q0)
+    result = N.matmul(operand, key, accum=score0, initialize=True)
+    N.copy(result, scores)
 
 
 @N.inline
 def softmax(scores, probabilities, buffers):
     score, probability, maximum, total, partial, broadcast = buffers
-    N.copy(scores, score)
-    N.mul(score, 0.08838834764831845, out=score)
-    N.reduce_max(score, axis=1, out=maximum, scratch=partial[:, :2], order="r64_then_packed_merge")
-    N.sub(score, maximum[:, None], out=score, scratch=broadcast)
-    N.exp(score, out=score)
-    N.reduce_sum(score, axis=1, out=total, scratch=partial[:, :2], order="r64_then_packed_merge")
-    N.div(score, total[:, None], out=score, scratch=broadcast)
-    N.cast(score, out=probability)
-    N.copy(probability, probabilities)
+    loaded = N.copy(scores, score)
+    scaled = N.mul(loaded, 0.08838834764831845, out=score)
+    row_max = N.reduce_max(
+        scaled, axis=1, out=maximum, scratch=partial[:, :2], order="r64_then_packed_merge"
+    )
+    shifted = N.sub(scaled, row_max[:, None], out=score, scratch=broadcast)
+    exponentials = N.exp(shifted, out=score)
+    row_sum = N.reduce_sum(
+        exponentials, axis=1, out=total, scratch=partial[:, :2], order="r64_then_packed_merge"
+    )
+    normalized = N.div(exponentials, row_sum[:, None], out=score, scratch=broadcast)
+    converted = N.cast(normalized, out=probability)
+    N.copy(converted, probabilities)
 
 
 @N.inline
 def pv(probabilities, value, products, buffers):
     p1, p0, output0 = buffers
-    N.copy(probabilities, p1)
-    N.copy(p1, p0)
-    N.matmul(p0, value, accum=output0, initialize=True)
-    N.copy(output0, products)
+    loaded = N.copy(probabilities, p1)
+    operand = N.copy(loaded, p0)
+    result = N.matmul(operand, value, accum=output0, initialize=True)
+    N.copy(result, products)
 
 
 @N.inline
 def store(products, destination, buffers):
     output, result = buffers
-    N.copy(products, output)
-    N.cast(output, out=result)
-    N.copy(result, destination)
+    loaded = N.copy(products, output)
+    converted = N.cast(loaded, out=result)
+    N.copy(converted, destination)
 
 
 @N.prim_func(disjoint_external=True)
@@ -91,6 +95,9 @@ def simple_attention(
         softmax_buffers = (score, probability, maximum, total, partial, broadcast)
         pv_buffers = (p1, p0, output0)
         store_buffers = (output, result)
+        scores = N.slotted_view(Score[head, :, :, :])
+        probabilities = N.slotted_view(P[head, :, :, :])
+        products = N.slotted_view(PV[head, :, :, :])
 
         # K and V stay resident across all query tiles of this head.
         with N.Cube():
@@ -99,24 +106,27 @@ def simple_attention(
             N.copy(V[head, :, :], v1)
             N.copy(v1, v0)
 
-        for tile in N.Dataflow(S // 64):
+        for tile in N.Dataflow(
+            S // 64, issue_order={"cube": ("qk", "pv"), "vector": ("softmax", "store")}
+        ):
             q = tile * 64
-            slot = tile % 2
 
             with N.Cube(), N.Stage(0, name="qk"):
-                qk(Q[head, q : q + 64, :], k0, Score[head, slot, :, :], qk_buffers)
+                qk(Q[head, q : q + 64, :], k0, scores.at(tile), qk_buffers)
 
             with N.Vector() as lane, N.Stage(0, name="softmax"):
                 r = lane * 32
                 softmax(
-                    Score[head, slot, r : r + 32, :],
-                    P[head, slot, r : r + 32, :],
+                    scores.at(tile)[r : r + 32, :],
+                    probabilities.at(tile)[r : r + 32, :],
                     softmax_buffers,
                 )
 
             with N.Cube(), N.Stage(1, name="pv"):
-                pv(P[head, slot, :, :], v0, PV[head, slot, :, :], pv_buffers)
+                pv(probabilities.at(tile), v0, products.at(tile), pv_buffers)
 
             with N.Vector() as lane, N.Stage(1, name="store"):
                 r = lane * 32
-                store(PV[head, slot, r : r + 32, :], O[head, q + r : q + r + 32, :], store_buffers)
+                store(
+                    products.at(tile)[r : r + 32, :], O[head, q + r : q + r + 32, :], store_buffers
+                )

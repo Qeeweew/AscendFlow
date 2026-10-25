@@ -69,6 +69,12 @@ Q/K 归一化、gate exp 和 beta 每个 head 只做一次。两个状态槽加�
 177216 B（173.0625 KiB）UB，低于 910B 单 AIV 的 192 KiB。
 编译器生成输入 ready、输出 ready、真实最后 reader 的 release 及槽位回收。
 
+recurrent/decode 的输入与输出分别以显式 slots 和 `at(item)` 选择，保留原来
+的独立容量。一次输入导入用 CopyGroup 共同 ready，包含实际的 Q/K、Gate、
+Value 及 decode 的 State 读取；不合并 DMA 或放大存储 release。
+归一化、decay、delta update 和转换结果传递对应 Tile；recurrent 的完整 FP32
+carry 继续原地递推，导出的快照来自独立存储及其真实 writer。
+
 每 token/head 的有用算术为 `7*K*V + 7*K` FLOPs，另有 K 次 exp 和两次 rsqrt。
 默认完整 launch 为 473432064 FLOPs。有效 GM 流量约 518.016 MiB，其中 state 读写为 512 MiB；
 PMU 请求流量、UB 流量与 HBM 实流量是不同计数口径。

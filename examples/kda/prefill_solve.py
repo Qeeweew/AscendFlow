@@ -12,56 +12,48 @@ def solve_import(inputs, buffers, geometry, coordinates):
     Blocks, Negative = inputs
     a1, b1 = buffers
     (WIDTH,) = geometry
-    chunk, head, ring, right, left = coordinates
-    N.copy(
-        Blocks[chunk, head, right : right + WIDTH, right : right + WIDTH],
-        a1[ring, :, :],
-    )
-    N.copy(
-        Negative[chunk, head, right : right + WIDTH, left : left + WIDTH],
-        b1[ring, :, :],
-    )
+    right, left = coordinates
+    with N.CopyGroup(name="inverse_operands"):
+        diagonal = N.copy(Blocks[right : right + WIDTH, right : right + WIDTH], a1)
+        negative = N.copy(Negative[right : right + WIDTH, left : left + WIDTH], b1)
+    return diagonal, negative
 
 
 @N.inline
-def merge_inverse_blocks(inputs, buffers, geometry, coordinates):
+def merge_inverse_blocks(inputs, operands, buffers):
     Merge, Blocks, Off = inputs
     a0, a1, b0, b1, c0 = buffers
-    (WIDTH,) = geometry
-    ring, owner, chunk, head, left, right = coordinates
-    aa = N.copy(a1[ring, :, :], a0)
-    bb = N.copy(b1[ring, :, :], b0)
-    N.matmul(aa, bb, accum=c0, initialize=True)
-    N.copy(c0, Merge[owner, ring, :, :])
-    aa = N.copy(Merge[owner, ring, :, :], a1[ring, :, :])
-    bb = N.copy(Blocks[chunk, head, left : left + WIDTH, left : left + WIDTH], b1[ring, :, :])
+    diagonal, negative = operands
+    aa = N.copy(diagonal, a0)
+    bb = N.copy(negative, b0)
+    result = N.matmul(aa, bb, accum=c0, initialize=True)
+    N.copy(result, Merge)
+    aa = N.copy(Merge, a1)
+    bb = N.copy(Blocks, b1)
     aa = N.copy(aa, a0)
     bb = N.copy(bb, b0)
-    N.matmul(aa, bb, accum=c0, initialize=True)
-    if WIDTH == 16:
-        N.copy(c0, Off[chunk, head, right : right + WIDTH, left : left + WIDTH])
-    else:
-        N.copy(c0, Off[owner, ring, :, :])
+    result = N.matmul(aa, bb, accum=c0, initialize=True)
+    N.copy(result, Off)
 
 
 @N.inline
 def read_inverse_blocks(inputs, raw, coordinates):
     Blocks, Off = inputs
-    lane, chunk, head, owner, ring = coordinates
+    (lane,) = coordinates
     row = lane * 16
-    N.copy(Blocks[chunk, head, row : row + 16, :], raw[:16, :])
-    N.copy(Blocks[chunk, head, row + 32 : row + 48, 32:64], raw[16:32, 32:64])
-    N.copy(Off[owner, ring, row : row + 16, :], raw[16:32, :32])
+    N.copy(Blocks[row : row + 16, :], raw[:16, :])
+    N.copy(Blocks[row + 32 : row + 48, 32:64], raw[16:32, 32:64])
+    N.copy(Off[row : row + 16, :], raw[16:32, :32])
 
 
 @N.inline
 def publish_inverse_blocks(Inverse, buffers, coordinates):
     raw, packed = buffers
-    lane, chunk, head, _owner, _ring = coordinates
+    (lane,) = coordinates
     row = lane * 16
-    N.cast(raw, out=packed)
-    N.copy(packed[:16, :], Inverse[chunk, head, row : row + 16, :])
-    N.copy(packed[16:32, :], Inverse[chunk, head, row + 32 : row + 48, :])
+    rounded = N.cast(raw, out=packed)
+    N.copy(rounded[:16, :], Inverse[row : row + 16, :])
+    N.copy(rounded[16:32, :], Inverse[row + 32 : row + 48, :])
 
 
 @N.inline
@@ -94,32 +86,53 @@ def prefill_solve_merge(
         assert BT == 64 and (WIDTH == 16 or WIDTH == 32), "hierarchical block merge"
         raw = N.alloc_ub((32, BT), N.f32)
         packed = N.alloc_ub((32, BT), DTYPE)
-        a1 = N.alloc_l1((2, WIDTH, WIDTH), N.f32)
-        b1 = N.alloc_l1((2, WIDTH, WIDTH), N.f32)
+        a1 = N.alloc_l1((WIDTH, WIDTH), N.f32, slots=2)
+        b1 = N.alloc_l1((WIDTH, WIDTH), N.f32, slots=2)
         a0 = N.alloc_l0a((WIDTH, WIDTH), N.f32)
         b0 = N.alloc_l0b((WIDTH, WIDTH), N.f32)
         c0 = N.alloc_l0c((WIDTH, WIDTH), N.f32)
+        merges = N.slotted_view(Merge[owner, :, :, :])
+        if WIDTH == 32:
+            off_values = N.slotted_view(Off[owner, :, :, :])
         for item in N.Dataflow(
-            N.ceildiv(N.max(0, CHUNKS * H * (BT // (2 * WIDTH)) - owner), GROUPS)
+            N.ceildiv(N.max(0, CHUNKS * H * (BT // (2 * WIDTH)) - owner), GROUPS),
+            issue_order={"cube": ("import", "merge"), "vector": ("pack",)}
+            if WIDTH == 32
+            else {"cube": ("import", "merge")},
         ):
             work = owner + item * GROUPS
             chunk, head = work // (H * (BT // (2 * WIDTH))), (work // (BT // (2 * WIDTH))) % H
             left = (work % (BT // (2 * WIDTH))) * 2 * WIDTH
             right = left + WIDTH
-            ring = item % 2
             with N.Cube(), N.Stage(0, name="import"):
-                solve_import(
-                    (Blocks, Negative), (a1, b1), (WIDTH,), (chunk, head, ring, right, left)
+                diagonal, negative = solve_import(
+                    (Blocks[chunk, head, :, :], Negative[chunk, head, :, :]),
+                    (a1.at(item), b1.at(item)),
+                    (WIDTH,),
+                    (right, left),
                 )
             with N.Cube(), N.Stage(1, name="merge"):
+                if WIDTH == 16:
+                    target = Off[chunk, head, right : right + WIDTH, left : left + WIDTH]
+                else:
+                    target = off_values.at(item)
                 merge_inverse_blocks(
-                    (Merge, Blocks, Off),
-                    (a0, a1, b0, b1, c0),
-                    (WIDTH,),
-                    (ring, owner, chunk, head, left, right),
+                    (
+                        merges.at(item),
+                        Blocks[chunk, head, left : left + WIDTH, left : left + WIDTH],
+                        target,
+                    ),
+                    (diagonal, negative),
+                    (a0, a1.at(item), b0, b1.at(item), c0),
                 )
             if WIDTH == 32:
                 with N.Vector() as lane, N.Stage(2, name="pack"):
                     pack_inverse_blocks(
-                        (Blocks, Off, Inverse), (raw, packed), (lane, chunk, head, owner, ring)
+                        (
+                            Blocks[chunk, head, :, :],
+                            off_values.at(item),
+                            Inverse[chunk, head, :, :],
+                        ),
+                        (raw, packed),
+                        (lane,),
                     )

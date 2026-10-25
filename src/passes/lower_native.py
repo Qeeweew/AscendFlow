@@ -37,6 +37,7 @@ from ..dialects.physical import (
 from ..dialects.source import (
     AllocationOp,
     CompareOp,
+    CopyGroupOp,
     CopyOp,
     DomainOp,
     ElementOp,
@@ -54,11 +55,19 @@ from ..dialects.source import (
     ScaleOp,
     SizeOp,
     StageOp,
+    StorageSelectOp,
+    TileSliceOp,
     ViewOp,
     WhereOp,
     YieldOp,
 )
-from ..dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
+from ..dialects.structured import (
+    ActorDomainOp,
+    AddressOp,
+    PipelineLoopOp,
+    PipelineStageOp,
+    ReadyGroupOp,
+)
 from ..dialects.types import TaskType, TileType, ref_type
 from ..indexing import multiple_of, validate_static_arithmetic
 from ..scalar import facts_from_sizes, from_ssa
@@ -95,6 +104,7 @@ class NativeStructure:
     uses: tuple[TileUse, ...]
     task_scopes: Mapping[TaskOp, ValueScope]
     work: Mapping[str, int]
+    ready_groups: Mapping[CopyGroupOp, ReadyGroupOp]
 
 
 _INHERIT = object()
@@ -160,6 +170,7 @@ class _Lowerer:
             )
         )
         self.register_uses = []
+        self.ready_groups = {}
         self.work = Counter(source_operations=0, native_templates=0, expanded_iterations=0)
 
     def scalar(self, value, scope):
@@ -168,6 +179,14 @@ class _Lowerer:
         if value in scope.pure:
             return scope.pure[value]
         owner = value.owner
+        if isinstance(owner, StorageSelectOp):
+            selector = self.scalar(owner.selector, scope)
+            if owner.mode.data == "generation":
+                operation = arith.RemUIOp(selector, scope.constant(owner.depth.data))
+                scope.block.add_op(operation)
+                selector = operation.result
+            scope.pure[value] = selector
+            return selector
         _unsupported(
             isinstance(owner, (arith.ConstantOp, arith.CmpiOp, PredicateOp))
             or type(owner) in INTEGER_OPERATIONS,
@@ -423,6 +442,19 @@ class _Lowerer:
             scope.values[op.value] = size.value
         elif isinstance(op, AllocationOp):
             self.allocation(op, scope)
+        elif isinstance(op, CopyGroupOp):
+            before = set(scope.block.ops)
+            self.block(op.body.block, scope)
+            members = tuple(
+                operation.task
+                for operation in scope.block.ops
+                if isinstance(operation, TaskOp) and operation not in before
+            )
+            _unsupported(bool(members), "CopyGroup has no native copy members", op)
+            group = ReadyGroupOp.build(operands=[members], attributes={"label": op.label})
+            group.location = op.location
+            scope.block.add_op(group)
+            self.ready_groups[op] = group
         elif isinstance(
             op,
             (
@@ -482,7 +514,18 @@ class _Lowerer:
             )
             scope.block.add_op(scf.YieldOp(*(self.scalar(value, scope) for value in op.arguments)))
         elif (
-            isinstance(op, (YieldOp, ViewOp, PredicateOp, arith.ConstantOp, arith.CmpiOp))
+            isinstance(
+                op,
+                (
+                    YieldOp,
+                    ViewOp,
+                    PredicateOp,
+                    StorageSelectOp,
+                    TileSliceOp,
+                    arith.ConstantOp,
+                    arith.CmpiOp,
+                ),
+            )
             or type(op) in INTEGER_OPERATIONS
         ):
             # Pure scalar work is materialized at its actual use, with this
@@ -624,7 +667,15 @@ class _Lowerer:
                 if count > before.get(family, 0)
             )
 
-        descriptors = (ViewOp, YieldOp, PredicateOp, arith.ConstantOp, arith.CmpiOp)
+        descriptors = (
+            ViewOp,
+            YieldOp,
+            PredicateOp,
+            StorageSelectOp,
+            TileSliceOp,
+            arith.ConstantOp,
+            arith.CmpiOp,
+        )
 
         def collect(source, actor=None):
             ordinary = []
@@ -788,4 +839,5 @@ def lower_native_structure(source) -> NativeStructure:
         uses,
         MappingProxyType(lowerer.task_scopes),
         MappingProxyType(dict(lowerer.work)),
+        MappingProxyType(lowerer.ready_groups),
     )

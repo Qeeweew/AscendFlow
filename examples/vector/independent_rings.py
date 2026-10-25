@@ -19,12 +19,12 @@ def independent_rings(
     Q: N.constexpr = 7,
 ):
     with N.Kernel(1, kind="vector"):
-        x = N.alloc_ub((P, 64), N.f32, name="inputs")
-        y = N.alloc_ub((Q, 64), N.f32, name="outputs")
-        for t in N.Pipelined(tiles):
+        x = N.alloc_ub((64,), N.f32, slots=P, name="inputs")
+        y = N.alloc_ub((64,), N.f32, slots=Q, name="outputs")
+        for t in N.Pipelined(tiles, issue_order=("load", "compute", "store")):
             with N.Stage(0, name="load"):
-                N.copy(X[t, :], x[t % P, :])
+                loaded = N.copy(X[t, :], x.at(t))
             with N.Vector(), N.Stage(1, name="compute"):
-                N.mul(x[t % P, :], 2.0, out=y[t % Q, :])
+                scaled = N.mul(loaded, 2.0, out=y.at(t))
             with N.Stage(2, name="store"):
-                N.copy(y[t % Q, :], Y[t, :])
+                N.copy(scaled, Y[t, :])

@@ -346,6 +346,8 @@ def _enclosing_slices(address, facts):
     Linear storage permits any fixed leading prefix. Fractal matrices retain
     their final two axes together; the already checked layout maps every
     such matrix into its contiguous plane. No native footprint is enlarged.
+    Admission may use a complete real definition of this enclosure to cover
+    a legal indirect read; the enclosure by itself defines no byte or value.
     """
     axes = address.axes
     if address.matrix is not None:

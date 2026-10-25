@@ -16,6 +16,31 @@
 
 每项义务记录输入、建立者、产出、消费者、保持条件及失效条件。不要把所有名为`prove`的函数一概删除；也不要用cache命中率证明职责设计已合理。不建设可伪造的verified标记或庞大通用proof框架。
 
+source 的槽选择保留实际 allocation、原 selector SSA、槽轴、深度和 generation/
+physical 方式。lowering 产生该 selector 对应的真实 modulo 或直接索引；raw view
+与结构化 view 进入相同地址/effects/alias 链。Tile slice 沿共享值 DAG 转发原
+writer，读取的真实区域仍由 admission 检查，切片不定义新值。
+
+选中的真实 writer 若已定义完整逻辑 allocation 或已建立 enclosure 的完整槽平面，
+其 Tile 可供该范围内合法的间接子视图读取；不重复证明调用方动态索引的 bounds。
+普通初始化检查也消费同一 source/native enclosure 及真实完整 writer。完整范围排除 allocation padding，
+不能由其他 writer 的初始化补大当前 Tile。实际读取仍检查 participant、原 writer
+及之后的可能覆盖；该数值定义事实不提供 ready、ownership 或事件消费。
+
+返回部分 row-prefix copy 的 Tile 表示该更新点的目标区域。其保留部分必须在
+更新发生时已有定义：admission 在真实 native 更新后、下一个 writer 前，从既有
+region/字节 transfer 冻结来源快照，并分别保存实际 participant。完整 payload
+只作为值的区域 enclosure；真实 prefix effects 不扩大。后来写入不能回填早先
+快照，raw alias 的后续覆盖仍由原 stale-value 检查拒绝。定义快照不提供 ready、
+ownership 或 reader 退休，后续同步仍使用真实物理访问。
+
+CopyGroup 的 typed region 对应 physical ReadyGroupOp 的实际 native 成员。
+内存事实检查相同 queue、参与者与 activation；RAW 共同捕获最后成员的真实
+源前缀，原存储 ownership 和 WAR/WAW 分别保持。内部联系不通过共同 ready
+反向等待。资源规划前完成端点与 quorum 检查，终端投影只移除已消费的组描述。
+独立有限模型从 source 对应记录额外的共同 ready 义务，但只允许实际 Set/Wait
+建立完成顺序；未读取的同组成员也不能提前被宣布完成。
+
 目标原生指令的静态描述由 `NativeSpec` 统一保存，逻辑 memory template 和
 终端 native 共享同一份不可变值；实际地址和循环 read condition 各自绑定真实
 SSA/代次。opcode、参数或地址 operand 数量改变必须更新描述，不能沿用旧
@@ -90,18 +115,24 @@ BoundPlacement、LogicalNotification、StructuredNeed 的 hash 在各自不变�
 Comparison、Boolean 和 Symbol 同样只保存自身完整比较字段的 hash；它们不保存
 范围、定义性或完成证明。
 
-Handback 的实际 publication port 按旧消费点、peer、真实循环及 horizon 建立，
-保留全部 source/receiver 激活、坐标对应和首段发射条件。不同目标可以共用这些
-未变接口，但各自仍检查 receiver→新 Set 和完整消费覆盖。先按路由选择，再按需
-打开 child FIRST/LAST；未用的可选边界不成为新的准入要求。两段交接只连接实际
-中间 queue 已有的通知，不存任意路径闭包。覆盖 union 没有新增证据时不重复求解，
-输入前提变化的其他 reuse 请求不能借用该结论。
+消费使用独立的 ConsumptionOrigin：真实匹配 Wait 已消费后，它只阻塞指定 queue，
+Scalar/cross Wait 按目标合同阻塞 controller。来源完成和消费共用位置、实际
+capture 快照及匹配 acquire 的 DAG，不能把数据 ready 替代旧 Wait 消费。
+复用窗口通过实际 offset span 和 FIRST/LAST 端口建立，不展开 runtime N。
+同锚点不同动作没有自然先后；消费到新 capture 必须严格推进真实位置。
 
-单段 handback 的返回前沿可以省去被已有返回点覆盖的较晚候选：完整有序 guard、
-全部参与者的实际坐标/选择前提必须相同，两个 Wait 均已具备阻塞目标 queue/controller
-的路由资格，且已有返回点到较晚返回点的实际发射顺序无条件成立。由发射顺序传递，
-任何可由较晚返回点到达的新 Set 也能由已有返回点到达；不新增完成边，不将两个
-通知合成一个贡献。两段 handback 的中间 native/queue 匹配仍保留全部原端口。
+消费前沿保留 origin、实际取得事实的 Wait 或 queue admission cut、完整前提、
+证明及该输入作用域拥有的数学答案。二维位置索引只从同一阻塞路由和实际调用
+取前沿；在实际 Wait 后取得的事实不能借相同锚点回填更早 capture。改变前提的
+查询仍证明全部激活及两个 cut 的顺序，不复用其他作用域的 proved 标记。
+条件证明可以共享；未覆盖开放边界时继续组合该图，缓存阴性结果不作不可达证明。
+报告按 DAG 引用保留证据，不重新展开全部 relay 历史。
+
+同一 transfer 图的数学剪枝上下文按完整有序前提共享。上下文保留标准化
+差式及常量偏移的上下界，处理严格比较和相反方向，只用于 guard 真值和 may
+可达性的剪枝；它不产生完成/消费事实。实际覆盖仍保留原条件，并由同一
+输入 owner 的数学服务验证完整蕴含。图、输入事实或前提改变时不能复用该表，
+原式定义性和机器整数范围也不由这些数学差式授权。
 
 本地事件共享使用分层的真实 publication/consumption 前沿。包围依据完整激活和
 坐标合同下的无条件发射顺序，实际消费仍由 handback 建立，包括各层重入。
@@ -183,6 +214,11 @@ mode-2 Wait 阻塞接收端 controller。已有完整 quorum 的 capture/acquire
 同一接收端 controller 上随后其他 pipe 的访问，但须保持 producer pipe、全部
 参与者、激活和真实端点顺序。该覆盖不新增完成关系或改变原通知的 ownership。
 local Wait 只阻塞目标 queue，不能以相同理由覆盖另一 pipe 的 consumer。
+
+组合完成覆盖逐条保存合并前需求的端点和证明对应；证明只落到实际保留的
+capture/acquire。已删除动作不能支持后续删除，保留支持动作也不能再被删除。
+同一通知的多个 writer、分支和调用分别检查完整激活，不能只证明代表端点。
+完成证明不授权旧 Wait 已消费；消费和资源许可在最终通知集合上另行建立。
 
 release定位全部相关最后reader：MTE1读完L1可以释放L1而MAD/FIX继续；MTE2读完共享GM可以释放GM而Vector继续。不能以整个计算完成替代最后读取，不能因不同tensor名称忽略别名。
 

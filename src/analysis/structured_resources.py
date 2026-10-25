@@ -40,7 +40,9 @@ def allocate_event_ids(problem):
     preferred = problem
     for option, candidate in enumerate((preferred, *preferred.alternatives)):
         require(
-            candidate.selection is preferred.selection and candidate.order is preferred.order,
+            candidate.selection is preferred.selection
+            and candidate.order is preferred.order
+            and candidate.id_pools is preferred.id_pools,
             "protocol option belongs to another generated notification program",
         )
         try:
@@ -177,6 +179,7 @@ def allocate_event_ids(problem):
     problem.work.coloring_nodes = nodes
     problem.work.selected_protocol_option = option
     problem.work.peer_equalities = len(problem.peers)
+    problem.work.phase_occupancies = sum(d.phase is not None for d in problem.demands)
     problem.work.counter_groups = len(problem.counter_groups)
     return EventAllocation(
         ids,
@@ -279,6 +282,8 @@ def allocate_structured_events(problem):
         work=problem.work,
         channels=problem.channels,
         banks=tuple(EventBankUsage(b, tuple(sorted(ids))) for b, ids in banks.items()),
+        id_pools=problem.id_pools,
+        occupancies=problem.demands,
         sharing=allocation.sharing,
         persistent=persistent,
         counter_groups=allocation.counter_groups,

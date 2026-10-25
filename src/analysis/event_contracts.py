@@ -33,6 +33,48 @@ CROSS_BACKLOG = 15
 
 
 @dataclass(frozen=True, slots=True)
+class EventIdPools:
+    """Assignable target numbers, snapshotted before resource planning.
+
+    A restricted pool is a subset of the real hardware namespace. Fixed
+    reservations remain occupied even when outside that assignable subset.
+    Private bank overrides do not merge AIV storage or numbering obligations.
+    """
+
+    local: tuple[int, ...] = tuple(range(8))
+    cross: tuple[int, ...] = tuple(range(16))
+    banks: tuple[tuple[LocalBank, tuple[int, ...]], ...] = ()
+
+    def __post_init__(self):
+        def snapshot(values, limit):
+            values = tuple(values)
+            if any(type(n) is not int or not 0 <= n < limit for n in values):
+                raise ValueError("event pool must contain actual target integer IDs")
+            if len(set(values)) != len(values):
+                raise ValueError("event pool repeats a target ID")
+            return tuple(sorted(values))
+
+        object.__setattr__(self, "local", snapshot(self.local, 8))
+        object.__setattr__(self, "cross", snapshot(self.cross, 16))
+        banks = tuple((tuple(bank), snapshot(values, 8)) for bank, values in self.banks)
+        if len({bank for bank, _ in banks}) != len(banks):
+            raise ValueError("event pool repeats a private bank")
+        if any(
+            len(bank) != 3
+            or not isinstance(bank[0], Actor)
+            or any(not isinstance(pipe, Engine) for pipe in bank[1:])
+            for bank, _ in banks
+        ):
+            raise ValueError("event pool requires an actual actor/pipe bank")
+        object.__setattr__(self, "banks", banks)
+
+    def ids(self, bank):
+        if bank is None:
+            return self.cross
+        return next((values for own, values in self.banks if own == bank), self.local)
+
+
+@dataclass(frozen=True, slots=True)
 class CaseLease:
     case: EventCase
     width: int
@@ -82,13 +124,19 @@ class PersistentEventAssignment:
 
 @dataclass(frozen=True, slots=True)
 class EventDemand:
-    """One complete credit's virtual lanes, independent of hardware numbers."""
+    """One occupation's virtual lanes, retaining its logical credit identity.
+
+    A whole credit is the preferred occupation. A phase may instead select
+    actual notification members; their own leases and all pairing still hold.
+    """
 
     members: tuple[LogicalNotification, ...]
     width: int
     banks: tuple[LocalBank, ...]
     backlog: int | None = None
     persistent: PersistentCellCredit | None = None
+    credit: object | None = None
+    phase: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +161,7 @@ class EventResourceProblem:
     """Owned, frozen resource premises; no domain or solver service is exposed.
 
     Construct with plan_event_resources. Relations cover all members of each
-    complete credit. A missing/None relation supplies no reuse permission.
+    selected occupation, retaining its logical credit. Missing/None gives no permission.
     CounterSharing pairs still require a whole CounterGroup for FIFO packing.
     Work is diagnostic accounting only and never an allocation premise.
     """
@@ -129,6 +177,7 @@ class EventResourceProblem:
     counter_groups: tuple[CounterGroup, ...]
     counter_compositions: tuple[CounterTimeGroups, ...]
     counter_reuses: Mapping[tuple[int, int], tuple[CounterReuse, ...]]
+    id_pools: EventIdPools
     reservations: tuple[EventReservation, ...]
     relations: FrozenEventRelations
     work: ResourceWork
@@ -174,13 +223,7 @@ class ResourceWork:
     window_constructions: int = 0
     lifetime_interfaces: int = 0
     issue_order_words: int = 0
-    handback_candidates: int = 0
-    handback_port_candidates: int = 0
-    handback_ports: int = 0
-    handback_return_candidates: int = 0
-    dominated_handback_returns: int = 0
     handback_cover_queries: int = 0
-    handback_compositions: int = 0
     ring_cases: int = 0
     cell_channels: int = 0
     cell_members: int = 0
@@ -207,6 +250,40 @@ class ResourceWork:
     counter_time_cache_hits: int = 0
     boundary_instances: int = 0
     boundary_instance_reuses: int = 0
+    transfer_words: int = 0
+    transfer_nodes: int = 0
+    transfer_edges: int = 0
+    transfer_order_bands: int = 0
+    transfer_range_vertices: int = 0
+    completion_queries: int = 0
+    completion_nodes: int = 0
+    completion_cycles: int = 0
+    completion_eliminated: int = 0
+    transfer_components: int = 0
+    transfer_may_points: int = 0
+    completion_pruned: int = 0
+    completion_shortcuts: int = 0
+    consumption_queries: int = 0
+    consumption_nodes: int = 0
+    consumption_cycles: int = 0
+    consumption_pruned: int = 0
+    consumption_shortcuts: int = 0
+    consumption_instances: int = 0
+    consumption_regions: int = 0
+    consumption_frontier_words: int = 0
+    consumption_frontier_queries: int = 0
+    consumption_frontier_hits: int = 0
+    consumption_fact_reuses: int = 0
+    consumption_state_hits: int = 0
+    consumption_state_refreshes: int = 0
+    counter_structure_ids: int = 0
+    consumption_acquired_boundaries: int = 0
+    consumption_bound_queries: int = 0
+    consumption_bound_exclusions: int = 0
+    phase_occupancies: int = 0
+    phase_candidates: int = 0
+    transfer_fact_contexts: int = 0
+    transfer_fact_reuses: int = 0
 
 
 @dataclass(frozen=True)
@@ -220,6 +297,8 @@ class StructuredEventPlan:
     work: ResourceWork
     channels: tuple[CellChannel, ...]
     banks: tuple[EventBankUsage, ...]
+    id_pools: EventIdPools
+    occupancies: tuple[EventDemand, ...]
     sharing: tuple[EventSharing | LocalEventReuse | CounterSharing | CounterReuse, ...] = ()
     persistent: tuple[PersistentEventAssignment, ...] = ()
     counter_groups: tuple = ()

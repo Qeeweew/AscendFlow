@@ -11,6 +11,12 @@ FIX 退休点。L1 384 KiB，L0A/B 各 64 KiB，L0C 128 KiB，无 GM workspace�
 仅最后一个 K panel 写回，FIXPIPE 位于 compute 末尾的 LAST 条件内，
 与 compute 共用 stage；pipeline horizon 为 `PREFETCH+1`。
 
+A/B、L0 operand 和输出环分别用 `slots` 声明，列片位于 payload 内。
+import helper 接收当前 panel view，返回 A 的逻辑 Tile；多个 B 列片保持各自
+copy 和普通物理 view。compute helper 保留 A 的全部实际 reader，并接收按
+输出 tile 选中的 L0C payload，最后 FIX 后才允许下一次覆盖。相邻 B 列片
+不要求共同 ready，原 load/compute 发射顺序与 `PREFETCH` 含义保留。
+
 输出 tile 的核间独立性属于源 SPMD 算法前提，编译器不求解遍历的全局单射。
 实际二维 footprint、axes 和 offset 保留并检查 bounds；简单矩形规则无法
 排除冲突时，按 AliasRegion 保留源码访问顺序。异步完成和物理槽复用分别处理。

@@ -10,7 +10,7 @@ from itertools import combinations
 
 from ..budget import poll
 from ..diagnostics import CompileError, ErrorKind, require
-from .event_contracts import CROSS_BACKLOG, LOCAL_CAPACITY, SUPPORTED_CROSS_IDS, EventDemand
+from .event_contracts import CROSS_BACKLOG, EventDemand, EventIdPools
 
 MAX_COLORING_NODES = 16384
 
@@ -35,7 +35,8 @@ def relation(problem, a, b):
 class _ColoringProblem:
     demands: tuple
     reservations: tuple
-    relations: dict
+    relations: object
+    id_pools: EventIdPools
     counter_packs: tuple[frozenset[int], ...] = ()
     counter_reuses: frozenset[tuple[int, int]] = frozenset()
     counter_time_packs: tuple[tuple[frozenset[int], ...], ...] = ()
@@ -74,6 +75,46 @@ def _peer_demands(demands, peers):
     return merged, groups
 
 
+@dataclass(frozen=True)
+class _PeerRelations:
+    """Numeric projection queried only for actual residual conflicts.
+
+    Do not materialize all quotient pairs before the exclusive/word fast
+    paths. The original frozen permissions and every private bank survive.
+    """
+
+    original: object
+    groups: tuple
+    banks: tuple
+    demands: tuple
+    packs: tuple
+    reuses: frozenset
+    time_packs: tuple
+
+    def get(self, key, default=None):
+        a, b = key
+        if (a, b) in self.reuses:
+            return ()
+        if self.demands[a].backlog is not None:
+            return (
+                ()
+                if (
+                    any({a, b} <= pack for pack in self.packs)
+                    or any({a, b} <= frozenset().union(*groups) for groups in self.time_packs)
+                )
+                else default
+            )
+        common = False
+        for x in self.groups[a]:
+            for y in self.groups[b]:
+                if self.banks[x].isdisjoint(self.banks[y]):
+                    continue
+                common = True
+                if self.original.get((min(x, y), max(x, y))) is None:
+                    return default
+        return () if common else default
+
+
 def _equal_numbers(problem):
     demands, groups = _peer_demands(problem.demands, problem.peers)
     owners = {n: i for i, group in enumerate(groups) for n in group}
@@ -82,39 +123,22 @@ def _equal_numbers(problem):
         tuple(frozenset(owners[n] for n in group) for group in c.groups)
         for c in getattr(problem, "counter_compositions", ())
     )
-    relations = {}
-    time = set()
-    for a, b in combinations(range(len(groups)), 2):
-        common = set(namespaces(demands[a])).intersection(namespaces(demands[b]))
-        if not common:
-            continue
-        permissions = [
-            relation(problem, x, y)
-            for x in groups[a]
-            for y in groups[b]
-            if set(namespaces(problem.demands[x])).intersection(namespaces(problem.demands[y]))
-        ]
-        temporal = demands[a].backlog is not None and all(
-            (min(x, y), max(x, y)) in problem.counter_reuses for x in groups[a] for y in groups[b]
-        )
-        packing = (
-            demands[a].backlog is None
-            or any({a, b} <= pack for pack in packs)
-            or any({a, b} <= frozenset().union(*groups) for groups in time_packs)
-        )
-        if temporal:
-            time.add((a, b))
-        if (
-            temporal
-            or packing
-            and (
-                demands[a].backlog is not None
-                or all(permission is not None for permission in permissions)
-            )
-        ):
-            relations[a, b] = ()
+    # Mode-2 has no peer quotient: each original temporal pair remains one
+    # numeric pair. Local peers must satisfy all original private-bank rows.
+    time = frozenset(
+        (min(owners[a], owners[b]), max(owners[a], owners[b])) for a, b in problem.counter_reuses
+    )
+    relations = _PeerRelations(
+        problem.relations,
+        groups,
+        tuple(frozenset(namespaces(d)) for d in problem.demands),
+        demands,
+        packs,
+        time,
+        time_packs,
+    )
     return _ColoringProblem(
-        demands, problem.reservations, relations, packs, frozenset(time), time_packs
+        demands, problem.reservations, relations, problem.id_pools, packs, time, time_packs
     ), groups
 
 
@@ -141,39 +165,84 @@ def counter_group_usage(demands, members, reuses, packs, *, packing=True, time_p
     return None
 
 
+def counter_fifo_partition(demands, packs, members=None):
+    """A concrete finite upper bound using already certified whole words.
+
+    Removing messages preserves a CounterGroup certificate. This greedy
+    partition is a sufficient mapping proposal, never a minimum-ID claim.
+    It neither queries a domain nor derives an event consumption relation.
+    """
+    remaining = {
+        n
+        for n, demand in enumerate(demands)
+        if demand.backlog is not None and (members is None or n in members)
+    }
+    if any(demands[n].width != 1 or demands[n].backlog > CROSS_BACKLOG for n in remaining):
+        return None
+    result = []
+    for pack in sorted(packs, key=lambda values: (-len(values), tuple(sorted(values)))):
+        selected = frozenset(remaining.intersection(pack))
+        if len(selected) < 2 or sum(demands[n].backlog for n in selected) > CROSS_BACKLOG:
+            continue
+        result.append(selected)
+        remaining.difference_update(selected)
+    result.extend(frozenset((n,)) for n in sorted(remaining))
+    return tuple(result)
+
+
+def _structured_counter_colors(problem, group, reserved):
+    partition = counter_fifo_partition(problem.demands, problem.counter_packs, group)
+    available = tuple(flag for flag in problem.id_pools.cross if flag not in reserved.get(None, ()))
+    if partition is None or len(partition) > len(available):
+        return None
+    return {
+        number: (flag,) for pack, flag in zip(partition, available, strict=False) for number in pack
+    }
+
+
 def _components(demands):
-    pending = set(range(len(demands)))
-    while pending:
-        first = min(pending)
-        pending.remove(first)
-        group, banks = [first], set(namespaces(demands[first]))
-        changed = True
-        while changed:
-            changed = False
-            for number in sorted(pending):
-                own = set(namespaces(demands[number]))
-                if banks.intersection(own):
-                    pending.remove(number)
-                    group.append(number)
-                    banks.update(own)
-                    changed = True
-        yield tuple(sorted(group))
+    roots, banks = list(range(len(demands))), {}
+
+    def root(number):
+        while roots[number] != number:
+            roots[number] = roots[roots[number]]
+            number = roots[number]
+        return number
+
+    for number, demand in enumerate(demands):
+        for bank in namespaces(demand):
+            prior = banks.setdefault(bank, number)
+            a, b = root(prior), root(number)
+            roots[max(a, b)] = min(a, b)
+    groups = {}
+    for number in range(len(demands)):
+        groups.setdefault(root(number), []).append(number)
+    yield from (tuple(group) for group in groups.values())
 
 
-def _exclusive(demands, group, reserved, capacity):
+def _available(pools, banks, occupied):
+    return tuple(
+        sorted(
+            set.intersection(
+                *(set(pools.ids(bank)).difference(occupied.get(bank, ())) for bank in banks)
+            )
+        )
+    )
+
+
+def _exclusive(demands, group, reserved, pools):
     occupied = {b: set(ids) for b, ids in reserved.items()}
     result = {}
     for number in group:
         d = demands[number]
-        blocked = set().union(*(occupied.get(b, set()) for b in namespaces(d)))
-        choices = [flag for flag in range(capacity) if flag not in blocked]
+        choices = _available(pools, namespaces(d), occupied)
         if len(choices) < d.width:
             return None
         ids = next(
             (
                 tuple(range(base, base + d.width))
-                for base in range(capacity - d.width + 1)
-                if all(flag not in blocked for flag in range(base, base + d.width))
+                for base in choices
+                if all(flag in choices for flag in range(base, base + d.width))
             ),
             tuple(choices[: d.width]),
         )
@@ -183,7 +252,7 @@ def _exclusive(demands, group, reserved, capacity):
     return result
 
 
-def exclusive_pressure_banks(demands, reservations, peers):
+def exclusive_pressure_banks(demands, reservations, peers, id_pools):
     """Banks whose joint exclusive placement fails the finite fast path.
 
     Equal-number peers couple otherwise private banks. Per-bank counts can
@@ -196,11 +265,49 @@ def exclusive_pressure_banks(demands, reservations, peers):
         reserved.setdefault(r.bank, set()).add(r.event)
     pressured = set()
     for group in _components(demands):
-        cross = demands[group[0]].backlog is not None
-        capacity = len(SUPPORTED_CROSS_IDS) if cross else LOCAL_CAPACITY
-        if _exclusive(demands, group, reserved, capacity) is None:
+        if _exclusive(demands, group, reserved, id_pools) is None:
             pressured.update(bank for n in group for bank in namespaces(demands[n]))
     return pressured
+
+
+def fixed_credit_pressure_banks(problem):
+    """A finite clique of whole-credit constraints requests phase precision.
+
+    This is a sufficient failure of the frozen coarse mapping, never a
+    physical-occupancy minimum. Do not enumerate compatible member subsets.
+    """
+    groups, reserved = {}, {}
+    for r in problem.reservations:
+        reserved.setdefault(r.bank, set()).add(r.event)
+    for number, demand in enumerate(problem.demands):
+        if demand.backlog is None:
+            for bank in demand.banks:
+                groups.setdefault(bank, []).append(number)
+    result = set()
+    for bank, members in groups.items():
+        clique, width = [], 0
+        capacity = len(set(problem.id_pools.ids(bank)).difference(reserved.get(bank, ())))
+        for number in members:
+            if all(relation(problem, number, prior) is None for prior in clique):
+                clique.append(number)
+                width += problem.demands[number].width
+                if width > capacity:
+                    if any(len(problem.demands[n].members) > 1 for n in members):
+                        result.add(bank)
+                    break
+    return frozenset(result)
+
+
+def _exclusive_overfull(problem, group, reserved):
+    """A real exclusive bank count avoids constructing a dense clique."""
+    counts = {}
+    for number in group:
+        for bank in namespaces(problem.demands[number]):
+            counts[bank] = counts.get(bank, 0) + problem.demands[number].width
+    return any(
+        count > len(set(problem.id_pools.ids(bank)).difference(reserved.get(bank, ())))
+        for bank, count in counts.items()
+    )
 
 
 def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_packing=False):
@@ -210,17 +317,20 @@ def _color(problem, group, reserved, capacity, node_limit, *, reuse, counter_pac
     adjacency = [set() for _ in vertices]
     allowed = []
     for number, _ in vertices:
-        blocked = set().union(*(reserved.get(b, set()) for b in namespaces(demands[number])))
-        allowed.append(tuple(flag for flag in range(capacity) if flag not in blocked))
+        allowed.append(_available(problem.id_pools, namespaces(demands[number]), reserved))
     # Unused IDs with the same admissible vertices are interchangeable.
     # Reservations can distinguish numbers across joint banks, so retain the
     # whole allowed-column signature rather than just a count of used IDs.
-    signatures = tuple(tuple(flag in choices for choices in allowed) for flag in range(capacity))
+    signatures = {
+        flag: tuple(flag in choices for choices in allowed) for flag in set().union(*allowed)
+    }
     for i, j in combinations(range(len(vertices)), 2):
         a, b = vertices[i][0], vertices[j][0]
         common = set(namespaces(demands[a])).intersection(namespaces(demands[b]))
-        permitted = relation(problem, a, b) is not None and (
-            not cross or counter_packing or (min(a, b), max(a, b)) in problem.counter_reuses
+        permitted = (
+            reuse
+            and relation(problem, a, b) is not None
+            and (not cross or counter_packing or (min(a, b), max(a, b)) in problem.counter_reuses)
         )
         if a == b or common and (not reuse or not permitted):
             adjacency[i].add(j)
@@ -320,9 +430,17 @@ def color_event_resources(problem, *, node_limit=None):
     nodes = 0
     for group in _components(problem.demands):
         cross = problem.demands[group[0]].backlog is not None
-        capacity = len(SUPPORTED_CROSS_IDS) if cross else LOCAL_CAPACITY
-        colors = _exclusive(problem.demands, group, reserved, capacity)
-        if colors is None:
+        capacity = len(
+            set().union(
+                *(
+                    problem.id_pools.ids(bank)
+                    for number in group
+                    for bank in namespaces(problem.demands[number])
+                )
+            )
+        )
+        colors = _exclusive(problem.demands, group, reserved, problem.id_pools)
+        if colors is None and not _exclusive_overfull(problem, group, reserved):
             # Greedy placement can fail even when a different exclusive
             # mapping fits all peer banks. Exhaust that finite constraint
             # graph before enabling any optional reuse relation.
@@ -330,22 +448,26 @@ def color_event_resources(problem, *, node_limit=None):
                 problem, group, reserved, capacity, node_limit - nodes, reuse=False
             )
             nodes += work
+        if colors is None and cross and not problem.counter_reuses:
+            colors = _structured_counter_colors(problem, group, reserved)
         if colors is None:
             colors, work = _color(
                 problem, group, reserved, capacity, node_limit - nodes, reuse=True
             )
             nodes += work
         if colors is None and cross:
-            colors, work = _color(
-                problem,
-                group,
-                reserved,
-                capacity,
-                node_limit - nodes,
-                reuse=True,
-                counter_packing=True,
-            )
-            nodes += work
+            colors = _structured_counter_colors(problem, group, reserved)
+            if colors is None:
+                colors, work = _color(
+                    problem,
+                    group,
+                    reserved,
+                    capacity,
+                    node_limit - nodes,
+                    reuse=True,
+                    counter_packing=True,
+                )
+                nodes += work
         if colors is None:
             first = problem.demands[group[0]]
             names = [m.name for n in group for m in problem.demands[n].members]

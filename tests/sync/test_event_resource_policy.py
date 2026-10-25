@@ -12,7 +12,12 @@ from ascendflow.analysis.event_coloring import (
     color_event_resources,
     exclusive_pressure_banks,
 )
-from ascendflow.analysis.event_contracts import EventDemand, EventReservation, ResourceWork
+from ascendflow.analysis.event_contracts import (
+    EventDemand,
+    EventIdPools,
+    EventReservation,
+    ResourceWork,
+)
 from ascendflow.analysis.notification_lifetimes import HandbackRule, Reuse
 from ascendflow.analysis.structured_protocols import NotificationKind
 from ascendflow.analysis.structured_resources import _mapped_event
@@ -116,6 +121,7 @@ def private_bank_problem(*, both_coupled):
         counter_groups=(),
         counter_reuses={},
         relations={},
+        id_pools=EventIdPools(),
     ), (a, b)
 
 
@@ -127,9 +133,9 @@ def test_joint_private_bank_pressure_is_detected_when_individual_counts_fit():
             + sum(r.bank == bank for r in problem.reservations)
             == 8
         )
-    assert exclusive_pressure_banks(problem.demands, problem.reservations, problem.peers) == set(
-        banks
-    )
+    assert exclusive_pressure_banks(
+        problem.demands, problem.reservations, problem.peers, problem.id_pools
+    ) == set(banks)
     with pytest.raises(NoEventAssignment):
         color_event_resources(problem)
     # Both complete private pairs have frozen noninterference permissions.

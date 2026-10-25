@@ -27,6 +27,7 @@ from .structured_schedule import ActionGuard, Comparison, Placement
 
 if TYPE_CHECKING:
     from .cell_ownership import CellLifetime
+    from .completion_prefixes import CompletionCoverage
     from .region_coordinates import ScalarScope
     from .smt import Exists
 
@@ -180,6 +181,15 @@ class EmptyOrdinalDomain:
 
 
 @dataclass(frozen=True, slots=True)
+class RequirementBinding:
+    """Original demand endpoints before capture/quorum/coverage coalescing."""
+
+    requirement: StructuredNeed
+    source: BoundPlacement
+    consumer: BoundPlacement
+
+
+@dataclass(frozen=True, slots=True)
 class NotificationCoverage:
     requirement: StructuredNeed
     rule: str
@@ -187,6 +197,8 @@ class NotificationCoverage:
     ordering: OrderingWitness | None = None
     ownership: CellLifetime | None = None
     absence: EmptyOrdinalDomain | None = None
+    completion: CompletionCoverage | None = None
+    binding: RequirementBinding | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +232,8 @@ class SynchronizationSelection:
         return not self.unresolved
 
     def require_closed(self):
+        from .completion_prefixes import CompletionCoverage
+
         if self.unresolved:
             issue = self.unresolved[0]
             raise CompileError(
@@ -253,7 +267,7 @@ class SynchronizationSelection:
             all(
                 sum(
                     item is not None
-                    for item in (c.notification, c.ordering, c.ownership, c.absence)
+                    for item in (c.notification, c.ordering, c.ownership, c.absence, c.completion)
                 )
                 == 1
                 and (
@@ -264,5 +278,30 @@ class SynchronizationSelection:
                 )
                 for c in self.coverage
             ),
-            "coverage lacks an owned notification, ordering, ownership, or empty-domain fact",
+            "coverage lacks exactly one owned notification, ordering, ownership, absence, or completion fact",
         )
+        retained = {id(item) for item in self.notifications}
+        completions = {
+            id(c.completion): c.completion for c in self.coverage if c.completion is not None
+        }
+        for item in self.coverage:
+            proof = item.completion
+            require(
+                proof is None
+                or isinstance(proof, CompletionCoverage)
+                and proof.dispatch is self.dispatch
+                and item.binding is not None
+                and item.binding.requirement is item.requirement
+                and proof.covers(item.binding)
+                and any(need is item.requirement for need in proof.notification.requirements),
+                "completion coverage belongs to another requirement or dispatch",
+            )
+        for proof in completions.values():
+            require(
+                proof.obligations
+                and proof.cases
+                and id(proof.notification) not in retained
+                and all(item.answer.proved for item in proof.obligations)
+                and all(id(item) in retained for item in proof.supports()),
+                "completion coverage does not terminate in retained actual actions",
+            )

@@ -41,21 +41,21 @@ def mask_rows(
         cols = N.arange(COLUMNS)[None, :]
         # Column prefix: cols < hi.
         N.copy(X, work)
-        N.fill(work, -7.0, mask=cols < hi)
-        N.copy(work, Y0)
+        prefix = N.fill(work, -7.0, mask=cols < hi)
+        N.copy(prefix, Y0)
         # Complement of one runtime point: cols != lo.
         N.copy(X, work)
-        N.fill(work, -9.0, mask=cols != lo)
-        N.copy(work, Y1)
+        complement = N.fill(work, -9.0, mask=cols != lo)
+        N.copy(complement, Y1)
         # Negative unit comparison with a per-row origin: rows >= cols - q.
         # A one-row tile has no non-singleton row lane axis, so the same
         # predicate is written with its degenerate row origin (row 0).
         N.copy(X, work)
         if ROWS == 1:
-            N.fill(work, -11.0, mask=cols <= q)
+            diagonal = N.fill(work, -11.0, mask=cols <= q)
         else:
-            N.fill(work, -11.0, mask=rows >= cols - q)
-        N.copy(work, Y2)
+            diagonal = N.fill(work, -11.0, mask=rows >= cols - q)
+        N.copy(diagonal, Y2)
 
 
 def main():

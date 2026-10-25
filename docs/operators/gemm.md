@@ -21,6 +21,12 @@ K 流水只有 load/compute 两个 stage；最后一个 panel 在 compute 末尾
 FIXPIPE，不为只执行一次的写回增加 export stage。MAD→FIX 与 accumulator
 下一次清零前的最后读取关系仍由正常同步分析建立。
 
+L1 和 L0 的时间环分别使用 `slots` 声明，列片仍是 payload 内的空间轴。
+load helper 接收当前物理 payload view，并在 `CopyGroup` 中共同发布 A/B 两份
+panel，返回各自的逻辑 Tile。compute helper 从这些 Tile 切出真实 Cube 子片；
+切片保持原 writer、NZ leading M 和各自的最后 reader。共同 ready 不合并 DMA，
+各 buffer 的 release、累加器 RMW 和 FIX 生命周期仍单独建立。
+
 默认 `L2_TILE=0` 按半个 L2 的输入预算选择子矩形边长：
 `edge=max(1,L2_BYTES//(4*K*(BM+BN*COL_PARTS)))`。M/N 方向各取不超过
 该边长的完整 tile 数；不能整除时该轴采用一个 tile。先遍历 L2 子矩形，

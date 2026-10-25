@@ -12,14 +12,22 @@ from ascendflow.dialects.physical import (
     RuntimeSizeOp,
     TaskOp,
 )
-from ascendflow.dialects.structured import ActorDomainOp, AddressOp, PipelineLoopOp, PipelineStageOp
+from ascendflow.dialects.structured import (
+    ActorDomainOp,
+    AddressOp,
+    PipelineLoopOp,
+    PipelineStageOp,
+    ReadyGroupOp,
+)
 from ascendflow.dialects.types import RefType
 
 
 def interpret(block, values, arguments, trace):
     """Independent scalar evaluation; plain clock enumeration only in tests."""
     for op in block.ops:
-        if isinstance(op, FixConfigOp):
+        if isinstance(op, ReadyGroupOp):
+            result = ()  # Policy marker; native/address dispatch has no new instruction.
+        elif isinstance(op, FixConfigOp):
             result = ()  # Register setup is outside this scalar/address oracle.
         elif isinstance(op, RuntimeSizeOp):
             result = (arguments[op.sym_name.data],)

@@ -78,6 +78,21 @@ queue acquire。被选通知保留它自身的原始 ownership edge，不把新�
 各 word 分别判断激活包含关系，任意多种条件/调用域一般仍可形成真实稠密关系。
 这些完成覆盖事实不提供 event 消费或 ID 共享资格。
 
+配对域建立后，完成前缀还通过实际 capture/acquire 组合。capture 冻结其之前
+已阻塞本 queue/controller 的 Wait 所取得的来源；后来才执行的 Wait 不能回填。
+native issue 本身不产生完成事实。同锚点不同动作不因位置相等取得先后关系。
+条件前缀的合取/并集保持共享 DAG，由原始需求的完整激活前提证明覆盖。
+层级位置索引将不同 sibling region 的内部获取合为共享出口范围；查询只进入
+与目标位置重合的 child，开放分支的激活仍保留在每个真实获取上。range 节点
+不成为新 gate，空 child 不提供完成事实。SCC 的可能来源上界仅用于查询剪枝，
+同一不可变上界在当前原始需求的查询中复用，不作为完成证据。
+
+每条合并前需求保留独立的 source/consumer binding，包含 CopyGroup 明确授权的
+共同 ready。删除一个合并通知前逐 binding、逐参数 case 检查；只为相同真实端点
+共享查询，不能用代表 source 替代其他 writer，也不能合取互斥 writer 的激活条件
+制造空域。证明排除自身及此前已删除的协议，成功证明引用的实际支持协议保持
+保留。cell credit、消费、进展和资源许可随后在保留集合上建立。
+
 以上规则也适用于已经完整的跨核 quorum：每个 producer 的捕获都覆盖所需
 source，每个 receiver 的已有 acquire 都先于所需 consumer，才能复用。
 相同 Stage、ActorDomain 或共同写入某个 cell 都不授权合并独立完成边界；
@@ -229,9 +244,15 @@ queue_order 检查。无法建立这个本地前提时明确报告支持边界�
 
 真正 streaming 地址之间没有物理 slot 可提供上述归纳。它们使用明确的有限使用
 上界，或真实 queue handback：旧 Wait 直接阻塞下一 Set 的 source queue/controller，
-或经已经需要的同步返回。两次 handoff 可在同一实际 native occurrence 上相接，
-也可经同一 stage 内同一队列的后续发布相接；后者独立检查实际坐标、存在域及
-Wait 到发布之间的 queue 次序。只组合两次既有 handoff，不建立任意路径搜索。
+或经已经需要的同步返回。消费 origin 经实际 capture/acquire 快照组合，不设
+固定 relay 深度。每个实际 Set 的快照仍只取得它之前的 Wait；晚于 capture 的
+交接不能回填。完整源/目标存在域、真实 actor clock、FIRST/LAST 和每个参与者
+分别保持；没有新增 barrier 或 controller gate。
+
+已建立的消费事实导出到实际取得它的 Wait，保存完整前提和数学证明，再沿真实
+queue/controller 传递。相同前沿通过共享位置范围索引和不可变证明复用；新的
+开放边界仍在同一图中组合。完成和消费有不同的 origin 类型，完成覆盖不提供
+事件复用资格。布尔条件和证明用 DAG 保存，编码及遍历不依赖 Python 递归深度。
 
 环政策与规则能力分开：先用有限次数或 native 边界 handback 构造首选协议；
 该流自身无法在容量内构造时才直接用 queue-composition。已有合法首选环的

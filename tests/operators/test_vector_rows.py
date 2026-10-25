@@ -88,8 +88,8 @@ def test_broadcast_requires_complete_supported_physical_rows():
 def test_broadcast_reads_the_borrowed_statistic_before_it_is_overwritten():
     source = mutated(
         lambda s: s.replace(
-            "T.sub(x[slot, :, :], maximum[:, None]",
-            "T.fill(statistic, 0.0)\n    T.sub(x[slot, :, :], maximum[:, None]",
+            "shifted = T.sub(x, maximum[:, None]",
+            "T.fill(statistic, 0.0)\n    shifted = T.sub(x, maximum[:, None]",
         )
     )
     with pytest.raises(CompileError, match="overwrite before its actual native reader"):
@@ -97,11 +97,14 @@ def test_broadcast_reads_the_borrowed_statistic_before_it_is_overwritten():
 
 
 def test_broadcast_result_keeps_the_destination_as_its_logical_producer():
-    source = mutated(
-        lambda s: s.replace("T.sub(x[", "shifted = T.sub(x[").replace(
-            "T.exp(y[slot, :, :]", "T.exp(shifted"
-        )
+    source = softmax.to_ir()
+    shifted = next(
+        op for op in source.walk() if isinstance(op, ElementOp) and op.kind.data == "sub_rows"
     )
+    exponential = next(
+        op for op in source.walk() if isinstance(op, ElementOp) and op.kind.data == "exp"
+    )
+    assert tuple(exponential.dependencies) == (shifted.value,)
     assert "asc_exp" in compile(source).asc
 
 

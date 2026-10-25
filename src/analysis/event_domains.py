@@ -146,6 +146,43 @@ class EventDomains:
         for name in ("tests", "cases", "clocks", "endpoints", "active"):
             object.__setattr__(self, name, MappingProxyType(getattr(self, name)))
 
+    def retain(self, selection):
+        """Project unchanged endpoint facts after proven protocol deletion.
+
+        Native, guards, cases and coordinates have not changed. Pairing and
+        activation facts are retained by exact object identity; lifetimes,
+        consumption and resource constraints have not yet been established.
+        """
+        selection.require_closed()
+        require(
+            selection.dependencies is self.selection.dependencies
+            and selection.dispatch is self.dispatch
+            and {id(item) for item in selection.notifications}
+            <= {id(item) for item in self.notifications},
+            "event-domain projection changed its native or protocol premises",
+        )
+        result = object.__new__(EventDomains)
+        for name in self.__dataclass_fields__:
+            object.__setattr__(result, name, getattr(self, name))
+        object.__setattr__(result, "selection", selection)
+        object.__setattr__(result, "notifications", selection.notifications)
+        kept = frozenset(selection.notifications)
+        for name in ("tests", "cases", "clocks"):
+            object.__setattr__(
+                result,
+                name,
+                MappingProxyType(
+                    {n: value for n, value in getattr(self, name).items() if n in kept}
+                ),
+            )
+        object.__setattr__(
+            result,
+            "active",
+            MappingProxyType({key: value for key, value in self.active.items() if key[0] in kept}),
+        )
+        self.work.notifications = len(kept)
+        return result
+
     def _validate(self):
         admitted_endpoints = set()
         evaluated_at = {}

@@ -40,6 +40,7 @@ from ascendflow.dialects.structured import (
     NotificationOp,
     PipelineLoopOp,
     PipelineStageOp,
+    ReadyGroupOp,
 )
 from ascendflow.target.ascend910b import Actor, Engine, SyncKind
 
@@ -141,6 +142,7 @@ class _Interpret:
         self.templates = {template.operation: template for template in memory.templates}
         self.physical, self.maximum = physical, maximum
         self.commands = []
+        self.ready_groups = {}
 
     def native(self, operation, values, invocation, group, actor, coordinates):
         _check(actor is not None, "native has no actual actor domain")
@@ -238,6 +240,12 @@ class _Interpret:
         for operation in block.ops:
             if isinstance(operation, (EndOp, scf.YieldOp)):
                 return tuple(values[value] for value in operation.operands)
+            if isinstance(operation, ReadyGroupOp):
+                # A source policy/correspondence grants no hardware causality.
+                # Only the actual retained Set/Wait instructions do that.
+                members = tuple(values[value] for value in operation.members)
+                self.ready_groups.update((member, members) for member in members)
+                continue
             if isinstance(operation, RuntimeSizeOp):
                 value = self.parameters[operation.sym_name.data]
                 _check(
@@ -568,7 +576,7 @@ def _causality(commands):
     return tuple(reach), tuple(consumptions), {node: index for index, node in enumerate(order)}
 
 
-def _accesses(logical, physical, reach, order):
+def _accesses(logical, physical, reach, order, ready_groups=None):
     actual = {command.occurrence: command for command in physical if command.kind == "native"}
     expected = {command.occurrence: command for command in logical}
     _check(
@@ -647,6 +655,10 @@ def _accesses(logical, physical, reach, order):
     for cell, reader, writer in bindings:
         if writer is not None:
             require_order("RAW", cell, writer, reader)
+            members = (ready_groups or {}).get(writer, ())
+            if reader not in members:
+                for member in members:
+                    require_order("CopyGroup-ready", cell, member, reader)
         next_writer = following.get((cell, writer))
         if next_writer is not None:
             require_order("WAR", cell, reader, next_writer)
@@ -870,7 +882,14 @@ def check_structured_events(
         else [correspondence(command) for command in logical.commands]
     )
     reach, consumptions, order = _causality(physical.commands)
-    hazards, reads, writes = _accesses(expected, physical.commands, reach, order)
+    translated = {
+        a.occurrence: b.occurrence for a, b in zip(logical.commands, expected, strict=True)
+    }
+    ready_groups = {
+        translated[member]: tuple(translated[item] for item in members)
+        for member, members in logical.ready_groups.items()
+    }
+    hazards, reads, writes = _accesses(expected, physical.commands, reach, order, ready_groups)
     registers = _register_accesses(expected, physical.commands, reach, order)
     return FiniteExecution(
         tuple(physical.commands), consumptions, hazards, reach, reads, writes, registers

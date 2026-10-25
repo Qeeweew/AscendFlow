@@ -128,7 +128,7 @@ def test_resident_worker_retires_old_token_across_ragged_and_empty_requests(
 
 
 def test_new_softmax_cannot_overwrite_previous_token_denominator():
-    source = sparse_mla.source.replace("final_l[slot, local : local + UR]", "row_sum[0:UR]")
+    source = sparse_mla.source.replace("final_l.at(query)[local : local + UR]", "row_sum[0:UR]")
     assert source != sparse_mla.source
     with pytest.raises(CompileError, match="issued|ownership|same-engine|queue"):
         compile(specialize(replace(sparse_mla, source=source)), timeout_s=300)
@@ -136,9 +136,9 @@ def test_new_softmax_cannot_overwrite_previous_token_denominator():
 
 @pytest.mark.parametrize("gather_first", (False, True))
 def test_two_cache_slots_require_prior_score_acquire_before_gather(monkeypatch, gather_first):
-    source = sparse_mla.source.replace("3, S - WINDOW", "2, S - WINDOW").replace(
-        "cache_slot = query % 3", "cache_slot = query % 2"
-    )
+    # slotted_view takes its real depth from the changed external shape.
+    source = sparse_mla.source.replace("3, S - WINDOW", "2, S - WINDOW")
+    assert source != sparse_mla.source
     if not gather_first:
         source = source.replace(
             '"vector": ("gather", "softmax", "finish")',

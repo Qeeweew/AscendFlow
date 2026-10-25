@@ -17,6 +17,20 @@ class EventSharing:
 
 
 @dataclass(frozen=True, slots=True)
+class CellPhaseSharing:
+    """Projection of an established physical-cell lifetime onto its members.
+
+    Splitting integer allocation never resets that word or its open uses.
+    The exact original cell channel, ownership and nonduplicate members stay
+    the premise; this supplies no relation to another logical credit.
+    """
+
+    credit: object
+    left: object
+    right: object
+
+
+@dataclass(frozen=True, slots=True)
 class CounterSharing:
     """Pairwise order premises, not a certificate for a whole FIFO group.
 
@@ -220,10 +234,8 @@ def _same_iteration_streams(domains, rule, left, right):
 
 def _handback(domains, rule, earlier, old, later, target, assumptions, **reuse):
     # Binary sharing additionally requires forward issue on its controller.
-    # Cross consumption blocks the whole controller, so the supported mode-2
-    # rule uses one opposite-direction, complete-quorum return. Its receiver
-    # must precede the new Set. Do not search compositions across unrelated
-    # queue stages when that direct return cannot be established.
+    # Cross consumption blocks the whole controller. Its transfer still keeps
+    # every publisher/receiver and the complete matched quorum.
     if (
         earlier.mechanism is NotificationKind.LOCAL_EVENT
         and not domains.arithmetic.queries.covers(
@@ -237,7 +249,6 @@ def _handback(domains, rule, earlier, old, later, target, assumptions, **reuse):
         later,
         target,
         assumptions,
-        max_relays=1 if earlier.mechanism is NotificationKind.CROSS_EVENT else 2,
         **reuse,
     )
 

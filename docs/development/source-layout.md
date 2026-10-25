@@ -45,6 +45,7 @@ compile / Compilation
     generate_notifications
       bind_notifications                 # 覆盖、真实位置及原始 ownership edges
       EventDomains                       # 新 guard 定义性、复用实际 SSA、坐标往返、配对
+      reduce_completion_prefixes         # 冻结实际 capture，逐原始义务证明多段完成覆盖
       bind_cell_credits                  # 稀疏私有轮次的端点与本地发射前提
       establish_queue_order              # 逐层 physical-step / phase 准入
       construct_cell_channels            # 物理 lifetime credit 归纳
@@ -67,6 +68,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | 文件/范围 | 职责与输出 |
 |---|---|
 | `frontend/`、`dialects/source.py`、`language.py` | TileLang 风格 AST、typed source、逻辑 Tile 和显式 buffer |
+| source `StorageSelectOp`、`TileSliceOp`、`CopyGroupOp`；physical `ReadyGroupOp` | 实际 root/原 selector/槽轴映射、借用子视图 writer 以及共同 ready 到 native 成员的 typed 对应；均不自行提供异步完成 |
 | `passes/lower_pipeline.py`、`lower_native.py`、`native_recipes.py`、`native_addresses.py` | 参数化控制及 native recipe；尚未建立异步完成 |
 | `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/effects、绑定真实循环的条件读取；消费共享目标描述 |
 | `target/native.py` 的 `NativeSpec` | 一份不可变的 native opcode、参数、operand geometry/effects、寄存器读写及所需值、packet、read reset 与完成规则；逻辑分析和终端共享，不含地址/代次 |
@@ -82,15 +84,16 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/local_schedule.py`、`structured_dispatch.py` | 按迭代域和 actor family 建立本地 stage 顺序与 horizon；派发消费该顺序并绑定 native、控制入口/出口的位置 |
 | `passes/notification_binding.py`、`analysis/structured_protocols.py` | 复用已经必要的 capture/acquire、建立完整 quorum；保留自身 origin，不将新增 coverage 当作 ownership，不按 Stage 合并独立完成边界 |
 | `analysis/acquired_prefixes.py` | 按真实激活类与层级发射 word 查询已有 capture/acquire pair；保留每个 participant 的 lexical 分段与原最早匹配，不扫描同 word 的全部获取历史，不提供事件消费资格 |
+| `analysis/position_words.py`、`protocol_transfers.py`、`completion_prefixes.py` | 共用层级位置和真实 Set/Wait 快照 DAG；完成和消费有独立 origin；逐合并前需求验证完成覆盖，排除自身及已删协议，固定保留支持动作 |
 | `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期 |
 | `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |
 | `analysis/queue_order.py` | 每层 actor clock-origin 差约束、按实际路由/有限时间类建立的稀疏阻塞区间索引、零距离 DAG 与正距离前进；child 仅导出 open ports 和 may-block cuts |
 | `analysis/cell_channels.py` | 相同完整物理 ownership 集合和 role 的非重复 credit；原始值/存储 lifetime 归纳 |
 | `analysis/cell_ownership.py` | 从原始 body/全部 effects 建立闭合私有轮次，绑定真实 acquire/return、校验实际本地发射前提；不将队列端口当成 native lifetime |
-| `analysis/notification_lifetimes.py` | 按真实 actor/引擎路由检索既有交接，按旧消费点/clock horizon 建立实际 publication ports，并复用中间 queue 的第二段接口；目标方仍检查完整激活与覆盖，无任意路径搜索 |
-| `analysis/event_planning.py`、`event_sharing.py`、`event_counter_groups.py`、`event_peers.py` | 完整 credit 的重叠 FIFO 候选、实际首末端口 word 拼接、FIFO 子组间完整消费回传、逐 publisher 积压及虚拟 AIV 对应；冻结组合与有限缩环选项 |
+| `analysis/notification_lifetimes.py`、`consumption_frontiers.py` | 实际 reuse window 与 FIRST/LAST 端口、独立消费 origin、真实取得 cut 的二维前沿索引；共享未变条件事实并继续组合开放边界，不设固定 relay 深度 |
+| `analysis/event_planning.py`、`event_sharing.py`、`event_counter_groups.py`、`event_peers.py` | 保留 logical credit 的实际 local 成员 phase 占用、重叠 FIFO 候选、实际首末端口 word 拼接、FIFO 子组间完整消费回传、逐 publisher 积压及虚拟 AIV 对应；冻结实际数字池、组合与有限协议选项 |
 | `analysis/event_frontiers.py`、`event_frontier_contracts.py` | 本地事件真实发布/消费区间的分层包围与 handback 分离；失败接口细分，冻结完整 credit 的有限复用矩形；最终组检查逐行消费 mask，报告共享端点树/证书而不展开消息对 |
-| `analysis/event_coloring.py`、`structured_resources.py`、`event_contracts.py` | 联合专属、时间复用、FIFO 的有限协议/约束分配；持久 token 与配置/drain 台账；全部选项共享工作上限，只消费冻结约束及物化编号 |
+| `analysis/event_coloring.py`、`structured_resources.py`、`event_contracts.py` | 联合专属、已证 FIFO 的结构分配和有限残余；时间复用保持完整消费前提；持久 token 与配置/drain 台账，全部选项共享工作上限，只消费冻结约束及物化编号 |
 | `passes/materialize_structure.py` | 插入确定动作、共享同位置短路 guard 前缀；不改变 native 或 issue order |
 | `passes/executable.py` | 终端模块、native 对应、共享 NativeSpec 与最终 SSA 范围；不携带逻辑控制、地址证明或同步求解入口 |
 | `passes/lower_execution.py` | 将 count/stage 表示降为实际 arith/scf；按 family 保持 issue order，移动原 native，不复制双 AIV body |

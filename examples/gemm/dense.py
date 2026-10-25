@@ -18,47 +18,48 @@ from ascendflow import language as T
 def import_panel(inputs, buffers, geometry, coordinates):
     A, Bt = inputs
     a1, b1 = buffers
-    A_SLOTS, BM, BK, COL_PARTS, B_SLOTS, BN = geometry
-    row, k, panel, column = coordinates
-    T.copy(A[row : row + BM, k : k + BK], a1[panel % A_SLOTS, :, :])
+    BM, BK, COL_PARTS, BN = geometry
+    row, k, column = coordinates
+    av = T.copy(A[row : row + BM, k : k + BK], a1)
     for part in T.unroll(COL_PARTS):
         T.copy(
             Bt[column + part * BN : column + (part + 1) * BN, k : k + BK],
-            b1[panel % B_SLOTS, part, :, :],
+            b1[part, :, :],
         )
+    return av
 
 
 @T.inline
 def accumulate_panel(inputs, buffers, geometry, coordinates):
-    (C,) = inputs
-    a1, a0, b1, b0, c0 = buffers
-    chunks, COL_PARTS, A_SLOTS, CK, B_SLOTS, C_SLOTS, ktiles, BM, BN = geometry
-    panel, tile, row, column = coordinates
+    C, av, b1 = inputs
+    a0, b0, c0 = buffers
+    chunks, COL_PARTS, CK, ktiles, BM, BN = geometry
+    panel, row, column = coordinates
     for chunk in T.unroll(chunks):
         aa = T.copy(
-            a1[panel % A_SLOTS, :, chunk * CK : (chunk + 1) * CK],
-            a0[chunk % 2, :, :],
+            av[:, chunk * CK : (chunk + 1) * CK],
+            a0.at(chunk),
         )
         for part in T.unroll(COL_PARTS):
             # Both output parts borrow the same A operand.
             bb = T.copy(
-                b1[panel % B_SLOTS, part, :, chunk * CK : (chunk + 1) * CK],
-                b0[(chunk * COL_PARTS + part) % 2, :, :],
+                b1[part, :, chunk * CK : (chunk + 1) * CK],
+                b0.at(chunk * COL_PARTS + part),
                 transpose=True,
             )
             if chunk == 0:
                 T.matmul(
                     aa,
                     bb,
-                    accum=c0[tile % C_SLOTS, part, :, :],
+                    accum=c0[part, :, :],
                     initialize=(panel == 0),
                 )
             else:
-                T.matmul(aa, bb, accum=c0[tile % C_SLOTS, part, :, :], initialize=False)
+                T.matmul(aa, bb, accum=c0[part, :, :], initialize=False)
     if panel == ktiles - 1:
         for part in T.unroll(COL_PARTS):
             T.copy(
-                c0[tile % C_SLOTS, part, :, :],
+                c0[part, :, :],
                 C[row : row + BM, column + part * BN : column + (part + 1) * BN],
             )
 
@@ -100,12 +101,12 @@ def dense_gemm(
         assert K % BK == 0, "K must contain complete reduction panels"
         assert BK % CK == 0, "L1 panels must contain complete Cube chunks"
         # The default K panel contains two contiguous full-row NZ slices.
-        a1 = T.alloc_l1((A_SLOTS, BM, BK), T.f16)
-        b1 = T.alloc_l1((B_SLOTS, COL_PARTS, BN, BK), T.f16)
-        a0 = T.alloc_l0a((2, BM, CK), T.f16)
-        b0 = T.alloc_l0b((2, CK, BN), T.f16)
+        a1 = T.alloc_l1((BM, BK), T.f16, slots=A_SLOTS)
+        b1 = T.alloc_l1((COL_PARTS, BN, BK), T.f16, slots=B_SLOTS)
+        a0 = T.alloc_l0a((BM, CK), T.f16, slots=2)
+        b0 = T.alloc_l0b((CK, BN), T.f16, slots=2)
         # Each column part has its own last MAD and FIX retirement point.
-        c0 = T.alloc_l0c((C_SLOTS, COL_PARTS, BM, BN), T.f32)
+        c0 = T.alloc_l0c((COL_PARTS, BM, BN), T.f32, slots=C_SLOTS)
         ntiles = N // (BN * COL_PARTS)
         ktiles = K // BK
         chunks = BK // CK
@@ -115,19 +116,20 @@ def dense_gemm(
             index = group + tile * GROUPS
             row = (index // ntiles) * BM
             column = (index % ntiles) * BN * COL_PARTS
-            for panel in T.Pipelined(ktiles):
+            for panel in T.Pipelined(ktiles, issue_order=("load", "compute")):
                 k = panel * BK
                 with T.Stage(0, name="load"):
-                    import_panel(
+                    b_panel = b1.at(panel)
+                    av = import_panel(
                         (A, Bt),
-                        (a1, b1),
-                        (A_SLOTS, BM, BK, COL_PARTS, B_SLOTS, BN),
-                        (row, k, panel, column),
+                        (a1.at(panel), b_panel),
+                        (BM, BK, COL_PARTS, BN),
+                        (row, k, column),
                     )
                 with T.Stage(PREFETCH, name="compute"):
                     accumulate_panel(
-                        (C,),
-                        (a1, a0, b1, b0, c0),
-                        (chunks, COL_PARTS, A_SLOTS, CK, B_SLOTS, C_SLOTS, ktiles, BM, BN),
-                        (panel, tile, row, column),
+                        (C, av, b_panel),
+                        (a0, b0, c0.at(tile)),
+                        (chunks, COL_PARTS, CK, ktiles, BM, BN),
+                        (panel, row, column),
                     )

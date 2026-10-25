@@ -22,20 +22,19 @@ def grouped_scale(
     GROUPS: T.constexpr = 20,
 ):
     with T.Kernel(GROUPS, kind="vector") as group:
-        x = T.alloc_ub((2, ROWS, D), T.f32, name="inputs")
-        y = T.alloc_ub((2, ROWS, D), T.f32, name="outputs")
+        x = T.alloc_ub((ROWS, D), T.f32, slots=2, name="inputs")
+        y = T.alloc_ub((ROWS, D), T.f32, slots=2, name="outputs")
         tiles = S // ROWS
         total = B * H * tiles
         count = T.ceildiv(T.max(0, total - group), GROUPS)
-        for task in T.Pipelined(count):
+        for task in T.Pipelined(count, issue_order=("load", "scale", "store")):
             flat = group + task * GROUPS
             batch = flat // (H * tiles)
             head = (flat // tiles) % H
             row = (flat % tiles) * ROWS
-            slot = task % 2
             with T.Stage(0, name="load"):
-                value = T.copy(X[batch, head, row : row + ROWS, :], x[slot, :, :])
+                value = T.copy(X[batch, head, row : row + ROWS, :], x.at(task))
             with T.Vector(), T.Stage(1, name="scale"):
-                value = T.mul(value, 2.0, out=y[slot, :, :])
+                value = T.mul(value, 2.0, out=y.at(task))
             with T.Stage(2, name="store"):
                 T.copy(value, Y[batch, head, row : row + ROWS, :])

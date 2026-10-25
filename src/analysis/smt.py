@@ -111,18 +111,30 @@ class Boolean:
         )
 
 
+@memoized(key=lambda kind, operands: (kind, tuple((type(value), value) for value in operands)))
+def _boolean(kind, operands):
+    """Intern exact mathematical syntax inside the current compilation only.
+
+    Children created by these factories already have canonical identity, so
+    equality of shared Boolean DAGs never unfolds their full path trees.
+    Operand types are part of the key: Python's 0 == False cannot bypass the
+    ordinary predicate validation. This stores no facts or query answers.
+    """
+    return Boolean(kind, operands)
+
+
 def all_of(*conditions):
     if any(condition is False for condition in conditions):
         return False
     values = tuple(dict.fromkeys(condition for condition in conditions if condition is not True))
-    return True if not values else values[0] if len(values) == 1 else Boolean("and", values)
+    return True if not values else values[0] if len(values) == 1 else _boolean("and", values)
 
 
 def any_of(*conditions):
     if any(condition is True for condition in conditions):
         return True
     values = tuple(dict.fromkeys(condition for condition in conditions if condition is not False))
-    return False if not values else values[0] if len(values) == 1 else Boolean("or", values)
+    return False if not values else values[0] if len(values) == 1 else _boolean("or", values)
 
 
 @memoized(key=lambda facts: frozenset(facts.items()))
@@ -453,12 +465,31 @@ class IntegerQueryService:
 
     @memoized_method
     def _comparison(self, test: Comparison | Boolean | bool):
-        if type(test) is bool:
-            return BoolVal(test)
-        if isinstance(test, Boolean):
-            operation = _and if test.kind == "and" else _or
-            return operation(*(self._comparison(value) for value in test.operands))
-        return _cmp(self._integer(test.lhs), test.predicate, self._integer(test.rhs))
+        # Long transfer proofs are shared DAGs, not Python call trees. Keep
+        # the exact child order and AST while encoding each node once.
+        encoded = self.__dict__.setdefault("_encoded_predicates", {})
+        pending = [(test, False)]
+        while pending:
+            current, done = pending.pop()
+            key = type(current), current
+            if key in encoded:
+                continue
+            if type(current) is bool:
+                encoded[key] = BoolVal(current)
+            elif isinstance(current, Boolean):
+                if done:
+                    operation = _and if current.kind == "and" else _or
+                    encoded[key] = operation(
+                        *(encoded[type(value), value] for value in current.operands)
+                    )
+                else:
+                    pending.append((current, True))
+                    pending.extend((value, False) for value in reversed(current.operands))
+            else:
+                encoded[key] = _cmp(
+                    self._integer(current.lhs), current.predicate, self._integer(current.rhs)
+                )
+        return encoded[type(test), test]
 
     def _context(self, assumptions):
         """Input facts plus one complete ordered premise tuple, as relations.
@@ -495,11 +526,27 @@ class IntegerQueryService:
         All correlated or unresolved relations still use the complete SMT
         context, including contradictory premises.
         """
-        if type(test) is bool:
-            return test
-        if isinstance(test, Boolean):
-            values = (self._elementary(value) for value in test.operands)
-            return all(values) if test.kind == "and" else any(values)
+        known = self.__dict__.setdefault("_elementary_predicates", {})
+        pending = [(test, False)]
+        while pending:
+            current, done = pending.pop()
+            key = type(current), current
+            if key in known:
+                continue
+            if type(current) is bool:
+                known[key] = current
+            elif isinstance(current, Boolean):
+                if done:
+                    values = (known[type(value), value] for value in current.operands)
+                    known[key] = all(values) if current.kind == "and" else any(values)
+                else:
+                    pending.append((current, True))
+                    pending.extend((value, False) for value in reversed(current.operands))
+            else:
+                known[key] = self._elementary_atom(current)
+        return known[type(test), test]
+
+    def _elementary_atom(self, test):
         if test.lhs == test.rhs:
             return test.predicate in {"==", "<=", ">="}
         low, high = self._range(test.lhs)
@@ -526,6 +573,20 @@ class IntegerQueryService:
             and other_high < low
         )
 
+    def owns_implication(self, answer, test, assumptions):
+        """Exact established question in this service's immutable input scope."""
+        return (
+            isinstance(answer, Answer)
+            and answer.proved
+            and (type(test) is bool or isinstance(test, (Comparison, Boolean)))
+            and isinstance(assumptions, tuple)
+            and all(
+                type(item) is bool or isinstance(item, (Comparison, Boolean))
+                for item in assumptions
+            )
+            and self._answers.get(("implies", assumptions, ("implies", test))) is answer
+        )
+
     def _local_timeout(self):
         """The local cap, further bounded by the remaining build deadline."""
         left = remaining("integer query")
@@ -535,6 +596,19 @@ class IntegerQueryService:
 
     def _decide(self, kind, assumptions, key, goal, *, universal):
         """Decide one question and cache the structured outcome."""
+        require(
+            isinstance(assumptions, tuple)
+            and all(
+                type(item) is bool or isinstance(item, (Comparison, Boolean))
+                for item in assumptions
+            )
+            and (
+                kind != "implies"
+                or type(key[1]) is bool
+                or isinstance(key[1], (Comparison, Boolean))
+            ),
+            "integer query requires immutable mathematical predicates",
+        )
         cache_key = (kind, assumptions, key)
         cached = self._answers.get(cache_key)
         if cached is not None:

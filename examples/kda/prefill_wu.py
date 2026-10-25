@@ -8,38 +8,37 @@ from ascendflow import language as N
 
 
 @N.inline
-def wu_import(Inverse, a1, chunk, head, ring, Right, b1):
-    N.copy(Inverse[chunk, head, :, :], a1[ring, :, :])
-    for part in N.unroll(2):
-        N.copy(Right[chunk, head, part, :, :], b1[ring, part, :, :])
+def wu_import(inputs, buffers):
+    Inverse, Right = inputs
+    a1, b1 = buffers
+    with N.CopyGroup(name="wu_operands"):
+        inverse = N.copy(Inverse, a1)
+        weight = N.copy(Right[0, :, :], b1[0, :, :])
+        value = N.copy(Right[1, :, :], b1[1, :, :])
+    return inverse, weight, value
 
 
 @N.inline
-def wu_products(inputs, buffers, coordinates):
+def wu_products(inputs, operands, buffers):
     W16Ring, U = inputs
-    a0, a1, b0, b1, c0 = buffers
-    ring, owner, chunk, head = coordinates
-    aa = N.copy(a1[ring, :, :], a0)
-    ww = N.copy(b1[ring, 0, :, :], b0)
-    N.matmul(aa, ww, accum=c0, initialize=True)
-    N.copy(c0, W16Ring[owner, ring, :, :])
-    uu = N.copy(b1[ring, 1, :, :], b0)
-    N.matmul(aa, uu, accum=c0, initialize=True)
-    N.copy(c0, U[chunk, head, :, :])
+    inverse, weight, value = operands
+    a0, b0, c0 = buffers
+    aa = N.copy(inverse, a0)
+    ww = N.copy(weight, b0)
+    result = N.matmul(aa, ww, accum=c0, initialize=True)
+    N.copy(result, W16Ring)
+    uu = N.copy(value, b0)
+    result = N.matmul(aa, uu, accum=c0, initialize=True)
+    N.copy(result, U)
 
 
 @N.inline
-def publish_rounded_weights(inputs, buffers, geometry, coordinates):
+def publish_rounded_weights(inputs, buffers):
     W16Ring, W32 = inputs
     w16, w32 = buffers
-    (BT,) = geometry
-    owner, ring, lane, chunk, head = coordinates
-    N.copy(
-        W16Ring[owner, ring, lane * (BT // 2) : (lane + 1) * (BT // 2), :],
-        w16[ring, :, :],
-    )
-    N.cast(w16[ring, :, :], out=w32[ring, :, :])
-    N.copy(w32[ring, :, :], W32[chunk, head, lane * (BT // 2) : (lane + 1) * (BT // 2), :])
+    rounded = N.copy(W16Ring, w16)
+    promoted = N.cast(rounded, out=w32)
+    N.copy(promoted, W32)
 
 
 @N.prim_func(disjoint_external=True)
@@ -57,23 +56,37 @@ def prefill_wu(
     DTYPE: N.constexpr = N.bf16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
-        a1 = N.alloc_l1((2, BT, BT), DTYPE)
-        b1 = N.alloc_l1((2, 2, BT, K), DTYPE)
+        a1 = N.alloc_l1((BT, BT), DTYPE, slots=2)
+        b1 = N.alloc_l1((2, BT, K), DTYPE, slots=2)
         a0 = N.alloc_l0a((BT, BT), DTYPE)
         b0 = N.alloc_l0b((BT, K), DTYPE)
         c0 = N.alloc_l0c((BT, K), N.f32)
-        w16 = N.alloc_ub((2, BT // 2, K), DTYPE)
-        w32 = N.alloc_ub((2, BT // 2, K), N.f32)
-        for task in N.Dataflow(N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS)):
+        w16 = N.alloc_ub((BT // 2, K), DTYPE, slots=2)
+        w32 = N.alloc_ub((BT // 2, K), N.f32, slots=2)
+        weights = N.slotted_view(W16Ring[owner, :, :, :])
+        for task in N.Dataflow(
+            N.ceildiv(N.max(0, CHUNKS * H - owner), GROUPS),
+            issue_order={"cube": ("load", "compute"), "vector": ("cast",)},
+        ):
             flat = owner + task * GROUPS
             chunk, head = flat // H, flat % H
-            ring = task % 2
             with N.Cube(), N.Stage(0, name="load"):
-                wu_import(Inverse, a1, chunk, head, ring, Right, b1)
+                inverse, weight, value = wu_import(
+                    (Inverse[chunk, head, :, :], Right[chunk, head, :, :, :]),
+                    (a1.at(task), b1.at(task)),
+                )
             with N.Cube(), N.Stage(1, name="compute"):
-                wu_products((W16Ring, U), (a0, a1, b0, b1, c0), (ring, owner, chunk, head))
+                wu_products(
+                    (weights.at(task), U[chunk, head, :, :]),
+                    (inverse, weight, value),
+                    (a0, b0, c0),
+                )
             with N.Vector() as lane, N.Stage(2, name="cast"):
                 # Preserve the low-precision W rounding before its FP32 projection.
                 publish_rounded_weights(
-                    (W16Ring, W32), (w16, w32), (BT,), (owner, ring, lane, chunk, head)
+                    (
+                        weights.at(task)[lane * (BT // 2) : (lane + 1) * (BT // 2), :],
+                        W32[chunk, head, lane * (BT // 2) : (lane + 1) * (BT // 2), :],
+                    ),
+                    (w16.at(task), w32.at(task)),
                 )

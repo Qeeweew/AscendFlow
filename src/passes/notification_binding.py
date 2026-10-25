@@ -11,8 +11,14 @@ from __future__ import annotations
 from dataclasses import replace
 from math import gcd, lcm
 
-from ..analysis.access_frontier import LoopResidueSelection, QueueEndpoint, ResiduePosition
+from ..analysis.access_frontier import (
+    AccessEndpoint,
+    LoopResidueSelection,
+    QueueEndpoint,
+    ResiduePosition,
+)
 from ..analysis.acquired_prefixes import AcquiredPrefixes
+from ..analysis.hazards import HazardKind
 from ..analysis.integer_facts import IntegerFacts
 from ..analysis.region_coordinates import ScalarScope
 from ..analysis.smt import all_of, any_of
@@ -27,6 +33,7 @@ from ..analysis.structured_protocols import (
     NotificationCoverage,
     NotificationKind,
     OrderingWitness,
+    RequirementBinding,
     SelectedOrdinal,
     SynchronizationSelection,
     UnresolvedSynchronization,
@@ -602,14 +609,14 @@ def _clock(need, source, consumer, memory):
     return None
 
 
-def _bind_notification(need, dispatch, effective_guards):
+def _bind_notification(need, dispatch, effective_guards, *, ready_source=None):
     memory = dispatch.memory
     consumer = _bind_endpoint(
         need, need.consumer, memory, source=False, effective_guards=effective_guards
     )
     source = _bind_endpoint(
         need,
-        need.source,
+        need.source if ready_source is None else ready_source,
         memory,
         source=True,
         consumer_coordinates=consumer.coordinates,
@@ -919,12 +926,16 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
     )
     order = _IssueOrder(dispatch)
     notifications, coverage, unresolved = [], [], []
+    bindings = {}
     owned = {
         need: lifetime
         for lifetime in dependencies.order.cell_lifetimes
         for need in lifetime.requirements
     }
     bundles = {}
+    ready_groups = {
+        member.operation: group for group in dependencies.memory.ready_groups for member in group
+    }
     for need in dependencies.required:
         if need in owned:
             coverage.append(
@@ -942,6 +953,7 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
             need.domains,
             order.guards(need),
             RegisterCell if isinstance(need.cell, RegisterCell) else need.cell.root.type.bank,
+            need.kind if ready_groups else None,
         )
         bundles.setdefault(key, []).append(need)
     for bundle in bundles.values():
@@ -968,9 +980,25 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
             )
             continue
         try:
+            ready_source = None
+            group = ready_groups.get(need.source.operation)
+            if (
+                group is not None
+                and need.kind is HazardKind.RAW
+                and need.consumer.operation not in {member.operation for member in group}
+            ):
+                ready_source = replace(
+                    need.source,
+                    endpoint=AccessEndpoint.from_template(group[-1], need.source.participant),
+                )
             item = replace(
-                _bind_notification(need, dispatch, order.guards(need)), requirements=tuple(bundle)
+                _bind_notification(need, dispatch, order.guards(need), ready_source=ready_source),
+                requirements=tuple(bundle),
             )
+            for original in bundle:
+                bindings[original] = RequirementBinding(
+                    original, item.sources[0], item.consumers[0]
+                )
             if rule := _implicit(item, order):
                 coverage.extend(
                     NotificationCoverage(
@@ -1019,6 +1047,7 @@ def bind_notifications(dependencies, dispatch) -> SynchronizationSelection:
                     if item.mechanism is NotificationKind.CROSS_EVENT
                     else "actual cumulative source capture and consumer-queue acquire",
                     item,
+                    binding=bindings[need],
                 )
             )
     return SynchronizationSelection(

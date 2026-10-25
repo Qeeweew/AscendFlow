@@ -3,7 +3,7 @@
 from itertools import combinations, product
 
 from ascendflow.analysis.event_coloring import _color, _ColoringProblem
-from ascendflow.analysis.event_contracts import EventDemand
+from ascendflow.analysis.event_contracts import EventDemand, EventIdPools
 from ascendflow.target.ascend910b import Actor, Engine
 
 BANK = (Actor.AIV0, Engine.MTE2, Engine.V)
@@ -15,6 +15,7 @@ def problem(edges):
         tuple(EventDemand((), 1, (BANK,)) for _ in range(5)),
         (),
         {pair: () for pair in pairs if pair not in edges},
+        EventIdPools(),
     )
 
 
@@ -46,7 +47,7 @@ def test_different_joint_bank_reservations_keep_distinct_unused_id_choices():
     demands = (EventDemand((), 1, (BANK,)), EventDemand((), 1, (BANK, other)))
     # Both vertices need different IDs in BANK. Only 0 is available in the
     # other bank: vertex 0 must backtrack from 0 to the initially unused 1.
-    numeric = _ColoringProblem(demands, (), {})
+    numeric = _ColoringProblem(demands, (), {}, EventIdPools())
     colors, _ = _color(
         numeric,
         (0, 1),

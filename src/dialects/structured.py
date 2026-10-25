@@ -31,7 +31,37 @@ from xdsl.traits import RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
 from ..target.native import nz_columns
-from .types import AsyncEffects, RefType
+from .types import AsyncEffects, RefType, TaskType
+
+
+@irdl_op_definition
+class ReadyGroupOp(IRDLOperation):
+    """Typed correspondence of common readiness to actual native members.
+
+    No execution effect: actual Set/Wait instructions implement the source
+    policy after all queue, activation and internal-dependency checks.
+    """
+
+    name = "npu.ready_group"
+    members = var_operand_def(TaskType)
+    label = attr_def(StringAttr)
+
+    def verify_(self):
+        from .physical import TaskOp
+
+        if not self.members or any(
+            not isinstance(value.owner, TaskOp) or value.owner.parent is not self.parent
+            for value in self.members
+        ):
+            raise VerifyException(
+                "CopyGroup members must be real natives in one straight-line block"
+            )
+        positions = {operation: i for i, operation in enumerate(self.parent.ops)}
+        ranks = [positions[value.owner] for value in self.members]
+        if ranks != sorted(set(ranks)) or ranks[-1] >= positions[self]:
+            raise VerifyException(
+                "CopyGroup native members must precede its boundary in source order"
+            )
 
 
 @irdl_op_definition

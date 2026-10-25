@@ -10,22 +10,22 @@ from ascendflow import language as N
 
 
 @N.inline
-def rms_compute(x, slot, y, partial, statistics, D, EPS, constant):
-    N.mul(x[slot, :], x[slot, :], out=y[slot, :])
-    N.reduce_sum(
-        y[slot, :],
+def rms_compute(x, y, partial, statistics, D, EPS, constant):
+    squared = N.mul(x, x, out=y)
+    total = N.reduce_sum(
+        squared,
         axis=0,
         scratch=partial,
         out=statistics[:1],
         order="r64_then_native_merge",
     )
-    N.mul(statistics[:1], 1.0 / D, out=statistics[:1])
-    N.add(statistics[:1], EPS, out=statistics[:1])
-    N.sqrt(statistics[:1], out=statistics[:1])
-    N.fill(constant[:1], 1.0)
-    N.div(constant[:1], statistics[:1], out=statistics[:1])
-    inverse = N.load_scalar(statistics[:1])
-    N.mul(x[slot, :], inverse, out=y[slot, :])
+    mean = N.mul(total, 1.0 / D, out=statistics[:1])
+    stabilized = N.add(mean, EPS, out=statistics[:1])
+    root = N.sqrt(stabilized, out=statistics[:1])
+    one = N.fill(constant[:1], 1.0)
+    reciprocal = N.div(one, root, out=statistics[:1])
+    inverse = N.load_scalar(reciprocal)
+    return N.mul(x, inverse, out=y)
 
 
 @N.prim_func(disjoint_external=True)
@@ -38,16 +38,15 @@ def rms_normalize(
     EPS: N.constexpr = 1e-6,
 ):
     with N.Kernel(GROUPS, kind="vector") as group:
-        x = N.alloc_ub((2, D), N.f32, name="inputs")
-        y = N.alloc_ub((2, D), N.f32, name="work")
+        x = N.alloc_ub((D,), N.f32, slots=2, name="inputs")
+        y = N.alloc_ub((D,), N.f32, slots=2, name="work")
         partial = N.alloc_ub((D // 64,), N.f32, name="partial")
         statistics = N.alloc_ub((8,), N.f32, name="statistics")
         constant = N.alloc_ub((8,), N.f32, name="constant")
         for row in N.Pipelined(rows, issue_order=("store", "load", "compute")):
-            slot = row % 2
             with N.Stage(0, name="load"):
-                N.copy(X[group, row, :], x[slot, :])
+                loaded = N.copy(X[group, row, :], x.at(row))
             with N.Vector(), N.Stage(1, name="compute"):
-                rms_compute(x, slot, y, partial, statistics, D, EPS, constant)
+                normalized = rms_compute(loaded, y.at(row), partial, statistics, D, EPS, constant)
             with N.Stage(2, name="store"):
-                N.copy(y[slot, :], Y[group, row, :])
+                N.copy(normalized, Y[group, row, :])

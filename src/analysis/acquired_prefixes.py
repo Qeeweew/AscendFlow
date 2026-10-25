@@ -8,103 +8,25 @@ notification history is scanned within a word and no unknown order is assumed.
 This is completion coverage only, not event consumption or ID-reuse evidence.
 """
 
-from bisect import bisect_left, bisect_right
-from itertools import pairwise
+from bisect import bisect_left
 
-from .access_frontier import QueueEndpoint
+from .position_words import PositionWord, position_word
 from .structured_protocols import NotificationKind
-
-
-def _points(points):
-    return tuple(sorted(points, key=lambda p: p.actor.value))
 
 
 def _capture(item):
     return item.consumers if item.mechanism is NotificationKind.PIPE_FENCE else item.sources
 
 
-def _word(points, order):
-    points = _points(points)
-    paths = tuple(order.position(p) for p in points)
-    base = paths[0][-1][2]
-    return (
-        tuple(
-            (
-                p.actor,
-                p.placement,
-                path[:-1],
-                path[-1][:2],
-                path[-1][2] - base,
-                # Distinct zero-width control boundaries can have the same
-                # lexical position without a proven order. Do not identify
-                # their ties or treat one boundary as the other's native.
-                p.operation if isinstance(p.occurrence.endpoint, QueueEndpoint) else None,
-                order.dispatch.site(p).stage,
-            )
-            for p, path in zip(points, paths, strict=True)
-        ),
-        base,
-    )
-
-
-class _Positions:
-    def __init__(self, entries, order, work):
-        self.order, self.work = order, work
-        self.examples = dict(entries)
-        self.keys = sorted(self.examples)
-        example = self.examples[self.keys[0]]
-        self.paths = tuple(order.position(p) for p in _points(example))
-        self.base = self.paths[0][-1][2]
-
-    def ranges(self, target, requirements, *, before):
-        """All ranks in a band have the same complete comparison formula.
-
-        Only the last lexical rank varies in a word. All earlier scopes,
-        coordinates and ranks are fixed. If the target has that same scope,
-        its rank splits this word into strictly-before/equal/strictly-after
-        bands. Otherwise the comparison is independent of the varying rank.
-        Preserve each participant's split; a quorum is not one shared clock.
-        """
-        target = _points(target)
-        cuts = {0, len(self.keys)}
-        for path, point in zip(self.paths, target, strict=True):
-            other = self.order.position(point)
-            depth = len(path) - 1
-            if len(other) > depth and path[-1][0] is other[depth][0]:
-                threshold = other[depth][2] - (path[-1][2] - self.base)
-                cuts.add(bisect_left(self.keys, threshold))
-                cuts.add(bisect_right(self.keys, threshold))
-        cuts = sorted(cuts)
-        result = []
-        for start, end in pairwise(cuts):
-            self.work.order_bands += 1
-            representative = _points(self.examples[self.keys[start]])
-            relative = {
-                self.order.compare(a, b, need)
-                for a, b in zip(
-                    representative if before else target,
-                    target if before else representative,
-                    strict=True,
-                )
-                for need in requirements
-            }
-            if relative <= {-1, 0}:
-                if result and result[-1][1] == start:
-                    result[-1] = result[-1][0], end
-                else:
-                    result.append((start, end))
-        return result
-
-
 class _AcquiredWord:
     def __init__(self, items, order, work):
         self.work = work
         self.representative = items[0]
-        self.captures = _Positions(
-            ((_word(_capture(n), order)[1], _capture(n)) for n in items), order, work
+        self.captures = PositionWord(
+            ((position_word(_capture(n), order)[1], _capture(n)) for n in items), order
         )
-        self.acquires = _Positions(
-            ((_word(n.consumers, order)[1], n.consumers) for n in items), order, work
+        self.acquires = PositionWord(
+            ((position_word(n.consumers, order)[1], n.consumers) for n in items), order
         )
         self.size = 1 << (len(self.captures.keys) - 1).bit_length()
         # Each capture-tree vertex stores the actual acquired lexical ranks
@@ -118,8 +40,8 @@ class _AcquiredWord:
         self.capture_high = 0
 
     def add(self, item, number, order):
-        capture = bisect_left(self.captures.keys, _word(_capture(item), order)[1])
-        acquire = bisect_left(self.acquires.keys, _word(item.consumers, order)[1])
+        capture = bisect_left(self.captures.keys, position_word(_capture(item), order)[1])
+        acquire = bisect_left(self.acquires.keys, position_word(item.consumers, order)[1])
         self.capture_low = min(self.capture_low, capture)
         self.capture_high = max(self.capture_high, capture + 1)
         vertex = self.size + capture
@@ -134,12 +56,16 @@ class _AcquiredWord:
     def find(self, item):
         captures = tuple(
             (max(start, self.capture_low), min(end, self.capture_high))
-            for start, end in self.captures.ranges(item.sources, item.requirements, before=False)
+            for start, end in self.captures.ranges(
+                item.sources, item.requirements, before=False, work=self.work
+            )
             if start < self.capture_high and self.capture_low < end
         )
         if not captures:
             return None
-        acquires = self.acquires.ranges(item.consumers, item.requirements, before=True)
+        acquires = self.acquires.ranges(
+            item.consumers, item.requirements, before=True, work=self.work
+        )
         result = None
         for start, end in captures:
             vertices = []
@@ -178,8 +104,8 @@ class AcquiredPrefixes:
             key = (
                 route(item),
                 activation(item),
-                _word(_capture(item), order)[0],
-                _word(item.consumers, order)[0],
+                position_word(_capture(item), order)[0],
+                position_word(item.consumers, order)[0],
             )
             self.keys[item] = key
             groups.setdefault(key, []).append(item)

@@ -12,7 +12,7 @@ def prepare_one_gram(inputs, buffers, geometry, coordinates):
     Gp, Kp, GramLeft, Qp, GramRight = inputs
     anchor, gates, factor, raw, k, q, right_factor, right = buffers
     (SCALE,) = geometry
-    chunk, head, lane, owner, ring, item = coordinates
+    (lane,) = coordinates
     for panel in N.unroll(3):
         if panel < 2:
             start, col, extent = 16 + panel * 32, panel * 32, 16
@@ -23,51 +23,42 @@ def prepare_one_gram(inputs, buffers, geometry, coordinates):
         half = extent // 2
         row = start + lane * half
         right_row = col + lane * half
-        N.copy(Gp[chunk, head, start, :], anchor)
-        N.copy(Gp[chunk, head, row : row + half, :], gates[:half, :])
+        N.copy(Gp[start, :], anchor)
+        N.copy(Gp[row : row + half, :], gates[:half, :])
         N.mul(anchor, -1.0, out=anchor)
         N.add(gates[:half, :], anchor[None, :], out=factor[:half, :])
         N.exp(factor[:half, :], out=factor[:half, :])
-        N.copy(Kp[chunk, head, row : row + half, :], raw[:half, :])
+        N.copy(Kp[row : row + half, :], raw[:half, :])
         N.cast(raw[:half, :], out=k[:half, :])
         N.mul(k[:half, :], factor[:half, :], out=k[:half, :])
         N.copy(
             k[:half, :],
             GramLeft[
-                owner,
-                ring,
-                item,
                 left_offset + lane * half : left_offset + lane * half + half,
                 :,
             ],
         )
-        N.copy(Qp[chunk, head, row : row + half, :], raw[:half, :])
+        N.copy(Qp[row : row + half, :], raw[:half, :])
         N.cast(raw[:half, :], out=q[:half, :])
         N.mul(q[:half, :], factor[:half, :], out=q[:half, :])
         N.mul(q[:half, :], SCALE, out=q[:half, :])
         N.copy(
             q[:half, :],
             GramLeft[
-                owner,
-                ring,
-                item,
                 left_offset + extent + lane * half : left_offset + extent + lane * half + half,
                 :,
             ],
         )
-        N.copy(Gp[chunk, head, right_row : right_row + half, :], gates[:half, :])
+        N.copy(Gp[right_row : right_row + half, :], gates[:half, :])
         N.add(gates[:half, :], anchor[None, :], out=right_factor[:half, :])
         N.mul(right_factor[:half, :], -1.0, out=right_factor[:half, :])
         N.exp(right_factor[:half, :], out=right_factor[:half, :])
-        N.copy(Kp[chunk, head, right_row : right_row + half, :], raw[:half, :])
+        N.copy(Kp[right_row : right_row + half, :], raw[:half, :])
         N.cast(raw[:half, :], out=right[:half, :])
         N.mul(right[:half, :], right_factor[:half, :], out=right[:half, :])
         N.copy(
             right[:half, :],
             GramRight[
-                owner,
-                ring,
-                item,
                 right_offset + lane * half : right_offset + lane * half + half,
                 :,
             ],
@@ -76,114 +67,128 @@ def prepare_one_gram(inputs, buffers, geometry, coordinates):
 
 @N.inline
 def prepare_gram_operands(inputs, buffers, geometry, coordinates):
+    Gp, Kp, GramLeft, Qp, GramRight = inputs
     PACK, H, SCALE = geometry
-    base, lane, owner, ring = coordinates
+    base, lane = coordinates
     for item in N.serial(PACK):
         flat = base + item
-        prepare_one_gram(inputs, buffers, (SCALE,), (flat // H, flat % H, lane, owner, ring, item))
+        chunk, head = flat // H, flat % H
+        prepare_one_gram(
+            (
+                Gp[chunk, head, :, :],
+                Kp[chunk, head, :, :],
+                GramLeft[item, :, :],
+                Qp[chunk, head, :, :],
+                GramRight[item, :, :],
+            ),
+            buffers,
+            (SCALE,),
+            (lane,),
+        )
 
 
 @N.inline
-def import_gram_item(inputs, buffers, coordinates):
+def import_gram_item(inputs, buffers):
     GramLeft, GramRight = inputs
     a1, b1_small, b1_large = buffers
-    owner, ring, item, native_ring = coordinates
-    N.copy(GramLeft[owner, ring, item, :, :], a1[native_ring, :, :])
-    for panel in N.unroll(2):
-        N.copy(
-            GramRight[owner, ring, item, panel * 16 : panel * 16 + 16, :],
-            b1_small[native_ring, panel, :, :],
-        )
-    N.copy(GramRight[owner, ring, item, 32:64, :], b1_large[native_ring, :, :])
+    with N.CopyGroup(name="gram_operands"):
+        left = N.copy(GramLeft, a1)
+        for panel in N.unroll(2):
+            N.copy(GramRight[panel * 16 : panel * 16 + 16, :], b1_small[panel, :, :])
+        right = N.copy(GramRight[32:64, :], b1_large)
+    return left, right
 
 
 @N.inline
-def compute_gram_item(outputs, buffers, coordinates):
+def compute_gram_item(outputs, operands, buffers):
     GramSmall, GramLarge = outputs
-    b0_large, a1, b1_large, a0_small, b0_small, c0_small, a0_large, c0_large, b1_small = buffers
-    owner, ring, item, native_ring = coordinates
+    a1, b1_small, b1_large = operands
+    b0_large, a0_small, b0_small, c0_small, a0_large, c0_large = buffers
     for panel in N.unroll(2):
-        aa = N.copy(a1[native_ring, panel * 32 : panel * 32 + 32, :], a0_small)
-        bb = N.copy(
-            b1_small[native_ring, panel, :, :],
-            b0_small,
-            transpose=True,
-        )
-        N.matmul(aa, bb, accum=c0_small, initialize=True)
-        N.copy(c0_small, GramSmall[owner, ring, item, panel, :, :])
-    bb = N.copy(b1_large[native_ring, :, :], b0_large, transpose=True)
+        aa = N.copy(a1[panel * 32 : panel * 32 + 32, :], a0_small)
+        bb = N.copy(b1_small[panel, :, :], b0_small, transpose=True)
+        result = N.matmul(aa, bb, accum=c0_small, initialize=True)
+        N.copy(result, GramSmall[panel, :, :])
+    bb = N.copy(b1_large, b0_large, transpose=True)
     for part in N.unroll(2):
-        aa = N.copy(a1[native_ring, 64 + part * 32 : 96 + part * 32, :], a0_large)
-        N.matmul(aa, bb, accum=c0_large, initialize=True)
+        aa = N.copy(a1[64 + part * 32 : 96 + part * 32, :], a0_large)
+        result = N.matmul(aa, bb, accum=c0_large, initialize=True)
         N.copy(
-            c0_large,
-            GramLarge[owner, ring, item, part * 32 : part * 32 + 32, :],
+            result,
+            GramLarge[part * 32 : part * 32 + 32, :],
         )
 
 
 @N.inline
-def gram_products(inputs, buffers, geometry, coordinates):
+def gram_products(inputs, buffers, geometry):
     GramLeft, GramRight, GramSmall, GramLarge = inputs
-    _b0_large, a1, b1_large, _a0_small, _b0_small, _c0_small, _a0_large, _c0_large, b1_small = (
-        buffers
-    )
+    b0_large, a1, b1_large, a0_small, b0_small, c0_small, a0_large, c0_large, b1_small = buffers
     (PACK,) = geometry
-    owner, ring = coordinates
-    for item in N.Pipelined(PACK):
-        native_ring = item % 2
+    for item in N.Pipelined(PACK, issue_order=("load", "dot")):
         with N.Stage(0, name="load"):
-            import_gram_item(
-                (GramLeft, GramRight), (a1, b1_small, b1_large), (owner, ring, item, native_ring)
+            left, right = import_gram_item(
+                (GramLeft[item, :, :], GramRight[item, :, :]),
+                (a1.at(item), b1_small.at(item), b1_large.at(item)),
             )
         with N.Stage(1, name="dot"):
-            compute_gram_item((GramSmall, GramLarge), buffers, (owner, ring, item, native_ring))
+            compute_gram_item(
+                (GramSmall[item, :, :, :], GramLarge[item, :, :]),
+                (left, b1_small.at(item), right),
+                (b0_large, a0_small, b0_small, c0_small, a0_large, c0_large),
+            )
 
 
 @N.inline
 def store_one_gram(inputs, buffers, coordinates):
     GramSmall, GramLarge, Bp, Negative, Aqk = inputs
     scores32, scores16, betas, rows = buffers
-    chunk, head, valid, lane, owner, ring, item = coordinates
+    valid, lane = coordinates
     for panel in N.unroll(3):
         if panel < 2:
             start, col, extent = 16 + panel * 32, panel * 32, 16
             scores = scores16[:8, :]
-            score_source = GramSmall[owner, ring, item, panel, :, :]
+            score_source = GramSmall[panel, :, :]
         else:
             start, col, extent = 32, 0, 32
             scores = scores32
-            score_source = GramLarge[owner, ring, item, :, :]
+            score_source = GramLarge
         half = extent // 2
         row = start + lane * half
         N.copy(score_source[lane * half : lane * half + half, :], scores)
         if start + extent > valid:
             N.fill(scores, 0.0, mask=N.arange(half)[:, None] + row >= valid)
-        N.copy(Bp[chunk, head, row : row + half], betas[:half])
+        N.copy(Bp[row : row + half], betas[:half])
         N.mul(scores, betas[:half, None], out=scores, scratch=rows[:half, :])
         N.mul(scores, -1.0, out=scores)
-        N.copy(scores, Negative[chunk, head, row : row + half, col : col + extent])
+        N.copy(scores, Negative[row : row + half, col : col + extent])
         N.copy(
             score_source[extent + lane * half : extent + lane * half + half, :],
             scores,
         )
         if start + extent > valid:
             N.fill(scores, 0.0, mask=N.arange(half)[:, None] + row >= valid)
-        N.copy(scores, Aqk[chunk, head, row : row + half, col : col + extent])
+        N.copy(scores, Aqk[row : row + half, col : col + extent])
 
 
 @N.inline
 def store_gram_blocks(inputs, buffers, geometry, coordinates):
     Lengths, GramSmall, GramLarge, Bp, Negative, Aqk = inputs
     PACK, H = geometry
-    base, lane, owner, ring = coordinates
+    base, lane = coordinates
     for item in N.serial(PACK):
         flat = base + item
         chunk, head = flat // H, flat % H
         valid = N.load_index(Lengths[chunk : chunk + 1])
         store_one_gram(
-            (GramSmall, GramLarge, Bp, Negative, Aqk),
+            (
+                GramSmall[item, :, :, :],
+                GramLarge[item, :, :],
+                Bp[chunk, head, :],
+                Negative[chunk, head, :, :],
+                Aqk[chunk, head, :, :],
+            ),
             buffers,
-            (chunk, head, valid, lane, owner, ring, item),
+            (valid, lane),
         )
 
 
@@ -226,31 +231,39 @@ def prefill_gram_cross(
         scores32 = N.alloc_ub((16, 32), N.f32)
         # One actual DMA defines the complete left slab. Its L1 reuse waits
         # for all four readers; right operands retain compact transpose planes.
-        a1 = N.alloc_l1((2, 128, K), N.f32)
-        b1_small = N.alloc_l1((2, 2, 16, K), N.f32)
-        b1_large = N.alloc_l1((2, 32, K), N.f32)
+        a1 = N.alloc_l1((128, K), N.f32, slots=2)
+        b1_small = N.alloc_l1((2, 16, K), N.f32, slots=2)
+        b1_large = N.alloc_l1((32, K), N.f32, slots=2)
         a0_small = N.alloc_l0a((32, K), N.f32)
         a0_large = N.alloc_l0a((32, K), N.f32)
         b0_small = N.alloc_l0b((K, 16), N.f32)
         b0_large = N.alloc_l0b((K, 32), N.f32)
         c0_small = N.alloc_l0c((32, 16), N.f32)
         c0_large = N.alloc_l0c((32, 32), N.f32)
+        left_values = N.slotted_view(GramLeft[owner, :, :, :, :])
+        right_values = N.slotted_view(GramRight[owner, :, :, :, :])
+        small_values = N.slotted_view(GramSmall[owner, :, :, :, :, :])
+        large_values = N.slotted_view(GramLarge[owner, :, :, :, :])
         for cohort in N.Dataflow(
             N.ceildiv(N.max(0, CHUNKS * H // PACK - owner), GROUPS),
-            issue_order={"vector": ("store", "prepare")},
+            issue_order={"cube": ("compute",), "vector": ("store", "prepare")},
         ):
             base = (owner + cohort * GROUPS) * PACK
-            ring = cohort % 2
             with N.Vector() as lane, N.Stage(0, name="prepare"):
                 prepare_gram_operands(
-                    (Gp, Kp, GramLeft, Qp, GramRight),
+                    (Gp, Kp, left_values.at(cohort), Qp, right_values.at(cohort)),
                     (anchor, gates, factor, raw, k, q, right_factor, right),
                     (PACK, H, SCALE),
-                    (base, lane, owner, ring),
+                    (base, lane),
                 )
             with N.Cube(), N.Stage(1, name="compute"):
                 gram_products(
-                    (GramLeft, GramRight, GramSmall, GramLarge),
+                    (
+                        left_values.at(cohort),
+                        right_values.at(cohort),
+                        small_values.at(cohort),
+                        large_values.at(cohort),
+                    ),
                     (
                         b0_large,
                         a1,
@@ -263,12 +276,11 @@ def prefill_gram_cross(
                         b1_small,
                     ),
                     (PACK,),
-                    (owner, ring),
                 )
             with N.Vector() as lane, N.Stage(2, name="store"):
                 store_gram_blocks(
-                    (Lengths, GramSmall, GramLarge, Bp, Negative, Aqk),
+                    (Lengths, small_values.at(cohort), large_values.at(cohort), Bp, Negative, Aqk),
                     (scores32, scores16, betas, rows),
                     (PACK, H),
-                    (base, lane, owner, ring),
+                    (base, lane),
                 )

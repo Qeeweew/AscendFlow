@@ -27,7 +27,7 @@ def test_expert_policy_cannot_silently_drop_stage_constraints(labels):
 
 def test_reduction_scratch_alias_cannot_be_hidden_by_sync():
     helper = replace(
-        rms_compute, source=rms_compute.source.replace("scratch=partial", "scratch=y[slot, :64]")
+        rms_compute, source=rms_compute.source.replace("scratch=partial", "scratch=y[:64]")
     )
     assert helper.source != rms_compute.source
     source = from_source(

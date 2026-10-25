@@ -156,6 +156,14 @@ L1，下一 query 的覆盖仍等待旧 PV 的真实 MTE1 reader。这个政策�
 Cube 的 `pv→qk`、Vector 的 `gather→softmax→finish`，阶段偏移分别为 0/1/2。
 KV/Bias 使用 `query%3`，Score/P/PV 和分母快照使用 `query%2`，不能共用一个 slot 时钟。
 
+上述 GM workspace 以每组 `slotted_view` 绑定，各自用 `at(query)` 选择本 allocation
+的槽；helper 接收当前 payload，不重建 group/slot 地址。gather 的行与 mask、
+流式 L1 KV/P、分母快照分别显式声明 slots。固定 resident 平面和 Q/P phase alias
+用物理 `slot` 选择；L0A 的 Q 平面数不等于 PV 的双槽周期，PV 仍只覆盖原来的
+前两个平面。两页 overlay、条件 gather 写入及缓存复用继续保留普通 view 的
+部分更新语义。已完整导入 UB 的 indices/pages 以实际 Tile 传给 gather，间接
+Scalar 读取保留其原 writer 和各 AIV 私有存储身份。
+
 三槽还保护 **两个 AIV 对 Bias 的最后读取**。Cube 先执行 PV(q)，再执行 QK(q+1)；
 后者的最终 Score 完成前缀经过读取双方 P(q) 的 PV，因此已经涵盖双方 Bias(q)
 读取。每个 AIV 在下一轮 gather 前已获取该 Score。到 q+3 覆盖旧 Bias(q) 时，
