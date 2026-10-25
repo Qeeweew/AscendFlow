@@ -5,7 +5,6 @@ import ctypes as ct
 import hashlib
 import json
 import os
-import re
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -158,22 +157,15 @@ def artifact(output, entry, filename):
         "ASC identity changed",
     )
     require(digest(library.read_bytes()) == manifest["shared_sha256"], "library identity changed")
-    signatures = re.findall(r'extern "C" int launch_\w+\(([^()]*)\)', frozen.asc)
-    require(len(signatures) == 1, "expected one launcher")
-    names = [
-        parameter.strip().split()[-1].removeprefix("arg_") for parameter in signatures[0].split(",")
-    ]
-    require(names[0] == "stream", "unexpected launcher stream position")
-    module = ct.CDLL(str(library.resolve()))
-    launch = getattr(module, f"launch_{entry}")
-    launch.argtypes, launch.restype = [ct.c_void_p] * len(names), ct.c_int
+    names = [tensor["name"] for tensor in frozen.report["abi"]["tensors"]]
     identity = {
         "blocks": frozen.plan.body.block.first_op.blocks.data,
         "manifest": manifest,
         "source_ir_sha256": digest((directory / "source.xdsl").read_bytes()),
         "physical_ir_sha256": digest((directory / "after.xdsl").read_bytes()),
+        "workspace": frozen.report["workspace"],
     }
-    return module, launch, names[1:], identity
+    return library, names, identity
 
 
 def run_device(args, policy):
@@ -187,7 +179,7 @@ def run_device(args, policy):
         record["hardware"] = hardware_snapshot(args.physical)
         record["source_identity"] = json.loads((output / "source-identity.json").read_text())
         kernels = {entry: artifact(output, entry, filename) for entry, filename in SOURCES.items()}
-        record["artifacts"] = {entry: value[3] for entry, value in kernels.items()}
+        record["artifacts"] = {entry: value[2] for entry, value in kernels.items()}
         if args.reference_artifacts is not None:
             os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(args.reference_artifacts.resolve())
         runtime = ACL()
@@ -197,19 +189,30 @@ def run_device(args, policy):
             name: int(np.prod(shape)) * (2 if name in {"KV", "attention_out", "P"} else 4)
             for name, shape in shapes.items()
         }
-        workspace = {
-            name: runtime.allocate(b"\xcd" * size + GUARD) for name, size in capacities.items()
+        bindings = {
+            entry: runtime.kernel(library, entry)
+            for entry, (library, _names, _identity) in kernels.items()
         }
+        workspace = {
+            "attention_out": runtime.allocate(b"\xcd" * capacities["attention_out"] + GUARD)
+        }
+        arena = bindings["sparse_mla"]
+        offset = 0
+        for allocation in kernels["sparse_mla"][2]["workspace"]["allocations"]:
+            name, nbytes = allocation["name"], allocation["byte_coefficient"]
+            require(
+                not allocation["dimensions"] and nbytes == capacities[name],
+                "workspace layout differs",
+            )
+            workspace[name] = ct.c_void_p(arena.workspace.value + offset)
+            offset += (nbytes + 511) // 512 * 512
+        require(offset == arena.workspace_nbytes, "workspace total differs")
+        record["workspace_bytes"] = arena.workspace_nbytes
+        retained_handles = len(runtime.allocations)
         for case in args.cases:
             data = inputs(policy, case, args.query_lens)
             directory = output / "validation" / case
             directory.mkdir(parents=True, exist_ok=True)
-            if case == args.cases[0]:
-                np.savez(output / "cache-inputs.npz", ori_kv=data["ori_kv"], cmp_kv=data["cmp_kv"])
-            np.savez(
-                directory / "inputs.npz",
-                **{key: value for key, value in data.items() if key not in {"ori_kv", "cmp_kv"}},
-            )
             raw = {
                 key: encode(value, dtype) if key in {"q", "ori_kv", "cmp_kv"} else value.tobytes()
                 for key, value in data.items()
@@ -221,11 +224,8 @@ def run_device(args, policy):
 
             def launch_attention(pointers=pointers):
                 for entry in SOURCES:
-                    _module, launch, names, _identity = kernels[entry]
-                    require(
-                        launch(runtime.stream, *(pointers[key] for key in names)) == 0,
-                        f"{entry} launch failed",
-                    )
+                    _library, names, _identity = kernels[entry]
+                    bindings[entry](*(pointers[key] for key in names))
 
             for _ in range(args.warmup):
                 launch_attention()
@@ -236,18 +236,14 @@ def run_device(args, policy):
                 launch_attention()
             runtime.record(end)
             runtime.synchronize()
-            elapsed = ct.c_float()
-            runtime.call(
-                "aclrtEventElapsedTime",
-                [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-                ct.byref(elapsed),
-                start,
-                end,
-            )
+            elapsed_us = runtime.elapsed_us(start, end)
             results = {}
             for name, size in capacities.items():
-                blob = runtime.read(pointers[name], size + len(GUARD))
-                require(blob[size:] == GUARD, f"{case}: {name} bounds guard changed")
+                blob = runtime.read(
+                    pointers[name], size + (len(GUARD) if name == "attention_out" else 0)
+                )
+                if name == "attention_out":
+                    require(blob[size:] == GUARD, f"{case}: {name} bounds guard changed")
                 results[name] = blob[:size]
             for name, blob in raw.items():
                 require(
@@ -262,7 +258,7 @@ def run_device(args, policy):
                 gathered_bias,
                 lambda token, kv=expected_kv, mask=expected_bias: (kv[token], mask[token]),
                 policy,
-                kernels["sparse_mla"][3]["blocks"],
+                kernels["sparse_mla"][2]["blocks"],
             )
             actual = decode(results["attention_out"], dtype, shapes["attention_out"])
             expected = np.empty_like(actual)
@@ -273,7 +269,6 @@ def run_device(args, policy):
                 policy,
             ):
                 expected[first : first + len(chunk)] = chunk
-            np.savez(directory / "outputs.npz", actual=actual, expected=expected)
             require(
                 np.allclose(actual, expected, rtol=RTOL, atol=ATOL),
                 f"{case}: sparse attention differs; max_abs={np.max(np.abs(actual - expected))}",
@@ -299,7 +294,6 @@ def run_device(args, policy):
                     np.allclose(official, expected, rtol=RTOL, atol=ATOL),
                     f"{case}: official differs from independent oracle",
                 )
-                np.savez(directory / "official.npz", actual=official, expected=expected)
                 reference_record = reference.identity()
                 reference.close()
                 reference = None
@@ -308,7 +302,7 @@ def run_device(args, policy):
                 "max_abs_error": float(np.max(np.abs(actual - expected))),
                 "input_sha256": {key: digest(value) for key, value in raw.items()},
                 "output_sha256": digest(results["attention_out"]),
-                "stream_interval_us": elapsed.value * 1000 / args.repeats,
+                "stream_interval_us": elapsed_us / args.repeats,
                 "timing_scope": "fused kernel plus host submission gaps; single probe, no performance qualification",
                 "input_and_guards": "unchanged",
                 "gather": "exact",
@@ -329,9 +323,9 @@ def run_device(args, policy):
             )
             # Reuse the same output/workspace and library across all lengths;
             # release only the current case's input allocations.
-            for handle in runtime.allocations[len(workspace) :]:
+            for handle in runtime.allocations[retained_handles:]:
                 runtime.call("aclrtFree", [ct.c_void_p], handle)
-            del runtime.allocations[len(workspace) :]
+            del runtime.allocations[retained_handles:]
         record["status"] = "passed"
     except BaseException as error:
         record.update(status="failed", error=f"{type(error).__name__}: {error}")

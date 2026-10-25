@@ -46,7 +46,6 @@ def prefill_wu(
     Inverse: N.Tensor((CHUNKS, H, BT, BT), DTYPE),
     Right: N.Tensor((CHUNKS, H, 2, BT, K), DTYPE),
     U: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
-    W16Ring: N.Tensor((GROUPS, 2, BT, K), DTYPE, access="write"),
     W32: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write", write_disjoint=True),
     CHUNKS: N.constexpr = 2,
     H: N.constexpr = 32,
@@ -56,6 +55,7 @@ def prefill_wu(
     DTYPE: N.constexpr = N.bf16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
+        W16Ring = N.alloc_workspace((GROUPS, 2, BT, K), DTYPE, name="W16Ring")
         a1 = N.alloc_l1((BT, BT), DTYPE, slots=2)
         b1 = N.alloc_l1((2, BT, K), DTYPE, slots=2)
         a0 = N.alloc_l0a((BT, BT), DTYPE)

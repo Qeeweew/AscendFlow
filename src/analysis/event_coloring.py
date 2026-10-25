@@ -10,11 +10,11 @@ from heapq import heapify, heappop, heappush
 from itertools import combinations
 from time import perf_counter
 
-from z3 import And, Distinct, If, Implies, Int, Or, Sum
+from z3 import And, BitVec, Distinct, If, Implies, Int, Or, Sum
 
 from ..budget import poll
 from ..diagnostics import CompileError, ErrorKind, require
-from .event_contracts import CROSS_BACKLOG, EventDemand, EventIdPools
+from .event_contracts import CROSS_BACKLOG, SUPPORTED_CROSS_IDS, EventDemand, EventIdPools
 from .event_frontier_contracts import FrozenEventRelations
 from .smt import finite_model
 
@@ -493,8 +493,12 @@ def _constraints(prepared, option, selected, constraints, objectives):
     lanes, variables = {}, 0
     for component, (group, choices, exclusive_possible) in enumerate(residual):
         poll("event ID constraints", component=component, credits=len(group))
+        # Keep the full physical namespace, including IDs outside this pool.
         current = {
-            n: tuple(Int(f"{prefix}_{n}_{lane}") for lane in range(problem.demands[n].width))
+            n: tuple(
+                BitVec(f"{prefix}_{n}_{lane}", max(SUPPORTED_CROSS_IDS).bit_length())
+                for lane in range(problem.demands[n].width)
+            )
             for n in group
         }
         lanes.update(current)

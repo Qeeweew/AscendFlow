@@ -56,6 +56,7 @@ from z3 import (
     BoolRef,
     BoolVal,
     CheckSatResult,
+    Context,
     FreshBool,
     Function,
     If,
@@ -99,10 +100,16 @@ def finite_model(constraints, objectives=()):
     Named constraints refer to the frozen caller contracts. No source facts,
     reachability variables or rule inference enter this finite problem.
     """
-    optimizer = Optimize()
+    context = Context()
+    optimizer = Optimize(ctx=context)
     for name, condition in constraints:
-        optimizer.assert_and_track(condition, FreshBool(name))
-    minima = [optimizer.minimize(objective) for objective in objectives]
+        condition = (
+            BoolVal(condition, ctx=context)
+            if isinstance(condition, bool)
+            else condition.translate(context)
+        )
+        optimizer.assert_and_track(condition, Bool("finite." + name, ctx=context))
+    minima = [optimizer.minimize(objective.translate(context)) for objective in objectives]
     poll("finite resource selection")
     left = remaining("finite resource selection")
     timeout = _LOCAL_TIMEOUT_MS if left is None else min(_LOCAL_TIMEOUT_MS, int(left * 1000))
@@ -116,7 +123,7 @@ def finite_model(constraints, objectives=()):
             kind=ErrorKind.ANALYSIS_LIMIT,
             phase="event-id-allocation",
         )
-        return optimizer.model(), ()
+        return optimizer.model().translate(main_ctx()), ()
     if outcome == unsat:
         return None, tuple(str(item) for item in optimizer.unsat_core())
     raise CompileError(

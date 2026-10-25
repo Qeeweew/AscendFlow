@@ -5,6 +5,7 @@ import ctypes as ct
 import hashlib
 import json
 import subprocess
+from functools import partial
 from pathlib import Path
 
 from ascendflow.backend.cann import CANN
@@ -263,12 +264,7 @@ def main():
         pointers = [ct.c_void_p(handle.value + len(prefix)) for handle in handles]
         if args.backend == "generated":
             library = directory / "gemm.so"
-            module = ct.CDLL(str(library))
-            launcher = module.launch_gemm
-            launcher.argtypes, launcher.restype = [ct.c_void_p] * 4, ct.c_int
-
-            def launch():
-                require(launcher(runtime.stream, *pointers) == 0, "GEMM launch rejected")
+            launch = partial(runtime.kernel(library, "gemm"), *pointers)
 
             identity = {
                 "library": str(library),
@@ -355,14 +351,7 @@ def main():
             ),
             "GEMM input or guard changed",
         )
-        elapsed = ct.c_float()
-        runtime.call(
-            "aclrtEventElapsedTime",
-            [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-            ct.byref(elapsed),
-            start,
-            stop,
-        )
+        elapsed_us = runtime.elapsed_us(start, stop)
         case = {
             "backend": args.backend,
             "shape_mnk": [m, n, k],
@@ -390,7 +379,7 @@ def main():
             "output_sha256": sha(output),
             "warmup": args.warmup,
             "repeats": args.repeats,
-            "stream_interval_us": elapsed.value * 1000 / args.repeats,
+            "stream_interval_us": elapsed_us / args.repeats,
             "timing_scope": "ACL stream interval including host submission gaps; not kernel-only",
             "cache_policy": "same allocations reused, no flush",
             "generated_buffer_cache_policies": caches,

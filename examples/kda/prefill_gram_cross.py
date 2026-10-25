@@ -383,10 +383,6 @@ def prefill_gram_cross(
     Negative: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
     Aqk: N.Tensor((CHUNKS, H, BT, BT), N.f32, access="write", write_disjoint=True),
     Lengths: N.Tensor((CHUNKS,), N.i64),
-    GramLeft: N.Tensor((GROUPS, 2, PACK, 128, K), N.f32, access="write"),
-    GramRight: N.Tensor((GROUPS, 2, PACK, 64, K), N.f32, access="write"),
-    GramSmall: N.Tensor((GROUPS, 2, PACK, 2, 32, 16), N.f32, access="write"),
-    GramLarge: N.Tensor((GROUPS, 2, PACK, 64, 32), N.f32, access="write"),
     CHUNKS: N.constexpr = 2,
     H: N.constexpr = 32,
     K: N.constexpr = 128,
@@ -397,6 +393,10 @@ def prefill_gram_cross(
     SCALE: N.constexpr = 0.08838834764831845,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
+        GramLeft = N.alloc_workspace((GROUPS, 2, PACK, 128, K), N.f32, name="GramLeft")
+        GramRight = N.alloc_workspace((GROUPS, 2, PACK, 64, K), N.f32, name="GramRight")
+        GramSmall = N.alloc_workspace((GROUPS, 2, PACK, 2, 32, 16), N.f32, name="GramSmall")
+        GramLarge = N.alloc_workspace((GROUPS, 2, PACK, 64, 32), N.f32, name="GramLarge")
         assert K == 128 and BT == 64, "hierarchical 16/32-token Gram rectangles"
         assert PACK > 0 and CHUNKS * H % PACK == 0, "complete task cohorts"
         raw = N.alloc_ub((16, K), DTYPE)

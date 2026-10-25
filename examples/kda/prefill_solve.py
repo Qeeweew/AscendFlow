@@ -98,14 +98,12 @@ def solve_chunk_inverse(Diagonal, Negative, Ai32, Merge16, Merge32, Off32, a1, b
 def prefill_solve_merge(
     Negative: N.Tensor((CHUNKS, H, BT, BT), N.f32),
     Blocks: N.Tensor((CHUNKS, H, BT, BT), N.f32),
-    Merge: N.Tensor((GROUPS, 2, WIDTH, WIDTH), N.f32, access="write"),
-    Off: N.Tensor(
-        (CHUNKS, H, BT, BT) if WIDTH == 16 else (GROUPS, 2, WIDTH, WIDTH),
-        N.f32,
+    Result: N.Tensor(
+        (CHUNKS, H, BT, BT),
+        N.f32 if WIDTH == 16 else DTYPE,
         access="write",
-        write_disjoint=WIDTH == 16,
+        write_disjoint=True,
     ),
-    Inverse: N.Tensor((CHUNKS, H, BT, BT), DTYPE, access="write", write_disjoint=True),
     CHUNKS: N.constexpr = 2,
     H: N.constexpr = 32,
     BT: N.constexpr = 64,
@@ -114,6 +112,9 @@ def prefill_solve_merge(
     DTYPE: N.constexpr = N.bf16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
+        Merge = N.alloc_workspace((GROUPS, 2, WIDTH, WIDTH), N.f32, name="Merge")
+        if WIDTH == 32:
+            Off = N.alloc_workspace((GROUPS, 2, WIDTH, WIDTH), N.f32, name="Off")
         assert BT == 64 and (WIDTH == 16 or WIDTH == 32), "hierarchical block merge"
         raw = N.alloc_ub((32, BT), N.f32)
         packed = N.alloc_ub((32, BT), DTYPE)
@@ -144,7 +145,7 @@ def prefill_solve_merge(
                 )
             with N.Cube(), N.Stage(1, name="merge"):
                 if WIDTH == 16:
-                    target = Off[chunk, head, right : right + WIDTH, left : left + WIDTH]
+                    target = Result[chunk, head, right : right + WIDTH, left : left + WIDTH]
                 else:
                     target = off_values.at(item)
                 merge_inverse_blocks(
@@ -162,7 +163,7 @@ def prefill_solve_merge(
                         (
                             Blocks[chunk, head, :, :],
                             off_values.at(item),
-                            Inverse[chunk, head, :, :],
+                            Result[chunk, head, :, :],
                         ),
                         (raw, packed),
                         (lane,),

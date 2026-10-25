@@ -171,13 +171,19 @@ Scalar 读取保留其原 writer 和各 AIV 私有存储身份。
 本身不能授权覆盖 Bias。回归用独立有限模型保留提前读取和两槽覆盖的 RAW/WAR
 反例，不以普通编译成功代替 peer 访问证明。
 
-调用方分配以下 GM workspace，其中 `G=min(GROUPS,T*(H/BM))`，仅分配 resident worker 的切片：
+以下 GM workspace 均通过 `N.alloc_workspace` 内部分配，其中
+`G=min(GROUPS,T*(H/BM))`，仅分配 resident worker 的切片，各 allocation 起点自动
+按 512 B 对齐，调用方无需提供 scratch 参数：
 
 | workspace | 形状和 dtype |
 | --- | --- |
 | KV / Bias | `[G,3,CP,D]` b16 / `[G,3,CP]` FP32 |
 | Score / P | `[G,2,BM,S]` FP32 / b16 |
 | PV | `[G,2,BM,D]` FP32 |
+
+固定 worker 上限、TOPK/S、D 和 tile/slot 政策时，私有 workspace 容量有固定上限；
+增加 B/T 或原始 context 长度只增加 worker 轮数。TOPK/S 表示选中容量，增大它们仍会
+增大 workspace。KV cache、索引和实际输入输出按其数据规模分配。
 
 QK/PV 使用 b16 输入和 FP32 累加。P 在 PV 前显式舍入成输入 dtype；分母使用
 未舍入的 FP32 概率，最终输出仍是输入 dtype。统一最大值后舍入 P，与原先
@@ -230,8 +236,9 @@ python -m benchmarks.attention.run_sparse --build --batch 64 --query-tokens 6 \
 
 只做 Python/IR 检查时加 `--ir-only`。每个构建共享 300 秒硬期限，失败即停。
 运行复用 manifest 中已发布的库，不隐式重新编译。输出保存 policy、源码身份、
-DSL/物理 IR、ASC/库 hash、CANN 命令、设备健康、原始输入和逐项误差；输入及
-workspace 的尾部哨兵也要保持。默认检查空集合、window-only、混合两类 KV、
+DSL/物理 IR、ASC/库 hash、CANN 命令、设备健康、输入身份和逐项误差；输入和输出
+检查尾部哨兵，内部 gather workspace 按已发布布局回读实际 payload 并校验。
+不保存大规模输入输出张量转储。默认检查空集合、window-only、混合两类 KV、
 变长/空请求、索引 padding、重复索引、replay 后缀及极端有限 sink，并复用同一组 workspace。
 
 每次设备资格只属于其记录的 DSL/IR/ASC/库与输入。runner 的 ACL event 包含

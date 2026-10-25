@@ -93,8 +93,16 @@ def _allocations(memory):
             operation,
         )
         _require(
-            operation.external.data in {0, 1} and bool(operation.external.data) == (bank == "GM"),
-            "GM allocations are external; local banks are private",
+            operation.external.data in {0, 1}
+            and (not operation.external.data or bank == "GM")
+            and (
+                bank != "GM"
+                or operation.external.data
+                or operation.access is not None
+                and operation.access.data == "local"
+                and operation.initialized.data == 0
+            ),
+            "GM storage is external or uninitialized kernel workspace; local banks are private",
             operation,
         )
         _require(

@@ -47,6 +47,10 @@ descriptor 和逻辑 Tile 仍指向原 writer，另一个已初始化兄弟槽�
 
 ## Tensor 声明
 
+内部 GM 由 `N.alloc_workspace` 声明，其容量、512 B 对齐、设备资源绑定和
+生命周期合同见 [GM workspace](../guide/workspace.md)。设备资源在 source 构造前
+冻结，打包在同步后物化；两者均不替换真实访问的依赖、初始化或最后 reader 分析。
+
 ```python
 X: N.Tensor((n, 64), N.f16)
 Y: N.Tensor((n, 64), N.f16, access="write", write_disjoint=True)
@@ -62,7 +66,9 @@ State: N.Tensor((64,), N.f32, access="read_write")
 | `disjoint_external=True` | 不同外部 tensor roots 不别名；与同一 tensor 内的写入是否重叠是不同合同 |
 
 write_disjoint 不保证每次写完整 tensor、全部输出都被写到、初始化或 ready，
-也不约束下一次 launch。算法和调用方满足声明，launcher 不添加运行时检查。
+也不约束下一次 launch。算法和调用方满足声明，底层 C launcher 不检查动态访问。
+可选的 [tensor runtime](../guide/runtime.md) 校验外部 shape/dtype/layout、标量合同和
+已声明的外部 disjoint 区间，不逐个检查间接地址或推导完整输出初始化。
 独立有限模型按 invocation 检查具体重复写，能发现错误声明。
 
 当前只对没有内部 reader 的 write_disjoint 输出消除写间 WAW，无需恢复排列的

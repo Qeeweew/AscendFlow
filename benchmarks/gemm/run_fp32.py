@@ -1,10 +1,10 @@
 """Check the IEEE FP32 native path with inputs not representable in b16."""
 
 import argparse
-import ctypes as ct
 import json
 from pathlib import Path
 
+from ascendflow import TorchRuntime
 from ascendflow.device import health_snapshot
 from ascendflow.diagnostics import require
 from benchmarks.kda.run import digest, error_metrics
@@ -32,16 +32,10 @@ def main():
     directory = args.artifact.resolve()
     manifest = json.loads((directory / "batched_matmul.compile.json").read_text())
     require(digest(directory / "batched_matmul.so") == manifest["shared_sha256"], "library changed")
-    library = ct.CDLL(str(directory / "batched_matmul.so"))
-    launch = library.launch_batched_matmul
-    launch.argtypes = [ct.c_void_p] * 4 + [ct.c_int64]
-    launch.restype = ct.c_int
-    stream = torch.npu.current_stream()
-    require(
-        launch(stream.npu_stream, aa.data_ptr(), bb.data_ptr(), cc.data_ptr(), 3) == 0,
-        "FP32 launch failed",
-    )
-    torch.npu.synchronize()
+    with TorchRuntime(torch) as runtime:
+        launch = runtime.kernel(directory / "batched_matmul.so", "batched_matmul")
+        launch(aa, bb, cc)
+        torch.npu.synchronize()
     metrics = error_metrics(cc, expected)
     (args.output / "result.json").write_text(
         json.dumps(

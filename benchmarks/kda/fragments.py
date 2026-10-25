@@ -1,11 +1,11 @@
 """Build and numerically check the standalone KDA prefill fragments."""
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 from pathlib import Path
 
+from ascendflow import TorchRuntime
 from ascendflow.build import build_file
 from ascendflow.device import health_snapshot
 from ascendflow.diagnostics import require
@@ -21,26 +21,6 @@ CASES = {
     "transform": ("prefill_transform", {}),
     "wu": ("prefill_wu", {}),
 }
-ORDERS = {
-    "gram": ("Qp", "Kp", "Gp", "Bp", "Aqk", "Diagonal", "Ai32", "Lengths"),
-    "gram-cross": (
-        "Qp",
-        "Kp",
-        "Gp",
-        "Bp",
-        "Negative",
-        "Aqk",
-        "Lengths",
-        "GramLeft",
-        "GramRight",
-        "GramSmall",
-        "GramLarge",
-    ),
-    "solve16": ("Negative", "Blocks", "Merge", "Off", "Inverse"),
-    "solve32": ("Negative", "Blocks", "Merge", "Off", "Inverse"),
-    "transform": ("Qp", "Kp", "Vp", "Gp", "Bp", "Right", "KG", "QG", "Aqk", "A16", "Lengths"),
-    "wu": ("Inverse", "Right", "U", "W16Ring", "W32"),
-}
 
 
 def source(case):
@@ -49,7 +29,7 @@ def source(case):
     return f"examples/kda/{filename}.py", entry
 
 
-def sample(case):
+def sample(case, *, names):
     """Independent CPU equations, including untouched output regions and rounding."""
     import torch
 
@@ -97,13 +77,6 @@ def sample(case):
     elif case == "gram-cross":
         for name in ("Negative", "Aqk"):
             expected[name] = workspace(name, matrix, value=7.0).clone()
-        for name, dims in {
-            "GramLeft": (1, 2, 2, 128, 128),
-            "GramRight": (1, 2, 2, 64, 128),
-            "GramSmall": (1, 2, 2, 2, 32, 16),
-            "GramLarge": (1, 2, 2, 64, 32),
-        }.items():
-            workspace(name, dims)
         for start, col, extent in ((16, 0, 16), (48, 32, 16), (32, 0, 32)):
             rows, columns = slice(start, start + extent), slice(col, col + extent)
             g = host["Gp"]
@@ -124,20 +97,19 @@ def sample(case):
             blocks[:, :, start : start + width, start : start + width] = torch.eye(width) + (
                 random((2, 2, width, width)) / 128
             ).tril(-1)
-        workspace("Merge", (1, 2, width, width))
-        off = workspace("Off", matrix if width == 16 else (1, 2, width, width), value=7.0)
-        inverse = workspace("Inverse", matrix, torch.bfloat16, value=7.0)
+        result = workspace(
+            "Result", matrix, torch.float32 if width == 16 else torch.bfloat16, value=7.0
+        )
         if width == 16:
-            expected["Off"] = off.clone()
-            expected["Inverse"] = inverse.clone()  # This specialization must leave it untouched.
+            expected["Result"] = result.clone()
         else:
-            expected["Inverse"] = blocks.clone()
+            expected["Result"] = blocks.clone()
         for left in range(0, 64, 2 * width):
             a, b = slice(left, left + width), slice(left + width, left + 2 * width)
             merged = blocks[:, :, b, b] @ host["Negative"][:, :, b, a] @ blocks[:, :, a, a]
-            expected["Off" if width == 16 else "Inverse"][:, :, b, a] = merged
+            expected["Result"][:, :, b, a] = merged
         if width == 32:
-            expected["Inverse"] = expected["Inverse"].bfloat16()
+            expected["Result"] = expected["Result"].bfloat16()
     elif case == "transform":
         q, k, v = (host[n].float() for n in ("Qp", "Kp", "Vp"))
         g, beta = host["Gp"], host["Bp"]
@@ -159,8 +131,7 @@ def sample(case):
         expected["W32"] = products[:, :, 0].float()
         workspace("U", shape, torch.bfloat16, value=7.0)
         workspace("W32", shape, value=7.0)
-        workspace("W16Ring", (1, 2, 64, 128), torch.bfloat16)
-    return {name: host[name].contiguous() for name in ORDERS[case]}, expected
+    return {name: host[name].contiguous() for name in names}, expected
 
 
 def worker(args):
@@ -189,26 +160,20 @@ def worker(args):
         and identity["so"] == manifest["shared_sha256"],
         "fragment artifact changed",
     )
-    host, expected = sample(case)
+    runtime = TorchRuntime(torch)
+    launch = runtime.kernel(args.artifacts / f"{entry}.so", entry)
+    host, expected = sample(case, names=launch.tensors)
     inputs = {
         name: hashlib.sha256(t.view(torch.uint8).numpy().tobytes()).hexdigest()
         for name, t in host.items()
     }
     device = {name: t.npu() for name, t in host.items()}
-    library = ct.CDLL(str((args.artifacts / f"{entry}.so").resolve()))
-    launch = getattr(library, "launch_" + entry)
-    launch.argtypes, launch.restype = [ct.c_void_p] * (len(ORDERS[case]) + 1), ct.c_int
+    invoke = launch.bind(**device)
     results = []
     for _ in range(3):
         for name in expected:
             device[name].copy_(host[name])
-        require(
-            launch(
-                torch.npu.current_stream().npu_stream, *(device[n].data_ptr() for n in ORDERS[case])
-            )
-            == 0,
-            "fragment launch failed",
-        )
+        invoke()
         torch.npu.synchronize()
         measured = {name: device[name].cpu() for name in expected}
         metrics = {name: error_metrics(value, expected[name]) for name, value in measured.items()}
@@ -232,11 +197,13 @@ def worker(args):
                 "input_sha256": inputs,
                 "checks": results,
                 "invocations": 3,
+                "workspace_bytes": launch.workspace_nbytes,
             },
             indent=2,
         )
         + "\n"
     )
+    runtime.close()
 
 
 def main():

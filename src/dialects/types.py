@@ -1,6 +1,6 @@
 """Shared NPU types, conservative effects, and runtime input contracts."""
 
-from xdsl.dialects.builtin import ArrayAttr, IntAttr, StringAttr
+from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, IntAttr, StringAttr
 from xdsl.ir import Operation, ParametrizedAttribute, TypeAttribute
 from xdsl.irdl import irdl_attr_definition
 from xdsl.traits import EffectInstance, MemoryEffect, MemoryEffectKind
@@ -37,6 +37,21 @@ def verify_runtime_contract(name, minimum, multiple):
         raise VerifyException("runtime multiple must be a positive int64 integer")
     if ((minimum + multiple - 1) // multiple) * multiple > (1 << 63) - 1:
         raise VerifyException("runtime input contract has no representable int64 value")
+
+
+def verify_device_resources(resources):
+    if resources is None:
+        return
+    if (
+        not isinstance(resources, DictionaryAttr)
+        or resources.data.keys() != {"cube_cores", "vector_cores"}
+        or any(
+            not isinstance(n, IntAttr) or not 1 <= n.data <= 1024 for n in resources.data.values()
+        )
+    ):
+        raise VerifyException(
+            "device resources require positive cube_cores/vector_cores in [1,1024]"
+        )
 
 
 def ref_type(bank: str, dtype: str, layout: str = "linear") -> RefType:

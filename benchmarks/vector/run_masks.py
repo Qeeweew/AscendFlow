@@ -25,7 +25,6 @@ nonnegative runtime origins up to ``INT64_MAX`` stay exact.
 """
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 import re
@@ -321,20 +320,6 @@ def run(
     records = []
     inventory = structure_inventory(result.plan)
     try:
-        module = ct.CDLL(str(Path(library).resolve()))
-        launch = getattr(module, f"launch_{result.name}")
-        launch.argtypes = [
-            ct.c_void_p,
-            ct.c_void_p,
-            ct.c_void_p,
-            ct.c_void_p,
-            ct.c_void_p,
-            ct.c_void_p,
-            ct.c_int64,
-            ct.c_int64,
-            ct.c_int64,
-        ]
-        launch.restype = ct.c_int
         guard = b"\x5a" * 128
         x, z = field_tensors(rows, columns)
         require(x.shape == (rows, columns), "runner input does not match the published shape")
@@ -357,6 +342,7 @@ def run(
                 "adjacent 64-lane data compare bitmaps do not differ",
             )
         for q, lo, hi in cases:
+            launch = runtime.kernel(library, result.name, parameters=(q, lo, hi))
             expected = oracle(x, z, q, lo, hi)
             mask = coordinates(rows, columns, q, lo, hi)
             coverage = lane_coverage(mask, mask["fill"])
@@ -378,10 +364,7 @@ def run(
                 runtime.allocate(raw_z),
                 *(runtime.allocate(raw) for raw in buffers),
             ]
-            require(
-                launch(runtime.stream, *devices, q, lo, hi) == 0,
-                "mask example launch rejected its runtime contract",
-            )
+            launch(*devices)
             runtime.synchronize()
             outputs = [
                 runtime.read(device, len(raw))
@@ -409,18 +392,12 @@ def run(
                 "read-only input changed",
             )
             for _ in range(warmup - 1):
-                require(
-                    launch(runtime.stream, *devices, q, lo, hi) == 0,
-                    "mask example launch rejected its runtime contract",
-                )
+                launch(*devices)
             runtime.synchronize()
             start, stop = runtime.event(), runtime.event()
             runtime.record(start)
             for _ in range(repeats):
-                require(
-                    launch(runtime.stream, *devices, q, lo, hi) == 0,
-                    "mask example launch rejected its runtime contract",
-                )
+                launch(*devices)
             runtime.record(stop)
             runtime.synchronize()
             outputs = [
@@ -438,14 +415,7 @@ def run(
                 and all(raw[x.nbytes :] == guard for raw in outputs),
                 "repeated launches changed numerical output or bounds guard",
             )
-            elapsed = ct.c_float()
-            runtime.call(
-                "aclrtEventElapsedTime",
-                [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-                ct.byref(elapsed),
-                start,
-                stop,
-            )
+            elapsed_us = runtime.elapsed_us(start, stop)
             record = {
                 "q": q,
                 "lo": lo,
@@ -474,7 +444,7 @@ def run(
                 "input_and_output_guards": "checked",
                 "warmup": warmup,
                 "repeats": repeats,
-                "stream_interval_us_per_launch": elapsed.value * 1000 / repeats,
+                "stream_interval_us_per_launch": elapsed_us / repeats,
                 "timing_scope": "ACL event stream interval, including submission gaps; not kernel-only",
                 "input_sha256": _digest(raw_x),
                 "work": work_record(

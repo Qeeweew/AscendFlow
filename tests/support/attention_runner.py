@@ -14,13 +14,13 @@ from ascendflow import language as N
 from ascendflow.dialects.source import ElementOp, SizeOp
 from benchmarks.attention import run
 
-GENERATED_ORDER = ("Q", "K", "Score", "P", "V", "PV", "O")
+GENERATED_ORDER = ("Q", "K", "O", "V")
 
 
 def generated_source(order=GENERATED_ORDER):
     parameters = ", ".join("void* arg_" + name for name in order)
     return (
-        f'extern "C" int launch_attention_target(void* stream, {parameters}, '
+        f'extern "C" int launch_attention_target(void* stream, {parameters}, void* npu_workspace, '
         "int64_t npu_size_Sq, int64_t npu_size_Sk) { return 0; }\n"
     )
 
@@ -44,12 +44,12 @@ def metadata_ir(policy=run.DEFAULT_POLICY):
         )
         physical.append(
             f'%{name} = "npu.buffer"({operands}) {{sym_name="{name}", nbytes=#builtin.int<{nbytes}>, '
-            f"external=#builtin.int<1>, initialized=#builtin.int<{int(name in {'Q', 'K', 'V'})}>"
+            f"external=#builtin.int<{int(name in {'Q', 'K', 'V', 'O'})}>, initialized=#builtin.int<{int(name in {'Q', 'K', 'V'})}>"
             f'{count_scale}}} : ({types}) -> !npu.ref<"GM", "{dtype}", "linear">'
         )
         dimensions = ", ".join(f"#builtin.int<{n}>" for n in shape)
         axes = "#builtin.int<2>" if extent else ""
-        access = "read" if name in {"Q", "K", "V"} else "write"
+        access = "read" if name in {"Q", "K", "V"} else "write" if name == "O" else "local"
         logical.append(
             f'%{name} = "npu_source.alloc"({operands}) {{sym_name="{name}", versions=#builtin.int<1>, '
             f'access="{access}", ring=#builtin.int<0>, dynamic_axes=[{axes}]}} : ({types}) -> '
@@ -250,15 +250,26 @@ def mock_execution(monkeypatch, policy, *, actual_value=1.25, expected_value=1.2
         def synchronize(self):
             pass
 
+        def kernel(self, library, name, *, parameters=()):
+            nbytes = sum(t.fixed_bytes for t in policy.tensors if t.name in {"Score", "P", "PV"})
+            fn = library.launch_attention_target
+
+            class Bound:
+                workspace_nbytes = nbytes
+
+                def __call__(self, *pointers):
+                    fn(None, *pointers, None, *parameters)
+
+            return Bound()
+
         def event(self):
             return object()
 
         def record(self, event):
             pass
 
-        def call(self, name, types, elapsed, start, stop):
-            assert name == "aclrtEventElapsedTime"
-            ct.cast(elapsed, ct.POINTER(ct.c_float))[0] = 1.0
+        def elapsed_us(self, start, stop):
+            return 1000.0
 
         def close(self):
             self.closed = True

@@ -222,11 +222,6 @@ def sparse_mla(
     ori_topk_length: N.Tensor((T, 1), N.i32),
     sinks: N.Tensor((H,), N.f32),
     attention_out: N.Tensor((T, H, D), DTYPE, access="write", write_disjoint=True),
-    KV: N.Tensor((N.min(GROUPS, T * (H // BM)), 3, S - WINDOW, D), DTYPE, access="write"),
-    Bias: N.Tensor((N.min(GROUPS, T * (H // BM)), 3, S - WINDOW), N.f32, access="write"),
-    Score: N.Tensor((N.min(GROUPS, T * (H // BM)), 2, BM, S), N.f32, access="write"),
-    P: N.Tensor((N.min(GROUPS, T * (H // BM)), 2, BM, S), DTYPE, access="write"),
-    PV: N.Tensor((N.min(GROUPS, T * (H // BM)), 2, BM, D), N.f32, access="write"),
     B: N.constexpr = 4,
     T: N.constexpr = 16,
     H: N.constexpr = 64,
@@ -250,6 +245,11 @@ def sparse_mla(
     SCALE: N.constexpr = 0.04419417382415922,
 ):
     with N.Kernel(N.min(GROUPS, T * (H // BM)), kind="mixed") as group:
+        KV = N.alloc_workspace((N.min(GROUPS, T * (H // BM)), 3, S - WINDOW, D), DTYPE, name="KV")
+        Bias = N.alloc_workspace((N.min(GROUPS, T * (H // BM)), 3, S - WINDOW), N.f32, name="Bias")
+        Score = N.alloc_workspace((N.min(GROUPS, T * (H // BM)), 2, BM, S), N.f32, name="Score")
+        P = N.alloc_workspace((N.min(GROUPS, T * (H // BM)), 2, BM, S), DTYPE, name="P")
+        PV = N.alloc_workspace((N.min(GROUPS, T * (H // BM)), 2, BM, D), N.f32, name="PV")
         assert B > 0 and B < 2147483648 and T > 0 and T < 2147483648, "nonempty INT32 TND prefix"
         assert H % BM == 0 and (BM == 32 or BM == 64), "complete head tiles"
         assert WINDOW == 128 and PAGE == 128 and BK == 512 and C == 128, "cache/tile geometry"

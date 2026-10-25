@@ -71,7 +71,6 @@ def prefill_output(
     Snapshot: N.Tensor((CHUNKS, H, K, K), DTYPE),
     Residual: N.Tensor((CHUNKS, H, BT, K), DTYPE),
     Output: N.Tensor((TOKENS, H, K), DTYPE, access="write", write_disjoint=True),
-    OutputProducts: N.Tensor((GROUPS, 2, BT, 2 * K), N.f32, access="write"),
     Starts: N.Tensor((CHUNKS,), N.i64),
     Lengths: N.Tensor((CHUNKS,), N.i64),
     TOKENS: N.i64(minimum=1),
@@ -87,6 +86,7 @@ def prefill_output(
     DTYPE: N.constexpr = N.bf16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
+        OutputProducts = N.alloc_workspace((GROUPS, 2, BT, 2 * K), N.f32, name="OutputProducts")
         assert K == 128 and BT == 64 and CK == 64 and BV == 64, "output tile policy"
         assert CHUNKS == SEQUENCES * NC, "each sequence has NC nonempty chunks"
         q1 = N.alloc_l1((BT, K), DTYPE, slots=2)

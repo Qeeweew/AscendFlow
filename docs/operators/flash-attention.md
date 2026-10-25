@@ -9,13 +9,18 @@
 - Sq/Sk为任意正整数runtime参数，声明均为 `N.i64(minimum=1)`，没有倍数限制；空owner不发任务。
 - 每组串行处理分配到的Q块，每个Q块遍历KV块，内部Cube/Vector再分块。这里的Q块不是编译器应特殊识别的控制类型。
 
-| 显式workspace | shape | dtype |
+| 内部 workspace | shape | dtype |
 |---|---|---|
 | Score | `(GROUPS, 2, BQ, BK)` | f32 |
 | P | `(GROUPS, 2, BQ, BK)` | 输入dtype |
 | PV | `(GROUPS, 2, BQ, D)` | f32 |
 
-Q/K/V/O与workspace的真实指针区间遵守外部disjoint合同；局部L1/L0/UB以及上述GM环仍按真实访问同步，不能因变量名不同认为无复用。
+Score/P/PV 由 DSL 的 `N.alloc_workspace` 声明，runtime 自动分配一个 arena，各 allocation
+起点按 512 B 对齐；调用方只传 Q/K/V/O 与 Sq/Sk。Q/K/V/O 的真实指针区间遵守外部
+disjoint 合同，内部 arena 与它们分离。局部 L1/L0/UB 及上述 GM 环仍按真实访问同步。
+固定 GROUPS 与 tile 政策时，默认私有 workspace 共 65 MiB，不随 Sq/Sk 或 batch/head
+任务数增长；增加任务只增加各组处理的轮数。资源查询与生命周期见
+[GM workspace](../guide/workspace.md)。
 
 两槽 workspace 通过每组的 `slotted_view` 绑定。dense 以
 `query * kv_tiles + kv` 选择 generation，causal 以当前 `kv` 选择；Score/P/PV

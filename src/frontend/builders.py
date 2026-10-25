@@ -1098,6 +1098,10 @@ def alloc_ub(shape, dtype=f32, *, slots=None, name=None):
     return _local_storage(shape, dtype, "UB", slots=slots, name=name)
 
 
+def alloc_workspace(shape, dtype=f32, *, slots=None, name=None):
+    return _local_storage(shape, dtype, "GM", slots=slots, name=name)
+
+
 def alloc_l1(shape, dtype=f16, *, slots=None, name=None):
     return _local_storage(shape, dtype, "L1", layout="NZ", slots=slots, name=name)
 

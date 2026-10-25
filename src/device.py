@@ -8,10 +8,12 @@ import ctypes as ct
 import os
 import re
 import subprocess
+from functools import cached_property
 from pathlib import Path
 
 from .backend.cann import CANN
 from .diagnostics import require
+from .target.resources import DeviceResources
 
 
 def health_snapshot(physical: int, output: Path) -> dict:
@@ -64,6 +66,8 @@ class ACL:
         self.allocations = []
         self.events = []
         self.stream = ct.c_void_p()
+        self._closed = False
+        self._bound_kernels = False
         self.call("aclInit", [ct.c_char_p], None)
         self.call("aclrtSetDevice", [ct.c_int], 0)
         count = ct.c_uint()
@@ -127,6 +131,26 @@ class ACL:
     def synchronize(self):
         self.call("aclrtSynchronizeStream", [ct.c_void_p], self.stream)
 
+    @cached_property
+    def resources(self):
+        """Query the mapped logical device, never a hard-coded 910B core count."""
+        require(not self._closed, "kernel runtime is closed")
+        return query_device_resources(self.call)
+
+    def kernel(self, library, name, *, parameters=()):
+        """Bind a compiled kernel, allocating its workspace once on this stream.
+
+        Only external tensor pointers are passed to the returned callable.
+        Uniform size parameters follow source signature order and remain fixed
+        for this binding. Another binding owns an independent arena.
+        """
+        from .runtime.kernel import KernelLaunch
+
+        require(not self._closed, "kernel runtime is closed")
+        kernel = KernelLaunch(self, library, name, parameters=parameters)
+        self._bound_kernels = True
+        return kernel
+
     def event(self):
         event = ct.c_void_p()
         self.call("aclrtCreateEvent", [ct.POINTER(ct.c_void_p)], ct.byref(event))
@@ -136,10 +160,44 @@ class ACL:
     def record(self, event):
         self.call("aclrtRecordEvent", [ct.c_void_p, ct.c_void_p], event, self.stream)
 
+    def elapsed_us(self, start, stop):
+        """Elapsed ACL stream interval, including host submission gaps."""
+        elapsed = ct.c_float()
+        self.call(
+            "aclrtEventElapsedTime",
+            [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
+            ct.byref(elapsed),
+            start,
+            stop,
+        )
+        return elapsed.value * 1000
+
     def close(self):
+        if self._closed:
+            return
+        if self._bound_kernels:
+            self.synchronize()
         for event in self.events:
             self.call("aclrtDestroyEvent", [ct.c_void_p], event)
         for handle in self.allocations:
             self.call("aclrtFree", [ct.c_void_p], handle)
         self.call("aclrtDestroyStream", [ct.c_void_p], self.stream)
         self.call("aclFinalize", [])
+        self._closed = True
+
+
+def query_device_resources(call):
+    """Read core counts in an already initialized, explicitly mapped ACL context."""
+    counts = []
+    # CANN 9.1 aclrtDevAttr: CUBE_CORE_NUM=102, VECTOR_CORE_NUM=201.
+    for attr in (102, 201):
+        value = ct.c_int64()
+        call(
+            "aclrtGetDeviceInfo",
+            [ct.c_uint32, ct.c_int, ct.POINTER(ct.c_int64)],
+            0,
+            attr,
+            ct.byref(value),
+        )
+        counts.append(value.value)
+    return DeviceResources(*counts)

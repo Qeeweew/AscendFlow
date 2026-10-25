@@ -6,7 +6,6 @@ element is checked against a separate NumPy oracle, without tolerance tuning.
 """
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 from pathlib import Path
@@ -17,7 +16,7 @@ from ascendflow.device import ACL, health_snapshot
 from ascendflow.diagnostics import require
 from ascendflow.performance import hardware_snapshot
 from benchmarks.artifacts import read_artifact
-from benchmarks.references import ascendc_source
+from benchmarks.references import ascendc_source, reference_kernel
 from benchmarks.work import structure_inventory, work_record
 from examples.gemm.batched import batched_matmul
 
@@ -161,10 +160,13 @@ def main():
     try:
         for variant in variants:
             name, _ = sources[variant]
-            module = ct.CDLL(str((args.output / variant / f"{name}.so").resolve()))
-            launch = getattr(module, "launch_" + name)
-            launch.argtypes, launch.restype = [ct.c_void_p] * 4 + [ct.c_int64], ct.c_int
+            library = args.output / variant / f"{name}.so"
             for tiles in args.tiles:
+                launch = (
+                    runtime.kernel(library, name, parameters=(tiles,))
+                    if variant == "generated"
+                    else reference_kernel(runtime, library, name, 3, parameters=(tiles,))
+                )
                 a, b, expected = inputs_and_oracle(policy, tiles)
                 guard = b"\x5a" * 512
                 a, b = a + guard, b + guard
@@ -174,12 +176,12 @@ def main():
                     runtime.allocate(b"\xcd" * expected.nbytes + guard),
                 )
                 for _ in range(args.warmup):
-                    require(launch(runtime.stream, ap, bp, cp, tiles) == 0, "launch rejected")
+                    launch(ap, bp, cp)
                 runtime.synchronize()
                 start, stop = runtime.event(), runtime.event()
                 runtime.record(start)
                 for _ in range(args.repeats):
-                    require(launch(runtime.stream, ap, bp, cp, tiles) == 0, "launch rejected")
+                    launch(ap, bp, cp)
                 runtime.record(stop)
                 runtime.synchronize()
                 raw = runtime.read(cp, expected.nbytes + len(guard))
@@ -195,14 +197,7 @@ def main():
                     and runtime.read(bp, len(b)) == b,
                     "input/output guard changed",
                 )
-                elapsed = ct.c_float()
-                runtime.call(
-                    "aclrtEventElapsedTime",
-                    [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-                    ct.byref(elapsed),
-                    start,
-                    stop,
-                )
+                elapsed_us = runtime.elapsed_us(start, stop)
                 record = {
                     "variant": variant,
                     "kernel": name,
@@ -215,7 +210,7 @@ def main():
                     "max_abs_error": 0.0,
                     "warmup": args.warmup,
                     "repeats": args.repeats,
-                    "stream_interval_us": elapsed.value * 1000 / args.repeats,
+                    "stream_interval_us": elapsed_us / args.repeats,
                     "timing_scope": "ACL stream interval including submission gaps; not kernel-only",
                     "cache_policy": "same allocations reused; no cache flush",
                     "input_sha256": [hashlib.sha256(a).hexdigest(), hashlib.sha256(b).hexdigest()],

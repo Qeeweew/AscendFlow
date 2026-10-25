@@ -19,7 +19,6 @@ from benchmarks.attention.run_sparse import (
     SOURCES,
     artifact,
     policy_for,
-    workspace_shapes,
 )
 from benchmarks.references.sparse_mla_aclnn import SparseMlaReference
 from benchmarks.validation.dtypes import decode, encode
@@ -201,7 +200,7 @@ def main(argv=None):
             kernels = {
                 entry: artifact(args.artifacts, entry, name) for entry, name in SOURCES.items()
             }
-            record["artifacts"] = {entry: kernel[3] for entry, kernel in kernels.items()}
+            record["artifacts"] = {entry: kernel[2] for entry, kernel in kernels.items()}
             record["source_identity"] = json.loads(
                 (args.artifacts / "source-identity.json").read_text()
             )
@@ -209,19 +208,15 @@ def main(argv=None):
             require(args.reference_artifacts is not None, "official custom OPP package is required")
             os.environ["ASCEND_CUSTOM_OPP_PATH"] = str(args.reference_artifacts.resolve())
         runtime = ACL()
-        shapes = workspace_shapes(policy)
-        capacities = (
+        bindings = (
             {
-                name: int(np.prod(shape)) * (2 if name in {"KV", "P"} else 4)
-                for name, shape in shapes.items()
-                if name != "attention_out"
+                entry: runtime.kernel(library, entry)
+                for entry, (library, _names, _identity) in kernels.items()
             }
             if args.backend == "ascendflow"
             else {}
         )
-        scratch = {
-            name: runtime.allocate(b"\xcd" * size + GUARD) for name, size in capacities.items()
-        }
+        record["workspace_bytes"] = sum(k.workspace_nbytes for k in bindings.values())
         sizes = {
             "ori_kv": policy["ORI_BLOCKS"] * policy["PAGE"] * policy["D"] * 2,
             "cmp_kv": policy["CMP_BLOCKS"] * (policy["PAGE"] // policy["RATIO"]) * policy["D"] * 2,
@@ -235,7 +230,7 @@ def main(argv=None):
                 key: encode(value, "bf16") if key == "q" else value.tobytes()
                 for key, value in arrays.items()
             }
-            pointers = scratch | {key: runtime.allocate(blob + GUARD) for key, blob in raw.items()}
+            pointers = {key: runtime.allocate(blob + GUARD) for key, blob in raw.items()}
             cache_identity = {}
             for name, size in sizes.items():
                 pointers[name], cache_identity[name] = zero_cache(runtime, size, patches[name])
@@ -248,11 +243,8 @@ def main(argv=None):
             if args.backend == "ascendflow":
 
                 def launch(pointers=pointers):
-                    for _module, fn, names, _identity in kernels.values():
-                        require(
-                            fn(runtime.stream, *(pointers[key] for key in names)) == 0,
-                            "generated launch failed",
-                        )
+                    for entry, (_library, names, _identity) in kernels.items():
+                        bindings[entry](*(pointers[key] for key in names))
             else:
                 reference = SparseMlaReference(
                     runtime,

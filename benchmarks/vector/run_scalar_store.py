@@ -1,7 +1,6 @@
 """Check the public scalar capture/store example against an exact FP32 oracle."""
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 from pathlib import Path
@@ -38,12 +37,10 @@ def main():
     source, destination = values.tobytes() + guard, b"\xcd" * values.nbytes + guard
     runtime = ACL()
     try:
-        module = ct.CDLL(str(library))
-        launch = module.launch_scalar_store
-        launch.argtypes, launch.restype = [ct.c_void_p] * 3, ct.c_int
+        launch = runtime.kernel(library, artifact.name)
         x, y = runtime.allocate(source), runtime.allocate(destination)
         for _ in range(3):
-            require(launch(runtime.stream, x, y) == 0, "scalar store launch failed")
+            launch(x, y)
             runtime.synchronize()
             actual = runtime.read(y, len(destination))
             require(

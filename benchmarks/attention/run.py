@@ -120,7 +120,8 @@ def launcher_abi(source, name, *, generated):
         "attention artifact needs exactly its declared extern launcher",
     )
     pointers = (
-        {"arg_" + key: value for key, value in BUFFER_NAMES.items()}
+        {"arg_" + key: value for key, value in BUFFER_NAMES.items() if key in {"Q", "K", "V", "O"}}
+        | {"npu_workspace": "workspace"}
         if generated
         else {value: value for value in BUFFER_NAMES.values()}
     )
@@ -147,9 +148,13 @@ def launcher_abi(source, name, *, generated):
             key = sizes[argument]
         names.append(argument)
         keys.append(key)
+    expected = (
+        {"stream", "sq", "sk", "q", "k", "v", "o", "workspace"}
+        if generated
+        else {"stream", "sq", "sk", *BUFFER_NAMES.values()}
+    )
     require(
-        len(keys) == len(set(keys)) == 10
-        and set(keys) == {"stream", "sq", "sk", *BUFFER_NAMES.values()},
+        len(keys) == len(set(keys)) == len(expected) and set(keys) == expected,
         "attention launcher has missing or duplicate named parameters",
     )
     require(keys[0] == "stream", "attention launcher must start with its stream pointer")
@@ -159,7 +164,9 @@ def launcher_abi(source, name, *, generated):
 def local_contract(program, root, policy):
     """Check complete source footprints and each actor's physical storage."""
     local = [
-        op for op in program.walk() if isinstance(op, AllocationOp) and op.access.data == "local"
+        op
+        for op in program.walk()
+        if isinstance(op, AllocationOp) and op.ref.type.memory.data != "GM"
     ]
     footprints = Counter(
         (
@@ -189,7 +196,9 @@ def local_contract(program, root, policy):
         == {"cube", "vector"},
         "compiled attention requires shared Cube/Vector domains in one mixed body",
     )
-    physical = [op for op in root.walk() if isinstance(op, BufferOp) and not op.external.data]
+    physical = [
+        op for op in root.walk() if isinstance(op, BufferOp) and op.ref.type.bank.data != "GM"
+    ]
     expected = {op.sym_name.data: op for op in local}
     require(
         len(physical) == len(expected)
@@ -270,12 +279,12 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
     allocations = {
         op.sym_name.data: op
         for op in program.body.block.ops
-        if isinstance(op, AllocationOp) and op.access.data != "local"
+        if isinstance(op, AllocationOp) and op.ref.type.memory.data == "GM"
     }
     buffers = {
         op.sym_name.data: op
         for op in physical.walk()
-        if isinstance(op, BufferOp) and op.external.data
+        if isinstance(op, BufferOp) and op.ref.type.bank.data == "GM"
     }
     tensors = {tensor.name: tensor for tensor in policy.tensors}
     require(
@@ -307,7 +316,8 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
         require(
             allocation.versions.data == 1
             and allocation.ring.data == 0
-            and allocation.access.data == ("read" if name in {"Q", "K", "V"} else "write"),
+            and allocation.access.data
+            == ("read" if name in {"Q", "K", "V"} else "write" if name == "O" else "local"),
             f"compiled attention access contract differs for {name}",
         )
         require(
@@ -326,6 +336,7 @@ def generated_contract(directory, policy=DEFAULT_POLICY):
             and (0 if buffer.count_scale is None else buffer.count_scale.data)
             == tensor.bytes_per_extent
             and buffer.initialized.data == int(name in {"Q", "K", "V"})
+            and buffer.external.data == int(name in {"Q", "K", "V", "O"})
             and buffer.extent_count is (None if extent is None else sizes[extent].value),
             f"compiled attention physical extent/type differs for {name}",
         )
@@ -616,6 +627,8 @@ def run(args):
             {name: len(data) for name, data in raw.items()} == policy.allocation_bytes(sq, sk),
             "attention oracle allocation contract differs from this compiled policy",
         )
+        if args.backend in {"generated", "aclnn"}:
+            raw = {name: blob for name, blob in raw.items() if name in {"q", "k", "v", "o"}}
         prepared.append((sq, sk, raw, expected, selected, oracle_s))
     # This inspects every card and enforces one explicitly mapped physical
     # card as logical zero, before this process initializes any ACL context.
@@ -628,10 +641,16 @@ def run(args):
         launch = None
         if backend.abi is not None:
             library = ct.CDLL(str(backend.library))
-            launch = getattr(library, backend.abi.symbol)
-            launch.argtypes, launch.restype = backend.abi.argtypes, ct.c_int
+            if args.backend != "generated":
+                launch = getattr(library, backend.abi.symbol)
+                launch.argtypes, launch.restype = backend.abi.argtypes, ct.c_int
         for sq, sk, raw, expected, selected, oracle_s in prepared:
             pointers = {name: runtime.allocate(data + GUARD) for name, data in raw.items()}
+            bound = (
+                runtime.kernel(library, ENTRY, parameters=(sq, sk))
+                if args.backend == "generated"
+                else None
+            )
             if args.backend == "aclnn":
                 reference = FlashAttentionReference(
                     runtime,
@@ -647,12 +666,20 @@ def run(args):
 
             arguments = (
                 backend.abi.arguments(runtime.stream, pointers, sq, sk)
-                if backend.abi is not None
+                if backend.abi is not None and args.backend != "generated"
                 else ()
             )
 
-            def invoke(reference=reference, arguments=arguments):
-                if reference is not None:
+            def invoke(reference=reference, arguments=arguments, bound=bound, pointers=pointers):
+                if bound is not None:
+                    bound(
+                        *(
+                            pointers[key]
+                            for key in backend.abi.keys
+                            if key not in {"stream", "workspace", "sq", "sk"}
+                        )
+                    )
+                elif reference is not None:
                     reference()
                 else:
                     require(
@@ -688,16 +715,9 @@ def run(args):
                 require(observed[-len(GUARD) :] == GUARD, f"{name} allocation guard changed")
                 if name in {"q", "k", "v"}:
                     require(observed[: -len(GUARD)] == raw[name], f"{name} input changed")
-            elapsed = ct.c_float()
-            runtime.call(
-                "aclrtEventElapsedTime",
-                [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-                ct.byref(elapsed),
-                start,
-                stop,
-            )
+            elapsed_us = runtime.elapsed_us(start, stop)
             require(
-                math.isfinite(elapsed.value) and elapsed.value > 0,
+                math.isfinite(elapsed_us) and elapsed_us > 0,
                 "invalid ACL stream event interval",
             )
             row = {
@@ -728,11 +748,11 @@ def run(args):
                 "oracle_s": oracle_s,
                 "warmup": args.warmup,
                 "repeats": args.repeats,
-                "stream_interval_us": elapsed.value * 1000 / args.repeats,
+                "stream_interval_us": elapsed_us / args.repeats,
                 "timing_scope": TIMING_SCOPE,
                 "cache_policy": "same allocations and inputs reused within the case; no cache flush",
                 "input_contract": {
-                    "allocation_bytes": policy.allocation_bytes(sq, sk),
+                    "allocation_bytes": {name: len(blob) for name, blob in raw.items()},
                     "example_groups": policy.groups,
                     "example_tile_bq_bk_ck_vr": [
                         policy.parameters()[key] for key in ("BQ", "BK", "CK", "VR")
@@ -749,7 +769,9 @@ def run(args):
                 "inputs_unchanged": True,
                 "guards_checked": True,
                 "guard_bytes": len(GUARD),
-                "backend_workspace_bytes": None
+                "backend_workspace_bytes": bound.workspace_nbytes
+                if bound is not None
+                else None
                 if reference is None
                 else reference.workspace_size.value,
                 "backend_auxiliary_bytes": None if reference is None else reference.auxiliary_bytes,

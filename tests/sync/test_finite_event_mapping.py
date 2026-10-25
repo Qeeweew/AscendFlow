@@ -33,6 +33,21 @@ def test_odd_cycle_has_no_mapping_in_the_actual_two_number_pool():
     assert error.value.witness
 
 
+def test_finite_mapping_and_diagnostics_ignore_unrelated_solver_history():
+    from z3 import FreshBool
+
+    mappings, witnesses = [], []
+    for count in (0, 37):
+        for _ in range(count):
+            FreshBool("unrelated_query")
+        mappings.append(color_event_resources(problem({(0, 1), (1, 2), (2, 3)})))
+        with pytest.raises(NoEventAssignment) as error:
+            color_event_resources(problem({(0, 1), (1, 2), (2, 3), (3, 4), (0, 4)}))
+        witnesses.append(frozenset(error.value.witness))
+    assert mappings[0] == mappings[1]
+    assert witnesses[0] == witnesses[1]
+
+
 def test_all_five_vertex_graphs_match_an_independent_two_color_oracle():
     pairs = tuple(combinations(range(5), 2))
     for mask in range(1 << len(pairs)):
@@ -138,6 +153,9 @@ def test_unknown_finite_choice_never_authorizes_an_allocation(monkeypatch):
     from ascendflow.diagnostics import CompileError, ErrorKind
 
     class Undecided:
+        def __init__(self, *, ctx):
+            pass
+
         def assert_and_track(self, *args):
             pass
 

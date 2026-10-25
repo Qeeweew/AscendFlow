@@ -34,7 +34,14 @@ from xdsl.irdl import (
 from xdsl.traits import IsTerminator, RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
-from .types import AsyncEffects, MaskType, TensorType, TileType, verify_runtime_contract
+from .types import (
+    AsyncEffects,
+    MaskType,
+    TensorType,
+    TileType,
+    verify_device_resources,
+    verify_runtime_contract,
+)
 
 
 def _verify_yield(op):
@@ -197,10 +204,12 @@ class ProgramOp(IRDLOperation):
     kind = attr_def(StringAttr)
     groups = attr_def(IntAttr)
     disjoint_external = attr_def(IntAttr)
+    device_resources = opt_attr_def(DictionaryAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
 
     def verify_(self):
+        verify_device_resources(self.device_resources)
         _verify_yield(self)
         if self.kind.data not in {"vector", "cube", "mixed"} or not 1 <= self.groups.data <= 1024:
             raise VerifyException("source kernel requires vector/cube/mixed and groups in [1,1024]")
@@ -217,6 +226,8 @@ class ProgramOp(IRDLOperation):
 
 @irdl_op_definition
 class AllocationOp(IRDLOperation):
+    """External permissions or kernel-owned storage (access=local, including GM)."""
+
     name = "npu_source.alloc"
     sym_name = attr_def(StringAttr)
     versions = attr_def(IntAttr)

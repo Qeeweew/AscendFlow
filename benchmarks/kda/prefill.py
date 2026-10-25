@@ -1,7 +1,6 @@
 """Build, validate and time the chunk KDA prefill pipeline."""
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 import os
@@ -9,6 +8,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from ascendflow import TorchRuntime
 from ascendflow.build import build_file
 from ascendflow.device import health_snapshot
 from ascendflow.diagnostics import require
@@ -22,70 +22,9 @@ from benchmarks.kda.run import digest, error_metrics
 PHASES = ("prepare", "scan", "output")
 KERNELS = {p: "prefill_" + p for p in PHASES}
 SOURCES = {p: "examples/kda/prefill_" + p + ".py" for p in PHASES}
-RUNTIME_PHASES = {"prepare", "output"}
-ORDERS = {
-    "prepare": (
-        "Q",
-        "Key",
-        "Value",
-        "Gate",
-        "Beta",
-        "Qp",
-        "Kp",
-        "Vp",
-        "Gp",
-        "LocalGp",
-        "Bp",
-        "Aqk",
-        "Diagonal",
-        "Ai32",
-        "Negative",
-        "Inverse",
-        "Right",
-        "KG",
-        "QG",
-        "A16",
-        "U",
-        "W32",
-        "GramLeft",
-        "GramRight",
-        "GramProducts",
-        "Merge16",
-        "Merge32",
-        "Off32",
-        "W16Ring",
-        "Starts",
-        "Lengths",
-        "Lower",
-    ),
-    "scan": (
-        "U",
-        "KG",
-        "Gp",
-        "Initial",
-        "Final",
-        "History",
-        "Snapshot",
-        "W32",
-        "Projection",
-        "Residual",
-        "Delta",
-        "Lengths",
-    ),
-    "output": (
-        "QG",
-        "A16",
-        "Snapshot",
-        "Residual",
-        "Output",
-        "OutputProducts",
-        "Starts",
-        "Lengths",
-    ),
-}
 
 
-def workspace_layout(chunks, heads, sequences, dtype):
+def intermediate_layout(chunks, heads, sequences, dtype):
     layouts = {}
 
     def add(names, shape, storage):
@@ -93,24 +32,10 @@ def workspace_layout(chunks, heads, sequences, dtype):
             layouts[name] = (shape, storage)
 
     add("KG QG Residual U", (chunks, heads, 64, 128), dtype)
-    add("Qp Kp Vp", (20, 1, 64, 128), dtype)
-    add("LocalGp", (20, 1, 64, 128), "f32")
-    add("Gp W32 Projection", (chunks, heads, 64, 128), "f32")
-    add("Aqk Ai32 Negative Diagonal", (20, 1, 64, 64), "f32")
-    add("Bp", (20, 1, 64), "f32")
-    add("Merge16", (20, 2, 16, 16), "f32")
-    add("Merge32 Off32", (20, 2, 32, 32), "f32")
-    add("Inverse", (20, 1, 64, 64), dtype)
+    add("Gp W32", (chunks, heads, 64, 128), "f32")
     add("A16", (chunks, heads, 64, 64), dtype)
-    add("OutputProducts", (20, 2, 64, 256), "f32")
-    add("Right", (20, 1, 2, 64, 128), dtype)
-    add("W16Ring", (20, 2, 64, 128), dtype)
     add("Snapshot", (chunks, heads, 128, 128), dtype)
-    add("Delta", (chunks, heads, 128, 128), "f32")
-    add("GramLeft", (20, 2, 1, 128, 128), "f32")
-    add("GramRight", (20, 2, 1, 64, 128), "f32")
-    add("GramProducts", (20, 2, 32, 96), "f32")
-    add("Initial History Final", (sequences, heads, 128, 128), "f32")
+    add("Initial Final", (sequences, heads, 128, 128), "f32")
     add("Lower", (2, 64, 64), "f32")
     return layouts
 
@@ -185,16 +110,22 @@ def build(args):
 
 def validate_artifacts(directory, heads, dtype, chunks, sequences):
     identity = {}
-    layouts = workspace_layout(chunks, heads, sequences, dtype)
+    layouts = intermediate_layout(chunks, heads, sequences, dtype)
     for phase in PHASES:
         path = directory / phase
         source = parse((path / "source.xdsl").read_text())
         buffers = {
             op.sym_name.data: op.ref.type
             for op in source.walk()
-            if isinstance(op, AllocationOp) and op.ref.type.memory.data == "GM"
+            if isinstance(op, AllocationOp)
+            and op.ref.type.memory.data == "GM"
+            and op.access.data != "local"
         }
-        require(tuple(buffers) == ORDERS[phase], f"{phase} library ABI differs")
+        abi = json.loads((path / "verification.json").read_text())["abi"]
+        require(
+            tuple(buffers) == tuple(item["name"] for item in abi["tensors"]),
+            f"{phase} library ABI differs",
+        )
         for name, tensor in buffers.items():
             if name in layouts:
                 shape, storage = layouts[name]
@@ -301,12 +232,15 @@ def worker(args):
         device[name] = torch.empty(shape, dtype=storage_dtype, device="npu")
 
     storage_types = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
-    for name, (shape, storage) in workspace_layout(chunks, heads, batch, config["dtype"]).items():
+    for name, (shape, storage) in intermediate_layout(
+        chunks, heads, batch, config["dtype"]
+    ).items():
         if name not in device:
             workspace(name, shape, storage_types[storage])
     workspace("Output", (tokens, heads, dimension), dtype)
     stream = torch.npu.current_stream()
-    libraries, launchers, artifacts = [], {}, {}
+    kernel_runtime = TorchRuntime(torch)
+    launchers, artifacts = {}, {}
     for phase in PHASES:
         directory = (args.artifacts / phase).resolve()
         kernel = KERNELS[phase]
@@ -316,13 +250,8 @@ def worker(args):
             and digest(directory / f"{kernel}.asc") == manifest["source_sha256"],
             "prefill artifact changed",
         )
-        library = ct.CDLL(str(directory / f"{kernel}.so"))
-        libraries.append(library)
-        launch = getattr(library, "launch_" + kernel)
-        launch.argtypes = [ct.c_void_p] * (len(ORDERS[phase]) + 1) + (
-            [ct.c_int64] if phase in RUNTIME_PHASES else []
-        )
-        launch.restype = ct.c_int
+        library = directory / f"{kernel}.so"
+        launch = kernel_runtime.kernel(library, kernel)
         launchers[phase] = launch
         artifacts[phase] = {
             "directory": str(directory),
@@ -331,15 +260,13 @@ def worker(args):
             "commands": manifest["commands"],
         }
 
+    bound = {
+        phase: launch.bind(**{name: device[name] for name in launch.tensors})
+        for phase, launch in launchers.items()
+    }
+
     def launch_phase(phase):
-        runtime = [tokens] if phase in RUNTIME_PHASES else []
-        require(
-            launchers[phase](
-                stream.npu_stream, *(device[n].data_ptr() for n in ORDERS[phase]), *runtime
-            )
-            == 0,
-            f"prefill {phase} launch failed",
-        )
+        bound[phase]()
         if args.phase_sync:
             torch.npu.synchronize()
             print("completed " + phase, flush=True)
@@ -417,6 +344,9 @@ def worker(args):
     if reference_call is not None:
         torch.npu.synchronize()
         reference_call.close()
+    for phase, launch in launchers.items():
+        artifacts[phase]["workspace_bytes"] = launch.workspace_nbytes
+    kernel_runtime.close()
     (args.output / "results.json").write_text(
         json.dumps(
             {

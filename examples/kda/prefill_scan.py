@@ -86,12 +86,9 @@ def prefill_scan(
     Gp: N.Tensor((CHUNKS, H, BT, K), N.f32),
     Initial: N.Tensor((SEQUENCES, H, K, K), N.f32),
     Final: N.Tensor((SEQUENCES, H, K, K), N.f32, access="write", write_disjoint=True),
-    History: N.Tensor((SEQUENCES, H, K, K), N.f32, access="write"),
     Snapshot: N.Tensor((CHUNKS, H, K, K), DTYPE, access="write", write_disjoint=True),
     W32: N.Tensor((CHUNKS, H, BT, K), N.f32),
-    Projection: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write"),
     Residual: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write"),
-    Delta: N.Tensor((CHUNKS, H, K, K), N.f32, access="write"),
     Lengths: N.Tensor((CHUNKS,), N.i64),
     SEQUENCES: N.constexpr = 1,
     NC: N.constexpr = 2,
@@ -105,6 +102,9 @@ def prefill_scan(
     DTYPE: N.constexpr = N.bf16,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
+        History = N.alloc_workspace((GROUPS, K, K), N.f32, name="History")
+        Projection = N.alloc_workspace((GROUPS, BT, K), N.f32, name="Projection")
+        Delta = N.alloc_workspace((GROUPS, K, K), N.f32, name="Delta")
         assert K == 128 and BT == 64 and CK == 64 and BV == 64, "scan tile policy"
         assert CHUNKS == SEQUENCES * NC, "each sequence has NC nonempty chunks"
         carry = N.alloc_ub((BV, K), N.f32)
@@ -159,32 +159,32 @@ def prefill_scan(
                 with N.Vector() as lane, N.Stage(1, name="history"):
                     publish_history_and_snapshot(
                         carry,
-                        History[seq, head, lane * BV : (lane + 1) * BV, :],
+                        History[owner, lane * BV : (lane + 1) * BV, :],
                         state16,
                         Snapshot[chunk, head, lane * BV : (lane + 1) * BV, :],
                     )
                 with N.Cube(), N.Stage(1, name="projection"):
                     project_history(
-                        (History[seq, head, :, :], Projection[chunk, head, :, :]),
+                        (History[owner, :, :], Projection[owner, :, :]),
                         (b32_1, a32_0, b32_0, a32_1.at(local), score0),
                         (K, CK),
                     )
                 with N.Vector() as lane, N.Stage(1, name="residual"):
                     form_residual(
                         (
-                            Projection[chunk, head, :, lane * BV : (lane + 1) * BV],
+                            Projection[owner, :, lane * BV : (lane + 1) * BV],
                             Residual[chunk, head, :, lane * BV : (lane + 1) * BV],
                         ),
                         (values, other, scratch, r16),
                     )
                 with N.Cube(), N.Stage(1, name="delta"):
                     form_state_delta(
-                        (Residual[chunk, head, :, :], Delta[chunk, head, :, :]),
+                        (Residual[chunk, head, :, :], Delta[owner, :, :]),
                         (res1, update_a0, right0, keys, state0),
                     )
                 with N.Vector() as lane, N.Stage(1, name="carry"):
                     update_fp32_carry(
-                        decay, carry, update, Delta[chunk, head, lane * BV : (lane + 1) * BV, :]
+                        decay, carry, update, Delta[owner, lane * BV : (lane + 1) * BV, :]
                     )
             with N.Vector() as final_lane:
                 N.copy(carry, Final[seq, head, final_lane * BV : (final_lane + 1) * BV, :])

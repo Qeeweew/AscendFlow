@@ -246,9 +246,6 @@ def attention_target(
     K: N.Tensor((B, HKV, Sk, D), DTYPE),
     V: N.Tensor((B, HKV, Sk, D), DTYPE),
     O: N.Tensor((B, HQ, Sq, D), DTYPE, access="write", write_disjoint=True),
-    Score: N.Tensor((GROUPS, 2, BQ, BK), N.f32, access="write"),
-    P: N.Tensor((GROUPS, 2, BQ, BK), DTYPE, access="write"),
-    PV: N.Tensor((GROUPS, 2, BQ, D), N.f32, access="write"),
     Sq: N.i64(minimum=1),
     Sk: N.i64(minimum=1),
     B: N.constexpr = 1,
@@ -266,6 +263,9 @@ def attention_target(
     CAUSAL: N.constexpr = False,
 ):
     with N.Kernel(GROUPS, kind="mixed") as group:
+        Score = N.alloc_workspace((GROUPS, 2, BQ, BK), N.f32, name="Score")
+        P = N.alloc_workspace((GROUPS, 2, BQ, BK), DTYPE, name="P")
+        PV = N.alloc_workspace((GROUPS, 2, BQ, D), N.f32, name="PV")
         assert B > 0, "batch count must be positive"
         assert HQ > 0, "query head count must be positive"
         assert HKV > 0, "KV head count must be positive"

@@ -81,6 +81,14 @@ class Compilation:
             "pipeline": "structured-regions",
             "verification_mode": "generated-lifetimes",
             "debug_structural_verification": debug_verify,
+            "workspace": emission.workspace,
+            "abi": emission.abi,
+            "device_resources": (
+                None
+                if (resources := plan.module.body.block.first_op.attributes.get("device_resources"))
+                is None
+                else {name: value.data for name, value in resources.data.items()}
+            ),
             "analysis_work": {
                 "lowering": dict(plan.structure.work),
                 "bounds": {

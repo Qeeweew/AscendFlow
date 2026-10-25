@@ -1,13 +1,13 @@
 """Validate a published KDA library and compare upstream AscendC KDA."""
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 import os
 import sys
 from pathlib import Path
 
+from ascendflow import TorchRuntime
 from ascendflow.device import health_snapshot
 from ascendflow.diagnostics import require
 from ascendflow.dialects.io import parse
@@ -128,31 +128,11 @@ def worker(args):
     torch.npu.set_device(0)
     device = {name: tensor.npu() for name, tensor in host.items()}
     stream = torch.npu.current_stream()
-    library = ct.CDLL(str(directory / f"{kernel}.so"))
-    launch = getattr(library, f"launch_{kernel}")
-    order = (
-        "Q",
-        "Key",
-        "Value",
-        "Gate",
-        "Beta",
-        "State",
-        "Snapshots",
-        "Output",
-        "Cu",
-        "Indices",
-        "Accepted",
-    )
-    launch.argtypes = [ct.c_void_p] * (len(order) + 1) + [ct.c_int64] * len(sizes)
-    launch.restype = ct.c_int
+    runtime = TorchRuntime(torch)
+    launch = runtime.kernel(directory / f"{kernel}.so", kernel).bind(**device)
 
     def generated():
-        result = launch(
-            ct.c_void_p(stream.npu_stream),
-            *(ct.c_void_p(device[name].data_ptr()) for name in order),
-            *(runtime_values[op.sym_name.data] for op in sizes),
-        )
-        require(result == 0, f"KDA launch returned {result}")
+        launch()
         return device["Output"], device["State"]
 
     functions = {"ascendflow": generated}
@@ -216,6 +196,7 @@ def worker(args):
     if reference_call is not None:
         torch.npu.synchronize()
         reference_call.close()
+    runtime.close()
     record = {
         "status": "passed",
         "operator": kernel,

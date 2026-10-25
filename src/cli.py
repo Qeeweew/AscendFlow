@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .build import build_file
+from .target.resources import DeviceResources
 
 
 def main():
@@ -17,6 +18,11 @@ def main():
         "--parameters", type=json.loads, default={}, help="JSON AST constexpr specializations"
     )
     parser.add_argument("--output", type=Path, required=True, help="external run/build directory")
+    parser.add_argument(
+        "--device-resources",
+        type=json.loads,
+        help='explicit target facts: {"cube_cores":20,"vector_cores":40}; no device is queried offline',
+    )
     parser.add_argument(
         "--timeout", type=float, default=300, help="total operator deadline, at most 300 seconds"
     )
@@ -33,6 +39,9 @@ def main():
         args.output,
         entry=args.entry,
         parameters=args.parameters,
+        device_resources=None
+        if args.device_resources is None
+        else DeviceResources(**args.device_resources),
         timeout_s=args.timeout,
         compile_asc=args.compile,
         shared=args.shared,

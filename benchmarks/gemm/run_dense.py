@@ -9,6 +9,7 @@ import ctypes as ct
 import hashlib
 import json
 import subprocess
+from functools import partial
 from pathlib import Path
 
 from ascendflow.backend.cann import CANN
@@ -245,13 +246,7 @@ def main():
         )
         if args.backend == "generated":
             library = directory / "dense_gemm.so"
-            module = ct.CDLL(str(library))
-            launcher = module.launch_dense_gemm
-            launcher.argtypes, launcher.restype = [ct.c_void_p] * 4, ct.c_int
-
-            def launch():
-                status = launcher(runtime.stream, ap, bp, cp)
-                require(status == 0, f"GEMM launch rejected: {status}")
+            launch = partial(runtime.kernel(library, "dense_gemm"), ap, bp, cp)
 
             identity = {
                 "manifest": manifest,
@@ -300,14 +295,7 @@ def main():
             and runtime.read(bp, len(b) + len(GUARD)) == b + GUARD,
             "GEMM input or guard changed",
         )
-        elapsed = ct.c_float()
-        runtime.call(
-            "aclrtEventElapsedTime",
-            [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-            ct.byref(elapsed),
-            start,
-            stop,
-        )
+        elapsed_us = runtime.elapsed_us(start, stop)
         case = {
             "backend": args.backend,
             "shape_mnk": [m, n, k],
@@ -327,7 +315,7 @@ def main():
             "output_sha256": sha(raw[: m * n * 4]),
             "warmup": args.warmup,
             "repeats": args.repeats,
-            "stream_interval_us": elapsed.value * 1000 / args.repeats,
+            "stream_interval_us": elapsed_us / args.repeats,
             "timing_scope": "ACL stream event interval including host submission gaps; not kernel-only",
             "cache_policy": "same contiguous allocations reused; no flush",
             "generated_buffer_cache_policies": caches,

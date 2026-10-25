@@ -10,6 +10,8 @@
 |---|---|
 | [快速上手](guide/quickstart.md) | 环境、首个 kernel、CLI/Python API、产物、运行与排错 |
 | [DSL](guide/dsl.md) | runtime/constexpr、执行域、物理存储、流水、多级 CV 和支持边界 |
+| [设备核数与 workspace](guide/workspace.md) | CANN 核数绑定、512 B 对齐的内部 GM、容量、依赖分析与 stream 生命周期 |
+| [Tensor 调用与 host launch](guide/runtime.md) | 编译器签名、自动参数与动态轴绑定、Torch 当前 stream、重复调用和产物身份 |
 | [测试与 profiling](guide/testing.md) | CPU 回归、所有示例编译/运行、FA/GEMM 多 shape 的默认 msprof、ACLNN 对照与 TFLOPS |
 | [可运行示例](../examples/README.md) | 按算法查找入口、运行器和检查范围 |
 

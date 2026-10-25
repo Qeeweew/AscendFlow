@@ -8,6 +8,7 @@ share one existence guard. Nested loop coordinates remain separate SSA bindings.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from xdsl.dialects import arith, scf
@@ -35,6 +36,7 @@ from ..passes.executable import ExecutablePlan, NativeExecution
 from ..target.ascend910b import Actor
 from .native import QUALIFIER
 from .structured_native import format_native
+from .workspace import WorkspaceLayout
 
 _BINARY = {
     arith.AddiOp: "+",
@@ -69,6 +71,8 @@ class EmissionWork:
     actions_printed: int = 0
     output_bytes: int = 0
     task_prints: dict = field(default_factory=dict)
+    workspace: dict = field(default_factory=dict)
+    abi: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -94,6 +98,8 @@ class _Emitter:
         self.roots = {op.ref: f"npu_buffer_{i}" for i, op in enumerate(self.buffers)}
         self.externals = tuple(op for op in self.buffers if op.external.data)
         self.parameters = tuple(op for op in plan.module.walk() if isinstance(op, RuntimeSizeOp))
+        self.workspace = WorkspaceLayout(self.buffers)
+        self.work.workspace = self.workspace.metadata
         uses = ScalarUses(plan.module, plan.natives)
         self.relevant = uses.operations
         self.scalar_uses = uses.values
@@ -425,6 +431,8 @@ class _Emitter:
         name = self.root.sym_name.data
         require(name.isascii() and name.isidentifier(), "kernel name is not a C identifier")
         signature = [f"__gm__ uint8_t* {self.roots[op.ref]}" for op in self.externals]
+        if self.workspace.slices:
+            signature.append("__gm__ uint8_t* npu_workspace")
         signature.extend(f"int64_t npu_size_{op.sym_name.data}" for op in self.parameters)
         kind = (
             "__mix__(1, 2)"
@@ -455,6 +463,7 @@ class _Emitter:
                 "  const int64_t npu_sid = " + ("asc_get_sub_block_id();" if self.mixed else "0;"),
             ]
         )
+        lines.extend(self.workspace.bindings(self.roots))
         families = (
             ("cube", "vector")
             if self.mixed
@@ -466,7 +475,7 @@ class _Emitter:
                 lines.append(f"  if ASC_IS_{'AIC' if family == 'cube' else 'AIV'} {{")
             peaks = {}
             for allocation in self.buffers:
-                if allocation.external.data:
+                if allocation.ref.type.bank.data == "GM":
                     continue
                 bank = allocation.ref.type.bank.data
                 if (bank == "UB") != (family == "vector"):
@@ -522,7 +531,13 @@ def _emit_owned(plan, *, host_launcher=True, work=None):
         isinstance(plan, StructuredSynchronization), "executable ASC needs owned synchronization"
     )
     work = EmissionWork() if work is None else work
-    return _Emitter(plan.executable, work).render(
+    emitter = _Emitter(plan.executable, work)
+    from .abi import launch_abi
+
+    work.abi = launch_abi(
+        plan.structure.source, emitter.externals, emitter.parameters, emitter.workspace
+    )
+    return emitter.render(
         executable=True,
         host_launcher=host_launcher,
     )
@@ -538,8 +553,11 @@ def _launcher(emitter):
         "launcher buffer names must be unique C identifiers",
     )
     signature = ["void* stream"] + [f"void* arg_{name}" for name in buffer_names]
-    signature += [f"int64_t npu_size_{op.sym_name.data}" for op in emitter.parameters]
     arguments = [f"(uint8_t*)arg_{name}" for name in buffer_names]
+    if emitter.workspace.slices:
+        signature.append("void* npu_workspace")
+        arguments.append("(uint8_t*)npu_workspace")
+    signature += [f"int64_t npu_size_{op.sym_name.data}" for op in emitter.parameters]
     bypass = {
         i
         for i, buffer in enumerate(emitter.externals)
@@ -564,7 +582,30 @@ def _launcher(emitter):
             arguments[i] = f"(uint8_t*)(uintptr_t(arg_{buffer_names[i]}) + npu_l2_offset)"
     arguments += [f"npu_size_{op.sym_name.data}" for op in emitter.parameters]
     groups = 1 if root.blocks is None else root.blocks.data
+    resources = root.attributes.get("device_resources")
+    configuration = (
+        len(emitter.externals),
+        len(emitter.parameters),
+        int(bool(emitter.workspace.slices)),
+        0 if resources is None else resources.data["cube_cores"].data,
+        0 if resources is None else resources.data["vector_cores"].data,
+    )
     return [
+        *(
+            emitter.workspace.query(root.sym_name.data, emitter.parameters)
+            if emitter.workspace.slices
+            else []
+        ),
+        "",
+        f'extern "C" int kernel_config_{root.sym_name.data}(int64_t* npu_config) {{',
+        "  if (npu_config == nullptr) return -1;",
+        *(f"  npu_config[{i}] = {value};" for i, value in enumerate(configuration)),
+        "  return 0;",
+        "}",
+        "",
+        f'extern "C" const char* kernel_metadata_{root.sym_name.data}() {{',
+        "  return " + json.dumps(json.dumps(emitter.work.abi, separators=(",", ":"))) + ";",
+        "}",
         "",
         *declarations,
         f'extern "C" int launch_{root.sym_name.data}({", ".join(signature)}) {{',

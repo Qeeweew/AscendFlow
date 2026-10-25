@@ -1,13 +1,19 @@
 # 可运行示例
 
 算法、分块、缓存和排步政策放在 `examples/`；编译器走同一条 DSL→IR→ASC→CANN
-路径。先读[快速上手](../docs/guide/quickstart.md)，所有示例的统一检查命令为：
+路径。示例文件只保留 DSL 定义；构建统一使用编译器 CLI，数值与性能检查放在
+`benchmarks/`。先读[快速上手](../docs/guide/quickstart.md)，所有示例的统一检查命令为：
 
 ```bash
 python -m benchmarks.check_examples --list
 python -m benchmarks.check_examples --output build/examples-cann
 # 完成全卡检查与显式映射后，再加 --physical <物理卡号> 检查设备结果。
 ```
+
+所有示例的私有 GM scratch 均使用 `N.alloc_workspace`，runtime 自动分配，各 allocation
+起点按 512 B 对齐。固定 worker、tile 与 slot 政策后，容量不随任务数无限增长；教学
+attention 也由固定 worker 依次处理 head。跨 kernel 的中间结果保持显式 tensor，其容量
+仍随数据规模变化。设备核数查询、容量和生命周期见 [workspace 合同](../docs/guide/workspace.md)。
 
 | 检查名称 | 源码 / DSL 入口 | 主要展示内容 |
 |---|---|---|

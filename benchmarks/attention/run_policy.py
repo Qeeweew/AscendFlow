@@ -1,7 +1,6 @@
 """Independent fixed-policy AscendC FA reference."""
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 from pathlib import Path
@@ -12,6 +11,7 @@ from ascendflow.device import ACL, health_snapshot
 from ascendflow.diagnostics import require
 from ascendflow.performance import hardware_snapshot
 from benchmarks.artifacts import read_artifact
+from benchmarks.references import reference_kernel
 from benchmarks.references.attention import NAME, reference_source
 from benchmarks.validation.attention import decode, inputs_and_oracle
 
@@ -79,18 +79,15 @@ def main():
         for sq, sk, raw, expected, selected, oracle_s in prepared:
             guard = b"\x5a" * 512
             pointers = {k: runtime.allocate(v + guard) for k, v in raw.items()}
-            library = ct.CDLL(str(library_path.resolve()))
-            launch = getattr(library, "launch_" + NAME)
-            launch.argtypes = [ct.c_void_p] * 8 + [ct.c_int64] * 2
-            launch.restype = ct.c_int
+            launch = reference_kernel(runtime, library_path, NAME, 7, parameters=(sq, sk))
             params = [pointers[k] for k in ("q", "k", "v", "o", "score", "p", "pv")]
             for _ in range(args.warmup):
-                require(launch(runtime.stream, *params, sq, sk) == 0, "reference launch rejected")
+                launch(*params)
             runtime.synchronize()
             start, stop = runtime.event(), runtime.event()
             runtime.record(start)
             for _ in range(args.repeats):
-                require(launch(runtime.stream, *params, sq, sk) == 0, "reference launch rejected")
+                launch(*params)
             runtime.record(stop)
             runtime.synchronize()
             actual_raw = runtime.read(pointers["o"], len(raw["o"]) + len(guard))
@@ -114,14 +111,7 @@ def main():
                 require(observed[-len(guard) :] == guard, f"{name} guard changed")
                 if name in {"q", "k", "v"}:
                     require(observed[: -len(guard)] == raw[name], f"{name} input changed")
-            elapsed = ct.c_float()
-            runtime.call(
-                "aclrtEventElapsedTime",
-                [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-                ct.byref(elapsed),
-                start,
-                stop,
-            )
+            elapsed_us = runtime.elapsed_us(start, stop)
             row = {
                 "sq": sq,
                 "sk": sk,
@@ -139,7 +129,7 @@ def main():
                 "data_case": args.data_case,
                 "warmup": args.warmup,
                 "repeats": args.repeats,
-                "stream_interval_us": elapsed.value * 1000 / args.repeats,
+                "stream_interval_us": elapsed_us / args.repeats,
                 "timing_scope": "ACL stream interval includes host submission gaps; not kernel-only",
                 "cache_policy": "same BNSD allocations reused; no flush",
                 "input_sha256": {k: hashlib.sha256(v).hexdigest() for k, v in raw.items()},

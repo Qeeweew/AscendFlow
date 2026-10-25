@@ -11,6 +11,7 @@
 | `@T.prim_func` | 捕获源码、参数及位置 |
 | `@T.inline` | 词法作用域的透明 AST 内联；不执行 Python helper |
 | `T.Tensor` | 外部 tensor 的 shape、元素类型与访问权限 |
+| `T.get_core_num("cube"/"vector"/"mixed")` | host 绑定的 constexpr 核数；cube/mixed 返回 AIC 数，vector 返回 AIV 数，与 CANN 一致 |
 | `T.i32` / `T.i64` | 统一整数类型；均可作 GM/UB tensor 元素类型，runtime 参数目前只支持 `T.i64` |
 | `T.i64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
 | `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 或已初始化 UB 单个 int32/int64 的 S 读取，捕获有符号 index SSA；inclusive 值合同不生成 clamp |
@@ -29,6 +30,7 @@
 | `T.Stage(offset, name=...)` | 最近迭代域内当前 actor 的发射偏移，不是完成边界 |
 | `T.CopyGroup(name=...)` | 单 actor、同激活域的一组 copy 共同对外 ready；各存储的 release 分别推导 |
 | `alloc_ub/l1/l0a/l0b/l0c`、views | 显式物理容量、布局、slot与别名 |
+| `alloc_workspace(shape, dtype=f32, slots=S)` | 内部、入口未初始化的 GM tensor；allocation 起点自动按 512 B 对齐 |
 | `alloc_*(shape, dtype, slots=S)`、`slotted_view(view, axis=0)` | 明确槽轴与每槽 payload，绑定已有 view 时不增加存储 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
 | `copy(..., valid_rows=r)` | 二维 runtime 行前缀；GM→L1 可补零或保留其余 NZ 行，UB→GM 部分写 |
@@ -83,8 +85,8 @@ count-mode 16 位 Vector Dup，计数以元素为单位，不扩大到完整 rep
 
 ```python
 x = T.alloc_ub((64,), T.bf16, slots=3)
-x.at(t)          # t % 3 对应的普通 payload view
-x.slot(i)        # 物理槽 i，不取模
+x.at(t)  # t % 3 对应的普通 payload view
+x.slot(i)  # 物理槽 i，不取模
 x.storage[i, :]  # 同一 allocation 的普通完整物理 view
 ```
 
@@ -121,6 +123,8 @@ with T.CopyGroup(name="operands"):
 
 `Dataflow` 和 `Pipelined` 可选 `name=` 仅用于诊断，控制与调用身份仍由实际 IR
 建立。allocation 缺省 dtype 保持 UB/L0C 为 f32、L1/L0A/L0B 为 f16；BF16 显式声明。
+
+核数绑定、workspace 容量和运行时分配见 [GM workspace](workspace.md)。
 
 完整当前源码：[scale.py](../../examples/vector/scale.py)。核心结构如下：
 
@@ -233,9 +237,9 @@ runtime输入的minimum/multiple支持除数正性和整除推导；非法的原
 
 ```python
 rows = N.min(128, N.max(0, length - base))
-N.copy(X[base:base + 128, :], x, valid_rows=rows, pad_value=0)
+N.copy(X[base : base + 128, :], x, valid_rows=rows, pad_value=0)
 # 使用完整、已经补零的 L1 tile 计算；y 为已定义的 UB 输出。
-N.copy(y, Y[base:base + 128, :], valid_rows=rows)
+N.copy(y, Y[base : base + 128, :], valid_rows=rows)
 ```
 
 `valid_rows` 只选择二维 view 第一轴的连续前缀，不改变物理计算 tile 的形状。

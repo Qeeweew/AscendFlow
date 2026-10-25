@@ -16,11 +16,20 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from xdsl.dialects import arith, scf
-from xdsl.dialects.builtin import FileLineColLoc, IndexType, IntAttr, ModuleOp, StringAttr, i1
+from xdsl.dialects.builtin import (
+    DictionaryAttr,
+    FileLineColLoc,
+    IndexType,
+    IntAttr,
+    ModuleOp,
+    StringAttr,
+    i1,
+)
 from xdsl.ir import Block, OpResult, Region, SSAValue, SSAValues
 
 from ..diagnostics import CompileError, require
 from ..dialects.source import YieldOp
+from ..target.resources import DeviceResources
 from . import builders, contracts, syntax
 
 
@@ -50,6 +59,8 @@ _CALLS = {
     "Cube",
     "Vector",
     "alloc_ub",
+    "alloc_workspace",
+    "get_core_num",
     "alloc_mask",
     "arange",
     "alloc_l1",
@@ -137,6 +148,7 @@ class InlineFunction(_SourceFunction):
 class PrimFunction(_SourceFunction):
     disjoint_external: bool = False
     specializations: tuple = ()
+    device_resources: DeviceResources | None = None
 
     def to_ir(self):
         return _Parser(self).build()
@@ -145,6 +157,11 @@ class PrimFunction(_SourceFunction):
         bound = dict(self.specializations)
         bound.update((name, _constant(value)) for name, value in values.items())
         return replace(self, specializations=tuple(bound.items()))
+
+    def bind_device(self, resources):
+        """Freeze runtime hardware facts before constructing source or proving dependencies."""
+        require(isinstance(resources, DeviceResources), "bind_device requires DeviceResources")
+        return replace(self, device_resources=resources)
 
 
 def capture(function, *, namespace, disjoint_external=False, inline=False):
@@ -208,6 +225,7 @@ def from_source(
 class _Parser:
     def __init__(self, definition):
         self.definition = definition
+        self.device_resources = definition.device_resources
         self.env = dict(definition.environment)
         self.trace = None
         self.steps = 0
@@ -265,6 +283,13 @@ class _Parser:
             self.fail(func, "use named tensor/scalar parameters; no variadic or return annotation")
         self.trace = builders._Trace(func.name, self.definition.disjoint_external)
         self.trace.op.attributes["frontend"] = StringAttr("ast")
+        if self.device_resources is not None:
+            self.trace.op.attributes["device_resources"] = DictionaryAttr(
+                {
+                    "cube_cores": IntAttr(self.device_resources.cube_cores),
+                    "vector_cores": IntAttr(self.device_resources.vector_cores),
+                }
+            )
         token = builders._current.set(self.trace)
         try:
             self.locate(func)
@@ -385,6 +410,8 @@ class _Parser:
             typ = self.expr(annotation)
             if not isinstance(typ, syntax.Tensor):
                 self.fail(arg, "expected Tensor shape/dtype/access annotation")
+            if typ.access not in {"read", "write", "read_write"}:
+                self.fail(arg, "external Tensor access must be read, write, or read_write")
             self.env[arg.arg] = builders._allocate(
                 typ.shape,
                 typ.dtype,
@@ -820,6 +847,15 @@ class _Parser:
                 self.fail(node, "calling arbitrary Python functions is unsupported")
             args, kwargs = self.arguments(node)
             name = symbol.name
+            if name == "get_core_num":
+                if len(args) != 1 or kwargs:
+                    self.fail(node, "get_core_num requires one core kind")
+                if self.device_resources is None:
+                    self.fail(
+                        node,
+                        "get_core_num requires bind_device(DeviceResources) before compilation",
+                    )
+                return self.device_resources.core_count(args[0])
             if name in {"ceildiv", "min", "max"}:
                 if len(args) != 2 or kwargs:
                     self.fail(node, f"{name} requires two scalar arguments")

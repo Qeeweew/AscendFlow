@@ -2,7 +2,7 @@
 
 Each head computes softmax(Q @ K.T / sqrt(128)) @ V: D=128, Sk=128, BQ=64.
 S is a positive multiple of 64. FP16 Q/K/V/P/O, FP32 scores and reductions.
-Score, P and PV are two-slot GM workspaces, private to each head.
+Score, P and PV are two-slot GM workspaces, reused by each bounded worker.
 """
 
 from __future__ import annotations
@@ -63,15 +63,17 @@ def simple_attention(
     K: N.Tensor((H, 128, 128), N.f16),
     V: N.Tensor((H, 128, 128), N.f16),
     O: N.Tensor((H, S, 128), N.f16, access="write", write_disjoint=True),
-    Score: N.Tensor((H, 2, 64, 128), N.f32, access="write"),
-    P: N.Tensor((H, 2, 64, 128), N.f16, access="write"),
-    PV: N.Tensor((H, 2, 64, 128), N.f32, access="write"),
     S: N.constexpr = 256,
     H: N.constexpr = 4,
+    GROUPS: N.constexpr = 20,
 ):
-    with N.Kernel(H, kind="mixed") as head:
+    workers = N.min(H, GROUPS)
+    with N.Kernel(workers, kind="mixed") as group:
         assert S > 0 and S % 64 == 0
-        assert H > 0
+        assert H > 0 and GROUPS > 0
+        Score = N.alloc_workspace((workers, 2, 64, 128), N.f32, name="Score")
+        P = N.alloc_workspace((workers, 2, 64, 128), N.f16, name="P")
+        PV = N.alloc_workspace((workers, 2, 64, 128), N.f32, name="PV")
         q1 = N.alloc_l1((64, 128), N.f16)
         k1 = N.alloc_l1((128, 128), N.f16)
         p1 = N.alloc_l1((64, 128), N.f16)
@@ -95,38 +97,45 @@ def simple_attention(
         softmax_buffers = (score, probability, maximum, total, partial, broadcast)
         pv_buffers = (p1, p0, output0)
         store_buffers = (output, result)
-        scores = N.slotted_view(Score[head, :, :, :])
-        probabilities = N.slotted_view(P[head, :, :, :])
-        products = N.slotted_view(PV[head, :, :, :])
-
-        # K and V stay resident across all query tiles of this head.
-        with N.Cube():
-            N.copy(K[head, :, :], k1)
-            N.copy(k1, k0, transpose=True)
-            N.copy(V[head, :, :], v1)
-            N.copy(v1, v0)
-
-        for tile in N.Dataflow(
-            S // 64, issue_order={"cube": ("qk", "pv"), "vector": ("softmax", "store")}
+        # A worker with exactly one head needs no serial task scope.
+        for head_task in (N.unroll if H <= GROUPS else N.serial)(
+            1 if H <= GROUPS else N.ceildiv(N.max(0, H - group), workers)
         ):
-            q = tile * 64
+            head = group + head_task * workers
+            scores = N.slotted_view(Score[group, :, :, :])
+            probabilities = N.slotted_view(P[group, :, :, :])
+            products = N.slotted_view(PV[group, :, :, :])
 
-            with N.Cube(), N.Stage(0, name="qk"):
-                qk(Q[head, q : q + 64, :], k0, scores.at(tile), qk_buffers)
+            # K and V stay resident across all query tiles of this head.
+            with N.Cube():
+                N.copy(K[head, :, :], k1)
+                N.copy(k1, k0, transpose=True)
+                N.copy(V[head, :, :], v1)
+                N.copy(v1, v0)
 
-            with N.Vector() as lane, N.Stage(0, name="softmax"):
-                r = lane * 32
-                softmax(
-                    scores.at(tile)[r : r + 32, :],
-                    probabilities.at(tile)[r : r + 32, :],
-                    softmax_buffers,
-                )
+            for tile in N.Dataflow(
+                S // 64, issue_order={"cube": ("qk", "pv"), "vector": ("softmax", "store")}
+            ):
+                q = tile * 64
 
-            with N.Cube(), N.Stage(1, name="pv"):
-                pv(probabilities.at(tile), v0, products.at(tile), pv_buffers)
+                with N.Cube(), N.Stage(0, name="qk"):
+                    qk(Q[head, q : q + 64, :], k0, scores.at(tile), qk_buffers)
 
-            with N.Vector() as lane, N.Stage(1, name="store"):
-                r = lane * 32
-                store(
-                    products.at(tile)[r : r + 32, :], O[head, q + r : q + r + 32, :], store_buffers
-                )
+                with N.Vector() as lane, N.Stage(0, name="softmax"):
+                    r = lane * 32
+                    softmax(
+                        scores.at(tile)[r : r + 32, :],
+                        probabilities.at(tile)[r : r + 32, :],
+                        softmax_buffers,
+                    )
+
+                with N.Cube(), N.Stage(1, name="pv"):
+                    pv(probabilities.at(tile), v0, products.at(tile), pv_buffers)
+
+                with N.Vector() as lane, N.Stage(1, name="store"):
+                    r = lane * 32
+                    store(
+                        products.at(tile)[r : r + 32, :],
+                        O[head, q + r : q + r + 32, :],
+                        store_buffers,
+                    )

@@ -6,9 +6,9 @@ uses 32768x1024 f32; --rows always counts rows per group, not native tiles.
 """
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
+from functools import partial
 from pathlib import Path
 
 from ascendflow.backend.cann import CANN
@@ -18,7 +18,7 @@ from ascendflow.diagnostics import require
 from ascendflow.performance import hardware_snapshot
 from ascendflow.target.scalars import round_f32
 from benchmarks.artifacts import read_artifact
-from benchmarks.references import ascendc_source
+from benchmarks.references import ascendc_source, reference_kernel
 from benchmarks.work import structure_inventory, work_record
 from examples.normalization.rms_norm import rms_normalize
 from examples.normalization.softmax import softmax
@@ -185,12 +185,6 @@ def main():
     try:
         for variant in variants:
             name = "aclnnSoftmax" if variant == "aclnn" else sources[variant][0]
-            launch = None
-            if variant != "aclnn":
-                library = ct.CDLL(str((args.output / variant / f"{name}.so").resolve()))
-                launch = getattr(library, "launch_" + name)
-                launch.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_int64]
-                launch.restype = ct.c_int
             for rows in args.rows:
                 values = (
                     ((np.arange(args.groups * rows * args.columns, dtype=np.int32) % 127 - 63) / 16)
@@ -203,20 +197,19 @@ def main():
                 guard = b"\x5a" * 128
                 raw = values.tobytes() + guard
                 x, y = runtime.allocate(raw), runtime.allocate(b"\xcd" * values.nbytes + guard)
-                reference = None
                 count = rows // args.tile_rows if is_softmax else rows
                 if variant == "aclnn":
                     from benchmarks.references.aclnn import SoftmaxReference
 
-                    reference = SoftmaxReference(runtime, x, y, len(values), args.columns)
-
-                def invoke(reference=reference, launch=launch, x=x, y=y, count=count):
-                    if reference is not None:
-                        reference()
-                    else:
-                        require(
-                            launch(runtime.stream, x, y, count) == 0, "launch contract rejected"
-                        )
+                    invoke = SoftmaxReference(runtime, x, y, len(values), args.columns)
+                else:
+                    library = args.output / variant / f"{name}.so"
+                    bound = (
+                        runtime.kernel(library, name, parameters=(count,))
+                        if variant == "generated"
+                        else reference_kernel(runtime, library, name, 2, parameters=(count,))
+                    )
+                    invoke = partial(bound, x, y)
 
                 for _ in range(args.warmup):
                     invoke()
@@ -239,14 +232,7 @@ def main():
                     actual[values.nbytes :] == guard and runtime.read(x, len(raw)) == raw,
                     "input/output guards changed",
                 )
-                elapsed = ct.c_float()
-                runtime.call(
-                    "aclrtEventElapsedTime",
-                    [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-                    ct.byref(elapsed),
-                    start,
-                    stop,
-                )
+                elapsed_us = runtime.elapsed_us(start, stop)
                 record = {
                     "variant": variant,
                     "kernel": name,
@@ -260,7 +246,7 @@ def main():
                     else 0,
                     "warmup": args.warmup,
                     "repeats": args.repeats,
-                    "stream_interval_us": elapsed.value * 1000 / args.repeats,
+                    "stream_interval_us": elapsed_us / args.repeats,
                     "timing_scope": "ACL stream interval including submission gaps, not kernel-only",
                     "cache_policy": "same input/output allocations reused; no flush",
                     "input_sha256": hashlib.sha256(raw).hexdigest(),
@@ -289,8 +275,8 @@ def main():
                         else 0
                     )
                     require(np.isfinite(numeric).all(), "softmax has nonfinite output")
-                if reference is not None:
-                    reference.close()
+                if variant == "aclnn":
+                    invoke.close()
                 records.append(record)
                 print(
                     json.dumps({key: value for key, value in record.items() if key != "work"}),

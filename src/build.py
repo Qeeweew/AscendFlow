@@ -174,13 +174,15 @@ def build_module(
         )
 
 
-def build_file(path, output, *, entry=None, parameters=None, **options):
+def build_file(path, output, *, entry=None, parameters=None, device_resources=None, **options):
     """Read IR or capture a current AST PrimFunction inside the bounded worker."""
     build_process.reject_worker_nesting()
     path = Path(path).resolve()
     parameters = {} if parameters is None else dict(parameters)
     if parameters and entry is None:
         raise ValueError("AST specialization parameters require --entry")
+    if device_resources is not None and entry is None:
+        raise ValueError("device resource binding requires a DSL --entry")
 
     def construct():
         if entry is None:
@@ -202,6 +204,7 @@ def build_file(path, output, *, entry=None, parameters=None, **options):
             sys.path[:] = search_path
         if not isinstance(definition, PrimFunction):
             raise TypeError("--entry must name a captured AST prim_func")
-        return definition.specialize(**parameters)
+        definition = definition.specialize(**parameters)
+        return definition if device_resources is None else definition.bind_device(device_resources)
 
     return build_module(construct, output, **options)

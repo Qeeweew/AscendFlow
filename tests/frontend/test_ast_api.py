@@ -24,7 +24,7 @@ def test_public_physical_builder_has_been_removed():
         importlib.import_module("ascendflow.builder")
 
 
-@pytest.mark.parametrize("name", ["trace_func", "alloc_workspace", "gemm"])
+@pytest.mark.parametrize("name", ["trace_func", "gemm"])
 def test_removed_source_entry_has_no_compatibility_alias(name):
     assert not hasattr(N, name)
 
@@ -54,7 +54,7 @@ def test_allocations_have_only_explicit_shape_axes(name):
         definition.to_ir()
 
 
-@pytest.mark.parametrize("name", ["gemm", "alloc_workspace", "trace_func"])
+@pytest.mark.parametrize("name", ["gemm", "trace_func"])
 def test_removed_names_are_not_ast_operations(name):
     definition = N.from_source(f"""
         def invalid():

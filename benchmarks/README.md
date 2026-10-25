@@ -37,9 +37,19 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 | `references/` | 日常 ACLNN 适配器与独立 AscendC 参考 |
 
+生成 kernel 的 runner 统一使用 `ACL.kernel` 或 `ascendflow.TorchRuntime`，从库内签名
+绑定外部输入输出、标量和 workspace，不各自维护 ctypes 签名。GEMM、归一化及固定政策
+FA 的手写 AscendC 对照共用 `references.reference_kernel`。`ACL.elapsed_us` 返回 stream interval，
+仍包含 host 提交间隙。Torch 适配器使用当前 NPU stream，保持
+arena 到 stream 退休后释放。KDA 的 `intermediate_layout` 只包含跨 kernel 中间结果
+和常量，不再为私有 scratch 按 chunk/head 分配存储；见
+[workspace 合同](../docs/guide/workspace.md)。KDA runner 从编译器签名绑定 tensor，
+不维护 ORDERS 或手工指针列表；调用与复用见 [host runtime](../docs/guide/runtime.md)。
+
 README 的整块 non-causal attention 教学示例使用 `attention/run_simple.py` 验证：
-默认 H4/Sq256/Sk128/D128，检查随机输入和均匀 softmax，每组复用 workspace 调用三次，
-对比独立 FP32 NumPy 参考并检查输入和尾哨兵。统一入口为
+默认 H4/Sq256/Sk128/D128，runner 从已发布 IR 读取 H/Sq，支持多个 head 复用同一 worker；
+检查随机输入和均匀 softmax。内部 GM workspace 由 runtime
+自动分配并复用，每组调用三次，对比独立 FP32 NumPy 参考并检查输入和输出尾哨兵。统一入口为
 `python -m benchmarks.check_examples --only simple-attention --output build/simple-attention`，
 完成全卡检查和显式映射后增加 `--physical <物理卡号>` 进行设备检查。
 

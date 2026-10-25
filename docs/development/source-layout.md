@@ -18,7 +18,7 @@ AscendFlow/
     analysis/            # 内存、依赖、同步与资源事实
     passes/              # lowering、生成和物化
     backend/             # ASC 与 CANN
-    runtime/             # 构建期限和进程组
+    runtime/             # 构建期限、进程组和 tensor 调用
   examples/              # 算法及政策
   tests/                 # 语义与集成回归
   benchmarks/            # 编译及后续设备测量
@@ -102,6 +102,9 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `passes/simplify_scalars.py` | 复用源循环联合范围；共享仿射视图、倍数事实、支配 CSE、域内化简和安全外提 |
 | `passes/simplify_conditions.py` | 用实际loop/祖先/分支前提化简条件并集，共享连续条件块，合并互斥事件通知及event ID；同一完成前缀的连续 fence 按幂等规则合并，保留重叠 Set/Wait 贡献 |
 | `backend/structured.py`、`backend/cann.py`、`build.py`、`runtime/process.py` | 打印实际 IR；CANN 离线编译与 300 秒组期限 |
+| `target/resources.py`、`frontend/parser.py` 的设备绑定 | 运行时查询的核数在 source 构造前冻结成 constexpr；资源改变重新编译，不在依赖分析后更换 launch 数 |
+| `backend/workspace.py`、`runtime/kernel.py`、`device.py` | 保留内部 GM root 的 effects/生命周期，最终打包为 512 B 对齐的互不重叠区间；host 检查容量、一次分配、stream 内复用及退休后释放 |
+| `backend/abi.py`、`runtime/torch.py` | 从保留的 source 合同和真实 C 参数次序发布版本化签名；可选 Torch tensor 绑定、动态轴校验、按当前 stream/尺寸复用 arena，不重复依赖分析或隐式转换 |
 | `tests/models/structured_events.py` | 独立有限队列/二值 flag/quorum/字节版本检查，可对照 pre-sync 快照 |
 
 旧 `event_progress`、`event_paths`、`event_lifetimes`、`progress_*` 和

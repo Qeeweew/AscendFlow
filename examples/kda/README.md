@@ -22,6 +22,13 @@ Prepare 入口集中声明存储、阶段别名和 Dataflow 排步；非末块�
 任务域。不同 kernel 间由 stream 建立全设备阶段顺序，kernel 内使用同一 group
 的普通自动同步。
 
+私有 GM scratch 使用 `N.alloc_workspace`，runtime 自动分配并按 512 B 对齐。
+容量按 GROUPS、tile 和 slots 计算，scan 的 History/Projection/Delta 复用每个 group
+的一份平面。跨 kernel 的 Gp/KG/QG/A16/U/W32、Snapshot/Residual 仍是显式中间结果，
+会随任务数增长，完整说明见 [workspace 合同](../../docs/guide/workspace.md)。
+Torch runner 使用库内签名直接绑定 tensor，动态 tokens 从 shape 取得；三阶段和
+独立 fragment 不再手写参数顺序。调用与重复执行见 [host runtime](../../docs/guide/runtime.md)。
+
 完整输入、精度及同步合同见 [KDA prefill](../../docs/operators/kda-prefill.md)。
 构建与设备 oracle 统一由 `python -m benchmarks.check_examples --only kda-prefill`
 执行，参数和输出路径见[示例入口](../README.md)。
@@ -36,3 +43,6 @@ python -m benchmarks.check_examples --only kda-gram kda-gram-cross \
 
 这些检查使用完整小 cohort、
 37/64 行尾块、环复用和三次调用，对照独立 CPU 方程；不作为三阶段性能结果。
+独立块逆入口只接收 Negative、Blocks 和 Result：WIDTH=16 时 Result 是 FP32
+非对角块部分输出，WIDTH=32 时 Result 是 BF16 完整块逆。Merge 与 Off 临时面内部
+分配；共享 inline helper 仍服务于融合 Prepare。

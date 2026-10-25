@@ -170,30 +170,12 @@ def prefill_prepare(
     Value: N.Tensor((TOKENS, H, K), DTYPE),
     Gate: N.Tensor((TOKENS, H, K), N.f32),
     Beta: N.Tensor((TOKENS, H), N.f32),
-    Qp: N.Tensor((GROUPS, 1, BT, K), DTYPE, access="write"),
-    Kp: N.Tensor((GROUPS, 1, BT, K), DTYPE, access="write"),
-    Vp: N.Tensor((GROUPS, 1, BT, K), DTYPE, access="write"),
     Gp: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write", write_disjoint=True),
-    LocalGp: N.Tensor((GROUPS, 1, BT, K), N.f32, access="write"),
-    Bp: N.Tensor((GROUPS, 1, BT), N.f32, access="write"),
-    Aqk: N.Tensor((GROUPS, 1, BT, BT), N.f32, access="write"),
-    Diagonal: N.Tensor((GROUPS, 1, BT, BT), N.f32, access="write"),
-    Ai32: N.Tensor((GROUPS, 1, BT, BT), N.f32, access="write"),
-    Negative: N.Tensor((GROUPS, 1, BT, BT), N.f32, access="write"),
-    Inverse: N.Tensor((GROUPS, 1, BT, BT), DTYPE, access="write"),
-    Right: N.Tensor((GROUPS, 1, 2, BT, K), DTYPE, access="write"),
     KG: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
     QG: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
     A16: N.Tensor((CHUNKS, H, BT, BT), DTYPE, access="write", write_disjoint=True),
     U: N.Tensor((CHUNKS, H, BT, K), DTYPE, access="write", write_disjoint=True),
     W32: N.Tensor((CHUNKS, H, BT, K), N.f32, access="write", write_disjoint=True),
-    GramLeft: N.Tensor((GROUPS, 2, 1, 128, K), N.f32, access="write"),
-    GramRight: N.Tensor((GROUPS, 2, 1, 64, K), N.f32, access="write"),
-    GramProducts: N.Tensor((GROUPS, 2, 32, 96), N.f32, access="write"),
-    Merge16: N.Tensor((GROUPS, 2, 16, 16), N.f32, access="write"),
-    Merge32: N.Tensor((GROUPS, 2, 32, 32), N.f32, access="write"),
-    Off32: N.Tensor((GROUPS, 2, 32, 32), N.f32, access="write"),
-    W16Ring: N.Tensor((GROUPS, 2, BT, K), DTYPE, access="write"),
     Starts: N.Tensor((CHUNKS,), N.i64),
     Lengths: N.Tensor((CHUNKS,), N.i64),
     Lower: N.Tensor((2, BT, BT), N.f32),
@@ -209,6 +191,24 @@ def prefill_prepare(
     SCALE: N.constexpr = 0.08838834764831845,
 ):
     with N.Kernel(GROUPS, kind="mixed") as owner:
+        Qp = N.alloc_workspace((GROUPS, 1, BT, K), DTYPE, name="Qp")
+        Kp = N.alloc_workspace((GROUPS, 1, BT, K), DTYPE, name="Kp")
+        Vp = N.alloc_workspace((GROUPS, 1, BT, K), DTYPE, name="Vp")
+        LocalGp = N.alloc_workspace((GROUPS, 1, BT, K), N.f32, name="LocalGp")
+        Bp = N.alloc_workspace((GROUPS, 1, BT), N.f32, name="Bp")
+        Aqk = N.alloc_workspace((GROUPS, 1, BT, BT), N.f32, name="Aqk")
+        Diagonal = N.alloc_workspace((GROUPS, 1, BT, BT), N.f32, name="Diagonal")
+        Ai32 = N.alloc_workspace((GROUPS, 1, BT, BT), N.f32, name="Ai32")
+        Negative = N.alloc_workspace((GROUPS, 1, BT, BT), N.f32, name="Negative")
+        Inverse = N.alloc_workspace((GROUPS, 1, BT, BT), DTYPE, name="Inverse")
+        Right = N.alloc_workspace((GROUPS, 1, 2, BT, K), DTYPE, name="Right")
+        GramLeft = N.alloc_workspace((GROUPS, 2, 1, 128, K), N.f32, name="GramLeft")
+        GramRight = N.alloc_workspace((GROUPS, 2, 1, 64, K), N.f32, name="GramRight")
+        GramProducts = N.alloc_workspace((GROUPS, 2, 32, 96), N.f32, name="GramProducts")
+        Merge16 = N.alloc_workspace((GROUPS, 2, 16, 16), N.f32, name="Merge16")
+        Merge32 = N.alloc_workspace((GROUPS, 2, 32, 32), N.f32, name="Merge32")
+        Off32 = N.alloc_workspace((GROUPS, 2, 32, 32), N.f32, name="Off32")
+        W16Ring = N.alloc_workspace((GROUPS, 2, BT, K), DTYPE, name="W16Ring")
         assert CHUNKS == SEQUENCES * NC and NC > 0, "equal nonempty chunk domains"
         assert H % 8 == 0 and K == 128 and BT == 64, "KDA front-end tile policy"
         raw_keys = N.alloc_ub((32, K), DTYPE)

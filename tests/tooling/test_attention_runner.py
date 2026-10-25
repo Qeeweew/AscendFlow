@@ -45,6 +45,7 @@ def test_runner_uses_the_actual_compiler_launcher_parameter_names():
     source = N.from_source(f"""
 def attention_target({parameters},Sq:N.i64,Sk:N.i64):
     with N.Kernel():
+        workspace=N.alloc_workspace((64,))
         x=N.alloc_ub((64,))
         N.fill(x,1.0)
 """)
@@ -53,6 +54,7 @@ def attention_target({parameters},Sq:N.i64,Sk:N.i64):
     assert abi.names == (
         "stream",
         *("arg_" + name for name in GENERATED_ORDER),
+        "npu_workspace",
         "npu_size_Sq",
         "npu_size_Sk",
     )
@@ -77,21 +79,23 @@ def forbid_device_and_build(monkeypatch):
 
 def test_generated_launcher_uses_its_actual_order_instead_of_dsl_or_reference_order():
     abi = run.launcher_abi(generated_source(), "attention_target", generated=True)
-    pointers = {name: object() for name in run.BUFFER_NAMES.values()}
+    pointers = {name: object() for name in (*run.BUFFER_NAMES.values(), "workspace")}
     stream = object()
     assert abi.names == (
         "stream",
         *("arg_" + name for name in GENERATED_ORDER),
+        "npu_workspace",
         "npu_size_Sq",
         "npu_size_Sk",
     )
     assert abi.arguments(stream, pointers, 128, 1024) == (
         stream,
         *(pointers[run.BUFFER_NAMES[name]] for name in GENERATED_ORDER),
+        pointers["workspace"],
         128,
         1024,
     )
-    assert abi.argtypes == [ct.c_void_p] * 8 + [ct.c_int64] * 2
+    assert abi.argtypes == [ct.c_void_p] * 6 + [ct.c_int64] * 2
     reference = run.launcher_abi(run.reference_source(), run.REFERENCE_NAME, generated=False)
     assert reference.arguments(stream, pointers, 128, 1024) == (
         stream,
@@ -106,7 +110,7 @@ def test_generated_launcher_uses_its_actual_order_instead_of_dsl_or_reference_or
     "source",
     (
         generated_source(("Q", "K", "V", "O", "Score", "P", "P")),
-        generated_source().replace("void* arg_PV", "void* arg_unknown"),
+        generated_source().replace("void* npu_workspace", "void* arg_unknown"),
         generated_source().replace("void* arg_Q", "int64_t arg_Q"),
         generated_source().replace("npu_size_Sk", "sk"),
         generated_source().replace("void* stream", "int64_t stream"),
@@ -174,7 +178,7 @@ def test_reusing_generated_artifact_never_builds_and_records_its_own_identity(ar
     identity = result["artifact"]
     assert identity["library"] == str(artifact / "attention_target.so")
     assert identity["shared_sha256"] == run.sha256((artifact / "attention_target.so").read_bytes())
-    assert identity["launcher_parameters"][3:5] == ("arg_Score", "arg_P")
+    assert identity["launcher_parameters"][3:5] == ("arg_O", "arg_V")
     assert identity["contract"]["buffers"]["score"]["fixed_bytes"] == 41943040
     origin = identity["source_build"]
     assert origin["pipeline"] == "structured-regions"
@@ -667,13 +671,21 @@ def test_selected_policy_reaches_oracle_decode_aclnn_and_reports(tmp_path, monke
     sq = policy.query_tile
     assert state["decode"] == [(policy.dtype, (1, 8, sq, 128))]
     assert state["reference"] == [(policy.shape(sq, 1024), policy.dtype, policy.scale)]
-    assert state["allocation_bytes"] == list(policy.allocation_bytes(sq, 1024).values())
+    assert state["allocation_bytes"] == [
+        nbytes
+        for name, nbytes in policy.allocation_bytes(sq, 1024).items()
+        if name in {"q", "k", "v", "o"}
+    ]
     assert report["artifact"]["runtime_policy"] == policy.as_dict()
     row = report["cases"][0]
     assert report["status"] == "passed" and row["dtype"] == policy.dtype
     assert (row["rtol"], row["atol"]) == policy.tolerances
     assert row["shape_b_hq_hkv_sq_sk_d"] == policy.shape(sq, 1024)
-    assert row["input_contract"]["allocation_bytes"] == policy.allocation_bytes(sq, 1024)
+    assert row["input_contract"]["allocation_bytes"] == {
+        name: nbytes
+        for name, nbytes in policy.allocation_bytes(sq, 1024).items()
+        if name in {"q", "k", "v", "o"}
+    }
     assert row["input_contract"]["example_tile_bq_bk_ck_vr"] == [sq, 1024, 128, 8]
     assert row["input_contract"]["example_native_query_tile_bm"] == 128
     assert row["guards_checked"] is True and row["inputs_unchanged"] is True

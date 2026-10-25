@@ -4,7 +4,15 @@ SSA task identity is deliberately not a completion token. Executing operations
 have observable effects, so generic CSE/DCE cannot erase asynchronous work.
 """
 
-from xdsl.dialects.builtin import ArrayAttr, FloatAttr, IndexType, IntAttr, StringAttr, f32
+from xdsl.dialects.builtin import (
+    ArrayAttr,
+    DictionaryAttr,
+    FloatAttr,
+    IndexType,
+    IntAttr,
+    StringAttr,
+    f32,
+)
 from xdsl.ir import Dialect
 from xdsl.irdl import (
     IRDLOperation,
@@ -38,6 +46,7 @@ class KernelOp(IRDLOperation):
     target = attr_def(StringAttr)
     core = attr_def(StringAttr)
     disjoint_external = attr_def(IntAttr)
+    device_resources = opt_attr_def(DictionaryAttr)
     blocks = opt_attr_def(IntAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
@@ -52,12 +61,15 @@ class MixedOp(IRDLOperation):
     target = attr_def(StringAttr)
     blocks = attr_def(IntAttr)
     disjoint_external = attr_def(IntAttr)
+    device_resources = opt_attr_def(DictionaryAttr)
     body = region_def("single_block")
     traits = traits_def(RecursiveMemoryEffect())
 
 
 @irdl_op_definition
 class BufferOp(IRDLOperation):
+    """A distinct physical root; internal GM is packed into the launch workspace."""
+
     name = "npu.buffer"
     sym_name = attr_def(StringAttr)
     nbytes = attr_def(IntAttr)

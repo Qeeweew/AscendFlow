@@ -21,12 +21,8 @@ interpreter.
 
 from __future__ import annotations
 
-import argparse
-from pathlib import Path
-
 # ruff: noqa: F821 - DSL signature annotations resolve at capture time.
 from ascendflow import language as N
-from ascendflow.build import build_file
 
 
 @N.prim_func(disjoint_external=True)
@@ -90,28 +86,3 @@ def masks(
         filled = N.fill(fill_work, -9.0, mask=both, scratch=scratch)
         N.copy(selected, Y1)
         N.copy(filled, Y2)
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--rows", type=int, default=8)
-    parser.add_argument("--columns", type=int, default=128)
-    parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--shared", action="store_true")
-    parser.add_argument("--timeout", type=float, default=300)
-    args = parser.parse_args()
-    report = build_file(
-        Path(__file__),
-        args.output,
-        entry="masks",
-        parameters={"ROWS": args.rows, "COLUMNS": args.columns},
-        compile_asc=args.compile,
-        shared=args.shared,
-        timeout_s=args.timeout,
-    )
-    print(report["compilation"])
-
-
-if __name__ == "__main__":
-    main()

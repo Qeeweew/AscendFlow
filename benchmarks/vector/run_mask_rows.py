@@ -32,7 +32,6 @@ performance comparison.
 """
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 import re
@@ -209,10 +208,6 @@ def run(
     runtime = ACL()
     records = []
     try:
-        module = ct.CDLL(str(Path(library).resolve()))
-        launch = getattr(module, f"launch_{result.name}")
-        launch.argtypes = [ct.c_void_p] * 5 + [ct.c_int64] * 3
-        launch.restype = ct.c_int
         guard = b"\x5a" * 128
         x = field_tensor(rows, columns)
         raw_x = x.tobytes() + guard
@@ -220,22 +215,17 @@ def run(
         require(len(raw_x) == nbytes + len(guard), "input byte count mismatch")
         raw_x_digest = _digest(raw_x)
 
-        def launch_case(devices, q, lo, hi):
-            require(
-                launch(runtime.stream, *devices, q, lo, hi) == 0,
-                f"row-mask launch rejected its runtime contract: case={(q, lo, hi)}",
-            )
-
         def read_outputs(devices):
             raw = [runtime.read(device, nbytes + len(guard)) for device in devices[1:]]
             actual = [np.frombuffer(item[:nbytes], dtype=np.float32).reshape(shape) for item in raw]
             return raw, actual
 
         for q, lo, hi in cases:
+            launch = runtime.kernel(library, result.name, parameters=(q, lo, hi))
             expected = oracle(x, q, lo, hi)
             buffers = [b"\xcd" * nbytes + guard for _ in range(3)]
             devices = [runtime.allocate(raw_x), *(runtime.allocate(raw) for raw in buffers)]
-            launch_case(devices, q, lo, hi)
+            launch(*devices)
             runtime.synchronize()
             raw, actual = read_outputs(devices)
             errors = [
@@ -253,7 +243,7 @@ def run(
             require(all(item[nbytes:] == guard for item in raw), "output guard changed")
             require(runtime.read(devices[0], len(raw_x)) == raw_x, "read-only input changed")
             for _ in range(repeats - 1):
-                launch_case(devices, q, lo, hi)
+                launch(*devices)
             runtime.synchronize()
             repeated_raw, repeated = read_outputs(devices)
             require(

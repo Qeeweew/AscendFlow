@@ -6,7 +6,6 @@ static. Device timings are diagnostic stream intervals, not tuned throughput.
 """
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 from pathlib import Path
@@ -46,19 +45,16 @@ def run(result, library, output, physical, counts, repeats, *, grouped=False, wa
             "runner requires the declared grouped example policy",
         )
     try:
-        module = ct.CDLL(str(library.resolve()))
-        launch = getattr(module, f"launch_{result.name}")
-        launch.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_int64]
-        launch.restype = ct.c_int
         guard = b"\x5a" * 128
         for count in counts:
+            launch = runtime.kernel(library, result.name, parameters=(count,))
             shape = (2, 3, count, 64) if grouped else (groups, count, 64)
             elements = 6 * count * 64 if grouped else groups * count * 64
             values = ((np.arange(elements, dtype=np.int32) % 127 - 63) / 16).astype(np.float32)
             raw_input = values.tobytes() + guard
             raw_output = b"\xcd" * values.nbytes + guard
             x, y = runtime.allocate(raw_input), runtime.allocate(raw_output)
-            require(launch(runtime.stream, x, y, count) == 0, "runtime length contract rejected")
+            launch(x, y)
             runtime.synchronize()
             raw = runtime.read(y, len(raw_output))
             actual = np.frombuffer(raw[: values.nbytes], dtype=np.float32)
@@ -71,16 +67,12 @@ def run(result, library, output, physical, counts, repeats, *, grouped=False, wa
             )
             require(runtime.read(x, len(raw_input)) == raw_input, "read-only input changed")
             for _ in range(warmup - 1):
-                require(
-                    launch(runtime.stream, x, y, count) == 0, "runtime length contract rejected"
-                )
+                launch(x, y)
             runtime.synchronize()
             start, stop = runtime.event(), runtime.event()
             runtime.record(start)
             for _ in range(repeats):
-                require(
-                    launch(runtime.stream, x, y, count) == 0, "runtime length contract rejected"
-                )
+                launch(x, y)
             runtime.record(stop)
             runtime.synchronize()
             raw = runtime.read(y, len(raw_output))
@@ -91,14 +83,7 @@ def run(result, library, output, physical, counts, repeats, *, grouped=False, wa
                 and raw[values.nbytes :] == guard,
                 "repeated launches changed numerical output or bounds guard",
             )
-            elapsed = ct.c_float()
-            runtime.call(
-                "aclrtEventElapsedTime",
-                [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-                ct.byref(elapsed),
-                start,
-                stop,
-            )
+            elapsed_us = runtime.elapsed_us(start, stop)
             record = {
                 "sequence_length" if grouped else "tiles_per_group": count,
                 "shape": list(shape),
@@ -108,7 +93,7 @@ def run(result, library, output, physical, counts, repeats, *, grouped=False, wa
                 "empty_loop_and_bounds_guards": "checked",
                 "warmup": warmup,
                 "repeats": repeats,
-                "stream_interval_us_per_launch": elapsed.value * 1000 / repeats,
+                "stream_interval_us_per_launch": elapsed_us / repeats,
                 "timing_scope": "ACL event stream interval, including submission gaps; not kernel-only",
                 "input_sha256": hashlib.sha256(raw_input).hexdigest(),
                 "work": work_record(

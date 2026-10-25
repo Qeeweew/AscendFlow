@@ -259,7 +259,7 @@ class _Lowerer:
         attrs = {
             "sym_name": op.sym_name,
             "nbytes": IntAttr(size),
-            "external": IntAttr(int(op.ref.type.memory.data == "GM")),
+            "external": IntAttr(int(op.ref.type.memory.data == "GM" and op.access.data != "local")),
             "initialized": IntAttr(int(op.access.data in {"read", "read_write"})),
             "access": op.access,
         }
@@ -757,6 +757,8 @@ def lower_native_structure(source) -> NativeStructure:
         "disjoint_external": program.disjoint_external,
         "blocks": program.groups,
     }
+    if "device_resources" in program.attributes:
+        attrs["device_resources"] = program.attributes["device_resources"]
     mixed = program.kind.data == "mixed"
     if not mixed:
         attrs["core"] = StringAttr("aic" if program.kind.data == "cube" else "aiv")

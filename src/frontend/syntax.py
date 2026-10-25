@@ -56,7 +56,25 @@ def _ast_only():
     raise CompileError("device syntax requires prim_func or from_source AST capture")
 
 
+def get_core_num(kind):
+    """Device core count resolved from host-bound resources before IR analysis.
+
+    cube/mixed return the AIC count; vector returns the AIV count, matching
+    CANN. It is a constexpr device fact, never a tensor/metadata load.
+    """
+    _ast_only()
+
+
 def alloc_ub(shape, dtype=f32, *, slots=None, name=None):
+    _ast_only()
+
+
+def alloc_workspace(shape, dtype=f32, *, slots=None, name=None):
+    """Uninitialized kernel-owned GM tensor, with a 512-byte-aligned base.
+
+    Shape uses constexpr axes or uniform runtime size parameters. Storage is
+    shared by the launch's groups and actors; group/slot indexing is explicit.
+    """
     _ast_only()
 
 

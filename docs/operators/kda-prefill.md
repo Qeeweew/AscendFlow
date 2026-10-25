@@ -30,6 +30,19 @@ FP32 carry 与 BF16 snapshot 是不同的值和存储，snapshot 不反馈到递
 Prepare 内的一个 chunk/head 完整归属一个 mixed group，因此不需要 kernel 内全核同步。
 核内 ready/release、GM 交接和有限事件资源由公共同步链建立。
 
+各阶段私有 GM scratch 均由 `N.alloc_workspace` 声明并由 runtime 自动分配，各
+allocation 起点按 512 B 对齐。Prepare 的归一化、Gram/块逆和 W/U 临时面，scan 的
+History/Projection/Delta，以及 output 的 OutputProducts 都按 group 和固定 tile/slot
+分片，固定 GROUPS 时不随 CHUNKS、H 或 SEQUENCES 增长。
+scan 的三项临时容量为 `4*GROUPS*(2*K*K+BT*K)` 字节；默认 GROUPS=20、K=128、
+BT=64 时共 3,276,800 B（3.125 MiB）。每组依次处理自己的 sequence/head，原有
+最后 reader 与 ownership 检查约束下一 chunk 和下一任务覆盖同一平面。
+
+Gp/KG/QG/A16/U/W32、Snapshot/Residual 是跨 kernel 的中间结果，仍作为显式 tensor
+传递并随任务数增长。常量矩阵、最终 Output/Final 也保留其输入输出身份；因此整个
+三 kernel pipeline 的总存储仍随数据规模变化。分配与依赖分析合同见
+[GM workspace](../guide/workspace.md)。
+
 | 阶段 | 计算及归属 |
 |---|---|
 | prepare | Q/K 归一化、Gate 前缀、对角与跨块 Gram、16→32→64 块逆、RHS/KG/QG/A16、W/U；每个 chunk/head 在同一 AIC 与两个 AIV 内完成 |

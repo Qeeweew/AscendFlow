@@ -6,7 +6,6 @@ already panel-major, so neither implementation performs an extra GM packing.
 """
 
 import argparse
-import ctypes as ct
 import hashlib
 import json
 from pathlib import Path
@@ -17,7 +16,7 @@ from ascendflow.device import ACL, health_snapshot
 from ascendflow.diagnostics import require
 from ascendflow.performance import hardware_snapshot
 from benchmarks.artifacts import read_artifact
-from benchmarks.references import ascendc_source
+from benchmarks.references import ascendc_source, reference_kernel
 from benchmarks.validation.gemm import inputs_and_oracle
 from benchmarks.work import structure_inventory, work_record
 from examples.gemm.reduction import reduction_gemm
@@ -118,22 +117,25 @@ def main():
     try:
         for variant in variants:
             name, _ = sources[variant]
-            module = ct.CDLL(str((args.output / variant / f"{name}.so").resolve()))
-            launch = getattr(module, "launch_" + name)
-            launch.argtypes, launch.restype = [ct.c_void_p] * 4 + [ct.c_int64], ct.c_int
+            library = args.output / variant / f"{name}.so"
             for panels in args.panels:
+                launch = (
+                    runtime.kernel(library, name, parameters=(panels,))
+                    if variant == "generated"
+                    else reference_kernel(runtime, library, name, 3, parameters=(panels,))
+                )
                 a, b, expected = inputs_and_oracle(policy, panels)
                 guard = b"\x5a" * 512
                 a, b = a + guard, b + guard
                 original = b"\xcd" * expected.nbytes + guard
                 ap, bp, cp = runtime.allocate(a), runtime.allocate(b), runtime.allocate(original)
                 for _ in range(args.warmup):
-                    require(launch(runtime.stream, ap, bp, cp, panels) == 0, "launch rejected")
+                    launch(ap, bp, cp)
                 runtime.synchronize()
                 start, stop = runtime.event(), runtime.event()
                 runtime.record(start)
                 for _ in range(args.repeats):
-                    require(launch(runtime.stream, ap, bp, cp, panels) == 0, "launch rejected")
+                    launch(ap, bp, cp)
                 runtime.record(stop)
                 runtime.synchronize()
                 raw = runtime.read(cp, len(original))
@@ -150,14 +152,7 @@ def main():
                     and runtime.read(bp, len(b)) == b,
                     "input/output guard changed",
                 )
-                elapsed = ct.c_float()
-                runtime.call(
-                    "aclrtEventElapsedTime",
-                    [ct.POINTER(ct.c_float), ct.c_void_p, ct.c_void_p],
-                    ct.byref(elapsed),
-                    start,
-                    stop,
-                )
+                elapsed_us = runtime.elapsed_us(start, stop)
                 record = {
                     "variant": variant,
                     "kernel": name,
@@ -170,7 +165,7 @@ def main():
                     "guards_unchanged": True,
                     "warmup": args.warmup,
                     "repeats": args.repeats,
-                    "stream_interval_us": elapsed.value * 1000 / args.repeats,
+                    "stream_interval_us": elapsed_us / args.repeats,
                     "timing_scope": "ACL stream interval including submission gaps; not kernel-only",
                     "cache_policy": "same panel-major allocations reused, no flush",
                     "input_sha256": [hashlib.sha256(a).hexdigest(), hashlib.sha256(b).hexdigest()],

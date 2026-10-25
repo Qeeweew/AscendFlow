@@ -1055,10 +1055,10 @@ def admit_structured_memory(
         for template in memory.templates
         if not template.frame.statically_empty
         for access in template.accesses
-        if access.address.geometry.bank == "GM"
+        if access.address.root.owner.external.data
     }
     writes_external = any(
-        access.mode.writes and access.address.geometry.bank == "GM"
+        access.mode.writes and access.address.root.owner.external.data
         for template in memory.templates
         if not template.frame.statically_empty
         for access in template.accesses
