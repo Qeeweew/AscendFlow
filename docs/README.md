@@ -20,6 +20,7 @@
 | 文档 | 内容 |
 |---|---|
 | [GEMM](operators/gemm.md) | 标准连续 `C=A@B`，FP16/BF16、尾块、数值和缓存政策 |
+| [Grouped GEMM](operators/grouped-gemm.md) | type=0 专家边界、ND/NZ 权重、本地 EP/TP 接口及独立验证 |
 | [Dense NT GEMM](operators/dense-gemm.md) | `C=A@Bt.T`，FP16 输入、FP32 输出及整块限制 |
 | [Flash Attention](operators/flash-attention.md) | dense/causal BNSD forward、online softmax、workspace、输入条件及数值容差 |
 | [Sparse MLA](operators/sparse-mla.md) | V4.1 分页滑窗/压缩 shared-KV、sink、INT32 元数据与支持边界 |

@@ -34,6 +34,8 @@ python -m benchmarks.profile_defaults --causal --require-no-slower --output buil
 | `attention/run_sparse.py` | V4.1 CSA 单 kernel decode/prefill、INT32 页表/索引、NPU FP32 数值参考与输入/哨兵检查；见[合同](../docs/operators/sparse-mla.md) |
 | `attention/profile_sparse.py` | 仅做 msprof 性能采集，不运行数值参考或回读算子输出；支持独立缓存轮换、显式 L2 驱逐、batch 和上下文矩阵 |
 | `attention/gather_dma.py` | 独立 AscendC 单行/双行 DMA 对照，包含逐行查页表和预给物理行号两种路径；不是 AscendFlow DSL 或完整 attention |
+| `moe/run.py` | 独立 type=0 grouped GEMM、ND/NZ 权重、CPU 参考与原始 GMM task duration；`--require-performance` 逐轮验收不慢于原始 1% |
+| `moe/parallel.py` | 单设备依次执行 EP/TP/EP+TP 本地分片并重组，独立于 vllm/HCCL；设备组合检查已通过，当前源码对应关系见[合同](../docs/operators/grouped-gemm.md) |
 | `validation/` | 独立数值参考、输入数据和 dtype 编解码 |
 | `references/` | 日常 ACLNN 适配器与独立 AscendC 参考 |
 

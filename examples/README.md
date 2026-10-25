@@ -1,7 +1,7 @@
 # 可运行示例
 
 算法、分块、缓存和排步政策放在 `examples/`；编译器走同一条 DSL→IR→ASC→CANN
-路径。示例文件只保留 DSL 定义；构建统一使用编译器 CLI，数值与性能检查放在
+路径。示例保存 DSL 定义及可选的算法 host 调用封装；构建使用普通编译器入口，数值与性能检查放在
 `benchmarks/`。先读[快速上手](../docs/guide/quickstart.md)，所有示例的统一检查命令为：
 
 ```bash
@@ -29,6 +29,7 @@ attention 也由固定 worker 依次处理 head。跨 kernel 的中间结果保�
 | `hierarchical-gemm` | [gemm/hierarchical.py](gemm/hierarchical.py) · `hierarchical_gemm` | 输出块循环嵌套 K 流水 |
 | `dense-gemm` | [gemm/dense.py](gemm/dense.py) · `dense_gemm` | 连续 NT、FP16 输入/FP32 输出 |
 | `gemm` | [gemm/matmul.py](gemm/matmul.py) · `gemm` | 连续 NN、FP16/BF16、静态尾块 |
+| `grouped-gemm` | [moe/grouped_gemm.py](moe/grouped_gemm.py) · `grouped_gemm` | type=0 边界、ND/NZ 权重、runtime 行前缀 FIX |
 | `flash-attention` | [flash_attention/attention.py](flash_attention/attention.py) · `attention_target` | QK/softmax/PV/update 多级 CV 流水 |
 | `simple-attention` | [flash_attention/simple.py](flash_attention/simple.py) · `simple_attention` | 整块 non-causal attention 教学示例，D128、四阶段与两槽 workspace |
 | `sparse-mla` | [sparse_attention/gather.py](sparse_attention/gather.py) / [attention.py](sparse_attention/attention.py) | V4.1 decode/prefill、分页 shared-KV、稀疏 TopK、sink 与双 AIV 流水 |

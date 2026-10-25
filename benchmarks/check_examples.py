@@ -150,6 +150,14 @@ def examples():
         ("--scope", "full", "--warmup", "1", "--repeats", "1"),
     )
     add(
+        "grouped-gemm",
+        "moe/grouped_gemm",
+        "grouped_gemm",
+        "moe.run",
+        (),
+        ("--worker", "--ends", "0,0,0", "1,1,19", "16,16,49", "17,31,65", "--padding", "7"),
+    )
+    add(
         "flash-attention",
         "flash_attention/attention",
         "attention_target",
