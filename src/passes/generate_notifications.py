@@ -51,6 +51,8 @@ def _complete_bindings(selection, *, binding_s=0.0):
     domains = select_completion_frontiers(domains)
     selection = domains.selection
     prefixed = perf_counter()
+    domains = domains.for_lifetimes()
+    windowed = perf_counter()
     credits, credit_order = bind_cell_credits(domains)
     paired = perf_counter()
     order = establish_queue_order(domains)
@@ -64,7 +66,8 @@ def _complete_bindings(selection, *, binding_s=0.0):
         ("notification_binding", binding_s),
         ("endpoint_domains", domained - started),
         ("completion_prefixes", prefixed - domained),
-        ("cell_credits", paired - prefixed),
+        ("lifetime_windows", windowed - prefixed),
+        ("cell_credits", paired - windowed),
         ("queue_order", ordered - paired),
         ("credit_lifetimes", completed - ordered),
     )

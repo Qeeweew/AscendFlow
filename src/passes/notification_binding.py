@@ -71,15 +71,11 @@ def _comparison(test, substitutions, facts):
     return Comparison(lhs, test.predicate, rhs)
 
 
-def _branch_test(operation, branch, control):
-    tests = control.branches[operation, branch]
-    require(
-        len(tests) == 1, "notification branch guard needs an admitted signed integer comparison"
-    )
-    return tests[0]
+def _branch_tests(operation, branch, control):
+    return control.branches[operation, branch]
 
 
-def _case_tests(guards, control):
+def _case_tests(guards, control, need=None):
     """Retain effect predicates in the requirement's consumer coordinates."""
     for guard in guards:
         if isinstance(guard, LoopCountGuard):
@@ -88,7 +84,16 @@ def _case_tests(guards, control):
             yield guard.comparison
         else:
             assert isinstance(guard, BranchGuard)
-            yield _branch_test(guard.operation, guard.branch, control)
+            tests = _branch_tests(guard.operation, guard.branch, control)
+            if need is not None:
+                for point in (need.source, need.consumer):
+                    if any(
+                        frame.operation is guard.operation and frame.branch == guard.branch
+                        for frame in point.frame.ancestors()
+                    ):
+                        tests = control.participant_comparisons(tests, point.participant)
+                        break
+            yield from tests
 
 
 def _guard(tests):
@@ -370,15 +375,17 @@ def _bind_endpoint(
         _case_tests(
             _effective_guards(need, memory) if effective_guards is None else effective_guards,
             control,
+            need,
         )
     )
 
     # Selector equalities compare the current actual ordinal, whereas every
     # other test is phrased in the requirement's logical consumer coordinates.
     rendered = [
-        _branch_test(frame.operation, frame.branch, control)
+        test
         for frame in occurrence.frame.ancestors()
         if frame.branch is not None
+        for test in _branch_tests(frame.operation, frame.branch, control)
     ]
     rendered.extend(_comparison(test, substitutions, environment.facts) for test in tests)
     rendered.extend(
@@ -477,7 +484,7 @@ class _IssueOrder:
     def premises(self, need):
         if need not in self._premises:
             tests = (
-                *_case_tests(need.guards, self.dispatch.memory.control),
+                *_case_tests(need.guards, self.dispatch.memory.control, need),
                 *self.ordinal_domain(need),
             )
             self._premises[need] = tuple(dict.fromkeys(tests))
@@ -577,6 +584,8 @@ def _effective_guards(need, memory):
     result = []
     for guard in need.guards:
         implied = False
+        if isinstance(guard, BranchGuard):
+            implied = not tuple(_case_tests((guard,), memory.control, need))
         if isinstance(guard, LoopCountGuard) and guard.relation.value == ">":
             for domain in need.domains:
                 if domain.loop is not guard.loop or domain.count != guard.count:
@@ -869,64 +878,131 @@ def _ordered_prefix_point(points, requirements, order, *, source):
 
 
 def _quorums(notifications, order):
-    local, cross = [], {}
-    for item in notifications:
-        if item.mechanism is not NotificationKind.CROSS_EVENT:
-            local.append(item)
-            continue
+    control = order.dispatch.memory.control
+
+    def point_key(point, *, operation=True):
+        # SID branches can give the two roles distinct native instructions.
+        # Compare their activation in their own real participant, never in
+        # the Cube receiver's SID or a fabricated peer instruction.
+        key = _point_key(
+            replace(
+                point,
+                guard=ActionGuard(
+                    tuple(control.participant_comparisons(point.guard.comparisons, point.actor))
+                ),
+            ),
+            actor=False,
+        )
+        return key if operation else key[1:]
+
+    def group_key(item, *, cube_operation):
         cube_source = item.sources[0].actor is Actor.AIC
         cube = item.sources[0] if cube_source else item.consumers[0]
         vector = item.consumers[0] if cube_source else item.sources[0]
-        key = (
+        return (
             cube_source,
-            _point_key(vector, actor=False),
-            # Different Cube operations may produce/consume the two AIV
-            # partitions. They must still share the exact activation and
-            # invocation; cumulative capture/acquire order is checked below.
-            _point_key(cube, actor=False)[1:],
+            point_key(vector, operation=not cube_operation),
+            point_key(cube, operation=cube_operation),
             item.source_engine,
             item.destination_engine,
             _domain_key(item),
         )
-        cross.setdefault(key, []).append(item)
-    unresolved = []
-    for items in cross.values():
-        first = items[0]
+
+    def combine(items):
         sources = _unique_points(p for item in items for p in item.sources)
         consumers = _unique_points(p for item in items for p in item.consumers)
         a, b = {p.actor for p in sources}, {p.actor for p in consumers}
-        complete = (a == {Actor.AIC} and b == {Actor.AIV0, Actor.AIV1}) or (
-            b == {Actor.AIC} and a == {Actor.AIV0, Actor.AIV1}
-        )
+        if not (
+            (a == {Actor.AIC} and b == {Actor.AIV0, Actor.AIV1})
+            or (b == {Actor.AIC} and a == {Actor.AIV0, Actor.AIV1})
+        ):
+            return None
         requirements = tuple(n for item in items for n in item.requirements)
-        if complete:
-            cube_source = a == {Actor.AIC}
-            cube = sources if cube_source else consumers
-            vector = consumers if cube_source else sources
-            selected = _ordered_prefix_point(cube, requirements, order, source=cube_source)
-            complete = selected is not None and len(vector) == 2
-            if complete:
-                if cube_source:
-                    sources = (selected,)
-                else:
-                    consumers = (selected,)
-        if not complete:
+        chosen = []
+        for points, actors, source in ((sources, a, True), (consumers, b, False)):
+            for actor in sorted(actors, key=lambda actor: actor.value):
+                selected = _ordered_prefix_point(
+                    tuple(p for p in points if p.actor is actor), requirements, order, source=source
+                )
+                if selected is None:
+                    return None
+                chosen.append((source, selected))
+        return replace(
+            items[0],
+            sources=tuple(point for source, point in chosen if source),
+            consumers=tuple(point for source, point in chosen if not source),
+            requirements=requirements,
+            anchors=tuple(b for item in items for b in item.anchors),
+        )
+
+    local, cross = [], {}
+    for item in notifications:
+        if item.mechanism is not NotificationKind.CROSS_EVENT:
+            local.append(item)
+        else:
+            cross.setdefault(group_key(item, cube_operation=False), []).append(item)
+    remaining = {}
+    for items in cross.values():
+        joined = combine(items)
+        if joined is not None:
+            local.append(joined)
+        else:
+            # Preserve complete groups above. Only incomplete groups may
+            # propose a quorum at one exact Cube operation. This does not
+            # transitively merge messages sharing arbitrary endpoints.
+            for item in items:
+                remaining.setdefault(group_key(item, cube_operation=True), []).append(item)
+    pending = []
+    for items in remaining.values():
+        joined = combine(items)
+        if joined is not None:
+            local.append(joined)
+        else:
+            pending.extend(items)
+    unresolved = []
+    for item in pending:
+        for index, previous in enumerate(local):
+            if (
+                previous.mechanism is not NotificationKind.CROSS_EVENT
+                or previous.source_engine is not item.source_engine
+                or previous.destination_engine is not item.destination_engine
+                or _domain_key(previous) != _domain_key(item)
+            ):
+                continue
+            # A complete, already-required quorum can cover a later
+            # read of one peer's data. Keep its real endpoints; a
+            # one-peer requirement cannot create a peer contribution.
+            matched = True
+            for old, needed, source in (
+                (previous.sources, item.sources, True),
+                (previous.consumers, item.consumers, False),
+            ):
+                peers = {p.actor: p for p in old}
+                for point in needed:
+                    peer = peers.get(point.actor)
+                    if (
+                        peer is None
+                        or point_key(peer, operation=False) != point_key(point, operation=False)
+                        or any(
+                            order.compare(point if source else peer, peer if source else point, n)
+                            not in {-1, 0}
+                            for n in item.requirements
+                        )
+                    ):
+                        matched = False
+                        break
+            if matched:
+                local[index] = replace(
+                    previous, requirements=previous.requirements + item.requirements
+                )
+                break
+        else:
             unresolved.extend(
                 UnresolvedSynchronization(
-                    n, "mode-2 notification lacks the two actual AIV quorum members"
+                    need, "mode-2 notification lacks the two actual AIV quorum members"
                 )
-                for n in requirements
+                for need in item.requirements
             )
-            continue
-        local.append(
-            replace(
-                first,
-                sources=sources,
-                consumers=consumers,
-                requirements=requirements,
-                anchors=tuple(b for item in items for b in item.anchors),
-            )
-        )
     return tuple(local), tuple(unresolved)
 
 

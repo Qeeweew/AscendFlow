@@ -2,9 +2,8 @@
 
 This stage owns one selected dispatch and its activation domains. It performs
 no event allocation, lifetime search, progress construction or materialization.
-Each clock has an exact membership window. Child existence is eliminated
-from the innermost clock outward using that window's explicit projection;
-unknown sparse or correlated activation is diagnosed at its actual boundary.
+Pairing uses actual activation, independently of event ranks. Exact membership
+windows are added only for retained protocols whose lifetime needs them.
 """
 
 from __future__ import annotations
@@ -117,6 +116,7 @@ class EventDomains:
     _guard_inputs: dict[BoundPlacement, tuple] = field(compare=False, repr=False)
     _input_ranges_cache: dict[BoundPlacement, tuple] = field(compare=False, repr=False)
     _boundary_instances: dict[tuple, tuple] = field(compare=False, repr=False)
+    _window_errors: Mapping[LogicalNotification, CompileError] = field(compare=False, repr=False)
 
     def __init__(self, selection: SynchronizationSelection, work: ResourceWork):
         memory = selection.dependencies.memory
@@ -139,6 +139,7 @@ class EventDomains:
             ("_guard_inputs", {}),
             ("_input_ranges_cache", {}),
             ("_boundary_instances", {}),
+            ("_window_errors", {}),
         ):
             object.__setattr__(self, name, value)
         self.work.notifications = len(self.notifications)
@@ -181,6 +182,58 @@ class EventDomains:
             MappingProxyType({key: value for key, value in self.active.items() if key[0] in kept}),
         )
         self.work.notifications = len(kept)
+        return result
+
+    def for_lifetimes(self):
+        """Refine retained streams only where reuse needs exact membership.
+
+        Completion coverage consumes paired occurrences, not FIRST/LAST or
+        event ranks. Deleted protocols therefore need no resource windows.
+        This specialization preserves pairing and all original input facts.
+        It does not grant a windowless queue port a physical-cell lease.
+        """
+        from .cell_channels import owns_stable_cell
+
+        result = object.__new__(EventDomains)
+        for name in self.__dataclass_fields__:
+            object.__setattr__(result, name, getattr(self, name))
+        for name in ("cases", "endpoints", "active", "_window_errors"):
+            object.__setattr__(result, name, dict(getattr(self, name)))
+        for notification in self.notifications:
+            if notification.mechanism is NotificationKind.PIPE_FENCE:
+                continue
+            if owns_stable_cell(notification, self.control, self.clocks[notification]):
+                continue
+            if all(case.empty or case.windows for case in self.cases[notification]):
+                continue
+            if not self.clocks[notification]:
+                continue
+            try:
+                family = result._family(notification)
+            except CompileError as error:
+                if notification.mechanism is not NotificationKind.LOCAL_EVENT or (
+                    error.kind is not ErrorKind.UNSUPPORTED
+                    or error.phase not in {"event-parameter-cases", "event-window-membership"}
+                ):
+                    raise
+                # Exact rank is unavailable. This grants no lease: the
+                # generator must prove consumption for every ordered pair
+                # of actual uses, or retain this refusal.
+                result._window_errors[notification] = error
+                continue
+            result.cases[notification] = family
+            # Universal endpoint equivalence was already established. Exact
+            # case specialization restricts that fact; it does not require
+            # another equivalence query for each alternative.
+            for case in result.cases[notification]:
+                points = notification.sources + notification.consumers
+                instances = tuple(result._instance(p, {}, case=case) for p in points)
+                result.endpoints.update(zip(((p, case) for p in points), instances, strict=True))
+                result.active[notification, case] = not case.empty and result._possible(
+                    instances[:1]
+                )
+        for name in ("cases", "endpoints", "active", "_window_errors"):
+            object.__setattr__(result, name, MappingProxyType(getattr(result, name)))
         return result
 
     def _validate(self):
@@ -312,18 +365,14 @@ class EventDomains:
             # a binary event domain that no resource consumer needs.
             if notification.mechanism is NotificationKind.PIPE_FENCE:
                 continue
-            from .cell_channels import owns_stable_cell
-
-            if owns_stable_cell(notification, self.control, self.clocks[notification]):
-                # A cell credit is one physical resource across the complete
-                # invocation. It has no dense rank, mixed radix or event
-                # width to derive. Check actual pairing once; only unresolved
-                # periodic parameter premises need exact family refinement.
-                self.cases[notification] = (EventCase(ActionGuard(), (), (), ()),)
-                if self._paired(notification):
-                    self.work.parameter_cases += 1
-                    continue
-                self.work.pairing_refinements += 1
+            self.cases[notification] = (EventCase(ActionGuard(), (), (), ()),)
+            if self._paired(notification):
+                self.work.parameter_cases += 1
+                continue
+            # Different endpoint expressions may need finite parameter
+            # specialization to establish pairing itself. This is distinct
+            # from adding reuse windows to an already paired stream.
+            self.work.pairing_refinements += 1
             self.cases[notification] = self._family(notification)
             self._pair(notification)
 
@@ -510,12 +559,6 @@ class EventDomains:
                     )
                 )
             if frame.branch is not None:
-                require(
-                    len(frame.comparisons) == 1,
-                    "event scope needs an admitted signed integer comparison",
-                    kind=ErrorKind.UNSUPPORTED,
-                    phase="structured-event-pairing",
-                )
                 append(bind(test, translate) for test in frame.comparisons)
         append(bind(test, translate) for test in placement.guard.comparisons)
         result = tuple(tests.items())

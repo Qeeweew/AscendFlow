@@ -52,6 +52,7 @@ from z3 import (
     Z3_OP_UNINTERPRETED,
     BitVec,
     BitVecVal,
+    Bool,
     BoolRef,
     BoolVal,
     CheckSatResult,
@@ -127,7 +128,7 @@ def finite_model(constraints, objectives=()):
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Boolean:
-    """A mathematical conjunction/union, never an executable guard rewrite."""
+    """A mathematical Boolean DAG, never an executable guard rewrite."""
 
     kind: str
     operands: tuple
@@ -164,6 +165,15 @@ class Boolean:
         return value
 
     def __post_init__(self):
+        if self.kind == "atom":
+            require(
+                isinstance(self.operands, tuple)
+                and len(self.operands) == 2
+                and isinstance(self.operands[0], Symbol)
+                and type(self.operands[1]) is bool,
+                "a Boolean atom needs a symbol and a polarity",
+            )
+            return
         require(self.kind in {"and", "or"}, "unknown boolean query operation")
         require(
             isinstance(self.operands, tuple)
@@ -198,6 +208,27 @@ def any_of(*conditions):
     return False if not values else values[0] if len(values) == 1 else _boolean("or", values)
 
 
+@memoized(key=lambda conditions: tuple((type(c), c) for c in conditions))
+def conjuncts(conditions):
+    """Explicit conjuncts only; never split a disjunction or infer a relation."""
+    require(
+        isinstance(conditions, tuple)
+        and all(isinstance(c, (Comparison, Boolean, bool)) for c in conditions),
+        "conjuncts need immutable mathematical predicates",
+    )
+    pending, result, seen = list(conditions), set(), set()
+    while pending:
+        condition = pending.pop()
+        if condition is True or condition in seen:
+            continue
+        seen.add(condition)
+        if isinstance(condition, Boolean) and condition.kind == "and":
+            pending.extend(condition.operands)
+        else:
+            result.add(condition)
+    return frozenset(result)
+
+
 def negate(condition):
     """Complement shared mathematical syntax without expanding paths."""
     opposite = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}
@@ -211,6 +242,9 @@ def negate(condition):
             results[key] = not current
         elif isinstance(current, Comparison):
             results[key] = Comparison(current.lhs, opposite[current.predicate], current.rhs)
+        elif isinstance(current, Boolean) and current.kind == "atom":
+            symbol, positive = current.operands
+            results[key] = _boolean("atom", (symbol, not positive))
         elif isinstance(current, Boolean):
             if not done:
                 pending.append((current, True))
@@ -261,6 +295,10 @@ class Instance:
                 continue
             if is_bv_value(value):
                 values.append((declaration.name(), value.as_signed_long()))
+            elif is_true(value) or is_false(value):
+                values.append(
+                    (self._symbols.get(declaration.name(), declaration.name()), int(is_true(value)))
+                )
             else:
                 try:
                     values.append(
@@ -570,9 +608,13 @@ class _RuleContext:
                 )
                 answer = Answer(PROVED, "implies", elapsed)
             elif outcome == sat:
-                answer = Answer(
-                    COUNTEREXAMPLE, "implies", elapsed, service._model_instance(solver.model())
-                )
+                model = solver.model()
+                # A failed rule deduction supplies a real model of the full
+                # input premises, just like an ordinary integer query. Reuse
+                # its guard interpretations to refute later coverage attempts;
+                # unassigned predicates remain unknown and grant no fact.
+                service._witnesses.appendleft((model, dict.fromkeys(self.assumptions, True)))
+                answer = Answer(COUNTEREXAMPLE, "implies", elapsed, service._model_instance(model))
             else:
                 answer = Answer(UNKNOWN, "implies", elapsed, reason=str(solver.reason_unknown()))
         finally:
@@ -679,7 +721,35 @@ class IntegerQueryService:
             symbol = value.args[0]
             result = self._values.get(symbol)
             if result is None:
-                if (
+                if isinstance(symbol, Symbol) and symbol.kind in {
+                    SymbolKind.PREDICATE,
+                    SymbolKind.SELECTION,
+                }:
+                    from xdsl.dialects import arith, scf
+
+                    from ..indexing import pure_scalar_selection
+
+                    owner = getattr(symbol.origin, "owner", None)
+                    if symbol.kind is SymbolKind.PREDICATE and isinstance(owner, arith.CmpiOp):
+                        require(owner.predicate.value.data < 6, "unsupported predicate comparison")
+                        require(len(symbol.captures) == 2, "comparison lost its actual operands")
+                        predicate = ("==", "!=", "<", "<=", ">", ">=")[owner.predicate.value.data]
+                        a, b = (self._integer(v) for v in symbol.captures)
+                        result = If(_cmp(a, predicate, b), IntVal(1), IntVal(0))
+                    else:
+                        require(
+                            isinstance(owner, scf.IfOp)
+                            and pure_scalar_selection(owner)
+                            and len(symbol.captures) == 3,
+                            "selection needs its actual pure SSA branches",
+                        )
+                        test, yes, no = (self._integer(v) for v in symbol.captures)
+                        result = (
+                            If(test != 0, yes, no)
+                            if symbol.kind is SymbolKind.SELECTION
+                            else If(If(test != 0, yes != 0, no != 0), IntVal(1), IntVal(0))
+                        )
+                elif (
                     isinstance(symbol, Symbol)
                     and symbol.kind in {SymbolKind.METADATA, SymbolKind.CARRY}
                     and symbol.captures
@@ -772,6 +842,15 @@ class IntegerQueryService:
                 continue
             if type(current) is bool:
                 encoded[key] = BoolVal(current)
+            elif isinstance(current, Boolean) and current.kind == "atom":
+                symbol, positive = current.operands
+                atoms = self.__dict__.setdefault("_boolean_atoms", {})
+                if symbol not in atoms:
+                    name = f"predicate_{len(atoms)}"
+                    atoms[symbol] = Bool(name)
+                    self._symbols[name] = symbol
+                atom = atoms[symbol]
+                encoded[key] = atom if positive else Not(atom)
             elif isinstance(current, Boolean):
                 if done:
                     operation = _and if current.kind == "and" else _or
@@ -831,6 +910,8 @@ class IntegerQueryService:
                 continue
             if type(current) is bool:
                 known[key] = current
+            elif isinstance(current, Boolean) and current.kind == "atom":
+                known[key] = False
             elif isinstance(current, Boolean):
                 if done:
                     values = (known[type(value), value] for value in current.operands)
@@ -912,7 +993,9 @@ class IntegerQueryService:
             return cached
         poll("integer query", distinct=self.statistics.distinct, calls=self.statistics.calls)
         started = perf_counter()
-        if kind == "implies" and self._elementary(key[1]):
+        if kind == "implies" and (
+            self._elementary(key[1]) or conjuncts((key[1],)) <= conjuncts(assumptions)
+        ):
             require(
                 isinstance(assumptions, tuple)
                 and all(isinstance(item, (Comparison, Boolean, bool)) for item in assumptions),

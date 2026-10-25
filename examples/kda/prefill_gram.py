@@ -130,6 +130,91 @@ def diagonal_inverse(inputs, buffers, geometry):
         )
 
 
+@N.inline
+def owned_diagonal_inverse(inputs, outputs, panels, gram_work, inverse_work, masks, geometry, lane):
+    """Compute the peer's two diagonal blocks with the original FP32 trees."""
+    Kp, Qp, Gp, Lengths, betas = inputs
+    Aqk, Ai32, Diagonal = outputs
+    raw_keys, raw_queries, gate_panels = panels
+    keys, queries, weighted, rows, steps, decay, diagonal, attention, product, scores, partial = (
+        gram_work
+    )
+    (
+        inverse,
+        coefficients,
+        coefficient_matrix,
+        plane_scratch,
+        inverse_rows,
+        weighted_inverse,
+        inverse_tree,
+        identities,
+    ) = inverse_work
+    upper, mask_zero, strict_upper = masks
+    SCALE, K, BT = geometry
+    valid = N.load_index(Lengths, minimum=1, maximum=BT)
+    # Each peer owns two 16-token diagonal blocks; only the
+    # input/output rows use global chunk coordinates. The two
+    # inverse blocks are packed in the peer's local 32 columns.
+    for local in N.serial(2):
+        block = lane * 32 + local * 16
+        with N.CopyGroup(name="diagonal_panel"):
+            N.copy(Kp[block : block + 16, :], raw_keys[:16, :])
+            N.copy(Qp[block : block + 16, :], raw_queries[:16, :])
+            N.copy(Gp[block : block + 16, :], gate_panels[:16, :])
+        diagonal_gram(
+            (
+                raw_keys[:16, :],
+                keys,
+                betas[block : block + 16],
+                weighted[:16, :],
+                rows[:16, :],
+                raw_queries[:16, :],
+                queries,
+                steps,
+                gate_panels[:16, :],
+                decay,
+                diagonal,
+                attention.slot(0),
+                product,
+                scores,
+                partial,
+                upper,
+                mask_zero,
+                strict_upper,
+                inverse,
+            ),
+            (SCALE, K),
+            (local * 16, N.max(0, valid - lane * 32)),
+        )
+        N.copy(
+            attention.slot(0),
+            Aqk[block : block + 16, block : block + 16],
+        )
+    invert_diagonal(
+        (
+            inverse,
+            coefficients,
+            coefficient_matrix,
+            plane_scratch,
+            inverse_rows,
+            weighted_inverse,
+            inverse_tree,
+            identities,
+        ),
+        (32,),
+    )
+    for local in N.unroll(2):
+        block = lane * 32 + local * 16
+        N.copy(
+            inverse[:, local * 16 : local * 16 + 16],
+            Ai32[block : block + 16, block : block + 16],
+        )
+        N.copy(
+            inverse[:, local * 16 : local * 16 + 16],
+            Diagonal[block : block + 16, block : block + 16],
+        )
+
+
 @N.prim_func(disjoint_external=True)
 def prefill_gram(
     Qp: N.Tensor((CHUNKS, H, BT, K), DTYPE),

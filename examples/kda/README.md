@@ -16,8 +16,11 @@ Prefill 发射三个 kernel：
 Prepare 的对角 Gram、跨块操作数、块逆和 W/U 分别复用
 [prefill_gram.py](prefill_gram.py)、[prefill_gram_cross.py](prefill_gram_cross.py)、
 [prefill_solve.py](prefill_solve.py) 和 [prefill_wu.py](prefill_wu.py) 中的 inline helper。
-非末块与末块在同一 Prepare kernel 的两个循环中执行；不同 kernel 间由 stream
-建立全设备阶段顺序，kernel 内只使用同一 group 的普通自动同步。
+[prefill_transform.py](prefill_transform.py) 的行变换同时用于 Prepare 的每 AIV 32 行
+和独立 transform 的整块 64 行；FP32 K 与 exp(G) 在该阶段复用，舍入边界保持。
+Prepare 入口集中声明存储、阶段别名和 Dataflow 排步；非末块与末块先后进入同一个
+任务域。不同 kernel 间由 stream 建立全设备阶段顺序，kernel 内使用同一 group
+的普通自动同步。
 
 完整输入、精度及同步合同见 [KDA prefill](../../docs/operators/kda-prefill.md)。
 构建与设备 oracle 统一由 `python -m benchmarks.check_examples --only kda-prefill`

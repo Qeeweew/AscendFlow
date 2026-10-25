@@ -412,3 +412,54 @@ def paired(A:N.Tensor((16,16),N.f16),B:N.Tensor((16,16),N.f16),
     release.attributes["participants"] = ArrayAttr([StringAttr(Actor.AIV0.value)])
     with pytest.raises(EventModelError, match="quorum|contribution"):
         check_structured_events(final, {"n": 5}, logical_reference=original)
+
+
+@pytest.mark.parametrize("whole_first", [True, False])
+def test_distinct_sid_publications_cover_a_later_single_peer_read(whole_first):
+    from ascendflow.diagnostics import CompileError
+    from ascendflow.passes.structured_sync import synchronize_structure
+
+    whole = "            N.copy(Work,whole)"
+    partial = "            N.copy(Work[:16,:],part)"
+    reads = (whole, partial) if whole_first else (partial, whole)
+    program = N.from_source(
+        """
+def roles(Work:N.Tensor((64,16),N.f32,access="write")):
+    with N.Kernel(1,kind="mixed"):
+        x=N.alloc_ub((32,16),N.f32)
+        whole=N.alloc_l1((64,16),N.f32)
+        part=N.alloc_l1((16,16),N.f32)
+        with N.Vector() as sid:
+            N.fill(x,1.0)
+            if sid==0:
+                N.copy(x[:16,:],Work[:16,:])
+                N.copy(x[:16,:],Work[16:32,:])
+            else:
+                N.copy(x,Work[32:64,:])
+        with N.Cube():
+"""
+        + "\n".join(reads),
+        disjoint_external=True,
+    )
+    if not whole_first:
+        # The future whole-tile acquire cannot establish completion before
+        # the earlier partial read. No inactive peer may be invented for it.
+        with pytest.raises(CompileError, match="two actual AIV quorum members"):
+            synchronize_structure(program)
+        return
+    plan = synchronize_structure(program)
+    checked = check_compiled_events(plan)
+    publications = [c for c in checked.natives if c.source is Engine.MTE3]
+    imports = [
+        c for c in checked.natives if c.occurrence.actor is Actor.AIC and c.source is Engine.MTE2
+    ]
+    assert len(publications) == 3 and len(imports) == 2
+    for writer in publications:
+        assert checked.happens_before(writer.end, imports[0].begin)
+        assert checked.happens_before(writer.end, imports[1].begin)
+    acquisitions = [
+        op
+        for op in plan.module.walk()
+        if isinstance(op, NotificationOp) and op.kind.data == SyncKind.CROSS_WAIT.value
+    ]
+    assert len(acquisitions) == 1

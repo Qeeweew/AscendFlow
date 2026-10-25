@@ -14,7 +14,8 @@
 | 私有 packet 的物理复用 | 局部完整写入、内部读绑定及实际 stage 顺序 | storage_packets / storage_word；局部完整 packet 的实际邻接 | access_order | 改 native 覆盖、slot、dispatch、packet 前提 |
 | 稀疏私有 cell 的完整 ownership round | 原始 body 接口、全部实际访问、相同激活域与本地派发 | cell_ownership；完整 writer/reader 轮次及被替代的原始 requirements | 通知生成、有限 bank、物化 | 改访问、guard、参与者、reader 集合或本地排步 |
 | 真实 Set/Wait 位置和覆盖 | 上述必要依赖 | notification binding；保留原始 ownership edge，可增加 coverage | 域、阶段序、credit | 改捕获/等待位置或 activation |
-| 存在域、配对、原式定义性 | 实际位置、祖先坐标、有序 guard | EventDomains；一次建立的 cases/windows | credit、资源和物化 | 改位置、坐标、guard、ordinal |
+| 实际激活、配对、原式定义性 | 实际位置、祖先坐标、有序 guard | EventDomains；已配对的真实发生域 | 完成覆盖、credit、资源和物化 | 改位置、坐标、guard、ordinal |
+| 复用所需精确成员及 FIRST/LAST | 保留的配对协议、真实激活及循环范围 | EventDomains.for_lifetimes；精确 cases/windows | handback、资源和物化 | 改激活、循环或生命周期政策 |
 | 无循环等待 | actor-local epoch、queue/controller 路由 | queue_order；每层 phase rank 和 child may-block cuts | credit 构造及输出合同 | 改排步、路由、参与者、Wait 位置 |
 | 消费先于复用 | 原始 ownership edge、完整邻接 lifetime，或明确 queue handback | cell_channels / notification_lifetimes；完整事件生命周期 | bank 分配 | 改 credit 成员、width、ordinal、原始 edge |
 | bank/ID/共享 | 已确定生命周期、配置和最终 drain 预留 | structured_resources；实际 ID 台账及新增共享关系 | 物化 | 改 namespace、ID、共享成员、width |
@@ -87,10 +88,19 @@ queue acquire。被选通知直接引用自身的原始 anchor binding，不把�
 配对域建立后，完成前缀还通过实际 capture/acquire 组合。capture 冻结其之前
 已阻塞本 queue/controller 的 Wait 所取得的来源；后来才执行的 Wait 不能回填。
 native issue 本身不产生完成事实。同锚点不同动作不因位置相等取得先后关系。
+同一实际 capture 在不同需求中可能采用不同逻辑代次。按 actor、源 queue、真实
+操作、插入位置和循环路径对应后，仅用已存在坐标间的精确常量平移实例化协议；
+sources、consumers、activation 和 metadata captures 同时替换。新实例仍引用
+原协议，排除该协议时同时排除全部代次。它不是新参数 case，也不产生硬件动作；
+每条原始 binding 在每个 case 中仍独立检查一次。非单位平移或无法对齐时不扩展。
 有限 capture/acquire 关系保留各自的原整数条件。查询只要求在原始需求的完整
-激活前提下必然取得目标事实，以实际 seed 和既有转移的 Horn 规则建立结论，
-不构造所有分支组合的可达函数。没有来源的环不能自证。证明保留真实支持规则
-及完整前提的 owned implication；规则本身不是已取得的事实。
+激活前提下必然取得目标事实。若实际 seed 和路径上全部条件已经是调用方的显式
+合取前提，直接沿该路径传播，并保留每个 capture/acquire 的独立条件。按路径长度
+归纳即可得到结论；没有 seed 的环不能自证，也不能拆开或条件选取尚未成立的一侧。
+其余相关整数及分支关系仍通过既有转移的 Horn 规则建立结论，不展开全部路径。
+单输入范围只是带条件的转发边，不另建状态；多输入合流与真实动作使用 Bool
+可达状态，避免引入无关整数。证明保留真实支持及完整前提的 owned implication；
+规则本身不是已取得的事实。
 层级位置索引将不同 sibling region 的内部获取合为共享出口范围；查询只进入
 与目标位置重合的 child，开放分支的激活仍保留在每个真实获取上。range 节点
 不成为新 gate，空 child 不提供完成事实。有限规则也不把这些共享范围当作已经
@@ -109,6 +119,13 @@ native issue 本身不产生完成事实。同锚点不同动作不因位置相�
 坐标、guard 和真实 capture/acquire 证明，不需要后续删边或支持固定集合。
 来源种子正向闭包与目标反向闭包之外的规则不参与该次证明；没有真实 seed
 的环不能建立完成事实。cell credit、消费、进展和资源许可随后在保留集合上建立。
+
+端点配对先直接比较真实激活，不要求该激活在所有祖先循环上具有周期或 dense
+rank；仅在配对本身需要参数特化时建立对应精确 case。完成覆盖之后，保留的非
+稳定 cell 协议才建立生命周期所需的成员窗口。已配对域的精确特化保持原等价
+事实，不重复证明未改变的配对。这个顺序不授予队列端口单 credit：转发端口仍须
+取得完整消费、重入和有限资源证明。无法构造精确窗口时，仅下述任意间隔消费
+规则可独立取得宽度 1；不能直接把空 rings 当作宽度 1。
 
 闭合私有轮次在已检查的同参与者、同读取队列及实际 stage/lexical 顺序下，一次
 选定最后 reader。退休直接消费原始 RAW binding：覆写许可放在真实 writer 前，
@@ -276,6 +293,16 @@ queue_order 检查。无法建立这个本地前提时明确报告支持边界�
 queue/controller 传递。相同前沿通过共享位置范围索引和不可变证明复用；新的
 开放边界仍在同一图中组合。完成和消费有不同的 origin 类型，完成覆盖不提供
 事件复用资格。布尔条件和证明用 DAG 保存，编码及遍历不依赖 Python 递归深度。
+
+单 publisher/consumer、同 actor 的本地通知另有稀疏单 credit 规则。共同 clock
+须在真实端点上为单位平移；publisher 不带 family，consumer 只允许已配对的
+单次选择坐标。任取两次实际发布，以首个不同共同 clock 分情况：之前的坐标
+相等，该坐标增加 `1+gap`（`gap>=0`），后代坐标独立。metadata captures 随坐标
+替换，不能假设两次读取的值相同。在新旧端点的完整 activation/ranges 下，
+证明旧 Wait 消费先于新 Set；查询排除该通知全部动作。真实 relay 仅取旧调用和
+相邻返回 horizon，目标间隔仍任意，必须由真实 queue 顺序跨越。各层证明覆盖
+全部严格后继及重入，故任意时刻最多一个未消费发布，虚拟 lane 恒为 0。该规则只在
+精确窗口表示不支持时使用，不改变已有合法环的首选政策；证明失败继续拒绝。
 
 环政策与规则能力分开：先用有限次数或 native 边界 handback 构造首选协议；
 该流自身无法在容量内构造时才直接用 queue-composition。已有合法首选环的

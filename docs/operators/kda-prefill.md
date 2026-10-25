@@ -36,9 +36,14 @@ Prepare 内的一个 chunk/head 完整归属一个 mixed group，因此不需要
 | scan | 以 sequence/head 分配任务；chunk 间两阶段预取/递推，历史投影、residual、状态增量和 FP32 carry 更新保持递推顺序 |
 | output | 以 chunk/head 并行，双缓冲导入、Cube 计算两项输出乘法、Vector 合并及有效行写回 |
 
-Prepare 在同一 kernel 内分别循环处理非末块与每序列末块。非末块使用 FP32
+Prepare 在同一任务域中先处理非末块，再处理每序列末块。非末块使用 FP32
 下三角矩阵乘计算 Gate 前缀；末块保留 FP32 Vector 顺序累加并清零 padding，
 随后用单位矩阵乘发布完整前缀。末块即使有 64 个有效 token，也保持该求和次序。
+末块按 16 行预取 Gate 到既有 UB，再逐行累加；不足一片时只搬入有效行，
+其余补零，仍执行原有的 64 次顺序 FP32 加法。
+Gate 的搬运和发布先于 Q/K/V 搬运与归一化，使 Cube 前缀能与两者重叠。
+归一化按每个 AIV 拥有的连续 32 行执行；跨块 Gram 的 Q/K 读取也限制在同一
+32 行归属内，因此提前 Gate 不依赖另一个 AIV 尚未完成的归一化。
 FP32 carry、BF16 snapshot 和矩阵乘输入精度分别遵守上述数值合同。
 
 所有阶段以显式 slots/at 表达时间缓冲，helper 接收当前输入 Tile 或实际 payload
@@ -46,13 +51,53 @@ view。跨块 Gram、块逆和 W/U 的同队列操作数导入使用 CopyGroup �
 每份 L1/L0 的 release 仍取自己的最后 reader。融合 Prepare 显式选择原有的
 固定 workspace 面，不轮换到额外面；full/tail 继续共享原来的 L1、L0 和私有 UB。
 Q/Key 归一化、前缀、Gram 与变换之间的 phase alias 保留实际 root，既不增加
-scratch，也不按每阶段重新分配存储。全部原生模板和各 bank 字节容量保持。
+重复的阶段存储，也不扩大各 bank 容量。归一化复用随后构造 Gram 的 FP32
+工作面；延迟 W 发布使用另一工作面，不能让仍活跃的 MTE3 reader 阻塞下一任务
+的归一化。Gram 的工作面在真实最后 MTE3 reader 退休后才可覆写。
 
 块逆使用 `[[D0,0],[-D1*A10*D0,D1]]` 合并 16→32→64，乘法输入保持 FP32。
-对角逆的四个矩阵沿列合并，使乘法及加法树填满 64 个 FP32 lane；行依赖仍在核内顺序执行。
+16-token 对角块是本示例的分块政策；32 来自两个相邻对角块合并，64 是 chunk 大小。
+两个 AIV 各计算两个对角块，沿列打包为本 peer 的 `[16,32]` 块逆；只计算实际拥有的
+32 列，保留每列原有 FP32 递推及 16→8→4→2→1 加法树。
+跨块部分恰好是以下三个矩形，8/16 行的发布切片分别来自两个 AIV 平分其输出行。
+
+| 合并层级 | chunk 行 | chunk 列 | 每个 AIV 的行数 |
+|---|---|---|---:|
+| 16→32，前半块 | 16:32 | 0:16 | 8 |
+| 16→32，后半块 | 48:64 | 32:48 | 8 |
+| 32→64 | 32:64 | 0:32 | 16 |
+
 跨块 Gram 采用 16/32-token 分层矩形；四次 FP32 GEMM 的结果占用同一
 `[32,96]` L0C 的不重叠列区间，经一次 FIX 写入 `GramProducts`。
+前两个 16 列区间各上下堆叠 K/Q 分数，后两个 32 列区间分别存放大块 K/Q 分数。
+该物理打包不引入第四种数学分块。独立 `prefill_gram_cross` 保留各自紧凑的
+small/large 结果平面和四次 FIX，Vector 消费紧凑的行分片；融合阶段采用一个
+结果平面，以已有的双 AIV 前缀交接获取完整结果。独立阶段保留 Negative→Aqk
+发布顺序；融合阶段仍要求 Aqk→Negative，使后续获取涵盖两个 peer 的 Aqk 写入。
+对角 Gram 和跨块 Gram 的操作数只依赖同一份已发布的输入与 Gate 前缀，
+因此先发布跨块操作数，让 Cube 的跨块乘法与 Vector 的对角计算重叠。
+GramLeft 的 0:32 行由 AIV0 发布，32:128 行由 AIV1 发布；GramRight 的
+0:16 和 32:64 行由 AIV0 发布，16:32 行由 AIV1 发布。每个 AIV 最后发布自己的
+GramLeft。Cube 先整体导入 GramLeft，取得两个真实发布者的完整 MTE3 前缀，
+再导入 GramRight 的三片。后续单个 AIV 所写分片的读取消费此前完整获取，
+不新增单侧通知。Diagonal、Negative 只发布实际使用的块，均在读取前完整覆写；
+Aqk、Ai32 保留整面补零。恒定三角 mask 在 kernel 入口构造一次。
+
+块逆合并先导入最后发布的 32×32 Negative，将其保存在既有 B 侧 L1 的
+32:64 行；两次 16×16 合并只使用 0:16 行，因而不会覆盖它。
+所有非转置 FP32 B 的物理 leading M 保持 64，避免因临时存放位置改变而反复
+切换 fmatrix 配置。该导入仍取得两个 AIV 的完整发布前缀。
 中间 GM workspace 按 group 分配，并由实际最后 reader 约束回收。
+transform 的两个 AIV 共读末行时，读取已经发布的当前 chunk 的 Gp 输出；
+不用下一任务即将复用的 LocalGp 半区承载该跨 peer 读取。末块的末行仍来自
+各自 UB 中保留的 FP32 顺序前缀，保持原求和次序。
+transform 在已有 UB 中保留当前面板的 FP32 K 与 `exp(Gp)`，分别供两项 K
+变换和 QG 使用；每项乘法及 BF16 舍入的顺序保持，避免重复搬入、转换和 exp。
+该行变换由同一个 inline helper 表达：Prepare 使用每 AIV 32 行，独立 transform
+使用 64 行。独立入口保留按 valid-1 读取的实际末行，不从尾块 padding 推导末值。
+Right、KG、QG 的形成提前到块逆获取之前，与 Cube 合并块逆重叠。
+A16 仍在取得块逆的完整可见性之后读取 Aqk；每个 AIV 的两个连续 16 行面板
+合为一次 32 行导入、BF16 转换和发布，复用既有 32 行缓冲。
 两个 AIV 共用 body，通过 runtime SID 区分地址与角色；分析保留各自私有 UB
 及完整 quorum 贡献，不把同组不同 AIV 的源码顺序当作完成关系。
 
@@ -71,6 +116,8 @@ scan 中每个 chunk 保存更新前的 BF16 snapshot，同时用 FP32 历史状
 residual 舍入为 BF16 后参与状态增量。carry 在 FP32 中完成衰减与加法，
 每个 sequence/head 必须按 chunk 顺序执行。独立的 output 阶段读取各 chunk 的
 snapshot、residual 等数据，按 chunk 分配负载，不重新计算递推状态。
+W32 的两个 K=64 列片独立搬入双槽 L1，与 KG 共同 ready；每片存储分别在
+自己的旧 reader 退休后即可复用，投影保持原有 FP32 分段累加顺序。
 
 output 的两项 FP32 乘积在 L0C 中占据同一 `[BT,2*K]` 平面的两个列区间，
 分别保留原有初始化和累加顺序。一次 FIX 将两项结果发布到

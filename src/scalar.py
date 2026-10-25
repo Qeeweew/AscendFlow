@@ -374,7 +374,10 @@ def from_ssa(value, *, coordinates=None, memo=None):
     Unmodelled operations retain their SSA identity and operand captures. This
     is not a range, invariance, or source-definedness certificate.
     """
+    from xdsl.dialects.builtin import IndexType, i1
+
     from .dialects.source import SizeOp
+    from .indexing import pure_scalar_selection
 
     memo = {} if memo is None else memo
 
@@ -391,15 +394,29 @@ def from_ssa(value, *, coordinates=None, memo=None):
             result = literal(value.owner.value.value.data)
         else:
             op = value.owner
-            operands = tuple(visit(v) for v in getattr(op, "operands", ()))
-            if (
-                type(op) in ARITHMETIC
-                and 1 + sum(v.weight for v in operands) <= 4096
-                and max(v.depth for v in operands) < 128
+            if (value.type == i1 or isinstance(value.type, IndexType)) and pure_scalar_selection(
+                op
             ):
-                result = expression(ARITHMETIC[type(op)], *operands)
+                operands = (
+                    visit(op.cond),
+                    *(visit(region.block.last_op.arguments[value.index]) for region in op.regions),
+                )
+                kind = SymbolKind.PREDICATE if value.type == i1 else SymbolKind.SELECTION
+                result = Expr("argument", (Symbol("$selection", kind, value, operands),))
             else:
-                result = Expr("argument", (Symbol("$ssa", SymbolKind.SSA, value, operands),))
+                operands = tuple(visit(v) for v in getattr(op, "operands", ()))
+                if isinstance(op, arith.CmpiOp) and op.predicate.value.data < 6:
+                    result = Expr(
+                        "argument", (Symbol("$predicate", SymbolKind.PREDICATE, value, operands),)
+                    )
+                elif (
+                    type(op) in ARITHMETIC
+                    and 1 + sum(v.weight for v in operands) <= 4096
+                    and max(v.depth for v in operands) < 128
+                ):
+                    result = expression(ARITHMETIC[type(op)], *operands)
+                else:
+                    result = Expr("argument", (Symbol("$ssa", SymbolKind.SSA, value, operands),))
         memo[value] = result
         return result
 

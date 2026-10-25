@@ -8,6 +8,188 @@ from ascendflow import language as N
 
 
 @N.inline
+def gram_factors(Gp, anchor, factors, start, row, extent, right):
+    N.copy(Gp[start, :], anchor)
+    N.mul(anchor, -1.0, out=anchor)
+    N.copy(Gp[row : row + extent, :], factors[:extent, :])
+    N.add(factors[:extent, :], anchor[None, :], out=factors[:extent, :])
+    if right:
+        N.mul(factors[:extent, :], -1.0, out=factors[:extent, :])
+    return N.exp(factors[:extent, :], out=factors[:extent, :])
+
+
+@N.inline
+def right_gram_rows(Gp, Kp, Right, anchor, factors, raw, work, start, row, extent):
+    decay = gram_factors(Gp, anchor, factors, start, row, extent, True)
+    N.copy(Kp[row : row + extent, :], raw[:extent, :])
+    keys = N.cast(raw[:extent, :], out=work[:extent, :])
+    keys = N.mul(keys, decay, out=work[:extent, :])
+    N.copy(keys, Right)
+
+
+@N.inline
+def left_gram_rows(
+    Gp, Kp, Qp, LeftK, LeftQ, anchor, factors, raw, keys, queries, SCALE, start, extent
+):
+    decay = gram_factors(Gp, anchor, factors, start, start, extent, False)
+    N.copy(Kp[start : start + extent, :], raw[:extent, :])
+    key_values = N.cast(raw[:extent, :], out=keys[:extent, :])
+    key_values = N.mul(key_values, decay, out=keys[:extent, :])
+    N.copy(key_values, LeftK)
+    N.copy(Qp[start : start + extent, :], raw[:extent, :])
+    query_values = N.cast(raw[:extent, :], out=queries[:extent, :])
+    query_values = N.mul(query_values, decay, out=queries[:extent, :])
+    query_values = N.mul(query_values, SCALE, out=queries[:extent, :])
+    N.copy(query_values, LeftQ)
+
+
+@N.inline
+def prepare_owned_gram(Gp, Kp, Qp, Left, Right, anchor, factors, raw, keys, queries, SCALE, lane):
+    # Every K/Q input below belongs to the executing peer's normalized rows.
+    # Each peer publishes its final Left rows last. One Cube import of the
+    # complete Left slab then captures both prefixes, including all Right.
+    if lane == 0:
+        right_gram_rows(Gp, Kp, Right[32:64, :], anchor, factors, raw, keys, 32, 0, 32)
+        right_gram_rows(Gp, Kp, Right[:16, :], anchor, factors, raw, keys, 16, 0, 16)
+        left_gram_rows(
+            Gp,
+            Kp,
+            Qp,
+            Left[:16, :],
+            Left[16:32, :],
+            anchor,
+            factors,
+            raw,
+            keys,
+            queries,
+            SCALE,
+            16,
+            16,
+        )
+    else:
+        right_gram_rows(Gp, Kp, Right[16:32, :], anchor, factors, raw, keys, 48, 32, 16)
+        left_gram_rows(
+            Gp,
+            Kp,
+            Qp,
+            Left[32:48, :],
+            Left[48:64, :],
+            anchor,
+            factors,
+            raw,
+            keys,
+            queries,
+            SCALE,
+            48,
+            16,
+        )
+        left_gram_rows(
+            Gp,
+            Kp,
+            Qp,
+            Left[64:96, :],
+            Left[96:128, :],
+            anchor,
+            factors,
+            raw,
+            keys,
+            queries,
+            SCALE,
+            32,
+            32,
+        )
+
+
+@N.inline
+def packed_gram_products(GramProducts, a1, b1s, b1l, a0, b0s, b0l, c0):
+    # Four independent GEMMs occupy disjoint columns of one accumulator.
+    # Publish their complete word with one FIX, retaining FP32 arithmetic.
+    for panel in N.unroll(2):
+        aa = N.copy(a1[panel * 32 : panel * 32 + 32, :], a0)
+        bb = N.copy(b1s[panel, :, :], b0s, transpose=True)
+        N.matmul(aa, bb, accum=c0[:, panel * 16 : panel * 16 + 16], initialize=True)
+    bb = N.copy(b1l, b0l, transpose=True)
+    for part in N.unroll(2):
+        aa = N.copy(a1[64 + part * 32 : 96 + part * 32, :], a0)
+        N.matmul(aa, bb, accum=c0[:, 32 + part * 32 : 64 + part * 32], initialize=True)
+    N.copy(c0, GramProducts)
+
+
+@N.inline
+def publish_gram_block(
+    key_source,
+    query_source,
+    Bp,
+    Negative,
+    Aqk,
+    scores,
+    betas,
+    rows,
+    start,
+    col,
+    extent,
+    valid,
+    lane,
+):
+    half = extent // 2
+    row = start + lane * half
+    # Aqk must precede Negative: the solve -> transform handoff then carries
+    # both peers' Aqk writes, including rows owned by the other peer later.
+    N.copy(query_source, scores)
+    if start + extent > valid:
+        N.fill(scores, 0.0, mask=N.arange(half)[:, None] + row >= valid)
+    N.copy(scores, Aqk[row : row + half, col : col + extent])
+    with N.CopyGroup(name="gram_key_beta"):
+        N.copy(key_source, scores)
+        N.copy(Bp[row : row + half], betas[:half])
+    if start + extent > valid:
+        N.fill(scores, 0.0, mask=N.arange(half)[:, None] + row >= valid)
+    N.mul(scores, betas[:half, None], out=scores, scratch=rows[:half, :])
+    N.mul(scores, -1.0, out=scores)
+    N.copy(scores, Negative[row : row + half, col : col + extent])
+
+
+@N.inline
+def store_packed_gram(
+    GramProducts, Bp, Negative, Aqk, scores32, scores16, betas, rows, valid, lane
+):
+    # First merge level: rows 16:32 x cols 0:16 and rows 48:64 x cols 32:48.
+    # Each peer publishes eight rows of each 16x16 block.
+    for pair in N.unroll(2):
+        publish_gram_block(
+            key_source=GramProducts[lane * 8 : lane * 8 + 8, pair * 16 : pair * 16 + 16],
+            query_source=GramProducts[16 + lane * 8 : 24 + lane * 8, pair * 16 : pair * 16 + 16],
+            Bp=Bp,
+            Negative=Negative,
+            Aqk=Aqk,
+            scores=scores16[:8, :],
+            betas=betas,
+            rows=rows,
+            start=16 + pair * 32,
+            col=pair * 32,
+            extent=16,
+            valid=valid,
+            lane=lane,
+        )
+    # Second merge level: rows 32:64 x cols 0:32. Each peer owns sixteen rows.
+    publish_gram_block(
+        key_source=GramProducts[lane * 16 : lane * 16 + 16, 32:64],
+        query_source=GramProducts[lane * 16 : lane * 16 + 16, 64:96],
+        Bp=Bp,
+        Negative=Negative,
+        Aqk=Aqk,
+        scores=scores32,
+        betas=betas,
+        rows=rows,
+        start=32,
+        col=0,
+        extent=32,
+        valid=valid,
+        lane=lane,
+    )
+
+
+@N.inline
 def prepare_one_gram(inputs, buffers, geometry, coordinates):
     Gp, Kp, GramLeft, Qp, GramRight = inputs
     anchor, gates, factor, raw, k, q, right_factor, right = buffers

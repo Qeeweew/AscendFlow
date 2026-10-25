@@ -46,10 +46,11 @@ compile / Compilation
       bind_notifications                 # 先绑定原始义务，再选择/合并通知；保留 ownership edges
       EventDomains                       # 新 guard 定义性、复用实际 SSA、坐标往返、配对
       select_completion_frontiers        # 先接纳真实支持前沿，再发布覆盖；不按静态位置猜动态先后
+      EventDomains.for_lifetimes         # 仅给保留且需要 rank/FIRST/LAST 的通知建立精确窗口
       bind_cell_credits                  # 稀疏私有轮次的端点与本地发射前提
       establish_queue_order              # 逐层 physical-step / phase 准入
       construct_cell_channels            # 物理 lifetime credit 归纳
-      HandbackRule                       # 无稳定 cell 的有限/ring 生命周期
+      HandbackRule                       # 有限/ring 或逐层任意间隔证明的本地单 credit
     plan_event_resources                # 冻结首选/有限缩环、虚拟动作、复用及整组 FIFO
     allocate_structured_events          # 联合选择已证有限选项和编号，不查询域或 handback
     materialize_notifications
@@ -84,9 +85,9 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/local_schedule.py`、`structured_dispatch.py` | 按迭代域和 actor family 建立本地 stage 顺序与 horizon；派发消费该顺序并绑定 native、控制入口/出口的位置 |
 | `passes/notification_binding.py`、`analysis/structured_protocols.py` | 原始需求先拥有真实 source/consumer 和可选共同 ready，随后选择机制、复用已有 capture/acquire、建立完整 quorum；合并不替换原始 binding，不将新增 coverage 当作 ownership |
 | `analysis/acquired_prefixes.py` | 按真实激活类与层级发射 word 查询已有 capture/acquire pair；保留每个 participant 的 lexical 分段与原最早匹配，不扫描同 word 的全部获取历史，不提供事件消费资格 |
-| `analysis/position_words.py`、`protocol_transfers.py`、`completion_prefixes.py` | 共用层级位置和真实 Set/Wait 快照；候选图提出支持前沿，先接纳全部实际支持再发布覆盖，已覆盖候选不能作为支持；来源正向与目标反向闭包裁剪，复用完整前提下的实际反例，只为剩余相关顶点构造和编码规则；保留实际支持和独立 acquire 结论，完成和消费的 origin 分别保持 |
+| `analysis/position_words.py`、`protocol_transfers.py`、`completion_prefixes.py` | 共用层级位置和真实 Set/Wait 快照；候选图提出支持前沿，先接纳全部实际支持再发布覆盖；已有显式前提先沿实际路径传播，相关整数/分支关系再求解；单输入范围内联，合流与真实动作保留 Bool 状态；保留实际支持和独立 acquire 结论，完成和消费的 origin 分别保持 |
 | `passes/generate_notifications.py` | 唯一通知生成入口，组合规则并输出完整生命周期；保留同一输入 owner 的消费分析交给资源规划，完成选择的临时图不向下游保留 |
-| `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 配对及按需的精确成员、FIRST/LAST、非空投影；稳定 cell 不要求 dense rank |
+| `analysis/event_domains.py`、`event_windows.py`、`event_families.py` | 先按真实激活配对，完成覆盖后才为保留通知建立精确成员、FIRST/LAST、非空投影；窗口表示不支持时保留原诊断，稀疏本地消费规则另行证明，未取得生命周期不得物化 |
 | `analysis/queue_order.py` | 每层 actor clock-origin 差约束、按实际路由/有限时间类建立的稀疏阻塞区间索引、零距离 DAG 与正距离前进；child 仅导出 open ports 和 may-block cuts |
 | `analysis/cell_channels.py` | 直接消费原始 anchor binding 的物理 ownership 集合和 role；按实际 Set/Wait 位置归集激活，仅检查共同位置的重叠，最终成员一次冻结 |
 | `analysis/cell_ownership.py` | 从原始 body/全部 effects 建立闭合私有轮次，一次选定真实最后 reader；消费原始 binding 形成 acquire/return，不重建端点或临时通知，继续校验本地发射前提 |

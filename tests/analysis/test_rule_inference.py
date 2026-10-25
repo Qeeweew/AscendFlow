@@ -2,14 +2,42 @@
 
 import pytest
 
-from ascendflow.analysis.smt import IntegerQueryService, all_of, any_of, negate
+from ascendflow.analysis.smt import Boolean, IntegerQueryService, all_of, any_of, conjuncts, negate
 from ascendflow.analysis.structured_schedule import Comparison
 from ascendflow.diagnostics import CompileError
 from ascendflow.scalar import Expr, literal
+from ascendflow.symbols import Symbol, SymbolKind
 
 
 def proposition(name):
-    return Comparison(Expr("argument", (name,)), "==", literal(0))
+    return Boolean("atom", (Symbol(name, SymbolKind.SSA), True))
+
+
+def test_boolean_atoms_keep_identity_polarity_and_do_not_become_integers():
+    left, right = (
+        Boolean("atom", (Symbol("same", SymbolKind.SSA, object()), True)) for _ in range(2)
+    )
+    queries = IntegerQueryService({})
+    assert queries.implies(left, (left,)).proved
+    assert not queries.implies(left, (right,)).proved
+    assert queries.satisfies((left, negate(right))).satisfied
+    assert queries.satisfies((left, negate(left))).impossible
+    assert negate(negate(left)) == left
+    assert queries._integer.cache_info().currsize == 0
+    with pytest.raises(CompileError, match="polarity"):
+        Boolean("atom", (left.operands[0], 1))
+
+
+def test_explicit_conjuncts_preserve_disjunctions_and_visit_a_shared_dag_once():
+    p, q = proposition("p"), proposition("q")
+    condition = True
+    for _ in range(128):
+        condition = all_of(all_of(condition, p), all_of(condition, q))
+    assert conjuncts((condition,)) == frozenset((p, q))
+    queries = IntegerQueryService({})
+    assert queries.implies(condition, (p, q)).proved
+    assert queries.statistics.solver_checks == 0
+    assert not queries.implies(p, (any_of(p, q),)).proved
 
 
 def test_supported_implication_is_owned_without_leaking_temporary_axioms():
@@ -117,3 +145,21 @@ def test_complete_premises_change_without_reencoding_or_strengthening_the_relati
             assert context.prove(q).answer.proved == expected
     assert queries.statistics.rule_encodings == 2
     assert queries.statistics.rule_assertions == 6
+
+
+def test_failed_rule_query_reuses_only_a_model_of_the_complete_input_premises():
+    x = Expr("argument", ("x",))
+    active = Comparison(x, "==", literal(1))
+    lower = Comparison(x, ">=", literal(1))
+    q, unseen = proposition("q"), proposition("unseen")
+    queries = IntegerQueryService({})
+    with queries.rule_system((any_of(negate(active), q),)).assuming((lower,)) as context:
+        assert context.prove(q).answer.refuted
+    evaluate = queries.witness_evaluation((lower,))
+    assert evaluate is not None
+    assert evaluate(active) is False
+    assert evaluate(q) is False
+    assert evaluate(unseen) is None
+    assert queries.witness_evaluation((active,)) is None
+    # The model is a counterexample, never a permanent rule or a new premise.
+    assert not queries.implies(q, (lower,)).proved

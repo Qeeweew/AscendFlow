@@ -154,3 +154,37 @@ def test_unknown_finite_choice_never_authorizes_an_allocation(monkeypatch):
     with pytest.raises(CompileError, match="unknown.*no allocation permitted") as error:
         smt.finite_model((("pool", True),))
     assert error.value.kind is ErrorKind.ANALYSIS_LIMIT
+
+
+@pytest.mark.parametrize("widths", [(2, 1, 1), (2, 2, 1)])
+def test_time_only_counter_lanes_match_independent_number_sets(widths):
+    from ascendflow.analysis.event_frontier_contracts import CreditSeparation
+
+    pairs = tuple(combinations(range(3), 2))
+    palette = (0, 3, 9)
+    for mask in range(1 << len(pairs)):
+        separated = {pair for bit, pair in enumerate(pairs) if mask & (1 << bit)}
+        rows = []
+        for n in range(3):
+            allowed = sum(1 << m for m in range(3) if (min(n, m), max(n, m)) in separated)
+            rows.append(((allowed, CreditSeparation((), 1 << n, allowed)),) if allowed else ())
+        numeric = problem(set(), size=3)
+        numeric.demands = tuple(EventDemand((), width, (), backlog=width) for width in widths)
+        numeric.counter_reuses = FrozenEventRelations(rows)
+        numeric.id_pools = EventIdPools(cross=palette)
+
+        def legal(values, separated=separated):
+            return all(
+                (a, b) in separated or set(values[a]).isdisjoint(values[b]) for a, b in pairs
+            )
+
+        expected = any(
+            legal(values) for values in product(*(tuple(combinations(palette, w)) for w in widths))
+        )
+        try:
+            ids, _ = color_event_resources(numeric)
+        except NoEventAssignment:
+            assert not expected
+        else:
+            assert expected and legal(ids)
+            assert all(len(set(lanes)) == width for lanes, width in zip(ids, widths, strict=True))

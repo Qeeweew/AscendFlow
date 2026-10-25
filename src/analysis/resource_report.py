@@ -162,6 +162,9 @@ def event_resource_report(plan):
             consumption_predicates.append(record)
             if type(item) is bool:
                 record["constant"] = item
+            elif isinstance(item, Boolean) and item.kind == "atom":
+                symbol, positive = item.operands
+                record.update(kind="atom", symbol=symbol.name, positive=positive)
             elif isinstance(item, Boolean):
                 record.update(kind=item.kind, operands=[])
                 pending.extend(reversed(item.operands))

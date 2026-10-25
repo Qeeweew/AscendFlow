@@ -187,7 +187,7 @@ class _Builder:
                 )
                 for test in frame.comparisons
             )
-        return tuple(tests)
+        return tuple(self.memory.control.participant_comparisons(tests, point.participant))
 
     def _entry_available(self, operation, points):
         """All original activation/selection inputs exist at this loop entry.
@@ -346,7 +346,29 @@ class _Builder:
             # queue-prefix forwarding edges, like retirement, follow the
             # physical word established below, not the source packet order.
             self._connect(cell, before, after, scope, retirement=retirement, raw=raw)
-            result[cell] = before.join(after)
+            joined = before.join(after)
+            if (
+                not joined.readers_follow_writes
+                and raw
+                and before.tail_writes
+                and not after.first_writes
+                and any(
+                    isinstance(point.endpoint, AccessEndpoint)
+                    and point.endpoint.frame is self.memory.control.frames[scope]
+                    and any(
+                        effect.participant is point.participant
+                        and any(a.mode.reads and a.read_condition is None for a in effect.accesses)
+                        for effect in self.accesses.effects.get(point.operation, {}).get(cell, ())
+                    )
+                    for point in after.head_reads
+                )
+            ):
+                # The RAWs just constructed acquire every pending writer at
+                # this unconditional native read. Its future WAR retirement
+                # therefore also orders those writes, even if a preceding
+                # branch had to export conservative queue-prefix ports.
+                joined = replace(joined, readers_follow_writes=True)
+            result[cell] = joined
         return result
 
     def _native(self, operation):
@@ -764,8 +786,8 @@ class _Builder:
             # on both paths instead of hoisting that predicate to the publisher.
             frame = self.memory.control.frames[operation]
             stable = self.entry_symbols | {loop.ordinal.args[0] for loop in frame.loops()}
-            (test,) = self.memory.control.branches[operation, 0]
-            if not arguments(test.lhs) | arguments(test.rhs) <= stable:
+            tests = self.memory.control.branches[operation, 0]
+            if not all(arguments(test.lhs) | arguments(test.rhs) <= stable for test in tests):
                 premises = (
                     tuple(
                         Comparison(value, predicate, bound)
@@ -775,8 +797,8 @@ class _Builder:
                     + frame.predicates()
                 )
                 if not (
-                    self.arithmetic.prove(test, premises)
-                    or self.arithmetic.prove(opposite(test), premises)
+                    all(self.arithmetic.prove(test, premises) for test in tests)
+                    or any(self.arithmetic.prove(opposite(test), premises) for test in tests)
                 ):
                     cells.update(
                         self._envelope(

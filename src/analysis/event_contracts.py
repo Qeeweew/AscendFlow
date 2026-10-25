@@ -268,6 +268,7 @@ class ResourceWork:
     transfer_order_bands: int = 0
     transfer_range_vertices: int = 0
     completion_queries: int = 0
+    completion_forward_cuts: int = 0
     completion_countermodels: int = 0
     completion_rule_instances: int = 0
     completion_conclusions: int = 0
@@ -275,6 +276,7 @@ class ResourceWork:
     transfer_capture_words: int = 0
     transfer_capture_bands: int = 0
     consumption_queries: int = 0
+    consumption_forward_cuts: int = 0
     consumption_countermodels: int = 0
     consumption_rule_instances: int = 0
     consumption_conclusions: int = 0

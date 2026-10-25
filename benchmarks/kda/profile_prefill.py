@@ -183,6 +183,8 @@ def main():
             "ArithmeticUtilization",
             "L2Cache",
             "Memory",
+            "MemoryUB",
+            "ResourceConflictRatio",
             "Default",
         ),
         default="BasicInfo",

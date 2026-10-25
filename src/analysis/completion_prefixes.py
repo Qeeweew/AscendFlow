@@ -69,13 +69,13 @@ def select_completion_frontiers(domains):
         if item.notification is not None:
             bindings.setdefault(item.notification, []).append(item.binding)
 
-    def cover(original, episodes, excluded):
+    def cover(original, cases, excluded):
         obligations = []
-        for episode in episodes:
+        for case in cases:
             pairs = {}
             for binding in original:
-                source = domains._instance(binding.completion_source, {}, case=episode.case)
-                consumer = domains._instance(binding.consumer, {}, case=episode.case)
+                source = domains._instance(binding.completion_source, {}, case=case)
+                consumer = domains._instance(binding.consumer, {}, case=case)
                 pairs.setdefault((source, consumer), []).append(binding)
             for (source, consumer), owners in pairs.items():
                 # Each demand keeps its own activation. Unrelated writers'
@@ -101,13 +101,11 @@ def select_completion_frontiers(domains):
                 if not answer.proved:
                     return None
                 obligations.append(
-                    CompletionObligation(
-                        tuple(owners), source, consumer, episode.case, proof, answer
-                    )
+                    CompletionObligation(tuple(owners), source, consumer, case, proof, answer)
                 )
         return CompletionCoverage(
             domains.dispatch,
-            tuple(item.case for item in episodes),
+            cases,
             tuple(obligations),
         )
 
@@ -121,23 +119,23 @@ def select_completion_frontiers(domains):
         if not original or any(item is None for item in original):
             retained.add(notification)
             continue
-        episodes = graph.episodes.get(notification, ())
+        cases = tuple(dict.fromkeys(e.case for e in graph.episodes.get(notification, ())))
         expected = (
             1
             if notification.mechanism is NotificationKind.PIPE_FENCE
             else sum(domains.active[notification, case] for case in domains.cases[notification])
         )
-        if not episodes or len(episodes) != expected:
+        if not cases or len(cases) != expected:
             retained.add(notification)
             continue
         excluded = frozenset((*covered, notification))
-        coverage = cover(original, episodes, excluded)
+        coverage = cover(original, cases, excluded)
         if coverage is not None:
             support = frozenset(coverage.supports())
             require(not support & excluded, "completion frontier depends on an absent protocol")
             if support - retained:
                 unavailable = frozenset(n for n in domains.notifications if n not in retained)
-                existing = cover(original, episodes, unavailable)
+                existing = cover(original, cases, unavailable)
                 if existing is not None:
                     coverage = existing
                     support = frozenset(coverage.supports())

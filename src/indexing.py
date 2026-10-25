@@ -648,6 +648,19 @@ def merge_scalar_bounds(values, branch_domains, outer_domains, facts):
     return low, high
 
 
+def pure_scalar_selection(operation):
+    from xdsl.dialects import arith, scf
+
+    from .dialects.source import PredicateOp
+    from .target.scalars import INTEGER_OPERATIONS
+
+    return isinstance(operation, scf.IfOp) and all(
+        type(child) in INTEGER_OPERATIONS
+        or isinstance(child, (scf.IfOp, scf.YieldOp, arith.ConstantOp, arith.CmpiOp, PredicateOp))
+        for child in operation.walk()
+    )
+
+
 def branch_comparison(condition, decode, branch):
     """Decode a signed integer branch in its actual SSA environment.
 
@@ -656,10 +669,24 @@ def branch_comparison(condition, decode, branch):
     selected region, never to the condition's own evaluation or a merge.
     """
     from xdsl.dialects import arith
+    from xdsl.dialects.builtin import i1
 
     from .analysis.structured_schedule import Comparison
 
     compare = condition.owner
+    if condition.type == i1 and pure_scalar_selection(compare):
+        values = tuple(
+            region.block.last_op.arguments[condition.index] for region in compare.regions
+        )
+        for selected in (0, 1):
+            other = values[1 - selected].owner
+            if isinstance(other, arith.ConstantOp) and bool(other.value.value.data) != (not branch):
+                # False OR and true AND each have one selected path. Keep
+                # its original short-circuit order, including partial integer
+                # expressions. Effectful selections remain opaque.
+                return branch_comparison(compare.cond, decode, selected) + branch_comparison(
+                    values[selected], decode, branch
+                )
     predicates = ("==", "!=", "<", "<=", ">", ">=")
     if not isinstance(compare, arith.CmpiOp) or compare.predicate.value.data >= len(predicates):
         return (Comparison(decode(condition), "==" if branch else "!=", literal(0)),)

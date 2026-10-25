@@ -213,3 +213,46 @@ def test_source_contract_decorator_cannot_be_silently_ignored():
     """)
     with pytest.raises(FrontendError, match="conflicts with the explicit input contract"):
         definition.to_ir()
+
+
+def test_pure_scalar_selection_rebinds_per_stage_without_evaluating_inactive_division():
+    from ascendflow.analysis.structured_memory import collect_native_memory
+    from tests.models.structured_events import check_structured_events
+
+    program = N.from_source(
+        """
+def selected(X:N.Tensor((n,64),N.f32),Y:N.Tensor((n,64),N.f32,access="write"),n:N.i64):
+    with N.Kernel():
+        x=N.alloc_ub((64,),slots=2)
+        for t in N.Pipelined(n):
+            row=t//(t-1) if t>1 else 0
+            with N.Stage(0):
+                value=N.copy(X[row,:],x.at(t))
+            with N.Stage(1):
+                N.copy(value,Y[t,:])
+""",
+        disjoint_external=True,
+    )
+    artifact = compile(program)
+    original = collect_native_memory(parse(artifact.before_ir))
+    final = collect_native_memory(artifact.plan)
+    for count in (0, 1, 2, 3, 7):
+        check_structured_events(final, {"n": count}, logical_reference=original, invocations=2)
+
+
+def test_effectful_scalar_selection_before_stages_cannot_clone_metadata_loads():
+    from ascendflow.diagnostics import CompileError
+
+    program = N.from_source(
+        """
+def selected(X:N.Tensor((2,64),N.f32),I:N.Tensor((2,),N.i64),n:N.i64):
+    with N.Kernel():
+        x=N.alloc_ub((64,))
+        for t in N.Pipelined(n):
+            row=N.load_index(I[:1]) if t>1 else 0
+            with N.Stage(0):
+                N.copy(X[row,:],x)
+"""
+    )
+    with pytest.raises(CompileError, match="asynchronous values cannot be cloned"):
+        compile(program)

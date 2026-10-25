@@ -27,12 +27,14 @@ from ..indexing import (
     branch_comparison,
     domain_nonnegative,
     equivalent,
+    exact_constant,
     interval,
     merge_scalar_bounds,
     nonnegative,
+    pure_scalar_selection,
 )
 from ..memo import memoized_method
-from ..scalar import Expr, Fact, expression, from_ssa, literal, positive
+from ..scalar import Expr, Fact, expression, from_ssa, literal, positive, substitute
 from ..symbols import Symbol, SymbolKind, is_coordinate
 from ..target.ascend910b import Actor
 from .structured_addresses import ScalarEnvironment
@@ -196,6 +198,22 @@ class ControlFacts:
     sid: Expr
     operations_visited: int
 
+    def participant_comparisons(self, tests, actor):
+        """Bind SID to the actual participant, retaining every unknown test.
+
+        This projects activation only; it supplies no completion or ownership.
+        """
+        bindings = {self.sid: literal(1 if actor is Actor.AIV1 else 0)}
+        for test in tests:
+            lhs, rhs = (substitute(value, bindings) for value in (test.lhs, test.rhs))
+            a, b = (exact_constant(value, self.environment.facts) for value in (lhs, rhs))
+            if a is None or b is None:
+                yield test
+            else:
+                bound = Comparison(literal(a), test.predicate, literal(b))
+                if not bound.evaluate({}):
+                    yield bound
+
     @memoized_method
     def _scalar_prefix(self, block):
         def scalar(value):
@@ -250,6 +268,8 @@ class ControlFacts:
         names, metadata = self._invariant_input(operation)
         return all(
             name in names
+            or isinstance(name, Symbol)
+            and name.kind in {SymbolKind.PREDICATE, SymbolKind.SELECTION}
             or isinstance(name, Symbol)
             and name.kind is SymbolKind.METADATA
             and name._identity in metadata
@@ -321,6 +341,9 @@ def build_control_facts(module: ModuleOp) -> ControlFacts:
     def unknown_scalar(value, frame, kind=SymbolKind.CARRY):
         nonlocal unknown
         if isinstance(value.type, IndexType) or value.type == i1:
+            if pure_scalar_selection(value.owner):
+                bindings[value] = from_ssa(value, memo=bindings)
+                return
             captures = (group, sid, *(loop.ordinal for loop in frame.loops()))
             bindings[value] = Expr(
                 "argument", (Symbol(f"$scalar{unknown}", kind, value, captures),)

@@ -17,7 +17,7 @@ from tests.sync.test_consumption_transfers import cube_chain
 @pytest.mark.parametrize(
     "source", (nested_copy, nested_cv, chain(runtime=True, branch=True), cube_chain())
 )
-def test_new_cuts_only_add_rules_without_rebuilding_established_relations(source):
+def test_new_cuts_inline_prefixes_without_new_causal_states(source):
     graph = ProtocolTransfers(prepared(selected(source)))
     assert not graph.rules and not graph.propositions
     requested = {i for i, node in enumerate(graph.nodes) if node.kind == "capture"}
@@ -27,8 +27,7 @@ def test_new_cuts_only_add_rules_without_rebuilding_established_relations(source
         for episode in episodes:
             for point in episode.consumers:
                 cut = graph.snapshot(point, episode.notification.destination_engine, strict=True)
-                requested.add(cut)
-                graph._rule(cut)
+                graph._proposition(cut)
     assert set(graph.rules) == requested
     assert all(graph.rules[i] is rule for i, rule in original_rules.items())
     assert all(graph.propositions[i] is symbol for i, symbol in original_symbols.items())
@@ -37,6 +36,7 @@ def test_new_cuts_only_add_rules_without_rebuilding_established_relations(source
     for number in requested:
         graph._rule(number)
     assert graph.work.transfer_rules == count
+    assert all(graph.nodes[i].kind != "union" for i in graph.rules)
 
 
 @pytest.mark.parametrize(

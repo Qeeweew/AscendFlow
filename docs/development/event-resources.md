@@ -20,6 +20,13 @@ counter 候选组及预留。域和 handback 查询只在规划阶段发生。
 `EventDomains`、SMT callback 或补造 handback 的入口。分配不能移动 native、
 Wait、修改 buffer 数量或添加 controller gate。物化继续同一条 source 编译链。
 
+mode-2 的两个 AIV 贡献必须来自真实执行端点。不同 SID 分支的不同原生
+指令可以在同一个精确 Cube 操作上形成 quorum，但 activation、代次和坐标
+必须一致；各 actor 的最后发布与最早读取仍逐个证明。保留已完整的原有分组，
+不沿共享端点作传递合并。已选完整 quorum 可覆盖后续单个 peer 的需求，条件是
+真实发布先于其 capture、其 acquire 先于该 consumer；不移动已选端点，不
+虚构另一个 peer，也不以未来的 acquire 覆盖更早读取。
+
 ## 专属优先和有限联合选择
 
 local namespace 是 `(actor, source pipe, destination pipe)`，每 bank 8 ID。
