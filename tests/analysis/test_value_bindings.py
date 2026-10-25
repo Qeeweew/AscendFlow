@@ -177,7 +177,7 @@ def test_real_use_of_empty_pipeline_result_remains_an_unresolved_obligation():
     first, second = tuple(op for op in module.walk() if isinstance(op, IterationOp))
     consumer = next(op for op in second.walk() if isinstance(op, CopyOp))
     replacement = CopyOp.build(
-        operands=[consumer.source, consumer.destination, [first.values[0]]],
+        operands=[consumer.source, consumer.destination, [first.values[0]], None],
         result_types=[consumer.value.type],
         attributes={"dependency_inputs": ArrayAttr([IntAttr(0)])},
     )

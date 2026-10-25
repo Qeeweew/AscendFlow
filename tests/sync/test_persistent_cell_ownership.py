@@ -65,13 +65,15 @@ def test_cell_retirement_consumes_original_bindings_without_rebinding_or_selecti
     credits, _ = bind_cell_credits(domains)
     assert len(credits) == 2
     for credit in credits:
-        for actual, original in zip(credit.rounds, credit.lifetime.rounds, strict=True):
+        for actual, original in zip(credit.rounds, credit.members[0].lifetime.rounds, strict=True):
             assert actual.acquire.operation is original.retirement.source.operation
             assert actual.release.operation is original.retirement.consumer.operation
             assert original.retirement.consumer is original.readers[-1]
 
     binding = next(
-        b for b in selection.bindings if b.requirement is credits[0].lifetime.rounds[0].retirement
+        b
+        for b in selection.bindings
+        if b.requirement is credits[0].members[0].lifetime.rounds[0].retirement
     )
     for bindings in (
         tuple(b for b in selection.bindings if b is not binding),
@@ -109,7 +111,7 @@ def grouped(X:N.Tensor((n,4,64),N.f32),
         for b in plan.generation.selection.bindings
     )
     for credit in plan.generation.credits:
-        for actual, original in zip(credit.rounds, credit.lifetime.rounds, strict=True):
+        for actual, original in zip(credit.rounds, credit.members[0].lifetime.rounds, strict=True):
             assert actual.acquire.operation is original.retirement.source.operation
             assert actual.release.operation is original.retirement.consumer.operation
     for n in (0, 3, 10):
@@ -145,16 +147,24 @@ def test_returning_credit_after_only_the_first_reader_has_a_real_war_counterexam
     earlier = {
         (credit.name, body.release.operation): raw.readers[0].operation
         for credit in program.credits
-        for body, raw in zip(credit.rounds, credit.lifetime.rounds, strict=True)
+        for body, raw in zip(credit.rounds, credit.members[0].lifetime.rounds, strict=True)
     }
-    actions = tuple(
-        replace(action, anchor=earlier[action.protocols[0], action.anchor])
-        if action.kind is SyncKind.LOCAL_SET
-        and len(action.protocols) == 1
-        and (action.protocols[0], action.anchor) in earlier
-        else action
-        for action in resources.actions
-    )
+    actions = []
+    moved = 0
+    for action in resources.actions:
+        targets = {
+            earlier[name, action.anchor]
+            for name in action.protocols
+            if (name, action.anchor) in earlier
+        }
+        if action.kind is SyncKind.LOCAL_SET and targets:
+            assert len(targets) == 1
+            assert all((name, action.anchor) in earlier for name in action.protocols)
+            anchor = targets.pop()
+            moved += anchor is not action.anchor
+            action = replace(action, anchor=anchor)
+        actions.append(action)
+    assert moved > 0
     materialize_notifications(memory, actions)
     with pytest.raises(EventModelError):
         check_structured_events(
@@ -182,7 +192,7 @@ def test_last_reader_follows_dispatched_stages_instead_of_source_order():
     plan = synchronize_structure(N.from_source(source, disjoint_external=True))
     assert len(plan.generation.credits) == 3
     for credit in plan.generation.credits:
-        for actual, original in zip(credit.rounds, credit.lifetime.rounds, strict=True):
+        for actual, original in zip(credit.rounds, credit.members[0].lifetime.rounds, strict=True):
             assert len(original.readers) == 2
             assert original.retirement.consumer is original.readers[0]
             assert actual.release.operation is original.retirement.consumer.operation
@@ -247,3 +257,83 @@ def prefix(X:N.Tensor((n,2,4,64),N.f32),
     assert len(plan.generation.credits) == credits
     for n in (0, 1, 2, 4, 7):
         check_compiled_events(plan, {"n": n}, invocations=2)
+
+
+def split_plane(late_stage=1):
+    return N.from_source(
+        f"""
+def split(X:N.Tensor((n,4,2,2,64),N.f32),
+          Out:N.Tensor((n,4,2,2,64),N.f32,access="write",write_disjoint=True),n:N.i64):
+    with N.Kernel(1,kind="mixed"):
+        scratch=N.alloc_ub((2,64),N.f32,slots={late_stage + 1})
+        with N.Vector() as lane:
+            for parent in N.serial(n):
+                for child in N.Pipelined((parent//2)%5):
+                    with N.Stage(0):
+                        N.copy(X[parent,child,lane,:,:],scratch.at(child))
+                    with N.Stage(1):
+                        N.copy(scratch.at(child)[0,:],Out[parent,child,lane,0,:])
+                    with N.Stage({late_stage}):
+                        N.copy(scratch.at(child)[1,:],Out[parent,child,lane,1,:])
+""",
+        disjoint_external=True,
+    )
+
+
+@pytest.mark.parametrize("late_stage", (1, 2))
+def test_common_full_writer_joins_cells_after_the_actual_last_reader_prefix(late_stage):
+    plan = synchronize_structure(split_plane(late_stage))
+    credits = plan.generation.credits
+    assert len(credits) == 2 * (late_stage + 1)
+    assert all(len(c.members) == 2 for c in credits)
+    assert len(plan.dependencies.cell_lifetimes) == 2 * len(credits)
+    dispatch = plan.generation.domains.dispatch
+    for credit in credits:
+        for member in credit.members:
+            for shared, original in zip(credit.rounds, member.rounds, strict=True):
+                assert shared.acquire == original.acquire
+                actual = dispatch.site(shared.release.occurrence)
+                old = dispatch.site(original.release.occurrence)
+                assert (actual.stage, actual.lexical) >= (old.stage, old.lexical)
+    for n in (0, 1, 5, 10, 17):
+        check_compiled_events(plan, {"n": n}, invocations=2)
+
+
+def test_returning_a_joined_credit_before_another_member_reader_has_a_war_counterexample():
+    memory = native_memory(split_plane())
+    program = generate_notifications(build_access_order(memory))
+    resources = allocate_structured_events(plan_event_resources(program))
+    original = collect_native_memory(memory.module.clone())
+    dispatch = program.domains.dispatch
+    earlier = {}
+    for credit in program.credits:
+        for index, body in enumerate(credit.rounds):
+            first = min(
+                (m.rounds[index].release for m in credit.members),
+                key=lambda p: dispatch.site(p.occurrence).lexical,
+            )
+            earlier[credit.name, body.release.operation] = first.operation
+    actions = []
+    moved = 0
+    for action in resources.actions:
+        targets = {
+            earlier[name, action.anchor]
+            for name in action.protocols
+            if (name, action.anchor) in earlier
+        }
+        if action.kind is SyncKind.LOCAL_SET and targets:
+            assert len(targets) == 1
+            assert all((name, action.anchor) in earlier for name in action.protocols)
+            anchor = targets.pop()
+            moved += anchor is not action.anchor
+            action = replace(action, anchor=anchor)
+        actions.append(action)
+    assert moved > 0
+    materialize_notifications(memory, actions)
+    with pytest.raises(EventModelError):
+        check_structured_events(
+            collect_native_memory(memory.module),
+            {"n": 17},
+            logical_reference=original,
+            invocations=2,
+        )

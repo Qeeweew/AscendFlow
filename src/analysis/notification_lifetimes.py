@@ -11,7 +11,7 @@ from functools import cached_property
 
 from ..diagnostics import CompileError, ErrorKind, require
 from ..memo import memoized_method
-from ..scalar import Expr, expression, literal
+from ..scalar import Expr, expression, literal, substitute
 from ..symbols import Symbol, SymbolKind
 from .consumption_frontiers import AcquiredConsumption, ConsumptionFrontiers
 from .event_contracts import CROSS_BACKLOG, LOCAL_CAPACITY, CaseLease, StructuredEventLease
@@ -60,6 +60,7 @@ class HandbackRule:
         )
         self.positions = ProtocolPositions(domains)
         self.boundary_cases = {}
+        self.invocation_boundaries = {}
         self.declined_boundaries = {}
         self._consumptions = {}
 
@@ -153,6 +154,29 @@ class HandbackRule:
             return self.boundary_cases[peer]
         return cases
 
+    def _child_cases(self, peer, scope):
+        """Optional child ports do not require a rank across parent calls."""
+        cases = self._cases(peer)
+        if cases:
+            return cases
+        key = peer, scope
+        if key not in self.invocation_boundaries:
+            from .event_families import build_boundary_family
+
+            try:
+                cases = build_boundary_family(self.domains, peer, scope)
+            except CompileError as error:
+                if error.kind is not ErrorKind.UNSUPPORTED or error.phase not in {
+                    "event-parameter-cases",
+                    "event-window-membership",
+                }:
+                    raise
+                self.declined_boundaries[peer] = error
+                self.domains.work.optional_relay_declines += 1
+                cases = ()
+            self.invocation_boundaries[key] = cases
+        return self.invocation_boundaries[key]
+
     @memoized_method
     def _step(self, bound, loop):
         d = self.domains
@@ -193,7 +217,7 @@ class HandbackRule:
                     offsets = range(begin - max(starts), end - min(stops) + 1)
                 else:
                     offsets = (0,)
-                for case in self._cases(peer):
+                for case in self._child_cases(peer, loop):
                     if case.empty:
                         continue
                     for offset in offsets:
@@ -534,6 +558,21 @@ class HandbackRule:
         case = cases[0]
         if not d.active[channel, case]:
             return StructuredEventLease(channel, 0, ())
+        lease = self._sparse_local_ring(channel, case, 1, literal(0))
+        if lease is not None:
+            return lease
+        # Sparse parent calls need no dense rank. A real descendant clock can
+        # name finite lanes if every pair of actual uses of the same lane has
+        # a consumption handback, including parent reentry and empty gaps.
+        phase = d.control.loops[d.clocks[channel][-1]].ordinal
+        for width in range(2, LOCAL_CAPACITY + 1):
+            lease = self._sparse_local_ring(channel, case, width, phase)
+            if lease is not None:
+                return lease
+        return None
+
+    def _sparse_local_ring(self, channel, case, width, phase):
+        d = self.domains
         source, wait = (
             d._instance(p, {}, case=case) for p in (channel.sources[0], channel.consumers[0])
         )
@@ -552,6 +591,17 @@ class HandbackRule:
                 for p in (channel.sources[0], channel.consumers[0])
             )
             condition = ActionGuard((Comparison(gap, ">=", literal(0)),))
+            if width > 1:
+                condition = ActionGuard(
+                    condition.comparisons
+                    + (
+                        Comparison(
+                            expression("rem", phase, literal(width)),
+                            "==",
+                            expression("rem", substitute(phase, shifted), literal(width)),
+                        ),
+                    )
+                )
             assumptions = tuple(
                 dict.fromkeys(
                     condition.comparisons
@@ -568,10 +618,11 @@ class HandbackRule:
             begin, end = self._step(wait, loop), self._step(source, loop)
             if begin is None or end is None:
                 return None
-            # Search only the actual old invocation and its adjacent return
-            # horizon. The later target may be arbitrarily far away; exact
-            # queue order must bridge that gap. Failure gives no permission.
-            graph = self._region_transfer(loop, begin, end + 1, True)
+            # A width-lane ring can use the retained returns up to its next
+            # possible same-lane publication. The later target may be
+            # arbitrarily far away; exact queue order must bridge that gap.
+            # This is a finite proof horizon, never runtime loop expansion.
+            graph = self._region_transfer(loop, begin, max(begin, end + width), True)
             proof = graph.consumption(
                 channel, wait, next_source, channel.source_engine, assumptions=assumptions
             )
@@ -586,11 +637,11 @@ class HandbackRule:
             uses.append(Reuse(loop, None, None, condition, handbacks))
         lease = CaseLease(
             case,
-            1,
-            literal(0),
+            width,
+            phase,
             (),
             tuple(uses[-1:]),
             tuple(uses[:-1]),
             policy="ordered-local-handback",
         )
-        return StructuredEventLease(channel, 1, (lease,))
+        return StructuredEventLease(channel, width, (lease,))

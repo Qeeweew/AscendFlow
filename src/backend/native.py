@@ -124,6 +124,23 @@ def native_line(task, *, pointer_renderer, generation):
             f"asc_copy({bits[1]}, {bits[0]}, uint8_t({refs[0].rows}), "
             f"1, 1, {strides[1]}, {strides[0]});"
         )
+    if task.spec.native in {"copy_nz", "copy_nz_pad"}:
+        rows, columns = task.spec.params[:2]
+        resident_rows = refs[1].leading_rows
+        call = (
+            f"asc_copy_gm2l1((__cbuf__ void*){p[1]}, (__gm__ void*){p[0]}, "
+            f"uint16_t({columns // 16}), "
+            f"uint16_t({rows}), uint16_t({refs[0].leading_rows - rows}), "
+            f"uint16_t({resident_rows - rows}));"
+        )
+        if task.spec.native == "copy_nz_pad":
+            zero = (
+                "asc_fill_value_config npu_zero = { .config = uint64_t(1) | "
+                f"(uint64_t({refs[1].total_nbytes // 32}) << 16) }}; "
+                f"asc_fill_l1({p[1]}, uint32_t(0), npu_zero); asc_sync_pipe(PIPE_MTE2); "
+            )
+            return "{ " + zero + call + " }"
+        return call
     if task.spec.native == "copy_rows_prefix":
         rows = task.operands[0]
         if all(ref.contiguous for ref in refs):
@@ -496,8 +513,9 @@ def native_line(task, *, pointer_renderer, generation):
             if task.spec.native == "mad_cycle"
             else ("true" if clear else "false")
         )
-        return f"asc_mmad({p[2]}, {p[0]}, {p[1]}, {m}, {k}, {n}, 0, false, false, {flag});"
-    if task.spec.native == "fix":
+        unit = task.operands[0] if task.spec.unit_flag else "0"
+        return f"asc_mmad({p[2]}, {p[0]}, {p[1]}, {m}, {k}, {n}, {unit}, false, false, {flag});"
+    if task.spec.native in {"fix", "fix_rows"}:
         m, n = task.spec.params[:2]
         source_m = task.spec.params[2] if len(task.spec.params) == 3 else m
         dtype = refs[1].dtype
@@ -506,10 +524,12 @@ def native_line(task, *, pointer_renderer, generation):
             "f16": "uint64_t(QuantMode_t::F322F16)",
             "bf16": "uint64_t(QuantMode_t::F322BF16)",
         }[dtype]
-        return (
-            f"asc_copy_l0c2gm({p[1]}, {p[0]}, {n}, {m}, {refs[1].row_stride // ITEMSIZE[dtype]}, "
-            f"{source_m}, 0, {quant}, 0, false, true);"
+        rows = task.operands[0] if task.spec.native == "fix_rows" else str(m)
+        call = (
+            f"asc_copy_l0c2gm({p[1]}, {p[0]}, {n}, {rows}, {refs[1].row_stride // ITEMSIZE[dtype]}, "
+            f"{source_m}, {task.spec.unit_flag}, {quant}, 0, false, true);"
         )
+        return f"if (({rows}) > 0) {{ {call} }}" if task.spec.native == "fix_rows" else call
     if task.spec.native == "mad16":
         clear = "true" if task.spec.params[0] else "false"
         return f"asc_mmad({p[2]}, {p[0]}, {p[1]}, 16, 16, 16, 0, false, false, {clear});"

@@ -323,7 +323,12 @@ class _PolynomialQuery:
                         numerator = _to_expr(top)
                         divisor = _to_expr(bottom)
                     atom = expression("floordiv", numerator, divisor)
-                    result = {(self.atom(atom),): 1}
+                    # Ring cancellation can leave a constant quotient here.
+                    # Constants are coefficients, never function atoms with
+                    # integer-valued (rather than Expr-valued) operands.
+                    result = (
+                        self.visit(atom) if atom.constant is not None else {(self.atom(atom),): 1}
+                    )
         else:
             result = {(self.atom(expr),): 1}
         self.memo[expr] = result

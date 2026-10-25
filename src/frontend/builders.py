@@ -1063,6 +1063,19 @@ def _allocate(
     except ValueError:
         # Internal packed predicate storage uses raw u8 bytes, never f32.
         require(dtype == "u8", "unknown native element type")
+    require(
+        layout == "linear"
+        or memory != "GM"
+        or layout == "NZ"
+        and not axes
+        and dtype in {f16, bf16}
+        and access == "read",
+        "external NZ tensors require immutable static b16 matrix planes",
+    )
+    if memory == "GM" and layout == "NZ":
+        from ..target.layout import NZLayout
+
+        NZLayout(shape, 2)
     name = name or trace.name(memory.lower())
     op = AllocationOp.create(
         operands=[trace.size(shape[i]) for i in axes],
@@ -1271,10 +1284,37 @@ def _issue_order(order):
     }
 
 
-def copy(source, destination, *, valid=None, valid_rows=None, transpose=False, pad_value=None):
+def copy(
+    source,
+    destination,
+    *,
+    valid=None,
+    valid_rows=None,
+    transpose=False,
+    pad_value=None,
+    unit_flag=0,
+    cache_bypass=False,
+):
     src, dst = _view(source), _view(destination).bound()
     require(dst.buffer.op.access.data != "read", "copy cannot write a read-only tensor")
     require(type(transpose) is bool, "copy transpose policy must be constexpr boolean")
+    bypass = None
+    if cache_bypass is not False:
+        require(
+            src.buffer.memory == "GM" and src.buffer.op.access.data == "read",
+            "cache bypass requires an external read-only GM source",
+        )
+        if cache_bypass is True:
+            from xdsl.dialects import arith
+
+            bypass = _trace()._pure(arith.ConstantOp.from_int_and_width(1, i1))
+        else:
+            bypass = _predicate(cache_bypass)
+    require(type(unit_flag) is int and unit_flag in {0, 3}, "copy unit_flag must be 0 or 3")
+    require(
+        unit_flag == 0 or (src.buffer.memory, dst.buffer.memory) == ("L0C", "GM"),
+        "copy unit_flag=3 requires L0C→GM",
+    )
     require(
         pad_value is None or type(pad_value) in {int, float} and pad_value == 0,
         "copy padding currently requires pad_value=0",
@@ -1286,10 +1326,13 @@ def copy(source, destination, *, valid=None, valid_rows=None, transpose=False, p
             and len(src.shape) == len(dst.shape) == 2
             and (
                 (src.buffer.memory, dst.buffer.memory) == ("GM", "L1")
+                and src.buffer.layout == "linear"
                 or (src.buffer.memory, dst.buffer.memory) == ("UB", "GM")
                 and pad_value is None
+                or (src.buffer.memory, dst.buffer.memory) == ("L0C", "GM")
+                and pad_value is None
             ),
-            "valid_rows requires a GM→L1 or UB→GM matrix copy",
+            "valid_rows requires a GM→L1, UB→GM or L0C→GM matrix copy",
         )
     if transpose:
         require(
@@ -1319,12 +1362,14 @@ def copy(source, destination, *, valid=None, valid_rows=None, transpose=False, p
                 else valid
             ),
             _deps([source]),
+            bypass,
         ],
         result_types=[_tile(dst)],
         attributes={
             "dependency_inputs": _dependency_inputs([source]),
             **({"transpose": IntAttr(1)} if transpose else {}),
             **({"zero_pad": IntAttr(1)} if pad_value is not None else {}),
+            **({"unit_flag": IntAttr(3)} if unit_flag else {}),
         },
     )
     _trace().add(op)
@@ -1847,7 +1892,7 @@ def reduce_max(source, *, axis, out, scratch, order):
     return _reduce("max", source, axis=axis, out=out, scratch=scratch, order=order)
 
 
-def matmul(a, b, *, accum, initialize=True):
+def matmul(a, b, *, accum, initialize=True, unit_flag=0):
     """Native L0A[M,K] × L0B[K,N] → L0C[M,N], without hidden operands.
 
     L1→L0 copies and every buffer slot are explicit. For stored Bᵀ[N,K],
@@ -1858,10 +1903,10 @@ def matmul(a, b, *, accum, initialize=True):
         == ("L0A", "L0B", "L0C"),
         "matmul requires explicit L0A, L0B and L0C tiles; copy L1 operands first",
     )
-    return _matmul(a, b, accum, initialize=initialize)
+    return _matmul(a, b, accum, initialize=initialize, unit_flag=unit_flag)
 
 
-def _matmul(a, b, accumulator, *, initialize):
+def _matmul(a, b, accumulator, *, initialize, unit_flag):
     av, bv, cv = _view(a), _view(b), _view(accumulator).bound()
     require(all(len(v.shape) == 2 for v in (av, bv, cv)), "matmul requires matrix tiles")
     m, k = av.shape
@@ -1876,7 +1921,14 @@ def _matmul(a, b, accumulator, *, initialize):
     initialization = _predicate(initialize)
     inputs = [a, b] if initialize is True else [a, b, accumulator]
     op = MatmulOp.build(
-        operands=[av.emit(), bv.emit(), cv.emit(), initialization, _deps(inputs)],
+        operands=[
+            av.emit(),
+            bv.emit(),
+            cv.emit(),
+            initialization,
+            _trace().scalar(unit_flag),
+            _deps(inputs),
+        ],
         result_types=[_tile(cv)],
         attributes={
             "transpose_b": IntAttr(0),

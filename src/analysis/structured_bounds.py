@@ -204,7 +204,7 @@ def _original_view(address: AddressFacts, facts):
             )
         _require(
             equivalent(actual, expected, {}),
-            "address offset does not match its L1 allocation layout",
+            "address offset does not match its NZ allocation layout",
             operation,
         )
         rank = len(layout.shape)
@@ -213,16 +213,16 @@ def _original_view(address: AddressFacts, facts):
             and all(width == 1 for width in axes.widths[:-2])
             and axes.widths[-1] % layout.c0 == 0
             and multiple_of(axes.origins[-1], layout.c0, facts),
-            "native access needs an aligned L1 NZ rectangle",
+            "native access needs an aligned NZ rectangle",
             operation,
             kind=ErrorKind.UNSUPPORTED,
         )
         expected_geometry = layout.geometry(
-            *axes.widths[-2:], prefix=address.valid_rows is not None
+            *axes.widths[-2:], prefix=address.valid_rows is not None or geometry.bank == "GM"
         )
         _require(
             (geometry.nbytes, geometry.rows, geometry.row_stride) == expected_geometry,
-            "L1 native footprint differs from its allocation layout and view",
+            "NZ native footprint differs from its allocation layout and view",
             operation,
         )
         return expected_geometry
@@ -405,7 +405,15 @@ def admit_memory_bounds(memory: NativeMemoryFacts) -> MemoryBoundsFacts:
                 else ITEMSIZE[access.address.geometry.dtype]
                 if bank == "GM"
                 and template.operation.native.data
-                in {"nd2nz", "nd2nz_pad", "nd2nz_rows", "nd2nz_overlay", "fix", "copy_bytes"}
+                in {
+                    "nd2nz",
+                    "nd2nz_pad",
+                    "nd2nz_rows",
+                    "nd2nz_overlay",
+                    "fix",
+                    "fix_rows",
+                    "copy_bytes",
+                }
                 else ITEMSIZE[access.address.geometry.dtype]
                 if engine is Engine.S
                 else 32

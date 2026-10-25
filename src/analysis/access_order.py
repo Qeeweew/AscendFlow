@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from .cell_ownership import CellLifetime
     from .storage_packets import PacketPartition
     from .structured_admission import StructuredAdmission
+    from .unit_flags import UnitFlagProtocols
 
 
 def unique(items):
@@ -121,6 +122,7 @@ class AccessOrder:
     packet_partitions: tuple[PacketPartition, ...]
     cell_lifetimes: tuple[CellLifetime, ...]
     work: DependencyWork
+    unitflags: UnitFlagProtocols
 
 
 def build_access_order(memory, *, admission=None, dispatch=None):
@@ -133,7 +135,11 @@ def build_access_order(memory, *, admission=None, dispatch=None):
 
 class _Builder:
     def __init__(self, memory, dispatch, admission):
+        from .unit_flags import admit_unit_flags
+
         self.memory, self.dispatch, self.admission = memory, dispatch, admission
+        self.unitflags = admit_unit_flags(memory, dispatch)
+        self.unitflag_consumers = {p.consumer.operation for p in self.unitflags.pairs}
         self.accesses = partition_accesses(memory, admission)
         self.work = self.accesses.work
         self.needs, self.required = [], []
@@ -768,6 +774,7 @@ class _Builder:
                     if (
                         varying
                         and not exact
+                        and not self._unitflag_reader(transfer)
                         and (
                             transfer.head_reads
                             or transfer.tail_reads
@@ -807,6 +814,7 @@ class _Builder:
                                 cell: transfer
                                 for cell, transfer in cells.items()
                                 if (operation, cell) not in self.envelopes
+                                and not self._unitflag_reader(transfer)
                             },
                         )
                     )
@@ -837,6 +845,21 @@ class _Builder:
         self.summaries[operation] = MappingProxyType(cells)
         return cells
 
+    def _unitflag_reader(self, transfer):
+        # The original native reader gates its L0C access itself. Keeping it
+        # visible neither hoists its activation nor acquires a queue prefix
+        # on an empty path. Other cells/readers retain the balanced interface.
+        readers = transfer.head_reads + transfer.tail_reads
+        return (
+            bool(readers)
+            and not transfer.first_writes
+            and not transfer.tail_writes
+            and all(
+                isinstance(p.endpoint, AccessEndpoint) and p.operation in self.unitflag_consumers
+                for p in readers
+            )
+        )
+
     def build(self):
         self._node(self.memory.module)
         from .cell_ownership import infer_cell_lifetimes
@@ -857,4 +880,5 @@ class _Builder:
             tuple(self.partitions),
             lifetimes,
             self.work,
+            self.unitflags,
         )

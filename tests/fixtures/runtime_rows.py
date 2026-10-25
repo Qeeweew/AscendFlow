@@ -38,6 +38,29 @@ def rows_output(O:N.Tensor((n,16),N.f32,access="write",write_disjoint=True),n:N.
     )
 
 
+def matrix_output(dtype="bf16", columns=48):
+    """A full NZ producer with a runtime row prefix read by FIXPIPE."""
+    return N.from_source(
+        f"""
+def rows_fix(A:N.Tensor((16,16),N.{dtype}), B:N.Tensor((16,{columns}),N.{dtype}),
+             O:N.Tensor((n,{columns}),N.{dtype},access="write",write_disjoint=True),n:N.i64):
+    with N.Kernel(kind="cube"):
+        a1=N.alloc_l1((16,16),N.{dtype})
+        b1=N.alloc_l1((16,{columns}),N.{dtype})
+        a0=N.alloc_l0a((16,16),N.{dtype})
+        b0=N.alloc_l0b((16,{columns}),N.{dtype})
+        c0=N.alloc_l0c((16,{columns}),N.f32)
+        av=N.copy(A,a1)
+        bv=N.copy(B,b1)
+        aa=N.copy(av,a0)
+        bb=N.copy(bv,b0)
+        value=N.matmul(aa,bb,accum=c0,initialize=True)
+        N.copy(value,O[0:16,:],valid_rows=N.min(n,16))
+""",
+        disjoint_external=True,
+    )
+
+
 def fp32_padding(*, runtime=False, pitch=19):
     prefix = ",valid_rows=N.min(n,3)" if runtime else ""
     return N.from_source(f"""

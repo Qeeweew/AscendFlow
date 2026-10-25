@@ -201,6 +201,8 @@ _MASK_FREE = frozenset(
         "copy_bytes",
         "copy_rows",
         "copy_rows_prefix",
+        "copy_nz",
+        "copy_nz_pad",
         "scalar_load",
         "scalar_store",
         "index_load",
@@ -224,6 +226,7 @@ _MASK_FREE = frozenset(
         "mad_first",
         "mad16",
         "fix",
+        "fix_rows",
         "fix16",
         "compare_eq",
         "compare_ne",
@@ -275,8 +278,8 @@ def _packet(native: str) -> NativePacket | None:
             ),
             internal_fences=("V",),
         )
-    if native in {"nd2nz_pad", "nd2nz_rows"}:
-        # L1 fill and ND2NZ share MTE2 but can overlap execution. The fill
+    if native in {"nd2nz_pad", "nd2nz_rows", "copy_nz_pad"}:
+        # L1 fill and GM→L1 copies share MTE2 but can overlap execution. The fill
         # must retire before the valid values overwrite its zero padding.
         return NativePacket(native, internal_fences=("MTE2",))
     if native in _COUNT:

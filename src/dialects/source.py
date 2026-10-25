@@ -277,6 +277,19 @@ class AllocationOp(IRDLOperation):
             raise VerifyException(
                 "allocation requires versions in [1,8] and a known access contract"
             )
+        if (
+            typ.memory.data == "GM"
+            and typ.layout.data != "linear"
+            and not (
+                typ.layout.data == "NZ"
+                and typ.dtype.data in {"f16", "bf16"}
+                and self.access.data == "read"
+                and len(typ.shape) >= 2
+                and all(n.data > 0 for n in typ.shape)
+                and all(n.data % 16 == 0 for n in tuple(typ.shape)[-2:])
+            )
+        ):
+            raise VerifyException("external NZ tensors require immutable static aligned b16 planes")
         if self.ring.data not in {0, 1}:
             raise VerifyException("task ring marker must be boolean")
         axes = [] if self.dynamic_axes is None else [axis.data for axis in self.dynamic_axes]
@@ -921,15 +934,33 @@ class CopyOp(IRDLOperation):
     source = operand_def(TensorType)
     destination = operand_def(TensorType)
     dependencies = var_operand_def(TileType)
+    cache_bypass = opt_operand_def(i1)
     dependency_inputs = attr_def(ArrayAttr[IntAttr])
     transpose = opt_attr_def(IntAttr)
     zero_pad = opt_attr_def(IntAttr)
+    unit_flag = opt_attr_def(IntAttr)
     value = result_def(TileType)
     traits = traits_def(AsyncEffects())
+    irdl_options = (AttrSizedOperandSegments(as_property=False),)
 
     def verify_(self):
         _verify_result(self, self.destination)
         _verify_dependencies(self, [self.source])
+        if self.cache_bypass is not None:
+            view = self.source.owner
+            if (
+                self.source.type.memory.data != "GM"
+                or not isinstance(view, ViewOp)
+                or not isinstance(view.source.owner, AllocationOp)
+                or view.source.owner.access.data != "read"
+            ):
+                raise VerifyException("cache bypass requires an external read-only GM source")
+            _verify_index_provenance(self.cache_bypass, self, set(), {}, {})
+        if self.unit_flag is not None and (
+            self.unit_flag.data != 3
+            or (self.source.type.memory.data, self.destination.type.memory.data) != ("L0C", "GM")
+        ):
+            raise VerifyException("copy unit_flag=3 requires L0C→GM")
         transpose = 0 if self.transpose is None else self.transpose.data
         if transpose not in {0, 1}:
             raise VerifyException("copy transpose policy must be boolean")
@@ -1286,6 +1317,7 @@ class MatmulOp(IRDLOperation):
     b = operand_def(TensorType)
     accumulator = operand_def(TensorType)
     initialize = operand_def(i1)
+    unit_flag = operand_def(IndexType)
     dependencies = var_operand_def(TileType)
     dependency_inputs = attr_def(ArrayAttr[IntAttr])
     transpose_b = attr_def(IntAttr)

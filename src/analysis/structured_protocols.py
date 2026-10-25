@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .region_coordinates import ScalarScope
     from .smt import Exists
     from .structured_dispatch import StructuredDispatch
+    from .unit_flags import UnitFlagCoverage, UnitFlagProtocols
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +210,7 @@ class NotificationCoverage:
     absence: EmptyOrdinalDomain | None = None
     completion: CompletionCoverage | None = None
     binding: RequirementBinding | None = None
+    unitflag: UnitFlagCoverage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +238,7 @@ class SynchronizationSelection:
     unresolved: tuple[UnresolvedSynchronization, ...] = ()
     binding_work: BindingWork = field(default_factory=BindingWork, compare=False)
     bindings: tuple[RequirementBinding, ...] = ()
+    unitflags: UnitFlagProtocols | None = None
 
     @property
     def dispatch(self):
@@ -303,7 +306,14 @@ class SynchronizationSelection:
             all(
                 sum(
                     item is not None
-                    for item in (c.notification, c.ordering, c.ownership, c.absence, c.completion)
+                    for item in (
+                        c.notification,
+                        c.ordering,
+                        c.ownership,
+                        c.absence,
+                        c.completion,
+                        c.unitflag,
+                    )
                 )
                 == 1
                 and (
@@ -314,9 +324,24 @@ class SynchronizationSelection:
                 )
                 for c in self.coverage
             ),
-            "coverage lacks exactly one owned notification, ordering, ownership, absence, or completion fact",
+            "coverage needs exactly one owned notification, ordering, ownership, absence, completion, or unitflag fact",
         )
         retained = {id(item) for item in self.notifications}
+        require(
+            all(
+                c.unitflag is None
+                or self.unitflags is not None
+                and self.unitflags is self.dependencies.unitflags
+                and c.unitflag.binding is c.binding
+                and any(c.unitflag.pair is pair for pair in self.unitflags.pairs)
+                and (
+                    c.unitflag.following is None
+                    or any(c.unitflag.following is pair for pair in self.unitflags.pairs)
+                )
+                for c in self.coverage
+            ),
+            "unitflag coverage lost its owned native word or original binding",
+        )
         completions = {
             id(c.completion): c.completion for c in self.coverage if c.completion is not None
         }

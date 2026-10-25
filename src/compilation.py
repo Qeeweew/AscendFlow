@@ -123,6 +123,15 @@ class Compilation:
             "required_dependencies": len(plan.dependencies.required),
             "selected_protocols": len(plan.selection.notifications),
             "sync_instructions": len(plan.resources.actions),
+            "unitflag_pairs": [
+                {
+                    "publisher": pair.publisher.operation.uid.data,
+                    "consumer": pair.consumer.operation.uid.data,
+                    "checks": [t.operation.uid.data for t in pair.checks],
+                    "scope": "L0C accesses only; no native/queue completion prefix",
+                }
+                for pair in plan.selection.unitflags.pairs
+            ],
             "event_resources": event_resource_report(plan.resources),
             "witnesses": [
                 {

@@ -75,8 +75,10 @@ class NativeGeometry:
     def __post_init__(self):
         if self.matrix_shape is not None:
             require(
-                self.bank == "L1" and self.layout == "NZ" and self.dtype in {"f16", "bf16", "f32"},
-                "physical matrix shape is an L1 NZ allocation descriptor",
+                self.bank in {"GM", "L1"}
+                and self.layout == "NZ"
+                and self.dtype in {"f16", "bf16", "f32"},
+                "physical matrix shape requires a GM or L1 NZ allocation descriptor",
             )
             NZLayout(self.matrix_shape, ITEMSIZE[self.dtype])
         require(
@@ -99,8 +101,8 @@ class NativeGeometry:
     @property
     def leading_rows(self) -> int:
         require(
-            self.bank == "L1" and self.layout == "NZ" and self.matrix_shape is not None,
-            "L1 native requires its allocation's physical leading dimension",
+            self.bank in {"GM", "L1"} and self.layout == "NZ" and self.matrix_shape is not None,
+            "NZ native requires its allocation's physical leading dimension",
         )
         return self.matrix_shape[0]
 
@@ -203,6 +205,7 @@ class NativeSpec:
     modes: tuple[str, ...]
     params: tuple[int, ...]
     operands: tuple[NativeGeometry, ...]
+    unit_flag: int = 0
     packet: NativePacket | None = field(init=False)
     read_resets: tuple[NativeReadReset, ...] = field(init=False)
     implicit_completion: bool = field(init=False)
@@ -210,6 +213,17 @@ class NativeSpec:
 
     def __post_init__(self):
         require(len(self.operands) == len(self.modes), "native operand/effect counts differ")
+        require(
+            type(self.unit_flag) is int
+            and (
+                self.unit_flag == 0
+                or self.unit_flag == 1
+                and self.native in {"mad", "mad_first", "mad_cycle"}
+                or self.unit_flag == 3
+                and self.native in {"fix", "fix_rows"}
+            ),
+            "unitflag requires MAD control or FIX mode 3",
+        )
         object.__setattr__(self, "packet", audited_packet(self.native))
         resets = native_read_resets(self.native, self.params)
         require(
@@ -877,6 +891,33 @@ def native_contract(
             "statistics recipe needs aligned f32 words per row",
         )
         return "V", ("W",) if arity == 1 else ("R", "R", "W")
+    if native in {"copy_nz", "copy_nz_pad"}:
+        padded = native == "copy_nz_pad"
+        require(
+            len(params) == (4 if padded else 2), "NZ DMA needs exact source/resident dimensions"
+        )
+        m, n = params[:2]
+        pm, pn = params[2:] if padded else (m, n)
+        require(
+            banks == ("GM", "L1")
+            and layouts == ("NZ", "NZ")
+            and dtypes[0] == dtypes[1] in {"f16", "bf16"}
+            and all(v > 0 and v % 16 == 0 for v in (m, n, pm, pn))
+            # Raw DMA counts column blocks and 32-byte bursts; the 256
+            # ND2NZ matrix limit does not apply to prepacked NZ storage.
+            and m <= pm <= 65535
+            and n <= pn
+            and n // 16 <= 4095
+            and refs[0].nbytes == m * 32
+            and refs[0].rows == n // 16
+            and refs[0].row_stride == refs[0].leading_rows * 32
+            and refs[0].leading_rows <= 65535
+            and refs[1].contiguous
+            and lengths[1] == pm * pn * 2
+            and refs[1].leading_rows == pm,
+            "NZ DMA requires precise b16 GM column blocks and a compact L1 NZ plane",
+        )
+        return "MTE2", ("R", "W")
     if native == "copy_rows_prefix":
         require(tuple(r.bank for r in refs) == ("UB", "GM"), "runtime row output requires UB→GM")
         return native_contract("copy_rows", refs, params)
@@ -886,7 +927,7 @@ def native_contract(
         itemsize = ITEMSIZE[dtypes[0]] if dtypes else 0
         require(
             1 <= m <= pm <= 256
-            and 1 <= n <= pn <= 256
+            and 1 <= n <= pn <= 65520
             and pm % 16 == pn % 16 == 0
             and banks == ("GM", "L1")
             and layouts == ("linear", "NZ")
@@ -914,7 +955,7 @@ def native_contract(
             and banks == ("GM", "L1")
             and layouts == ("linear", "NZ")
             and dtypes[0] == dtypes[1] in {"f16", "bf16", "f32"}
-            and c0 <= n <= 256
+            and c0 <= n <= 65520
             and n % c0 == 0
             and refs[0].rows == m
             and refs[0].nbytes == n * itemsize
@@ -933,7 +974,7 @@ def native_contract(
         itemsize = ITEMSIZE[dtypes[0]] if dtypes else 0
         require(
             1 <= m <= pm <= 256
-            and 1 <= n <= pn <= 256
+            and 1 <= n <= pn <= 65520
             and pm % 16 == pn % 16 == 0
             and banks == ("GM", "L1")
             and dtypes[0] == dtypes[1] in {"f16", "bf16", "f32"}
@@ -1025,7 +1066,7 @@ def native_contract(
             "MAD requires exact b16 operand tiles and an f32 accumulator, without padding",
         )
         return "M", ("R", "R", "W" if native == "mad" and clear else "RW")
-    if native == "fix":
+    if native in {"fix", "fix_rows"}:
         require(len(refs) == 2, "Fixpipe requires a source and destination")
         require(len(params) in {2, 3}, "Fixpipe requires (M,N[,source_M])")
         m, n = params[:2]

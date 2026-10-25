@@ -204,7 +204,7 @@ class _Planning:
                     EventReservation(bank, 7, "final native retirement drain", root)
                 )
         for credit in self.program.credits:
-            lifetime = credit.lifetime
+            lifetime = credit.members[0].lifetime
             actor = lifetime.cell.private
             source, destination = lifetime.source_engine, lifetime.destination_engine
             resource = len(self.demands)

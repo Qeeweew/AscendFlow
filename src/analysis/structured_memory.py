@@ -95,10 +95,11 @@ def _conditional_reads(operation, contract, control):
         return {}
     operands = scalar_operands(operation)
     require(
-        len(operands) == 1 and isinstance(operands[0].type, IndexType),
+        len(operands) == (2 if contract.unit_flag else 1)
+        and isinstance(operands[-1].type, IndexType),
         "native reset needs an SSA ordinal",
     )
-    ordinal = control.environment.expression(operands[0])
+    ordinal = control.environment.expression(operands[-1])
     loops = control.frames[operation].loops()
     stage = operation.parent_op()
     while stage is not None and not isinstance(stage, PipelineStageOp):
@@ -106,7 +107,7 @@ def _conditional_reads(operation, contract, control):
     if stage is not None:
         loop = stage.parent_op()
         require(
-            operands[0] is stage.body.block.args[0]
+            operands[-1] is stage.body.block.args[0]
             and any(item.operation is loop for item in loops),
             "native reset needs its actual pipeline stage ordinal",
         )
@@ -248,7 +249,8 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
         atoms = scalar_operands(operation)
         if operation.native.data in {"mad_first", "mad_cycle"}:
             require(
-                len(atoms) == 1 and isinstance(atoms[0].type, IndexType),
+                len(atoms) == (2 if operation.unit_flag is not None else 1)
+                and isinstance(atoms[-1].type, IndexType),
                 "native reset needs an explicit index ordinal after its references",
             )
         scalar_source = None
@@ -274,7 +276,7 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
             (0,)
             if operation.native.data == "nd2nz_rows"
             else (0, 1)
-            if operation.native.data in {"copy_rows_prefix", "nd2nz_overlay"}
+            if operation.native.data in {"copy_rows_prefix", "nd2nz_overlay", "fix_rows"}
             else ()
         )
         require(
@@ -339,7 +341,14 @@ def collect_native_memory(module: ModuleOp, *, control: ControlFacts | None = No
                 scalar_values[operation.value] = operation
         _check_mask_program(operation, refs, params)
         _check_mask_layout(operation)
-        spec = native.NativeSpec(operation.native.data, engine, modes, params, geometries)
+        spec = native.NativeSpec(
+            operation.native.data,
+            engine,
+            modes,
+            params,
+            geometries,
+            0 if operation.unit_flag is None else operation.unit_flag.data,
+        )
         require(
             not spec.registers or frame.participants == (Actor.AIC,),
             "Load3D and FP32 register state belongs to the AIC",

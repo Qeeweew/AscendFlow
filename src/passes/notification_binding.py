@@ -1020,6 +1020,7 @@ def bind_notifications(dependencies: AccessOrder) -> SynchronizationSelection:
         "selection and dispatch belong to different owned memory facts",
     )
     order = _IssueOrder(dispatch)
+    unitflags = dependencies.unitflags
     notifications, coverage, unresolved = [], [], []
     bindings, bound_bundles = {}, []
     owned = {
@@ -1104,7 +1105,19 @@ def bind_notifications(dependencies: AccessOrder) -> SynchronizationSelection:
         need, source, consumer = bound.requirement, bound.completion_source, bound.consumer
         try:
             a, b = dispatch.site(source), dispatch.site(consumer)
-            if rule := _implicit(bound, order):
+            if (unitflag := unitflags.cover(bound)) is not None:
+                coverage.extend(
+                    NotificationCoverage(
+                        original.requirement,
+                        "L0C unitflag access handshake",
+                        binding=original,
+                        unitflag=unitflag
+                        if original is bound
+                        else replace(unitflag, binding=original),
+                    )
+                    for original in bundle
+                )
+            elif rule := _implicit(bound, order):
                 coverage.extend(
                     NotificationCoverage(
                         original.requirement,
@@ -1174,4 +1187,5 @@ def bind_notifications(dependencies: AccessOrder) -> SynchronizationSelection:
         tuple(unresolved),
         order.binding_work,
         tuple(bindings.values()),
+        unitflags,
     )

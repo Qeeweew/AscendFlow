@@ -113,7 +113,7 @@ def test_cube_keeps_expert_issue_order_and_actual_tile_writers_readers():
     _, trace = dispatch(plan, tiles=5)
     instructions = (
         (0, 1, ("nd2nz", "nd2nz")),
-        (1, 2, ("load2d_a", "load2d_b_nt")),
+        (1, 2, ("load3d_a", "load2d_b_nt")),
         (2, 3, ("mad",)),
         (3, 0, ("fix",)),
     )
@@ -123,7 +123,9 @@ def test_cube_keeps_expert_issue_order_and_actual_tile_writers_readers():
         for stage, order, names in instructions
         for inside, name in enumerate(names)
     )
-    assert [item[0] for item in trace] == [item[3] for item in expected]
+    assert [item[0] for item in trace] == ["set_load3d", "set_fmatrix_a"] + [
+        item[3] for item in expected
+    ]
 
 
 def test_empty_pipeline_exports_last_selection_without_inventing_completion():

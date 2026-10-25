@@ -110,6 +110,7 @@ def lower_address(
     roots: Mapping[AllocationOp, SSAValue],
     append: Append,
     matrix: bool = False,
+    cache_bypass: SSAValue | None = None,
 ) -> SSAValue:
     """Lower one source view with its caller's actual lexical SSA bindings.
 
@@ -136,7 +137,9 @@ def lower_address(
     itemsize = ITEMSIZE[typ.dtype.data]
     shape = tuple(size.data for size in original.shape)
     layout = (
-        NZLayout(shape, itemsize) if typ.memory.data == "L1" and typ.layout.data == "NZ" else None
+        NZLayout(shape, itemsize)
+        if typ.memory.data in {"GM", "L1"} and typ.layout.data == "NZ"
+        else None
     )
     widths = tuple(width.data for width in view.widths)
     axes = tuple(axis.data for axis in view.axes)
@@ -188,7 +191,7 @@ def lower_address(
     _require(selected[-1] == itemsize, "native tile columns must be contiguous", unsupported=True)
     contiguous = len(dimensions) == 1 or selected[0] == dimensions[1] * itemsize
     if typ.layout.data != "linear":
-        column_slice = typ.memory.data == "L1" and typ.layout.data == "NZ"
+        column_slice = typ.memory.data in {"GM", "L1"} and typ.layout.data == "NZ"
         # Full M retains the NZ column-block pitch: an aligned L0C column
         # interval is itself compact and needs no strided MAD addressing.
         accumulator_columns = typ.memory.data == "L0C" and typ.layout.data == "NZ"
@@ -208,7 +211,11 @@ def lower_address(
             unsupported=True,
         )
     if layout is not None:
-        nbytes, rows, row_stride = layout.geometry(*dimensions, prefix=view.valid is not None)
+        nbytes, rows, row_stride = layout.geometry(
+            *dimensions, prefix=view.valid is not None or typ.memory.data == "GM"
+        )
+    elif view.valid is not None and typ.memory.data == "L0C" and typ.layout.data == "NZ":
+        nbytes, rows, row_stride = dimensions[0] * 64, dimensions[1] // 16, shape[-2] * 64
     elif len(dimensions) == 2 and typ.layout.data == "linear" and (matrix or not contiguous):
         rows, columns = dimensions
         nbytes, row_stride = columns * itemsize, selected[0]
@@ -251,6 +258,7 @@ def lower_address(
             origins,
             actual_extents,
             None if view.valid is None else materialize(view.valid),
+            cache_bypass,
         ],
         attributes={
             "nbytes": IntAttr(nbytes),
@@ -280,6 +288,7 @@ def subview(
     _require(type(offset) is int and offset >= 0, "native subview offset must be nonnegative")
     span = _geometry(nbytes, rows, row_stride)
     owner = source.owner
+    cache_bypass = owner.cache_bypass if isinstance(owner, AddressOp) else None
     indices = _Indices(append)
     origins, extents = (), ()
     widths = axes = displacement = None
@@ -340,6 +349,7 @@ def subview(
             origins,
             extents,
             None,
+            cache_bypass,
         ],
         attributes={
             "nbytes": IntAttr(nbytes),

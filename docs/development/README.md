@@ -15,6 +15,7 @@
 | 8 | [内存合同](memory-contracts.md) | 并行前提、读写权限、write_disjoint 与可能别名分别由谁负责？ |
 | 9 | [事件资源](event-resources.md) | 虚拟通知、专属政策、AIV 对应和整组 counter 如何分离？ |
 | 10 | [寄存器状态](register-state.md) | Load3D/FP32 配置的值、可见性和旧读取退休如何分开？ |
+| 11 | [L0C unitflag](unit-flags.md) | MAD/FIX 细粒度握手覆盖哪些访问，为什么不代表整个 pipe 完成？ |
 
 日常命令和两项性能采集统一在[测试指南](../guide/testing.md)，测试目录职责见
 [tests](../../tests/README.md)。不要恢复历史 solver、旧公开 task API 或第二条编译路径。

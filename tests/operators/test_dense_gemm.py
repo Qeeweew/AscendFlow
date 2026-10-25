@@ -20,6 +20,60 @@ from tests.models.structured_events import EventModelError, check_structured_eve
 EXAMPLE = Path(__file__).parents[2] / "examples/gemm/dense.py"
 
 
+@pytest.mark.parametrize("dtype", ("f16", "bf16"))
+@pytest.mark.parametrize("row_begin", (0, 32))
+def test_b16_strided_a_panel_uses_one_load3d_with_its_real_resident_pitch(dtype, row_begin):
+    from ascendflow import compile
+    from ascendflow import language as T
+
+    result = compile(
+        T.from_source(f"""
+def panel(X:T.Tensor((128,128),T.{dtype})):
+    with T.Kernel(kind="cube"):
+        a1=T.alloc_l1((128,128),T.{dtype})
+        a0=T.alloc_l0a((64,64),T.{dtype})
+        v=T.copy(X,a1)
+        T.copy(v[{row_begin}:{row_begin + 64},32:96],a0)
+""")
+    )
+    memory = collect_native_memory(result.plan)
+    load = next(t for t in memory.templates if t.spec.native == "load3d_a")
+    source, destination = load.spec.operands
+    assert (source.nbytes, source.rows, source.row_stride) == (2048, 4, 4096)
+    assert source.leading_rows == 128
+    assert destination.total_nbytes == 64 * 64 * 2
+    check_structured_events(
+        memory, logical_reference=collect_native_memory(parse(result.before_ir))
+    )
+    assert "npu_chunk" not in result.asc
+    assert result.asc.count("asc_copy_l12l0a(") == 1
+
+
+@pytest.mark.parametrize("dtype", ("f16", "bf16"))
+def test_b16_complete_b_panel_transposes_block_axes_with_one_load3d(dtype):
+    from ascendflow import compile
+    from ascendflow import language as T
+
+    result = compile(
+        T.from_source(f"""
+def panel(X:T.Tensor((128,128),T.{dtype})):
+    with T.Kernel(kind="cube"):
+        b1=T.alloc_l1((128,128),T.{dtype})
+        b0=T.alloc_l0b((128,128),T.{dtype})
+        v=T.copy(X,b1)
+        T.copy(v,b0)
+""")
+    )
+    memory = collect_native_memory(result.plan)
+    load = next(t for t in memory.templates if t.spec.native == "load3d_b_nn")
+    assert load.spec.operands[0].leading_rows == 128
+    check_structured_events(
+        memory, logical_reference=collect_native_memory(parse(result.before_ir))
+    )
+    assert "npu_chunk" not in result.asc
+    assert result.asc.count("asc_copy_l12l0b(") == 1
+
+
 @pytest.mark.parametrize("bk,k", [(16, 16), (16, 32), (16, 48), (32, 32), (64, 128)])
 def test_contiguous_nt_gemm_keeps_byte_versions_and_actual_event_consumption(tmp_path, bk, k):
     report = build_file(
@@ -132,7 +186,7 @@ def test_nz_column_slice_needs_fractal_alignment_even_when_bytes_are_aligned():
                 T.copy(x[:,8:24],a)
     """)
     memory = collect_native_memory(lower_native_structure(source).module)
-    with pytest.raises(CompileError, match="aligned L1 NZ rectangle"):
+    with pytest.raises(CompileError, match="aligned NZ rectangle"):
         admit_memory_bounds(memory)
 
 

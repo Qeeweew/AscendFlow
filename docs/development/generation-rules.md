@@ -133,6 +133,13 @@ rank；仅在配对本身需要参数特化时建立对应精确 case。完成�
 移到组末尾。全部 reader 和完整 effects 仍属于 lifetime；最后 reader 是同队列
 顺序已成立后的退休里程碑，不删除其他 reader。
 
+同一次完整 writer 的多个私有 cell 可以共享一个 persistent free credit，但所有
+原始 member lifetime、round 和 binding 继续保留。必须是相同 actor、相同 pipe
+路由、完全相同 acquire，且 release 的真实 scope、guard、坐标、family 和代次
+绑定完全一致；统一在同 pipe 实际 stage/lexical 最后的 reader 后归还。该 Set
+捕获 reader 完成前缀，下一次共同完整 writer 原本就要同时取得全部 cell。
+不同参与者、quorum、激活或 writer 不合并，不增加容量，也不重新建立访问事实。
+
 以上规则也适用于已经完整的跨核 quorum：每个 producer 的捕获都覆盖所需
 source，每个 receiver 的已有 acquire 都先于所需 consumer，才能复用。
 相同 Stage、ActorDomain 或共同写入某个 cell 都不授权合并独立完成边界；

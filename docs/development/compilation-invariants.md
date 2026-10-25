@@ -20,7 +20,7 @@
 保留协议的生命周期构造需要精确窗口。对已证明通用配对的域作合法参数特化时，
 保持其等价事实。配对成立不提供旧 Wait 消费或端口重入事实。环复用检查全部
 共同 clock 的精确窗口；同 actor 的单发布/单消费本地通知还可逐层证明任意两次
-实际使用之间的消费顺序，独立取得单 credit，不要求 dense rank。缺失窗口本身
+实际使用之间的消费顺序，独立取得有限本地环，不要求 dense rank。缺失窗口本身
 不授予复用。同步转移中的自由可达命题使用 Bool；直接前提
 传播保留实际 capture 路径，不将 source 的整数值或发射顺序当作完成事实。
 
@@ -66,6 +66,8 @@ SSA/代次。opcode、参数或地址 operand 数量改变必须更新描述，�
 源程序实际执行的访问及算术定义性属于 DSL 输入合同。编译器不证明全部
 动态原轴/byte bounds，也不要求所有 index 拥有 uniform extrema；静态非法
 原式仍在代数化简前诊断。typed SSA 保留实际执行语义，`Expr` 仅是可选分析视图。
+ASC 中 unsigned 除法/余数的中间运算在离开该 SSA 定义时恢复 index 的 int64 类型，
+包括内联表达式；其后有符号减法、比较和 min/max 不得继承 C++ unsigned promotion。
 
 存储检查保留真实 allocation、原轴线性化、native 子视图/行间空洞、对齐及容量。
 源索引作为 SSA 原子参与对应，不展开任意数据计算；不同 active domain 仍保留
@@ -85,10 +87,21 @@ stage 的纯复制在相同输入/坐标下可证明相等。执行 SSA 仍为�
 不能将其升级为循环非空、端点存在或完成证据。条件值在早期 publisher 尚未
 定义时，使用既有平衡的 queue-prefix 入口/出口，不提前读取条件，不添加统一 drain。
 
+已核验的 [L0C unitflag](unit-flags.md) word 单独覆盖参与访问的 RAW/WAR，
+不建立完整 native 或 pipe-prefix 完成。其条件 FIX 保留真实 reader，不为它
+提前捕获 metadata；全部其他访问、边界和 ownership 继续保留。flag 范围、
+完整 footprint、更新/消费激活及实际交替次序在访问顺序构造前建立一次，
+改变这些前提时失效。独立模型不把细粒度握手提升为 MAD.end→FIX.begin。
+
 空间 enclosure 可由合法源访问及已检查的布局对应建立，无需再证明源 bounds。
 它只提供保守空间分离，不改变真实 native 字节、不建立初始化、KILL 或 credit。
 区域关系未知或可选分析预算耗尽，保留 AliasRegion 及必要源码顺序；必要协议
 检查仍拒绝无法实现的 ownership、quorum、进展或有限事件资源。
+
+MAD 周期 reset 的数值初始化归纳可作用于环形槽。必须证明实际地址、激活和
+后代循环次数在整个 reset 区间内与其起点相同；仅在起点完整写入的同一 footprint
+才可供后续 RW 读取。该查询消费已有 loop/facts，保持真实 RW effects，不能
+提供异步完成、ownership 或最后 reader 退休；缺失起点或区间内换槽仍拒绝。
 
 二维前缀保留实际 count SSA 与静态容量，native 使用同一个 count。部分写不
 授权完整初始化；显式补零的 GM 部分读和 L1 完整写分别建模，禁止整块 DMA 多读。

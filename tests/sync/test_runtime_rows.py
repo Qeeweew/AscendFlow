@@ -8,7 +8,7 @@ from ascendflow import language as N
 from ascendflow.analysis.structured_memory import collect_native_memory
 from ascendflow.diagnostics import CompileError
 from ascendflow.passes.structured_sync import synchronize_structure
-from tests.fixtures.runtime_rows import fp32_padding, matrix_import, row_output
+from tests.fixtures.runtime_rows import fp32_padding, matrix_import, matrix_output, row_output
 from tests.models.structured_events import EventModelError, check_compiled_events
 from tests.support.structured import native_memory
 
@@ -158,6 +158,33 @@ def fragment(A:N.Tensor((16,32),N.bf16)):
     assert "1, 1, 32, 0, 32, 16, 1, 0" in result.asc
 
 
+@pytest.mark.parametrize("dtype", ("f16", "bf16", "f32"))
+def test_runtime_fix_preserves_nz_source_holes_and_exact_gm_rows(dtype):
+    from ascendflow import compile
+    from ascendflow.dialects.io import parse
+    from tests.models.structured_events import check_structured_events
+
+    definition = matrix_output(dtype)
+    result = compile(definition)
+    before = collect_native_memory(parse(result.before_ir))
+    after = collect_native_memory(result.plan)
+    for count in (0, 1, 7, 15, 16, 17):
+        checked = check_structured_events(
+            after, {"n": count}, logical_reference=before, invocations=2
+        )
+        for command in checked.natives:
+            if command.occurrence.operation.native.data != "fix_rows":
+                continue
+            reads = [s for s in command.spans if s.root.ref.type.bank.data == "L0C"]
+            writes = [s for s in command.spans if s.root.sym_name.data == "O"]
+            valid = min(count, 16)
+            assert [(s.start, s.end) for s in reads] == (
+                [(block * 1024, block * 1024 + valid * 64) for block in range(3)] if valid else []
+            )
+            assert sum(s.end - s.start for s in writes) == valid * 48 * (4 if dtype == "f32" else 2)
+    assert "asc_copy_l0c2gm" in result.asc
+
+
 def test_nd2nz_row_fragment_does_not_define_other_nz_rows():
     source = N.from_source("""
 def fragment(A:N.Tensor((16,32),N.bf16)):
@@ -169,6 +196,50 @@ def fragment(A:N.Tensor((16,32),N.bf16)):
 """)
     with pytest.raises(CompileError, match="initialized writer coverage"):
         synchronize_structure(source)
+
+
+@pytest.mark.parametrize("dtype", ("f16", "bf16", "f32"))
+@pytest.mark.parametrize("mode", ("padded", "runtime", "overlay"))
+def test_wide_nd2nz_preserves_partial_rows_and_column_blocks(dtype, mode):
+    from ascendflow import compile
+    from ascendflow.dialects.io import parse
+    from tests.models.structured_events import check_structured_events
+
+    itemsize = 4 if dtype == "f32" else 2
+    columns = 512
+    copy = {
+        "padded": "N.copy(A[:7,:509],x,pad_value=0)",
+        "runtime": "N.copy(A[:16,:509],x,valid_rows=N.min(n,16),pad_value=0)",
+        "overlay": "N.fill(x,0.0)\n        N.copy(A,x,valid_rows=N.min(n,16))",
+    }[mode]
+    source = N.from_source(f"""
+def wide(A:N.Tensor((16,{columns}),N.{dtype}), n:N.i64):
+    with N.Kernel(kind="cube"):
+        x=N.alloc_l1((16,{columns}),N.{dtype})
+        {copy}
+""")
+    result = compile(source)
+    before = collect_native_memory(parse(result.before_ir))
+    for rows in (0, 1, 15, 16):
+        execution = check_structured_events(
+            collect_native_memory(result.plan), {"n": rows}, logical_reference=before, invocations=2
+        )
+        count = 7 if mode == "padded" else rows
+        width = columns if mode == "overlay" else 509
+        commands = [
+            c for c in execution.natives if c.occurrence.operation.native.data.startswith("nd2nz")
+        ]
+        for command in commands:
+            reads = [s for s in command.spans if s.root.sym_name.data == "A"]
+            assert [(s.start, s.end) for s in reads] == [
+                (row * columns * itemsize, (row * columns + width) * itemsize)
+                for row in range(count)
+            ]
+            writes = [s for s in command.spans if s.root.ref.type.bank.data == "L1"]
+            assert sum(s.end - s.start for s in writes) == (
+                count * columns * itemsize if mode == "overlay" else 16 * columns * itemsize
+            )
+    assert "asc_copy_gm2l1_nd2nz" in result.asc
 
 
 @pytest.mark.parametrize("column,accepted", [(0, True), (32, False), (64, False)])

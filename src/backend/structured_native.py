@@ -30,7 +30,7 @@ class PrintTask:
     mask_iteration: str | None
 
 
-def format_native(template, *, render, roots, task_names, generation):
+def format_native(template, *, render, roots, cache_aliases, task_names, generation):
     def pointer(index, *, extra=""):
         geometry = template.spec.operands[index]
         # Geometry is shared; pointer identity and offset are final SSA values.
@@ -45,7 +45,12 @@ def format_native(template, *, render, roots, task_names, generation):
                 and owner.value.value.data == 0
             )
             offset = extra if zero else f"({offset} + {extra})"
-        return f"({QUALIFIER[geometry.bank]} {CTYPE[geometry.dtype]}*)({roots[operation.source]} + ({offset}))"
+        base = roots[operation.source]
+        if operation.cache_bypass is not None and operation.source in cache_aliases:
+            base = (
+                f"({render(operation.cache_bypass)} ? {cache_aliases[operation.source]} : {base})"
+            )
+        return f"({QUALIFIER[geometry.bank]} {CTYPE[geometry.dtype]}*)({base} + ({offset}))"
 
     operation = template.operation
     atoms = tuple(operation.refs[len(template.spec.operands) :])

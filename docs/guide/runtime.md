@@ -58,8 +58,10 @@ Vector、归一化、GEMM、attention 和 KDA 的生成 kernel 均走这两个 r
 
 ## 校验、复用与 stream
 
-默认每次 tensor 调用检查名称、dtype、rank、完整 shape、连续 linear 存储、映射设备及
+默认每次 tensor 调用检查名称、dtype、rank、完整 shape、连续存储、映射设备及
 runtime 标量合同。源码要求外部 disjoint 时还检查 tensor 字节区间。
+linear ABI 仅接受 ND 存储；外部 NZ ABI 要求实际 FRACTAL_NZ format 29。
+runtime 不把连续的逻辑 shape 当成打包布局证明，也不在绑定或执行时做格式转换。
 不执行隐式 cast、contiguous copy、clamp 或填充，也不检查 metadata 内容或逐次间接
 访问的动态边界；这些仍遵守[内存合同](../development/memory-contracts.md)。
 

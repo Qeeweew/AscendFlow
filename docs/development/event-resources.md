@@ -104,6 +104,19 @@ runtime ring 内不同 lane 的进一步共享仍须额外证明，不能由此�
 
 ## 环复用与 local 不干涉的组合理由
 
+当父调用中的 metadata 改变子循环次数，无法建立跨父调用的 dense rank 时，单发布、
+单消费、同 actor 的本地通知可直接证明任意两次实际使用的消费顺序。先尝试一个
+credit，再尝试以最内层真实 clock 为 phase 的有限环，宽度仍受每 bank 8 ID 限制。
+按两次使用的第一个不同共同 clock 分情况：该层推进任意正间隔，后代坐标独立，
+且两次 phase 对环宽同余。每种情况都必须证明旧 Wait 消费先于新 Set，包括父层
+重入、空调用及空隙。没有精确窗口、源码先后或同号本身均不提供许可。
+
+消费图可以选择单个父 invocation 内的子 FIRST/LAST 端口。`BoundaryCase` 只保存
+这类数学 case，参数须在选中的子树内不变，原条件与 metadata capture 随真实父
+坐标重新绑定；它不能充当跨父调用的 rank 或共享流窗口。全局 event family 继续
+要求 kernel-uniform 参数。有限证明 horizon 由真实 stage span 和候选环宽决定，
+后续任意间隔仍须由真实队列顺序连接；不展开 runtime 循环，不插入指令或 barrier。
+
 每维精确窗口用实际成员 rank 对该维宽度取余，再组成混合进位虚拟 lane。
 同 lane 的两个使用必定每维同余。取最外层不同的维度：普通 successor 由该维
 完整消费回传连接；跨 child invocation 则连接旧 LAST 与新 FIRST。中间同余

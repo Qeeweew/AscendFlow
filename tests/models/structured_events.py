@@ -99,6 +99,9 @@ class Command:
     issue: int = -1
     begin: int = -1
     end: int = -1
+    unit_flag: int = 0
+    cc_begin: int = -1
+    cc_end: int = -1
 
 
 @dataclass(frozen=True)
@@ -183,7 +186,7 @@ class _Interpret:
                     "actual runtime row count exceeds capacity",
                 )
                 if geometry.layout == "NZ":
-                    active_bytes = count * 32
+                    active_bytes = count * (64 if geometry.bank == "L0C" else 32)
                     active_rows = geometry.rows if count else 0
                 else:
                     active_rows = count
@@ -226,6 +229,11 @@ class _Interpret:
                 template.spec.engine,
                 spans=tuple(spans),
                 implicit=template.spec.implicit_completion,
+                unit_flag=(
+                    values[operation.refs[len(template.spec.operands)]]
+                    if template.spec.unit_flag == 1
+                    else template.spec.unit_flag
+                ),
                 registers=tuple(
                     (effect.register, effect.mode, effect.value)
                     for effect in template.spec.registers
@@ -474,6 +482,7 @@ def _causality(commands):
 
     local_sets, local_waits, cross_sets, cross_waits = (defaultdict(list) for _ in range(4))
     previous_counter = {}
+    unit_checks, unit_published, unit_released = defaultdict(list), {}, {}
     for command in commands:
         point = command.occurrence
         controller = point.group, point.actor
@@ -500,6 +509,48 @@ def _causality(commands):
         if queue is not None:
             edge(queues.get(queue), command.begin)
         edge(command.begin, command.end)
+        if command.unit_flag:
+            _check(kind == "native", "only native work may carry a unitflag")
+            command.cc_begin = node(point.label + ":L0C-begin")
+            command.cc_end = node(point.label + ":L0C-end")
+            edge(command.begin, command.cc_begin)
+            edge(command.cc_begin, command.cc_end)
+            edge(command.cc_end, command.end)
+            cc = tuple(
+                (s.storage, s.start, s.end)
+                for s in command.spans
+                if s.root.ref.type.bank.data == "L0C"
+            )
+            _check(cc, "unitflag native has no L0C accesses")
+            # Normalize contiguous physical rows independently of the compiler.
+            cc = tuple(sorted(cc, key=lambda item: item[1]))
+            _check(
+                all(a[0] == b[0] and a[2] == b[1] for a, b in pairwise(cc)),
+                "unitflag L0C plane has holes",
+            )
+            plane = cc[0][0], cc[0][1], cc[-1][2]
+            if pipe is Engine.M:
+                _check(command.unit_flag in {2, 3}, "invalid MAD unitflag")
+                _check(
+                    controller not in unit_published, "MAD intervenes before unitflag FIX consume"
+                )
+                previous = unit_checks[controller]
+                if previous:
+                    _check(previous[-1][1] == plane, "unitflag word interleaves planes")
+                    edge(previous[-1][0].cc_end, command.cc_begin)
+                else:
+                    edge(unit_released.get(controller), command.cc_begin)
+                previous.append((command, plane))
+                if command.unit_flag == 3:
+                    unit_published[controller] = command, plane
+            else:
+                _check(pipe is Engine.FIX and command.unit_flag == 3, "invalid unitflag consumer")
+                _check(controller in unit_published, "unitflag FIX has no publication")
+                publication, produced_plane = unit_published.pop(controller)
+                _check(produced_plane == plane, "unitflag FIX consumes a different plane")
+                edge(publication.cc_end, command.cc_begin)
+                unit_released[controller] = command.cc_end
+                unit_checks[controller].clear()
         controllers[controller] = command.issue
         if queue is not None:
             queues[queue] = command.begin
@@ -536,6 +587,10 @@ def _causality(commands):
             for source in sources:
                 cross_waits[point.group, source, point.actor, command.event].append(command)
 
+    _check(
+        not unit_published and not any(unit_checks.values()),
+        "unconsumed unitflag word at kernel exit/reentry",
+    )
     consumptions = []
     for sends, waits, name, counter in (
         (local_sets, local_waits, "binary event", False),
@@ -591,7 +646,7 @@ def _accesses(logical, physical, reach, order, ready_groups=None):
     boundaries = defaultdict(set)
     for key, command in expected.items():
         _check(
-            command.spans == actual[key].spans,
+            command.spans == actual[key].spans and command.unit_flag == actual[key].unit_flag,
             "physical projection changed an actual native address",
         )
         for span in command.spans:
@@ -636,8 +691,11 @@ def _accesses(logical, physical, reach, order, ready_groups=None):
             return
         storage, start, end = cell
         old, new = actual[source], actual[consumer]
+        cc = storage[0].ref.type.bank.data == "L0C"
+        old_end = old.cc_end if cc and old.unit_flag else old.end
+        new_begin = new.cc_begin if cc and new.unit_flag else new.begin
         _check(
-            bool(reach[old.end] & (1 << new.begin)),
+            bool(reach[old_end] & (1 << new_begin)),
             f"unordered physical {kind}: {storage[0].sym_name.data}[{start}:{end}] {source.label} -> {consumer.label}",
         )
         hazards.append(Hazard(kind, source, consumer, storage[0], start, end))
@@ -651,7 +709,13 @@ def _accesses(logical, physical, reach, order, ready_groups=None):
         # Independent clears may occupy a slot in a different order from
         # source traversal. Actual causal write order must still be total;
         # source RAW bindings below forbid any intervening wrong version.
-        versions.sort(key=lambda key: order[actual[key].begin])
+        versions.sort(
+            key=lambda key: order[
+                actual[key].cc_begin
+                if cell[0][0].ref.type.bank.data == "L0C" and actual[key].unit_flag
+                else actual[key].begin
+            ]
+        )
         following[cell, None] = versions[0]
         for old, new in pairwise(versions):
             require_order("WAW", cell, old, new)
@@ -742,6 +806,7 @@ def _reference_correspondence(memory, reference):
                 source.attributes[name] == actual.attributes[name]
                 for name in ("native", "params", "scalar")
             )
+            and source.unit_flag == actual.unit_flag
             and tuple(value.type for value in source.refs)
             == tuple(value.type for value in actual.refs),
             f"logical reference native contract changed: {uid}",

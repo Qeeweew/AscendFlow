@@ -330,6 +330,7 @@ class _Builder:
         parameter_bindings,
         *,
         ordered_definedness,
+        scoped_parameters=frozenset(),
     ):
         self.notification, self.loop, self.ordinal = notification, loop, ordinal
         self.facts, self.proves, self.bounds, self.invariant = facts, proves, bounds, invariant
@@ -344,14 +345,17 @@ class _Builder:
                 and bool(arguments(source))
                 and invariant(source)
                 and invariant(replacement)
-                and all(
-                    name in facts
-                    and (
-                        not is_coordinate(name)
-                        or isinstance(name, Symbol)
-                        and name.kind is SymbolKind.GROUP
+                and (
+                    source in scoped_parameters
+                    or all(
+                        name in facts
+                        and (
+                            not is_coordinate(name)
+                            or isinstance(name, Symbol)
+                            and name.kind is SymbolKind.GROUP
+                        )
+                        for name in arguments(source) | arguments(replacement)
                     )
-                    for name in arguments(source) | arguments(replacement)
                 ),
                 "event parameter bindings must contain only uniform input expressions",
             )
@@ -939,12 +943,15 @@ def build_event_window(
     invariant: Callable[[Expr], bool],
     ordered_definedness: OrderedDefinedness,
     parameter_bindings: Mapping[Expr, Expr] | None = None,
+    scoped_parameters: frozenset[Expr] = frozenset(),
 ) -> EventWindow:
     """Establish one concrete fiber, with optional uniform parameter specialization.
 
     The caller retains the parameter case that authorizes its bindings. The
     same substitution applies to actual guards, source count and domain hints.
     This builder never specializes a generation or creates parameter families.
+    scoped_parameters are established invocation-invariant mathematical case
+    inputs for child ports only; they do not authorize a global event rank.
     """
     return _Builder(
         notification,
@@ -958,4 +965,5 @@ def build_event_window(
         invariant,
         {} if parameter_bindings is None else parameter_bindings,
         ordered_definedness=ordered_definedness,
+        scoped_parameters=scoped_parameters,
     ).finish()

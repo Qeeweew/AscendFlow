@@ -26,7 +26,7 @@ def test_conditional_clear_keeps_the_accumulator_numerical_reader():
         "                value = T.matmul(aa, bb, accum=prior, initialize=(k == 0))",
     )
     result = compile(replace(reduction_gemm, source=source))
-    assert result.report["native_templates"] == 7
+    assert result.report["native_templates"] == 9
     assert result.asc.count("asc_mmad(") == 2
 
 

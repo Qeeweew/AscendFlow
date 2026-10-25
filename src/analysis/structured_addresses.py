@@ -23,7 +23,7 @@ from ..indexing import equivalent, exact_constant, normalize
 from ..scalar import Expr, Fact, expression, from_ssa, literal
 from ..symbols import Symbol
 from ..target.layout import NZLayout
-from ..target.native import ITEMSIZE, NativeGeometry
+from ..target.native import ITEMSIZE, NativeGeometry, nz_columns
 from .matrix_regions import MatrixRegion
 
 
@@ -99,13 +99,19 @@ class AddressFacts:
     def row_capacity(self):
         # Prefix counts are logical matrix rows. NZ represents those rows
         # as a byte prefix in each physical column-block segment.
-        return self.geometry.nbytes // 32 if self.geometry.layout == "NZ" else self.geometry.rows
+        if self.geometry.layout == "NZ":
+            return self.geometry.nbytes // self.row_bytes
+        return self.geometry.rows
+
+    @property
+    def row_bytes(self):
+        return nz_columns(self.geometry.bank, self.geometry.dtype) * ITEMSIZE[self.geometry.dtype]
 
     def prefix_span(self):
         if self.geometry.layout == "NZ":
             return expression(
                 "add",
-                expression("mul", self.valid_rows, literal(32)),
+                expression("mul", self.valid_rows, literal(self.row_bytes)),
                 literal((self.geometry.rows - 1) * self.geometry.row_stride),
             )
         return expression(
@@ -197,18 +203,16 @@ class StructuredAddresses:
 
         typ = operation.source.type
         layout = None
-        if typ.bank.data == "L1" and typ.layout.data == "NZ":
+        if typ.bank.data in {"GM", "L1"} and typ.layout.data == "NZ":
             if operation.source not in self._layouts:
                 root = operation.source.owner
                 require(
-                    root.matrix_shape is not None, "L1 NZ allocation lost its physical matrix shape"
+                    root.matrix_shape is not None, "NZ allocation lost its physical matrix shape"
                 )
                 layout = NZLayout(
                     tuple(v.data for v in root.matrix_shape), ITEMSIZE[typ.dtype.data]
                 )
-                require(
-                    layout.nbytes == root.nbytes.data, "L1 NZ layout differs from allocation size"
-                )
+                require(layout.nbytes == root.nbytes.data, "NZ layout differs from allocation size")
                 self._layouts[operation.source] = layout
             layout = self._layouts[operation.source]
         geometry = NativeGeometry(
@@ -248,7 +252,7 @@ class StructuredAddresses:
                 and len(axes.extents) == len(layout.shape)
                 and axes.displacement == 0
                 and tuple(v.constant for v in axes.extents) == layout.shape,
-                "L1 view must retain its allocation layout and original coordinates",
+                "NZ view must retain its allocation layout and original coordinates",
             )
             widths = list(map(literal, axes.widths))
             if valid_rows is not None:

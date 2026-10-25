@@ -65,6 +65,8 @@ class ScalarUses:
                     if metadata
                     else (owner.offset,)
                 )
+                if owner.cache_bypass is not None:
+                    operands += (owner.cache_bypass,)
             elif isinstance(owner, (scf.IfOp, scf.ForOp)):
                 mark(owner, family)
                 operands = tuple(owner.operands)

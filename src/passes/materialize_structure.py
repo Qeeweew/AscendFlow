@@ -18,7 +18,7 @@ from ..analysis.structured_schedule import Comparison, Placement, SyncAction
 from ..diagnostics import require
 from ..dialects.physical import BufferOp, CoreIdOp, EndOp, KernelOp, MixedOp, RuntimeSizeOp, TaskOp
 from ..dialects.structured import ActorDomainOp, NotificationOp, PipelineLoopOp
-from ..scalar import DIVISION, INT64_MAX, expression, literal
+from ..scalar import DIVISION, INT64_MAX, expression, literal, substitution
 from ..target.ascend910b import Actor
 from .simplify_scalars import _bounded_interval, _Scope
 
@@ -172,6 +172,12 @@ def materialize_notifications(
             if family == "vector":
                 owner = body.args[0]
         memo, ordinals = _bindings(memory, block, before, current)
+        if family == "cube" or not isinstance(root, MixedOp):
+            # This actual actor has SID zero. Event planning specializes
+            # captured metadata/scalar symbols, while the original SSA is
+            # still the same dominating evaluation at this insertion point.
+            specialize = substitution({memory.control.sid: literal(0)})
+            memo.update((specialize(expr), value) for expr, value in tuple(memo.items()))
         if owner is not None:
             memo[memory.control.sid] = owner
         frame = memory.control.frames[anchor]

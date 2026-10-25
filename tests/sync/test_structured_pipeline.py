@@ -92,11 +92,11 @@ def test_physical_order_is_projected_without_reordering_the_memory_templates():
     structure = lower_native_structure(batched_matmul)
     memory = collect_native_memory(structure.module)
     dispatch = bind_structured_dispatch(memory)
-    body = next(body for body in dispatch.bodies.values() if body)
-    assert memory.templates[0].spec.native == "nd2nz"
+    body = next(body for body in dispatch.bodies.values() if body and body[0].native == "fix")
+    assert [t.spec.native for t in memory.templates[:3]] == ["set_load3d", "set_fmatrix_a", "nd2nz"]
     assert body[0].native == "fix"  # The expert export-first issue policy.
     assert body[0].template is memory.templates[-1]
-    assert len(body) == len(memory.templates) == 6
+    assert len(body) == 6 and len(memory.templates) == 8
 
 
 def test_guarded_last_id_does_not_evaluate_empty_loop_remainder():

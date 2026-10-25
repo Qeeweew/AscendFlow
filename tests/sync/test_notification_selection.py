@@ -164,7 +164,11 @@ def test_selected_set_and_wait_existence_is_exact_for_empty_short_and_reentry(ac
             for point in points:
                 counter = Counter()
                 for key, context in traces[point.actor]:
-                    if key[0] is point.operation and point.guard.evaluate(context):
+                    if (
+                        key[0] is point.operation
+                        and (len(key) == 3 or key[-1] is point.placement)
+                        and point.guard.evaluate(context)
+                    ):
                         identity = tuple(
                             (e.args[0], point.expression(e).evaluate(context))
                             for e in sorted(free, key=lambda e: e.order_key)

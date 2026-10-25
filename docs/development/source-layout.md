@@ -41,6 +41,7 @@ compile / Compilation
     lower_native_structure                # DSL→source、静态原式诊断、native lowering
     collect_native_memory
     physical contracts → admission → dispatch
+    admit_unit_flags                      # 完整 L0C word；仅访问握手，不提供 queue prefix
     build_access_order                    # 唯一 dispatch/存储义务；region 队列端口和局部 packet
     generate_notifications
       bind_notifications                 # 先绑定原始义务，再选择/合并通知；保留 ownership edges
@@ -50,7 +51,7 @@ compile / Compilation
       bind_cell_credits                  # 稀疏私有轮次的端点与本地发射前提
       establish_queue_order              # 逐层 physical-step / phase 准入
       construct_cell_channels            # 物理 lifetime credit 归纳
-      HandbackRule                       # 有限/ring 或逐层任意间隔证明的本地单 credit
+      HandbackRule                       # 精确窗口或逐层任意间隔证明的有限本地环
     plan_event_resources                # 冻结首选/有限缩环、虚拟动作、复用及整组 FIFO
     allocate_structured_events          # 联合选择已证有限选项和编号，不查询域或 handback
     materialize_notifications
@@ -74,7 +75,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/structured_control.py`、`structured_memory.py`、`native.py` | 原始有序算术、真实地址/effects、绑定真实循环的条件读取；消费共享目标描述 |
 | `target/native.py` 的 `NativeSpec` | 一份不可变的 native opcode、参数、operand geometry/effects、寄存器读写及所需值、packet、read reset 与完成规则；逻辑分析和终端共享，不含地址/代次 |
 | `analysis/registers.py` | 每个 block 一次建立常量 SPR 输入要求/输出集合；序列、分支与循环组合，只提供定义事实 |
-| `target/layout.py`、`analysis/structured_addresses.py` | L1 NZ allocation 形状、C0、偏移与条带几何；解码一次并将物理 M 交给 native 和终端消费 |
+| `target/layout.py`、`analysis/structured_addresses.py` | GM/L1 NZ allocation 形状、C0、偏移与条带几何；解码一次并将物理 M 交给 native 和终端消费 |
 | `analysis/matrix_regions.py` | L1 全 rank 逻辑矩形、实际部分定义及 writer 来源、精确相邻拼接与固定连续遍历摘要；不含 ready、退休或事件事实 |
 | `analysis/smt.py`、`integer_facts.py`、`guard_cover.py` | 原式数学关系与条件覆盖共用 Z3 查询；有限规则使用隔离临时上下文，输出完整前提及实际支持规则的 owned implication；定义性和机器范围独立 |
 | `memo.py` | 编译作用域和分析对象拥有的自动 memoization；统一释放表，语义键由查询声明，可变事实仍按原职责失效 |
@@ -83,6 +84,7 @@ build_file                               # 同一链路 + CANN，单次进程组
 | `analysis/structured_access.py`、`structured_regions.py` | 按真实地址周期建立可选精确 cell 与可能别名的 AliasRegion；独立 RegisterCell 接入共同顺序传递，不伪造 tensor 字节或完整定义 |
 | `analysis/access_order.py`、`storage_packets.py`、`storage_word.py` | 可能冲突的 RAW/WAR/WAW、条件访问的并集及完整入口可用域、单次激活证明、共同队列端口、局部完整 packet 的实际复用 |
 | `analysis/local_schedule.py`、`structured_dispatch.py` | 按迭代域和 actor family 建立本地 stage 顺序与 horizon；派发消费该顺序并绑定 native、控制入口/出口的位置 |
+| `analysis/unit_flags.py` | 已有 memory/dispatch 上的 MAD/FIX 完整平面、flag 范围、发布/消费激活和交替 word；保留独立的 L0C RAW/WAR coverage，不提供整个 native 完成 |
 | `passes/notification_binding.py`、`analysis/structured_protocols.py` | 原始需求先拥有真实 source/consumer 和可选共同 ready，随后选择机制、复用已有 capture/acquire、建立完整 quorum；合并不替换原始 binding，不将新增 coverage 当作 ownership |
 | `analysis/acquired_prefixes.py` | 按真实激活类与层级发射 word 查询已有 capture/acquire pair；保留每个 participant 的 lexical 分段与原最早匹配，不扫描同 word 的全部获取历史，不提供事件消费资格 |
 | `analysis/position_words.py`、`protocol_transfers.py`、`completion_prefixes.py` | 共用层级位置和真实 Set/Wait 快照；候选图提出支持前沿，先接纳全部实际支持再发布覆盖；已有显式前提先沿实际路径传播，相关整数/分支关系再求解；单输入范围内联，合流与真实动作保留 Bool 状态；保留实际支持和独立 acquire 结论，完成和消费的 origin 分别保持 |
@@ -265,3 +267,7 @@ SSA 名称，`i1` 输出为 `bool`。unsigned 除法/余数按 opcode 显式转�
 `uint64_t`，不依赖范围分析决定执行含义。普通缓存的 launcher 只有 kernel 调用和
 `return 0`；显式 GM cache bypass 先查询目标 runtime 的同一 allocation 地址
 别名，错误直接返回。它不改变物理 root 或在 kernel 中增加同步。
+每次只读 GM copy 的 `cache_bypass` i1 operand 保留到 AddressOp，ScalarUses
+将其视为真实地址依赖。对每个需要的 external root 生成一份隐藏 device 别名，
+公开 host/Torch ABI 保持；普通和 bypass 地址继续使用相同 canonical allocation
+及已建立的 effects/ownership，详见 [缓存政策](memory-contracts.md#每次只读-gm-copy-的缓存政策)。

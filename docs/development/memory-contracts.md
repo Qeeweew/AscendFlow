@@ -118,6 +118,11 @@ L1 NZ 在逻辑矩阵坐标中保存实际部分定义及 writer 来源；相邻
 
 ## L1 NZ 布局与区域定义
 
+Load3D A/B 的矩阵寄存器宽度来自原 allocation 的 leading M，不能以请求的子矩阵
+行数替换。b16 A 的行切片及完整/跨行 B NN 面板可在保持同一真实访问字节后选择
+单条 Load3D，目标仍是紧凑 L0 平面。该 lowering 继续使用寄存器的真实读写、ready
+和退休事实，不扩大 effects，也不把配置值相同当作旧读取完成。
+
 L1 NZ allocation 在物理 `BufferOp.matrix_shape` 中保留原始完整 shape。前导轴是
 独立平面/slot，最后两轴是矩阵 M/N；`NZLayout` 统一给出容量、偏移和条带几何。
 FP16/BF16 的 C0=16，FP32 的 C0=8，每个行块均为 32 B。L0C 的 FP32 16 列
@@ -167,11 +172,24 @@ AliasRegion 和控制端口都不直接使用稳定物理 cell credit；它们�
 
 ## Runtime 行前缀
 
+外部只读 GM tensor 可显式声明 `layout="NZ"`，仅接受静态 FP16/BF16、最后两轴
+16 对齐的矩阵平面。allocation、AddressOp 与 memory effects 保留同一 NZLayout、
+leading M、列块间距及真实读取字节；GM→L1 原始 DMA 不隐式重排。
+部分静态 tile 可显式补零，目标 fill 后的内部 MTE2 fence 只建立同一 packet 内的顺序。
+原始 DMA 使用列块数 `N/16`、32 B burst 长度 `M` 和真实源/目标 leading M 间隙；
+不套用 Cube 计算块的 256 维限制。列块数至多 4095，burst/间隙必须落入原指令字段，
+完整目标仍受真实 L1 容量约束。
+
 二维 `copy(valid_rows=r)` 保留静态物理容量及实际 `r` 两种事实。AddressOp
 携带原始轴、容量和真实行数 SSA；native 同时消费同一行数。地址前缀与指令
 操作数不一致、静态非法行数或将前缀地址交给整块 native 时明确拒绝。
 实际 `0 <= r <= capacity` 是源操作输入合同，不要求编译器证明动态数据；
 0 行没有该侧访问。实际源算术仍须可定义，lowering 不得提前求值或丢掉前缀。
+
+L0C→GM 的 `fix_rows` 在两侧携带同一行数 SSA。源是完整 resident M 与最小包围 N0
+列块，每列块实际读 `r*64` 字节，列块间距为 `resident_M*64`；目标实际写 r 行、
+每行 N 个输出元素，行步长按元素对齐。0 行不发 FIX，不提供输出其余部分的初始化。
+它继承普通 FIX 的 FP32 配置、舍入、最后 reader 和退休合同，不能靠容量上界扩大 effects。
 
 GM→L1 的补零目标是完整写入；GM输入只有实际行数的读取。UB→GM 的目标
 只是部分写，不能把其容量上界当成完整初始化或整片 Tile producer。GM前缀
@@ -180,7 +198,9 @@ UB的保守读取上界仍保持真实最后 reader。有限执行模型按实�
 并覆盖零行、部分行、完整行和重入。
 
 GM→L1 不指定 `pad_value` 时，`copy(valid_rows=r)` 只覆盖目标的逻辑行前缀，
-其余目标保持。当前支持 FP16/BF16/FP32、C0 列对齐、至多 256 行/列的 L1 NZ view。
+其余目标保持。当前支持 FP16/BF16/FP32、C0 列对齐、至多 256 行的 L1 NZ view。
+ND2NZ 的 D 字段为 uint16，当前列数上界为 65520；补零/行前缀与完整搬运
+使用同一列宽限制，目标仍受真实 L1 容量约束，不能把计算块维度当作搬运面板上界。
 GM 读取是 ND 的 `r` 行；NZ 写入是每个列块内的 `r*32` 字节前缀，保留 resident
 行距和真实行偏移；GM 源步长使用对应 dtype 的元素单位。两侧 count 必须对应
 同一实际 SSA，0 行不发 DMA。单次部分写只定义真实矩形，多次部分写按上述区域
@@ -206,6 +226,25 @@ load 范围，按真实 SID 和各层实际坐标绑定一次。消去恒真 act
 未知区域关系可能减少可用并行性。固定排步不兼容、事件容量不足或控制协议
 不能组合时具体拒绝，不加全局 barrier 或改排步。普通 loop 出口没有统一 drain；
 kernel 最终退休仍独立保留。
+
+## 每次只读 GM copy 的缓存政策
+
+`copy(..., cache_bypass=p)` 的非缺省选择只接纳 external、read-only GM source。
+`p` 是 bool 常量或当前实际求值域内定义的 i1 SSA；source provenance、lowering、
+AddressOp 与 ScalarUses 保留同一个选择及其真实依赖，不以分析 Expr 替代执行值。
+缺省 `False` 不增加地址选择，继承原 Tensor 的缓存政策。该机制不适用于目的
+地址、可写 GM 或私有存储，不通过缓存政策授予写入或别名分离许可。
+
+后端对需要选择的每个 canonical GM root 只准备一份隐藏 device bypass pointer，
+由 host launcher 查询 `rtGetL2CacheOffset` 并加到原地址；错误直接返回。已经全局
+bypass 的 root 不重复准备别名。公开 host/Torch ABI 不增加参数；device ABI 的
+`device_cache_aliases` 记录这些 root。offset、原 allocation 身份、ND/NZ footprint、
+effects、初始化、版本、ownership、最后 reader 与退休义务均保持。
+两种地址访问同一真实内存，不能据此删除 RAW/WAR/WAW 或增加同步。
+
+独立有限模型检查混合普通/选择读取、空/单次/多轮/重入和双 AIV 的私有选择，
+ND/NZ 的实际 native 与事件同普通缓存版本一致。设备缓存政策的性能仍须对具体
+产物、输入和原始 CSV 验收；缓存别名支持不构成性能保证。
 
 ## 动态标量分支和 L1 初始化
 

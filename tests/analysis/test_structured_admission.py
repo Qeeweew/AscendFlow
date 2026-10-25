@@ -82,9 +82,9 @@ def _last_source(minimum, *, overwritten=False):
     "source,templates,reads",
     [
         (scale, 3, 3),
-        (batched_matmul, 6, 7),
-        (attention_target, 53, 102),
-        (N.from_source(SHARED, disjoint_external=True), 9, 13),
+        (batched_matmul, 8, 7),
+        (attention_target, 56, 102),
+        (N.from_source(SHARED, disjoint_external=True), 11, 13),
     ],
 )
 def test_real_dsl_admission_keeps_owned_facts_and_reuses_native_address_control(

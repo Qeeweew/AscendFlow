@@ -196,3 +196,76 @@ def test_conditional_rule_cannot_be_attached_to_a_non_rw_operand():
                 )
             ),
         )
+
+
+@pytest.mark.parametrize("period", (1, 2, 3, 8))
+def test_source_periodic_reset_lowers_to_the_existing_native_read_contract(period):
+    structure = _structure(f"N.matmul(aa,bb,accum=c0,initialize=(k%{period}==0))")
+    admission = _admit(structure)
+    template, accumulator = _accumulator(admission.memory)
+    assert template.spec.native == "mad_cycle"
+    assert template.spec.params == (16, 16, 16, period)
+    condition = accumulator.read_condition
+    for ordinal in range(2 * period + 1):
+        assert condition.kill.evaluate({condition.ordinal.args[0]: ordinal}) == (
+            ordinal % period == 0
+        )
+
+
+def test_source_periodic_reset_cannot_borrow_a_serial_descendant_clock():
+    with pytest.raises(CompileError, match="own pipeline"):
+        _structure(
+            "for inner in N.serial(2):\n    N.matmul(aa,bb,accum=c0,initialize=(inner%2==0))"
+        )
+
+
+@pytest.mark.parametrize("period", (2, 3, 8))
+def test_periodic_reset_initializes_a_ring_slot_held_for_the_complete_reset_interval(period):
+    structure = _structure(
+        f"N.matmul(aa,bb,accum=c0[(k//{period})%2,:,:],initialize=(k%{period}==0))",
+        ring=True,
+    )
+    admission = _admit(structure)
+    _, accumulator = _accumulator(admission.memory)
+    assert any(row.initialization is accumulator.read_condition for row in admission.reads)
+
+
+@pytest.mark.parametrize("slot_period,reset_period", ((2, 3), (3, 2), (1, 8)))
+def test_periodic_reset_cannot_initialize_a_slot_that_changes_inside_its_interval(
+    slot_period, reset_period
+):
+    with pytest.raises(CompileError, match="initialized writer coverage"):
+        _admit(
+            _structure(
+                f"N.matmul(aa,bb,accum=c0[(k//{slot_period})%2,:,:],initialize=(k%{reset_period}==0))",
+                ring=True,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "if k%3>0:\n    N.matmul(aa,bb,accum=c0[(k//3)%2,:,:],initialize=(k%3==0))",
+        "for inner in N.serial(k%3):\n    N.matmul(aa,bb,accum=c0[(k//3)%2,:,:],initialize=(k%3==0))",
+    ),
+)
+def test_periodic_ring_initialization_requires_an_executing_reset(body):
+    if body.startswith("for "):
+        structure = _structure(body.replace("initialize=(k%3==0)", "initialize=True"), ring=True)
+        _retarget(structure, 3)
+    else:
+        structure = _structure(body, ring=True)
+    with pytest.raises(CompileError, match="initialized writer coverage"):
+        _admit(structure)
+
+
+def test_activation_constant_through_each_reset_interval_can_select_complete_cycles():
+    admission = _admit(
+        _structure(
+            "if (k//3)%2==1:\n    N.matmul(aa,bb,accum=c0[(k//3)%2,:,:],initialize=(k%3==0))",
+            ring=True,
+        )
+    )
+    _, accumulator = _accumulator(admission.memory)
+    assert any(row.initialization is accumulator.read_condition for row in admission.reads)

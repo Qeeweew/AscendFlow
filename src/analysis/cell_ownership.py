@@ -45,9 +45,15 @@ class CreditRound:
 
 
 @dataclass(frozen=True, slots=True)
+class CellCreditMember:
+    lifetime: CellLifetime
+    rounds: tuple[CreditRound, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PersistentCellCredit:
     name: str
-    lifetime: CellLifetime
+    members: tuple[CellCreditMember, ...]
     rounds: tuple[CreditRound, ...]
 
 
@@ -59,12 +65,20 @@ class LocalCreditOrder:
 def infer_cell_lifetimes(builder):
     """Consume body interfaces and actual effects; never search execution paths."""
     groups, sparse_cells, incomplete_cells = {}, set(), set()
+    unitflag_roots = {
+        a.address.root
+        for t in builder.memory.templates
+        if t.spec.unit_flag
+        for a in t.accesses
+        if a.address.geometry.bank == "L0C"
+    }
     needs, raw_reads = {}, None
     control, dispatch = builder.memory.control, builder.dispatch
     root = builder.memory.module.body.block.first_op
     for loop, cell, body, period, _, sparse in builder.round_interfaces:
         if (
             not isinstance(cell, StorageCell)
+            or cell.root in unitflag_roots
             or cell.private is None
             or cell.streaming
             or cell.conditions
@@ -248,7 +262,10 @@ def bind_cell_credits(domains):
             actual = tuple(domains._instance(p, {}, case=case) for p in (acquire, release))
             tests = tuple(p.guard.comparisons for p in actual)
             require(
-                all(domains.arithmetic.ordered_definedness(t) is None for t in tests)
+                all(
+                    domains.arithmetic.ordered_definedness(t, domains.evaluated_scalars(p)) is None
+                    for t, p in zip(tests, actual, strict=True)
+                )
                 and all(
                     domains.arithmetic.queries.implies(all_of(*tests[i]), tests[1 - i]).proved
                     for i in range(2)
@@ -259,7 +276,62 @@ def bind_cell_credits(domains):
                 location=str(acquire.operation.location),
             )
             rounds.append(CreditRound(acquire, release))
-        credits.append(
-            PersistentCellCredit(f"persistent_cell_{len(credits)}", lifetime, tuple(rounds))
+        credits.append(CellCreditMember(lifetime, tuple(rounds)))
+    return _group_cell_credits(credits, domains), LocalCreditOrder(tuple(witnesses))
+
+
+def _group_cell_credits(members, domains):
+    """One common overwrite acquires all its cells after their last reader prefix.
+
+    Original cell lifetimes/bindings remain members. Only identical acquires
+    and coexecuting native releases in one dispatched scope may join. A Set
+    after the latest reader captures every earlier reader on that same pipe.
+    """
+    dispatch = domains.dispatch
+
+    def context(point):
+        site = dispatch.site(point.occurrence)
+        return (
+            site.scope.operation,
+            point.actor,
+            point.placement,
+            point.guard,
+            point.substitutions,
+            point.coordinate_guards,
+            point.families,
+            point.coordinates,
+            point.selected,
+            point.occurrence.bindings,
+            point.occurrence.families,
         )
-    return tuple(credits), LocalCreditOrder(tuple(witnesses))
+
+    groups = {}
+    for member in members:
+        lifetime = member.lifetime
+        key = (
+            lifetime.cell.private,
+            lifetime.source_engine,
+            lifetime.destination_engine,
+            tuple((r.acquire, context(r.release)) for r in member.rounds),
+        )
+        groups.setdefault(key, []).append(member)
+    credits = []
+    for group in groups.values():
+        rounds = []
+        for same_round in zip(*(member.rounds for member in group), strict=True):
+            release = max(
+                (r.release for r in same_round),
+                key=lambda p: (
+                    dispatch.site(p.occurrence).stage,
+                    dispatch.site(p.occurrence).lexical,
+                ),
+            )
+            rounds.append(CreditRound(same_round[0].acquire, release))
+        credits.append(
+            PersistentCellCredit(
+                f"persistent_cell_{len(credits)}",
+                tuple(group),
+                tuple(rounds),
+            )
+        )
+    return tuple(credits)

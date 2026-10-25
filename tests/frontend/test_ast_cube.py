@@ -18,7 +18,7 @@ from examples.gemm.batched import batched_matmul
 def test_cube_bf16_uses_the_same_explicit_storage_semantics():
     result = compile(batched_matmul.specialize(DTYPE=N.bf16, TRANSPOSE_B=False))
     assert "__cbuf__ bfloat16_t" in result.asc
-    assert result.report["native_templates"] == 6
+    assert result.report["native_templates"] == 9
 
 
 def test_ast_rejects_hidden_l0_recipe_and_dynamic_physical_allocation_shapes():

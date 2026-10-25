@@ -97,6 +97,22 @@ class _Emitter:
         self.buffers = tuple(op for op in plan.module.walk() if isinstance(op, BufferOp))
         self.roots = {op.ref: f"npu_buffer_{i}" for i, op in enumerate(self.buffers)}
         self.externals = tuple(op for op in self.buffers if op.external.data)
+        alias_roots = {
+            address.source
+            for native in plan.natives
+            for operand in native.operation.refs[: len(native.spec.operands)]
+            if isinstance((address := operand.owner), AddressOp)
+            and address.cache_bypass is not None
+            and _integer_constant(address.cache_bypass) != 0
+            and (address.source.owner.cache is None or address.source.owner.cache.data != "bypass")
+        }
+        self.cache_aliases = {
+            op.ref: self.roots[op.ref] + "_bypass" for op in self.externals if op.ref in alias_roots
+        }
+        require(
+            len(self.cache_aliases) == len(alias_roots),
+            "cache aliases must retain their original external GM root",
+        )
         self.parameters = tuple(op for op in plan.module.walk() if isinstance(op, RuntimeSizeOp))
         self.workspace = WorkspaceLayout(self.buffers)
         self.work.workspace = self.workspace.metadata
@@ -163,6 +179,11 @@ class _Emitter:
             assert isinstance(operation, arith.CeilDivUIOp)
             a, b = f"uint64_t({a})", f"uint64_t({b})"
             code = f"({a} / {b} + ({a} % {b} != 0))"
+        if isinstance(operation, (arith.DivUIOp, arith.RemUIOp, arith.CeilDivUIOp)):
+            # The operation is unsigned, but its index SSA result has the same
+            # int64 representation as a named binding. Inlining must not leak
+            # uint64 into later signed subtraction, min/max or comparisons.
+            code = f"int64_t({code})"
         # Inline single-use integer SSA and small predicates at their actual
         # use. Their operands are immutable SSA bindings in this lexical
         # invocation; no load, floating arithmetic or effect is rematerialized.
@@ -242,6 +263,7 @@ class _Emitter:
             template,
             render=lambda value: self.scalar(value, local),
             roots=self.roots,
+            cache_aliases=self.cache_aliases,
             task_names=self.task_names,
             generation=generation,
         )
@@ -431,6 +453,7 @@ class _Emitter:
         name = self.root.sym_name.data
         require(name.isascii() and name.isidentifier(), "kernel name is not a C identifier")
         signature = [f"__gm__ uint8_t* {self.roots[op.ref]}" for op in self.externals]
+        signature.extend(f"__gm__ uint8_t* {name}" for name in self.cache_aliases.values())
         if self.workspace.slices:
             signature.append("__gm__ uint8_t* npu_workspace")
         signature.extend(f"int64_t npu_size_{op.sym_name.data}" for op in self.parameters)
@@ -537,6 +560,10 @@ def _emit_owned(plan, *, host_launcher=True, work=None):
     work.abi = launch_abi(
         plan.structure.source, emitter.externals, emitter.parameters, emitter.workspace
     )
+    if emitter.cache_aliases:
+        work.abi["device_cache_aliases"] = [
+            op.sym_name.data for op in emitter.externals if op.ref in emitter.cache_aliases
+        ]
     return emitter.render(
         executable=True,
         host_launcher=host_launcher,
@@ -556,7 +583,6 @@ def _launcher(emitter):
     arguments = [f"(uint8_t*)arg_{name}" for name in buffer_names]
     if emitter.workspace.slices:
         signature.append("void* npu_workspace")
-        arguments.append("(uint8_t*)npu_workspace")
     signature += [f"int64_t npu_size_{op.sym_name.data}" for op in emitter.parameters]
     bypass = {
         i
@@ -564,7 +590,7 @@ def _launcher(emitter):
         if buffer.cache is not None and buffer.cache.data == "bypass"
     }
     cache_setup, declarations = [], []
-    if bypass:
+    if bypass or emitter.cache_aliases:
         declarations = [
             'extern "C" int32_t rtGetDevice(int32_t*);',
             'extern "C" int32_t rtGetL2CacheOffset(uint32_t, uint64_t*);',
@@ -580,6 +606,13 @@ def _launcher(emitter):
         ]
         for i in bypass:
             arguments[i] = f"(uint8_t*)(uintptr_t(arg_{buffer_names[i]}) + npu_l2_offset)"
+        arguments.extend(
+            f"(uint8_t*)(uintptr_t(arg_{op.sym_name.data}) + npu_l2_offset)"
+            for op in emitter.externals
+            if op.ref in emitter.cache_aliases
+        )
+    if emitter.workspace.slices:
+        arguments.append("(uint8_t*)npu_workspace")
     arguments += [f"npu_size_{op.sym_name.data}" for op in emitter.parameters]
     groups = 1 if root.blocks is None else root.blocks.data
     resources = root.attributes.get("device_resources")

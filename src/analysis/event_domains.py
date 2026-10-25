@@ -12,6 +12,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
+from xdsl.ir import Operation
+
 from ..diagnostics import CompileError, ErrorKind, require
 from ..dialects.physical import TaskOp
 from ..indexing import arguments
@@ -69,6 +71,18 @@ class EventCase:
 
     def specialize(self, value):
         return substitute(value, dict(self.substitutions))
+
+
+@dataclass(frozen=True, eq=False)
+class BoundaryCase(EventCase):
+    """Exact child ports in one parent invocation, never an event rank.
+
+    Parameters may vary between parent calls. Their unspecialized condition
+    must follow the actual parent coordinates at every selected boundary.
+    These cases are only inputs to retained-action consumption proofs.
+    """
+
+    scope: Operation | None = field(kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +472,29 @@ class EventDomains:
     def _ambient(self, placement):
         return tuple(test for test, _ in self._guarded_inputs(placement))
 
+    @memoized_method
+    def evaluated_scalars(self, placement):
+        """Actual dominating SSA evaluations at this participant's endpoint.
+
+        Original loop bounds and guards are reused, not re-evaluated when a
+        local lifetime is formed. This does not authorize new arithmetic at
+        an earlier or wider insertion point.
+        """
+        before = (
+            placement.operation
+            if placement.placement in {Placement.BEFORE, Placement.ENTRY}
+            else placement.operation.next_op
+        )
+        bindings = {
+            self.control.loops[loop].ordinal: value for loop, value in placement.coordinates
+        }
+        bindings[self.control.sid] = literal(1 if placement.actor is Actor.AIV1 else 0)
+        translate = substitution(bindings)
+        return frozenset(
+            translate(self.control.environment.expression(value))
+            for value in self.control.dominating_scalars(placement.operation.parent, before)
+        )
+
     def _input_ranges(self, placement):
         """Load contracts known when this actual endpoint executes.
 
@@ -782,6 +819,10 @@ class EventDomains:
         a new range/definedness query or an asynchronous completion fact.
         """
         require(not case.empty, "an empty event case has no selected boundary")
+        require(
+            not isinstance(case, BoundaryCase) or case.scope is loop,
+            "child boundary case used outside its actual parent invocation",
+        )
         key = notification, case, loop, offset, last
         if key in self._boundary_instances:
             self.work.boundary_instance_reuses += 1
@@ -806,10 +847,16 @@ class EventDomains:
             membership = case.windows[0].project_exists().guard.comparisons
         else:
             membership = self.tests[notification]
+        conditions = case.condition.comparisons
+        if isinstance(case, BoundaryCase):
+            conditions = tuple(
+                Comparison(substitute(t.lhs, bindings), t.predicate, substitute(t.rhs, bindings))
+                for t in conditions
+            )
         guard = ActionGuard(
             tuple(
                 dict.fromkeys(
-                    case.condition.comparisons
+                    conditions
                     + tuple(
                         Comparison(
                             substitute(case.specialize(test.lhs), bindings),

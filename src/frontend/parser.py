@@ -416,6 +416,7 @@ class _Parser:
                 typ.shape,
                 typ.dtype,
                 "GM",
+                layout=typ.layout,
                 name=arg.arg,
                 access=typ.access,
                 cache=typ.cache,

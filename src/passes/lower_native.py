@@ -161,13 +161,9 @@ class _Lowerer:
         self.needs_fp32 = any(
             isinstance(op, MatmulOp) and op.a.type.dtype.data == "f32" for op in source.walk()
         )
-        self.load3d_a = (
-            self.needs_fp32
-            or any(recipes.strided_b_width(op) is not None for op in source.walk())
-            or any(
-                recipes.compact_a_width(op) is not None and op.source.type.dtype.data == "f32"
-                for op in source.walk()
-            )
+        self.load3d_a = self.needs_fp32 or any(
+            recipes.load3d_b_width(op) is not None or recipes.load3d_a_width(op) is not None
+            for op in source.walk()
         )
         self.register_uses = []
         self.ready_groups = {}
@@ -263,7 +259,7 @@ class _Lowerer:
             "initialized": IntAttr(int(op.access.data in {"read", "read_write"})),
             "access": op.access,
         }
-        if op.ref.type.memory.data == "L1" and op.ref.type.layout.data == "NZ":
+        if op.ref.type.memory.data in {"GM", "L1"} and op.ref.type.layout.data == "NZ":
             attrs["matrix_shape"] = ArrayAttr(IntAttr(n.data) for n in op.ref.type.shape)
         if op.write_disjoint is not None:
             attrs["write_disjoint"] = op.write_disjoint
@@ -303,7 +299,7 @@ class _Lowerer:
             mask_iteration=None,
             mask_layout=None,
         ):
-            self.needs_fix |= native in {"fix", "fix16"}
+            self.needs_fix |= native in {"fix", "fix_rows", "fix16"}
             scalar_operands = tuple(operands)
             if native in {"mad_first", "mad_cycle"}:
                 require(scope.pipeline is not None, "native reset needs its logical ordinal")
@@ -322,6 +318,13 @@ class _Lowerer:
                 ),
                 **({} if mask_layout is None else {"mask_layout": StringAttr(mask_layout)}),
             }
+            if isinstance(op, MatmulOp):
+                flag = self.scalar(op.unit_flag, scope)
+                if not isinstance(flag.owner, arith.ConstantOp) or flag.owner.value.value.data != 0:
+                    attributes["unit_flag"] = IntAttr(1)
+                    scalar_operands = (flag, *scalar_operands)
+            elif isinstance(op, CopyOp) and op.unit_flag is not None:
+                attributes["unit_flag"] = op.unit_flag
             task = TaskOp.build(
                 operands=[(*refs, *scalar_operands)],
                 attributes=attributes,
@@ -356,6 +359,11 @@ class _Lowerer:
                 roots=self.roots,
                 append=scope.block.add_op,
                 matrix=matrix,
+                cache_bypass=(
+                    self.scalar(op.cache_bypass, scope)
+                    if isinstance(op, CopyOp) and value is op.source and op.cache_bypass is not None
+                    else None
+                ),
             )
 
         if self.index_facts is None:
@@ -421,18 +429,27 @@ class _Lowerer:
         if isinstance(predicate, arith.CmpiOp) and scope.pipeline is not None:
             values = predicate.operands
             coordinate = scope.pipeline.body.block.args[0]
-            other = next((value for value in values if value is not coordinate), None)
-            if (
-                predicate.predicate.value.data == 0
-                and coordinate in values
-                and other is not None
-                and isinstance(other.owner, arith.ConstantOp)
-                and other.owner.value.value.data == 0
-            ):
-                return "first"
+            if predicate.predicate.value.data == 0:
+                for value, other in (values, tuple(reversed(values))):
+                    if (
+                        not isinstance(other.owner, arith.ConstantOp)
+                        or other.owner.value.value.data != 0
+                    ):
+                        continue
+                    if value is coordinate:
+                        return "first"
+                    remainder = value.owner
+                    if (
+                        isinstance(remainder, arith.RemUIOp)
+                        and remainder.lhs is coordinate
+                        and isinstance(remainder.rhs.owner, arith.ConstantOp)
+                        and remainder.rhs.owner.value.value.data > 0
+                    ):
+                        return recipes.PeriodicInitialization(remainder.rhs.owner.value.value.data)
         _unsupported(
             False,
-            "matmul initialization needs a constant or its own pipeline's first logical iteration",
+            "matmul initialization needs a constant, its own pipeline's first logical iteration, "
+            "or a positive constant period on that iteration",
             op,
         )
 

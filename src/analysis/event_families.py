@@ -78,17 +78,18 @@ def _periodic_range(value, arithmetic, assumptions):
     )
 
 
-def _partition(domains, notification, loop, branch, unresolved):
+def _partition(domains, notification, loop, branch, unresolved, *, uniform_scope):
     arithmetic, control = domains.arithmetic, domains.control
     ordinal = control.loops[loop].ordinal
-    root = domains.memory.module.body.block.first_op
     assumptions = branch.condition.comparisons
     for test in unresolved:
         if arithmetic.prove(test, assumptions) or arithmetic.prove(_negative(test), assumptions):
             continue
         for parameter, periodic in ((test.lhs, test.rhs), (test.rhs, test.lhs)):
             parameter = arithmetic.bounded(parameter)
-            if parameter.constant is not None or not control.invariant_over(parameter, root):
+            if parameter.constant is not None or not control.invariant_over(
+                parameter, uniform_scope
+            ):
                 continue
             # A case condition cannot borrow a loop's activation prefix.
             if (
@@ -150,9 +151,38 @@ def _partition(domains, notification, loop, branch, unresolved):
 
 
 def build_event_family(domains, notification):
-    from .event_domains import EventCase
+    return _build_family(
+        domains,
+        notification,
+        domains.clocks[notification],
+        uniform_scope=domains.memory.module.body.block.first_op,
+    )
 
+
+def build_boundary_family(domains, notification, scope):
+    """Select descendants while keeping the real parent invocation unprojected.
+
+    No rank across parent calls is constructed. A parameter only needs to be
+    fixed over the selected child subtree; its actual capture and case guard
+    are rebound to each parent coordinate by EventDomains._boundary.
+    """
     clocks = domains.clocks[notification]
+    if scope is not None:
+        clocks = tuple(
+            loop
+            for loop in clocks
+            if loop is not scope
+            and any(frame.operation is scope for frame in domains.control.frames[loop].ancestors())
+        )
+    uniform = clocks[0] if clocks else domains.memory.module.body.block.first_op
+    return _build_family(
+        domains, notification, clocks, uniform_scope=uniform, boundary=True, scope=scope
+    )
+
+
+def _build_family(domains, notification, clocks, *, uniform_scope, boundary=False, scope=None):
+    from .event_domains import BoundaryCase, EventCase
+
     pending, result = [_Branch()], []
     constructions = 0
     # A fact is reusable only with the same complete premises and specialized
@@ -206,9 +236,17 @@ def build_event_family(domains, notification):
                                 value, loop
                             ),
                             parameter_bindings=bindings,
+                            scoped_parameters=frozenset(bindings) if boundary else frozenset(),
                         )
                     except WindowPartitionRequired as request:
-                        split = _partition(domains, notification, loop, branch, request.tests)
+                        split = _partition(
+                            domains,
+                            notification,
+                            loop,
+                            branch,
+                            request.tests,
+                            uniform_scope=uniform_scope,
+                        )
                         break
                     established[key] = window
                 windows[loop] = window
@@ -232,12 +270,13 @@ def build_event_family(domains, notification):
             pending.extend(reversed(split))
             continue
         result.append(
-            EventCase(
+            (BoundaryCase if boundary else EventCase)(
                 branch.condition,
                 branch.substitutions,
                 () if empty else tuple(windows[loop] for loop in clocks),
                 () if empty else tuple(projections),
                 empty,
+                **({"scope": scope} if boundary else {}),
             )
         )
     domains.work.parameter_cases += len(result)

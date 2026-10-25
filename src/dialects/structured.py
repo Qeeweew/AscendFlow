@@ -13,6 +13,7 @@ from xdsl.dialects.builtin import (
     IndexType,
     IntAttr,
     StringAttr,
+    i1,
 )
 from xdsl.irdl import (
     AttrSizedOperandSegments,
@@ -30,7 +31,7 @@ from xdsl.irdl import (
 from xdsl.traits import RecursiveMemoryEffect
 from xdsl.utils.exceptions import VerifyException
 
-from ..target.native import nz_columns
+from ..target.native import ITEMSIZE, nz_columns
 from .types import AsyncEffects, RefType, TaskType
 
 
@@ -200,6 +201,7 @@ class AddressOp(IRDLOperation):
     origins = var_operand_def(IndexType)
     extents = var_operand_def(IndexType)
     valid_rows = opt_operand_def(IndexType)
+    cache_bypass = opt_operand_def(i1)
     nbytes = attr_def(IntAttr)
     rows = attr_def(IntAttr)
     row_stride = attr_def(IntAttr)
@@ -217,6 +219,13 @@ class AddressOp(IRDLOperation):
             raise VerifyException("address source must be its original BufferOp allocation root")
         if self.ref.type != self.source.type:
             raise VerifyException("address must preserve its allocation reference type")
+        if self.cache_bypass is not None and (
+            owner.ref.type.bank.data != "GM"
+            or not owner.external.data
+            or owner.access is None
+            or owner.access.data != "read"
+        ):
+            raise VerifyException("cache bypass requires an external read-only GM source")
         width, rows, stride = self.nbytes.data, self.rows.data, self.row_stride.data
         if width <= 0 or rows <= 0 or stride < 0 or (rows > 1 and stride < width):
             raise VerifyException("address needs positive row width/count and non-overlapping rows")
@@ -253,18 +262,22 @@ class AddressOp(IRDLOperation):
             )
             nz = (
                 (
-                    self.source.type.bank.data == "L1"
+                    self.source.type.bank.data in {"L1", "L0C"}
                     and self.source.type.layout.data == "NZ"
                     and self.source.type.dtype.data in {"f16", "bf16", "f32"}
-                    and width == widths[axes[0]] * 32
-                    and rows * nz_columns("L1", self.source.type.dtype.data) == widths[axes[1]]
+                    and width
+                    == widths[axes[0]]
+                    * nz_columns(self.source.type.bank.data, self.source.type.dtype.data)
+                    * ITEMSIZE[self.source.type.dtype.data]
+                    and rows * nz_columns(self.source.type.bank.data, self.source.type.dtype.data)
+                    == widths[axes[1]]
                 )
                 if len(axes) == 2
                 else False
             )
             if len(axes) != 2 or self.displacement.data != 0 or not (linear or nz):
                 raise VerifyException(
-                    "runtime row prefixes require an original linear or L1 NZ matrix view"
+                    "runtime row prefixes require an original linear, L1 NZ or L0C NZ matrix view"
                 )
 
 

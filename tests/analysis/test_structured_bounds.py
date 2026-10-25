@@ -87,6 +87,7 @@ def _address(
             tuple(_index(block, value) for value in origins),
             tuple(_index(block, value) for value in extents),
             None,
+            None,
         ],
         attributes={
             "nbytes": IntAttr(nbytes),
@@ -411,6 +412,7 @@ def test_multirow_subview_needs_each_native_row_inside_an_original_row(rows, pit
 def test_same_address_uses_the_maximum_native_alignment_without_losing_actual_scope():
     block = Block()
     gm = _buffer(block, "GM", 512, dtype="f16", layout="NZ")
+    gm.attributes["matrix_shape"] = ArrayAttr([IntAttr(16), IntAttr(16)])
     l1 = _buffer(block, "L1", 512, dtype="f16", layout="NZ")
     l1.attributes["matrix_shape"] = ArrayAttr([IntAttr(16), IntAttr(16)])
     l0 = _buffer(block, "L0A", 512, dtype="f16", layout="ZZ")
@@ -421,7 +423,8 @@ def test_same_address_uses_the_maximum_native_alignment_without_losing_actual_sc
         "axes": (0, 1),
         "nbytes": 512,
     }
-    source, shared, destination = (_address(block, root, **geometry) for root in (gm, l1, l0))
+    source = _address(block, gm, **geometry, row_stride=512)
+    shared, destination = (_address(block, root, **geometry) for root in (l1, l0))
     _task(block, "copy", source, shared)
     _task(block, "copy", shared, destination)
     memory = collect_native_memory(_module(block, core="aic"))

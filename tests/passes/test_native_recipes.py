@@ -59,7 +59,7 @@ class Insertion:
             source = owner.source
         byte_offset = arith.ConstantOp.from_int_and_width(offset, IndexType())
         view = AddressOp.build(
-            operands=[source, byte_offset.result, [], [], None],
+            operands=[source, byte_offset.result, [], [], None, None],
             result_types=[source.type],
             attributes={
                 "nbytes": IntAttr(nbytes),

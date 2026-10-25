@@ -265,14 +265,14 @@ class ControlFacts:
         Unknown scalar carry/results have no invariance contract merely
         because their expression lacks this loop's ordinal symbol.
         """
-        names, metadata = self._invariant_input(operation)
+        names, captured = self._invariant_input(operation)
         return all(
             name in names
             or isinstance(name, Symbol)
             and name.kind in {SymbolKind.PREDICATE, SymbolKind.SELECTION}
             or isinstance(name, Symbol)
-            and name.kind is SymbolKind.METADATA
-            and name._identity in metadata
+            and name.kind in {SymbolKind.METADATA, SymbolKind.CARRY}
+            and (name.kind, name._identity) in captured
             for name in value.variables
         )
 
@@ -294,11 +294,11 @@ class ControlFacts:
                     symbol = self.environment.expression(operation.value).args[0]
                     if all(arguments(value) <= names for value in symbol.captures):
                         names.add(symbol)
-        metadata = {
-            name._identity
+        captured = {
+            (name.kind, name._identity)
             for name in names
             if isinstance(name, Symbol)
-            and name.kind is SymbolKind.METADATA
+            and name.kind in {SymbolKind.METADATA, SymbolKind.CARRY}
             and name.origin is not None
         }
         # Actor/ancestor selection specializes the capture coordinates, not
@@ -306,7 +306,7 @@ class ControlFacts:
         # dependency recursively: all must still be fixed in this invocation.
         # A load defined inside the queried loop has no visible origin here,
         # even if someone substitutes a constant for its captured ordinal.
-        return frozenset(names), frozenset(metadata)
+        return frozenset(names), frozenset(captured)
 
 
 def build_control_facts(module: ModuleOp) -> ControlFacts:

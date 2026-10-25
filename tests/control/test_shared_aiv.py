@@ -20,9 +20,10 @@ def test_mixed_ir_has_one_vector_body_one_sid_and_shared_gm_root():
     plan = lower_native_structure(N.from_source(SHARED, disjoint_external=True))
     assert isinstance(plan.module.body.block.first_op, MixedOp)
     domains = tuple(op for op in plan.module.walk() if isinstance(op, ActorDomainOp))
-    assert [domain.kind.data for domain in domains] == ["cube", "vector"]
-    assert sum(isinstance(op, TaskOp) for op in domains[1].walk()) == 3
-    assert plan.work["native_templates"] == 9  # vector tasks are not doubled
+    assert [domain.kind.data for domain in domains] == ["cube", "cube", "vector"]
+    cube, vector = domains[1:]
+    assert sum(isinstance(op, TaskOp) for op in vector.walk()) == 3
+    assert plan.work["native_templates"] == 11  # vector tasks are not doubled
     assert len(plan.loops) == 1
     assert [op.kind.data for op in plan.source.walk() if isinstance(op, DomainOp)] == [
         "cube",
@@ -33,14 +34,12 @@ def test_mixed_ir_has_one_vector_body_one_sid_and_shared_gm_root():
         for op in plan.module.walk()
         if isinstance(op, BufferOp) and op.sym_name.data == "Scratch"
     )
-    cube_fix = next(
-        op for op in domains[0].walk() if isinstance(op, TaskOp) and op.native.data == "fix"
-    )
+    cube_fix = next(op for op in cube.walk() if isinstance(op, TaskOp) and op.native.data == "fix")
     vector_copy = next(
-        op for op in domains[1].walk() if isinstance(op, TaskOp) and op.native.data == "copy"
+        op for op in vector.walk() if isinstance(op, TaskOp) and op.native.data == "copy"
     )
     assert cube_fix.refs[1].owner.source is vector_copy.refs[0].owner.source is shared
-    assert plan.task_scopes[vector_copy].operation is domains[1]
+    assert plan.task_scopes[vector_copy].operation is vector
     assert dump(parse(dump(plan.module))) == dump(plan.module)
 
 

@@ -10,7 +10,7 @@
 |---|---|
 | `@T.prim_func` | 捕获源码、参数及位置 |
 | `@T.inline` | 词法作用域的透明 AST 内联；不执行 Python helper |
-| `T.Tensor` | 外部 tensor 的 shape、元素类型与访问权限 |
+| `T.Tensor` | 外部 tensor 的 shape、元素类型、访问权限与 layout（默认 linear） |
 | `T.get_core_num("cube"/"vector"/"mixed")` | host 绑定的 constexpr 核数；cube/mixed 返回 AIC 数，vector 返回 AIV 数，与 CANN 一致 |
 | `T.i32` / `T.i64` | 统一整数类型；均可作 GM/UB tensor 元素类型，runtime 参数目前只支持 `T.i64` |
 | `T.i64(minimum=1, multiple_of=B)` | 调用方满足的runtime输入合同；不变成编译期常量，不生成launcher检查 |
@@ -33,7 +33,8 @@
 | `alloc_workspace(shape, dtype=f32, slots=S)` | 内部、入口未初始化的 GM tensor；allocation 起点自动按 512 B 对齐 |
 | `alloc_*(shape, dtype, slots=S)`、`slotted_view(view, axis=0)` | 明确槽轴与每槽 payload，绑定已有 view 时不增加存储 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
-| `copy(..., valid_rows=r)` | 二维 runtime 行前缀；GM→L1 可补零或保留其余 NZ 行，UB→GM 部分写 |
+| `copy(..., valid_rows=r)` | 二维 runtime 行前缀；GM→L1 可补零或保留其余 NZ 行，UB/L0C→GM 部分写 |
+| `copy(..., cache_bypass=p)` | 本次只读 external GM copy 的 L2 bypass 选择；p 为 bool 常量或实际 i1 SSA |
 | `alloc_mask(shape, slots=S)` | 显式 UB packed predicate 存储，每槽的64 lane占一个32 B块；不指定slots时为普通存储 |
 | `fill(destination, value)` | 连续 f32/f16/bf16 UB view 的完整写入；b16 使用精确 16 位 Vector Dup |
 | `arange(n)`、比较、`& \| ~` | 精确整数逻辑 lane 坐标与带shape谓词，支持singleton轴广播 |
@@ -43,6 +44,17 @@
 | `fill/mul/add/sub/div/maximum/exp/sqrt/rsqrt(..., mask=p)` | 显式谓词更新；mask=False lane保留目标旧值 |
 
 本地 stage 偏移、buffer slot 数、event width 互不等同。没有 `stages=` 声明。`cube.task/vector.task`已经移除且不恢复兼容。内部physical Task IR不属于旧公开语法。
+
+只读外部权重可声明 `T.Tensor((E,K,N), T.bf16, layout="NZ")`。当前要求静态
+FP16/BF16 矩阵平面、最后两轴为 16 的倍数；调用方提供已打包 FRACTAL_NZ 存储。
+GM→L1 原始 DMA 保留列块间距，不隐式执行 ND2NZ，不支持 runtime NZ 行前缀读取。
+
+`copy(source, destination, cache_bypass=predicate)` 按本次读取的实际谓词选择同一
+allocation 的 L2 bypass 地址。缺省 `False` 继承 Tensor 的缓存政策；`True` 或
+runtime i1 谓词仅用于只读 external GM source。它适用于 ND 和 NZ，不改变 layout、
+真实访问或同步，不复制 tensor。需要时 launcher 通过 `rtGetL2CacheOffset` 为 device
+入口准备隐藏别名；公开 host/Torch 调用参数保持不变。资格与生命周期见
+[内存合同](../development/memory-contracts.md#每次只读-gm-copy-的缓存政策)。
 
 类型由使用位置决定用途：`Meta: T.Tensor((n,), T.i64)` 声明 8 字节有符号
 整数存储，`n: T.i64` 声明 runtime 长度参数，两处使用同一个类型描述符。
@@ -209,7 +221,7 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 | FIRST/LAST/受限边界guard | 已有子集，组合限制存在 | 空/短/重合/孔洞的统一存在域 |
 | 可能重叠的符号地址、错位 ring 访问 | 按源码内存顺序处理 | 不虚构精确 producer 或完整覆盖；仍须满足现有控制与事件规则 |
 | 数据相关分支、间接alias/owner、任意多时钟连续任务 | 未普遍支持 | 明确可验证输入合同或具体拒绝 |
-| 二维 `copy(valid_rows=...)` | 补零或保留其余行的 GM→L1、部分 UB→GM 已实现 | 静态容量、真实行数、NZ footprint、初始化与 DMA 几何分别检查 |
+| 二维 `copy(valid_rows=...)` | 补零或保留其余行的 GM→L1、部分 UB/L0C→GM 已实现 | 静态容量、真实行数、NZ footprint、初始化与 DMA/FIX 几何分别检查 |
 | 一维 `valid=` prefix、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
 | 透明 `@T.inline` helper / 静态尾块区间 | 已实现 | 同一 AST、native lowering、访问检查和同步链；不引入设备 call |
 | opaque Python函数/任意宏 | 不支持 | 不以 host 执行隐藏原语或 effects |
@@ -243,12 +255,15 @@ N.copy(y, Y[base : base + 128, :], valid_rows=rows)
 ```
 
 `valid_rows` 只选择二维 view 第一轴的连续前缀，不改变物理计算 tile 的形状。
+L0C→GM 也支持该前缀：源保留完整 resident M 及包含输出 N 的最小 N0 列块，
+FIX 只读写真实行数，支持元素步长和 N 尾块，不接受 `pad_value`。
+L0C 的每个 N0 列块行宽为 64 B，行距保持 resident M；0 行不发指令。
 实际行数须在 `[0, 静态行容量]` 内，实际执行的源访问合法性由调用方满足。
 GM→L1 支持 f16/bf16/f32，指定 `pad_value=0` 时整个 NZ 目标有定义，缺失的
 行和扩展列为零；0行只填零、不读取 GM，行列均完整的 tile 不发额外填零。
 UB→GM 不接受 `pad_value`，只读取/写出有效行；0行不发 DMA，目标剩余字节
 保持原值。这一路仍要求普通 DMA 的32 B行宽、地址和步长合同，不能据此
-支持任意列尾块。转置搬运、其他内存路由及一维 `valid=` 不取得该支持。
+支持任意列尾块。转置搬运及一维 `valid=` 不取得该支持。
 补零 packet 的内部 MTE2 fence 保持 fill→ND2NZ 顺序，外部 ready 和最后 reader
 仍由同一自动同步链生成。输入不需要额外 host padding 或 packing kernel。
 
@@ -279,9 +294,24 @@ S store→S load 按已证明的发射顺序执行，跨循环端口也不生成
 不能用 Scalar 读的同步返回合同替代写入完成。
 
 `N.matmul` 的 L0A/L0B 输入支持 FP16、BF16 和 FP32，累加器为 FP32。
+`initialize` 可为常量、当前 pipeline 的 `k == 0`，或 `k % P == 0`，其中 P 是正
+constexpr 且不超过 4096。周期清零使用同一个真实 pipeline ordinal，非清零轮继续
+读取原累加器；不能用父循环或 serial 子循环的坐标冒充该 ordinal。
+周期清零允许环形累加器在清零点换槽，例如 `c.at(k // P)`：编译器须证明每个
+周期内的真实 footprint、激活和子循环次数与该周期起点一致。周期中途换槽、
+跳过起点清零或不能证明一致时拒绝；这项数值初始化事实不提供 ready 或 reader 退休。
 FP32 路径设置 IEEE 模式并建立 S→M ready，不先将操作数转成 b16/HF32。
 FP32 L1 NZ 每列组为 8 个元素；FP32 L0C 仍使用 16 列 fractal。
-当前 Load3D 配置在 kernel 入口保持不变，不支持一个 kernel 中任意切换 resident width。
+
+`matmul(..., unit_flag=3 if last else 2)` 与 `copy(c,out,unit_flag=3)` 可显式
+选择 L0C 细粒度握手，缺省为 0。当前要求固定、完整的同一 L0C 平面、相同
+stage 内配对的发布/消费及完整 FIX 读取；不匹配时诊断，不静默替换政策。
+这只覆盖参与的 L0C RAW/WAR，其他同步仍自动生成，详见
+[unitflag 合同](../development/unit-flags.md)。
+L1→L0 的多 fractal b16 A 面板和 NN B 面板选择一条 Load3D；A 的行切片保留真实
+resident leading M，B 的完整平面也可直接转置 block 轴。单 fractal 继续用 Load2D。
+Load3D 的单一矩阵宽度在入口配置；多种宽度保留实际 setter、ready 和旧 reader
+退休链，不能仅替换指令字段而省略寄存器生命周期。
 GM→L1、L1→L0 的实际 tile、转置和 FIX 写回仍满足各自 native 几何及访问合同。
 `mul/sub/div` 的行广播支持 8 的倍数且小于 64 的窄行，以及既有完整 64 列块；
 窄行按精确列数设置 Normal mask，行起点保持 32 B 对齐，scratch 仍为 `(rows,8)`。

@@ -63,11 +63,21 @@ void asc_sync_pipe(int){}
 template<class... P> void record(const char* name,float scalar,P... p){
  std::cout<<name<<" "<<scalar; ((std::cout<<" "<<uintptr_t(p)),...); std::cout<<"\n";
 }
+struct asc_load3d_v2_config{uint64_t config;};
+struct asc_l13d_fmatrix_config{uint64_t config;};
+void asc_set_l13d_rpt(asc_load3d_v2_config){record("set_load3d",0);}
+void asc_set_l13d_padding(uint64_t){} void asc_set_l13d_size(uint64_t){}
+void asc_set_l13d_fmatrix(asc_l13d_fmatrix_config){record("set_fmatrix_a",0);}
+void asc_set_l13d_fmatrix_b(asc_l13d_fmatrix_config){record("set_fmatrix_b",0);}
 template<class D,class S,class... P> void asc_copy_gm2ub(D d,S s,P...){record("copy",0,s,d);}
 template<class D,class S,class... P> void asc_copy_ub2gm(D d,S s,P...){record("copy",0,s,d);}
 template<class D,class S,class... P> void asc_copy_gm2l1_nd2nz(D d,S s,P...){record("nd2nz",0,s,d);}
-template<class D,class S,class... P> void asc_copy_l12l0a(D d,S s,P...){record("load2d_a",0,s,d);}
-template<class D,class S,class... P> void asc_copy_l12l0b(D d,S s,P...){record("load2d_b_nt",0,s,d);}
+template<class D,class S,class... P> void asc_copy_l12l0a(D d,S s,P...){
+ record(sizeof...(P)>4?"load3d_a":"load2d_a",0,s,d);
+}
+template<class D,class S,class... P> void asc_copy_l12l0b(D d,S s,P...){
+ record(sizeof...(P)>4?"load3d_b_nn":"load2d_b_nt",0,s,d);
+}
 template<class D,class S,class... P> void load_cbuf_to_cb(D d,S s,P...){record("load2d_b_nn",0,s,d);}
 template<class D,class A,class B,class... P> void asc_mmad(D d,A a,B b,P...){record("mad",0,a,b,d);}
 template<class D,class S,class... P> void asc_copy_l0c2gm(D d,S s,P...){record("fix",0,s,d);}

@@ -214,3 +214,79 @@ def test_mathematically_empty_domain_does_not_hide_undefined_source_remainder(ba
     )
     with pytest.raises(CompileError, match="ordered activation prefix"):
         EventDomains(selection, ResourceWork())
+
+
+def test_child_partition_rebinds_metadata_conditions_to_each_parent_call():
+    from ascendflow.analysis.event_domains import BoundaryCase
+    from ascendflow.analysis.event_families import build_boundary_family, build_event_family
+    from ascendflow.diagnostics import CompileError
+    from ascendflow.dialects.physical import TaskOp
+    from ascendflow.symbols import SymbolKind
+
+    selection = selected("""
+def parents(X:N.Tensor((n,17,64),N.f32),Meta:N.Tensor((n,),N.i64),n:N.i64):
+    with N.Kernel():
+        x,y=N.alloc_ub((64,)),N.alloc_ub((64,))
+        for parent in N.serial(n):
+            m=N.load_index(Meta[parent:parent+1],minimum=0,maximum=8)
+            for child in N.Pipelined(17):
+                with N.Stage(0):
+                    v=N.copy(X[parent,child,:],x)
+                with N.Stage(1):
+                    N.mul(v,2.0,out=y)
+""")
+    control = selection.dependencies.memory.control
+    parent, child = control.loops
+    load = next(
+        op
+        for op in selection.dependencies.memory.module.walk()
+        if isinstance(op, TaskOp) and op.native.data == "index_load"
+    )
+    parameter = control.environment.expression(load.value)
+    ordinal = control.loops[child].ordinal
+    predicate = Comparison(parameter, ">", expression("rem", ordinal, literal(5)))
+    guard = ActionGuard((predicate,))
+    original = next(
+        n for n in selection.notifications if n.sources[0].coordinates == n.consumers[0].coordinates
+    )
+    notification = replace(
+        original,
+        requirements=(),
+        domains=(),
+        anchors=(),
+        sources=tuple(replace(p, guard=guard) for p in original.sources),
+        consumers=tuple(replace(p, guard=guard) for p in original.consumers),
+    )
+    selection = replace(
+        selection,
+        dependencies=replace(selection.dependencies, required=()),
+        notifications=(notification,),
+        coverage=(),
+        bindings=(),
+    )
+    domains = EventDomains(selection, ResourceWork())
+    with pytest.raises(CompileError, match="kernel-uniform"):
+        build_event_family(domains, notification)
+    cases = build_boundary_family(domains, notification, parent)
+    assert cases and all(isinstance(case, BoundaryCase) and case.scope is parent for case in cases)
+    # The same call site sees different metadata on successive parent calls.
+    # Conditions must retain the original captured parameter until rebinding.
+    for offset in (0, 1, 3):
+        ports = [
+            domains._boundary(notification, case, parent, offset, last=False)[0][0]
+            for case in cases
+            if not case.empty
+        ]
+        for point in ports:
+            metadata = [
+                s
+                for t in point.guard.comparisons
+                for value in (t.lhs, t.rhs)
+                for s in value.variables
+                if s.kind is SymbolKind.METADATA
+            ]
+            assert metadata
+            expected = expression("add", control.loops[parent].ordinal, literal(offset))
+            assert all(expected in symbol.captures for symbol in metadata)
+    with pytest.raises(CompileError, match="actual parent invocation"):
+        domains._boundary(notification, next(c for c in cases if not c.empty), child, 0, last=False)

@@ -72,8 +72,13 @@ def test_real_cube_nested_and_cv_sources_close_without_old_completion_graph(sour
         n.loop is not None and n.distance is not None and n.distance > 0 for n in result.needs
     )
     assert all(
-        n.source.operation in operations and n.consumer.operation in operations
+        point.operation in operations
+        or (
+            isinstance(point.endpoint, QueueEndpoint)
+            and point.operation in result.memory.control.frames
+        )
         for n in result.needs
+        for point in (n.source, n.consumer)
     )
     assert result.work.native_templates == result.memory.native_contract_calls
     assert result.work.cells < 100
@@ -198,7 +203,7 @@ def test_compound_slot_short_and_long_children_preserve_actual_byte_values(width
 
 def test_default_flash_attention_closes_in_compact_actual_fragment_families():
     result = dependencies(attention_target)
-    assert result.work.native_templates == 53
+    assert result.work.native_templates == 56
     assert result.work.projected_accesses < 500
     assert result.work.cells < 200
     assert result.work.needs < 1500

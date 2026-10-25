@@ -50,6 +50,7 @@ class Tensor:
     access: str = "read"
     cache: str = "normal"
     write_disjoint: bool = False
+    layout: str = "linear"
 
 
 def _ast_only():
@@ -139,14 +140,27 @@ class Dataflow:
         _ast_only()
 
 
-def copy(source, destination, *, valid=None, valid_rows=None, transpose=False, pad_value=None):
+def copy(
+    source,
+    destination,
+    *,
+    valid=None,
+    valid_rows=None,
+    transpose=False,
+    pad_value=None,
+    unit_flag=0,
+    cache_bypass=False,
+):
     """Copy tiles; GM→L1 can zero-pad and L0C→GM converts to the output dtype.
 
     ``pad_value=0`` explicitly defines the complete destination NZ plane.
     A smaller GM destination exports the top-left accumulator rectangle.
     ``valid_rows`` copies a runtime leading-row prefix of a static matrix:
     GM→L1 with pad_value=0 defines the full destination; without padding it
-    preserves the remaining NZ rows. UB→GM writes only that prefix.
+    preserves the remaining NZ rows. UB/L0C→GM writes only that prefix.
+    ``cache_bypass`` selects an external read-only GM source's L2 policy
+    using a bool or actual i1 SSA; layout, effects and allocation stay fixed.
+    ``unit_flag=3`` on L0C→GM consumes a matching complete MAD publication.
     """
     _ast_only()
 
@@ -287,11 +301,14 @@ def fill(destination, value, *, mask=None, scratch=None):
     _ast_only()
 
 
-def matmul(a, b, *, accum, initialize=True):
+def matmul(a, b, *, accum, initialize=True, unit_flag=0):
     """Native L0A[M,K] × L0B[K,N] → L0C[M,N], without hidden operands.
 
     L1→L0 copies and every buffer slot are explicit. For stored Bᵀ[N,K],
     use copy(..., transpose=True) into an L0B[K,N] tile before this operation.
+    ``initialize`` accepts a constant or this pipeline's first/periodic reset.
+    ``unit_flag`` defaults to 0; 2 checks L0C availability and 3 also publishes
+    to a matching FIX. The handshake does not complete the whole MAD or pipe.
     """
     _ast_only()
 

@@ -19,7 +19,7 @@ from tests.fixtures.control import SHARED
 
 @pytest.mark.parametrize(
     "source,count",
-    [(scale, 3), (batched_matmul, 6), (N.from_source(SHARED, disjoint_external=True), 9)],
+    [(scale, 3), (batched_matmul, 8), (N.from_source(SHARED, disjoint_external=True), 11)],
 )
 def test_native_memory_facts_preserve_owned_operations_and_call_target_rule_once(
     source, count, monkeypatch
@@ -28,10 +28,17 @@ def test_native_memory_facts_preserve_owned_operations_and_call_target_rule_once
     control = build_control_facts(plan.module)
     rule = native.native_contract
     calls = []
+    depth = 0
 
     def counted(*args, **kwargs):
-        calls.append(args[0])
-        return rule(*args, **kwargs)
+        nonlocal depth
+        if depth == 0:
+            calls.append(args[0])
+        depth += 1
+        try:
+            return rule(*args, **kwargs)
+        finally:
+            depth -= 1
 
     def no_rebuild(*args):
         pytest.fail("unchanged control facts were rebuilt")

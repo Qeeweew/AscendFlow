@@ -1,4 +1,4 @@
-"""Canonical L1 NZ allocation geometry, independent of access generations."""
+"""Canonical GM/L1 NZ allocation geometry, independent of access generations."""
 
 from dataclasses import dataclass
 from math import prod
@@ -18,7 +18,7 @@ class NZLayout:
             and self.itemsize in {2, 4}
             and self.shape[-2] % 16 == 0
             and self.shape[-1] % self.c0 == 0,
-            "L1 NZ allocation needs static planes, row16 and C0-aligned columns",
+            "NZ allocation needs static planes, row16 and C0-aligned columns",
         )
 
     @property

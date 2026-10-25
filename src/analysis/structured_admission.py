@@ -995,7 +995,28 @@ def _conditional_initialization(access, template, memory):
     if equivalent(condition.kill.lhs, condition.kill.rhs, facts):
         # A reset at every ordinal has no old-value read, even for a ring view.
         return condition
-    if not control.invariant_over(access.address.offset, condition.loop):
+
+    def invariant(value):
+        if control.invariant_over(value, condition.loop):
+            return True
+        if template.spec.native != "mad_cycle":
+            return False
+        # Every ordinal in this reset interval must use the same footprint,
+        # activation and child counts as the interval's actual first ordinal.
+        # This numerical induction gives no ready or retirement permission.
+        ordinal = control.loops[condition.loop].ordinal
+        first = expression(
+            "sub", ordinal, expression("rem", ordinal, literal(template.spec.params[3]))
+        )
+        rebound = substitute(value, {ordinal: first})
+        return (
+            equivalent(value, rebound, facts)
+            or query_service(facts)
+            .equivalent(value, rebound, (Comparison(ordinal, ">=", literal(0)),))
+            .proved
+        )
+
+    if not invariant(access.address.offset):
         return None
     inside = False
     for scope in template.frame.ancestors():
@@ -1004,15 +1025,14 @@ def _conditional_initialization(access, template, memory):
             continue
         if not inside:
             continue
-        if scope.loop is not None and not control.invariant_over(scope.loop.count, condition.loop):
+        if scope.loop is not None and not invariant(scope.loop.count):
             return None
         if scope.branch is not None:
             comparison = scope.operation.cond.owner
             if not isinstance(comparison, arith.CmpiOp):
                 return None
             if not all(
-                control.invariant_over(control.environment.expression(value), condition.loop)
-                for value in comparison.operands
+                invariant(control.environment.expression(value)) for value in comparison.operands
             ):
                 return None
     return condition if inside else None

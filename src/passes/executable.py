@@ -29,6 +29,8 @@ class NativeExecution:
         count = self.operation.attributes.get("address_count")
         require(
             self.operation.native.data == self.spec.native
+            and (0 if self.operation.unit_flag is None else self.operation.unit_flag.data)
+            == self.spec.unit_flag
             and tuple(value.data for value in self.operation.params) == self.spec.params
             and (len(self.operation.refs) if count is None else count.data)
             == len(self.spec.operands),

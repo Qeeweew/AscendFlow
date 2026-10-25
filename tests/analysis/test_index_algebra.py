@@ -99,6 +99,16 @@ def test_nested_positive_quotients_and_last_index_have_exact_integer_identities(
         assert last.evaluate(values) == (left * right - 1) // left
 
 
+@pytest.mark.parametrize("numerator,divisor", ((1, 2), (7, 3), (0, 5)))
+def test_ring_cancellation_to_a_constant_quotient_keeps_a_coefficient(numerator, divisor):
+    x = argument("x")
+    top = expression("sub", expression("add", x, literal(numerator)), x)
+    quotient = expression("floordiv", top, literal(divisor))
+    remainder = expression("rem", top, literal(divisor))
+    assert indexing.normalize(quotient, {}) == literal(numerator // divisor)
+    assert indexing.normalize(remainder, {}) == literal(numerator % divisor)
+
+
 def test_large_rational_coefficients_never_pass_through_floating_point():
     value, coefficient = argument("x"), (1 << 60) + 3
     facts = {"x": Fact(multiple=3)}

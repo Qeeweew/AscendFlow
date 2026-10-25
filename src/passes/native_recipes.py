@@ -121,7 +121,7 @@ def source_allocation(value):
     return root
 
 
-def strided_b_width(op):
+def load3d_b_width(op):
     if (
         not isinstance(op, CopyOp)
         or (op.source.type.memory.data, op.destination.type.memory.data) != ("L1", "L0B")
@@ -132,14 +132,12 @@ def strided_b_width(op):
         return None
     rows, cols = source_shape(op.source)
     width = source_allocation(op.source).ref.type.shape.data[-2].data
-    # Load3D handles this strided zN rectangle in one instruction. Complete
-    # planes and one-fractal dimensions keep their existing Load2D recipe.
-    return (
-        width if (16 < rows < width and cols > 16) or op.source.type.dtype.data == "f32" else None
-    )
+    # Load3D transposes the block axes in one instruction for both complete
+    # and strided zN rectangles. One-fractal b16 dimensions keep Load2D.
+    return width if rows > 16 and cols > 16 or op.source.type.dtype.data == "f32" else None
 
 
-def compact_a_width(op):
+def load3d_a_width(op):
     if (
         not isinstance(op, CopyOp)
         or (op.source.type.memory.data, op.destination.type.memory.data) != ("L1", "L0A")
@@ -147,11 +145,11 @@ def compact_a_width(op):
     ):
         return None
     rows, _ = source_shape(op.source)
-    if op.source.type.dtype.data == "f32":
-        return source_allocation(op.source).ref.type.shape.data[-2].data
+    # Load3D's FMATRIX_A is the allocation's real leading M, including
+    # strided row slices. It is independent of the requested output M.
     return (
-        rows
-        if rows > 16 and source_allocation(op.source).ref.type.shape.data[-2].data == rows
+        source_allocation(op.source).ref.type.shape.data[-2].data
+        if rows > 16 or op.source.type.dtype.data == "f32"
         else None
     )
 
@@ -192,6 +190,20 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
                 params = source_shape(op.source) + (
                     source_allocation(op.destination).ref.type.shape.data[-2].data,
                 )
+        elif banks == ("L0C", "GM"):
+            require(
+                op.destination.owner.valid is prefix and op.zero_pad is None,
+                "runtime FIX requires the same source and destination row prefix",
+            )
+            m, n = source_shape(op.destination)
+            require(
+                source_shape(op.source)[0] == m
+                and source_shape(op.source)[1] == (n + 15) // 16 * 16,
+                "runtime FIX requires full resident rows and the exact enclosing N0 columns",
+            )
+            native = "fix_rows"
+            destination = context.view(op.destination, matrix=True)
+            params = (m, n, source_shape(op.source)[0])
         else:
             require(
                 banks == ("UB", "GM")
@@ -214,9 +226,12 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
     if banks == ("GM", "L1"):
         require(len(source_shape(op.source)) == 2, "ND→NZ copy requires a matrix")
         padded = op.zero_pad is not None and source_shape(op.source) != source_shape(op.destination)
+        nz = op.source.type.layout.data == "NZ"
         task = context.emit(
             "_copy",
-            "nd2nz_pad" if padded else "nd2nz",
+            ("copy_nz_pad" if padded else "copy_nz")
+            if nz
+            else ("nd2nz_pad" if padded else "nd2nz"),
             context.view(op.source, matrix=True),
             context.view(op.destination),
             params=source_shape(op.source) + (source_shape(op.destination) if padded else ()),
@@ -230,9 +245,9 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
             if transpose
             else "load2d_b_nn"
         )
-        if strided_b_width(op) is not None:
+        if load3d_b_width(op) is not None:
             native = "load3d_b_nn"
-        if not transpose and context.load3d_a and compact_a_width(op) is not None:
+        if not transpose and context.load3d_a and load3d_a_width(op) is not None:
             native = "load3d_a"
         task = context.emit(
             "_copy",
@@ -655,7 +670,12 @@ def lower_scale(op: ScaleOp, context: RecipeContext, *, factor: SSAValue) -> Rec
     return RecipeResult((task,), task, 1, (NativeRead(0, task, 0),))
 
 
-Initialization = int | Literal["first"]
+@dataclass(frozen=True)
+class PeriodicInitialization:
+    period: int
+
+
+Initialization = int | Literal["first"] | PeriodicInitialization
 
 
 def matmul_dimensions(op: MatmulOp) -> tuple[int, int, int]:
@@ -679,13 +699,16 @@ def lower_matmul(
         "native matmul recipe requires explicit L0A/L0B/L0C operands",
     )
     m, n, k = matmul_dimensions(op)
+    periodic = isinstance(initialization, PeriodicInitialization)
     task = context.emit(
         "_mad",
-        "mad_first" if initialization == "first" else "mad",
+        "mad_cycle" if periodic else "mad_first" if initialization == "first" else "mad",
         context.view(op.a),
         context.view(op.b),
         context.view(op.accumulator),
-        params=(m, n, k) if initialization == "first" else (m, n, k, initialization),
+        params=(m, n, k)
+        if initialization == "first"
+        else (m, n, k, initialization.period if periodic else initialization),
     )
     readers = [NativeRead(0, task, 0), NativeRead(1, task, 1)]
     if initialization != 1:

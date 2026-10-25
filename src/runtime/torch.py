@@ -115,10 +115,13 @@ class TensorKernel:
             )
             device = tensor.device if device is None else device
             require(tensor.device == device, "kernel tensors must share one device")
-            require(
-                spec["layout"] == "linear" and tensor.is_contiguous(),
-                f"{name}: expected contiguous linear storage",
-            )
+            require(tensor.is_contiguous(), f"{name}: expected contiguous tensor storage")
+            storage_format = self.runtime.tensor_format(tensor)
+            if spec["layout"] == "NZ":
+                require(storage_format == 29, f"{name}: expected FRACTAL_NZ storage")
+            else:
+                require(spec["layout"] == "linear", f"{name}: unsupported compiled tensor layout")
+                require(storage_format in {0, 2}, f"{name}: expected ND storage")
             require(
                 tensor.dtype == getattr(self.runtime.torch, _DTYPES[spec["dtype"]]),
                 f"{name}: tensor dtype differs from compiled ABI",
@@ -215,9 +218,11 @@ class TorchRuntime:
     def __init__(self, torch=None):
         if torch is None:
             import torch
+        from torch_npu import get_npu_format
         from torch_npu._C import _npu_getCurrentRawStreamNoWait
 
         self.torch = torch
+        self.tensor_format = get_npu_format
         self._stream_handle = _npu_getCurrentRawStreamNoWait
         self._closed = False
         self._streams = {}

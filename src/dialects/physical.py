@@ -116,6 +116,7 @@ class TaskOp(IRDLOperation):
     stage = attr_def(IntAttr)
     params = attr_def(ArrayAttr[IntAttr])
     scalar = attr_def(FloatAttr)
+    unit_flag = opt_attr_def(IntAttr)
     task = result_def(TaskType)
     value = opt_result_def()
     traits = traits_def(AsyncEffects())

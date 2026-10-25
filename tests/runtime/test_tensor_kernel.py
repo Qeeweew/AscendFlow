@@ -108,6 +108,7 @@ def runtime():
         return storage
 
     result.torch = SimpleNamespace(Tensor=Tensor, float32="f32", uint8="u8", npu=npu, empty=empty)
+    result.tensor_format = lambda tensor: getattr(tensor, "storage_format", 2)
     result.call = lambda name, types, *args: calls.append((name, args))
     return result, allocations, calls
 
@@ -123,6 +124,35 @@ def test_actual_library_metadata_matches_report_and_real_argument_order(artifact
     assert len(allocations) == 1 and kernel.workspace_nbytes == 1024
     assert allocations[0][0].streams == [99]
     assert next(iter(kernel._bindings.values())).workspace.value % 512 == 0
+
+
+def test_packed_storage_cannot_masquerade_as_linear(library):
+    owner, _, _ = runtime()
+    x = Tensor()
+    x.storage_format = 29
+    with pytest.raises(CompileError, match="expected ND storage"):
+        owner.kernel(library, "transfer").bind(x, Tensor(pointer=16384))
+
+
+def test_nz_tensor_binding_requires_actual_packed_storage():
+    definition = N.from_source("""
+def packed(W:N.Tensor((16,16),N.bf16,layout="NZ")):
+    with N.Kernel(kind="cube"):
+        pass
+""")
+    metadata = compile(definition).report["abi"]
+
+    def query():
+        return json.dumps(metadata).encode()
+
+    owner, _, _ = runtime()
+    owner.torch.bfloat16 = "bf16"
+    kernel = owner.kernel(SimpleNamespace(kernel_metadata_packed=query), "packed")
+    w = Tensor(shape=(16, 16), dtype="bf16")
+    with pytest.raises(CompileError, match="expected FRACTAL_NZ"):
+        kernel.bind(w)
+    w.storage_format = 29
+    assert callable(kernel.bind(w))
 
 
 def test_bound_call_reuses_arena_and_follows_current_stream(library):

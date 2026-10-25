@@ -354,6 +354,7 @@ def test_real_reduction_first_chunk_clear_uses_actual_stage_ordinal_ssa(tmp_path
         NativeExecution.from_template(template, template.operation),
         render=lambda value: "actual_offset",
         roots={address.root: "root" for address in facts.addresses.values()},
+        cache_aliases={},
         task_names={template.operation: "mad"},
         generation="actual_stage_ordinal",
     )
