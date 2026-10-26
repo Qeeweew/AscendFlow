@@ -147,7 +147,7 @@ def native_read_resets(native: str, params: tuple[int, ...]) -> tuple[NativeRead
 
 
 def _implicit_completion(native, engine, params):
-    if native in {"scalar_store", "set_fmatrix_a", "set_fmatrix_b", "set_load3d", "set_fp32"}:
+    if native in {"scalar_store", "index_store", "set_fmatrix_a", "set_fmatrix_b", "set_load3d", "set_fp32"}:
         # Ordered Scalar issue does not publish the UB write to Vector.
         return False
     if engine is Engine.S:
@@ -477,6 +477,17 @@ def native_contract(
             and lengths == (4,)
             and not params,
             "Scalar store requires one f32 UB element",
+        )
+        return "S", ("W",)
+    if native == "index_store":
+        require(
+            len(refs) == 1
+            and banks == ("UB",)
+            and dtypes[0] in {"i32", "i64"}
+            and layouts == ("linear",)
+            and lengths == (ITEMSIZE[dtypes[0]],)
+            and not params,
+            "index store requires exactly one int32/int64 UB element",
         )
         return "S", ("W",)
     if native == "index_load":
@@ -919,7 +930,10 @@ def native_contract(
         )
         return "MTE2", ("R", "W")
     if native == "copy_rows_prefix":
-        require(tuple(r.bank for r in refs) == ("UB", "GM"), "runtime row output requires UB→GM")
+        require(
+            tuple(r.bank for r in refs) in {("GM", "UB"), ("UB", "GM")},
+            "runtime row DMA requires GM↔UB",
+        )
         return native_contract("copy_rows", refs, params)
     if native == "nd2nz_rows":
         require(len(params) == 4, "runtime ND2NZ needs capacity and resident dimensions")

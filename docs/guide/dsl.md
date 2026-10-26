@@ -17,6 +17,7 @@
 | `T.load_index(view, minimum=..., maximum=...)` | 只读 GM 或已初始化 UB 单个 int32/int64 的 S 读取，捕获有符号 index SSA；inclusive 值合同不生成 clamp |
 | `T.load_scalar(view)` | f32 UB 或浮点 GM 单元素的 S 读取，返回 f32 SSA |
 | `T.store_scalar(value, out=view)` | 将已读取的 f32 SSA 写入单个 f32 UB 元素，保留真实 4 B S 写入效果 |
+| `T.store_index(value, out=view)` | 将 signed index SSA 写入单个 INT32/INT64 UB 元素，保留真实 4/8 B S 写入；调用方保证目标类型可表示，常量溢出直接拒绝 |
 | `T.broadcast(v[None,:], out=...)` / `v[:,None]` | 显式 f32 行/列展开；行展开需要 `(rows,8)` scratch |
 | `T.mul(k[None,:], v[:,None], out=..., scratch=...)` | 直接外积，保留列向量和 BRCB 行值的真实访问，不隐式复制完整列矩阵 |
 | `T.constexpr` | tile、dtype/layout、固定政策等显式特化参数 |
@@ -33,7 +34,7 @@
 | `alloc_workspace(shape, dtype=f32, slots=S)` | 内部、入口未初始化的 GM tensor；allocation 起点自动按 512 B 对齐 |
 | `alloc_*(shape, dtype, slots=S)`、`slotted_view(view, axis=0)` | 明确槽轴与每槽 payload，绑定已有 view 时不增加存储 |
 | `copy/matmul/reduce/...` | typed操作，scratch和真实读写可见 |
-| `copy(..., valid_rows=r)` | 二维 runtime 行前缀；GM→L1 可补零或保留其余 NZ 行，UB/L0C→GM 部分写 |
+| `copy(..., valid_rows=r)` | 二维 runtime 行前缀；GM→L1 可补零或保留其余 NZ 行，GM↔UB / L0C→GM 部分搬运 |
 | `copy(..., cache_bypass=p)` | 本次只读 external GM copy 的 L2 bypass 选择；p 为 bool 常量或实际 i1 SSA |
 | `alloc_mask(shape, slots=S)` | 显式 UB packed predicate 存储，每槽的64 lane占一个32 B块；不指定slots时为普通存储 |
 | `fill(destination, value)` | 连续 f32/f16/bf16 UB view 的完整写入；b16 使用精确 16 位 Vector Dup |
@@ -221,7 +222,7 @@ serial、pipeline、嵌套及循环前后操作使用统一控制与region接口
 | FIRST/LAST/受限边界guard | 已有子集，组合限制存在 | 空/短/重合/孔洞的统一存在域 |
 | 可能重叠的符号地址、错位 ring 访问 | 按源码内存顺序处理 | 不虚构精确 producer 或完整覆盖；仍须满足现有控制与事件规则 |
 | 数据相关分支、间接alias/owner、任意多时钟连续任务 | 未普遍支持 | 明确可验证输入合同或具体拒绝 |
-| 二维 `copy(valid_rows=...)` | 补零或保留其余行的 GM→L1、部分 UB/L0C→GM 已实现 | 静态容量、真实行数、NZ footprint、初始化与 DMA/FIX 几何分别检查 |
+| 二维 `copy(valid_rows=...)` | 补零或保留其余行的 GM→L1、部分 GM↔UB / L0C→GM 已实现 | 静态容量、真实行数、NZ footprint、初始化与 DMA/FIX 几何分别检查 |
 | 一维 `valid=` prefix、循环内动态 allocation | 前端可表达，native lowering 明确拒绝 | 需要独立访问/生命周期合同后开放 |
 | 透明 `@T.inline` helper / 静态尾块区间 | 已实现 | 同一 AST、native lowering、访问检查和同步链；不引入设备 call |
 | opaque Python函数/任意宏 | 不支持 | 不以 host 执行隐藏原语或 effects |

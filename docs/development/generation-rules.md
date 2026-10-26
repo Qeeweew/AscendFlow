@@ -70,10 +70,12 @@ queue acquire。被选通知直接引用自身的原始 anchor binding，不把�
 反过来当作捕获者自己的存储归属。
 
 通用 cell credit 按这些原始 binding 的完整物理 ownership 集合和 role 分组。
-同一实际操作的 Set 或 Wait 不能重复发射；构造按 Set/Wait、participant、native
-操作归集真实激活域，只对共同位置检查完整条件是否互斥，unknown 不允许合并。
-无共同动作位置的历史成员不再逐对访问。保持首个可接受 credit 的选择顺序，
-成员逐次追加后只冻结一次；credit 不再额外复制一份累计 owner 列表。
+先按 Set/Wait、participant、native 操作建立全部保留片段的真实激活索引。
+同一位置存在可重叠的多个后继/前驱时，相关片段各自保留独立 credit：保守访问
+前沿可能同时保留相邻边和跨条件 child 的更晚边，后者不能冒充相邻 lifetime。
+其余无重复端点的相邻片段才按同一物理 word 归纳共享；不同 credit 如需复用 ID，
+仍须由资源规划取得真实消费回传证明。条件未知时保守分开，不新增同步或 loop drain。
+共同位置的激活交叠只建立一次，分组直接消费该事实。
 
 已取得的完成前缀按实际 route、完整激活类、capture/acquire 的层级发射坐标
 建立查询索引。同一个发射 word 只允许最后 lexical 位置变化，其余 scope、
@@ -201,7 +203,9 @@ origin 必须是绑定自身保留的精确物理访问/邻接 lifetime edge。�
 及物理 cell 保持各自 credit。
 
 同一物理 cell、role 和路由的首末/循环分片，可跨不同 native reader/writer
-组成一个 credit。相同 native 上的 Set 域及 Wait 域必须分别不相交；不同
+组成一个 credit。每个片段先对整个同 ownership/role/route 集合检查重复端点；
+存在可重叠 fan-out/fan-in 的片段不得与其它 phase 直接组成相邻 word。
+其余片段在相同 native 上的 Set 域及 Wait 域分别不相交；不同
 native 是 lifetime word 的不同 occurrence。两个 ready consumer 的共同
 definition 会使 Set 域重合；多个最后 reader 的共同下一 writer 会使 Wait
 域重合，因此它们不会被合并掉。比较使用各端真实坐标，参数 case 仍由域构造负责。

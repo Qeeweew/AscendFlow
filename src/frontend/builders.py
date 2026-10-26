@@ -1327,12 +1327,12 @@ def copy(
             and (
                 (src.buffer.memory, dst.buffer.memory) == ("GM", "L1")
                 and src.buffer.layout == "linear"
-                or (src.buffer.memory, dst.buffer.memory) == ("UB", "GM")
+                or (src.buffer.memory, dst.buffer.memory) in {("GM", "UB"), ("UB", "GM")}
                 and pad_value is None
                 or (src.buffer.memory, dst.buffer.memory) == ("L0C", "GM")
                 and pad_value is None
             ),
-            "valid_rows requires a GM→L1, UB→GM or L0C→GM matrix copy",
+            "valid_rows requires a GM→L1, GM↔UB or L0C→GM matrix copy",
         )
     if transpose:
         require(
@@ -1819,6 +1819,25 @@ def store_scalar(value, *, out):
     dst = _view(out).bound()
     require(dst.buffer.op.access.data != "read", "store_scalar requires writable storage")
     op = ScalarWriteOp.build(operands=[value.value, dst.emit()], result_types=[_tile(dst)])
+    _trace().add(op)
+    _trace().record(op.value)
+    return _Value(dst, op.value)
+
+
+def store_index(value, *, out):
+    dst = _view(out).bound()
+    require(
+        dst.buffer.memory == "UB" and dst.buffer.dtype in {i32, i64},
+        "store_index requires one int32/int64 UB element",
+    )
+    require(dst.buffer.op.access.data != "read", "store_index requires writable storage")
+    if type(value) is int:
+        bits = 32 if dst.buffer.dtype == i32 else 64
+        require(-(1 << (bits - 1)) <= value < (1 << (bits - 1)),
+                "store_index constant must fit the destination signed dtype")
+    op = ScalarWriteOp.build(
+        operands=[_trace().scalar(value), dst.emit()], result_types=[_tile(dst)]
+    )
     _trace().add(op)
     _trace().record(op.value)
     return _Value(dst, op.value)

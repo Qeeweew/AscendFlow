@@ -53,6 +53,9 @@ CopyGroup 的 typed region 对应 physical ReadyGroupOp 的实际 native 成员�
 coverage 引用 selection 拥有的同一份 binding，完成覆盖和动作合并保持其身份。
 选定通知的 anchors 同样引用这些原始 binding，必须属于本通知覆盖的需求；
 新增 coverage 不增加或替换存储归属，复制一份值相等的 binding 不能冒充原始事实。
+稳定 cell 的二值 credit 还要求真实相邻 lifetime；保守前沿中的跨 child 非相邻边
+不提供此归纳。按完整 ownership/role/route 检查所有片段的重复实际 Set/Wait 位置，
+重叠 fan-out/fan-in 的片段保持独立 credit，另行取得消费回传才可复用编号。
 闭合私有轮次在输入事实建立时选定真实最后 reader；后续 ownership 直接消费
 原始 RAW 端点，不重新绑定或创建临时通知。CopyGroup 的 ready 前缀不替换
 覆写前的真实 writer 位置，全部 reader/effects 和退休义务继续保留。

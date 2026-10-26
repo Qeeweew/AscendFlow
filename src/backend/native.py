@@ -143,12 +143,13 @@ def native_line(task, *, pointer_renderer, generation):
         return call
     if task.spec.native == "copy_rows_prefix":
         rows = task.operands[0]
+        function = "asc_copy_gm2ub" if refs[0].bank == "GM" else "asc_copy_ub2gm"
         if all(ref.contiguous for ref in refs):
-            call = f"asc_copy_ub2gm({p[1]}, {p[0]}, uint32_t(({rows}) * {refs[0].nbytes}));"
+            call = f"{function}({p[1]}, {p[0]}, uint32_t(({rows}) * {refs[0].nbytes}));"
         else:
             gaps = [(r.row_stride - r.nbytes) // 32 if r.rows > 1 else 0 for r in refs]
             call = (
-                f"asc_copy_ub2gm({p[1]}, {p[0]}, uint16_t({rows}), "
+                f"{function}({p[1]}, {p[0]}, uint16_t({rows}), "
                 f"uint16_t({refs[0].nbytes // 32}), uint16_t({gaps[0]}), uint16_t({gaps[1]}));"
             )
         return f"if (({rows}) > 0) {{ {call} }}"
@@ -194,6 +195,10 @@ def native_line(task, *, pointer_renderer, generation):
     if task.spec.native == "scalar_store":
         destination = p[0].replace("float*", "volatile float*")
         return f"*({destination}) = npu_value_{task.scalar_source};"
+    if task.spec.native == "index_store":
+        element = CTYPE[refs[0].dtype]
+        destination = p[0].replace(f"{element}*", f"volatile {element}*")
+        return f"*({destination}) = {element}({task.operands[0]});"
     if task.spec.native in {"mul_columns", "add_columns", "broadcast_columns", "broadcast_rows"}:
         rows, cols = task.spec.params
         dst = ptr(-1, extra="npu_chunk * 256")

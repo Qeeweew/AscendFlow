@@ -88,6 +88,7 @@ _CALLS = {
     "div",
     "load_scalar",
     "store_scalar",
+    "store_index",
     "load_index",
     "broadcast",
     "reduce_sum",

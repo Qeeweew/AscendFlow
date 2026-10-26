@@ -206,6 +206,7 @@ _MASK_FREE = frozenset(
         "scalar_load",
         "scalar_store",
         "index_load",
+        "index_store",
         "set_fmatrix_a",
         "set_fmatrix_b",
         "set_load3d",

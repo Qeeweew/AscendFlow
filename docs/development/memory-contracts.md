@@ -87,6 +87,13 @@ UB 可通过普通 DMA 批量预取整数元数据；Scalar 读取捕获当前�
 后续覆盖 UB 不改变该 SSA。它保留普通 Tile 来源、初始化、MTE2→S readiness
 和 S→writer 退休义务，不把可写 UB 当作不可变输入元数据。
 
+`N.store_index(value, out=...)` 通过有序 Scalar issue 写入单个 INT32 / INT64 UB
+元素，真实 effects 分别为4 /8字节，不写 GM、不经过浮点转换。调用方保证动态
+signed index 值可由目标 signed dtype 表示；静态常量溢出直接拒绝，不生成 clamp、
+饱和或静默回绕。它与 f32 `store_scalar` 共用 source ScalarWriteOp，并降为
+typed `index_store` native；不赋予 S 写入对其他 pipe 的隐式完成。UB 的定义、
+S→MTE3/Vector readiness 以及后续覆盖前的 reader retirement 都由普通访问链生成。
+
 `structured_access` 是实际 native footprint 的唯一输入。StorageCell 表示可选的
 精确字节区域；AliasRegion 表示无法排除重叠的同一存储实例。两者都由
 `access_order` 建立可能冲突的 RAW/WAR/WAW；RAW 在这里是顺序义务，不宣称
@@ -196,6 +203,13 @@ GM→L1 的补零目标是完整写入；GM输入只有实际行数的读取。U
 使用保守 AliasRegion 保持可能重叠的源码顺序，不虚构精确覆盖/KILL；私有
 UB的保守读取上界仍保持真实最后 reader。有限执行模型按实际行数解释字节，
 并覆盖零行、部分行、完整行和重入。
+
+GM↔UB 的 `copy(valid_rows=r)` 支持连续或按32B对齐的跨步矩形，两侧保留同一个
+实际行数 SSA；GM→UB 走 MTE2，UB→GM 走 MTE3。连续片段按 `r*row_bytes` 发一条
+DMA，跨步片段按实际行数发一条二维 DMA；0行不发DMA。未覆盖的 UB 行与行间孔洞
+保持原内容，不能由静态容量推断完整初始化，也不隐式补零。需要读取完整 UB tile时，
+先显式初始化；普通 UB 读仍沿现有保守定义覆盖规则检查。新路由复用已有
+`copy_rows_prefix`、真实prefix访问和ready/最后reader退休规则，不增加全局barrier。
 
 GM→L1 不指定 `pad_value` 时，`copy(valid_rows=r)` 只覆盖目标的逻辑行前缀，
 其余目标保持。当前支持 FP16/BF16/FP32、C0 列对齐、至多 256 行的 L1 NZ view。

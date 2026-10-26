@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from xdsl.dialects.builtin import IndexType
 from xdsl.ir import SSAValue
 
 from ..diagnostics import require
@@ -206,10 +207,10 @@ def lower_copy(op: CopyOp, context: RecipeContext) -> RecipeResult:
             params = (m, n, source_shape(op.source)[0])
         else:
             require(
-                banks == ("UB", "GM")
+                banks in {("GM", "UB"), ("UB", "GM")}
                 and op.destination.owner.valid is prefix
                 and op.zero_pad is None,
-                "runtime output rows require the same UB→GM prefix",
+                "runtime row DMA requires the same GM↔UB prefix",
             )
             native = "copy_rows_prefix"
             destination = context.view(op.destination, matrix=True)
@@ -640,7 +641,8 @@ def lower_scalar_read(op: ScalarReadOp, context: RecipeContext) -> RecipeResult:
 def lower_scalar_write(
     op: ScalarWriteOp, context: RecipeContext, *, value: SSAValue
 ) -> RecipeResult:
-    task = context.emit("_store", "scalar_store", context.view(op.destination), operands=(value,))
+    native = "index_store" if isinstance(value.type, IndexType) else "scalar_store"
+    task = context.emit("_store", native, context.view(op.destination), operands=(value,))
     return RecipeResult((task,), task, 0, ())
 
 

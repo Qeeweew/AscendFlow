@@ -9,6 +9,7 @@ from math import prod
 from xdsl.dialects.builtin import (
     ArrayAttr,
     DictionaryAttr,
+    Float32Type,
     FloatAttr,
     IndexType,
     IntAttr,
@@ -1232,7 +1233,7 @@ class ReduceOp(IRDLOperation):
 @irdl_op_definition
 class ScalarWriteOp(IRDLOperation):
     name = "npu_source.scalar_write"
-    source = operand_def(f32)
+    source = operand_def(Float32Type | IndexType)
     destination = operand_def(TensorType)
     value = result_def(TileType)
     traits = traits_def(AsyncEffects())
@@ -1241,10 +1242,12 @@ class ScalarWriteOp(IRDLOperation):
         _verify_result(self, self.destination)
         if (
             self.destination.type.memory.data != "UB"
-            or self.destination.type.dtype.data != "f32"
+            or self.destination.type.dtype.data not in (
+                {"i32", "i64"} if isinstance(self.source.type, IndexType) else {"f32"}
+            )
             or any(n.data != 1 for n in self.destination.type.shape)
         ):
-            raise VerifyException("Scalar store requires one f32 UB element")
+            raise VerifyException("Scalar store requires one UB element matching f32 or index dtype")
 
 
 @irdl_op_definition

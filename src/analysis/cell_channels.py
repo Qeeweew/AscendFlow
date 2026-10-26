@@ -71,7 +71,37 @@ def _occupations(domains, notification):
 
 def construct_cell_channels(domains):
     leases, remaining = [], []
-    groups, occupations, members = {}, [], []
+    groups, members = {}, []
+    fragments, by_site, separate = {}, {}, set()
+    # A conservative access frontier may retain both an adjacent successor and
+    # a later successor across a conditional child. Those releases overlap:
+    # "same physical cell" alone does not make them one lifetime word. Keep
+    # every overlapping branch of that fan-out/fan-in in its own credit.
+    # Other fragments can still share by the ordinary adjacent-cell induction;
+    # the resource planner may separately prove reuse between distinct credits.
+    for item in domains.notifications:
+        if item.mechanism is NotificationKind.PIPE_FENCE or not owns_stable_cell(
+            item, domains.control, domains.clocks[item]
+        ):
+            continue
+        key = (
+            frozenset(b.requirement.ownership_key for b in item.anchors),
+            item.source_engine,
+            item.destination_engine,
+            item.mechanism,
+        )
+        actual = _occupations(domains, item)
+        fragments[item] = key, actual
+        for site, tests in actual.items():
+            previous = by_site.setdefault((key, site), [])
+            for other, domains_before in previous:
+                if any(
+                    not domains.arithmetic.queries.satisfies(before + current).impossible
+                    for before in domains_before
+                    for current in tests
+                ):
+                    separate.update((other, item))
+            previous.append((item, tests))
     for item in domains.notifications:
         if item.mechanism is NotificationKind.PIPE_FENCE:
             continue
@@ -80,30 +110,14 @@ def construct_cell_channels(domains):
             continue
         # The anchor bindings already own the actual memory edges. Added
         # completion coverage never changes this physical ownership set.
-        key = (
-            frozenset(b.requirement.ownership_key for b in item.anchors),
-            item.source_engine,
-            item.destination_engine,
-            item.mechanism,
-        )
-        sites = _occupations(domains, item)
-        candidates = groups.setdefault(key, [])
-        for index in candidates:
-            if all(
-                domains.arithmetic.queries.satisfies(previous + current).impossible
-                for site, tests in sites.items()
-                for previous in occupations[index].get(site, ())
-                for current in tests
-            ):
-                break
-        else:
+        key, _ = fragments[item]
+        key = key, item if item in separate else None
+        if key not in groups:
             index = len(members)
-            candidates.append(index)
+            groups[key] = index
             members.append([])
-            occupations.append({})
+        index = groups[key]
         members[index].append(item)
-        for site, tests in sites.items():
-            occupations[index].setdefault(site, []).extend(tests)
         cases = tuple(
             CaseLease(
                 c,

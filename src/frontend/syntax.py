@@ -249,6 +249,15 @@ def store_scalar(value, *, out):
     _ast_only()
 
 
+def store_index(value, *, out):
+    """Store a signed index into one int32/int64 UB element through S.
+
+    The caller keeps value representable in the destination signed dtype.
+    This is a typed integer store, without saturation or a floating conversion.
+    """
+    _ast_only()
+
+
 def load_index(source, *, minimum=None, maximum=None):
     """Read one immutable GM or initialized UB int32/int64 element.
 
